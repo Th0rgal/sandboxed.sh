@@ -30,8 +30,8 @@ interface WorkersStripProps {
 
 type ChipStatus = {
   icon: React.ReactNode;
-  color: string;
-  bg: string;
+  text: string;
+  border: string;
   activity: string | null;
   isActive: boolean;
 };
@@ -41,8 +41,8 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     if (info.state === 'running') {
       return {
         icon: <Loader2 className="h-3 w-3 animate-spin" />,
-        color: 'text-indigo-700 dark:text-indigo-300',
-        bg: 'bg-indigo-500/10 border-indigo-500/25 hover:bg-indigo-500/15',
+        text: 'text-indigo-400',
+        border: 'border-indigo-500/30',
         activity: info.current_activity || null,
         isActive: true,
       };
@@ -50,8 +50,8 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     if (info.state === 'waiting_for_tool') {
       return {
         icon: <Clock className="h-3 w-3" />,
-        color: 'text-amber-700 dark:text-amber-300',
-        bg: 'bg-amber-500/10 border-amber-500/25 hover:bg-amber-500/15',
+        text: 'text-amber-400',
+        border: 'border-amber-500/30',
         activity: info.current_activity || 'Waiting for tool',
         isActive: true,
       };
@@ -59,8 +59,8 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     if (info.state === 'queued') {
       return {
         icon: <Clock className="h-3 w-3" />,
-        color: 'text-foreground/65 dark:text-white/60',
-        bg: 'bg-white/[0.03] border-white/[0.08] hover:bg-white/[0.06]',
+        text: 'text-white/60',
+        border: 'border-white/10',
         activity: 'Queued',
         isActive: false,
       };
@@ -71,48 +71,48 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     case 'completed':
       return {
         icon: <CheckCircle className="h-3 w-3" />,
-        color: 'text-emerald-700 dark:text-emerald-300',
-        bg: 'bg-emerald-500/10 border-emerald-500/20 hover:bg-emerald-500/15',
+        text: 'text-emerald-400',
+        border: 'border-emerald-500/25',
         activity: null,
         isActive: false,
       };
     case 'failed':
       return {
         icon: <XCircle className="h-3 w-3" />,
-        color: 'text-red-700 dark:text-red-300',
-        bg: 'bg-red-500/10 border-red-500/20 hover:bg-red-500/15',
+        text: 'text-red-400',
+        border: 'border-red-500/25',
         activity: null,
         isActive: false,
       };
     case 'interrupted':
       return {
         icon: <AlertTriangle className="h-3 w-3" />,
-        color: 'text-amber-700 dark:text-amber-300',
-        bg: 'bg-amber-500/10 border-amber-500/20 hover:bg-amber-500/15',
+        text: 'text-amber-400',
+        border: 'border-amber-500/25',
         activity: null,
         isActive: false,
       };
     case 'not_feasible':
       return {
         icon: <Ban className="h-3 w-3" />,
-        color: 'text-rose-700 dark:text-rose-300',
-        bg: 'bg-rose-500/10 border-rose-500/20 hover:bg-rose-500/15',
+        text: 'text-rose-400',
+        border: 'border-rose-500/25',
         activity: null,
         isActive: false,
       };
     case 'active':
       return {
         icon: <Loader2 className="h-3 w-3 animate-spin" />,
-        color: 'text-indigo-700 dark:text-indigo-300',
-        bg: 'bg-indigo-500/10 border-indigo-500/25 hover:bg-indigo-500/15',
+        text: 'text-indigo-400',
+        border: 'border-indigo-500/30',
         activity: null,
         isActive: true,
       };
     default:
       return {
         icon: <Clock className="h-3 w-3" />,
-        color: 'text-foreground/60 dark:text-white/50',
-        bg: 'bg-white/[0.03] border-white/[0.08] hover:bg-white/[0.06]',
+        text: 'text-white/50',
+        border: 'border-white/[0.08]',
         activity: null,
         isActive: false,
       };
@@ -121,7 +121,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
 
 /**
  * Horizontal, sticky strip of worker chips. Sits at the top of the chat
- * container so the boss can see active workers without opening the side
+ * container so the boss can see active workers without opening a side
  * panel. Click-to-switch into a worker. Self-hides when there are no
  * children.
  *
@@ -161,11 +161,14 @@ export const WorkersStrip = memo(function WorkersStrip({
   const parentTitle = parentMission
     ? parentMission.title?.trim() || getMissionShortName(parentMission.id)
     : null;
+  const activeCount = chips.filter((c) => c.status.isActive).length;
+  // Index where the active → idle transition happens (chips are sorted active-first).
+  const firstIdleIndex = chips.findIndex((c) => !c.status.isActive);
 
   return (
     <div
       className={cn(
-        'flex items-center gap-2 px-4 py-2 border-b border-white/[0.06] overflow-x-auto',
+        'flex items-center gap-1.5 px-3 py-1.5 border-b border-white/[0.06] overflow-x-auto',
         'scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent',
         className
       )}
@@ -177,53 +180,71 @@ export const WorkersStrip = memo(function WorkersStrip({
             type="button"
             onClick={() => onSelectWorker(parentMission.id)}
             className={cn(
-              'shrink-0 inline-flex items-center gap-1.5 rounded-full border border-violet-500/30',
-              'bg-violet-500/10 hover:bg-violet-500/20 text-violet-300',
-              'px-2.5 py-1 text-xs transition-colors max-w-[300px]'
+              'shrink-0 inline-flex h-6 items-center gap-1 rounded-md border border-violet-500/30',
+              'bg-violet-500/10 hover:bg-violet-500/20 text-violet-400',
+              'px-2 text-[11px] font-medium transition-colors max-w-[280px]'
             )}
             title={`Back to boss: ${parentTitle}`}
             aria-label={`Back to boss mission ${parentTitle}`}
           >
             <ArrowLeft className="h-3 w-3 shrink-0" />
             <Crown className="h-3 w-3 shrink-0" />
-            <span className="hidden sm:inline text-violet-400/80">Boss:</span>
             <span className="truncate">{parentTitle}</span>
           </button>
           {chips.length > 0 && (
-            <span
-              aria-hidden
-              className="shrink-0 h-4 w-px bg-white/10 mx-1"
-            />
+            <span aria-hidden className="shrink-0 h-3.5 w-px bg-white/10" />
           )}
         </>
       )}
       {chips.length > 0 && (
-        <span className="shrink-0 text-[10px] uppercase tracking-wider text-white/40 mr-1">
-          {onWorkerView ? 'Siblings' : 'Workers'}
+        <span
+          className="shrink-0 inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-white/45 mr-0.5"
+          title={`${activeCount} active of ${chips.length} ${onWorkerView ? 'siblings' : 'workers'}`}
+        >
+          <span>{onWorkerView ? 'Siblings' : 'Workers'}</span>
+          <span className="tabular-nums text-white/60">
+            {activeCount}
+            <span className="text-white/30">/{chips.length}</span>
+          </span>
         </span>
       )}
-      {chips.map(({ mission, status }) => {
+      {chips.map(({ mission, status }, index) => {
         const isViewing = mission.id === viewingMissionId;
         const title = mission.title?.trim() || getMissionShortName(mission.id);
+        const showDivider =
+          index !== 0 && index === firstIdleIndex && activeCount > 0;
         return (
-          <button
-            key={mission.id}
-            onClick={() => onSelectWorker(mission.id)}
-            className={cn(
-              'shrink-0 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors max-w-[280px]',
-              status.bg,
-              isViewing && 'ring-1 ring-indigo-400/60'
+          <span key={mission.id} className="contents">
+            {showDivider && (
+              <span
+                aria-hidden
+                className="shrink-0 h-3.5 w-px bg-white/10 mx-0.5"
+                title="Idle workers"
+              />
             )}
-            title={status.activity ? `${title}: ${status.activity}` : title}
-          >
-            <span className={cn('shrink-0', status.color)}>{status.icon}</span>
-            <span className="truncate text-foreground/85">{title}</span>
-            {status.activity && (
-              <span className="hidden md:inline truncate text-white/40 max-w-[120px]">
-                · {status.activity}
+            <button
+              onClick={() => onSelectWorker(mission.id)}
+              className={cn(
+                'shrink-0 inline-flex h-6 items-center gap-1.5 rounded-md border px-2 text-[11px] transition-colors max-w-[260px]',
+                'bg-white/[0.02] hover:bg-white/[0.05]',
+                status.border,
+                !status.isActive && 'opacity-75 hover:opacity-100',
+                isViewing &&
+                  'bg-indigo-500/10 ring-1 ring-indigo-400/40 border-indigo-500/35 opacity-100'
+              )}
+              title={status.activity ? `${title}: ${status.activity}` : title}
+            >
+              <span className={cn('shrink-0', status.text)}>{status.icon}</span>
+              <span className="truncate text-foreground/85 font-medium">
+                {title}
               </span>
-            )}
-          </button>
+              {status.activity && (
+                <span className="hidden lg:inline truncate text-white/40 max-w-[120px]">
+                  {status.activity}
+                </span>
+              )}
+            </button>
+          </span>
         );
       })}
     </div>

@@ -161,7 +161,7 @@ import {
   File,
   ExternalLink,
   MessageSquare,
-  Users,
+  Clipboard,
   BriefcaseBusiness,
   Inbox,
   Flag,
@@ -429,12 +429,6 @@ const NewMissionDialog = dynamic(() =>
 );
 const PerfOverlay = dynamic(() =>
   import("@/components/perf-overlay").then((m) => m.PerfOverlay),
-);
-const SubagentsPanel = dynamic(() =>
-  import("@/components/subagents-panel").then((m) => m.SubagentsPanel),
-);
-const WorkerPanel = dynamic(() =>
-  import("@/components/worker-panel").then((m) => m.WorkerPanel),
 );
 
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
@@ -2230,6 +2224,7 @@ function MissionWorkbenchPanel({
   role,
   isRunning,
   childMissions,
+  queueLen,
   onClose,
   onResume,
   onCancel,
@@ -2237,6 +2232,7 @@ function MissionWorkbenchPanel({
   onOpenSwitcher,
   onViewMission,
   onSetStatus,
+  onCopyDebug,
   runSettingsSlot,
   className,
 }: {
@@ -2245,6 +2241,8 @@ function MissionWorkbenchPanel({
   role: ReturnType<typeof inferMissionRole>;
   isRunning: boolean;
   childMissions: Mission[];
+  /** Pending message count, surfaced inline alongside status. */
+  queueLen?: number;
   onClose: () => void;
   onResume: () => void;
   onCancel: (missionId: string) => void;
@@ -2252,10 +2250,13 @@ function MissionWorkbenchPanel({
   onOpenSwitcher: () => void;
   onViewMission: (missionId: string) => void;
   onSetStatus: (status: MissionStatus) => void | Promise<void>;
+  /** Copy a JSON debug snapshot (mission + stream phase) to the clipboard. */
+  onCopyDebug: () => void | Promise<void>;
   /**
    * Optional slot for the mission's run-settings editor (the
-   * `<NewMissionDialog mode="edit">` trigger). Rendered next to Resume/Stop
-   * so it's accessible without a separate toolbar button.
+   * `<NewMissionDialog mode="edit">` trigger). Rendered on its own row below
+   * the action grid so the dialog's larger button doesn't break the 2-col
+   * rhythm of the other actions.
    */
   runSettingsSlot?: React.ReactNode;
   className?: string;
@@ -2308,23 +2309,23 @@ function MissionWorkbenchPanel({
       )}
       aria-label="Mission workbench"
     >
-      <div className="flex items-center justify-between border-b border-white/[0.06] px-4 py-3">
+      <div className="flex items-center justify-between border-b border-white/[0.06] px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          <BriefcaseBusiness className="h-4 w-4 shrink-0 text-indigo-400" />
-          <span className="truncate text-sm font-medium text-white">
+          <BriefcaseBusiness className="h-3.5 w-3.5 shrink-0 text-indigo-400" />
+          <span className="truncate text-xs font-medium text-white/90">
             Workbench
           </span>
         </div>
         <button
           onClick={onClose}
-          className="flex h-6 w-6 items-center justify-center rounded-lg text-white/40 hover:bg-white/[0.04] hover:text-white transition-colors"
+          className="flex h-5 w-5 items-center justify-center rounded text-white/40 hover:bg-white/[0.04] hover:text-white transition-colors"
           title="Close workbench"
         >
-          <X className="h-3.5 w-3.5" />
+          <X className="h-3 w-3" />
         </button>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-4 space-y-4">
+      <div className="min-h-0 flex-1 overflow-y-auto p-2.5 text-xs">
         {!mission ? (
           <div className="flex h-full flex-col items-center justify-center text-center">
             <Inbox className="mb-3 h-8 w-8 text-white/20" />
@@ -2333,126 +2334,121 @@ function MissionWorkbenchPanel({
             </p>
             <button
               onClick={onOpenSwitcher}
-              className="mt-4 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
+              className="mt-4 rounded-md border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5 text-xs text-white/70 hover:bg-white/[0.04]"
             >
               Open mission switcher
             </button>
           </div>
         ) : (
           <>
-            <section className="space-y-3">
-              <div>
-                <p className="mb-1 text-[10px] uppercase tracking-wide text-white/30">
-                  Mission
-                </p>
-                <h2
-                  className="line-clamp-3 text-sm font-medium leading-snug text-white/85"
-                  title={title}
-                >
-                  {title}
-                </h2>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
-                  <p className="text-[10px] text-white/30">Status</p>
-                  <div className="mt-1 flex items-center gap-1.5">
-                    <span
-                      className={cn(
-                        "h-2 w-2 rounded-full",
-                        missionStatusDotClass(mission.status, isRunning),
-                      )}
-                    />
-                    <span
-                      className={cn("text-xs font-medium", status?.className)}
-                    >
-                      {status?.label}
-                    </span>
-                  </div>
-                </div>
-                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
-                  <p className="text-[10px] text-white/30">Role</p>
-                  <p className="mt-1 truncate text-xs font-medium capitalize text-white/70">
-                    {role ?? "mission"}
-                  </p>
-                </div>
-                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
-                  <p className="text-[10px] text-white/30">Workspace</p>
-                  <p
-                    className="mt-1 truncate text-xs font-medium text-white/70"
-                    title={workspaceLabel}
-                  >
-                    {workspaceLabel ?? "Unassigned"}
-                  </p>
-                </div>
-                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
-                  <p className="text-[10px] text-white/30">Updated</p>
-                  <RelativeTime
-                    date={mission.updated_at}
-                    className="mt-1 text-xs font-medium text-white/70"
-                  />
-                </div>
-              </div>
-              {mission.short_description && (
-                <p className="workbench-mission-description rounded-md border border-white/[0.05] bg-white/[0.02] p-2 text-xs leading-relaxed text-white/50">
-                  {mission.short_description}
-                </p>
-              )}
-            </section>
+            <p
+              className="line-clamp-2 text-xs font-medium leading-snug text-white/85"
+              title={title}
+            >
+              {title}
+            </p>
 
-            <section className="space-y-2">
-              <p className="text-[10px] uppercase tracking-wide text-white/30">
+            <dl className="mt-2 space-y-0.5 text-[11px]">
+              <Row label="Status">
+                <span className="flex items-center gap-1.5">
+                  <span
+                    className={cn(
+                      "h-1.5 w-1.5 rounded-full",
+                      missionStatusDotClass(mission.status, isRunning),
+                    )}
+                  />
+                  <span className={cn("font-medium", status?.className)}>
+                    {status?.label}
+                  </span>
+                </span>
+              </Row>
+              {queueLen !== undefined && queueLen > 0 && (
+                <Row label="Queue">
+                  <span
+                    className={cn(
+                      "font-mono tabular-nums",
+                      queueLen >= 3 ? "text-orange-300" : "text-amber-300",
+                    )}
+                  >
+                    {queueLen}
+                  </span>
+                </Row>
+              )}
+              <Row label="Role">
+                <span className="capitalize font-mono text-white/70">
+                  {role ?? "mission"}
+                </span>
+              </Row>
+              <Row label="Workspace">
+                <span
+                  className="truncate font-mono text-white/70 max-w-[160px]"
+                  title={workspaceLabel}
+                >
+                  {workspaceLabel ?? "Unassigned"}
+                </span>
+              </Row>
+              <Row label="Updated">
+                <RelativeTime
+                  date={mission.updated_at}
+                  className="font-mono text-white/70"
+                />
+              </Row>
+            </dl>
+
+            {mission.short_description && (
+              <p className="workbench-mission-description mt-2 rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-[11px] leading-relaxed text-white/50">
+                {mission.short_description}
+              </p>
+            )}
+
+            <div className="mt-3 border-t border-white/[0.06] pt-2.5">
+              <p className="mb-1.5 text-[10px] uppercase tracking-wide text-white/30">
                 Actions
               </p>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-2 gap-1.5">
                 {canResume && (
-                  <button
+                  <WorkbenchActionButton
                     onClick={onResume}
-                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/15"
-                  >
-                    <RotateCcw className="h-3.5 w-3.5" />
-                    Resume
-                  </button>
+                    tone="emerald"
+                    icon={RotateCcw}
+                    label="Resume"
+                  />
                 )}
                 {isRunning && (
-                  <button
+                  <WorkbenchActionButton
                     onClick={() => onCancel(mission.id)}
-                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/15"
-                  >
-                    <Square className="h-3.5 w-3.5" />
-                    Stop
-                  </button>
+                    tone="red"
+                    icon={Square}
+                    label="Stop"
+                  />
                 )}
-                <button
+                <WorkbenchActionButton
                   onClick={onOpenAutomations}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs font-medium text-white/70 hover:bg-white/[0.04]"
-                >
-                  <Clock className="h-3.5 w-3.5" />
-                  Automations
-                </button>
-                <button
+                  icon={Clock}
+                  label="Automations"
+                />
+                <WorkbenchActionButton
                   onClick={onOpenSwitcher}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs font-medium text-white/70 hover:bg-white/[0.04]"
-                >
-                  <Layers className="h-3.5 w-3.5" />
-                  Switch
-                </button>
+                  icon={Layers}
+                  label="Switch"
+                />
                 <div ref={markAsRef} className="relative">
                   <button
                     onClick={() => setMarkAsOpen((prev) => !prev)}
                     aria-haspopup="menu"
                     aria-expanded={markAsOpen}
                     className={cn(
-                      "inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs font-medium text-white/70 hover:bg-white/[0.04]",
+                      "inline-flex h-7 w-full items-center justify-center gap-1 rounded-md border border-white/[0.06] bg-white/[0.02] px-2 text-[11px] font-medium text-white/70 hover:bg-white/[0.04]",
                       markAsOpen && "bg-white/[0.06] text-white",
                     )}
                   >
-                    <Flag className="h-3.5 w-3.5" />
-                    Mark As
+                    <Flag className="h-3 w-3" />
+                    Mark as
                   </button>
                   {markAsOpen && (
                     <div
                       role="menu"
-                      className="absolute right-0 top-full z-20 mt-1 w-40 overflow-hidden rounded-lg border border-white/[0.08] bg-[#1a1a1a] shadow-xl"
+                      className="absolute right-0 top-full z-20 mt-1 w-36 overflow-hidden rounded-md border border-white/[0.08] bg-[#1a1a1a] shadow-xl"
                     >
                       {(
                         ["completed", "blocked", "failed"] as MissionStatus[]
@@ -2469,7 +2465,7 @@ function MissionWorkbenchPanel({
                           }}
                           disabled={mission.status === nextStatus}
                           spinnerClassName="h-3 w-3"
-                          className="flex w-full items-center justify-between gap-2 px-3 py-2 text-xs capitalize text-white/70 transition-colors hover:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+                          className="flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-[11px] capitalize text-white/70 transition-colors hover:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
                         >
                           <span>{nextStatus.replace("_", " ")}</span>
                           {mission.status === nextStatus && (
@@ -2480,50 +2476,100 @@ function MissionWorkbenchPanel({
                     </div>
                   )}
                 </div>
-                {runSettingsSlot && (
-                  <div className="col-span-2 [&>div]:w-full [&>div>button]:w-full [&>div>button]:justify-center">
-                    {runSettingsSlot}
-                  </div>
-                )}
+                <WorkbenchActionButton
+                  onClick={onCopyDebug}
+                  icon={Clipboard}
+                  label="Copy debug"
+                  title="Copy mission + stream debug info as JSON"
+                />
               </div>
-            </section>
+              {runSettingsSlot && (
+                <div className="mt-1.5 [&>div]:w-full [&>div>button]:w-full [&>div>button]:justify-center [&>div>button]:h-7 [&>div>button]:px-2 [&>div>button]:py-0 [&>div>button]:text-[11px] [&>div>button]:gap-1 [&>div>button>svg]:h-3 [&>div>button>svg]:w-3 [&>div>button>span]:!inline">
+                  {runSettingsSlot}
+                </div>
+              )}
+            </div>
 
             {childMissions.length > 0 && (
-              <section className="space-y-2">
-                <div className="flex items-center justify-between">
+              <div className="mt-3 border-t border-white/[0.06] pt-2.5">
+                <div className="mb-1.5 flex items-center justify-between">
                   <p className="text-[10px] uppercase tracking-wide text-white/30">
-                    Worker Missions
+                    Workers
                   </p>
                   <span className="text-[10px] tabular-nums text-white/30">
                     {childMissions.length}
                   </span>
                 </div>
-                <div className="space-y-1.5">
-                  {childMissions.slice(0, 6).map((child) => (
+                <div className="space-y-0.5">
+                  {childMissions.slice(0, 8).map((child) => (
                     <button
                       key={child.id}
                       onClick={() => onViewMission(child.id)}
-                      className="flex w-full items-center gap-2 rounded-md border border-white/[0.05] bg-white/[0.02] px-2.5 py-2 text-left hover:bg-white/[0.04]"
+                      className="flex w-full items-center gap-2 rounded px-1.5 py-1 text-left hover:bg-white/[0.04]"
                     >
                       <span
                         className={cn(
-                          "h-2 w-2 rounded-full",
+                          "h-1.5 w-1.5 rounded-full shrink-0",
                           missionStatusDotClass(child.status),
                         )}
                       />
-                      <span className="min-w-0 flex-1 truncate text-xs text-white/70">
+                      <span className="min-w-0 flex-1 truncate text-[11px] text-white/70">
                         {child.title?.trim() || getMissionShortName(child.id)}
                       </span>
-                      <ChevronRight className="h-3 w-3 text-white/30" />
+                      <ChevronRight className="h-3 w-3 shrink-0 text-white/30" />
                     </button>
                   ))}
                 </div>
-              </section>
+              </div>
             )}
           </>
         )}
       </div>
     </aside>
+  );
+}
+
+function Row({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-2 py-0.5">
+      <dt className="text-white/40">{label}</dt>
+      <dd className="min-w-0">{children}</dd>
+    </div>
+  );
+}
+
+function WorkbenchActionButton({
+  onClick,
+  icon: Icon,
+  label,
+  tone,
+  title,
+}: {
+  onClick: () => void | Promise<void>;
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  tone?: "emerald" | "red";
+  title?: string;
+}) {
+  const toneClasses =
+    tone === "emerald"
+      ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/15"
+      : tone === "red"
+        ? "border-red-500/25 bg-red-500/10 text-red-400 hover:bg-red-500/15"
+        : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]";
+  return (
+    <button
+      type="button"
+      onClick={() => void onClick()}
+      title={title}
+      className={cn(
+        "inline-flex h-7 w-full items-center justify-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors",
+        toneClasses,
+      )}
+    >
+      <Icon className="h-3 w-3" />
+      {label}
+    </button>
   );
 }
 
@@ -4053,7 +4099,6 @@ export default function ControlClient() {
     "connected" | "disconnected" | "reconnecting"
   >("disconnected");
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
-  const [showStreamDiagnostics, setShowStreamDiagnostics] = useState(false);
   const [streamDiagnostics, setStreamDiagnostics] =
     useControlStreamingDiagnosticsStore();
   const [diagTick, setDiagTick] = useState(0);
@@ -4098,13 +4143,6 @@ export default function ControlClient() {
     [],
   );
   const [showMissionSwitcher, setShowMissionSwitcher] = useState(false);
-  const [showWorkerPanel, setShowWorkerPanel] = useState(false);
-  // Per-mission record of which missions the user has explicitly dismissed
-  // the worker panel for. Used so the auto-open effect doesn't keep reopening
-  // the panel after the user closes it while a streaming boss keeps spawning
-  // sub-agents.
-  const workerPanelDismissedRef = useRef<Set<string>>(new Set());
-  const workerPanelAutoOpenedForRef = useRef<string | null>(null);
   const [highlightedItemId, setHighlightedItemId] = useState<string | null>(
     null,
   );
@@ -8655,42 +8693,6 @@ export default function ControlClient() {
     };
   }, [setItems]);
 
-  const status = useMemo(() => statusLabel(viewingRunState), [viewingRunState]);
-  const StatusIcon = status.Icon;
-
-  const streamHints = useMemo(() => {
-    void diagTick;
-    const hints: string[] = [];
-    const ct = streamDiagnostics.contentType;
-    if (ct && !ct.toLowerCase().includes("text/event-stream")) {
-      hints.push(`Content-Type is "${ct}" (expected text/event-stream).`);
-    }
-    const ce = streamDiagnostics.contentEncoding;
-    if (ce && ce !== "identity") {
-      hints.push(`Content-Encoding is "${ce}". Disable gzip for SSE.`);
-    }
-    if (
-      streamDiagnostics.phase === "open" ||
-      streamDiagnostics.phase === "streaming"
-    ) {
-      const lastChunkAge = streamDiagnostics.lastChunkAt
-        ? Date.now() - streamDiagnostics.lastChunkAt
-        : null;
-      if (lastChunkAge !== null && lastChunkAge > 30000) {
-        hints.push(
-          "No SSE chunks for >30s. Likely proxy buffering or connection drops.",
-        );
-      }
-    }
-    if (
-      typeof streamDiagnostics.status === "number" &&
-      streamDiagnostics.status >= 400
-    ) {
-      hints.push(`Stream request returned HTTP ${streamDiagnostics.status}.`);
-    }
-    return hints;
-  }, [streamDiagnostics, diagTick]);
-
   const handleCopyDiagnostics = useCallback(async () => {
     const mission = viewingMission ?? currentMission;
     const payload = {
@@ -9366,30 +9368,6 @@ export default function ControlClient() {
     activeMissionRole === "boss" ||
     hasInMissionSubagents;
 
-  // Auto-show the workers/sub-agents panel ONCE per mission, the first time
-  // the active mission acquires workers or sub-agents. Tracked with a ref so
-  // a streaming mission spawning a new worker doesn't keep reopening the
-  // panel after the user has closed it.
-  useEffect(() => {
-    const missionId = activeMission?.id;
-    if (!missionId) return;
-    if (childMissions.length === 0 && !hasInMissionSubagents) return;
-    if (workerPanelDismissedRef.current.has(missionId)) return;
-    if (workerPanelAutoOpenedForRef.current === missionId) return;
-    workerPanelAutoOpenedForRef.current = missionId;
-    setShowWorkerPanel(true);
-  }, [activeMission?.id, childMissions.length, hasInMissionSubagents]);
-
-  // Stable callback: closing the panel marks the current mission as dismissed
-  // so the auto-open effect above doesn't immediately reopen it.
-  const handleCloseWorkerPanel = useCallback(() => {
-    const missionId = activeMission?.id;
-    if (missionId) {
-      workerPanelDismissedRef.current.add(missionId);
-    }
-    setShowWorkerPanel(false);
-  }, [activeMission?.id]);
-
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
   // - Mission is running
@@ -9635,30 +9613,6 @@ export default function ControlClient() {
                 <span className="text-xs opacity-60">{thinkingItemsCount}</span>
               )}
             </button>
-
-            {/* Worker panel toggle - only shown for boss missions */}
-            {isBossMission && (
-              <button
-                onClick={() => setShowWorkerPanel((prev) => !prev)}
-                className={cn(
-                  "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
-                  showWorkerPanel
-                    ? "border-violet-500/30 bg-violet-500/10 text-violet-400"
-                    : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
-                )}
-                title={
-                  showWorkerPanel ? "Hide worker panel" : "Show worker panel"
-                }
-              >
-                <Users className="h-4 w-4" />
-                <span className="hidden lg:inline">Workers</span>
-                {childMissions.length > 0 && (
-                  <span className="text-xs opacity-60">
-                    {childMissions.length}
-                  </span>
-                )}
-              </button>
-            )}
 
             {/* Desktop stream toggle with display selector - only shown when a desktop session is active */}
             {hasDesktopSession && (
@@ -9914,329 +9868,35 @@ export default function ControlClient() {
               </div>
             )}
 
-            {/* Status panel */}
-            <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-              {/* Connection status indicator - only show when not connected */}
-              {connectionState !== "connected" && (
-                <>
-                  <div
-                    className={cn(
-                      "flex items-center gap-2",
-                      connectionState === "reconnecting"
-                        ? "text-amber-400"
-                        : "text-red-400",
-                    )}
-                  >
-                    {connectionState === "reconnecting" ? (
-                      <>
-                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                        <span className="text-sm font-medium">
-                          Reconnecting
-                          {reconnectAttempt > 1
-                            ? ` (${reconnectAttempt})`
-                            : "..."}
-                        </span>
-                      </>
-                    ) : (
-                      <>
-                        <WifiOff className="h-3.5 w-3.5" />
-                        <span className="text-sm font-medium">
-                          Disconnected
-                        </span>
-                      </>
-                    )}
-                  </div>
-                  <div className="h-4 w-px bg-white/[0.08]" />
-                </>
-              )}
-
-              {/* Run state indicator with debug dropdown */}
-              <div className="relative">
-                <button
-                  onClick={() => setShowStreamDiagnostics((prev) => !prev)}
-                  className={cn(
-                    "flex items-center gap-2 rounded-md px-2 py-1 transition-colors hover:bg-white/[0.04]",
-                    status.className,
-                  )}
-                  title="Click for debug info"
-                >
-                  <StatusIcon
-                    className={cn(
-                      "h-3.5 w-3.5",
-                      viewingRunState !== "idle" && "animate-spin",
-                    )}
-                  />
-                  <span className="text-sm font-medium">{status.label}</span>
-                </button>
-
-                {showStreamDiagnostics && (
-                  <div className="absolute right-0 top-full z-50 mt-2 w-[280px] rounded-lg border border-white/[0.08] bg-[#121214] p-2.5 shadow-xl">
-                    {/* Mission Info */}
-                    {activeMission && (
-                      <div className="space-y-0.5 text-xs">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Mission</span>
-                          <span className="font-mono text-[11px] text-white/60 select-all">
-                            {activeMission.id.slice(0, 8)}
-                          </span>
-                        </div>
-                        {activeMission.workspace_name && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">Workspace</span>
-                            <span className="font-mono text-white/80">
-                              {activeMission.workspace_name}
-                            </span>
-                          </div>
-                        )}
-                        {activeMission.agent && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">Agent</span>
-                            <span className="font-mono text-white/80">
-                              {activeMission.agent}
-                            </span>
-                          </div>
-                        )}
-                        {activeMission.backend && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">Backend</span>
-                            <span className="font-mono text-white/80">
-                              {activeMission.backend}
-                            </span>
-                          </div>
-                        )}
-                        {activeMission.model_override && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">
-                              Model override
-                            </span>
-                            <span
-                              className="font-mono text-[11px] text-indigo-400 truncate max-w-[160px]"
-                              title={activeMission.model_override}
-                            >
-                              {activeMission.model_override}
-                            </span>
-                          </div>
-                        )}
-                        {activeMission.model_effort && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">Model effort</span>
-                            <span
-                              className="font-mono text-[11px] text-amber-300 truncate max-w-[160px]"
-                              title={activeMission.model_effort}
-                            >
-                              {activeMission.model_effort}
-                            </span>
-                          </div>
-                        )}
-                        {lastResolvedModel && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">
-                              Resolved model
-                            </span>
-                            <span
-                              className="font-mono text-[11px] text-emerald-400 truncate max-w-[160px]"
-                              title={lastResolvedModel}
-                            >
-                              {lastResolvedModel}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Orchestrator: Boss with workers */}
-                    {(childMissions.length > 0 ||
-                      activeMissionRole === "boss") && (
-                      <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-1 text-xs">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Role</span>
-                          <span className="font-mono text-[11px] text-violet-400">
-                            Boss
-                          </span>
-                        </div>
-                        <div className="flex items-center justify-between gap-2 mb-1">
-                          <span className="text-white/40">Workers</span>
-                          <span className="font-mono text-[11px] text-white/60">
-                            {childMissions.length}
-                          </span>
-                        </div>
-                        {childMissions.length > 0 && (
-                          <div className="space-y-0.5 max-h-[120px] overflow-y-auto">
-                            {childMissions.map((w) => (
-                              <a
-                                key={w.id}
-                                href={`/control?mission=${w.id}`}
-                                className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-white/[0.04] transition-colors"
-                              >
-                                <span
-                                  className={cn(
-                                    "h-1.5 w-1.5 rounded-full shrink-0",
-                                    w.status === "active" && "bg-indigo-400",
-                                    w.status === "completed" &&
-                                      "bg-emerald-400",
-                                    w.status === "failed" && "bg-red-400",
-                                    w.status === "interrupted" &&
-                                      "bg-amber-400",
-                                    w.status === "not_feasible" &&
-                                      "bg-rose-400",
-                                    ![
-                                      "active",
-                                      "completed",
-                                      "failed",
-                                      "interrupted",
-                                      "not_feasible",
-                                    ].includes(w.status) && "bg-white/30",
-                                  )}
-                                />
-                                <span className="font-mono text-[11px] text-foreground/80 truncate">
-                                  {w.title || w.id.slice(0, 8)}
-                                </span>
-                              </a>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Orchestrator: Worker info */}
-                    {activeMission?.parent_mission_id && (
-                      <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-0.5 text-xs">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Role</span>
-                          <span className="font-mono text-[11px] text-cyan-400">
-                            Worker
-                          </span>
-                        </div>
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Boss</span>
-                          <a
-                            href={`/control?mission=${activeMission.parent_mission_id}`}
-                            className="font-mono text-[11px] text-cyan-400 hover:text-cyan-300 transition-colors select-all"
-                          >
-                            {activeMission.parent_mission_id.slice(0, 8)}
-                          </a>
-                        </div>
-                        {activeMission.working_directory && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">Worktree</span>
-                            <span
-                              className="font-mono text-[11px] text-white/60 truncate max-w-[160px]"
-                              title={activeMission.working_directory}
-                            >
-                              {activeMission.working_directory.split("/").pop()}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Stream Status */}
-                    <div
-                      className={cn(
-                        "space-y-0.5 text-xs",
-                        activeMission &&
-                          "mt-2 pt-2 border-t border-white/[0.06]",
-                      )}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-white/40">Stream</span>
-                        <span className="flex items-center gap-1.5 font-mono text-white/80">
-                          <span
-                            className={cn(
-                              "h-1.5 w-1.5 rounded-full",
-                              (streamDiagnostics.phase === "streaming" ||
-                                streamDiagnostics.phase === "open") &&
-                                "bg-emerald-400",
-                              streamDiagnostics.phase === "connecting" &&
-                                "bg-amber-400",
-                              streamDiagnostics.phase === "error" &&
-                                "bg-red-400",
-                              (streamDiagnostics.phase === "closed" ||
-                                streamDiagnostics.phase === "idle") &&
-                                "bg-white/30",
-                            )}
-                          />
-                          {streamDiagnostics.phase}
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-white/40">Activity</span>
-                        <span className="font-mono text-white/60 text-[11px]">
-                          {formatDiagAge(streamDiagnostics.lastEventAt)}
-                        </span>
-                      </div>
-                    </div>
-
-                    {streamDiagnostics.lastError && (
-                      <div className="mt-2 rounded border border-red-500/30 bg-red-500/10 px-2 py-1 text-[11px] text-red-300">
-                        {streamDiagnostics.lastError}
-                      </div>
-                    )}
-
-                    {streamHints.length > 0 && (
-                      <div className="mt-2 space-y-0.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200">
-                        {streamHints.map((hint) => (
-                          <div key={hint}>{hint}</div>
-                        ))}
-                      </div>
-                    )}
-
-                    <button
-                      onClick={handleCopyDiagnostics}
-                      className="mt-2 w-full text-center text-[11px] text-white/40 hover:text-white/70 transition-colors"
-                    >
-                      Copy debug info
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* Queue count */}
-              <div className="h-4 w-px bg-white/[0.08]" />
+            {/* Connection status indicator — only surfaces when not connected.
+                Run state, queue length, and subtask progress now live in the
+                Workbench panel (open via the Workbench toggle). */}
+            {connectionState !== "connected" && (
               <div
-                className="flex items-center gap-1.5"
+                className={cn(
+                  "flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-medium",
+                  connectionState === "reconnecting"
+                    ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
+                    : "border-red-500/30 bg-red-500/10 text-red-300",
+                )}
                 title={
-                  viewingQueueLen > 0
-                    ? `${viewingQueueLen} message${viewingQueueLen > 1 ? "s" : ""} waiting to be processed`
-                    : "No messages queued"
+                  connectionState === "reconnecting"
+                    ? `Reconnecting${reconnectAttempt > 1 ? ` (attempt ${reconnectAttempt})` : "…"}`
+                    : "Disconnected from agent stream"
                 }
               >
-                <span className="text-[10px] uppercase tracking-wider text-white/40">
-                  Queue
-                </span>
-                <span
-                  className={cn(
-                    "text-sm font-medium tabular-nums",
-                    viewingQueueLen === 0 && "text-white/70",
-                    viewingQueueLen > 0 &&
-                      viewingQueueLen < 3 &&
-                      "text-amber-400",
-                    viewingQueueLen >= 3 && "text-orange-400",
-                  )}
-                >
-                  {viewingQueueLen}
+                {connectionState === "reconnecting" ? (
+                  <RefreshCw className="h-3 w-3 animate-spin" />
+                ) : (
+                  <WifiOff className="h-3 w-3" />
+                )}
+                <span className="hidden md:inline">
+                  {connectionState === "reconnecting"
+                    ? "Reconnecting"
+                    : "Disconnected"}
                 </span>
               </div>
-
-              {/* Progress indicator */}
-              {viewingProgress && viewingProgress.total > 0 && (
-                <>
-                  <div className="h-4 w-px bg-white/[0.08]" />
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[10px] uppercase tracking-wider text-white/40">
-                      Subtask
-                    </span>
-                    <span className="text-sm font-medium text-emerald-400 tabular-nums">
-                      {Math.min(
-                        viewingProgress.completed + 1,
-                        viewingProgress.total,
-                      )}
-                      /{viewingProgress.total}
-                    </span>
-                  </div>
-                </>
-              )}
-            </div>
+            )}
           </div>
         </div>
 
@@ -10502,60 +10162,43 @@ export default function ControlClient() {
                   {isViewingMissionStalled &&
                     viewingMissionId &&
                     !hasPendingUserInput && (
-                      <div className="flex justify-center py-4 animate-fade-in">
+                      <div className="flex justify-center py-2 animate-fade-in">
                         <div
                           className={cn(
-                            "flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4",
+                            "inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs",
                             isViewingMissionSeverelyStalled
-                              ? "bg-red-500/10 border border-red-500/20"
-                              : "bg-amber-500/10 border border-amber-500/20",
+                              ? "bg-red-500/10 border-red-500/30 text-red-400"
+                              : "bg-amber-500/10 border-amber-500/30 text-amber-400",
                           )}
+                          title={
+                            isViewingMissionSeverelyStalled
+                              ? "The agent appears to be stuck on a long-running operation. Consider stopping it."
+                              : "A tool or external operation may be taking longer than expected."
+                          }
                         >
-                          <div className="flex items-center gap-3">
-                            <AlertTriangle
-                              className={cn(
-                                "h-5 w-5 shrink-0",
-                                isViewingMissionSeverelyStalled
-                                  ? "text-red-400"
-                                  : "text-amber-400",
-                              )}
-                            />
-                            <div className="text-sm">
-                              <span
-                                className={cn(
-                                  "font-medium",
-                                  isViewingMissionSeverelyStalled
-                                    ? "text-red-400"
-                                    : "text-amber-400",
-                                )}
-                              >
-                                Agent may be stuck
-                              </span>
-                              <span className="text-white/50 ml-1">
-                                : no activity for{" "}
-                                {Math.floor(viewingMissionStallSeconds)}s
-                              </span>
-                              <p className="text-white/40 text-xs mt-1">
-                                {isViewingMissionSeverelyStalled
-                                  ? "The agent appears to be stuck on a long-running operation. Consider stopping it."
-                                  : "A tool or external operation may be taking longer than expected."}
-                              </p>
-                            </div>
-                          </div>
+                          <AlertTriangle className="h-3 w-3 shrink-0" />
+                          <span className="font-medium">
+                            {isViewingMissionSeverelyStalled
+                              ? "Likely stuck"
+                              : "Idle"}
+                          </span>
+                          <span className="text-white/50 tabular-nums">
+                            {Math.floor(viewingMissionStallSeconds)}s
+                          </span>
                           <button
                             onClick={() =>
                               handleCancelMission(viewingMissionId)
                             }
                             className={cn(
-                              "shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors",
+                              "ml-1 inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-medium transition-colors",
                               isViewingMissionSeverelyStalled
-                                ? "bg-red-500 text-white hover:bg-red-400"
-                                : "bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 border border-amber-500/30",
+                                ? "border-red-500/30 bg-red-500/15 text-red-400 hover:bg-red-500/25"
+                                : "border-amber-500/30 bg-amber-500/15 text-amber-400 hover:bg-amber-500/25",
                             )}
                           >
-                            <Square className="h-3.5 w-3.5" />
+                            <Square className="h-3 w-3" />
                             {isViewingMissionSeverelyStalled
-                              ? "Force Stop"
+                              ? "Force stop"
                               : "Stop"}
                           </button>
                         </div>
@@ -10652,47 +10295,74 @@ export default function ControlClient() {
                 </div>
               )}
 
-              {/* Show resume buttons for interrupted/blocked missions, otherwise show normal input */}
-              {/* Both are always rendered to prevent unmounting the input (which loses typed text) */}
-              {showResumeUI && (
-                <div className="mx-auto flex max-w-3xl gap-3 items-center justify-center py-2">
-                  <div className="flex items-center gap-2 text-sm text-white/50 mr-4">
-                    <AlertTriangle className="h-4 w-4 text-amber-400" />
-                    <span>
-                      Mission{" "}
-                      {activeMission.status === "blocked"
-                        ? "blocked"
-                        : activeMission.status === "failed"
-                          ? "failed"
-                          : "interrupted"}
-                    </span>
-                  </div>
-                  <button
-                    onClick={() => handleResumeMission()}
-                    disabled={missionLoading}
-                    className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] px-5 py-3 text-sm font-medium text-white/70 transition-colors disabled:opacity-50"
-                  >
-                    <PlayCircle className="h-4 w-4" />
-                    {activeMission.status === "blocked"
+              {/*
+                Slim status banner above the composer for interrupted / blocked
+                / failed missions. We never hide the composer underneath —
+                replacing the input with two large buttons was a UX trap: users
+                who hit Stop while typing would click "Retry" by mistake before
+                the composer reappeared. Now the input stays put and Retry is
+                a secondary action surfaced inline.
+              */}
+              {showResumeUI &&
+                activeMission &&
+                (() => {
+                  const statusLabel =
+                    activeMission.status === "blocked"
+                      ? "Mission blocked"
+                      : activeMission.status === "failed"
+                        ? "Mission failed"
+                        : "Mission interrupted";
+                  const actionLabel =
+                    activeMission.status === "blocked"
                       ? "Continue"
                       : activeMission.status === "failed"
                         ? "Retry"
-                        : "Resume"}
-                  </button>
-                  <button
-                    onClick={() => setDismissedResumeUI(true)}
-                    className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] px-5 py-3 text-sm font-medium text-white/70 transition-colors"
-                  >
-                    <MessageSquare className="h-4 w-4" />
-                    Custom Message
-                  </button>
-                </div>
-              )}
+                        : "Resume";
+                  const toneIsRed = activeMission.status === "failed";
+                  return (
+                    <div
+                      className={cn(
+                        "mx-auto flex max-w-3xl items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs",
+                        toneIsRed
+                          ? "border-red-500/25 bg-red-500/10 text-red-400"
+                          : "border-amber-500/25 bg-amber-500/10 text-amber-400",
+                      )}
+                      role="status"
+                    >
+                      <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                      <span className="font-medium">{statusLabel}</span>
+                      <span className="text-white/50 hidden sm:inline">
+                        — type below to continue with a new message, or use the
+                        action on the right.
+                      </span>
+                      <span className="ml-auto inline-flex items-center gap-1">
+                        <button
+                          onClick={() => handleResumeMission()}
+                          disabled={missionLoading}
+                          className={cn(
+                            "inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                            toneIsRed
+                              ? "border-red-500/30 bg-red-500/15 text-red-400 hover:bg-red-500/25"
+                              : "border-amber-500/30 bg-amber-500/15 text-amber-400 hover:bg-amber-500/25",
+                          )}
+                        >
+                          <PlayCircle className="h-3 w-3" />
+                          {actionLabel}
+                        </button>
+                        <button
+                          onClick={() => setDismissedResumeUI(true)}
+                          className="rounded p-0.5 text-white/40 hover:bg-white/10 hover:text-white/80 transition-colors"
+                          title="Dismiss"
+                          aria-label="Dismiss"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </span>
+                    </div>
+                  );
+                })()}
               <div
-                className={cn(
-                  "mx-auto max-w-3xl w-full space-y-2",
-                  showResumeUI && "hidden",
-                )}
+                className="mx-auto max-w-3xl w-full space-y-2"
               >
                 {/* Queue Strip - shows queued messages when present */}
                 <QueueStrip
@@ -10703,15 +10373,15 @@ export default function ControlClient() {
 
                 <form
                   onSubmit={(e) => e.preventDefault()}
-                  className="flex gap-3 items-end"
+                  className="flex gap-2 items-stretch"
                 >
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
+                    className="flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors"
                     title="Attach files"
                   >
-                    <Paperclip className="h-5 w-5" />
+                    <Paperclip className="h-4 w-4" />
                   </button>
 
                   <EnhancedInput
@@ -10761,34 +10431,37 @@ export default function ControlClient() {
                   })()}
 
                   {isBusy ? (
-                    <>
+                    <div className="inline-flex h-[46px] shrink-0 rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
                       <button
                         type="button"
                         onClick={() => enhancedInputRef.current?.submit()}
                         disabled={!canSubmitComposer}
-                        className="flex items-center gap-2 rounded-xl bg-indigo-500/80 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500/80"
+                        className="inline-flex items-center gap-1.5 px-3 text-sm font-medium text-indigo-300 hover:bg-indigo-500/15 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        title="Queue message"
                       >
                         <ListPlus className="h-4 w-4" />
-                        Queue
+                        <span className="hidden sm:inline">Queue</span>
                       </button>
+                      <div className="w-px bg-white/[0.06]" />
                       <button
                         type="button"
                         onClick={handleStop}
-                        className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
+                        className="inline-flex items-center gap-1.5 px-3 text-sm font-medium text-red-300 hover:bg-red-500/15 transition-colors"
+                        title="Stop mission"
                       >
                         <Square className="h-4 w-4" />
-                        Stop
+                        <span className="hidden sm:inline">Stop</span>
                       </button>
-                    </>
+                    </div>
                   ) : (
                     <button
                       type="button"
                       onClick={() => enhancedInputRef.current?.submit()}
                       disabled={!canSubmitComposer}
-                      className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500"
+                      className="inline-flex h-[46px] shrink-0 items-center gap-1.5 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-4 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500"
                     >
                       <Send className="h-4 w-4" />
-                      Send
+                      <span className="hidden sm:inline">Send</span>
                     </button>
                   )}
                 </form>
@@ -10799,8 +10472,7 @@ export default function ControlClient() {
           {/* Right column: Workbench, Thinking Panel and Desktop Stream stacked */}
           {(showWorkbenchPanel ||
             showThinkingPanel ||
-            showDesktopStream ||
-            (showWorkerPanel && isBossMission)) && (
+            showDesktopStream) && (
             <div
               className={cn(
                 // animate-fade-in is opacity-only and cheap; we drop the
@@ -10818,6 +10490,7 @@ export default function ControlClient() {
                   role={activeMissionRole}
                   isRunning={viewingMissionIsRunning}
                   childMissions={childMissions}
+                  queueLen={viewingQueueLen}
                   onClose={() => setShowWorkbenchPanel(false)}
                   onResume={handleResumeMission}
                   onCancel={handleCancelMission}
@@ -10825,6 +10498,7 @@ export default function ControlClient() {
                   onOpenSwitcher={() => setShowMissionSwitcher(true)}
                   onViewMission={handleViewMission}
                   onSetStatus={handleSetStatus}
+                  onCopyDebug={handleCopyDiagnostics}
                   runSettingsSlot={
                     activeMission && !viewingMissionIsRunning ? (
                       <NewMissionDialog
@@ -10849,56 +10523,13 @@ export default function ControlClient() {
                 />
               )}
 
-              {/* Worker Panel — real child missions (parent_mission_id) */}
-              {showWorkerPanel && isBossMission && (
-                <WorkerPanel
-                  childMissions={childMissions}
-                  runningMissions={runningMissions}
-                  bossMissionId={activeMission?.id ?? ""}
-                  viewingMissionId={viewingMissionId}
-                  onSelectWorker={(missionId) => handleViewMission(missionId)}
-                  onClose={handleCloseWorkerPanel}
-                  className={cn(
-                    // Equal vertical split with siblings instead of fixed
-                    // max-height caps. `min-h-0` is required for the inner
-                    // `overflow-y-auto` to clip rather than push the flex
-                    // child to its content height.
-                    showWorkbenchPanel ||
-                      showThinkingPanel ||
-                      showDesktopStream ||
-                      hasInMissionSubagents
-                      ? "flex-1 min-h-0"
-                      : "flex-1",
-                  )}
-                />
-              )}
-
-              {/* Sub-agents Panel — in-mission Task / orchestrator workers */}
-              {showWorkerPanel && hasInMissionSubagents && (
-                <SubagentsPanel
-                  subagents={inMissionSubagents}
-                  onFocusItem={focusChatItem}
-                  onClose={handleCloseWorkerPanel}
-                  className={cn(
-                    showWorkbenchPanel ||
-                      showThinkingPanel ||
-                      showDesktopStream ||
-                      childMissions.length > 0
-                      ? "flex-1 min-h-0"
-                      : "flex-1",
-                  )}
-                />
-              )}
-
               {/* Thinking Panel */}
               {showThinkingPanel && (
                 <ThinkingPanel
                   items={thinkingItems}
                   onClose={handleCloseThinkingPanel}
                   className={
-                    showWorkbenchPanel ||
-                    showDesktopStream ||
-                    (showWorkerPanel && isBossMission)
+                    showWorkbenchPanel || showDesktopStream
                       ? "flex-1 min-h-0"
                       : "flex-1"
                   }

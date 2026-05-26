@@ -37,16 +37,27 @@ private struct ControlDiagnosticsOverlay: View {
     let mergeCount: Int
     let renderCount: Int
     let droppedEvents: Int
+    let streamDiagnostics: [APIService.ControlStreamDiagnostic]
     let performanceRecords: [ControlPerformanceRecord]
     let hotRenderCounts: [(name: String, count: Int)]
 
     var body: some View {
+        let latestStream = streamDiagnostics.last
+        let latestError = streamDiagnostics.reversed().first { $0.phase == .error }
         VStack(alignment: .leading, spacing: 3) {
             Text("control diagnostics")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(Theme.textMuted)
             diagnosticRow("mission", missionId.map { String($0.prefix(8)) } ?? "none")
-            diagnosticRow("transport", "\(transport.lowercased()) · \(streamScope)")
+            diagnosticRow("transport", "\(latestStream?.transport.rawValue ?? transport.lowercased()) · \(streamScope)")
+            diagnosticRow("stream", latestStream?.phase.rawValue ?? "?")
+            if let latestError {
+                diagnosticRow(
+                    "last err",
+                    latestError.status.map { "http \($0)" } ?? String((latestError.error ?? "?").prefix(18)),
+                    warning: true
+                )
+            }
             diagnosticRow("max seq", maxSequence.map(String.init) ?? "?")
             diagnosticRow("cache", cacheHit.map { $0 ? "hit" : "miss" } ?? "?")
             diagnosticRow("merge", "\(mergeCount) ev")
@@ -94,11 +105,20 @@ struct ControlView: View {
         var updatedAt: Date
     }
 
+    private struct PendingSendEntry: Codable, Equatable {
+        let id: String
+        let missionId: String?
+        let content: String
+        let createdAt: Date
+    }
+
     private static let draftTextKey = "control_draft_text"
     private static let missionDraftsKey = "control_mission_drafts_v1"
     private static let lastMissionIdKey = "control_last_mission_id"
+    private static let pendingSendsKey = "control_pending_sends_v1"
     private static let maxDraftCacheBytes = 64 * 1_024
     private static let maxDraftCacheEntries = 50
+    private static let maxStreamDiagnostics = 80
 
     @State private var messages: [ChatMessage] = []
     @State private var inputText = ControlView.loadGlobalDraftText()
@@ -115,6 +135,9 @@ struct ControlView: View {
     @State private var viewingMission: Mission?
     @State private var isLoading = true
     @State private var streamTask: Task<Void, Never>?
+    @State private var streamGeneration = 0
+    @State private var latestStreamSeq: Int64?
+    @State private var streamDiagnostics: [APIService.ControlStreamDiagnostic] = []
     @State private var showMissionMenu = false
     /// Monotonic counter — each increment is a request to scroll to the bottom.
     /// Counter rather than a Bool because the conversation `ScrollView` is
@@ -267,6 +290,7 @@ struct ControlView: View {
             }
         }
         .onDisappear {
+            networkMonitor.noteStreamIdle()
             streamTask?.cancel()
             connectionState = .disconnected
             reconnectAttempt = 0
@@ -706,6 +730,7 @@ struct ControlView: View {
                 mergeCount: controlMergeCount,
                 renderCount: groupedItems.count,
                 droppedEvents: controlDroppedEvents,
+                streamDiagnostics: streamDiagnostics,
                 performanceRecords: controlPerformanceRecords,
                 hotRenderCounts: controlHotRenderCounts
             )
@@ -803,9 +828,11 @@ struct ControlView: View {
         saveDraft(inputText, missionId: oldId)
         UserDefaults.standard.set(newId, forKey: Self.lastMissionIdKey)
         inputText = loadDraft(missionId: newId)
+        networkMonitor.noteStreamIdle()
         streamTask?.cancel()
         connectionState = .disconnected
         reconnectAttempt = 0
+        latestStreamSeq = nil
         startStreaming()
     }
 
@@ -825,6 +852,7 @@ struct ControlView: View {
     /// SwiftUI type-checker doesn't OOM on the long modifier chain.
     private func handleScenePhaseChange(from oldPhase: ScenePhase, to newPhase: ScenePhase) {
         if newPhase != .active {
+            networkMonitor.setSceneActive(false)
             // Save draft text when leaving foreground. This is the
             // synchronous flush path — the debounced .onChange in
             // inputText handles the steady-state case, but
@@ -834,6 +862,7 @@ struct ControlView: View {
             saveCurrentDraft(inputText)
         }
         guard oldPhase != .active && newPhase == .active else { return }
+        networkMonitor.setSceneActive(true)
         // If the SSE is already reconnecting (or its inactivity watchdog
         // is about to fire), the reconnect path will call
         // resumeMissionAfterReconnect — duplicating that work here causes
@@ -847,9 +876,28 @@ struct ControlView: View {
         }
         Task {
             if !sseIsRecovering, let missionId = viewingMissionId {
+                if shouldSkipForegroundReload(missionId: missionId) {
+                    return
+                }
                 await reloadMissionFromServer(id: missionId)
             }
             await refreshRunningMissions()
+        }
+    }
+
+    private func shouldSkipForegroundReload(missionId: String) -> Bool {
+        guard networkMonitor.isStreamFresh(maxAge: NetworkMonitor.staleAfter * 2),
+              let latestStreamSeq,
+              let knownSeq = missionMaxSeq[missionId] else {
+            return false
+        }
+        return latestStreamSeq <= knownSeq
+    }
+
+    private func recordStreamDiagnostic(_ diagnostic: APIService.ControlStreamDiagnostic) {
+        streamDiagnostics.append(diagnostic)
+        if streamDiagnostics.count > Self.maxStreamDiagnostics {
+            streamDiagnostics.removeFirst(streamDiagnostics.count - Self.maxStreamDiagnostics)
         }
     }
 
@@ -1652,6 +1700,51 @@ struct ControlView: View {
         }
     }
 
+    // MARK: - Pending Send Cache
+
+    private static func loadPendingSends() -> [PendingSendEntry] {
+        guard let data = UserDefaults.standard.data(forKey: pendingSendsKey),
+              let entries = try? JSONDecoder().decode([PendingSendEntry].self, from: data) else {
+            return []
+        }
+        return entries
+    }
+
+    private static func storePendingSends(_ entries: [PendingSendEntry]) {
+        if let data = try? JSONEncoder().encode(entries), !entries.isEmpty {
+            UserDefaults.standard.set(data, forKey: pendingSendsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: pendingSendsKey)
+        }
+    }
+
+    private func rememberPendingSend(id: String, missionId: String?, content: String) {
+        var entries = Self.loadPendingSends()
+        entries.removeAll { $0.id == id }
+        entries.append(PendingSendEntry(id: id, missionId: missionId, content: content, createdAt: Date()))
+        Self.storePendingSends(entries)
+    }
+
+    private func forgetPendingSend(id: String) {
+        var entries = Self.loadPendingSends()
+        entries.removeAll { $0.id == id }
+        Self.storePendingSends(entries)
+    }
+
+    private func restorePendingSends(for missionId: String?) {
+        let entries = Self.loadPendingSends().filter { $0.missionId == missionId }
+        guard !entries.isEmpty else { return }
+        for entry in entries where !messages.contains(where: { $0.id == entry.id }) {
+            messages.append(ChatMessage(
+                id: entry.id,
+                type: .user,
+                content: entry.content,
+                sendState: .failed(reason: "Not sent before the app closed")
+            ))
+        }
+        recomputeGroupedItems()
+    }
+
     // Cache both mission metadata and events for consistent display
     private struct CachedMissionData: Codable {
         let mission: Mission
@@ -1955,6 +2048,7 @@ struct ControlView: View {
                 content: entry.content
             )
         }
+        restorePendingSends(for: mission.id)
         recomputeGroupedItems()
 
         if scrollToBottom {
@@ -2097,6 +2191,7 @@ struct ControlView: View {
                 messages = replay.messages
                 textOpBuffers = replay.textOpBuffers
             }
+            restorePendingSends(for: mission.id)
 
             // Recompute grouped items once after all events are processed
             recomputeGroupedItems()
@@ -2900,6 +2995,7 @@ struct ControlView: View {
             sendState: .pending
         )
         messages.append(tempMessage)
+        rememberPendingSend(id: clientMessageId, missionId: pendingMissionId, content: content)
         recomputeGroupedItems()
         scrollToBottomTick += 1
         pendingSendCount += 1
@@ -2921,6 +3017,7 @@ struct ControlView: View {
                 if let index = messages.firstIndex(where: { $0.id == clientMessageId || $0.id == messageId }) {
                     messages[index].sendState = .sent
                 }
+                forgetPendingSend(id: clientMessageId)
 
                 // Update queue count when message was queued
                 if queued {
@@ -2979,6 +3076,7 @@ struct ControlView: View {
                 if let index = messages.firstIndex(where: { $0.id == id }) {
                     messages[index].sendState = .sent
                 }
+                forgetPendingSend(id: id)
                 if queued { queueLength += 1 }
             } catch {
                 let reason = (error as? LocalizedError)?.errorDescription
@@ -3063,10 +3161,13 @@ struct ControlView: View {
     }
 
     private func startStreaming() {
+        streamGeneration += 1
+        let generation = streamGeneration
         streamTask?.cancel()
         let missionFilter = viewingMissionId
+        let sinceSeq = missionFilter.flatMap { missionMaxSeq[$0] }
         streamTask = Task {
-            // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+            // Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s, max 30s.
             let maxBackoff: UInt64 = 30
             var currentBackoff: UInt64 = 1
 
@@ -3082,6 +3183,7 @@ struct ControlView: View {
                 // Use OSAllocatedUnfairLock for thread-safe boolean access across actor boundaries
                 // Track successful (non-error) events separately from all events
                 let receivedSuccessfulEvent = OSAllocatedUnfairLock(initialState: false)
+                let stopRetrying = OSAllocatedUnfairLock(initialState: false)
                 let pendingEvents = OSAllocatedUnfairLock(initialState: [BufferedStreamEvent]())
                 let flushScheduled = OSAllocatedUnfairLock(initialState: false)
 
@@ -3104,8 +3206,12 @@ struct ControlView: View {
                         guard !batch.isEmpty else { return }
 
                         await MainActor.run {
+                            guard generation == self.streamGeneration else { return }
+                            let hasLiveSignal = batch.contains { event in
+                                event.type != "error" && event.type != "parseError"
+                            }
                             let wasReconnecting = !self.connectionState.isConnected && self.reconnectAttempt > 0
-                            if !self.connectionState.isConnected {
+                            if hasLiveSignal && !self.connectionState.isConnected {
                                 self.connectionState = .connected
                                 self.reconnectAttempt = 0
 
@@ -3126,9 +3232,22 @@ struct ControlView: View {
                             // half-open-socket false-positive.
                             self.networkMonitor.noteStreamActivity()
                             for event in batch {
+                                let rawData = event.data.mapValues { $0.value }
+                                if event.type == "heartbeat" {
+                                    if let seq = rawData["seq"] as? Int64 {
+                                        self.latestStreamSeq = seq
+                                    } else if let seq = rawData["seq"] as? Int {
+                                        self.latestStreamSeq = Int64(seq)
+                                    }
+                                    continue
+                                }
+                                if event.type == "connected" {
+                                    self.networkMonitor.noteStreamConnected()
+                                    continue
+                                }
                                 self.handleStreamEvent(
                                     type: event.type,
-                                    data: event.data.mapValues { $0.value }
+                                    data: rawData
                                 )
                             }
                         }
@@ -3136,7 +3255,36 @@ struct ControlView: View {
                 }
 
                 _ = await withCheckedContinuation { continuation in
-                    let innerTask = api.streamControl(missionId: missionFilter) { eventType, data in
+                    let innerTask = api.streamControl(
+                        missionId: missionFilter,
+                        sinceSeq: sinceSeq,
+                        preferWebSocket: true,
+                        generation: generation,
+                        onDiagnostic: { diagnostic in
+                            Task { @MainActor in
+                                guard generation == self.streamGeneration else { return }
+                                self.recordStreamDiagnostic(diagnostic)
+                            }
+                        }
+                    ) { eventType, data in
+                        guard generation == self.streamGeneration else { return }
+                        if eventType == "error" {
+                            if let status = data["status"] as? Int, status == 401 {
+                                stopRetrying.withLock { $0 = true }
+                                Task { @MainActor in
+                                    guard generation == self.streamGeneration else { return }
+                                    self.connectionState = .authExpired
+                                    self.networkMonitor.noteStreamAuthExpired()
+                                }
+                            } else if (data["reason"] as? String) == "invalid_configuration" {
+                                stopRetrying.withLock { $0 = true }
+                                Task { @MainActor in
+                                    guard generation == self.streamGeneration else { return }
+                                    self.connectionState = .invalidConfiguration
+                                    self.networkMonitor.noteStreamInvalidConfiguration()
+                                }
+                            }
+                        }
                         // Only server-sourced events count for backoff reset.
                         // `connected` is a synthetic the client emits when it
                         // opens the stream — counting it would let a server
@@ -3177,16 +3325,27 @@ struct ControlView: View {
 
                 // Stream ended - check if we should reconnect
                 guard !Task.isCancelled else { break }
+                if stopRetrying.withLock({ $0 }) { break }
 
                 // Update state to reconnecting
                 await MainActor.run {
+                    guard generation == self.streamGeneration else { return }
                     reconnectAttempt += 1
                     connectionState = .reconnecting(attempt: reconnectAttempt)
                     networkMonitor.noteStreamReconnecting(attempt: reconnectAttempt)
                 }
 
-                // Wait before reconnecting (exponential backoff)
-                try? await Task.sleep(for: .seconds(currentBackoff))
+                while !Task.isCancelled {
+                    let pathIsUp = await MainActor.run { self.networkMonitor.pathSatisfied }
+                    if pathIsUp { break }
+                    try? await Task.sleep(for: .seconds(1))
+                }
+
+                // Wait before reconnecting. Jitter prevents every suspended
+                // client from hammering the backend at the same cadence after
+                // a network flap.
+                let jitteredBackoff = Double(currentBackoff) * Double.random(in: 0.8...1.3)
+                try? await Task.sleep(for: .seconds(jitteredBackoff))
                 currentBackoff = min(currentBackoff * 2, maxBackoff)
 
                 // Check cancellation again after sleep
@@ -3657,9 +3816,11 @@ struct ControlView: View {
                     // from the SSE event in case the server normalised it.
                     messages[index].sendState = .sent
                     messages[index].content = content
+                    forgetPendingSend(id: id)
                 } else {
                     let message = ChatMessage(id: id, type: .user, content: content)
                     messages.append(message)
+                    forgetPendingSend(id: id)
                 }
             }
             

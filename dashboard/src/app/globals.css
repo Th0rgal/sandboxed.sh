@@ -357,8 +357,15 @@ select:focus-visible {
     color: rgb(4 120 87 / 0.88);
   }
 
-  [class~="text-amber-400"] {
+  [class~="text-amber-400"],
+  [class~="text-amber-300"],
+  [class~="text-amber-200"] {
     color: rgb(180 83 9);
+  }
+
+  [class~="text-orange-400"],
+  [class~="text-orange-300"] {
+    color: rgb(194 65 12);
   }
 
   [class~="text-red-400"] {
@@ -370,8 +377,86 @@ select:focus-visible {
   }
 
   [class~="text-red-300"],
+  [class~="text-red-200"],
   [class~="text-red-300/80"] {
     color: rgb(185 28 28 / 0.9);
+  }
+
+  [class~="text-rose-300"],
+  [class~="text-rose-400"] {
+    color: rgb(190 18 60);
+  }
+
+  [class~="text-cyan-300"],
+  [class~="text-cyan-400"] {
+    color: rgb(14 116 144);
+  }
+
+  [class~="text-violet-300"],
+  [class~="text-violet-400"] {
+    color: rgb(109 40 217);
+  }
+
+  /* Tinted surfaces beyond indigo — let the soft fills render with light-theme
+     friendly tones so the small status pills (queue badge, stop button, etc.)
+     stay legible without re-skinning every component. */
+  [class~="bg-amber-500/10"],
+  [class~="bg-amber-500/15"] {
+    background-color: rgb(254 243 199 / 0.7);
+  }
+  [class~="bg-amber-500/20"],
+  [class~="bg-amber-500/25"],
+  [class~="bg-amber-500/30"] {
+    background-color: rgb(252 211 77 / 0.55);
+  }
+  [class~="hover:bg-amber-500/15"]:hover,
+  [class~="hover:bg-amber-500/25"]:hover,
+  [class~="hover:bg-amber-500/30"]:hover {
+    background-color: rgb(252 211 77 / 0.75);
+  }
+  [class~="border-amber-500/20"],
+  [class~="border-amber-500/25"],
+  [class~="border-amber-500/30"] {
+    border-color: rgb(217 119 6 / 0.5);
+  }
+
+  [class~="bg-red-500/10"],
+  [class~="bg-red-500/15"] {
+    background-color: rgb(254 226 226 / 0.7);
+  }
+  [class~="bg-red-500/20"],
+  [class~="bg-red-500/25"],
+  [class~="bg-red-500/30"] {
+    background-color: rgb(252 165 165 / 0.5);
+  }
+  [class~="hover:bg-red-500/15"]:hover,
+  [class~="hover:bg-red-500/25"]:hover,
+  [class~="hover:bg-red-500/30"]:hover {
+    background-color: rgb(252 165 165 / 0.7);
+  }
+  [class~="border-red-500/20"],
+  [class~="border-red-500/25"],
+  [class~="border-red-500/30"] {
+    border-color: rgb(220 38 38 / 0.45);
+  }
+
+  [class~="bg-emerald-500/10"],
+  [class~="bg-emerald-500/15"] {
+    background-color: rgb(209 250 229 / 0.7);
+  }
+  [class~="bg-emerald-500/20"],
+  [class~="bg-emerald-500/25"],
+  [class~="bg-emerald-500/30"] {
+    background-color: rgb(110 231 183 / 0.45);
+  }
+  [class~="hover:bg-emerald-500/15"]:hover,
+  [class~="hover:bg-emerald-500/25"]:hover {
+    background-color: rgb(110 231 183 / 0.7);
+  }
+  [class~="border-emerald-500/20"],
+  [class~="border-emerald-500/25"],
+  [class~="border-emerald-500/30"] {
+    border-color: rgb(4 120 87 / 0.45);
   }
 
   [class~="hover:text-indigo-300"]:hover {

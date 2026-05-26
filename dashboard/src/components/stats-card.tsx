@@ -1,5 +1,6 @@
 'use client';
 
+import { memo } from 'react';
 import { cn } from '@/lib/utils';
 import { LucideIcon } from 'lucide-react';
 
@@ -34,7 +35,7 @@ const valueColors = {
   accent: 'text-indigo-400',
 };
 
-export function StatsCard({
+export const StatsCard = memo(function StatsCard({
   title,
   value,
   subtitle,
@@ -80,4 +81,4 @@ export function StatsCard({
       </div>
     </div>
   );
-}
+});

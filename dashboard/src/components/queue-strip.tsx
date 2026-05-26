@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { X, ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
+import { X, ChevronDown, ChevronUp, ListPlus, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 export interface QueueItem {
@@ -24,86 +24,90 @@ export function QueueStrip({ items, onRemove, onClearAll, className }: QueueStri
 
   const truncate = (text: string, maxLen: number) => {
     if (text.length <= maxLen) return text;
-    return text.slice(0, maxLen - 3) + '...';
+    return text.slice(0, maxLen - 1) + '…';
   };
 
   if (!expanded) {
+    const head = items[0];
     return (
       <div
         className={cn(
-          "flex items-center gap-2 px-3 py-2 rounded-lg text-xs cursor-pointer select-none",
-          "bg-indigo-500/20 border-2 border-dotted border-indigo-500/60",
-          "hover:bg-indigo-500/25 hover:border-indigo-500/70 transition-colors",
-          className
+          'group flex items-center gap-2 rounded-lg border border-indigo-500/25 bg-indigo-500/[0.06] px-2.5 py-1.5 text-xs transition-colors',
+          'hover:border-indigo-500/35 hover:bg-indigo-500/[0.09] cursor-pointer select-none',
+          className,
         )}
         onClick={() => setExpanded(true)}
         role="button"
         tabIndex={0}
         onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
+          if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
             setExpanded(true);
           }
         }}
         title="Click to expand queued message(s)"
       >
-        <span className="text-indigo-300 font-medium shrink-0">
-          Queued ({items.length})
+        <ListPlus className="h-3.5 w-3.5 shrink-0 text-indigo-400" />
+        <span className="shrink-0 font-medium text-indigo-300">
+          Queued
+          <span className="ml-1 rounded bg-indigo-500/20 px-1 tabular-nums text-[10px]">
+            {items.length}
+          </span>
         </span>
-        <span className="text-white/60 truncate flex-1">
-          {items[0].agent && <span className="text-emerald-400">@{items[0].agent} </span>}
-          {truncate(items[0].content, items.length === 1 ? 60 : 40)}
-          {items.length > 1 && <span className="text-white/30"> +{items.length - 1} more</span>}
+        <span className="min-w-0 flex-1 truncate text-white/55">
+          {head.agent && <span className="text-emerald-400">@{head.agent} </span>}
+          {truncate(head.content, items.length === 1 ? 80 : 60)}
+          {items.length > 1 && (
+            <span className="text-white/30"> · +{items.length - 1} more</span>
+          )}
         </span>
         {items.length === 1 ? (
           <button
             onClick={(e) => {
               e.stopPropagation();
-              onRemove(items[0].id);
+              onRemove(head.id);
             }}
-            className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white/70 transition-colors shrink-0"
+            className="shrink-0 rounded p-0.5 text-white/40 hover:bg-white/10 hover:text-white/80 transition-colors"
             title="Remove from queue"
           >
             <X className="h-3.5 w-3.5" />
           </button>
         ) : null}
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            setExpanded(true);
-          }}
-          className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white/70 transition-colors shrink-0"
-          title="Expand"
-        >
-          <ChevronDown className="h-3.5 w-3.5" />
-        </button>
+        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-white/35 transition-transform group-hover:text-white/60" />
       </div>
     );
   }
 
   // Expanded view
   return (
-    <div className={cn(
-      "rounded-lg bg-indigo-500/20 border-2 border-dotted border-indigo-500/60 overflow-hidden",
-      className
-    )}>
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-indigo-500/20">
-        <span className="text-indigo-300 font-medium text-xs">Queued Messages ({items.length})</span>
-        <div className="flex items-center gap-1">
+    <div
+      className={cn(
+        'rounded-lg border border-indigo-500/25 bg-indigo-500/[0.06] overflow-hidden',
+        className,
+      )}
+    >
+      <div className="flex items-center justify-between gap-2 border-b border-indigo-500/15 px-2.5 py-1.5">
+        <div className="flex items-center gap-2 text-xs">
+          <ListPlus className="h-3.5 w-3.5 text-indigo-400" />
+          <span className="font-medium text-indigo-300">Queued</span>
+          <span className="rounded bg-indigo-500/20 px-1 text-[10px] tabular-nums text-indigo-300">
+            {items.length}
+          </span>
+        </div>
+        <div className="flex items-center gap-0.5">
           {items.length > 1 && (
             <button
               onClick={onClearAll}
-              className="flex items-center gap-1 px-2 py-1 rounded text-[10px] text-red-400 hover:bg-red-500/10 transition-colors"
+              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-red-400 hover:bg-red-500/10 transition-colors"
               title="Clear all queued messages"
             >
               <Trash2 className="h-3 w-3" />
-              Clear All
+              Clear all
             </button>
           )}
           <button
             onClick={() => setExpanded(false)}
-            className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white/70 transition-colors"
+            className="rounded p-0.5 text-white/40 hover:bg-white/10 hover:text-white/80 transition-colors"
             title="Collapse"
           >
             <ChevronUp className="h-3.5 w-3.5" />
@@ -111,36 +115,34 @@ export function QueueStrip({ items, onRemove, onClearAll, className }: QueueStri
         </div>
       </div>
 
-      {/* Queue items */}
-      <div className="max-h-40 overflow-y-auto">
+      <ul className="max-h-44 divide-y divide-indigo-500/10 overflow-y-auto">
         {items.map((item, index) => (
-          <div
+          <li
             key={item.id}
-            className={cn(
-              "flex items-start gap-2 px-3 py-2 text-xs",
-              index < items.length - 1 && "border-b border-indigo-500/10"
-            )}
+            className="group flex items-start gap-2 px-2.5 py-1.5 text-xs hover:bg-indigo-500/[0.05]"
           >
-            <span className="text-white/30 font-mono shrink-0 w-4">{index + 1}.</span>
-            <div className="flex-1 min-w-0">
-              <p className="text-white/70 break-words">
-                {item.agent && <span className="text-emerald-400">@{item.agent} </span>}
-                {item.content}
-              </p>
-            </div>
+            <span className="w-4 shrink-0 pt-0.5 font-mono text-[10px] tabular-nums text-white/30">
+              {index + 1}
+            </span>
+            <p className="min-w-0 flex-1 break-words text-white/75 leading-snug">
+              {item.agent && (
+                <span className="text-emerald-400">@{item.agent} </span>
+              )}
+              {item.content}
+            </p>
             <button
               onClick={(e) => {
                 e.stopPropagation();
                 onRemove(item.id);
               }}
-              className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-red-400 transition-colors shrink-0"
+              className="shrink-0 rounded p-0.5 text-white/30 opacity-0 transition-opacity hover:bg-white/10 hover:text-red-400 group-hover:opacity-100 focus:opacity-100"
               title="Remove from queue"
             >
               <X className="h-3.5 w-3.5" />
             </button>
-          </div>
+          </li>
         ))}
-      </div>
+      </ul>
     </div>
   );
 }

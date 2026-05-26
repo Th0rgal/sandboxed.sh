@@ -159,6 +159,21 @@ final class ModelTests: XCTestCase {
         XCTAssertTrue(source.contains("runningMissions.removeAll { $0.missionId == missionId }"))
     }
 
+    func testControlViewKeepsMobileReliabilityAnchors() throws {
+        let source = try controlViewSource()
+
+        XCTAssertTrue(source.contains("streamGeneration"))
+        XCTAssertTrue(source.contains("latestStreamSeq"))
+        XCTAssertTrue(source.contains("shouldSkipForegroundReload"))
+        XCTAssertTrue(source.contains("recordStreamDiagnostic"))
+        XCTAssertTrue(source.contains("noteStreamAuthExpired"))
+        XCTAssertTrue(source.contains("noteStreamInvalidConfiguration"))
+        XCTAssertTrue(source.contains("rememberPendingSend"))
+        XCTAssertTrue(source.contains("restorePendingSends"))
+        XCTAssertTrue(source.contains("preferWebSocket: true"))
+        XCTAssertTrue(source.contains("generation == self.streamGeneration"))
+    }
+
     func testSharedControlReducerFixturesReplayOnIOS() throws {
         let fixtures = try sharedControlReducerFixtures()
 

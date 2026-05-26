@@ -875,6 +875,15 @@ fn looks_like_user_prompt(content: &str) -> bool {
         || trimmed.contains("\nInstructions:\n")
 }
 
+fn fold_stream_delta(buffer: &mut String, delta: &str) {
+    if !buffer.is_empty() && delta.starts_with(buffer.as_str()) {
+        buffer.clear();
+        buffer.push_str(delta);
+    } else if !buffer.starts_with(delta) {
+        buffer.push_str(delta);
+    }
+}
+
 fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option<OpenCodeEvent> {
     let part = props.get("part")?;
     let part_type = part.get("type").and_then(|v| v.as_str())?;
@@ -912,7 +921,7 @@ fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option
 
     let content = if let Some(delta) = delta {
         if !delta.is_empty() || full_text.is_none() {
-            buffer.push_str(delta);
+            fold_stream_delta(buffer, delta);
             buffer.clone()
         } else if let Some(full) = full_text {
             *buffer = full.to_string();
@@ -1166,7 +1175,7 @@ fn parse_sse_event(
                     .and_then(|v| v.as_str());
                 let key = response_id.unwrap_or("response.output_text").to_string();
                 let buffer = state.part_buffers.entry(key).or_default();
-                buffer.push_str(delta);
+                fold_stream_delta(buffer, delta);
                 Some(OpenCodeEvent::TextDelta {
                     content: buffer.clone(),
                 })
@@ -1676,6 +1685,56 @@ mod tests {
         let ev2 = parse_sse_event(&data2, None, "s1", &mut state);
         assert!(
             matches!(&ev2, Some(OpenCodeEvent::TextDelta { content }) if content == "Hello world")
+        );
+    }
+
+    #[test]
+    fn text_delta_accepts_cumulative_snapshots_without_snowballing() {
+        let mut state = new_state();
+        let data1 = json!({
+            "type": "response.output_text.delta",
+            "properties": { "delta": "The fix makes" }
+        })
+        .to_string();
+        let data2 = json!({
+            "type": "response.output_text.delta",
+            "properties": { "delta": "The fix makes a parity pack's fork count" }
+        })
+        .to_string();
+
+        parse_sse_event(&data1, None, "s1", &mut state);
+        let ev2 = parse_sse_event(&data2, None, "s1", &mut state);
+
+        assert!(
+            matches!(&ev2, Some(OpenCodeEvent::TextDelta { content }) if content == "The fix makes a parity pack's fork count")
+        );
+    }
+
+    #[test]
+    fn part_update_thinking_accepts_cumulative_snapshots_without_snowballing() {
+        let mut state = new_state();
+        let data1 = json!({
+            "type": "message.part.updated",
+            "properties": {
+                "delta": "I am building",
+                "part": { "id": "p1", "type": "thinking" }
+            }
+        })
+        .to_string();
+        let data2 = json!({
+            "type": "message.part.updated",
+            "properties": {
+                "delta": "I am building the patched compiler entrypoint",
+                "part": { "id": "p1", "type": "thinking" }
+            }
+        })
+        .to_string();
+
+        parse_sse_event(&data1, None, "s1", &mut state);
+        let ev2 = parse_sse_event(&data2, None, "s1", &mut state);
+
+        assert!(
+            matches!(&ev2, Some(OpenCodeEvent::Thinking { content, .. }) if content == "I am building the patched compiler entrypoint")
         );
     }
 

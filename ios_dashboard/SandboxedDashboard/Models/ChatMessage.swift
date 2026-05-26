@@ -427,6 +427,8 @@ enum ConnectionState: Equatable {
     case degraded
     case reconnecting(attempt: Int)
     case disconnected
+    case authExpired
+    case invalidConfiguration
 
     var isConnected: Bool {
         if case .connected = self { return true }
@@ -444,16 +446,18 @@ enum ConnectionState: Equatable {
     var showsBanner: Bool {
         switch self {
         case .connected: return false
-        case .degraded, .reconnecting, .disconnected: return true
+        case .degraded, .reconnecting, .disconnected, .authExpired, .invalidConfiguration: return true
         }
     }
 
     var label: String {
         switch self {
         case .connected: return ""
-        case .degraded: return "Slow connection · using cached data"
+        case .degraded: return "Slow connection · catching up"
         case .reconnecting(let attempt): return attempt > 1 ? "Reconnecting (\(attempt))..." : "Reconnecting..."
         case .disconnected: return "Offline"
+        case .authExpired: return "Session expired"
+        case .invalidConfiguration: return "Check server URL"
         }
     }
 
@@ -463,6 +467,8 @@ enum ConnectionState: Equatable {
         case .degraded: return "wifi.exclamationmark"
         case .reconnecting: return "wifi.exclamationmark"
         case .disconnected: return "wifi.slash"
+        case .authExpired: return "lock.trianglebadge.exclamationmark"
+        case .invalidConfiguration: return "server.rack"
         }
     }
 }

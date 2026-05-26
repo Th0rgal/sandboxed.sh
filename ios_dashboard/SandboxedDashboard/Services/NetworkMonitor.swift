@@ -25,6 +25,19 @@ import Observation
 @MainActor
 @Observable
 final class NetworkMonitor {
+    enum ReachabilityState: Equatable {
+        case reachable
+        case offline
+        case unhealthy(failures: Int)
+    }
+
+    enum StreamState: Equatable {
+        case connected
+        case reconnecting(attempt: Int)
+        case authExpired
+        case invalidConfiguration
+    }
+
     /// Time since the last byte from the SSE stream after which we consider
     /// the stream "stale" and start proactive health probes.
     static let staleAfter: TimeInterval = 12
@@ -51,18 +64,28 @@ final class NetworkMonitor {
     /// Set to true while NWPathMonitor reports `.satisfied`.
     private(set) var pathSatisfied: Bool = true
 
-    /// Latest SSE state reported by the caller. Merged with `pathSatisfied`
-    /// and `healthFailures` to produce `state`.
-    private var sseState: ConnectionState = .connected
+    /// Path + server health are tracked separately from stream transport state
+    /// so auth/config failures do not masquerade as a flaky network.
+    private(set) var reachabilityState: ReachabilityState = .reachable
+
+    /// Latest stream state reported by the caller. Merged with reachability to
+    /// produce the existing banner-facing `state`.
+    private(set) var streamState: StreamState = .connected
 
     private let pathMonitor = NWPathMonitor()
     private let pathQueue = DispatchQueue(label: "md.thomas.openagent.netpath")
     private var healthTask: Task<Void, Never>?
     private var healthFailures = 0
+    private var sceneActive = true
 
     nonisolated init() {}
 
     func start() {
+        APIService.shared.onSuccessfulAuthenticatedRequest = { [weak self] in
+            Task { @MainActor in
+                self?.noteSuccessfulRequest()
+            }
+        }
         pathMonitor.pathUpdateHandler = { [weak self] path in
             guard let self else { return }
             let satisfied = path.status == .satisfied
@@ -79,6 +102,7 @@ final class NetworkMonitor {
         pathMonitor.cancel()
         healthTask?.cancel()
         healthTask = nil
+        APIService.shared.onSuccessfulAuthenticatedRequest = nil
     }
 
     /// Call this from the SSE event handler on every received byte / event.
@@ -89,18 +113,32 @@ final class NetworkMonitor {
         recomputeState()
     }
 
+    func noteSuccessfulRequest() {
+        healthFailures = 0
+        recomputeState()
+    }
+
+    func setSceneActive(_ active: Bool) {
+        sceneActive = active
+        recomputeState()
+    }
+
+    func isStreamFresh(maxAge: TimeInterval = NetworkMonitor.staleAfter) -> Bool {
+        Date().timeIntervalSince(lastStreamActivity) <= maxAge
+    }
+
     /// Signal that the SSE socket itself is in a transitional state. Used by
     /// the stream loop so the banner doesn't flicker between `degraded` and
     /// `reconnecting`.
     func noteStreamReconnecting(attempt: Int) {
-        sseState = .reconnecting(attempt: attempt)
+        streamState = .reconnecting(attempt: attempt)
         recomputeState()
     }
 
     /// The SSE has just connected and emitted (or replayed) at least one
     /// real event. Clears any stale/offline state.
     func noteStreamConnected() {
-        sseState = .connected
+        streamState = .connected
         healthFailures = 0
         lastStreamActivity = Date()
         recomputeState()
@@ -109,13 +147,31 @@ final class NetworkMonitor {
     /// The SSE is intentionally torn down (mission switch, view disappear).
     /// Banner stays clean — disconnect is expected, not an error.
     func noteStreamIdle() {
-        sseState = .connected
+        streamState = .connected
+        recomputeState()
+    }
+
+    func noteStreamAuthExpired() {
+        streamState = .authExpired
+        recomputeState()
+    }
+
+    func noteStreamInvalidConfiguration() {
+        streamState = .invalidConfiguration
         recomputeState()
     }
 
     private func recomputeState() {
-        // Path down beats everything else.
         if !pathSatisfied {
+            reachabilityState = .offline
+        } else if healthFailures > 0 {
+            reachabilityState = .unhealthy(failures: healthFailures)
+        } else {
+            reachabilityState = .reachable
+        }
+
+        // Path down beats everything else.
+        if reachabilityState == .offline {
             state = .disconnected
             return
         }
@@ -123,9 +179,17 @@ final class NetworkMonitor {
             state = .disconnected
             return
         }
-        // SSE explicitly reconnecting outranks degraded.
-        if case .reconnecting = sseState {
-            state = sseState
+        if case .authExpired = streamState {
+            state = .authExpired
+            return
+        }
+        if case .invalidConfiguration = streamState {
+            state = .invalidConfiguration
+            return
+        }
+        // Stream reconnecting outranks degraded reachability.
+        if case .reconnecting(let attempt) = streamState {
+            state = .reconnecting(attempt: attempt)
             return
         }
         let staleness = Date().timeIntervalSince(lastStreamActivity)
@@ -140,7 +204,8 @@ final class NetworkMonitor {
         healthTask?.cancel()
         healthTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(Self.healthInterval))
+                let jitter = Double.random(in: 0.8...1.2)
+                try? await Task.sleep(for: .seconds(Self.healthInterval * jitter))
                 guard !Task.isCancelled else { return }
                 await self?.runHealthProbeIfNeeded()
             }
@@ -150,6 +215,7 @@ final class NetworkMonitor {
     private func runHealthProbeIfNeeded() async {
         // Only probe when the SSE has been silent long enough to be worth
         // burning a request on. On a busy stream this loop is a no-op.
+        guard sceneActive else { return }
         let staleness = Date().timeIntervalSince(lastStreamActivity)
         guard staleness > Self.staleAfter else { return }
         guard pathSatisfied else {

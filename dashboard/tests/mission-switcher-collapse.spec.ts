@@ -21,12 +21,12 @@ async function fulfillJson(route: Route, body: unknown, status = 200) {
   });
 }
 
-function buildBoss() {
+function buildBoss(status: 'active' | 'completed' = 'active') {
   return {
     id: BOSS_ID,
     title: 'Concrete Audit Model and Proofs',
     short_description: 'Coordinating projection proofs across worker missions',
-    status: 'active' as const,
+    status,
     workspace_id: 'ws-1',
     workspace_name: 'dumbcontracts',
     backend: 'codex',
@@ -54,7 +54,18 @@ function buildWorker(i: number) {
   };
 }
 
-async function mockBossWithWorkers(page: Page) {
+async function mockBossWithWorkers(
+  page: Page,
+  options: { bossStatus?: 'active' | 'completed'; running?: Array<{ mission_id: string; state: string; queue_len: number }> } = {}
+) {
+  const bossStatus = options.bossStatus ?? 'active';
+  const running =
+    options.running ??
+    [
+      { mission_id: BOSS_ID, state: 'running', queue_len: 0 },
+      ...WORKER_IDS.map((id) => ({ mission_id: id, state: 'running' as const, queue_len: 0 })),
+    ];
+
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url());
     const path = url.pathname;
@@ -76,7 +87,7 @@ async function mockBossWithWorkers(page: Page) {
       return;
     }
     if (path === '/api/control/missions') {
-      await fulfillJson(route, [buildBoss(), ...WORKER_IDS.map((_, i) => buildWorker(i))]);
+      await fulfillJson(route, [buildBoss(bossStatus), ...WORKER_IDS.map((_, i) => buildWorker(i))]);
       return;
     }
     if (path === '/api/control/missions/current') {
@@ -84,15 +95,12 @@ async function mockBossWithWorkers(page: Page) {
       return;
     }
     if (path === '/api/control/running') {
-      await fulfillJson(route, [
-        { mission_id: BOSS_ID, state: 'running', queue_len: 0 },
-        ...WORKER_IDS.map((id) => ({ mission_id: id, state: 'running' as const, queue_len: 0 })),
-      ]);
+      await fulfillJson(route, running);
       return;
     }
     if (path === '/api/control/missions/search') {
       const q = (url.searchParams.get('q') ?? '').toLowerCase();
-      const all = [buildBoss(), ...WORKER_IDS.map((_, i) => buildWorker(i))];
+      const all = [buildBoss(bossStatus), ...WORKER_IDS.map((_, i) => buildWorker(i))];
       const matches = all
         .filter((m) => m.title.toLowerCase().includes(q) || m.short_description.toLowerCase().includes(q))
         .map((mission, idx) => ({ mission, relevance_score: 100 - idx }));
@@ -160,6 +168,22 @@ test.describe('Cmd+K mission switcher collapse', () => {
     const pill = page.locator('span[title*="hidden worker"]').first();
     await expect(pill).toBeVisible();
     await expect(pill).toContainText('3');
+  });
+
+  test('groups workers under a recent boss that is not running', async ({ page }) => {
+    await mockBossWithWorkers(page, { bossStatus: 'completed', running: [] });
+    await openCmdK(page);
+
+    await expect(page.locator(`a[href*="${BOSS_ID}"]`).first()).toBeVisible();
+    expect(await countVisibleWorkers(page)).toBe(0);
+
+    const chevron = page.locator(`button[aria-label="Expand workers"]`).first();
+    await expect(chevron).toBeVisible();
+    await expect(chevron).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.locator('span[title*="hidden worker"]').first()).toContainText('3');
+
+    await chevron.click();
+    expect(await countVisibleWorkers(page)).toBe(3);
   });
 
   test('clicking chevron toggles worker visibility without opening the mission', async ({ page }) => {

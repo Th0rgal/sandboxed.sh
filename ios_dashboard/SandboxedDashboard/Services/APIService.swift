@@ -14,6 +14,8 @@ final class APIService {
     static let shared = APIService()
     nonisolated init() {}
 
+    nonisolated static let defaultBaseURL = "https://agent-backend.thomas.md"
+
     /// Per-request timeout for ordinary JSON calls. Anything that hasn't started
     /// returning data within this window is treated as failed. Default
     /// `URLSession.shared` ships with 60s, which is far too long for a chat
@@ -79,13 +81,22 @@ final class APIService {
 
     // Configuration
     var baseURL: String {
-        get { UserDefaults.standard.string(forKey: "api_base_url") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "api_base_url") }
+        get {
+            let stored = UserDefaults.standard.string(forKey: "api_base_url")?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return stored.isEmpty ? Self.defaultBaseURL : stored
+        }
+        set {
+            UserDefaults.standard.set(
+                newValue.trimmingCharacters(in: .whitespacesAndNewlines),
+                forKey: "api_base_url"
+            )
+        }
     }
 
     /// Whether the server URL has been configured
     var isConfigured: Bool {
-        !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        makeURL("/api/health") != nil
     }
     
     private var jwtToken: String? {
@@ -103,11 +114,39 @@ final class APIService {
     
     var authRequired: Bool = false
     var authMode: AuthMode = .singleTenant
+    var onSuccessfulAuthenticatedRequest: (() -> Void)?
 
     enum AuthMode: String {
         case disabled = "disabled"
         case singleTenant = "single_tenant"
         case multiUser = "multi_user"
+    }
+
+    enum ControlStreamTransport: String, Sendable {
+        case sse
+        case webSocket = "ws"
+    }
+
+    enum ControlStreamPhase: String, Sendable {
+        case connecting
+        case open
+        case heartbeat
+        case event
+        case closed
+        case error
+        case fallback
+    }
+
+    struct ControlStreamDiagnostic: Sendable {
+        let transport: ControlStreamTransport
+        let phase: ControlStreamPhase
+        let host: String?
+        let status: Int?
+        let bytes: Int?
+        let error: String?
+        let eventType: String?
+        let generation: Int
+        let timestamp: Date
     }
     
     
@@ -658,121 +697,255 @@ final class APIService {
         )
     }
 
-    // MARK: - SSE Streaming
+    // MARK: - Control Streaming
 
-    func streamControl(missionId: String?, onEvent: @escaping (String, [String: Any]) -> Void) -> Task<Void, Never> {
-        let base = baseURL
+    func streamControl(
+        missionId: String?,
+        sinceSeq: Int64? = nil,
+        preferWebSocket: Bool = true,
+        generation: Int = 0,
+        onDiagnostic: ((ControlStreamDiagnostic) -> Void)? = nil,
+        onEvent: @escaping (String, [String: Any]) -> Void
+    ) -> Task<Void, Never> {
         let token = jwtToken
+
+        return Task { [weak self] in
+            guard let self else { return }
+            if preferWebSocket, token != nil {
+                let opened = await self.runControlWebSocket(
+                    missionId: missionId,
+                    sinceSeq: sinceSeq,
+                    token: token,
+                    generation: generation,
+                    onDiagnostic: onDiagnostic,
+                    onEvent: onEvent
+                )
+                if opened || Task.isCancelled {
+                    return
+                }
+                self.emitDiagnostic(
+                    transport: .webSocket,
+                    phase: .fallback,
+                    host: nil,
+                    status: nil,
+                    bytes: nil,
+                    error: "WebSocket did not open; falling back to SSE",
+                    eventType: nil,
+                    generation: generation,
+                    onDiagnostic: onDiagnostic
+                )
+            }
+            await self.runControlSSE(
+                missionId: missionId,
+                token: token,
+                generation: generation,
+                onDiagnostic: onDiagnostic,
+                onEvent: onEvent
+            )
+        }
+    }
+
+    private func runControlSSE(
+        missionId: String?,
+        token: String?,
+        generation: Int,
+        onDiagnostic: ((ControlStreamDiagnostic) -> Void)?,
+        onEvent: @escaping (String, [String: Any]) -> Void
+    ) async {
         let maxBuffer = Self.streamMaxBufferBytes
         let inactivity = Self.streamInactivityTimeout
         let session = Self.streamSession
+        guard let url = makeURL("/api/control/stream", queryItems: missionId.map { [URLQueryItem(name: "mission", value: $0)] } ?? []) else {
+            emitDiagnostic(transport: .sse, phase: .error, host: nil, status: nil, bytes: nil, error: "Invalid server URL", eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
+            onEvent("error", ["message": "Invalid server URL", "reason": "invalid_configuration"])
+            return
+        }
 
-        return Task { [weak self] in
-            var components = URLComponents(string: "\(base)/api/control/stream")
-            var queryItems: [URLQueryItem] = []
-            if let missionId {
-                queryItems.append(URLQueryItem(name: "mission", value: missionId))
+        emitDiagnostic(transport: .sse, phase: .connecting, host: url.host, status: nil, bytes: nil, error: nil, eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
+
+        var request = URLRequest(url: url)
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
+        do {
+            let (rawStream, response) = try await session.bytes(for: request)
+
+            // Reject HTTP errors up front. The previous code happily fed
+            // a 401 HTML body through the SSE parser, which silently
+            // dropped events and left the user staring at "Reconnecting…".
+            if let http = response as? HTTPURLResponse {
+                guard (200..<300).contains(http.statusCode) else {
+                    if http.statusCode == 401 {
+                        logout()
+                    }
+                    emitDiagnostic(transport: .sse, phase: .error, host: url.host, status: http.statusCode, bytes: nil, error: "Stream rejected", eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
+                    onEvent("error", [
+                        "message": "Stream rejected by server (HTTP \(http.statusCode))",
+                        "status": http.statusCode
+                    ])
+                    return
+                }
+                emitDiagnostic(transport: .sse, phase: .open, host: url.host, status: http.statusCode, bytes: nil, error: nil, eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
             }
-            components?.queryItems = queryItems
-            guard let url = components?.url else { return }
+            onEvent("connected", ["type": "connected", "transport": ControlStreamTransport.sse.rawValue])
 
-            var request = URLRequest(url: url)
-            request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-            request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-            if let token {
-                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            // `rawStream.lines` decodes chunks as UTF-8 and yields per line.
+            var eventType = "message"
+            var dataLines: [String] = []
+            var bufferedBytes = 0
+            var bytesRead = 0
+
+            for try await line in rawStream.lines {
+                if Task.isCancelled { return }
+                bytesRead += line.utf8.count + 1
+
+                // Hard cap on per-event payload — a server that never emits a
+                // blank line must not balloon this buffer.
+                bufferedBytes += line.utf8.count + 1
+                if bufferedBytes > maxBuffer {
+                    emitDiagnostic(transport: .sse, phase: .error, host: url.host, status: nil, bytes: bytesRead, error: "Stream event exceeded buffer", eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
+                    onEvent("error", ["message": "Stream event exceeded \(maxBuffer) bytes — dropping connection"])
+                    return
+                }
+
+                if line.isEmpty {
+                    let dispatched = Self.dispatchSSEEvent(
+                        eventType: eventType,
+                        dataLines: dataLines,
+                        onEvent: onEvent
+                    )
+                    if dispatched {
+                        emitDiagnostic(transport: .sse, phase: .event, host: url.host, status: nil, bytes: bytesRead, error: nil, eventType: eventType, generation: generation, onDiagnostic: onDiagnostic)
+                    }
+                    eventType = "message"
+                    dataLines.removeAll(keepingCapacity: true)
+                    bufferedBytes = 0
+                    continue
+                }
+
+                if line.hasPrefix(":") {
+                    emitDiagnostic(transport: .sse, phase: .heartbeat, host: url.host, status: nil, bytes: bytesRead, error: nil, eventType: "heartbeat", generation: generation, onDiagnostic: onDiagnostic)
+                    onEvent("heartbeat", ["type": "heartbeat", "transport": ControlStreamTransport.sse.rawValue])
+                    continue
+                }
+
+                guard let colonIdx = line.firstIndex(of: ":") else { continue }
+                let field = line[..<colonIdx]
+                var value = line[line.index(after: colonIdx)...]
+                if value.first == " " { value = value.dropFirst() }
+
+                switch field {
+                case "event":
+                    eventType = String(value)
+                case "data":
+                    dataLines.append(String(value))
+                default:
+                    break
+                }
             }
-
-            do {
-                let (rawStream, response) = try await session.bytes(for: request)
-
-                // Reject HTTP errors up front. The previous code happily fed
-                // a 401 HTML body through the SSE parser, which silently
-                // dropped events and left the user staring at "Reconnecting…".
-                if let http = response as? HTTPURLResponse {
-                    guard (200..<300).contains(http.statusCode) else {
-                        if http.statusCode == 401 {
-                            await MainActor.run { self?.logout() }
-                        }
-                        onEvent("error", [
-                            "message": "Stream rejected by server (HTTP \(http.statusCode))",
-                            "status": http.statusCode
-                        ])
-                        return
-                    }
-                }
-                onEvent("connected", ["type": "connected"])
-
-                // `rawStream.lines` decodes chunks as UTF-8 and yields per
-                // line. Replaces the previous byte-by-byte
-                // `String(bytes: [byte], encoding: .utf8)` loop which silently
-                // dropped any byte belonging to a multi-byte UTF-8 codepoint —
-                // every emoji or non-ASCII character in the agent stream was
-                // being corrupted.
-                //
-                // Inactivity is enforced by `streamSession`'s
-                // `timeoutIntervalForRequest`: per URLSession semantics that
-                // is the max gap between received bytes, so a healthy stream
-                // resets it on every event and a silent half-open socket
-                // errors out within `streamInactivityTimeout`. No manual
-                // watchdog needed.
-                var eventType = "message"
-                var dataLines: [String] = []
-                var bufferedBytes = 0
-
-                for try await line in rawStream.lines {
-                    if Task.isCancelled { return }
-
-                    // Hard cap on per-event payload — a server that never
-                    // emits a blank line must not balloon this buffer.
-                    bufferedBytes += line.utf8.count + 1
-                    if bufferedBytes > maxBuffer {
-                        onEvent("error", ["message": "Stream event exceeded \(maxBuffer) bytes — dropping connection"])
-                        return
-                    }
-
-                    if line.isEmpty {
-                        Self.dispatchSSEEvent(
-                            eventType: eventType,
-                            dataLines: dataLines,
-                            onEvent: onEvent
-                        )
-                        eventType = "message"
-                        dataLines.removeAll(keepingCapacity: true)
-                        bufferedBytes = 0
-                        continue
-                    }
-
-                    if line.hasPrefix(":") { continue }  // comment
-
-                    guard let colonIdx = line.firstIndex(of: ":") else { continue }
-                    let field = line[..<colonIdx]
-                    var value = line[line.index(after: colonIdx)...]
-                    // SSE spec: strip exactly one leading space.
-                    if value.first == " " { value = value.dropFirst() }
-
-                    switch field {
-                    case "event":
-                        eventType = String(value)
-                    case "data":
-                        dataLines.append(String(value))
-                    default:
-                        break  // ignore id/retry/unknown
-                    }
-                }
-            } catch is CancellationError {
-                return
-            } catch let urlError as URLError where urlError.code == .timedOut {
-                onEvent("error", [
-                    "message": "Stream idle (no data for \(Int(inactivity))s) — reconnecting",
-                    "reason": "inactivity"
-                ])
-            } catch {
-                if !Task.isCancelled {
-                    onEvent("error", ["message": "Stream connection failed: \(error.localizedDescription)"])
-                }
+            emitDiagnostic(transport: .sse, phase: .closed, host: url.host, status: nil, bytes: bytesRead, error: nil, eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
+        } catch is CancellationError {
+            return
+        } catch let urlError as URLError where urlError.code == .timedOut {
+            emitDiagnostic(transport: .sse, phase: .error, host: url.host, status: nil, bytes: nil, error: "inactivity", eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
+            onEvent("error", [
+                "message": "Stream idle (no data for \(Int(inactivity))s) — reconnecting",
+                "reason": "inactivity"
+            ])
+        } catch {
+            if !Task.isCancelled {
+                emitDiagnostic(transport: .sse, phase: .error, host: url.host, status: nil, bytes: nil, error: error.localizedDescription, eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
+                onEvent("error", ["message": "Stream connection failed: \(error.localizedDescription)"])
             }
         }
+    }
+
+    /// Returns true after the socket opened. A false return means callers may
+    /// try SSE fallback immediately.
+    private func runControlWebSocket(
+        missionId: String?,
+        sinceSeq: Int64?,
+        token: String?,
+        generation: Int,
+        onDiagnostic: ((ControlStreamDiagnostic) -> Void)?,
+        onEvent: @escaping (String, [String: Any]) -> Void
+    ) async -> Bool {
+        guard let url = makeWebSocketURL("/api/control/ws", queryItems: missionId.map { [URLQueryItem(name: "mission", value: $0)] } ?? []) else {
+            emitDiagnostic(transport: .webSocket, phase: .error, host: nil, status: nil, bytes: nil, error: "Invalid WebSocket URL", eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
+            onEvent("error", ["message": "Invalid server URL", "reason": "invalid_configuration"])
+            return false
+        }
+
+        emitDiagnostic(transport: .webSocket, phase: .connecting, host: url.host, status: nil, bytes: nil, error: nil, eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
+
+        var request = URLRequest(url: url)
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let task = Self.streamSession.webSocketTask(with: request)
+        task.resume()
+
+        var opened = false
+        var bytesRead = 0
+        do {
+            if let sinceSeq {
+                let resume = ["type": "resume", "since_seq": sinceSeq] as [String: Any]
+                let data = try JSONSerialization.data(withJSONObject: resume)
+                if let string = String(data: data, encoding: .utf8) {
+                    try await task.send(.string(string))
+                }
+            }
+
+            while !Task.isCancelled {
+                let message = try await task.receive()
+                let text: String
+                switch message {
+                case .string(let value):
+                    text = value
+                case .data(let data):
+                    text = String(data: data, encoding: .utf8) ?? ""
+                @unknown default:
+                    continue
+                }
+                guard !text.isEmpty else { continue }
+                bytesRead += text.utf8.count
+                if !opened {
+                    opened = true
+                    emitDiagnostic(transport: .webSocket, phase: .open, host: url.host, status: 101, bytes: bytesRead, error: nil, eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
+                    onEvent("connected", ["type": "connected", "transport": ControlStreamTransport.webSocket.rawValue])
+                }
+                guard let data = text.data(using: .utf8),
+                      let obj = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) as? [String: Any] else {
+                    onEvent("parseError", ["raw": text, "reason": "invalid websocket json"])
+                    continue
+                }
+
+                if let seq = obj["seq"] as? Int64 ?? (obj["seq"] as? Int).map(Int64.init),
+                   obj["type"] == nil {
+                    emitDiagnostic(transport: .webSocket, phase: .heartbeat, host: url.host, status: nil, bytes: bytesRead, error: nil, eventType: "heartbeat", generation: generation, onDiagnostic: onDiagnostic)
+                    onEvent("heartbeat", ["type": "heartbeat", "transport": ControlStreamTransport.webSocket.rawValue, "seq": seq])
+                    continue
+                }
+
+                let eventType = obj["type"] as? String ?? "message"
+                emitDiagnostic(transport: .webSocket, phase: .event, host: url.host, status: nil, bytes: bytesRead, error: nil, eventType: eventType, generation: generation, onDiagnostic: onDiagnostic)
+                onEvent(eventType, obj)
+            }
+        } catch is CancellationError {
+            task.cancel(with: .normalClosure, reason: nil)
+            return opened
+        } catch {
+            let nsError = error as NSError
+            emitDiagnostic(transport: .webSocket, phase: .error, host: url.host, status: nsError.code, bytes: bytesRead, error: error.localizedDescription, eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
+            if opened {
+                onEvent("error", ["message": "WebSocket stream failed: \(error.localizedDescription)"])
+            }
+        }
+        task.cancel(with: .normalClosure, reason: nil)
+        return opened
     }
 
     /// Flush a complete SSE event. `dataLines` are joined with `\n` per spec —
@@ -781,18 +954,19 @@ final class APIService {
     /// surface as a structured `parseError` so the caller can log them
     /// instead of silently dropping data.
     @MainActor
+    @discardableResult
     private static func dispatchSSEEvent(
         eventType: String,
         dataLines: [String],
         onEvent: (String, [String: Any]) -> Void
-    ) {
-        guard !dataLines.isEmpty else { return }
+    ) -> Bool {
+        guard !dataLines.isEmpty else { return false }
         let payload = dataLines.joined(separator: "\n")
-        guard !payload.isEmpty else { return }
+        guard !payload.isEmpty else { return false }
 
         guard let data = payload.data(using: .utf8) else {
             onEvent("parseError", ["raw": payload, "reason": "non-utf8 payload"])
-            return
+            return true
         }
         do {
             let parsed = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
@@ -804,6 +978,7 @@ final class APIService {
         } catch {
             onEvent("parseError", ["raw": payload, "reason": error.localizedDescription])
         }
+        return true
     }
     
     // MARK: - Private Helpers
@@ -821,7 +996,7 @@ final class APIService {
         _ path: String,
         authenticated: Bool = true
     ) async throws -> (T, HTTPURLResponse) {
-        guard let url = URL(string: "\(baseURL)\(path)") else {
+        guard let url = makeURL(path) else {
             throw APIError.invalidURL
         }
 
@@ -836,7 +1011,7 @@ final class APIService {
     }
     
     private func post<T: Decodable, B: Encodable>(_ path: String, body: B, authenticated: Bool = true) async throws -> T {
-        guard let url = URL(string: "\(baseURL)\(path)") else {
+        guard let url = makeURL(path) else {
             throw APIError.invalidURL
         }
 
@@ -854,7 +1029,7 @@ final class APIService {
     }
 
     private func delete<T: Decodable>(_ path: String, authenticated: Bool = true) async throws -> T {
-        guard let url = URL(string: "\(baseURL)\(path)") else {
+        guard let url = makeURL(path) else {
             throw APIError.invalidURL
         }
 
@@ -869,7 +1044,7 @@ final class APIService {
     }
 
     private func patch<T: Decodable, B: Encodable>(_ path: String, body: B, authenticated: Bool = true) async throws -> T {
-        guard let url = URL(string: "\(baseURL)\(path)") else {
+        guard let url = makeURL(path) else {
             throw APIError.invalidURL
         }
 
@@ -884,6 +1059,66 @@ final class APIService {
         request.httpBody = try JSONEncoder().encode(body)
 
         return try await execute(request)
+    }
+
+    private func makeURL(_ path: String) -> URL? {
+        makeURL(path, queryItems: [])
+    }
+
+    private func makeURL(_ path: String, queryItems: [URLQueryItem]) -> URL? {
+        guard var components = makeURLComponents(path) else { return nil }
+        components.queryItems = queryItems.isEmpty ? nil : queryItems
+        return components.url
+    }
+
+    private func makeWebSocketURL(_ path: String, queryItems: [URLQueryItem]) -> URL? {
+        guard var components = makeURLComponents(path) else { return nil }
+        switch components.scheme?.lowercased() {
+        case "https": components.scheme = "wss"
+        case "http": components.scheme = "ws"
+        default: return nil
+        }
+        components.queryItems = queryItems.isEmpty ? nil : queryItems
+        return components.url
+    }
+
+    private func makeURLComponents(_ path: String) -> URLComponents? {
+        let trimmedBase = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+        guard var components = URLComponents(string: "\(trimmedBase)\(normalizedPath)"),
+              let scheme = components.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              components.host?.isEmpty == false
+        else {
+            return nil
+        }
+        components.path = normalizedPath
+        return components
+    }
+
+    private func emitDiagnostic(
+        transport: ControlStreamTransport,
+        phase: ControlStreamPhase,
+        host: String?,
+        status: Int?,
+        bytes: Int?,
+        error: String?,
+        eventType: String?,
+        generation: Int,
+        onDiagnostic: ((ControlStreamDiagnostic) -> Void)?
+    ) {
+        onDiagnostic?(ControlStreamDiagnostic(
+            transport: transport,
+            phase: phase,
+            host: host,
+            status: status,
+            bytes: bytes,
+            error: error,
+            eventType: eventType,
+            generation: generation,
+            timestamp: Date()
+        ))
     }
     
     private func execute<T: Decodable>(_ request: URLRequest) async throws -> T {
@@ -910,6 +1145,10 @@ final class APIService {
 
         guard httpResponse.statusCode >= 200 && httpResponse.statusCode < 300 else {
             throw APIError.httpError(httpResponse.statusCode, String(data: data, encoding: .utf8))
+        }
+
+        if request.value(forHTTPHeaderField: "Authorization") != nil {
+            onSuccessfulAuthenticatedRequest?()
         }
 
         // Handle empty responses

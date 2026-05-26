@@ -152,7 +152,9 @@ fn resolve_model(session_model: Option<&str>, default_model: Option<&str>) -> Op
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeltaSemantics {
     /// Each delta is a new token to append (`item/agentMessage/delta`,
-    /// `item/reasoning/textDelta`).
+    /// `item/reasoning/textDelta`). In practice, some app-server builds
+    /// occasionally send full snapshots through these methods, so the fold
+    /// still treats prefix-extension payloads as replacement snapshots.
     Incremental,
     /// Each delta is the full text-so-far. Atomic replacement
     /// (`item/reasoning/summaryTextDelta` — observed empirically on prod
@@ -164,16 +166,22 @@ enum DeltaSemantics {
 
 /// Fold a codex delta into a per-item buffer with explicit semantics.
 ///
-/// `Incremental` always appends. `CumulativeSnapshot` replaces the buffer
-/// — even when the new snapshot doesn't extend the prior one, because
-/// codex's summary stream can restart mid-item. The earlier prod bug
-/// ("The saved goalThe saved goal isThe saved goal is active…" 36×) was
-/// our heuristic-only fold appending a fresh-start summary on top of the
-/// stable reasoning text.
+/// `Incremental` appends true token deltas, but treats prefix-extension
+/// payloads as snapshots because some app-server builds send full text-so-far
+/// through delta-shaped events. `CumulativeSnapshot` replaces the buffer even
+/// when the new snapshot doesn't extend the prior one, because codex's summary
+/// stream can restart mid-item. The earlier prod bug ("The saved goalThe saved
+/// goal is active…" 36×) was our heuristic-only fold appending a fresh-start
+/// summary on top of the stable reasoning text.
 fn fold_delta_into(buffer: &mut String, delta: &str, semantics: DeltaSemantics) {
     match semantics {
         DeltaSemantics::Incremental => {
-            buffer.push_str(delta);
+            if !buffer.is_empty() && delta.starts_with(buffer.as_str()) {
+                buffer.clear();
+                buffer.push_str(delta);
+            } else if !buffer.starts_with(delta) {
+                buffer.push_str(delta);
+            }
         }
         DeltaSemantics::CumulativeSnapshot => {
             // Drop pure echoes (delta is an earlier substring of the buffer).
@@ -591,6 +599,13 @@ struct AppServerEventTranslator {
     /// `turn/started` for the same turn (codex re-emits on resume) doesn't
     /// double-count.
     counted_turn_ids: std::collections::HashSet<String>,
+    /// True while a goal-mode turn is still active. A goal can transition to
+    /// `complete` before the current turn emits its final assistant message;
+    /// ending immediately on the goal update drops that closing response.
+    goal_turn_active: bool,
+    /// Set after a terminal goal update (`complete` / `budgetLimited`). The
+    /// stream becomes terminal once the active turn completes.
+    goal_terminal_seen: bool,
 }
 
 struct TranslateOutcome {
@@ -802,15 +817,22 @@ impl AppServerEventTranslator {
                             });
                             terminal = true;
                         }
-                        // For goal missions, both `interrupted` and
-                        // `completed` are non-terminal at the turn level —
-                        // codex's goals.rs may launch the next turn or emit
-                        // `thread/goal/updated` with a terminal status; we
-                        // wait for that signal instead of guessing.
+                        // For goal missions, turn completion is terminal only
+                        // after we have already seen a terminal goal status.
+                        // `thread/goal/updated {status: complete}` can arrive
+                        // before the current turn emits its closing assistant
+                        // message; waiting for turn completion keeps that
+                        // final response in the stream.
                         // For non-goal missions, the mission ends when its
                         // single turn ends (whether interrupted or completed).
                         "interrupted" | "completed" if !is_goal_mission => {
                             terminal = true;
+                        }
+                        "interrupted" | "completed" if is_goal_mission => {
+                            self.goal_turn_active = false;
+                            if self.goal_terminal_seen {
+                                terminal = true;
+                            }
                         }
                         _ => {}
                     }
@@ -824,6 +846,7 @@ impl AppServerEventTranslator {
             // automatically. For non-goal missions there's only ever one
             // turn, so a counter would be noise.
             "turn/started" if is_goal_mission => {
+                self.goal_turn_active = true;
                 let turn_id = params
                     .get("turn")
                     .and_then(|t| t.get("id"))
@@ -861,7 +884,10 @@ impl AppServerEventTranslator {
                         });
                     }
                     if status == "complete" || status == "budgetLimited" {
-                        terminal = true;
+                        self.goal_terminal_seen = true;
+                        if !self.goal_turn_active {
+                            terminal = true;
+                        }
                     }
                 }
             }
@@ -1030,6 +1056,32 @@ mod tests {
     }
 
     #[test]
+    fn incremental_fold_accepts_cumulative_snapshots_without_snowballing() {
+        let mut buf = String::new();
+        fold_delta_into(&mut buf, "The fix makes", DeltaSemantics::Incremental);
+        fold_delta_into(
+            &mut buf,
+            "The fix makes a parity pack's fork count",
+            DeltaSemantics::Incremental,
+        );
+        fold_delta_into(
+            &mut buf,
+            "The fix makes a parity pack's fork count as selected.",
+            DeltaSemantics::Incremental,
+        );
+
+        assert_eq!(buf, "The fix makes a parity pack's fork count as selected.");
+    }
+
+    #[test]
+    fn incremental_fold_still_appends_true_token_deltas() {
+        let mut buf = String::new();
+        fold_delta_into(&mut buf, "Hello ", DeltaSemantics::Incremental);
+        fold_delta_into(&mut buf, "world", DeltaSemantics::Incremental);
+        assert_eq!(buf, "Hello world");
+    }
+
+    #[test]
     fn reasoning_thinking_events_carry_distinct_item_ids() {
         // Regression for mission dbc8a7e9 seq 6651: the translator must
         // tag each Thinking event with the per-item buffer key so the
@@ -1042,6 +1094,8 @@ mod tests {
             counted_turn_ids: HashSet::new(),
             goal_iteration: 0,
             goal_objective: String::new(),
+            goal_turn_active: false,
+            goal_terminal_seen: false,
         };
 
         let notify = |item_id: &str, delta: &str| {
@@ -1124,6 +1178,8 @@ mod tests {
             counted_turn_ids: HashSet::new(),
             goal_iteration: 0,
             goal_objective: String::new(),
+            goal_turn_active: false,
+            goal_terminal_seen: false,
         };
 
         let outcome = translator.handle_notification(
@@ -1148,6 +1204,52 @@ mod tests {
                 output_tokens: 56
             }
         )));
+    }
+
+    #[test]
+    fn goal_complete_waits_for_active_turn_completion() {
+        let mut translator = AppServerEventTranslator::default();
+
+        let started = translator.handle_notification(
+            "turn/started",
+            &json!({ "turn": { "id": "turn-1" } }),
+            true,
+        );
+        assert!(!started.terminal);
+
+        let complete = translator.handle_notification(
+            "thread/goal/updated",
+            &json!({
+                "goal": {
+                    "status": "complete",
+                    "objective": "finish the debug task"
+                }
+            }),
+            true,
+        );
+        assert!(!complete.terminal);
+        assert!(complete.events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::GoalStatus { status, .. } if status == "complete"
+        )));
+
+        let text = translator.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "msg-1", "delta": "FINAL_RESPONSE_DEBUG_OK" }),
+            true,
+        );
+        assert!(!text.terminal);
+        assert!(text.events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::TextDelta { content } if content == "FINAL_RESPONSE_DEBUG_OK"
+        )));
+
+        let turn_completed = translator.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "turn-1", "status": "completed" } }),
+            true,
+        );
+        assert!(turn_completed.terminal);
     }
 
     #[tokio::test]

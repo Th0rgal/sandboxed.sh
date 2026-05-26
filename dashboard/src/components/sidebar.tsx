@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { cn } from '@/lib/utils';
@@ -88,7 +88,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
-export function Sidebar() {
+export const Sidebar = memo(function Sidebar() {
   const pathname = usePathname();
   const [currentMission, setCurrentMission] = useState<Mission | null>(null);
   const [controlState, setControlState] = useState<ControlRunState>('idle');
@@ -296,4 +296,4 @@ export function Sidebar() {
       </div>
     </aside>
   );
-}
+});
