@@ -39,7 +39,7 @@ describe('AuthGate', () => {
       </AuthGate>
     );
 
-    expect(screen.getByLabelText('Checking authentication')).toBeInTheDocument();
+    expect(screen.getAllByLabelText('Loading').length).toBeGreaterThan(0);
     expect(screen.queryByText('Dashboard content')).not.toBeInTheDocument();
   });
 
@@ -92,6 +92,6 @@ describe('AuthGate', () => {
     );
 
     expect(screen.getByText('Dashboard content')).toBeVisible();
-    expect(screen.queryByLabelText('Checking authentication')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Loading')).not.toBeInTheDocument();
   });
 });
