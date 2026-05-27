@@ -11916,7 +11916,7 @@ async fn run_single_control_turn(
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
             Box::pin(super::mission_runner::run_opencode_turn(
-                &exec_workspace,
+                exec_workspace,
                 &ctx.working_dir,
                 &user_message,
                 config.default_model.as_deref(),

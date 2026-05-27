@@ -10667,7 +10667,9 @@ pub async fn run_opencode_turn(
 
     // opencode with --format json outputs structured events to stdout.
     let use_json_stdout = true;
-    let sse_handle = if false && command_available(&workspace_exec, work_dir, "curl").await {
+    let sse_handle = if std::env::var_os("SANDBOXED_SH_OPENCODE_ENABLE_SSE_CURL").is_some()
+        && command_available(&workspace_exec, work_dir, "curl").await
+    {
         let workspace_exec = workspace_exec.clone();
         let work_dir = work_dir.to_path_buf();
         let work_dir_arg = work_dir_arg.clone();
