@@ -2925,6 +2925,12 @@ pub struct UpdateProviderRequest {
     pub enabled: Option<bool>,
     /// Which backends this provider is used for (e.g., ["opencode", "claudecode"])
     pub use_for_backends: Option<Vec<String>>,
+    /// Custom models for custom providers
+    pub custom_models: Option<Vec<crate::ai_providers::CustomModel>>,
+    /// Custom environment variable name for API key (for custom providers)
+    pub custom_env_var: Option<Option<String>>,
+    /// NPM package for custom provider
+    pub npm_package: Option<Option<String>>,
     /// Account identifier (email) — set by frontend when server-side userinfo fails
     pub account_email: Option<String>,
 }
@@ -7240,6 +7246,15 @@ async fn update_provider(
     }
     if let Some(ref backends) = req.use_for_backends {
         updated.use_for_backends = Some(backends.clone());
+    }
+    if let Some(custom_models) = req.custom_models {
+        updated.custom_models = Some(custom_models);
+    }
+    if let Some(custom_env_var) = req.custom_env_var {
+        updated.custom_env_var = custom_env_var;
+    }
+    if let Some(npm_package) = req.npm_package {
+        updated.npm_package = npm_package;
     }
     if let Some(ref email) = req.account_email {
         updated.account_email = Some(email.clone());
