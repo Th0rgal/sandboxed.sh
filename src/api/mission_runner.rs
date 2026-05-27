@@ -10499,7 +10499,9 @@ pub async fn run_opencode_turn(
             .unwrap_or(".")
     );
     if let Err(e) = std::fs::write(&script_host_path, &inner_cmd) {
-        tracing::error!(mission_id = %mission_id, "Failed to write opencode command script: {}", e);
+        let err_msg = format!("Failed to write OpenCode command script: {}", e);
+        tracing::error!(mission_id = %mission_id, "{}", err_msg);
+        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
     }
     #[cfg(unix)]
     {
@@ -10717,11 +10719,6 @@ pub async fn run_opencode_turn(
     let sse_emitted_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    // Shared accumulator for token usage extracted from SSE response.completed events.
-    // Updated only by the dedicated SSE curl task; the stdout parser uses local counters
-    // and only accumulates when the SSE task is absent (to avoid double-counting).
-    let sse_usage_tokens: Arc<Mutex<crate::cost::TokenUsage>> =
-        Arc::new(Mutex::new(crate::cost::TokenUsage::default()));
     let latest_tool_result_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let rate_limit_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
@@ -10739,295 +10736,10 @@ pub async fn run_opencode_turn(
     // Used to skip inactivity timeouts during long tool runs (builds, tests, etc.).
     let (sse_tool_depth_tx, sse_tool_depth_rx) = tokio::sync::watch::channel(0u32);
 
-    // opencode with --format json outputs structured events to stdout.
-    let use_json_stdout = true;
-    let sse_handle = if std::env::var_os("SANDBOXED_SH_OPENCODE_ENABLE_SSE_CURL").is_some()
-        && command_available(&workspace_exec, work_dir, "curl").await
-    {
-        let workspace_exec = workspace_exec.clone();
-        let work_dir = work_dir.to_path_buf();
-        let work_dir_arg = work_dir_arg.clone();
-        let session_id_capture = session_id_capture.clone();
-        let sse_emitted_thinking = sse_emitted_thinking.clone();
-        let sse_emitted_text = sse_emitted_text.clone();
-        let sse_text_buffer = sse_text_buffer.clone();
-        let sse_done_sent = sse_done_sent.clone();
-        let sse_error_message = sse_error_message.clone();
-        let sse_cancel = sse_cancel.clone();
-        let sse_complete_tx = sse_complete_tx.clone();
-        let sse_session_idle_tx = sse_session_idle_tx.clone();
-        let sse_retry_tx = sse_retry_tx.clone();
-        let last_activity = last_activity.clone();
-        let text_output_tx = text_output_tx.clone();
-        let sse_tool_depth_tx = sse_tool_depth_tx.clone();
-        let sse_usage_tokens = sse_usage_tokens.clone();
-        let latest_tool_result_text = latest_tool_result_text.clone();
-        let events_tx = events_tx.clone();
-        let opencode_port = opencode_port.clone();
-        let sse_host = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-
-        Some(tokio::spawn(async move {
-            let event_url = format!(
-                "http://{}:{}/event?directory={}",
-                sse_host,
-                opencode_port,
-                urlencoding::encode(&work_dir_arg)
-            );
-
-            let mut attempts = 0u32;
-            loop {
-                if sse_cancel.is_cancelled() {
-                    break;
-                }
-                if attempts > 7 {
-                    break;
-                }
-                attempts += 1;
-
-                let args = vec![
-                    "-N".to_string(),
-                    "-s".to_string(),
-                    "-H".to_string(),
-                    "Accept: text/event-stream".to_string(),
-                    "-H".to_string(),
-                    "Cache-Control: no-cache".to_string(),
-                    event_url.clone(),
-                ];
-
-                let child = workspace_exec
-                    .spawn_streaming(&work_dir, "curl", &args, HashMap::new())
-                    .await;
-
-                // Exponential backoff: 50ms, 100ms, 200ms, 400ms, ...
-                let backoff_ms = 50u64 * (1u64 << (attempts - 1).min(6));
-
-                let mut child = match child {
-                    Ok(child) => child,
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        continue;
-                    }
-                };
-
-                let stdout = match child.stdout.take() {
-                    Some(stdout) => stdout,
-                    None => {
-                        let _ = child.kill().await;
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        continue;
-                    }
-                };
-
-                let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
-                let mut current_event: Option<String> = None;
-                let mut data_lines: Vec<String> = Vec::new();
-                let mut state = OpencodeSseState::default();
-                let mut saw_complete = false;
-                // Reset SSE state on reconnect so stale values from a lost
-                // connection don't cause incorrect behavior:
-                // - tool depth: stale counts would permanently disable the
-                //   inactivity timeout
-                // - session_idle: a stale `true` would trigger the 10s kill
-                //   timer after reconnect, prematurely terminating the mission
-                // - retry counter: stale counts from a previous connection
-                //   should not accumulate across reconnects
-                // - last_activity: reset so the 120s global and 30s text idle
-                //   timers count from the reconnect, not from the last event
-                //   on the dead connection (the depth reset to 0 disables the
-                //   tools_active guard, so last_activity is the only remaining
-                //   protection against premature timeout during reconnect)
-                sse_tool_depth_tx.send_modify(|v| *v = 0);
-                let _ = sse_session_idle_tx.send(false);
-                sse_retry_tx.send_modify(|v| *v = 0);
-                if let Ok(mut guard) = last_activity.lock() {
-                    *guard = std::time::Instant::now();
-                }
-
-                loop {
-                    if sse_cancel.is_cancelled() {
-                        let _ = child.kill().await;
-                        return;
-                    }
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let trimmed = line.trim_end();
-                            if trimmed.is_empty() {
-                                if !data_lines.is_empty() {
-                                    let data = data_lines.join("\n");
-                                    let current_session = session_id_capture
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .clone();
-                                    if let Some(parsed) = parse_opencode_sse_event(
-                                        &data,
-                                        current_event.as_deref(),
-                                        current_session.as_deref(),
-                                        &mut state,
-                                        mission_id,
-                                    ) {
-                                        if let Some(session_id) = parsed.session_id {
-                                            let mut guard = session_id_capture
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner());
-                                            if guard.is_none() {
-                                                *guard = Some(session_id);
-                                            }
-                                        }
-                                        if let Some(usage) = parsed.usage {
-                                            if let Ok(mut guard) = sse_usage_tokens.lock() {
-                                                merge_token_usage(&mut guard, &usage);
-                                            }
-                                        }
-                                        if let Some(event) = parsed.event {
-                                            if let Ok(mut guard) = last_activity.lock() {
-                                                *guard = std::time::Instant::now();
-                                            }
-                                            if let AgentEvent::Error { ref message, .. } = event {
-                                                let mut guard = sse_error_message
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                if guard.is_none() {
-                                                    *guard = Some(message.clone());
-                                                }
-                                            }
-                                            if matches!(event, AgentEvent::Thinking { .. }) {
-                                                sse_emitted_thinking.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::SeqCst,
-                                                );
-                                            }
-                                            if let AgentEvent::TextDelta { ref content, .. } = event
-                                            {
-                                                let _ = text_output_tx.send(true);
-                                                sse_emitted_text.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::SeqCst,
-                                                );
-                                                // Capture the latest full-text snapshot so
-                                                // it can serve as a fallback for final_result
-                                                // when stdout JSON and storage both fail.
-                                                if let Ok(mut buf) = sse_text_buffer.lock() {
-                                                    *buf = content.clone();
-                                                }
-                                            }
-                                            // Track active tool depth for permit management.
-                                            match &event {
-                                                AgentEvent::ToolCall { .. } => {
-                                                    sse_tool_depth_tx
-                                                        .send_modify(|v| *v = v.saturating_add(1));
-                                                }
-                                                AgentEvent::ToolResult { .. } => {
-                                                    sse_tool_depth_tx
-                                                        .send_modify(|v| *v = v.saturating_sub(1));
-                                                }
-                                                _ => {}
-                                            }
-                                            remember_tool_result_text(
-                                                &event,
-                                                &latest_tool_result_text,
-                                            );
-                                            let _ = events_tx.send(event);
-                                        }
-                                        for event in parsed.extra_events {
-                                            match &event {
-                                                AgentEvent::ToolCall { .. } => {
-                                                    sse_tool_depth_tx
-                                                        .send_modify(|v| *v = v.saturating_add(1));
-                                                }
-                                                AgentEvent::ToolResult { .. } => {
-                                                    sse_tool_depth_tx
-                                                        .send_modify(|v| *v = v.saturating_sub(1));
-                                                }
-                                                _ => {}
-                                            }
-                                            remember_tool_result_text(
-                                                &event,
-                                                &latest_tool_result_text,
-                                            );
-                                            let _ = events_tx.send(event);
-                                        }
-                                        if parsed.message_complete {
-                                            saw_complete = true;
-                                            let _ = sse_complete_tx.send(true);
-                                            if sse_emitted_thinking
-                                                .load(std::sync::atomic::Ordering::SeqCst)
-                                                && !sse_done_sent
-                                                    .load(std::sync::atomic::Ordering::SeqCst)
-                                            {
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: String::new(),
-                                                    done: true,
-                                                    mission_id: Some(mission_id),
-                                                });
-                                                sse_done_sent.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::SeqCst,
-                                                );
-                                            }
-                                            let _ = child.kill().await;
-                                            break;
-                                        }
-                                        if parsed.session_idle {
-                                            let _ = sse_session_idle_tx.send(true);
-                                        }
-                                        if parsed.session_retry {
-                                            sse_retry_tx.send_modify(|v| *v += 1);
-                                        }
-                                    }
-                                }
-
-                                current_event = None;
-                                data_lines.clear();
-                                continue;
-                            }
-
-                            if let Some(rest) = trimmed.strip_prefix("event:") {
-                                current_event = Some(rest.trim_start().to_string());
-                                continue;
-                            }
-
-                            if let Some(rest) = trimmed.strip_prefix("data:") {
-                                data_lines.push(rest.trim_start().to_string());
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(mission_id = %mission_id, error = %e, "SSE reader I/O error");
-                            break;
-                        }
-                    }
-                }
-
-                let _ = child.kill().await;
-                if saw_complete {
-                    break;
-                }
-                // Exponential backoff before reconnecting
-                let backoff_ms = 50u64 * (1u64 << attempts.min(6));
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-            }
-        }))
-    } else {
-        None
-    };
-    // In SSE mode, drop the original sender so the channel closes when the SSE
-    // handler exits.  This prevents a stale `tools_active == true` from
-    // permanently disabling the inactivity timeout if the SSE handler dies
-    // mid-tool-execution.
-    // In JSON stdout mode, keep the sender alive — we use it below to track
-    // tool depth from `tool_use` / `step_finish` events on stdout.
-    let json_tool_depth_tx = if use_json_stdout {
-        Some(sse_tool_depth_tx)
-    } else {
-        drop(sse_tool_depth_tx);
-        None
-    };
+    // OpenCode's supported integration path is `run --format json`; all events
+    // are consumed from stdout, with no parallel curl/SSE side channel.
+    let sse_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let json_tool_depth_tx = Some(sse_tool_depth_tx);
 
     // Spawn a task to read stderr (just log in JSON mode, events come on stdout)
     let mission_id_clone = mission_id;
@@ -12177,16 +11889,6 @@ pub async fn run_opencode_turn(
         }
     }
 
-    // Merge shared SSE usage from the curl task into local accumulators
-    if let Ok(guard) = sse_usage_tokens.lock() {
-        total_input_tokens = total_input_tokens.saturating_add(guard.input_tokens);
-        total_output_tokens = total_output_tokens.saturating_add(guard.output_tokens);
-        total_cache_creation_input_tokens = total_cache_creation_input_tokens
-            .saturating_add(guard.cache_creation_input_tokens.unwrap_or(0));
-        total_cache_read_input_tokens = total_cache_read_input_tokens
-            .saturating_add(guard.cache_read_input_tokens.unwrap_or(0));
-    }
-
     // Compute cost from accumulated token usage and model (if available)
     if total_input_tokens > 0
         || total_output_tokens > 0
@@ -12387,27 +12089,6 @@ fn nested_usage_value_tokens(value: &serde_json::Value, path: &[&str]) -> u64 {
         };
     }
     current.as_u64().unwrap_or(0)
-}
-
-fn merge_token_usage(target: &mut crate::cost::TokenUsage, usage: &crate::cost::TokenUsage) {
-    target.input_tokens = target.input_tokens.saturating_add(usage.input_tokens);
-    target.output_tokens = target.output_tokens.saturating_add(usage.output_tokens);
-    if let Some(tokens) = usage.cache_creation_input_tokens {
-        target.cache_creation_input_tokens = Some(
-            target
-                .cache_creation_input_tokens
-                .unwrap_or(0)
-                .saturating_add(tokens),
-        );
-    }
-    if let Some(tokens) = usage.cache_read_input_tokens {
-        target.cache_read_input_tokens = Some(
-            target
-                .cache_read_input_tokens
-                .unwrap_or(0)
-                .saturating_add(tokens),
-        );
-    }
 }
 
 fn opencode_usage_from_value(usage: &serde_json::Value) -> Option<crate::cost::TokenUsage> {
