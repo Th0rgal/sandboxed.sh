@@ -7331,6 +7331,7 @@ fn custom_opencode_provider_definition(
     app_working_dir: &std::path::Path,
     provider_id: &str,
 ) -> Option<serde_json::Value> {
+    let provider_id = sanitize_custom_opencode_provider_id(provider_id);
     let path = app_working_dir.join(crate::util::AI_PROVIDERS_PATH);
     let contents = std::fs::read_to_string(path).ok()?;
     let providers: Vec<crate::ai_providers::AIProvider> = serde_json::from_str(&contents).ok()?;
@@ -15640,6 +15641,34 @@ mod tests {
         );
         assert!(definition["models"].get("qwen3.5-397b").is_some());
         assert!(definition["models"].get("fast").is_some());
+    }
+
+    #[test]
+    fn custom_provider_definition_normalizes_model_provider_id() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = temp_dir.path().join(".sandboxed-sh");
+        fs::create_dir_all(&store_dir).expect("store dir");
+
+        let mut provider = crate::ai_providers::AIProvider::new(
+            crate::ai_providers::ProviderType::Custom,
+            "Spark-Fast".to_string(),
+        );
+        provider.base_url = Some("https://spark-de79.gazella-vector.ts.net/v1".to_string());
+        provider.custom_models = Some(vec![crate::ai_providers::CustomModel {
+            id: "qwen3.5-397b".to_string(),
+            name: Some("Qwen 3.5 397B".to_string()),
+            context_limit: None,
+            output_limit: None,
+        }]);
+
+        fs::write(
+            store_dir.join("ai_providers.json"),
+            serde_json::to_string_pretty(&vec![provider]).expect("serialize provider"),
+        )
+        .expect("write provider store");
+
+        assert!(custom_opencode_provider_definition(temp_dir.path(), "spark_fast").is_some());
+        assert!(custom_opencode_provider_definition(temp_dir.path(), "spark-fast").is_some());
     }
 
     #[test]
