@@ -10,8 +10,6 @@ import {
   getConfigProfileFile,
   saveConfigProfileFile,
   deleteConfigProfileFile,
-  getOpenCodeSettings,
-  updateOpenCodeSettings,
   getOpenCodeConfig,
   updateOpenCodeConfig,
   getClaudeCodeHostConfig,
@@ -135,7 +133,6 @@ const HARNESS_CONFIG = {
     libraryDir: 'opencode',     // Directory in library root
     files: [
       { name: 'settings.json', description: 'Main settings (agents, models, providers)', libraryName: 'settings.json' },
-      { name: 'oh-my-opencode.json', description: 'oh-my-opencode plugin configuration', libraryName: 'oh-my-opencode.json' },
     ],
   },
   claudecode: {
@@ -169,7 +166,6 @@ const HARNESS_CONFIG = {
 const EMPTY_FALLBACKS: Record<string, Record<string, string>> = {
   opencode: {
     'settings.json': '{}',
-    'oh-my-opencode.json': '{}',
   },
   claudecode: {
     'settings.json': '{}',
@@ -199,11 +195,6 @@ const HOST_SYNC_MAP: Partial<Record<HarnessId, Record<string, HostSyncHandler>>>
       label: 'opencode.json',
       load: getOpenCodeConfig,
       save: updateOpenCodeConfig,
-    },
-    'oh-my-opencode.json': {
-      label: 'oh-my-opencode.json',
-      load: getOpenCodeSettings,
-      save: updateOpenCodeSettings,
     },
   },
   claudecode: {
@@ -449,7 +440,6 @@ export default function SettingsPage() {
       return;
     }
     try {
-      // Use JSONC parser to support comments (oh-my-opencode.json supports comments)
       parseJsonc(fileContent);
       setParseError(null);
     } catch (err) {

@@ -939,15 +939,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // OpenCode connection endpoints
         .nest("/api/opencode/connections", opencode_api::routes())
         .route("/api/opencode/agents", get(opencode_api::list_agents))
-        // OpenCode settings (oh-my-opencode.json)
-        .route(
-            "/api/opencode/settings",
-            get(opencode_api::get_opencode_settings),
-        )
-        .route(
-            "/api/opencode/settings",
-            axum::routing::put(opencode_api::update_opencode_settings),
-        )
         .route(
             "/api/opencode/config",
             get(opencode_api::get_opencode_config),

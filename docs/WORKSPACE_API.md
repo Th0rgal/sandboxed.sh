@@ -125,7 +125,7 @@ Manually syncs the workspace's skills and tools from the library.
 **Response**: `Workspace` object.
 
 Note: Mission workspaces generate backend-specific config on execution:
-- **OpenCode**: `opencode.json`, `.opencode/opencode.json`, `.opencode/oh-my-opencode.json`
+- **OpenCode**: `opencode.json`, `.opencode/opencode.json`
 - **Claude Code**: `.claude/settings.local.json`, `.claude/skills/<name>/SKILL.md`, `CLAUDE.md`
 - **Codex**: `.codex/config.toml`, `.codex/skills/<name>/SKILL.md`
 - **Gemini/Grok**: OpenCode-style MCP/tool config for the native CLI backend

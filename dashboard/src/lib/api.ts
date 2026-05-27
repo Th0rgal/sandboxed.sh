@@ -2005,26 +2005,6 @@ export async function setDefaultOpenCodeConnection(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenCode Settings API (oh-my-opencode.json)
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Get OpenCode settings (oh-my-opencode.json)
-export async function getOpenCodeSettings(): Promise<Record<string, unknown>> {
-  return apiGet("/api/opencode/settings", "Failed to get OpenCode settings");
-}
-
-// Update OpenCode settings (oh-my-opencode.json)
-export async function updateOpenCodeSettings(
-  settings: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  return apiPut(
-    "/api/opencode/settings",
-    settings,
-    "Failed to update OpenCode settings",
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // OpenCode Config API (opencode.json)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2076,31 +2056,6 @@ export async function restartOpenCodeService(): Promise<{
     "/api/opencode/restart",
     undefined,
     "Failed to restart OpenCode service",
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Library-backed OpenCode Settings API
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Get OpenCode settings from Library (oh-my-opencode.json)
-export async function getLibraryOpenCodeSettings(): Promise<
-  Record<string, unknown>
-> {
-  return apiGet(
-    "/api/library/opencode/settings",
-    "Failed to get Library OpenCode settings",
-  );
-}
-
-// Save OpenCode settings to Library and sync to system
-export async function saveLibraryOpenCodeSettings(
-  settings: Record<string, unknown>,
-): Promise<void> {
-  return apiPut(
-    "/api/library/opencode/settings",
-    settings,
-    "Failed to save Library OpenCode settings",
   );
 }
 
@@ -2246,28 +2201,6 @@ export async function deleteConfigProfile(name: string): Promise<void> {
   return apiDel(
     `/api/library/config-profile/${encodeURIComponent(name)}`,
     "Failed to delete config profile",
-  );
-}
-
-// Get OpenCode settings for a specific profile
-export async function getLibraryOpenCodeSettingsForProfile(
-  profile: string,
-): Promise<Record<string, unknown>> {
-  return apiGet(
-    `/api/library/config-profile/${encodeURIComponent(profile)}/opencode/settings`,
-    "Failed to get OpenCode settings for profile",
-  );
-}
-
-// Save OpenCode settings for a specific profile
-export async function saveLibraryOpenCodeSettingsForProfile(
-  profile: string,
-  settings: Record<string, unknown>,
-): Promise<void> {
-  return apiPut(
-    `/api/library/config-profile/${encodeURIComponent(profile)}/opencode/settings`,
-    settings,
-    "Failed to save OpenCode settings for profile",
   );
 }
 

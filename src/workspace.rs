@@ -1241,12 +1241,9 @@ async fn write_opencode_config(
         write_commands_as_opencode_skills(workspace_dir, commands).await?;
     }
 
-    // Write Claude PreToolUse hooks for Claude Code (which oh-my-opencode wraps).
+    // Write Claude PreToolUse hooks for Claude-compatible execution.
     // These fix gh CLI hanging in PTY, optionally enable RTK compression for
     // native Bash, and block oversized image Reads before provider submission.
-    // Since OpenCode wraps Claude Code,
-    // we need to write a minimal `.claude/settings.local.json` containing the
-    // hooks config so the underlying Claude Code process discovers the hook.
     if let Some(hooks) =
         write_claude_pretool_hooks(workspace_dir, workspace_root, workspace_type).await?
     {
@@ -1279,8 +1276,7 @@ async fn write_opencode_config(
 /// the container's `/usr/local/bin/`, and paths in the hook config are
 /// translated to container-relative paths.
 ///
-/// For the OpenCode backend this is also called so that the underlying Claude
-/// Code process (wrapped by oh-my-opencode) picks up the hook.
+/// For the OpenCode backend this also keeps Claude-compatible tool hooks available.
 async fn write_claude_pretool_hooks(
     workspace_dir: &Path,
     workspace_root: &Path,
@@ -3436,99 +3432,8 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     )
     .await?;
 
-    // Sync oh-my-opencode settings into the mission directory only when the
-    // workspace (or its profile) opts into the wrapper. Vanilla `opencode`
-    // doesn't read this file, so writing it on every mission would just leave
-    // stale config behind. Native `.opencode/agents/*.md` files are still
-    // synced below, regardless of the wrapper flag.
-    let oh_my_opencode_enabled = workspace
-        .config
-        .get("enable_oh_my_opencode")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if backend_id == "opencode" && oh_my_opencode_enabled {
-        if let Some(lib) = library {
-            let profile = config_profile.unwrap_or("default");
-            tracing::info!(
-                mission = %mission_id,
-                workspace = %workspace.name,
-                profile = %profile,
-                "Loading oh-my-opencode settings from profile"
-            );
-            match lib.get_opencode_settings_for_profile(profile).await {
-                Ok(settings) => {
-                    if !settings.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-                        let opencode_dir = dir.join(".opencode");
-                        if let Err(e) = tokio::fs::create_dir_all(&opencode_dir).await {
-                            tracing::warn!(
-                                mission = %mission_id,
-                                workspace = %workspace.name,
-                                error = %e,
-                                "Failed to create .opencode directory for OpenCode settings"
-                            );
-                        } else {
-                            let dest_path = opencode_dir.join("oh-my-opencode.json");
-                            match serde_json::to_string_pretty(&settings) {
-                                Ok(content) => {
-                                    // Patch agent models for Claude Code OAuth compatibility
-                                    let patched_content =
-                                        patch_opencode_agent_models_for_oauth(&content);
-
-                                    let jsonc_path = opencode_dir.join("oh-my-opencode.jsonc");
-                                    if jsonc_path.exists() {
-                                        if let Err(e) = tokio::fs::remove_file(&jsonc_path).await {
-                                            tracing::warn!(
-                                                mission = %mission_id,
-                                                workspace = %workspace.name,
-                                                error = %e,
-                                                "Failed to remove oh-my-opencode.jsonc"
-                                            );
-                                        }
-                                    }
-                                    if let Err(e) =
-                                        tokio::fs::write(&dest_path, &patched_content).await
-                                    {
-                                        tracing::warn!(
-                                            mission = %mission_id,
-                                            workspace = %workspace.name,
-                                            error = %e,
-                                            "Failed to write oh-my-opencode settings"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            mission = %mission_id,
-                                            path = %dest_path.display(),
-                                            "Synced oh-my-opencode settings to mission directory"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        mission = %mission_id,
-                                        workspace = %workspace.name,
-                                        error = %e,
-                                        "Failed to serialize oh-my-opencode settings"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        mission = %mission_id,
-                        workspace = %workspace.name,
-                        error = %e,
-                        "Failed to load oh-my-opencode settings from library"
-                    );
-                }
-            }
-        }
-    }
-
-    // Sync native opencode agents directory from profile (e.g.
-    // .opencode/agents/*.md). These are read by vanilla `opencode` directly
-    // and apply whether or not the oh-my-opencode wrapper is enabled.
+    // Sync native opencode agents from profile into the workspace path read by
+    // vanilla `opencode`.
     if backend_id == "opencode" {
         if let Some(lib) = library {
             let profile = config_profile.unwrap_or("default");
@@ -3792,8 +3697,7 @@ pub async fn write_runtime_workspace_state(
     let payload_str = serde_json::to_string_pretty(&payload)?;
     tokio::fs::write(&path, &payload_str).await?;
 
-    // Also write to current_workspace.json so SANDBOXED_SH_RUNTIME_WORKSPACE_FILE always works
-    // (that env var points to current_workspace.json, and oh-my-opencode reads it for container detection)
+    // Also write to current_workspace.json so SANDBOXED_SH_RUNTIME_WORKSPACE_FILE always works.
     if mission_id.is_some() {
         let current_path = runtime_dir.join("current_workspace.json");
         if let Err(e) = tokio::fs::write(&current_path, &payload_str).await {
@@ -4349,12 +4253,6 @@ if [ -n "$PKG_MGR" ]; then
       echo "[sandboxed] curl not found; skipping opencode install"
     fi
   fi
-  if [ "{install_opencode}" = "true" ] && ! command -v oh-my-opencode >/dev/null 2>&1; then
-    echo "[sandboxed] Installing oh-my-opencode via $PKG_MGR..."
-    if ! $PKG_MGR install -g oh-my-opencode@latest; then
-      echo "[sandboxed] OpenCode plugin install failed"
-    fi
-  fi
 fi
 
 if [ "{install_grok}" = "true" ] && ! command -v grok >/dev/null 2>&1; then
@@ -4582,34 +4480,6 @@ fn resolve_opencode_config_dir() -> std::path::PathBuf {
         .join("opencode")
 }
 
-/// Sync oh-my-opencode.json from Library to ~/.config/opencode/
-/// This makes Library-backed settings take effect for OpenCode.
-pub async fn sync_opencode_settings(library: &crate::library::LibraryStore) -> anyhow::Result<()> {
-    let settings = library.get_opencode_settings().await?;
-
-    // Don't sync empty settings
-    if settings.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-        tracing::debug!("No opencode settings in Library to sync");
-        return Ok(());
-    }
-
-    let dest_dir = resolve_opencode_config_dir();
-    let dest_path = dest_dir.join("oh-my-opencode.json");
-
-    // Ensure directory exists
-    tokio::fs::create_dir_all(&dest_dir).await?;
-
-    let content = serde_json::to_string_pretty(&settings)?;
-    tokio::fs::write(&dest_path, content).await?;
-
-    tracing::info!(
-        path = %dest_path.display(),
-        "Synced oh-my-opencode settings from Library"
-    );
-
-    Ok(())
-}
-
 /// Sync sandboxed/config.json from Library to the working directory.
 /// This makes Library-backed agent visibility settings available.
 pub async fn sync_sandboxed_config(
@@ -4671,72 +4541,6 @@ pub async fn read_sandboxed_config(
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => crate::library::SandboxedConfig::default(),
-    }
-}
-
-/// Patch oh-my-opencode.json agent models for Claude Code OAuth compatibility.
-///
-/// Claude Code OAuth tokens only work with specific models. This function:
-/// - Replaces `anthropic/claude-opus-4-5` with `anthropic/claude-sonnet-4-5`
-/// - Removes the "variant" field from Anthropic model agents (e.g., "max" for extended thinking)
-///
-/// This ensures agents like Prometheus work correctly when using Claude Code OAuth.
-fn patch_opencode_agent_models_for_oauth(content: &str) -> String {
-    let mut json: serde_json::Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(_) => return content.to_string(),
-    };
-
-    let Some(agents) = json.get_mut("agents").and_then(|v| v.as_object_mut()) else {
-        return content.to_string();
-    };
-
-    let mut patched = false;
-
-    for (_name, agent) in agents.iter_mut() {
-        let Some(agent_obj) = agent.as_object_mut() else {
-            continue;
-        };
-
-        // Check if this agent uses an Anthropic model
-        let is_anthropic = agent_obj
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(|m| m.starts_with("anthropic/"))
-            .unwrap_or(false);
-
-        if is_anthropic {
-            // Replace claude-opus-4-5 with claude-sonnet-4-5
-            if let Some(model_str) = agent_obj
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-            {
-                if model_str.contains("claude-opus-4-5") {
-                    let new_model = model_str.replace("claude-opus-4-5", "claude-sonnet-4-5");
-                    agent_obj.insert("model".to_string(), serde_json::Value::String(new_model));
-                    patched = true;
-                    tracing::info!(
-                        "Patched oh-my-opencode agent model: {} -> claude-sonnet-4-5",
-                        model_str
-                    );
-                }
-            }
-
-            // Remove "variant" field (e.g., "max" for extended thinking) as it's not supported
-            if agent_obj.remove("variant").is_some() {
-                patched = true;
-                tracing::info!(
-                    "Removed 'variant' field from Anthropic agent for OAuth compatibility"
-                );
-            }
-        }
-    }
-
-    if patched {
-        serde_json::to_string_pretty(&json).unwrap_or_else(|_| content.to_string())
-    } else {
-        content.to_string()
     }
 }
 

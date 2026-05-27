@@ -32,7 +32,6 @@ const componentNames: Record<string, string> = {
   claude_code: 'Claude Code',
   codex: 'Codex',
   grok: 'Grok Build',
-  oh_my_opencode: 'oh-my-opencode',
 };
 
 // Component icons
@@ -43,7 +42,6 @@ const componentIcons: Record<string, string> = {
   claude_code: '🤖',
   codex: '🧠',
   grok: '𝕏',
-  oh_my_opencode: '🎭',
 };
 
 interface UpdateLog {
@@ -100,8 +98,7 @@ export function ServerConnectionCard({
   const [updateLogsByOp, setUpdateLogsByOp] = useState<Record<OpKey, UpdateLog[]>>({});
   const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
 
-  // Fetch the legacy host-only summary AND the new per-workspace report in parallel.
-  // The legacy endpoint still owns host-only components (sandboxed.sh, oh-my-opencode).
+  // Fetch the host summary and the per-workspace report in parallel.
   const { data: legacyData, isLoading: legacyLoading, mutate: mutateLegacy } = useSWR(
     'system-components',
     async () => (await getSystemComponents()).components,

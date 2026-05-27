@@ -8,7 +8,7 @@
 //! - Library agents (`agent/*.md`)
 //! - Library tools (`tool/*.ts`)
 //! - Config profiles (`configs/<profile>/`) with harness-specific settings:
-//!   - `.opencode/` - OpenCode settings (settings.json, oh-my-opencode.json)
+//!   - `.opencode/` - OpenCode settings (settings.json, agents)
 //!   - `.claudecode/` - Claude Code settings (settings.json)
 //!   - `.sandboxed-sh/` - Sandboxed config (config.json)
 
@@ -1644,23 +1644,6 @@ impl LibraryStore {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // OpenCode Settings (delegates to default profile)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Get oh-my-opencode settings from the Library (default profile).
-    /// Returns an empty object if the file doesn't exist.
-    pub async fn get_opencode_settings(&self) -> Result<serde_json::Value> {
-        self.get_opencode_settings_for_profile(DEFAULT_PROFILE)
-            .await
-    }
-
-    /// Save oh-my-opencode settings to the Library (default profile).
-    pub async fn save_opencode_settings(&self, settings: &serde_json::Value) -> Result<()> {
-        self.save_opencode_settings_for_profile(DEFAULT_PROFILE, settings)
-            .await
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
     // Sandboxed Config (delegates to default profile)
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1772,25 +1755,15 @@ impl LibraryStore {
         let sandboxed_config_path = profile_dir.join(".sandboxed-sh").join("config.json");
 
         // Legacy paths for backward compatibility
-        let legacy_opencode_path = profile_dir.join("opencode").join("oh-my-opencode.json");
         let legacy_sandboxed_path = profile_dir.join("sandboxed").join("config.json");
         let legacy_claudecode_path = profile_dir.join("claudecode").join("config.json");
 
         // Collect all files in the profile for file-based editing
         let mut files = Vec::new();
 
-        // Load OpenCode settings (try new path first, then legacy)
+        // Load OpenCode settings.
         let opencode_settings = if opencode_settings_path.exists() {
             let content = fs::read_to_string(&opencode_settings_path)
-                .await
-                .context("Failed to read opencode settings")?;
-            files.push(ConfigProfileFile {
-                path: ".opencode/settings.json".to_string(),
-                content: content.clone(),
-            });
-            serde_json::from_str(&content).unwrap_or_default()
-        } else if legacy_opencode_path.exists() {
-            let content = fs::read_to_string(&legacy_opencode_path)
                 .await
                 .context("Failed to read opencode settings")?;
             files.push(ConfigProfileFile {
@@ -1992,69 +1965,6 @@ impl LibraryStore {
                 codex_config: CodexProfileConfig::default(),
             })
         }
-    }
-
-    /// Get OpenCode settings from a specific profile.
-    pub async fn get_opencode_settings_for_profile(
-        &self,
-        profile: &str,
-    ) -> Result<serde_json::Value> {
-        Self::validate_name(profile)?;
-
-        let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
-        // Try new path first, then legacy
-        let new_path = profile_dir.join(".opencode").join("oh-my-opencode.json");
-        let legacy_settings_path = profile_dir.join(".opencode").join("settings.json");
-        let legacy_path = profile_dir.join("opencode").join("oh-my-opencode.json");
-
-        tracing::debug!(
-            profile = %profile,
-            new_path = %new_path.display(),
-            new_path_exists = new_path.exists(),
-            legacy_settings_path = %legacy_settings_path.display(),
-            legacy_settings_path_exists = legacy_settings_path.exists(),
-            legacy_path = %legacy_path.display(),
-            legacy_path_exists = legacy_path.exists(),
-            "Checking OpenCode settings paths"
-        );
-
-        let path = if new_path.exists() {
-            new_path
-        } else if legacy_settings_path.exists() {
-            legacy_settings_path
-        } else if legacy_path.exists() {
-            legacy_path
-        } else {
-            tracing::debug!(profile = %profile, "No OpenCode settings found for profile");
-            return Ok(serde_json::json!({}));
-        };
-
-        let content = fs::read_to_string(&path)
-            .await
-            .context("Failed to read opencode settings")?;
-
-        serde_json::from_str(&content).context("Failed to parse opencode settings")
-    }
-
-    /// Save OpenCode settings to a specific profile.
-    pub async fn save_opencode_settings_for_profile(
-        &self,
-        profile: &str,
-        settings: &serde_json::Value,
-    ) -> Result<()> {
-        Self::validate_name(profile)?;
-
-        let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
-        let opencode_dir = profile_dir.join(".opencode");
-
-        fs::create_dir_all(&opencode_dir).await?;
-
-        let content = serde_json::to_string_pretty(settings)?;
-        fs::write(opencode_dir.join("oh-my-opencode.json"), content)
-            .await
-            .context("Failed to write opencode settings")?;
-
-        Ok(())
     }
 
     /// Get Sandboxed config from a specific profile.
@@ -2309,7 +2219,6 @@ impl LibraryStore {
 
     /// Get a harness default file from the library.
     /// Harness defaults are stored at the library root in directories like:
-    /// - opencode/oh-my-opencode.json
     /// - opencode/settings.json
     /// - claudecode/config.json
     /// - sandboxed/config.json
@@ -2415,75 +2324,6 @@ impl LibraryStore {
             path,
             remote: "test-remote".to_string(),
         }
-    }
-}
-
-#[cfg(test)]
-mod opencode_settings_tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore = "System config merging not implemented for config profiles yet"]
-    async fn merges_missing_agents_from_system_config() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let library_path = temp.path().join("library");
-        let system_path = temp.path().join("system");
-
-        // Use new config profile structure
-        tokio::fs::create_dir_all(library_path.join("configs/default/.opencode"))
-            .await
-            .expect("create library dir");
-        tokio::fs::create_dir_all(&system_path)
-            .await
-            .expect("create system dir");
-
-        let library_settings = serde_json::json!({
-            "agents": {
-                "sisyphus": { "model": "openai/gpt-4o-mini" }
-            }
-        });
-        tokio::fs::write(
-            library_path.join("configs/default/.opencode/settings.json"),
-            serde_json::to_string_pretty(&library_settings).unwrap(),
-        )
-        .await
-        .expect("write library settings");
-
-        let system_settings = serde_json::json!({
-            "agents": {
-                "sisyphus": { "model": "openai/gpt-4o-mini" },
-                "prometheus": { "model": "openai/gpt-4o" }
-            }
-        });
-        tokio::fs::write(
-            system_path.join("oh-my-opencode.json"),
-            serde_json::to_string_pretty(&system_settings).unwrap(),
-        )
-        .await
-        .expect("write system settings");
-
-        std::env::set_var("OPENCODE_CONFIG_DIR", &system_path);
-
-        let store = LibraryStore::with_test_store(library_path).await;
-        let merged = store.get_opencode_settings().await.expect("get settings");
-
-        let agents = merged.get("agents").and_then(|v| v.as_object()).unwrap();
-        assert!(agents.contains_key("sisyphus"));
-        assert!(agents.contains_key("prometheus"));
-
-        // Library file should be updated with prometheus.
-        let updated_path = temp
-            .path()
-            .join("library/configs/default/.opencode/settings.json");
-        let updated = tokio::fs::read_to_string(updated_path)
-            .await
-            .expect("read updated library");
-        let updated_value: serde_json::Value = serde_json::from_str(&updated).unwrap();
-        let updated_agents = updated_value
-            .get("agents")
-            .and_then(|v| v.as_object())
-            .unwrap();
-        assert!(updated_agents.contains_key("prometheus"));
     }
 }
 

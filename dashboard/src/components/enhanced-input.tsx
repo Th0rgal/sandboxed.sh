@@ -330,7 +330,7 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
         type: 'command',
         name: cmd.name,
         description: cmd.description,
-        source: cmd.path === 'builtin' ? 'oh-my-opencode' : cmd.path === 'builtin-claude' ? 'claude-code' : 'library',
+        source: cmd.path === 'builtin' ? 'opencode' : cmd.path === 'builtin-claude' ? 'claude-code' : 'library',
         params: cmd.params,
       })));
       setTriggerPosition(0);

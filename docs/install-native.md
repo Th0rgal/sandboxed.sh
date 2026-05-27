@@ -300,47 +300,7 @@ Validation (on the server, from the repo root):
 scripts/validate_skill_isolation.sh
 ```
 
-### 3.3 Install oh-my-opencode (agent pack)
-
-Install the default agent pack. **Always use `bunx`, never `npm install -g`**:
-
-```bash
-bunx oh-my-opencode install --no-tui --claude=max20 --gemini=yes
-```
-
-This installs the **Sisyphus** default agent (plus other personalities like
-Oracle, Librarian, etc.).
-
-**Important**: If you enabled strong workspace skill isolation (section 3.2.1),
-the OpenCode service runs with `HOME=/var/lib/opencode`. Install oh-my-opencode
-with the correct HOME to ensure version detection works:
-
-```bash
-# Install with isolated HOME (required if using section 3.2.1)
-mkdir -p /var/lib/opencode/.config/opencode
-HOME=/var/lib/opencode bunx oh-my-opencode install --no-tui --claude=max20 --gemini=yes
-
-# Also copy/create configs if needed
-cp /root/.config/opencode/opencode.json /var/lib/opencode/.config/opencode/ 2>/dev/null || true
-systemctl restart opencode.service
-
-# Verify agents are loaded
-curl -s http://127.0.0.1:4096/agent | jq '.[].name'
-# Should show: Sisyphus, oracle, librarian, etc.
-```
-
-To preserve plugin defaults: leave the Sandboxed.sh agent/model overrides unset to
-use the OpenCode / oh-my-opencode defaults.
-
-Update strategy:
-
-- Pin a version in your Library `plugins.json` (e.g., `oh-my-opencode@1.2.3`) to
-  lock updates.
-- Otherwise, the plugin can auto-update via OpenCode's install hook and Open
-  Agent sync.
-- **After updating oh-my-opencode**, re-copy the configs if using isolated home.
-
-### 3.4 Install opencode-gemini-auth (optional, for Google OAuth)
+### 3.3 Install opencode-gemini-auth (optional, for Google OAuth)
 
 If you want to authenticate with Google accounts (Gemini plans/quotas including
 free tier) via OAuth instead of API keys:
@@ -762,8 +722,8 @@ Or follow `docs/DESKTOP_SETUP.md`.
 
 ### 9.1 Update Sandboxed.sh via Dashboard (recommended)
 
-The Settings page shows available updates for Sandboxed.sh, OpenCode, Grok, and
-oh-my-opencode. When a new version is available:
+The Settings page shows available updates for Sandboxed.sh, OpenCode, and Grok.
+When a new version is available:
 
 1. Go to **Settings → System Components**
 2. If "Update Available" appears, click the **Update** button
@@ -824,61 +784,6 @@ install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode
 systemctl restart opencode.service
 curl -fsSL http://127.0.0.1:4096/global/health | jq .
 ```
-
-### 9.4 Update oh-my-opencode
-
-oh-my-opencode is installed via `bunx` and cached in the service's HOME
-directory. Updates can be triggered from the dashboard (Settings → System
-Components) or manually:
-
-```bash
-# Run with the same HOME as the Sandboxed.sh service
-# Check your /etc/sandboxed_sh/sandboxed_sh.env for the correct HOME value
-source /etc/sandboxed_sh/sandboxed_sh.env
-bunx oh-my-opencode@latest install --no-tui --claude=yes --gemini=yes --copilot=no
-```
-
-**Important:** Do NOT install oh-my-opencode globally via `npm install -g`. This
-creates version detection conflicts because the global binary in PATH takes
-precedence over bunx cache. Always use `bunx` which caches packages in the HOME
-directory.
-
-#### Troubleshooting version detection issues
-
-If the dashboard shows an old version after updating, check for stale
-installations:
-
-```bash
-# 1. Check for npm global install
-npm ls -g oh-my-opencode
-# If found, remove it:
-npm uninstall -g oh-my-opencode
-
-# 2. Check for stale binaries in common locations
-which oh-my-opencode
-ls -la /usr/local/bin/oh-my-opencode
-ls -la /usr/bin/oh-my-opencode
-# Remove any found:
-rm -f /usr/local/bin/oh-my-opencode /usr/bin/oh-my-opencode
-
-# 3. Check NVM paths (if using NVM for Node.js)
-ls /root/.nvm/versions/node/*/bin/oh-my-opencode 2>/dev/null
-# Remove any found:
-rm -f /root/.nvm/versions/node/*/bin/oh-my-opencode
-
-# 4. Clear bun cache for the service's HOME
-# Use the same HOME as configured in /etc/sandboxed_sh/sandboxed_sh.env
-source /etc/sandboxed_sh/sandboxed_sh.env
-rm -rf $HOME/.bun/install/cache/oh-my-opencode*
-
-# 5. Reinstall and verify
-bunx oh-my-opencode@latest install --no-tui --claude=yes --gemini=yes --copilot=no
-bunx oh-my-opencode --version
-```
-
-The service detects versions by running `bunx oh-my-opencode --version`. If
-there's a binary earlier in PATH, it will report that version instead of the
-bunx-cached version.
 
 ## 10) Production Security (TLS + Reverse Proxy)
 

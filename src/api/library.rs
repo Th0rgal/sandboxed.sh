@@ -6,7 +6,7 @@
 //! - Skills CRUD
 //! - Commands CRUD
 //! - Library Agents CRUD
-//! - OpenCode settings (oh-my-opencode.json)
+//! - OpenCode settings
 //! - Sandboxed config (agent visibility, defaults)
 //! - Migration
 
@@ -224,9 +224,6 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/migrate", post(migrate_library))
         // Rename (works for all item types)
         .route("/rename/:item_type/:name", post(rename_item))
-        // OpenCode Settings (oh-my-opencode.json)
-        .route("/opencode/settings", get(get_opencode_settings))
-        .route("/opencode/settings", put(save_opencode_settings))
         // Sandboxed Config
         .route("/sandboxed-sh/config", get(get_sandboxed_config))
         .route("/sandboxed-sh/config", put(save_sandboxed_config))
@@ -241,14 +238,6 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/config-profile/:name", put(save_config_profile))
         .route("/config-profile/:name", delete(delete_config_profile))
         // Profile-specific config endpoints
-        .route(
-            "/config-profile/:name/opencode/settings",
-            get(get_opencode_settings_for_profile),
-        )
-        .route(
-            "/config-profile/:name/opencode/settings",
-            put(save_opencode_settings_for_profile),
-        )
         .route(
             "/config-profile/:name/sandboxed-sh/config",
             get(get_sandboxed_config_for_profile),
@@ -455,11 +444,6 @@ async fn sync_library_configs(
     crate::opencode_config::sync_global_plugins(&plugins)
         .await
         .map_err(internal_error)?;
-
-    // Sync OpenCode settings (oh-my-opencode.json) from Library to system
-    if let Err(e) = workspace::sync_opencode_settings(library).await {
-        tracing::warn!(error = %e, "Failed to sync oh-my-opencode settings during library sync");
-    }
 
     // Sync Sandboxed config from Library to working directory
     if let Err(e) = workspace::sync_sandboxed_config(library, &state.config.working_dir).await {
@@ -990,7 +974,7 @@ async fn delete_command(
 /// Response for builtin commands endpoint.
 #[derive(Debug, serde::Serialize)]
 struct BuiltinCommandsResponse {
-    /// Commands for OpenCode (oh-my-opencode)
+    /// Commands for OpenCode
     opencode: Vec<CommandSummary>,
     /// Commands for Claude Code
     claudecode: Vec<CommandSummary>,
@@ -1028,7 +1012,7 @@ async fn get_builtin_commands() -> (HeaderMap, Json<BuiltinCommandsResponse>) {
 }
 
 fn build_builtin_commands() -> BuiltinCommandsResponse {
-    // OpenCode builtin commands (oh-my-opencode)
+    // OpenCode builtin commands
     let opencode_commands = vec![
         CommandSummary {
             name: "ralph-loop".to_string(),
@@ -1437,55 +1421,6 @@ async fn migrate_library(
         .await
         .map(Json)
         .map_err(internal_error)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// OpenCode Settings (oh-my-opencode.json)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// GET /api/library/opencode/settings - Get oh-my-opencode settings from Library.
-async fn get_opencode_settings(
-    State(state): State<Arc<super::routes::AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .get_opencode_settings()
-        .await
-        .map(Json)
-        .map_err(internal_error)
-}
-
-/// PUT /api/library/opencode/settings - Save oh-my-opencode settings to Library.
-async fn save_opencode_settings(
-    State(state): State<Arc<super::routes::AppState>>,
-    headers: HeaderMap,
-    Json(settings): Json<serde_json::Value>,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-
-    // Validate that the input is a valid JSON object
-    if !settings.is_object() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Settings must be a JSON object".to_string(),
-        ));
-    }
-
-    library
-        .save_opencode_settings(&settings)
-        .await
-        .map_err(internal_error)?;
-
-    // Sync to system location
-    if let Err(e) = workspace::sync_opencode_settings(&library).await {
-        tracing::warn!(error = %e, "Failed to sync oh-my-opencode settings to system");
-    }
-
-    Ok((
-        StatusCode::OK,
-        "OpenCode settings saved successfully".to_string(),
-    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2018,48 +1953,6 @@ async fn delete_config_profile(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         })
-}
-
-/// GET /api/library/config-profile/:name/opencode/settings - Get OpenCode settings for a profile.
-async fn get_opencode_settings_for_profile(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .get_opencode_settings_for_profile(&name)
-        .await
-        .map(Json)
-        .map_err(internal_error)
-}
-
-/// PUT /api/library/config-profile/:name/opencode/settings - Save OpenCode settings for a profile.
-async fn save_opencode_settings_for_profile(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    Json(settings): Json<serde_json::Value>,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-
-    if !settings.is_object() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Settings must be a JSON object".to_string(),
-        ));
-    }
-
-    library
-        .save_opencode_settings_for_profile(&name, &settings)
-        .await
-        .map(|_| {
-            (
-                StatusCode::OK,
-                "OpenCode settings saved successfully".to_string(),
-            )
-        })
-        .map_err(internal_error)
 }
 
 /// GET /api/library/config-profile/:name/sandboxed-sh/config - Get Sandboxed config for a profile.

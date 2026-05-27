@@ -31,9 +31,7 @@ use crate::mcp::McpRegistry;
 use crate::opencode::{extract_reasoning, extract_text};
 use crate::secrets::SecretsStore;
 use crate::task::{extract_deliverables, DeliverableSet};
-use crate::util::{
-    auth_entry_has_credentials, build_history_context, env_var_bool, home_dir, strip_jsonc_comments,
-};
+use crate::util::{auth_entry_has_credentials, build_history_context, env_var_bool, home_dir};
 use crate::workspace::{self, Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
 
@@ -2073,9 +2071,7 @@ fn parse_opencode_sse_event(
         _ => None,
     };
 
-    // Detect session idle signals — oh-my-opencode emits these when the
-    // agent finishes all work.  This is critical for GLM models that may
-    // not emit response.completed.
+    // Detect session idle signals from OpenCode.
     let status_str = if event_type == "session.status" {
         props
             .get("type")
@@ -2889,8 +2885,7 @@ async fn run_mission_turn(
         && model_override.is_none()
     {
         // For OpenCode with a config profile but no explicit model override,
-        // clear the global default so the profile's oh-my-opencode agent
-        // models take precedence instead of being overridden.
+        // clear the global default so profile settings can take precedence.
         config.default_model = None;
     } else if backend_id == "codex" && model_override.is_none() {
         // Pin Codex instead of inheriting the global DEFAULT_MODEL, which is
@@ -2975,7 +2970,7 @@ async fn run_mission_turn(
     convo.push('\n');
 
     // Ensure mission workspace exists and is configured for OpenCode.
-    let mut workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    let workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
     if let Err(e) =
         workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
     {
@@ -3458,22 +3453,6 @@ async fn run_mission_turn(
             result
         }
         "opencode" => {
-            // Check profile's sandboxed config for the oh-my-opencode opt-in flag.
-            if let Some(ref profile) = effective_config_profile {
-                let lib_guard = library.read().await;
-                if let Some(lib) = lib_guard.as_ref() {
-                    if let Ok(profile_data) = lib.get_config_profile(profile).await {
-                        if profile_data.sandboxed_config.enable_oh_my_opencode {
-                            let mut obj = workspace.config.as_object().cloned().unwrap_or_default();
-                            obj.insert(
-                                "enable_oh_my_opencode".to_string(),
-                                serde_json::json!(true),
-                            );
-                            workspace.config = serde_json::Value::Object(obj);
-                        }
-                    }
-                }
-            }
             // Use per-workspace CLI execution for all workspace types to ensure
             // native bash + correct filesystem scope.
             run_opencode_turn(
@@ -6320,100 +6299,6 @@ fn opencode_session_token_from_line(line: &str) -> Option<&str> {
     None
 }
 
-/// Install a lightweight `opencode` wrapper script that intercepts `opencode serve` commands
-/// and overrides the `--port` argument using the `OPENCODE_SERVER_PORT` environment variable.
-///
-/// oh-my-opencode v3 is a compiled binary that always calls `opencode serve --port=4096`.
-/// Patching the JS source files has no effect on the binary. This wrapper sits at a higher
-/// PATH priority and intercepts the `serve` call to use the allocated port instead.
-fn install_opencode_serve_port_wrapper(
-    env: &mut HashMap<String, String>,
-    workspace: &Workspace,
-    port: &str,
-) -> bool {
-    // Only needed when a non-default port override is required
-    if port == "4096" || port == "0" || port.is_empty() {
-        return false;
-    }
-
-    // Determine the wrapper directory.
-    // For containers: use /root/.sandboxed-sh-bin (NOT /tmp) because nspawn mounts
-    // a fresh tmpfs over /tmp, hiding anything we write to the container rootfs.
-    let (wrapper_dir_host, wrapper_dir_env) = if workspace.workspace_type
-        == WorkspaceType::Container
-        && workspace::use_nspawn_for_workspace(workspace)
-    {
-        (
-            workspace.path.join("root").join(".sandboxed-sh-bin"),
-            "/root/.sandboxed-sh-bin".to_string(),
-        )
-    } else {
-        (
-            std::path::PathBuf::from("/tmp/.sandboxed-sh-bin"),
-            "/tmp/.sandboxed-sh-bin".to_string(),
-        )
-    };
-
-    if let Err(e) = std::fs::create_dir_all(&wrapper_dir_host) {
-        tracing::warn!("Failed to create opencode wrapper dir: {}", e);
-        return false;
-    }
-
-    // The wrapper script: intercepts `opencode serve` and overrides --port
-    // Note: We exclude our wrapper directory from PATH when searching for the real binary
-    // to avoid finding ourselves in an infinite loop.
-    let wrapper_script = r#"#!/bin/sh
-# opencode serve port override wrapper (installed by sandboxed.sh)
-WRAPPER_DIR="$(cd "$(dirname "$0")" && pwd)"
-CLEAN_PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^$WRAPPER_DIR$" | tr '\n' ':' | sed 's/:$//')"
-REAL_OPENCODE="$(PATH="$CLEAN_PATH" command -v opencode 2>/dev/null || echo /usr/local/bin/opencode)"
-if [ -n "$OPENCODE_SERVER_PORT" ] && [ "$1" = "serve" ]; then
-  shift
-  new_args=""
-  for arg in "$@"; do
-    case "$arg" in
-      --port=*) ;;
-      *) new_args="$new_args $arg" ;;
-    esac
-  done
-  exec "$REAL_OPENCODE" serve --port="$OPENCODE_SERVER_PORT" $new_args
-fi
-exec "$REAL_OPENCODE" "$@"
-"#;
-
-    let wrapper_path = wrapper_dir_host.join("opencode");
-    if let Err(e) = std::fs::write(&wrapper_path, wrapper_script) {
-        tracing::warn!("Failed to write opencode wrapper: {}", e);
-        return false;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
-    }
-
-    // Prepend the wrapper directory to PATH so it takes priority over the real binary
-    let current = env
-        .get("PATH")
-        .cloned()
-        .or_else(|| std::env::var("PATH").ok())
-        .unwrap_or_default();
-    let new_path = if current.is_empty() {
-        wrapper_dir_env.clone()
-    } else {
-        format!("{}:{}", wrapper_dir_env, current)
-    };
-    env.insert("PATH".to_string(), new_path);
-
-    tracing::debug!(
-        "Installed opencode serve port wrapper at {} (port={})",
-        wrapper_dir_env,
-        port
-    );
-    true
-}
-
 fn prepend_opencode_bin_to_path(env: &mut HashMap<String, String>, workspace: &Workspace) {
     let home = if workspace.workspace_type == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(workspace)
@@ -6449,7 +6334,7 @@ fn extract_opencode_session_id(output: &str) -> Option<String> {
 
 /// Returns true if the line is an OpenCode runner/status banner (not model output).
 ///
-/// oh-my-opencode writes a fixed set of status lines to stdout. We filter these
+/// OpenCode writes a fixed set of status lines to stdout. We filter these
 /// so they don't pollute `final_result` (which should only contain model text).
 ///
 /// The patterns below are deliberately tight — each matches a known runner status
@@ -6986,55 +6871,6 @@ fn allocate_opencode_server_port() -> Option<u16> {
         .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
 }
 
-fn host_oh_my_opencode_config_candidates() -> Vec<std::path::PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        let base = std::path::PathBuf::from(home)
-            .join(".config")
-            .join("opencode");
-        candidates.push(base.join("oh-my-opencode.json"));
-        candidates.push(base.join("oh-my-opencode.jsonc"));
-    }
-    candidates
-}
-
-fn omo_config_all_fallback(value: &serde_json::Value) -> bool {
-    let agents = match value.get("agents").and_then(|v| v.as_object()) {
-        Some(agents) => agents,
-        None => return false,
-    };
-    let mut saw_model = false;
-    for agent in agents.values() {
-        if let Some(model) = agent.get("model").and_then(|v| v.as_str()) {
-            saw_model = true;
-            if !model.contains("glm-4.7-free") {
-                return false;
-            }
-        }
-    }
-    saw_model
-}
-
-fn host_oh_my_opencode_config_is_fallback() -> Option<bool> {
-    for candidate in host_oh_my_opencode_config_candidates() {
-        if !candidate.exists() {
-            continue;
-        }
-        let contents = std::fs::read_to_string(&candidate).ok()?;
-        let parsed = serde_json::from_str::<serde_json::Value>(&contents)
-            .or_else(|_| {
-                let stripped = strip_jsonc_comments(&contents);
-                serde_json::from_str::<serde_json::Value>(&stripped)
-            })
-            .ok();
-        if let Some(value) = parsed {
-            return Some(omo_config_all_fallback(&value));
-        }
-        return Some(contents.contains("glm-4.7-free"));
-    }
-    None
-}
-
 struct OpenCodeAuthState {
     has_openai: bool,
     has_anthropic: bool,
@@ -7233,151 +7069,6 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
         has_zai,
         has_other,
         configured_providers,
-    }
-}
-
-fn workspace_oh_my_opencode_config_paths(
-    opencode_config_dir: &std::path::Path,
-) -> (std::path::PathBuf, std::path::PathBuf) {
-    (
-        opencode_config_dir.join("oh-my-opencode.json"),
-        opencode_config_dir.join("oh-my-opencode.jsonc"),
-    )
-}
-
-fn try_copy_host_oh_my_opencode_config(opencode_config_dir: &std::path::Path) -> bool {
-    let (omo_path, omo_path_jsonc) = workspace_oh_my_opencode_config_paths(opencode_config_dir);
-    for candidate in host_oh_my_opencode_config_candidates() {
-        if !candidate.exists() {
-            continue;
-        }
-        if let Some(parent) = opencode_config_dir.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(
-                    "Failed to create OpenCode config dir {}: {}",
-                    parent.display(),
-                    e
-                );
-                return false;
-            }
-        }
-        if let Err(e) = std::fs::create_dir_all(opencode_config_dir) {
-            tracing::warn!(
-                "Failed to create OpenCode config dir {}: {}",
-                opencode_config_dir.display(),
-                e
-            );
-            return false;
-        }
-        let dest = if candidate.extension().and_then(|s| s.to_str()) == Some("jsonc") {
-            &omo_path_jsonc
-        } else {
-            &omo_path
-        };
-        if let Err(e) = std::fs::copy(&candidate, dest) {
-            tracing::warn!(
-                "Failed to copy oh-my-opencode config to workspace {}: {}",
-                dest.display(),
-                e
-            );
-            return false;
-        }
-        tracing::info!(
-            "Copied oh-my-opencode config to workspace {}",
-            dest.display()
-        );
-        return true;
-    }
-    false
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn ensure_oh_my_opencode_config(
-    workspace_exec: &WorkspaceExec,
-    work_dir: &std::path::Path,
-    opencode_config_dir_host: &std::path::Path,
-    opencode_config_dir_env: &std::path::Path,
-    cli_runner: &str,
-    runner_is_direct: bool,
-    has_openai: bool,
-    has_anthropic: bool,
-    has_google: bool,
-) {
-    let (omo_path, omo_path_jsonc) =
-        workspace_oh_my_opencode_config_paths(opencode_config_dir_host);
-    if omo_path.exists() || omo_path_jsonc.exists() {
-        return;
-    }
-
-    let has_any_provider = has_openai || has_anthropic || has_google;
-    let host_fallback = host_oh_my_opencode_config_is_fallback();
-    let should_regen = matches!(host_fallback, Some(true)) && has_any_provider;
-
-    if !should_regen && try_copy_host_oh_my_opencode_config(opencode_config_dir_host) {
-        return;
-    }
-
-    // No config found; run oh-my-opencode install in non-interactive mode to generate defaults.
-    let mut args: Vec<String> = Vec::new();
-    let claude_flag = if has_anthropic { "yes" } else { "no" };
-    let openai_flag = if has_openai { "yes" } else { "no" };
-    let gemini_flag = if has_google { "yes" } else { "no" };
-    if runner_is_direct {
-        args.extend([
-            "install".to_string(),
-            "--no-tui".to_string(),
-            format!("--claude={}", claude_flag),
-            format!("--openai={}", openai_flag),
-            format!("--gemini={}", gemini_flag),
-            "--copilot=no".to_string(),
-            "--skip-auth".to_string(),
-        ]);
-    } else {
-        args.extend([
-            "oh-my-opencode".to_string(),
-            "install".to_string(),
-            "--no-tui".to_string(),
-            format!("--claude={}", claude_flag),
-            format!("--openai={}", openai_flag),
-            format!("--gemini={}", gemini_flag),
-            "--copilot=no".to_string(),
-            "--skip-auth".to_string(),
-        ]);
-    }
-
-    let mut env = std::collections::HashMap::new();
-    env.insert(
-        "OPENCODE_CONFIG_DIR".to_string(),
-        opencode_config_dir_env.to_string_lossy().to_string(),
-    );
-    env.insert("NO_COLOR".to_string(), "1".to_string());
-    env.insert("FORCE_COLOR".to_string(), "0".to_string());
-
-    match workspace_exec
-        .output(work_dir, cli_runner, &args, env)
-        .await
-    {
-        Ok(output) => {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                tracing::warn!(
-                    "oh-my-opencode install failed: {} {}",
-                    stderr.trim(),
-                    stdout.trim()
-                );
-            } else {
-                tracing::info!("Generated oh-my-opencode config in workspace");
-                // Some oh-my-opencode versions ignore OPENCODE_CONFIG_DIR during install,
-                // so copy the generated host config into the workspace if still missing.
-                if !omo_path.exists() && !omo_path_jsonc.exists() {
-                    let _ = try_copy_host_oh_my_opencode_config(opencode_config_dir_host);
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to run oh-my-opencode install: {}", e);
-        }
     }
 }
 
@@ -7622,285 +7313,6 @@ async fn ensure_opencode_plugin_installed(
     }
 }
 
-fn sync_opencode_agent_config(
-    opencode_config_dir: &std::path::Path,
-    default_model: Option<&str>,
-    has_openai: bool,
-    has_anthropic: bool,
-    has_google: bool,
-) {
-    let (omo_path, omo_path_jsonc) = workspace_oh_my_opencode_config_paths(opencode_config_dir);
-    let omo_path = if omo_path.exists() {
-        omo_path
-    } else if omo_path_jsonc.exists() {
-        omo_path_jsonc
-    } else {
-        return;
-    };
-
-    let omo_contents = match std::fs::read_to_string(&omo_path) {
-        Ok(contents) => contents,
-        Err(err) => {
-            tracing::warn!(
-                "Failed to read oh-my-opencode config at {}: {}",
-                omo_path.display(),
-                err
-            );
-            return;
-        }
-    };
-
-    let omo_json = if omo_path.extension().and_then(|s| s.to_str()) == Some("jsonc") {
-        serde_json::from_str::<serde_json::Value>(&strip_jsonc_comments(&omo_contents))
-    } else {
-        serde_json::from_str::<serde_json::Value>(&omo_contents)
-    };
-
-    let omo_json = match omo_json {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(
-                "Failed to parse oh-my-opencode config at {}: {}",
-                omo_path.display(),
-                err
-            );
-            return;
-        }
-    };
-
-    let Some(omo_agents) = omo_json.get("agents").and_then(|v| v.as_object()) else {
-        return;
-    };
-
-    let (opencode_path, mut opencode_json) = load_opencode_json(opencode_config_dir);
-
-    let provider_allowed = |provider: &str| -> bool {
-        match provider {
-            "anthropic" | "claude" => has_anthropic,
-            "openai" | "codex" => has_openai,
-            "google" | "gemini" => has_google,
-            _ => true,
-        }
-    };
-
-    let mut effective_default = default_model;
-    if let Some(model) = default_model {
-        if let Some((provider, _)) = model.split_once('/') {
-            if !provider_allowed(provider) {
-                tracing::warn!(
-                    provider = %provider,
-                    "Skipping default OpenCode model override because provider is not configured"
-                );
-                effective_default = None;
-            }
-        }
-    }
-
-    let model_allowed = |model: &str| -> bool {
-        match model.split_once('/') {
-            Some((provider, _)) => provider_allowed(provider),
-            None => true,
-        }
-    };
-
-    // When oh-my-opencode is enabled, it injects fully-specified agents
-    // (including prompts/permissions) into OpenCode. If we also write
-    // per-agent overrides into opencode.json, OpenCode treats those as
-    // authoritative and overwrites the plugin-defined agents, which
-    // strips the Prometheus/Metis/Momus/etc prompts. Therefore, we avoid
-    // writing any per-agent overrides for oh-my-opencode agents and
-    // remove any stale overrides that might already exist.
-    let oh_my_opencode_enabled = opencode_json
-        .get("plugin")
-        .and_then(|v| v.as_array())
-        .map(|plugins| {
-            plugins.iter().any(|entry| {
-                entry
-                    .as_str()
-                    .map(|s| s.contains("oh-my-opencode"))
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
-
-    let mut updated = false;
-    if let Some(model) = effective_default {
-        if let Some(obj) = opencode_json.as_object_mut() {
-            match obj.get("model").and_then(|v| v.as_str()) {
-                Some(existing) if existing == model => {}
-                _ => {
-                    obj.insert(
-                        "model".to_string(),
-                        serde_json::Value::String(model.to_string()),
-                    );
-                    updated = true;
-                }
-            }
-        }
-    } else if let Some(obj) = opencode_json.as_object_mut() {
-        if let Some(existing) = obj.get("model").and_then(|v| v.as_str()) {
-            if let Some((provider, _)) = existing.split_once('/') {
-                if !provider_allowed(provider) {
-                    obj.remove("model");
-                    updated = true;
-                }
-            }
-        }
-    }
-
-    if let Some(obj) = opencode_json.as_object_mut() {
-        let agent_entry = obj
-            .entry("agent".to_string())
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        let agent_entry = match agent_entry.as_object_mut() {
-            Some(entry) => entry,
-            None => return,
-        };
-
-        if oh_my_opencode_enabled {
-            for name in omo_agents.keys() {
-                if agent_entry.remove(name).is_some() {
-                    updated = true;
-                }
-            }
-        } else {
-            for (name, entry) in omo_agents {
-                // Agent-specific model from oh-my-opencode.json takes priority over fallback default
-                let desired_model = entry
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .filter(|model| model_allowed(model))
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        effective_default
-                            .filter(|model| model_allowed(model))
-                            .map(|s| s.to_string())
-                    });
-
-                if let Some(existing) = agent_entry.get_mut(name) {
-                    if let (Some(model), Some(existing_obj)) =
-                        (desired_model.as_ref(), existing.as_object_mut())
-                    {
-                        match existing_obj.get("model").and_then(|v| v.as_str()) {
-                            Some(current) if current == model => {}
-                            _ => {
-                                existing_obj.insert(
-                                    "model".to_string(),
-                                    serde_json::Value::String(model.clone()),
-                                );
-                                updated = true;
-                            }
-                        }
-                    } else if let Some(existing_obj) = existing.as_object_mut() {
-                        if let Some(current) = existing_obj.get("model").and_then(|v| v.as_str()) {
-                            if !model_allowed(current) {
-                                existing_obj.remove("model");
-                                updated = true;
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                let mut agent_config = serde_json::Map::new();
-                if let Some(model) = desired_model {
-                    agent_config.insert("model".to_string(), serde_json::Value::String(model));
-                }
-                agent_entry.insert(name.clone(), serde_json::Value::Object(agent_config));
-                updated = true;
-            }
-        }
-    }
-
-    if updated {
-        save_json_warn(&opencode_path, &opencode_json, "opencode.json agent config");
-    }
-}
-
-fn apply_model_override_to_oh_my_opencode(
-    opencode_config_dir: &std::path::Path,
-    model_override: &str,
-) {
-    let model_override = model_override.trim();
-    if model_override.is_empty() {
-        return;
-    }
-
-    let (omo_path, omo_path_jsonc) = workspace_oh_my_opencode_config_paths(opencode_config_dir);
-    let target_path = if omo_path.exists() {
-        omo_path
-    } else if omo_path_jsonc.exists() {
-        omo_path_jsonc
-    } else {
-        return;
-    };
-
-    let contents = match std::fs::read_to_string(&target_path) {
-        Ok(contents) => contents,
-        Err(err) => {
-            tracing::warn!(
-                "Failed to read oh-my-opencode config at {}: {}",
-                target_path.display(),
-                err
-            );
-            return;
-        }
-    };
-
-    let json = if target_path.extension().and_then(|s| s.to_str()) == Some("jsonc") {
-        serde_json::from_str::<serde_json::Value>(&strip_jsonc_comments(&contents))
-    } else {
-        serde_json::from_str::<serde_json::Value>(&contents)
-    };
-
-    let mut json = match json {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(
-                "Failed to parse oh-my-opencode config at {}: {}",
-                target_path.display(),
-                err
-            );
-            return;
-        }
-    };
-
-    if let Some(obj) = json.as_object_mut() {
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(model_override.to_string()),
-        );
-    }
-
-    if let Some(agents) = json.get_mut("agents").and_then(|v| v.as_object_mut()) {
-        for agent in agents.values_mut() {
-            if let Some(agent_obj) = agent.as_object_mut() {
-                agent_obj.insert(
-                    "model".to_string(),
-                    serde_json::Value::String(model_override.to_string()),
-                );
-                agent_obj.remove("variant");
-            }
-        }
-    }
-
-    if let Ok(updated) = serde_json::to_string_pretty(&json) {
-        if let Err(err) = std::fs::write(&target_path, updated) {
-            tracing::warn!(
-                "Failed to write oh-my-opencode config at {}: {}",
-                target_path.display(),
-                err
-            );
-        } else {
-            tracing::info!(
-                "Applied OpenCode model override {} to {}",
-                model_override,
-                target_path.display()
-            );
-        }
-    }
-}
-
 /// Ensure the `opencode.json` `provider` section contains a definition for the
 /// provider used by the model override.  OpenCode's built-in snapshot only knows
 /// about a subset of models per provider; if a model (e.g. `zai/glm-5`) is not
@@ -8070,179 +7482,6 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
             opencode_path.display()
         );
     }
-}
-
-/// Scan the oh-my-opencode config for all model references (top-level, agents,
-/// categories) and ensure each provider has a definition in `opencode.json`.
-fn ensure_opencode_providers_for_omo_config(opencode_config_dir: &std::path::Path) {
-    let (omo_path, omo_path_jsonc) = workspace_oh_my_opencode_config_paths(opencode_config_dir);
-    let target_path = if omo_path.exists() {
-        omo_path
-    } else if omo_path_jsonc.exists() {
-        omo_path_jsonc
-    } else {
-        return;
-    };
-
-    let contents = match std::fs::read_to_string(&target_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let parsed = if target_path.extension().and_then(|s| s.to_str()) == Some("jsonc") {
-        serde_json::from_str::<serde_json::Value>(&strip_jsonc_comments(&contents))
-    } else {
-        serde_json::from_str::<serde_json::Value>(&contents)
-    };
-    let json = match parsed {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let mut models = std::collections::HashSet::new();
-
-    // Collect top-level model
-    if let Some(m) = json.get("model").and_then(|v| v.as_str()) {
-        models.insert(m.to_string());
-    }
-
-    // Collect agent models
-    if let Some(agents) = json.get("agents").and_then(|v| v.as_object()) {
-        for agent in agents.values() {
-            if let Some(m) = agent.get("model").and_then(|v| v.as_str()) {
-                models.insert(m.to_string());
-            }
-        }
-    }
-
-    // Collect category models
-    if let Some(categories) = json.get("categories").and_then(|v| v.as_object()) {
-        for cat in categories.values() {
-            if let Some(m) = cat.get("model").and_then(|v| v.as_str()) {
-                models.insert(m.to_string());
-            }
-        }
-    }
-
-    for model in &models {
-        ensure_opencode_provider_for_model(opencode_config_dir, model);
-    }
-}
-
-fn workspace_abs_path(workspace: &Workspace, path: &std::path::Path) -> std::path::PathBuf {
-    if workspace.workspace_type == WorkspaceType::Container
-        && workspace::use_nspawn_for_workspace(workspace)
-    {
-        if let Ok(relative) = path.strip_prefix(std::path::Path::new("/")) {
-            return workspace.path.join(relative);
-        }
-        return workspace.path.join(path);
-    }
-    path.to_path_buf()
-}
-
-fn find_oh_my_opencode_cli_js(workspace: &Workspace) -> Option<std::path::PathBuf> {
-    // Static paths for global npm installations
-    let candidates = [
-        "/usr/local/lib/node_modules/oh-my-opencode/dist/cli/index.js",
-        "/usr/lib/node_modules/oh-my-opencode/dist/cli/index.js",
-        "/opt/homebrew/lib/node_modules/oh-my-opencode/dist/cli/index.js",
-        "/usr/local/share/node_modules/oh-my-opencode/dist/cli/index.js",
-    ];
-
-    for candidate in candidates {
-        let path = workspace_abs_path(workspace, std::path::Path::new(candidate));
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    // Search bun cache for oh-my-opencode (used when installed via bunx)
-    // Pattern: ~/.cache/.bun/install/cache/oh-my-opencode@<version>@@@1/dist/cli/index.js
-    // Some bun versions use ~/.bun/install/cache instead of ~/.cache/.bun/install/cache
-    let bun_cache_bases = [
-        "/root/.cache/.bun/install/cache",
-        "/root/.bun/install/cache",
-        "/home/*/.cache/.bun/install/cache",
-        "/home/*/.bun/install/cache",
-    ];
-    for base in bun_cache_bases {
-        let base_path = workspace_abs_path(workspace, std::path::Path::new(base));
-        if let Ok(entries) = std::fs::read_dir(&base_path) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("oh-my-opencode@") {
-                    let cli_js = entry.path().join("dist/cli/index.js");
-                    if cli_js.exists() {
-                        return Some(cli_js);
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn patch_oh_my_opencode_port_override(workspace: &Workspace) -> bool {
-    let Some(cli_js_path) = find_oh_my_opencode_cli_js(workspace) else {
-        return false;
-    };
-
-    let contents = match std::fs::read_to_string(&cli_js_path) {
-        Ok(contents) => contents,
-        Err(err) => {
-            tracing::warn!(
-                "Failed to read oh-my-opencode CLI at {}: {}",
-                cli_js_path.display(),
-                err
-            );
-            return false;
-        }
-    };
-
-    if contents.contains("SANDBOXED_SH_OPENCODE_PORT_PATCH") {
-        return true;
-    }
-
-    let newline = if contents.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    let needle = format!(
-        "const {{ client: client3, server: server2 }} = await createOpencode({{{nl}      signal: abortController.signal{nl}    }});",
-        nl = newline
-    );
-    if !contents.contains(&needle) {
-        tracing::warn!(
-            "Unable to patch oh-my-opencode CLI (pattern mismatch) at {}",
-            cli_js_path.display()
-        );
-        return false;
-    }
-
-    let replacement = format!(
-        "const __oaPortRaw = process.env.OPENCODE_SERVER_PORT;{nl}    const __oaPort = __oaPortRaw ? Number(__oaPortRaw) : void 0;{nl}    const __oaHost = process.env.OPENCODE_SERVER_HOSTNAME;{nl}    const {{ client: client3, server: server2 }} = await createOpencode({{{nl}      signal: abortController.signal,{nl}      ...(Number.isFinite(__oaPort) ? {{ port: __oaPort }} : {{}}),{nl}      ...(__oaHost ? {{ hostname: __oaHost }} : {{}}),{nl}      // SANDBOXED_SH_OPENCODE_PORT_PATCH{nl}    }});",
-        nl = newline
-    );
-
-    let patched = contents.replace(&needle, &replacement);
-    if let Err(err) = std::fs::write(&cli_js_path, patched) {
-        tracing::warn!(
-            "Failed to patch oh-my-opencode CLI at {}: {}",
-            cli_js_path.display(),
-            err
-        );
-        return false;
-    }
-
-    tracing::info!(
-        "Patched oh-my-opencode CLI to honor OPENCODE_SERVER_PORT at {}",
-        cli_js_path.display()
-    );
-    true
 }
 
 fn opencode_storage_roots(workspace: &Workspace) -> Vec<std::path::PathBuf> {
@@ -8829,46 +8068,7 @@ fn resolve_opencode_model_from_config(
         return Some(model.to_string());
     }
 
-    let omo_path = opencode_config_dir.join("oh-my-opencode.json");
-    let omo_jsonc_path = opencode_config_dir.join("oh-my-opencode.jsonc");
-    let omo_path = if omo_jsonc_path.exists() {
-        omo_jsonc_path
-    } else {
-        omo_path
-    };
-
-    let contents = std::fs::read_to_string(omo_path).ok()?;
-    let contents = if contents.contains("//") {
-        strip_jsonc_comments(&contents)
-    } else {
-        contents
-    };
-    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    if let Some(agent_name) = agent {
-        if let Some(model) = value
-            .get("agents")
-            .and_then(|v| v.get(agent_name))
-            .and_then(|v| v.get("model"))
-            .and_then(|v| v.as_str())
-        {
-            return Some(model.to_string());
-        }
-        if let Some(agent_map) = value.get("agents").and_then(|v| v.as_object()) {
-            let agent_lower = agent_name.to_lowercase();
-            for (name, entry) in agent_map {
-                if name.to_lowercase() == agent_lower {
-                    if let Some(model) = entry.get("model").and_then(|v| v.as_str()) {
-                        return Some(model.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    value
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    None
 }
 
 async fn command_available(
@@ -10134,14 +9334,6 @@ fn copy_host_executable_into_container(
     Ok(format!("/usr/local/bin/{}", name))
 }
 
-fn runner_is_oh_my_opencode(path: &str) -> bool {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| name == "oh-my-opencode")
-        .unwrap_or(false)
-}
-
 async fn resolve_opencode_installer_fetcher(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
@@ -10933,8 +10125,7 @@ async fn gemini_bun_fallback_if_needed(
 /// For Host workspaces: spawns the CLI directly on the host.
 /// For Container workspaces: spawns the CLI inside the container using systemd-nspawn.
 ///
-/// This uses the `oh-my-opencode run` CLI which creates an embedded OpenCode server,
-/// enabling per-workspace isolation without network issues.
+/// This uses `opencode run` directly for per-workspace isolation.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_opencode_turn(
     workspace: &Workspace,
@@ -10956,15 +10147,11 @@ pub async fn run_opencode_turn(
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    // When no agent is requested, default to vanilla opencode's primary
-    // "build" agent. Workspaces that opt into oh-my-opencode and want a
-    // different default should set their preferred agent on the mission
-    // (or via SandboxedConfig::default_agent).
+    // When no agent is requested, default to vanilla opencode's primary "build" agent.
     let default_agent = if agent.is_none() { Some("build") } else { None };
     let agent = agent.or(default_agent);
 
-    // Determine CLI runner: prefer backend config, then env var, then try bunx/npx
-    // We use 'bunx oh-my-opencode run' or 'npx oh-my-opencode run' for per-workspace execution.
+    // Use the OpenCode CLI directly for per-workspace execution.
     let workspace_exec = WorkspaceExec::new(workspace.clone());
     if let Err(err) = ensure_opencode_cli_available(&workspace_exec, work_dir).await {
         tracing::error!("{}", err);
@@ -10979,9 +10166,6 @@ pub async fn run_opencode_turn(
     let opencode_config_dir_host = work_dir.join(".opencode");
 
     // Resolve the model: explicit override > agent config > env var defaults.
-    // Agent config (oh-my-opencode.json) is checked before env vars so that
-    // config profiles with agent-specific models take precedence over global
-    // default model env vars.
     let mut resolved_model = model
         .map(|m| m.to_string())
         .or_else(|| resolve_opencode_model_from_config(&opencode_config_dir_host, agent))
@@ -11032,10 +10216,6 @@ pub async fn run_opencode_turn(
             provider_hint = None;
         }
     }
-
-    // Capture model override AFTER provider availability check so that cleared
-    // overrides are not passed to sync_opencode_agent_config.
-    let default_model_override = resolved_model.clone();
 
     let needs_google = matches!(provider_hint.as_deref(), Some("google" | "gemini"));
 
@@ -11090,10 +10270,8 @@ pub async fn run_opencode_turn(
     let configured_runner = get_backend_string_setting("opencode", "cli_path")
         .or_else(|| std::env::var("OPENCODE_CLI_PATH").ok());
 
-    let mut runner_is_direct = false;
     let cli_runner = if let Some(path) = configured_runner {
         if command_available(&workspace_exec, work_dir, &path).await {
-            runner_is_direct = runner_is_oh_my_opencode(&path);
             path
         } else {
             let err_msg = format!(
@@ -11103,18 +10281,14 @@ pub async fn run_opencode_turn(
             tracing::error!("{}", err_msg);
             return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
+    } else if command_available(&workspace_exec, work_dir, "opencode").await {
+        "opencode".to_string()
     } else {
-        // Prefer bunx for oh-my-opencode (avoids version conflicts from npm global installs)
-        if command_available(&workspace_exec, work_dir, "bunx").await {
-            "bunx".to_string()
-        } else if command_available(&workspace_exec, work_dir, "npx").await {
-            "npx".to_string()
-        } else {
-            let err_msg =
-                "No OpenCode CLI runner found in workspace (expected bunx or npx).".to_string();
-            tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-        }
+        let err_msg =
+            "OpenCode CLI not found in workspace. Install opencode or update OPENCODE_CLI_PATH."
+                .to_string();
+        tracing::error!("{}", err_msg);
+        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
     };
 
     // Proactive network connectivity check - fail fast if API is unreachable
@@ -11147,30 +10321,6 @@ pub async fn run_opencode_turn(
     let work_dir_env = workspace_path_for_env(workspace, work_dir);
     let work_dir_arg = work_dir_env.to_string_lossy().to_string();
     let opencode_config_dir_env = workspace_path_for_env(workspace, &opencode_config_dir_host);
-    ensure_oh_my_opencode_config(
-        &workspace_exec,
-        work_dir,
-        &opencode_config_dir_host,
-        &opencode_config_dir_env,
-        &cli_runner,
-        runner_is_direct,
-        has_openai,
-        has_anthropic,
-        needs_google,
-    )
-    .await;
-    if model.is_some() {
-        if let Some(model_override) = resolved_model.as_deref() {
-            apply_model_override_to_oh_my_opencode(&opencode_config_dir_host, model_override);
-        }
-    }
-    sync_opencode_agent_config(
-        &opencode_config_dir_host,
-        default_model_override.as_deref(),
-        has_openai,
-        has_anthropic,
-        has_google,
-    );
     let mut model_used: Option<String> = None;
     // Accumulate token usage from SSE response.completed events for cost estimation
     let mut total_input_tokens: u64 = 0;
@@ -11182,8 +10332,7 @@ pub async fn run_opencode_turn(
         resolved_model = agent_model.clone();
     }
     // Inject provider definitions into opencode.json for models not in
-    // OpenCode's built-in snapshot.  We do this *after* sync_opencode_agent_config
-    // so all writes to opencode.json's model/agent sections are finished first.
+    // OpenCode's built-in snapshot.
     if let Some(model_override) = resolved_model.as_deref() {
         ensure_opencode_provider_for_model(&opencode_config_dir_host, model_override);
     }
@@ -11192,7 +10341,6 @@ pub async fn run_opencode_turn(
             ensure_opencode_provider_for_model(&opencode_config_dir_host, am);
         }
     }
-    ensure_opencode_providers_for_omo_config(&opencode_config_dir_host);
     if needs_google {
         if let Some(project_id) = detect_google_project_id() {
             ensure_opencode_google_project_id(&opencode_config_dir_host, &project_id);
@@ -11220,31 +10368,6 @@ pub async fn run_opencode_turn(
         )
         .await;
     }
-    // Pre-cache oh-my-opencode via bunx/npx so the port override patch can find the CLI JS.
-    // When the runner is bunx/npx, the package isn't cached until the actual run command.
-    // Without pre-caching, the patch fails and the port falls back to 4096, which may
-    // conflict with a standalone opencode.service on the host (shared network namespace).
-    if !runner_is_direct && find_oh_my_opencode_cli_js(workspace).is_none() {
-        tracing::debug!(
-            mission_id = %mission_id,
-            cli_runner = %cli_runner,
-            "Pre-caching oh-my-opencode for port override patch"
-        );
-        let precache_args = vec!["oh-my-opencode".to_string(), "--version".to_string()];
-        let _ = workspace_exec
-            .output(work_dir, &cli_runner, &precache_args, HashMap::new())
-            .await;
-    }
-    // Patch JS source for older (pre-v3) JS-based oh-my-opencode versions.
-    // For v3+ compiled binaries, the wrapper script handles port override instead.
-    let _ = patch_oh_my_opencode_port_override(workspace);
-
-    // Build CLI arguments for oh-my-opencode run
-    // The 'run' command takes a prompt and executes it with completion detection
-    // Arguments: bunx oh-my-opencode run [--agent <agent>] [--directory <path>] <message>
-    // Note: --timeout was removed in oh-my-opencode 3.7.2; the runner handles
-    // completion detection internally so an explicit timeout is not needed.
-    //
     // The message is written to a temp file and passed via $(cat ...) to avoid
     // argument splitting issues when multi-line messages go through
     // systemd-nspawn or nsenter shell wrappers.
@@ -11257,8 +10380,8 @@ pub async fn run_opencode_turn(
     let prompt_file_env = workspace_path_for_env(workspace, &prompt_file_host);
     let prompt_file_arg = prompt_file_env.to_string_lossy().to_string();
 
-    // Build the oh-my-opencode run command as a shell string so that
-    // $(cat <file>) correctly expands the message as a single argument.
+    // Build the opencode run command as a shell string so that $(cat <file>)
+    // correctly expands the message as a single argument.
     let shell_escape = |s: &str| -> String {
         let mut escaped = String::with_capacity(s.len() + 2);
         escaped.push('\'');
@@ -11273,153 +10396,52 @@ pub async fn run_opencode_turn(
         escaped
     };
 
-    // Vanilla `opencode` is the default. oh-my-opencode wraps opencode with extra
-    // features (todo enforcement, background tasks, opinionated agent profiles)
-    // and is opt-in per workspace/profile via `enable_oh_my_opencode`.
-    let oh_my_opencode_enabled = workspace
-        .config
-        .get("enable_oh_my_opencode")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let use_plain_opencode = !oh_my_opencode_enabled;
-
-    // `sisyphus` only exists inside the oh-my-opencode wrapper. Warn loudly when
-    // it is requested without the wrapper so the failure mode is obvious.
-    if use_plain_opencode
-        && agent
-            .map(|a| a.eq_ignore_ascii_case("sisyphus"))
-            .unwrap_or(false)
-    {
-        tracing::warn!(
-            mission_id = %mission_id,
-            "Agent 'sisyphus' requires oh-my-opencode, but enable_oh_my_opencode is false; mission will likely fail"
-        );
+    let opencode_model = resolved_model.as_deref().unwrap_or("builtin/fast");
+    if opencode_model.starts_with("builtin/") {
+        ensure_opencode_provider_for_model(&opencode_config_dir_host, opencode_model);
     }
 
-    tracing::info!(
-        mission_id = %mission_id,
-        use_plain_opencode = use_plain_opencode,
-        oh_my_opencode_enabled = oh_my_opencode_enabled,
-        "OpenCode mode selection"
+    let mut inner_cmd = String::new();
+    inner_cmd.push_str("#!/bin/sh\n");
+    inner_cmd.push_str(&shell_escape(&cli_runner));
+    inner_cmd.push_str(" run --format json --model ");
+    inner_cmd.push_str(&shell_escape(opencode_model));
+    if let Some(a) = agent {
+        inner_cmd.push_str(" --agent ");
+        inner_cmd.push_str(&shell_escape(a));
+    }
+    inner_cmd.push_str(" --dir ");
+    inner_cmd.push_str(&shell_escape(&work_dir_arg));
+    inner_cmd.push_str(" \"$(cat ");
+    inner_cmd.push_str(&shell_escape(&prompt_file_arg));
+    inner_cmd.push_str(")\"");
+
+    let script_host_path = format!("{}/.sandboxed-sh-opencode-cmd.sh", work_dir.display());
+    let script_env_path = format!(
+        "{}/.sandboxed-sh-opencode-cmd.sh",
+        prompt_file_arg
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or(".")
     );
-
-    // When using plain opencode, inject the builtin proxy provider for builtin
-    // models and strip MCP servers (they hang during boot and aren't needed for
-    // simple assistant-mode chat).
-    let plain_opencode_model = if use_plain_opencode {
-        let m = resolved_model.as_deref().unwrap_or("builtin/fast");
-        if m.starts_with("builtin/") {
-            ensure_opencode_provider_for_model(&opencode_config_dir_host, m);
-        }
-
-        // Replace workspace MCPs with profile-defined MCPs only.
-        // Workspace MCPs (desktop, playwright, cq) hang during boot.
-        // The profile's settings.json can define lightweight MCPs
-        // (e.g. orchestrator, automation-manager) that are useful.
-        let config_path = opencode_config_dir_host.join("opencode.json");
-        let profile_mcp_path = opencode_config_dir_host.join("oh-my-opencode.json");
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(obj) = config.as_object_mut() {
-                    let profile_mcps = std::fs::read_to_string(&profile_mcp_path)
-                        .ok()
-                        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                        .and_then(|v| v.get("mcp").cloned())
-                        .unwrap_or(serde_json::json!({}));
-                    let mcp_count = profile_mcps.as_object().map(|m| m.len()).unwrap_or(0);
-                    obj.insert("mcp".to_string(), profile_mcps);
-                    if let Ok(updated) = serde_json::to_string_pretty(&config) {
-                        let _ = std::fs::write(&config_path, updated);
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            mcp_count = mcp_count,
-                            "Replaced workspace MCPs with profile MCPs for plain opencode mode"
-                        );
-                    }
-                }
-            }
-        }
-
-        m.to_string()
-    } else {
-        "builtin/fast".to_string()
-    };
-
-    let mut shell_cmd = String::new();
-    if runner_is_direct {
-        shell_cmd.push_str(&shell_escape(&cli_runner));
-        shell_cmd.push_str(" run");
-    } else if use_plain_opencode {
-        // For plain opencode, write the command to a temp script file to avoid
-        // shell quoting issues. The script is run inside `script -qe` for PTY.
-        let mut inner_cmd = String::from("#!/bin/sh\nopencode run --format json");
-        inner_cmd.push_str(" --model ");
-        inner_cmd.push_str(&shell_escape(&plain_opencode_model));
-        if let Some(a) = agent {
-            inner_cmd.push_str(" --agent ");
-            inner_cmd.push_str(&shell_escape(a));
-        }
-        inner_cmd.push_str(" --dir ");
-        inner_cmd.push_str(&shell_escape(&work_dir_arg));
-        inner_cmd.push_str(" \"$(cat ");
-        inner_cmd.push_str(&shell_escape(&prompt_file_arg));
-        inner_cmd.push_str(")\"");
-
-        // Write script to host filesystem (next to the prompt file)
-        let script_host_path = format!("{}/.sandboxed-sh-opencode-cmd.sh", work_dir.display());
-        let script_env_path = format!(
-            "{}/.sandboxed-sh-opencode-cmd.sh",
-            prompt_file_arg
-                .rsplit_once('/')
-                .map(|(dir, _)| dir)
-                .unwrap_or(".")
-        );
-        if let Err(e) = std::fs::write(&script_host_path, &inner_cmd) {
-            tracing::error!(mission_id = %mission_id, "Failed to write opencode command script: {}", e);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&script_host_path, std::fs::Permissions::from_mode(0o755));
-        }
-
-        // Use script -qe to wrap in PTY, -e preserves exit code.
-        // Reference the script via its container-relative path.
-        shell_cmd.push_str("script -qe /dev/null -c ");
-        shell_cmd.push_str(&shell_escape(&script_env_path));
-        shell_cmd.push_str(" 2>/dev/null");
-    } else {
-        shell_cmd.push_str(&shell_escape(&cli_runner));
-        shell_cmd.push_str(" oh-my-opencode run");
+    if let Err(e) = std::fs::write(&script_host_path, &inner_cmd) {
+        tracing::error!(mission_id = %mission_id, "Failed to write opencode command script: {}", e);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script_host_path, std::fs::Permissions::from_mode(0o755));
     }
 
-    if !use_plain_opencode || runner_is_direct {
-        // For non-plain opencode, add agent/dir/prompt args directly
-        if let Some(a) = agent {
-            shell_cmd.push_str(" --agent ");
-            shell_cmd.push_str(&shell_escape(a));
-        }
-
-        // oh-my-opencode uses --directory
-        if runner_is_direct {
-            shell_cmd.push_str(" --dir ");
-        } else {
-            shell_cmd.push_str(" --directory ");
-        }
-        shell_cmd.push_str(&shell_escape(&work_dir_arg));
-
-        shell_cmd.push_str(" \"$(cat ");
-        shell_cmd.push_str(&shell_escape(&prompt_file_arg));
-        shell_cmd.push_str(")\"");
-    }
+    let mut shell_cmd = String::from("script -qe /dev/null -c ");
+    shell_cmd.push_str(&shell_escape(&script_env_path));
+    shell_cmd.push_str(" 2>/dev/null");
 
     let args = vec!["-c".to_string(), shell_cmd.clone()];
     let cli_runner_shell = "/bin/sh".to_string();
 
     tracing::debug!(
         mission_id = %mission_id,
-        runner_is_direct = runner_is_direct,
         shell_cmd = %shell_cmd,
         prompt_file = %prompt_file_arg,
         "OpenCode CLI args prepared (shell wrapper)"
@@ -11468,8 +10490,7 @@ pub async fn run_opencode_turn(
         );
     }
 
-    // Ensure bun's global bin directories are in PATH so that oh-my-opencode
-    // can find the `opencode` binary installed via `bun install -g opencode-ai`.
+    // Ensure OpenCode's install directory is available in PATH.
     {
         let current_path = std::env::var("PATH").unwrap_or_default();
         let bun_bins = "/root/.bun/bin:/root/.cache/.bun/bin";
@@ -11502,15 +10523,10 @@ pub async fn run_opencode_turn(
         opencode_port = "4096".to_string();
     }
 
-    // Plain opencode manages its own serve process; skip the port wrapper
-    // to avoid conflicts. Oh-my-opencode needs the port override to coexist
-    // with other instances.
-    if !use_plain_opencode {
-        env.insert("OPENCODE_SERVER_PORT".to_string(), opencode_port.clone());
-        if let Ok(host) = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME") {
-            if !host.trim().is_empty() {
-                env.insert("OPENCODE_SERVER_HOSTNAME".to_string(), host);
-            }
+    env.insert("OPENCODE_SERVER_PORT".to_string(), opencode_port.clone());
+    if let Ok(host) = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME") {
+        if !host.trim().is_empty() {
+            env.insert("OPENCODE_SERVER_HOSTNAME".to_string(), host);
         }
     }
     tracing::info!(
@@ -11580,16 +10596,6 @@ pub async fn run_opencode_turn(
 
     prepend_opencode_bin_to_path(&mut env, workspace);
 
-    // Install the opencode serve wrapper AFTER prepend_opencode_bin_to_path so the
-    // wrapper dir (/tmp/.sandboxed-sh-bin) is prepended last and takes priority over
-    // the real binary at ~/.opencode/bin/opencode.
-    // oh-my-opencode v3+ is a compiled binary that spawns `opencode serve --port=4096`;
-    // the wrapper intercepts this and overrides the port.
-    // Skip for plain opencode — it manages its own serve process.
-    if !use_plain_opencode && opencode_port != "4096" {
-        install_opencode_serve_port_wrapper(&mut env, workspace, &opencode_port);
-    }
-
     cleanup_opencode_listeners(&workspace_exec, work_dir, Some(&opencode_port)).await;
 
     // Use WorkspaceExec to spawn the CLI in the correct workspace context.
@@ -11608,9 +10614,6 @@ pub async fn run_opencode_turn(
     };
 
     // Get stdout and stderr for reading output
-    // oh-my-opencode run writes:
-    // - stdout: assistant text output (the actual response)
-    // - stderr: event logs (tool calls, results, session status)
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -11662,12 +10665,9 @@ pub async fn run_opencode_turn(
     // Used to skip inactivity timeouts during long tool runs (builds, tests, etc.).
     let (sse_tool_depth_tx, sse_tool_depth_rx) = tokio::sync::watch::channel(0u32);
 
-    // plain opencode with --format json outputs structured events to stdout.
-    // oh-my-opencode uses SSE from its internal server instead.
-    let use_json_stdout = use_plain_opencode;
-    let sse_handle = if !use_json_stdout
-        && command_available(&workspace_exec, work_dir, "curl").await
-    {
+    // opencode with --format json outputs structured events to stdout.
+    let use_json_stdout = true;
+    let sse_handle = if false && command_available(&workspace_exec, work_dir, "curl").await {
         let workspace_exec = workspace_exec.clone();
         let work_dir = work_dir.to_path_buf();
         let work_dir_arg = work_dir_arg.clone();
@@ -12155,7 +11155,7 @@ pub async fn run_opencode_turn(
         })
     });
 
-    // Process stdout output from oh-my-opencode
+    // Process stdout output from OpenCode.
     // Events come via SSE (when curl is available), stdout contains the assistant's text response.
     let stdout_reader = BufReader::new(stdout);
     let mut stdout_lines = stdout_reader.lines();
@@ -12526,7 +11526,7 @@ pub async fn run_opencode_turn(
 
                             // Handle plain opencode --format json events.
                             // Plain opencode emits: step_start, text, step_finish
-                            // (different from oh-my-opencode's message.part.updated/completion)
+                            // (different from message.part.updated/completion)
                             if event_type == "text" {
                                 if let Some(part) = json.get("part") {
                                     if let Some(text) =
@@ -12592,7 +11592,7 @@ pub async fn run_opencode_turn(
                                 }
                             }
 
-                            // Handle completion and error events from oh-my-opencode
+                            // Handle completion and error events from OpenCode.
                             if event_type == "completion" {
                                 tracing::info!(mission_id = %mission_id, "OpenCode JSON completion event");
                                 let _ = sse_complete_tx.send(true);
@@ -15696,10 +14696,10 @@ mod tests {
         preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        use_thinking_only_fallback, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
-        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
-        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        strip_think_tags, summarize_recent_opencode_stderr, use_thinking_only_fallback,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -15942,93 +14942,6 @@ mod tests {
         assert!(!codex_final_message_looks_like_progress_update(
             "I ran the smoke task for both model aliases. opus-6 succeeded and opus failed with a timeout."
         ));
-    }
-
-    #[test]
-    fn sync_opencode_agent_config_removes_overrides_when_plugin_enabled() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let config_dir = temp_dir.path();
-
-        fs::write(
-            config_dir.join("oh-my-opencode.json"),
-            r#"{
-  "agents": {
-    "prometheus": { "model": "openai/gpt-4o" },
-    "sisyphus": {}
-  }
-}"#,
-        )
-        .expect("write oh-my-opencode.json");
-
-        fs::write(
-            config_dir.join("opencode.json"),
-            r#"{
-  "plugin": ["oh-my-opencode@0.0.1"],
-  "agent": {
-    "prometheus": { "model": "openai/gpt-4o-mini", "foo": "bar" },
-    "sisyphus": {},
-    "custom": { "model": "openai/gpt-4o" }
-  }
-}"#,
-        )
-        .expect("write opencode.json");
-
-        sync_opencode_agent_config(config_dir, Some("openai/gpt-4o-mini"), true, false, false);
-
-        let opencode_json: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(config_dir.join("opencode.json")).expect("read opencode.json"),
-        )
-        .expect("parse opencode.json");
-        let agents = opencode_json
-            .get("agent")
-            .and_then(|v| v.as_object())
-            .expect("agent object");
-
-        assert!(agents.get("prometheus").is_none());
-        assert!(agents.get("sisyphus").is_none());
-        assert!(agents.get("custom").is_some());
-    }
-
-    #[test]
-    fn sync_opencode_agent_config_writes_overrides_when_plugin_disabled() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let config_dir = temp_dir.path();
-
-        fs::write(
-            config_dir.join("oh-my-opencode.json"),
-            r#"{
-  "agents": {
-    "prometheus": { "model": "openai/gpt-4o" },
-    "sisyphus": {}
-  }
-}"#,
-        )
-        .expect("write oh-my-opencode.json");
-
-        sync_opencode_agent_config(config_dir, Some("openai/gpt-4o-mini"), true, false, false);
-
-        let opencode_json: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(config_dir.join("opencode.json")).expect("read opencode.json"),
-        )
-        .expect("parse opencode.json");
-        let agents = opencode_json
-            .get("agent")
-            .and_then(|v| v.as_object())
-            .expect("agent object");
-
-        let prometheus_model = agents
-            .get("prometheus")
-            .and_then(|v| v.get("model"))
-            .and_then(|v| v.as_str())
-            .expect("prometheus model");
-        let sisyphus_model = agents
-            .get("sisyphus")
-            .and_then(|v| v.get("model"))
-            .and_then(|v| v.as_str())
-            .expect("sisyphus model");
-
-        assert_eq!(prometheus_model, "openai/gpt-4o");
-        assert_eq!(sisyphus_model, "openai/gpt-4o-mini");
     }
 
     #[test]

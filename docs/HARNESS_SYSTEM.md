@@ -65,26 +65,20 @@ layer, not by a centralized OpenCode server.
 
 OpenCode is executed **per workspace** using the CLI:
 
-- Uses `oh-my-opencode run` to start an embedded OpenCode server.
+- Uses `opencode run` directly inside the workspace.
 - Reads config from `opencode.json` and `.opencode/opencode.json`.
-- `oh-my-opencode.json` is synced into each workspace.
 - Built-in `bash` is enabled; legacy `workspace_*` tools are disabled by default.
 
 ### Agents
 
-OpenCode agents are defined in `oh-my-opencode.json`:
+OpenCode agents are defined as native `.opencode/agents/*.md` files:
 
-```json
-{
-  "agents": {
-    "Sisyphus": {
-      "model": "anthropic/claude-opus-4-5"
-    },
-    "document-writer": {
-      "model": "google/gemini-3-flash-preview"
-    }
-  }
-}
+```markdown
+---
+model: anthropic/claude-sonnet-4-20250514
+---
+
+You are a focused coding agent.
 ```
 
 ## Claude Code harness
@@ -147,9 +141,9 @@ and copies the binary to `/usr/local/bin/opencode`. This requires `curl` inside
 the workspace. If `curl` is unavailable, the mission fails with a clear error
 message instructing you to add it to the workspace template.
 
-Claude Code and oh-my-opencode installation use `npm` in the workspace. If
-`npm` is unavailable, the mission fails with a clear error message instructing you
-to add Node/npm to the workspace template.
+Claude Code installation uses `npm` in the workspace. If `npm` is unavailable,
+the mission fails with a clear error message instructing you to add Node/npm to
+the workspace template.
 
 ### CLI protocol (NDJSON)
 

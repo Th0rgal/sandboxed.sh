@@ -1,7 +1,7 @@
 //! System component management API.
 //!
 //! Provides endpoints to query and update system components like OpenCode
-//! and oh-my-opencode.
+//! and related CLI components.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -351,10 +351,6 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
     // Grok Build
     let grok_info = get_grok_info().await;
     components.push(grok_info);
-
-    // oh-my-opencode
-    let omo_info = get_oh_my_opencode_info().await;
-    components.push(omo_info);
 
     Json(SystemComponentsResponse { components })
 }
@@ -985,105 +981,6 @@ fn qualify_version_token(raw: &str) -> Option<String> {
     }
 }
 
-/// Get oh-my-opencode version and status.
-async fn get_oh_my_opencode_info() -> ComponentInfo {
-    // Check if oh-my-opencode is installed by looking for the config file
-    let home = home_dir();
-    let config_path = format!("{}/.config/opencode/oh-my-opencode.json", home);
-
-    let installed = tokio::fs::metadata(&config_path).await.is_ok();
-
-    if !installed {
-        return ComponentInfo {
-            name: "oh_my_opencode".to_string(),
-            version: None,
-            installed: false,
-            update_available: None,
-            path: None,
-            source_path: None,
-            status: ComponentStatus::NotInstalled,
-        };
-    }
-
-    // Try to get version from the package
-    // oh-my-opencode doesn't have a --version flag, so we check npm/bun
-    let version = get_oh_my_opencode_version().await;
-    let update_available = check_oh_my_opencode_update(version.as_deref()).await;
-    let status = if update_available.is_some() {
-        ComponentStatus::UpdateAvailable
-    } else {
-        ComponentStatus::Ok
-    };
-
-    ComponentInfo {
-        name: "oh_my_opencode".to_string(),
-        version,
-        installed: true,
-        update_available,
-        path: Some(config_path),
-        source_path: None,
-        status,
-    }
-}
-
-/// Get the installed version of oh-my-opencode.
-/// Tries `bunx oh-my-opencode --version` first (most reliable), then falls back
-/// to scanning the bun cache for platform-specific package directories.
-async fn get_oh_my_opencode_version() -> Option<String> {
-    // Primary: ask bunx directly (works regardless of cache layout)
-    if let Ok(Ok(output)) = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        Command::new("bunx")
-            .args(["oh-my-opencode", "--version"])
-            .output(),
-    )
-    .await
-    {
-        if output.status.success() {
-            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !version.is_empty() && version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                return Some(version);
-            }
-        }
-    }
-
-    // Fallback: scan bun cache for platform-specific packages
-    // (e.g. oh-my-opencode-linux-x64@3.0.1@@@1)
-    let home = home_dir();
-    let output = Command::new("bash")
-        .args([
-            "-c",
-            &format!(
-                r#"find {}/.bun/install/cache -maxdepth 1 -type d -name 'oh-my-opencode*@*' 2>/dev/null | \
-                   grep -oP 'oh-my-opencode[^@]*@\K[0-9]+\.[0-9]+\.[0-9]+' | \
-                   sort -V | tail -1"#,
-                home
-            ),
-        ])
-        .output()
-        .await
-        .ok()?;
-
-    if output.status.success() {
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !version.is_empty() {
-            return Some(version);
-        }
-    }
-
-    None
-}
-
-/// Check if there's a newer version of oh-my-opencode available.
-async fn check_oh_my_opencode_update(current_version: Option<&str>) -> Option<String> {
-    let latest = fetch_npm_latest_version("oh-my-opencode").await?;
-    match current_version {
-        Some(current) if latest != current && version_is_newer(&latest, current) => Some(latest),
-        None => Some(latest), // If no current version, suggest the latest
-        _ => None,
-    }
-}
-
 /// Optional query params accepted by /components/:name/update.
 #[derive(Debug, Deserialize)]
 pub struct UpdateComponentQuery {
@@ -1140,7 +1037,6 @@ fn host_update_stream(
         "claude_code" => Ok(Sse::new(Box::pin(stream_claude_code_update()))),
         "codex" => Ok(Sse::new(Box::pin(stream_codex_update()))),
         "grok" => Ok(Sse::new(Box::pin(stream_grok_update()))),
-        "oh_my_opencode" => Ok(Sse::new(Box::pin(stream_oh_my_opencode_update()))),
         other => Err((
             StatusCode::BAD_REQUEST,
             format!("Unknown component: {}", other),
@@ -1239,7 +1135,6 @@ async fn uninstall_component(
         "claude_code" => Ok(Sse::new(Box::pin(stream_claude_code_uninstall()))),
         "codex" => Ok(Sse::new(Box::pin(stream_codex_uninstall()))),
         "grok" => Ok(Sse::new(Box::pin(stream_grok_uninstall()))),
-        "oh_my_opencode" => Ok(Sse::new(Box::pin(stream_oh_my_opencode_uninstall()))),
         _ => Err((
             StatusCode::BAD_REQUEST,
             format!("Unknown component: {}", name),
@@ -2301,73 +2196,6 @@ fn stream_grok_uninstall() -> impl Stream<Item = Result<Event, std::convert::Inf
     }
 }
 
-/// Stream the oh-my-opencode update process.
-fn stream_oh_my_opencode_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    async_stream::stream! {
-        yield sse("log", "Starting oh-my-opencode update...", Some(0));
-
-        let home = home_dir();
-
-        // Remove conflicting npm/nvm global installs (we only use bunx)
-        yield sse("log", "Removing npm/nvm global installs...", Some(5));
-        let _ = Command::new("bash")
-            .args([
-                "-c",
-                "npm uninstall -g oh-my-opencode 2>/dev/null || true",
-            ])
-            .output()
-            .await;
-
-        // Clear ALL oh-my-opencode caches (bun stores in multiple locations)
-        yield sse("log", "Clearing oh-my-opencode caches...", Some(15));
-        let cache_clear_script = format!(
-            r#"
-            rm -rf {home}/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.cache/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.npm/_npx/*/node_modules/oh-my-opencode* 2>/dev/null
-            "#,
-            home = home
-        );
-        let _ = Command::new("bash")
-            .args(["-c", &cache_clear_script])
-            .output()
-            .await;
-
-        yield sse("log", "Running bunx oh-my-opencode@latest install...", Some(25));
-
-        // Run the install command with @latest to force the newest version
-        // Enable all providers by default for updates
-        match Command::new("bunx")
-            .args([
-                "oh-my-opencode@latest",
-                "install",
-                "--no-tui",
-                "--claude=yes",
-                "--openai=yes",
-                "--gemini=yes",
-                "--copilot=no",
-            ])
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let summary: String = stdout.lines().take(5).collect::<Vec<_>>().join("\n");
-                yield sse("log", format!("Installation output: {summary}"), Some(80));
-                yield sse("complete", "oh-my-opencode updated successfully!", Some(100));
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                yield sse("error", format!("Failed to update oh-my-opencode: {} {}", stderr, stdout), None);
-            }
-            Err(e) => {
-                yield sse("error", format!("Failed to run update: {}", e), None);
-            }
-        }
-    }
-}
-
 /// Stream the OpenCode uninstall process.
 fn stream_opencode_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
@@ -2556,56 +2384,6 @@ fn stream_package_uninstall(
 /// Stream the Claude Code uninstall process.
 fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     stream_package_uninstall("@anthropic-ai/claude-code", ".claude", "Claude Code")
-}
-
-/// Stream the oh-my-opencode uninstall process.
-fn stream_oh_my_opencode_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>>
-{
-    async_stream::stream! {
-        yield sse("log", "Starting oh-my-opencode uninstall...", Some(0));
-
-        let home = home_dir();
-
-        // Remove npm global install if exists
-        yield sse("log", "Removing npm global install...", Some(10));
-        let _ = Command::new("npm")
-            .args(["uninstall", "-g", "oh-my-opencode"])
-            .output()
-            .await;
-
-        // Clear bun cache for oh-my-opencode
-        yield sse("log", "Clearing oh-my-opencode caches...", Some(30));
-        let cache_clear_script = format!(
-            r#"
-            rm -rf {home}/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.cache/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.npm/_npx/*/node_modules/oh-my-opencode* 2>/dev/null
-            "#,
-            home = home
-        );
-        let _ = Command::new("bash")
-            .args(["-c", &cache_clear_script])
-            .output()
-            .await;
-
-        // Remove the oh-my-opencode config file
-        yield sse("log", "Removing oh-my-opencode configuration...", Some(60));
-        let config_path = format!("{}/.config/opencode/oh-my-opencode.json", home);
-        if std::path::Path::new(&config_path).exists() {
-            match Command::new("rm")
-                .args(["-f", &config_path])
-                .output()
-                .await
-            {
-                Ok(o) if o.status.success() => {
-                    yield sse("log", "Removed oh-my-opencode.json", Some(80));
-                }
-                _ => {}
-            }
-        }
-
-        yield sse("complete", "oh-my-opencode uninstalled successfully!", Some(100));
-    }
 }
 
 #[cfg(test)]

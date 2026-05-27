@@ -69,6 +69,41 @@ pub async fn list_backend_agents(
     Extension(_user): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<AgentResponse>>, (StatusCode, String)> {
+    if id == "opencode" {
+        let payload = super::opencode::fetch_opencode_agents(&state)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to list agents: {}", e),
+                )
+            })?;
+        let agents = payload
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                serde_json::Value::String(name) => Some(AgentResponse {
+                    id: name.clone(),
+                    name,
+                }),
+                serde_json::Value::Object(obj) => {
+                    let name = obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| obj.get("id").and_then(|v| v.as_str()))?;
+                    Some(AgentResponse {
+                        id: name.to_string(),
+                        name: name.to_string(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        return Ok(Json(agents));
+    }
+
     let registry = state.backend_registry.read().await;
     let backend = registry
         .get(&id)

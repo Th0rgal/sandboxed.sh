@@ -1,6 +1,6 @@
 //! Web access tools: fetch URLs.
 //!
-//! Only the `fetch_url` tool remains; search is handled upstream by OpenCode/OMO agents.
+//! Only the `fetch_url` tool remains; search is handled upstream by configured agents.
 
 use std::path::Path;
 

@@ -39,7 +39,7 @@ async function getHostWorkspace(request: APIRequestContext) {
 test.describe('Mission backend configs', () => {
   test.setTimeout(180_000);
 
-  test('new mission dialog shows spark-local profile agents', async ({ page, request }) => {
+  test('new mission dialog shows opencode agents', async ({ page, request }) => {
     const profilesRes = await request.get(`${API_BASE}/api/library/config-profile`);
     expect(profilesRes.ok()).toBeTruthy();
     const profiles = (await profilesRes.json()) as Array<{ name: string }>;
@@ -55,26 +55,20 @@ test.describe('Mission backend configs', () => {
     });
     expect(updateRes.ok()).toBeTruthy();
 
-    const settingsRes = await request.get(
-      `${API_BASE}/api/library/config-profile/spark-local/opencode/settings`
-    );
-    expect(settingsRes.ok()).toBeTruthy();
-    const settings = (await settingsRes.json()) as { agents?: Record<string, unknown> | unknown[] };
-    const agentNames = Array.isArray(settings.agents)
-      ? settings.agents
-          .map((entry) => {
-            if (typeof entry === 'string') return entry;
-            if (entry && typeof entry === 'object') {
-              const obj = entry as { name?: unknown; id?: unknown };
-              if (typeof obj.name === 'string') return obj.name;
-              if (typeof obj.id === 'string') return obj.id;
-            }
-            return null;
-          })
-          .filter((name): name is string => Boolean(name))
-      : settings.agents && typeof settings.agents === 'object'
-      ? Object.keys(settings.agents)
-      : [];
+    const agentsRes = await request.get(`${API_BASE}/api/opencode/agents`);
+    expect(agentsRes.ok()).toBeTruthy();
+    const agents = (await agentsRes.json()) as unknown[];
+    const agentNames = agents
+      .map((entry) => {
+        if (typeof entry === 'string') return entry;
+        if (entry && typeof entry === 'object') {
+          const obj = entry as { name?: unknown; id?: unknown };
+          if (typeof obj.name === 'string') return obj.name;
+          if (typeof obj.id === 'string') return obj.id;
+        }
+        return null;
+      })
+      .filter((name): name is string => Boolean(name));
 
     expect(agentNames.length).toBeGreaterThan(0);
     const sampleAgent = agentNames[0];

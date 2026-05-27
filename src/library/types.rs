@@ -60,7 +60,7 @@ pub struct PluginUI {
 /// Plugin definition from plugins.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plugin {
-    /// npm package name (e.g., "oh-my-opencode", "@opencode/ralph-wiggum")
+    /// npm package name (e.g., "@opencode/ralph-wiggum")
     pub package: String,
     /// Description of what this plugin does
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -450,11 +450,6 @@ pub struct SandboxedConfig {
     /// Desktop session lifecycle configuration.
     #[serde(default)]
     pub desktop: DesktopConfig,
-    /// When true, wrap the `opencode` CLI in oh-my-opencode for extra features
-    /// (todo enforcement, background tasks, opinionated agent profiles).
-    /// Default: false — vanilla `opencode` is used directly.
-    #[serde(default)]
-    pub enable_oh_my_opencode: bool,
 }
 
 impl Default for SandboxedConfig {
@@ -471,7 +466,6 @@ impl Default for SandboxedConfig {
             ],
             default_agent: Some("build".to_string()),
             desktop: DesktopConfig::default(),
-            enable_oh_my_opencode: false,
         }
     }
 }
@@ -547,7 +541,7 @@ pub struct ConfigProfileFile {
 /// A profile is an instance of configs for OpenCode, Claude Code, Codex, and Sandboxed.
 ///
 /// Directory structure mirrors actual harness config directories:
-/// - `.opencode/` - OpenCode settings (settings.json, oh-my-opencode.json)
+/// - `.opencode/` - OpenCode settings (settings.json, agents)
 /// - `.claudecode/` - Claude Code settings (settings.json)
 /// - `.codex/` - Codex settings (config.toml, TOML format)
 /// - `.sandboxed-sh/` - Sandboxed config (config.json)
@@ -563,7 +557,7 @@ pub struct ConfigProfile {
     /// All files in the profile (for file-based editing)
     #[serde(default)]
     pub files: Vec<ConfigProfileFile>,
-    /// OpenCode settings (oh-my-opencode.json content) - legacy, for backward compat
+    /// OpenCode settings (settings.json content) - legacy, for backward compat
     #[serde(default)]
     pub opencode_settings: serde_json::Value,
     /// Sandboxed config - legacy, for backward compat

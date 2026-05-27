@@ -1,8 +1,7 @@
 mod client;
 
-use anyhow::{anyhow, Context, Error};
+use anyhow::Error;
 use async_trait::async_trait;
-use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -29,60 +28,6 @@ impl OpenCodeBackend {
     pub fn client(&self) -> &OpenCodeClient {
         &self.client
     }
-
-    async fn fetch_agents(&self) -> Result<Value, Error> {
-        let base_url = self.client.base_url().trim_end_matches('/');
-        if base_url.is_empty() {
-            return Err(anyhow!("OpenCode base URL is not configured"));
-        }
-        let url = format!("{}/agent", base_url);
-        let resp = reqwest::Client::new()
-            .get(url)
-            .send()
-            .await
-            .context("Failed to call OpenCode /agent")?;
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("OpenCode /agent failed: {}", text));
-        }
-        resp.json::<Value>()
-            .await
-            .context("Failed to parse OpenCode agent payload")
-    }
-
-    fn parse_agents(payload: Value) -> Vec<AgentInfo> {
-        let raw = match payload {
-            Value::Array(arr) => arr,
-            Value::Object(mut obj) => obj
-                .remove("agents")
-                .and_then(|v| v.as_array().cloned())
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-
-        raw.into_iter()
-            .filter_map(|entry| match entry {
-                Value::String(name) => Some(AgentInfo {
-                    id: name.clone(),
-                    name,
-                }),
-                Value::Object(mut obj) => {
-                    let name = obj
-                        .remove("name")
-                        .and_then(|v| v.as_str().map(|s| s.to_string()))
-                        .or_else(|| {
-                            obj.remove("id")
-                                .and_then(|v| v.as_str().map(|s| s.to_string()))
-                        });
-                    name.map(|name| AgentInfo {
-                        id: name.clone(),
-                        name,
-                    })
-                }
-                _ => None,
-            })
-            .collect()
-    }
 }
 
 #[async_trait]
@@ -96,21 +41,17 @@ impl Backend for OpenCodeBackend {
     }
 
     fn cli_names(&self) -> &'static [&'static str] {
-        // OpenCode ships under two binary names depending on install path.
-        &["oh-my-opencode", "opencode"]
+        &["opencode"]
     }
 
     async fn list_agents(&self) -> Result<Vec<AgentInfo>, Error> {
-        match self.fetch_agents().await {
-            Ok(payload) => Ok(Self::parse_agents(payload)),
-            Err(err) => {
-                tracing::warn!(
-                    "OpenCode /agent unavailable ({}). Returning empty agent list.",
-                    err
-                );
-                Ok(vec![])
-            }
-        }
+        Ok(["build", "plan"]
+            .into_iter()
+            .map(|name| AgentInfo {
+                id: name.to_string(),
+                name: name.to_string(),
+            })
+            .collect())
     }
 
     async fn create_session(&self, config: SessionConfig) -> Result<Session, Error> {

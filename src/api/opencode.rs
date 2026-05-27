@@ -22,9 +22,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::opencode_config::OpenCodeConnection;
-use crate::util::{
-    home_dir, internal_error, read_json_config, resolve_config_path, write_json_config,
-};
+use crate::util::{internal_error, read_json_config, resolve_config_path, write_json_config};
 
 /// Create OpenCode connection routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -38,21 +36,6 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/:id/default", post(set_default))
 }
 
-/// Resolve the path to oh-my-opencode.json configuration file.
-fn resolve_oh_my_opencode_path() -> std::path::PathBuf {
-    // Check OPENCODE_CONFIG_DIR first
-    if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
-        if !dir.trim().is_empty() {
-            return std::path::PathBuf::from(dir).join("oh-my-opencode.json");
-        }
-    }
-    // Fall back to ~/.config/opencode/oh-my-opencode.json
-    std::path::PathBuf::from(home_dir())
-        .join(".config")
-        .join("opencode")
-        .join("oh-my-opencode.json")
-}
-
 /// Resolve the path to opencode.json configuration file.
 fn resolve_opencode_config_path() -> std::path::PathBuf {
     resolve_config_path(
@@ -61,14 +44,6 @@ fn resolve_opencode_config_path() -> std::path::PathBuf {
         "opencode.json",
         ".config/opencode/opencode.json",
     )
-}
-
-/// GET /api/opencode/settings - Read oh-my-opencode settings.
-pub async fn get_opencode_settings() -> Result<Json<Value>, (StatusCode, String)> {
-    let path = resolve_oh_my_opencode_path();
-    read_json_config(&path, "oh-my-opencode.json")
-        .await
-        .map(Json)
 }
 
 /// GET /api/opencode/config - Read opencode.json settings.
@@ -93,15 +68,6 @@ pub async fn get_opencode_config() -> Result<Json<Value>, (StatusCode, String)> 
     read_json_config(&read_path, "opencode config")
         .await
         .map(Json)
-}
-
-/// PUT /api/opencode/settings - Write oh-my-opencode settings.
-pub async fn update_opencode_settings(
-    Json(config): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let path = resolve_oh_my_opencode_path();
-    write_json_config(&path, &config, "oh-my-opencode settings").await?;
-    Ok(Json(config))
 }
 
 /// PUT /api/opencode/config - Write opencode.json settings.
@@ -221,24 +187,6 @@ pub struct TestConnectionResponse {
 // Public Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn extract_agents_from_settings(settings: &Value) -> Option<Value> {
-    let agents = settings.get("agents")?;
-    if let Some(obj) = agents.as_object() {
-        if obj.is_empty() {
-            return None;
-        }
-        let agent_names: Vec<Value> = obj.keys().cloned().map(Value::String).collect();
-        return Some(Value::Array(agent_names));
-    }
-    if let Some(arr) = agents.as_array() {
-        if arr.is_empty() {
-            return None;
-        }
-        return Some(Value::Array(arr.clone()));
-    }
-    None
-}
-
 /// Vanilla opencode ships with these primary agents.  They are surfaced in the
 /// dashboard's agent dropdown even when the Library defines no `.opencode/agents/`
 /// files, so that picking "build" or "plan" Just Works.
@@ -248,9 +196,7 @@ const VANILLA_OPENCODE_AGENTS: &[&str] = &["build", "plan"];
 ///
 /// The returned list merges:
 ///   1. vanilla opencode's built-in primary agents ("build", "plan"),
-///   2. native `.opencode/agents/*.md` files in the Library profile,
-///   3. oh-my-opencode agents from `oh-my-opencode.json` — only when the
-///      profile's `SandboxedConfig.enable_oh_my_opencode` is true.
+///   2. native `.opencode/agents/*.md` files in the Library profile.
 pub async fn fetch_opencode_agents(state: &super::routes::AppState) -> Result<Value, String> {
     fetch_opencode_agents_for_profile(state, None).await
 }
@@ -307,37 +253,9 @@ pub async fn fetch_opencode_agents_for_profile(
         }
     }
 
-    // 3. Merge oh-my-opencode agents only when the profile opts into the wrapper.
-    let wrapper_enabled = lib
-        .get_sandboxed_config_for_profile(profile_name)
-        .await
-        .map(|c| c.enable_oh_my_opencode)
-        .unwrap_or(false);
-    if wrapper_enabled {
-        let omo_settings = if profile.is_some() {
-            lib.get_opencode_settings_for_profile(profile_name).await
-        } else {
-            lib.get_opencode_settings().await
-        };
-        if let Ok(settings) = omo_settings {
-            if let Some(omo_agents) = extract_agents_from_settings(&settings) {
-                if let Some(arr) = omo_agents.as_array() {
-                    for entry in arr {
-                        if let Some(name) = entry.as_str() {
-                            if !agents.iter().any(|a| a.eq_ignore_ascii_case(name)) {
-                                agents.push(name.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     tracing::debug!(
         profile = %profile_name,
         count = agents.len(),
-        wrapper_enabled = wrapper_enabled,
         "Resolved opencode agents"
     );
 

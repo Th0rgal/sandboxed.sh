@@ -374,7 +374,7 @@ Then restart the backend. Workspace-scoped MCPs must be in PATH for both host wo
 
 **Config profile not being applied:** Check that:
 1. The configs exist in the **correct library path** (`.sandboxed-sh/library/` for production, not `.openagent/library/` which was the old path)
-2. The library has the `configs/<profile>/.opencode/oh-my-opencode.json` file
+2. The library has the expected `configs/<profile>/.opencode/` files
 3. Pull latest library: `cd ~/.sandboxed-sh/library && git pull`
 
 **Missions not using correct settings:**
@@ -382,7 +382,7 @@ Then restart the backend. Workspace-scoped MCPs must be in PATH for both host wo
 **Missions stuck:** Look for running CLI processes:
 
 ```bash
-ps aux | grep -E "claude|oh-my-opencode"
+ps aux | grep -E "claude|opencode"
 machinectl list   # For container workspaces
 ```
 

@@ -82,8 +82,7 @@ sandboxed.sh orchestrates multiple AI coding agent runtimes:
 
 - **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**: Anthropic's
   official coding agent with native skills support (`.claude/skills/`)
-- **[OpenCode](https://github.com/anomalyco/opencode)**: Open-source alternative
-  via [oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode)
+- **[OpenCode](https://github.com/anomalyco/opencode)**: Open-source coding agent
 - **Codex, Gemini, and Grok**: Native CLI backends for OpenAI, Google, and xAI
   coding agents
 

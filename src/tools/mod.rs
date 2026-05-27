@@ -201,7 +201,7 @@ impl ToolRegistry {
         // Search
         tools.insert("grep_search".to_string(), Arc::new(search::GrepSearch));
 
-        // Web (fetch only; web search removed in favor of OMO/Exa)
+        // Web (fetch only; web search is handled upstream by configured agents)
         tools.insert("fetch_url".to_string(), Arc::new(web::FetchUrl));
 
         // Frontend Tool UI (schemas for rich rendering in the dashboard)

@@ -56,12 +56,10 @@ execution context:
 
 ### OpenCode
 
-- Runs **per workspace** using the CLI (via `oh-my-opencode run`).
-- Spawns an embedded OpenCode server inside the workspace.
+- Runs **per workspace** using the `opencode run` CLI.
 - Reads configuration from:
   - `opencode.json` at the workspace root
   - `.opencode/opencode.json`
-  - `.opencode/oh-my-opencode.json` (synced from the Library)
 - Built-in bash is **enabled** in per-workspace configs.
 
 ### Claude Code
@@ -122,7 +120,6 @@ Per-workspace config is generated from three sources:
 Files written per mission workspace:
 
 - `opencode.json` and `.opencode/opencode.json`
-- `.opencode/oh-my-opencode.json` (for OpenCode agents)
 - `.claude/settings.local.json` (for Claude Code)
 - `.claude/skills/<name>/SKILL.md` (native Claude Code skills)
 - `CLAUDE.md` (general workspace context)
@@ -143,7 +140,7 @@ This preserves the UI experience while keeping execution isolated per workspace.
 
 - **No central OpenCode server needed**: Missions spawn per-workspace CLI
   processes.
-- Agents are loaded from the Library's `oh-my-opencode.json` (no HTTP call).
+- Agents are loaded from OpenCode built-ins and native `.opencode/agents/*.md` files.
 - Per-workspace execution eliminates host-to-container network issues.
 - For remote workspaces, SSH execution keeps bash/tooling on the remote host.
 

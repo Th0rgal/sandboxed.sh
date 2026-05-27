@@ -17,7 +17,6 @@ vi.mock('@/lib/api', () => ({
   listBackendAgents: vi.fn().mockResolvedValue([{ id: 'default', name: 'Default' }]),
   getBackendConfig: vi.fn().mockResolvedValue({ enabled: true, cli_available: true }),
   getClaudeCodeConfig: vi.fn().mockResolvedValue({ hidden_agents: [] }),
-  getLibraryOpenCodeSettingsForProfile: vi.fn().mockResolvedValue({ agents: [] }),
   listBackendModelOptions: vi.fn().mockResolvedValue({ backends: {} }),
   listProviders: vi.fn().mockResolvedValue({ providers: [] }),
 }));

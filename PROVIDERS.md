@@ -120,62 +120,9 @@ curl -X POST https://YOUR-BACKEND/api/ai/providers \
   }'
 ```
 
-## oh-my-opencode Configuration
+## OpenCode Configuration
 
-For OpenCode backend, models are configured via oh-my-opencode profiles. These define which models to use for different agents and task categories.
-
-### Applying Configurations
-
-Use the example configurations in `examples/oh-my-opencode/`:
-
-```bash
-# Apply Cerebras configuration
-curl -X PUT https://YOUR-BACKEND/api/opencode/settings \
-  -H "Content-Type: application/json" \
-  -d @examples/oh-my-opencode/cerebras.json
-
-# Apply Z.AI configuration
-curl -X PUT https://YOUR-BACKEND/api/opencode/settings \
-  -H "Content-Type: application/json" \
-  -d @examples/oh-my-opencode/zai.json
-```
-
-### Custom Configuration
-
-Create a custom oh-my-opencode configuration:
-
-```json
-{
-  "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-opencode/master/assets/oh-my-opencode.schema.json",
-  "agents": {
-    "atlas": {
-      "model": "cerebras/llama-3.3-70b"
-    },
-    "explore": {
-      "model": "zai/glm-4-flash"
-    },
-    "sisyphus": {
-      "model": "anthropic/claude-sonnet-4-5"
-    }
-  },
-  "categories": {
-    "quick": {
-      "model": "zai/glm-4-flash"
-    },
-    "deep": {
-      "model": "cerebras/llama-3.3-70b"
-    }
-  }
-}
-```
-
-Apply it via API:
-
-```bash
-curl -X PUT https://YOUR-BACKEND/api/opencode/settings \
-  -H "Content-Type: application/json" \
-  -d @my-config.json
-```
+OpenCode model defaults are configured in `opencode.json` or through per-mission model overrides. Use native `.opencode/agents/*.md` files for agent-specific instructions and model metadata.
 
 ## Model Override in Missions
 
@@ -221,11 +168,8 @@ curl -X POST https://YOUR-BACKEND/api/missions \
 ### Model Not Found
 
 1. **Verify model name format:** `provider/model-name` (e.g., `cerebras/llama-3.3-70b`)
-2. **Check oh-my-opencode config:**
-   ```bash
-   curl -s https://YOUR-BACKEND/api/opencode/settings | jq
-   ```
-3. **Ensure provider is enabled for the backend** you're using
+2. **Check OpenCode config:** verify `opencode.json` contains the expected `model`, `agent`, and `provider` entries.
+3. **Ensure provider is enabled for the backend** you're using.
 
 ### OAuth Token Expires
 
@@ -248,9 +192,9 @@ Before using expensive models, test your setup with:
 - Cerebras `llama-3.1-8b` (very fast, cheap)
 - Z.AI `glm-4-flash` (cost-effective)
 
-### 2. Use oh-my-opencode for Consistent Configuration
+### 2. Use OpenCode Agent Files for Consistent Configuration
 
-Instead of specifying model overrides per mission, configure oh-my-opencode to use your preferred models automatically.
+Instead of specifying model overrides per mission, define native OpenCode agents in `.opencode/agents/*.md`.
 
 ### 3. Monitor Provider Status
 
@@ -297,17 +241,6 @@ Body: {
 ### Delete Provider
 ```bash
 DELETE /api/ai/providers/:id
-```
-
-### Get oh-my-opencode Settings
-```bash
-GET /api/opencode/settings
-```
-
-### Update oh-my-opencode Settings
-```bash
-PUT /api/opencode/settings
-Body: { /* oh-my-opencode JSON config */ }
 ```
 
 ## Examples
@@ -367,7 +300,7 @@ Mix of providers based on task:
 ## Getting Help
 
 - **Provider Issues**: Check provider's documentation for API status
-- **Configuration Issues**: Review this guide and the examples in `examples/oh-my-opencode/`
+- **Configuration Issues**: Review this guide and your OpenCode `opencode.json` / `.opencode/agents` files.
 - **Backend Issues**: Check backend logs with `journalctl -u sandboxed-sh-dev -f`
 
 ## Provider Links
