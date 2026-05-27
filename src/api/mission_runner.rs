@@ -7319,7 +7319,72 @@ async fn ensure_opencode_plugin_installed(
 /// in the snapshot the session silently fails.  By injecting a custom provider
 /// definition we tell the AI-SDK adapter *how* to reach the provider and declare
 /// the model as valid.
-fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, model_override: &str) {
+fn sanitize_custom_opencode_provider_id(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect::<String>()
+        .to_lowercase()
+        .replace('-', "_")
+}
+
+fn custom_opencode_provider_definition(
+    app_working_dir: &std::path::Path,
+    provider_id: &str,
+) -> Option<serde_json::Value> {
+    let path = app_working_dir.join(crate::util::AI_PROVIDERS_PATH);
+    let contents = std::fs::read_to_string(path).ok()?;
+    let providers: Vec<crate::ai_providers::AIProvider> = serde_json::from_str(&contents).ok()?;
+
+    let provider = providers.into_iter().find(|provider| {
+        provider.enabled
+            && provider.provider_type == crate::ai_providers::ProviderType::Custom
+            && sanitize_custom_opencode_provider_id(&provider.name) == provider_id
+    })?;
+
+    let base_url = provider.base_url?;
+    let custom_models = provider.custom_models.unwrap_or_default();
+    if custom_models.is_empty() {
+        return None;
+    }
+
+    let mut models = serde_json::Map::new();
+    for model in custom_models {
+        let id = model.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        models.insert(
+            id.to_string(),
+            serde_json::json!({
+                "name": model.name.unwrap_or_else(|| id.to_string())
+            }),
+        );
+    }
+    if models.is_empty() {
+        return None;
+    }
+
+    let mut options = serde_json::Map::new();
+    options.insert("baseURL".to_string(), serde_json::Value::String(base_url));
+    if let Some(api_key) = provider.api_key.filter(|key| !key.trim().is_empty()) {
+        options.insert("apiKey".to_string(), serde_json::Value::String(api_key));
+    }
+
+    Some(serde_json::json!({
+        "npm": provider
+            .npm_package
+            .unwrap_or_else(|| "@ai-sdk/openai-compatible".to_string()),
+        "name": provider.name,
+        "models": serde_json::Value::Object(models),
+        "options": serde_json::Value::Object(options),
+    }))
+}
+
+fn ensure_opencode_provider_for_model(
+    opencode_config_dir: &std::path::Path,
+    app_working_dir: &std::path::Path,
+    model_override: &str,
+) {
     let model_override = model_override.trim();
     if model_override.is_empty() {
         return;
@@ -7414,7 +7479,7 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
                 }
             }))
         }
-        _ => None,
+        _ => custom_opencode_provider_definition(app_working_dir, provider_id),
     };
 
     let Some(provider_def) = provider_def else {
@@ -10334,11 +10399,15 @@ pub async fn run_opencode_turn(
     // Inject provider definitions into opencode.json for models not in
     // OpenCode's built-in snapshot.
     if let Some(model_override) = resolved_model.as_deref() {
-        ensure_opencode_provider_for_model(&opencode_config_dir_host, model_override);
+        ensure_opencode_provider_for_model(
+            &opencode_config_dir_host,
+            app_working_dir,
+            model_override,
+        );
     }
     if let Some(ref am) = agent_model {
         if resolved_model.as_deref() != Some(am) {
-            ensure_opencode_provider_for_model(&opencode_config_dir_host, am);
+            ensure_opencode_provider_for_model(&opencode_config_dir_host, app_working_dir, am);
         }
     }
     if needs_google {
@@ -10398,7 +10467,11 @@ pub async fn run_opencode_turn(
 
     let opencode_model = resolved_model.as_deref().unwrap_or("builtin/fast");
     if opencode_model.starts_with("builtin/") {
-        ensure_opencode_provider_for_model(&opencode_config_dir_host, opencode_model);
+        ensure_opencode_provider_for_model(
+            &opencode_config_dir_host,
+            app_working_dir,
+            opencode_model,
+        );
     }
 
     let mut inner_cmd = String::new();
@@ -14687,6 +14760,7 @@ mod tests {
         codex_chatgpt_fallback_model, codex_error_message_to_surface,
         codex_final_message_looks_like_progress_update, codex_key_fingerprint,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
+        custom_opencode_provider_definition, ensure_opencode_provider_for_model,
         extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
         extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
         is_codex_node_wrapper, is_provider_payload_error, is_rate_limited_error,
@@ -15523,6 +15597,90 @@ mod tests {
             }
         });
         assert_eq!(extract_model_from_message(&val).as_deref(), Some("glm-5"));
+    }
+
+    #[test]
+    fn custom_provider_definition_uses_ai_provider_store_models() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = temp_dir.path().join(".sandboxed-sh");
+        fs::create_dir_all(&store_dir).expect("store dir");
+
+        let mut provider = crate::ai_providers::AIProvider::new(
+            crate::ai_providers::ProviderType::Custom,
+            "Spark".to_string(),
+        );
+        provider.base_url = Some("https://spark-de79.gazella-vector.ts.net/v1".to_string());
+        provider.custom_models = Some(vec![
+            crate::ai_providers::CustomModel {
+                id: "qwen3.5-397b".to_string(),
+                name: Some("Qwen 3.5 397B".to_string()),
+                context_limit: None,
+                output_limit: None,
+            },
+            crate::ai_providers::CustomModel {
+                id: "fast".to_string(),
+                name: Some("Spark Fast".to_string()),
+                context_limit: None,
+                output_limit: None,
+            },
+        ]);
+
+        fs::write(
+            store_dir.join("ai_providers.json"),
+            serde_json::to_string_pretty(&vec![provider]).expect("serialize provider"),
+        )
+        .expect("write provider store");
+
+        let definition = custom_opencode_provider_definition(temp_dir.path(), "spark")
+            .expect("custom provider definition");
+        assert_eq!(definition["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(
+            definition["options"]["baseURL"],
+            "https://spark-de79.gazella-vector.ts.net/v1"
+        );
+        assert!(definition["models"].get("qwen3.5-397b").is_some());
+        assert!(definition["models"].get("fast").is_some());
+    }
+
+    #[test]
+    fn ensure_provider_for_model_injects_custom_provider() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_dir = temp_dir.path().join("app");
+        let config_dir = temp_dir.path().join("opencode");
+        fs::create_dir_all(app_dir.join(".sandboxed-sh")).expect("store dir");
+        fs::create_dir_all(&config_dir).expect("config dir");
+
+        let mut provider = crate::ai_providers::AIProvider::new(
+            crate::ai_providers::ProviderType::Custom,
+            "Spark".to_string(),
+        );
+        provider.base_url = Some("https://spark-de79.gazella-vector.ts.net/v1".to_string());
+        provider.custom_models = Some(vec![crate::ai_providers::CustomModel {
+            id: "qwen3.5-397b".to_string(),
+            name: Some("Qwen 3.5 397B".to_string()),
+            context_limit: None,
+            output_limit: None,
+        }]);
+        fs::write(
+            app_dir.join(".sandboxed-sh").join("ai_providers.json"),
+            serde_json::to_string_pretty(&vec![provider]).expect("serialize provider"),
+        )
+        .expect("write provider store");
+
+        ensure_opencode_provider_for_model(&config_dir, &app_dir, "spark/qwen3.5-397b");
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        assert_eq!(
+            opencode_json["provider"]["spark"]["models"]["qwen3.5-397b"]["name"],
+            "Qwen 3.5 397B"
+        );
+        assert_eq!(
+            opencode_json["provider"]["spark"]["options"]["baseURL"],
+            "https://spark-de79.gazella-vector.ts.net/v1"
+        );
     }
 
     // ── extract_part_text tests ───────────────────────────────────────
