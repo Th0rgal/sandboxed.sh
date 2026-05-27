@@ -39,7 +39,7 @@ missions. Sandboxed.sh currently supports:
                ▼                               ▼
 ┌──────────────────────────┐    ┌──────────────────────────────────┐
 │     OpenCode CLI          │    │  Claude/Codex/Gemini/Grok CLIs │
-│  (opencode or wrapper)    │    │  - native streaming protocols  │
+│  (opencode)               │    │  - native streaming protocols  │
 │  - per-workspace config   │    │  - per-workspace config        │
 └──────────────────────────┘    └──────────────────────────────────┘
 ```
