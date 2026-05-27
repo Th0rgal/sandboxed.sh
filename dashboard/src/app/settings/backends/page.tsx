@@ -452,7 +452,7 @@ export default function BackendsPage() {
                   onChange={(e) =>
                     setOpencodeForm((prev) => ({ ...prev, default_agent: e.target.value }))
                   }
-                  placeholder="Sisyphus"
+                  placeholder="build"
                   className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
                 />
               </div>

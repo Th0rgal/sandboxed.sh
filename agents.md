@@ -23,7 +23,7 @@
 > Make this part of your pre-commit routine to avoid CI failures.
 
 This document describes how Sandboxed.sh executes missions after the per-workspace
-harness refactor ("ralph" plan). The core change: **agent harnesses run inside
+harness refactor. The core change: **agent harnesses run inside
 the target workspace**, so native bash and file effects are scoped to the correct
 environment. The host proxy bash tools are no longer required for normal
 missions.

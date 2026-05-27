@@ -38,7 +38,7 @@ GET /api/backends/:id/agents
 
 **Response**:
 ```json
-[{"id": "Sisyphus", "name": "Sisyphus"}]
+[{"id": "build", "name": "build"}, {"id": "plan", "name": "plan"}]
 ```
 
 ## Get Backend Config
@@ -55,7 +55,7 @@ GET /api/backends/:id/config
   "enabled": true,
   "settings": {
     "base_url": "http://127.0.0.1:4096",
-    "default_agent": "Sisyphus",
+    "default_agent": "build",
     "permissive": true
   }
 }
@@ -78,7 +78,7 @@ PUT /api/backends/:id/config
   "enabled": true,
   "settings": {
     "base_url": "http://127.0.0.1:4096",
-    "default_agent": "Sisyphus",
+    "default_agent": "build",
     "permissive": true
   }
 }

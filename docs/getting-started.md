@@ -234,11 +234,13 @@ The config editor shows:
 
 For OpenCode, you'll typically edit:
 
-1. **settings.json** - Main configuration:
+1. **opencode.json** - Main configuration:
 ```json
 {
-  "agents": {
-    "Sisyphus": {
+  "agent": {
+    "reviewer": {
+      "description": "Focused code review",
+      "mode": "subagent",
       "model": "anthropic/claude-sonnet-4-20250514"
     }
   }
@@ -274,9 +276,9 @@ Configure your mission:
    - **Isolated containers** - Sandboxed environments for projects
 
 2. **Agent** - Choose the AI model:
-   - **Smart Mode** - Balanced performance (recommended)
-   - **Rush Mode** - Faster responses
-   - **Custom agents** - Your configured agents (Sisyphus, Prometheus, etc.)
+   - **OpenCode build** - Default implementation agent
+   - **OpenCode plan** - Read-only planning agent
+   - **Custom agents** - Native agents configured in `.opencode/agents/`
 
 3. **Model Override (optional)** - Force a specific model for this mission:
    - **Claude Code**: use a raw model ID (e.g., `claude-opus-4-7`)

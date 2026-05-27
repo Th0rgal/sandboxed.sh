@@ -47,7 +47,7 @@ pub struct PluginUI {
     /// Lucide icon name (e.g., "zap", "refresh-cw")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
-    /// Display name (e.g., "Ralph Wiggum")
+    /// Display name (e.g., "Code Reviewer")
     pub label: String,
     /// Short description/hint (e.g., "continuous running")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,7 +60,7 @@ pub struct PluginUI {
 /// Plugin definition from plugins.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plugin {
-    /// npm package name (e.g., "@opencode/ralph-wiggum")
+    /// npm package name (e.g., "@opencode/plugin-name")
     pub package: String,
     /// Description of what this plugin does
     #[serde(skip_serializing_if = "Option::is_none")]

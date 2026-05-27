@@ -155,7 +155,7 @@ describe("EnhancedInput composer behavior", () => {
 describe("EnhancedInput command autocomplete backend filtering", () => {
   it("does not show OpenCode or Claude builtins for codex backend", async () => {
     vi.mocked(getBuiltinCommands).mockResolvedValue({
-      opencode: [{ name: "ralph-loop", description: null, path: "builtin" }],
+      opencode: [{ name: "init", description: null, path: "builtin" }],
       claudecode: [{ name: "plan", description: null, path: "builtin-claude" }],
     });
 
@@ -179,13 +179,13 @@ describe("EnhancedInput command autocomplete backend filtering", () => {
 
     await waitFor(() => {
       expect(screen.queryByText("plan")).not.toBeInTheDocument();
-      expect(screen.queryByText("ralph-loop")).not.toBeInTheDocument();
+      expect(screen.queryByText("init")).not.toBeInTheDocument();
     });
   });
 
   it("shows only Claude builtins for claudecode backend", async () => {
     vi.mocked(getBuiltinCommands).mockResolvedValue({
-      opencode: [{ name: "ralph-loop", description: null, path: "builtin" }],
+      opencode: [{ name: "init", description: null, path: "builtin" }],
       claudecode: [{ name: "plan", description: null, path: "builtin-claude" }],
     });
 
@@ -208,6 +208,6 @@ describe("EnhancedInput command autocomplete backend filtering", () => {
     fireEvent.change(textarea as HTMLTextAreaElement, { target: { value: "/" } });
 
     expect(await screen.findByText("plan")).toBeInTheDocument();
-    expect(screen.queryByText("ralph-loop")).not.toBeInTheDocument();
+    expect(screen.queryByText("init")).not.toBeInTheDocument();
   });
 });

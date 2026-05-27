@@ -505,13 +505,7 @@ export function NewMissionDialog({
       return;
     }
 
-    // Try OpenCode second (prefer Sisyphus if available)
-    const sisyphus = allAgents.find(a => a.backend === 'opencode' && a.agent === 'Sisyphus');
-    if (sisyphus) {
-      setSelectedAgentValue(sisyphus.value);
-      setDefaultSet(true);
-      return;
-    }
+    // Try OpenCode second
     const openCodeAgent = allAgents.find(a => a.backend === 'opencode');
     if (openCodeAgent) {
       setSelectedAgentValue(openCodeAgent.value);
@@ -794,7 +788,7 @@ export function NewMissionDialog({
                       </option>
                       {backendAgentsList.map((agent) => (
                         <option key={agent.value} value={agent.value} className="bg-[#1a1a1a]">
-                          {agent.displayName}{agent.backend === 'opencode' && agent.agent === 'Sisyphus' ? ' (recommended)' : ''}
+                          {agent.displayName}
                         </option>
                       ))}
                     </optgroup>

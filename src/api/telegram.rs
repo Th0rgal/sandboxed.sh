@@ -3381,8 +3381,8 @@ async fn resolve_or_create_mission(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let title = Some(format!("Telegram: {}", sender_name));
 
-    // Normalize agent name: strip parenthetical suffixes like "(Ultraworker)"
-    // and lowercase to get the config key (e.g. "Sisyphus (Ultraworker)" → "sisyphus")
+    // Normalize agent name: strip parenthetical suffixes like "(Reviewer)"
+    // and lowercase to get the config key (e.g. "Build (Reviewer)" -> "build")
     let agent = ctx.channel.default_agent.as_ref().map(|a| {
         let name = if let Some(idx) = a.find('(') {
             a[..idx].trim()

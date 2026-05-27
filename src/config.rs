@@ -8,7 +8,7 @@
 //! - `PORT` - Optional. Server port. Defaults to `3000`.
 //! - `MAX_ITERATIONS` - Optional. Maximum agent loop iterations. Defaults to `50`.
 //! - `OPENCODE_BASE_URL` - DEPRECATED. No longer used for mission execution (per-mission CLI mode).
-//! - `OPENCODE_AGENT` - Optional. Default OpenCode agent name (e.g., `Sisyphus`, `oracle`).
+//! - `OPENCODE_AGENT` - Optional. Default OpenCode agent name (e.g., `build`, `plan`).
 //! - `OPENCODE_PERMISSIVE` - Optional. If true, auto-allows all permissions for OpenCode sessions (default: true).
 //! - `SANDBOXED_USERS` or `SANDBOXED_SH_USERS` (legacy) - Optional. JSON array of user accounts for multi-user auth.
 //! - `LIBRARY_GIT_SSH_KEY` - Optional. SSH key path for library git operations. If set to a path, uses that key.
@@ -221,7 +221,7 @@ pub struct Config {
     /// DEPRECATED: OpenCode server base URL (no longer used for mission execution)
     pub opencode_base_url: String,
 
-    /// Default OpenCode agent name (e.g., "Sisyphus", "oracle")
+    /// Default OpenCode agent name (e.g., "build", "plan")
     pub opencode_agent: Option<String>,
 
     /// Whether to auto-allow all OpenCode permissions for created sessions

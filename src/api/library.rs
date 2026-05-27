@@ -1012,43 +1012,7 @@ async fn get_builtin_commands() -> (HeaderMap, Json<BuiltinCommandsResponse>) {
 }
 
 fn build_builtin_commands() -> BuiltinCommandsResponse {
-    // OpenCode builtin commands
-    let opencode_commands = vec![
-        CommandSummary {
-            name: "ralph-loop".to_string(),
-            description: Some(
-                "Start self-referential development loop until completion".to_string(),
-            ),
-            path: "builtin".to_string(),
-            params: vec![],
-        },
-        CommandSummary {
-            name: "cancel-ralph".to_string(),
-            description: Some("Cancel active Ralph Loop".to_string()),
-            path: "builtin".to_string(),
-            params: vec![],
-        },
-        CommandSummary {
-            name: "start-work".to_string(),
-            description: Some("Start Sisyphus work session from Prometheus plan".to_string()),
-            path: "builtin".to_string(),
-            params: vec![],
-        },
-        CommandSummary {
-            name: "refactor".to_string(),
-            description: Some(
-                "Intelligent refactoring with LSP, AST-grep, and TDD verification".to_string(),
-            ),
-            path: "builtin".to_string(),
-            params: vec![],
-        },
-        CommandSummary {
-            name: "init-deep".to_string(),
-            description: Some("Initialize hierarchical AGENTS.md knowledge base".to_string()),
-            path: "builtin".to_string(),
-            params: vec![],
-        },
-    ];
+    let opencode_commands = vec![];
 
     // Claude Code builtin commands
     let claudecode_commands = vec![

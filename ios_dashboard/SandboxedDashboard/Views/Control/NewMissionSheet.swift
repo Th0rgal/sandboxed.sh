@@ -293,16 +293,6 @@ struct NewMissionSheet: View {
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(Theme.textPrimary)
                         
-                        // Recommended badge for Sisyphus
-                        if backend.id == "opencode" && agent.name == "Sisyphus" {
-                            Text("Recommended")
-                                .font(.caption2.weight(.medium))
-                                .foregroundStyle(Theme.success)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Theme.success.opacity(0.15))
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
-                        }
                     }
                 }
                 
@@ -460,7 +450,7 @@ struct NewMissionSheet: View {
         enabledBackendIds = data.enabledBackendIds
         backendAgents = data.backendAgents
 
-        // Set default agent (prefer saved default, then Sisyphus in OpenCode, then first available)
+        // Set default agent (prefer saved default, then first available)
         if selectedAgentValue.isEmpty {
             // First check for saved default agent
             if let savedDefault = UserDefaults.standard.string(forKey: "default_agent"), !savedDefault.isEmpty {
@@ -473,11 +463,9 @@ struct NewMissionSheet: View {
                 }
             }
 
-            // Fall back to Sisyphus or first available
+            // Fall back to the first available agent.
             if selectedAgentValue.isEmpty {
-                if let sisyphus = backendAgents["opencode"]?.first(where: { $0.name == "Sisyphus" }) {
-                    selectedAgentValue = "opencode:\(sisyphus.id)"
-                } else if let firstBackend = backends.first(where: { enabledBackendIds.contains($0.id) }),
+                if let firstBackend = backends.first(where: { enabledBackendIds.contains($0.id) }),
                           let firstAgent = backendAgents[firstBackend.id]?.first {
                     selectedAgentValue = "\(firstBackend.id):\(firstAgent.id)"
                 }

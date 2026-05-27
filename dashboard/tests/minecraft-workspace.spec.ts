@@ -112,7 +112,7 @@ test.describe('Minecraft workspace mission', () => {
     });
 
     const missionRes = await request.post(`${apiBase}/api/control/missions`, {
-      data: { title: missionTitle, workspace_id: workspaceId, agent: 'Sisyphus' },
+      data: { title: missionTitle, workspace_id: workspaceId, agent: 'build' },
       headers: { 'Content-Type': 'application/json' },
     });
     expect(missionRes.ok()).toBeTruthy();
