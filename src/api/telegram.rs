@@ -50,6 +50,46 @@ fn paloma_scheduler_lease_expires_at() -> String {
     (Utc::now() + ChronoDuration::seconds(PALOMA_SCHEDULER_JOB_LEASE_SECONDS)).to_rfc3339()
 }
 
+fn env_unquote(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        return trimmed[1..trimmed.len() - 1].replace("'\\''", "'");
+    }
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        return trimmed[1..trimmed.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\");
+    }
+    trimmed.to_string()
+}
+
+fn parse_env_value(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (candidate, value) = line.split_once('=')?;
+        if candidate.trim() == key {
+            Some(env_unquote(value))
+        } else {
+            None
+        }
+    })
+}
+
+fn hermes_owned_telegram_tokens() -> HashSet<String> {
+    [
+        "/etc/sandboxed-sh/hermes-assistant.env",
+        "/etc/sandboxed-sh/hermes-assistant-dev.env",
+    ]
+    .into_iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .filter_map(|contents| parse_env_value(&contents, "TELEGRAM_BOT_TOKEN"))
+    .filter(|token| !token.trim().is_empty())
+    .collect()
+}
+
 /// Manages Telegram webhook registrations and channel routing context.
 pub struct TelegramBridge {
     /// Routing context for each active channel (needed to forward webhook messages).
@@ -2982,6 +3022,7 @@ impl TelegramBridge {
     ) {
         match store.list_all_active_telegram_channels().await {
             Ok(channels) => {
+                let hermes_tokens = hermes_owned_telegram_tokens();
                 if !channels.is_empty() {
                     tracing::info!(
                         "Booting {} active Telegram channel(s) from store",
@@ -2989,6 +3030,17 @@ impl TelegramBridge {
                     );
                 }
                 for channel in channels {
+                    if hermes_tokens.contains(&channel.bot_token) {
+                        let mut inactive = channel.clone();
+                        inactive.active = false;
+                        inactive.updated_at = now_string();
+                        let _ = store.update_telegram_channel(inactive).await;
+                        tracing::info!(
+                            channel_id = %channel.id,
+                            "Skipped legacy Telegram gateway boot because Hermes owns this bot token"
+                        );
+                        continue;
+                    }
                     let ch_id = channel.id;
                     if let Err(e) = self
                         .start_channel(

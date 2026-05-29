@@ -7,6 +7,7 @@ model:
   default: ${HERMES_ASSISTANT_MODEL}
   base_url: ${OPENAI_BASE_URL}
   api_key: ${OPENAI_API_KEY}
+  api_mode: chat_completions
 
 terminal:
   # Keep Hermes' own shell/tool execution scoped to the assistant workspace.

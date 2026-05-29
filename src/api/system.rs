@@ -817,6 +817,7 @@ pub struct AdoptHermesAssistantResponse {
     pub gateway_username: Option<String>,
     pub service_name: String,
     pub env_path: String,
+    pub dotenv_path: String,
     pub config_path: String,
     pub soul_path: String,
     pub workspace_path: String,
@@ -835,9 +836,11 @@ pub struct HermesAssistantStatusResponse {
     pub service_name: String,
     pub service_active: bool,
     pub env_path: String,
+    pub dotenv_path: String,
     pub config_path: String,
     pub soul_path: String,
     pub env_present: bool,
+    pub dotenv_present: bool,
     pub config_present: bool,
     pub soul_present: bool,
     pub token_present: bool,
@@ -955,6 +958,7 @@ fn hermes_config_yaml(runtime_name: &str) -> String {
   default: ${{HERMES_ASSISTANT_MODEL}}
   base_url: ${{OPENAI_BASE_URL}}
   api_key: ${{OPENAI_API_KEY}}
+  api_mode: chat_completions
 
 terminal:
   backend: local
@@ -1159,6 +1163,7 @@ async fn adopt_hermes_assistant(
     let runtime_name = assistant_runtime_name(&state.config);
     let service_name = format!("{runtime_name}.service");
     let env_path = format!("/etc/sandboxed-sh/{runtime_name}.env");
+    let dotenv_path = format!("/var/lib/{runtime_name}/.env");
     let config_path = format!("/var/lib/{runtime_name}/config.yaml");
     let soul_path = format!("/var/lib/{runtime_name}/SOUL.md");
     let workspace_path = format!("/var/lib/{runtime_name}/workspace");
@@ -1204,6 +1209,7 @@ async fn adopt_hermes_assistant(
         &format!("/var/lib/{runtime_name}"),
     ));
     env.push_str("HERMES_ACCEPT_HOOKS=1\n");
+    env.push_str("HERMES_INFERENCE_PROVIDER=custom\n");
     env.push_str(&env_line("HERMES_SANDBOXED_API_URL", &api_url));
     env.push_str("HERMES_SANDBOXED_API_TOKEN=\n");
     env.push_str(&env_line("JWT_SECRET", &jwt_secret));
@@ -1228,6 +1234,9 @@ async fn adopt_hermes_assistant(
     env.push_str("HERMES_ASSISTANT_MCP_COMMAND=/usr/local/bin/assistant-mcp\n");
 
     write_private_file(&env_path, &env)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_private_file(&dotenv_path, &env)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     write_private_file(&config_path, &hermes_config_yaml(runtime_name))
@@ -1313,6 +1322,7 @@ async fn adopt_hermes_assistant(
         gateway_username: channel.bot_username.clone(),
         service_name,
         env_path,
+        dotenv_path,
         config_path,
         soul_path,
         workspace_path,
@@ -1333,6 +1343,7 @@ async fn get_hermes_assistant_status(
     let runtime_name = assistant_runtime_name(&state.config);
     let service_name = format!("{runtime_name}.service");
     let env_path = format!("/etc/sandboxed-sh/{runtime_name}.env");
+    let dotenv_path = format!("/var/lib/{runtime_name}/.env");
     let config_path = format!("/var/lib/{runtime_name}/config.yaml");
     let soul_path = format!("/var/lib/{runtime_name}/SOUL.md");
     let service_active = Command::new("systemctl")
@@ -1343,6 +1354,7 @@ async fn get_hermes_assistant_status(
         .unwrap_or(false);
     let env_contents = tokio::fs::read_to_string(&env_path).await.ok();
     let env_present = env_contents.is_some();
+    let dotenv_present = tokio::fs::metadata(&dotenv_path).await.is_ok();
     let config_present = tokio::fs::metadata(&config_path).await.is_ok();
     let soul_present = tokio::fs::metadata(&soul_path).await.is_ok();
     let token = env_contents
@@ -1437,9 +1449,11 @@ async fn get_hermes_assistant_status(
         service_name,
         service_active,
         env_path,
+        dotenv_path,
         config_path,
         soul_path,
         env_present,
+        dotenv_present,
         config_present,
         soul_present,
         token_present,
