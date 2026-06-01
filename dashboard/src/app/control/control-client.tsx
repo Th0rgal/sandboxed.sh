@@ -484,18 +484,6 @@ const PerfOverlay = dynamic(() =>
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
 
-function scheduleBackgroundHistoryFill(callback: () => void) {
-  if (typeof window === "undefined") return;
-  const start = () => {
-    if ("requestIdleCallback" in window) {
-      window.requestIdleCallback(callback, { timeout: 5_000 });
-      return;
-    }
-    globalThis.setTimeout(callback, 250);
-  };
-  globalThis.setTimeout(start, 1_000);
-}
-
 // Module-level so all duration consumers share the same implementation.
 function formatDuration(seconds: number): string {
   if (seconds <= 0) return "<1s";
@@ -4444,28 +4432,43 @@ export default function ControlClient() {
     setThinkingPanelManuallyHidden(true);
   }, [setShowThinkingPanel, setThinkingPanelManuallyHidden]);
 
-  const adjustVisibleItemsLimit = useCallback((historyItems: ChatItem[]) => {
-    let lastAssistantIdx = -1;
-    for (let i = historyItems.length - 1; i >= 0; i--) {
-      if (historyItems[i].kind === "assistant") {
-        lastAssistantIdx = i;
-        break;
+  // Anchor the initial visible window on the last N conversation messages
+  // (user + assistant), not the last single assistant message. On tool-heavy
+  // missions a long run of tool calls would otherwise push the recent
+  // back-and-forth above the fold, behind "Load older messages". Expanding
+  // the window to span from the Nth-most-recent message through the newest
+  // item keeps the last ~10 turns (and the tool calls between them) visible
+  // immediately; everything older stays one click away.
+  const CONVERSATIONAL_ANCHOR_COUNT = 10;
+  const conversationalAnchorIndex = useCallback(
+    (historyItems: ChatItem[]): number => {
+      let convoSeen = 0;
+      let anchorIdx = -1;
+      for (let i = historyItems.length - 1; i >= 0; i--) {
+        const kind = historyItems[i].kind;
+        if (kind === "assistant" || kind === "user") {
+          anchorIdx = i;
+          convoSeen += 1;
+          if (convoSeen >= CONVERSATIONAL_ANCHOR_COUNT) break;
+        }
       }
-    }
+      return anchorIdx;
+    },
+    [],
+  );
 
-    if (lastAssistantIdx === -1) {
-      setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
-      return;
-    }
-
-    const required = historyItems.length - lastAssistantIdx;
-    if (required <= INITIAL_VISIBLE_ITEMS) {
-      setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
-      return;
-    }
-
-    setVisibleItemsLimit(required);
-  }, []);
+  const adjustVisibleItemsLimit = useCallback(
+    (historyItems: ChatItem[]) => {
+      const anchorIdx = conversationalAnchorIndex(historyItems);
+      if (anchorIdx === -1) {
+        setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
+        return;
+      }
+      const required = historyItems.length - anchorIdx;
+      setVisibleItemsLimit(Math.max(INITIAL_VISIBLE_ITEMS, required));
+    },
+    [conversationalAnchorIndex],
+  );
 
   const HISTORY_EVENT_TYPES = useMemo(
     () => [
@@ -4495,22 +4498,12 @@ export default function ControlClient() {
    */
   const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
 
-  // Page size for each backwards-paginate-older fetch (both the explicit
-  // "Load older messages" button and the post-initial background fill).
-  // Tuned for memory headroom on long missions — see the
-  // `chatScrollContainerRef` comment block above.
+  // Page size for each backwards-paginate-older fetch (the explicit
+  // "Load older messages" button / scroll-up). Tuned for memory headroom on
+  // long missions — see the `chatScrollContainerRef` comment block above.
   const HISTORY_PAGE_SIZE = 5000;
   const HISTORY_DELTA_PAGE_SIZE = 1000;
   const HISTORY_FALLBACK_PAGE_SIZE = 1000;
-  // Cap how far the background fill walks back from the head on first load.
-  // Past this depth the user has to click "Load older messages" — keeps
-  // memory + render cost predictable on huge missions while still feeling
-  // "complete" for typical ones.
-  const BACKGROUND_FILL_TARGET = 2000;
-  // Per-page size used by the background fill. Smaller than the explicit
-  // "Load older" button so each chunk costs less and we can interleave with
-  // live SSE events without long main-thread stalls.
-  const BACKGROUND_FILL_PAGE_SIZE = 500;
 
   const loadHistoryEvents = useCallback(
     async (id: string, opts?: { sinceSeq?: number }) => {
@@ -4673,32 +4666,15 @@ export default function ControlClient() {
         );
       }
 
-      // Kick off the background fill so the rest of the history streams in
-      // after first paint. Scheduled via setTimeout(0) so the caller's
-      // setItems/render commits first — running the next fetch synchronously
-      // here would just stall the same task we tried to free up. The ref
-      // indirection breaks TDZ against `streamOlderHistory`, which is
-      // declared after the older-paginator below.
-      const hasMoreLocal = metaTotal !== undefined && sorted.length < metaTotal;
-      if (hasMoreLocal) {
-        const fillFn = streamOlderHistoryRef.current;
-        if (fillFn) {
-          scheduleBackgroundHistoryFill(() => {
-            void fillFn(id);
-          });
-        }
-      }
+      // No eager background fill. The snapshot is conversation-anchored
+      // (it already includes the last N message turns plus the tool calls
+      // between them), so walking thousands more events back on open just
+      // re-replayed the whole accumulated set on the main thread per page —
+      // the "loads forever" jank on tool-heavy missions. Older history now
+      // loads purely on demand via "Load older messages" / scroll-up.
       return sorted;
     },
     [HISTORY_EVENT_TYPES],
-  );
-
-  // Bridge between `loadHistoryEvents` (declared above) and
-  // `streamOlderHistory` (declared below). `loadHistoryEvents` schedules
-  // the background fill at the tail end of its initial-load branch, but
-  // can't reference `streamOlderHistory` by name without a TDZ violation.
-  const streamOlderHistoryRef = useRef<((id: string) => Promise<void>) | null>(
-    null,
   );
 
   /**
@@ -4968,21 +4944,18 @@ export default function ControlClient() {
     return progressByMission[viewingMissionId] ?? null;
   }, [progressByMission, viewingMissionId]);
 
+  // As live events stream in, keep the last N conversation messages within
+  // the visible window. Mirrors `adjustVisibleItemsLimit` but only grows the
+  // window (never shrinks it) so unrelated growth elsewhere is preserved.
   useEffect(() => {
     if (items.length === 0) return;
-    let lastAssistantIdx = -1;
-    for (let i = items.length - 1; i >= 0; i--) {
-      if (items[i].kind === "assistant") {
-        lastAssistantIdx = i;
-        break;
-      }
-    }
-    if (lastAssistantIdx === -1) return;
+    const anchorIdx = conversationalAnchorIndex(items);
+    if (anchorIdx === -1) return;
     const visibleStart = Math.max(0, items.length - visibleItemsLimit);
-    if (lastAssistantIdx < visibleStart) {
-      setVisibleItemsLimit(items.length - lastAssistantIdx);
+    if (anchorIdx < visibleStart) {
+      setVisibleItemsLimit(items.length - anchorIdx);
     }
-  }, [items, visibleItemsLimit]);
+  }, [items, visibleItemsLimit, conversationalAnchorIndex]);
 
   const viewingMissionStallInfo = useMemo(() => {
     if (!viewingMissionId) return null;
@@ -5994,71 +5967,6 @@ export default function ControlClient() {
     [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder, setItems],
   );
 
-  // Background fill: after the initial fetch shows the newest events,
-  // walk older pages until we've reached `BACKGROUND_FILL_TARGET` total
-  // history events or there are no more. Runs `silent` so the
-  // "Load older messages" button doesn't flash a loading state; bails
-  // if the user switches missions, if a fetch fails, or if the mission
-  // turns out to have fewer events than the target (server total reached).
-  const streamOlderHistory = useCallback(
-    async (id: string) => {
-      // Yield once so the initial-render setItems can commit and paint
-      // before we start eating network/main-thread time on background
-      // fills. Without this the first chunk can land before the user
-      // sees the latest message at all.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      const stillActive = (): boolean =>
-        currentMissionRef.current?.id === id ||
-        viewingMissionRef.current?.id === id;
-
-      // Up to a few page-loads, with a small inter-page yield so live
-      // SSE events can interleave on the main thread without jank.
-      // Hard ceiling (16) is a backstop; the loop normally exits via
-      // the `hasMore`/target check first.
-      for (let i = 0; i < 16; i++) {
-        if (!stillActive()) return;
-        const accumulated =
-          missionHistoricEventsRef.current.get(id)?.length ?? 0;
-        const total = missionTotalHistoryRef.current.get(id);
-        if (total !== undefined && accumulated >= total) return;
-        if (accumulated >= BACKGROUND_FILL_TARGET) return;
-        const minSeq = missionMinSeqRef.current.get(id);
-        if (minSeq === undefined || minSeq <= 1) return;
-
-        try {
-          await loadOlderHistoryEvents(id, {
-            silent: true,
-            limit: BACKGROUND_FILL_PAGE_SIZE,
-          });
-        } catch {
-          // Stop on error — the user's manual "Load older messages"
-          // path remains available for retry.
-          return;
-        }
-
-        // If accumulated didn't grow, the server returned an empty
-        // page and there's nothing left to fetch. Avoid the
-        // pathological tight loop.
-        const after = missionHistoricEventsRef.current.get(id)?.length ?? 0;
-        if (after <= accumulated) return;
-
-        // Small pause between pages so the main thread can run other
-        // work (live event handlers, scroll, input).
-        await new Promise((resolve) => setTimeout(resolve, 150));
-      }
-    },
-    [loadOlderHistoryEvents, BACKGROUND_FILL_PAGE_SIZE, BACKGROUND_FILL_TARGET],
-  );
-
-  // Wire the ref consumed by `loadHistoryEvents` (which is declared
-  // above `streamOlderHistory`, so it can't reference it directly).
-  useEffect(() => {
-    streamOlderHistoryRef.current = streamOlderHistory;
-    return () => {
-      streamOlderHistoryRef.current = null;
-    };
-  }, [streamOlderHistory]);
 
   // Load mission from URL param on mount (and retry on auth success)
   const [authRetryTrigger, setAuthRetryTrigger] = useState(0);

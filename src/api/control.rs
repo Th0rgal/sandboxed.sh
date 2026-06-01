@@ -4918,7 +4918,21 @@ const HISTORY_EVENT_TYPES: &[&str] = &[
     "goal_iteration",
     "goal_status",
 ];
-const SNAPSHOT_EVENT_LIMIT: usize = 200;
+/// Conversation message types used to anchor the snapshot tail. The snapshot
+/// guarantees the most recent `SNAPSHOT_CONVERSATIONAL_MESSAGES` of these are
+/// loaded (plus every tool call between them), so a tool-heavy mission opens
+/// on the actual conversation instead of a wall of tool output.
+const SNAPSHOT_ANCHOR_TYPES: &[&str] = &[
+    "user_message",
+    "assistant_message",
+    "assistant_message_canonical",
+];
+/// How many recent conversation messages the snapshot guarantees.
+const SNAPSHOT_CONVERSATIONAL_MESSAGES: usize = 10;
+/// Hard cap on snapshot size. Bounds payload if the recent conversation
+/// happens to span an unusually large number of tool calls; the rest stays
+/// reachable via backwards pagination ("Load older messages").
+const SNAPSHOT_MAX_EVENTS: usize = 1500;
 
 fn event_types_for_query(query: &GetEventsQuery) -> Option<Vec<String>> {
     if let Some(types) = query.types.as_ref() {
@@ -4990,16 +5004,66 @@ pub async fn get_mission_snapshot(
         mission.workspace_name = Some(workspace.name);
     }
 
-    let events = control
+    // Conversation-anchored snapshot tail: load everything from the
+    // Nth-most-recent conversation message to the head, so the recent
+    // back-and-forth is always present even when tool calls dominate the
+    // raw event stream. Falls back to a plain recent-events tail when the
+    // mission has fewer than N conversation messages, or (degenerate) when
+    // the anchored span would exceed the hard cap.
+    let anchor_seq = control
         .mission_store
-        .get_events_before(
+        .nth_recent_event_sequence(
             mission_id,
-            i64::MAX,
-            Some(HISTORY_EVENT_TYPES),
-            Some(SNAPSHOT_EVENT_LIMIT),
+            SNAPSHOT_ANCHOR_TYPES,
+            SNAPSHOT_CONVERSATIONAL_MESSAGES,
         )
         .await
         .map_err(internal_error)?;
+    let events = match anchor_seq {
+        Some(anchor) => {
+            // `get_events_since` is `sequence > since`, so subtract one to
+            // include the anchor itself. Fetch one past the cap to detect
+            // overflow without a separate count query.
+            let anchored = control
+                .mission_store
+                .get_events_since(
+                    mission_id,
+                    anchor.saturating_sub(1),
+                    Some(HISTORY_EVENT_TYPES),
+                    Some(SNAPSHOT_MAX_EVENTS + 1),
+                )
+                .await
+                .map_err(internal_error)?;
+            if anchored.len() > SNAPSHOT_MAX_EVENTS {
+                // The recent conversation spans more than the cap of tool
+                // calls. `get_events_since` returned the OLDEST events after
+                // the anchor (ASC), which would miss the newest — so fall
+                // back to the most-recent capped tail instead.
+                control
+                    .mission_store
+                    .get_events_before(
+                        mission_id,
+                        i64::MAX,
+                        Some(HISTORY_EVENT_TYPES),
+                        Some(SNAPSHOT_MAX_EVENTS),
+                    )
+                    .await
+                    .map_err(internal_error)?
+            } else {
+                anchored
+            }
+        }
+        None => control
+            .mission_store
+            .get_events_before(
+                mission_id,
+                i64::MAX,
+                Some(HISTORY_EVENT_TYPES),
+                Some(SNAPSHOT_MAX_EVENTS),
+            )
+            .await
+            .map_err(internal_error)?,
+    };
     let summary = if should_summarize_events(&mission) {
         summarize_inactive_stream_events(events)
     } else {

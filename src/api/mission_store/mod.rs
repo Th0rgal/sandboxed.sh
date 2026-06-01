@@ -1367,6 +1367,22 @@ pub trait MissionStore: Send + Sync {
         Ok(0)
     }
 
+    /// Sequence of the Nth-most-recent event whose type is in `anchor_types`
+    /// (e.g. the 10th-most-recent user/assistant message). Returns `None`
+    /// when the mission has fewer than `n` such events. Used to load a
+    /// *conversation-anchored* snapshot tail — everything from this sequence
+    /// to the head — instead of a raw event-count tail that, on tool-heavy
+    /// missions, would be dominated by tool calls and bury recent messages.
+    async fn nth_recent_event_sequence(
+        &self,
+        mission_id: Uuid,
+        anchor_types: &[&str],
+        n: usize,
+    ) -> Result<Option<i64>, String> {
+        let _ = (mission_id, anchor_types, n);
+        Ok(None)
+    }
+
     /// Get total cost in cents across all missions.
     /// Aggregates assistant_message metadata cost across all events.
     async fn get_total_cost_cents(&self) -> Result<u64, String> {
