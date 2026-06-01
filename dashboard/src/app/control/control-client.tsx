@@ -1178,12 +1178,7 @@ function QuestionToolItem({
               <button
                 onClick={handleSubmit}
                 disabled={!canSubmit || submitting}
-                className={cn(
-                  "inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors",
-                  !canSubmit || submitting
-                    ? "bg-white/5 text-white/30 cursor-not-allowed"
-                    : "bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30",
-                )}
+                className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-600 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-indigo-500"
               >
                 {submitting ? "Sending…" : "Submit Answer"}
               </button>
