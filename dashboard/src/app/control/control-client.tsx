@@ -4921,7 +4921,7 @@ export default function ControlClient() {
         it.kind === "phase",
     );
     if (hasInlineLiveness) return null;
-    let since = 0;
+    let since: number | null = null;
     for (let i = items.length - 1; i >= 0; i--) {
       const it = items[i];
       // Queued user messages sit at the tail while the agent keeps inserting
@@ -4935,6 +4935,10 @@ export default function ControlClient() {
         break;
       }
     }
+    // No timed row to anchor on (e.g. only queued user messages): suppress the
+    // pill rather than pass 0, which LiveDuration would read as epoch ms and
+    // render as a ~decades-long elapsed time.
+    if (since == null) return null;
     return { since };
   }, [items, showThinkingPanel]);
 
