@@ -9488,6 +9488,23 @@ export default function ControlClient() {
     missionLoading &&
     !!viewingMissionId &&
     activeMission?.id !== viewingMissionId;
+
+  // The inline "Agent is working" pill renders *below* the virtualized
+  // timeline, so the bottom anchor (which keys off `groupedItems` only) never
+  // scrolls to reveal it — unlike the "is thinking" indicator, which is a real
+  // timeline item. Nudge to the bottom when the pill first appears while the
+  // user is already pinned there, so it shows up the same way thinking does.
+  const agentWorkingPillVisible =
+    viewingMissionIsRunning &&
+    activeMission?.status === "active" &&
+    !!agentWorkingIndicator;
+  const prevAgentWorkingPillVisible = useRef(false);
+  useEffect(() => {
+    if (agentWorkingPillVisible && !prevAgentWorkingPillVisible.current && isAtBottom) {
+      scrollToBottom("smooth");
+    }
+    prevAgentWorkingPillVisible.current = agentWorkingPillVisible;
+  }, [agentWorkingPillVisible, isAtBottom, scrollToBottom]);
   const workspaceNameById = useMemo(() => {
     return Object.fromEntries(workspaces.map((ws) => [ws.id, ws.name]));
   }, [workspaces]);
@@ -10561,9 +10578,7 @@ export default function ControlClient() {
                   inline. P2-#14: the items.some walk lives in the
                   `agentWorkingIndicator` memo so each NowTick render doesn't
                   re-walk the whole items array. */}
-                  {viewingMissionIsRunning &&
-                    activeMission?.status === "active" &&
-                    agentWorkingIndicator && (
+                  {agentWorkingPillVisible && agentWorkingIndicator && (
                       <div className="flex justify-start animate-fade-in">
                         <div className="inline-flex items-center gap-2 rounded-full border border-indigo-500/20 bg-indigo-500/[0.08] px-3 py-1.5">
                           <Loader className="h-3.5 w-3.5 text-indigo-400 animate-spin" />
