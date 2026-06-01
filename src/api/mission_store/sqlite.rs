@@ -4159,6 +4159,43 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn nth_recent_event_sequence(
+        &self,
+        mission_id: Uuid,
+        anchor_types: &[&str],
+        n: usize,
+    ) -> Result<Option<i64>, String> {
+        if n == 0 {
+            return Ok(None);
+        }
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let types: Vec<String> = anchor_types.iter().map(|s| s.to_string()).collect();
+        // OFFSET is zero-based: the Nth-most-recent row is at offset N-1.
+        let offset = (n - 1) as i64;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let types_json = serde_json::to_string(&types).unwrap_or_else(|_| "[]".to_string());
+            // Backed by idx_events_mission_type_sequence (mission_id,
+            // event_type, sequence) — the DESC walk + small OFFSET is cheap.
+            let seq: Option<i64> = conn
+                .query_row(
+                    "SELECT sequence FROM mission_events
+                     WHERE mission_id = ?1 AND event_type IN (SELECT value FROM json_each(?2))
+                     ORDER BY sequence DESC
+                     LIMIT 1 OFFSET ?3",
+                    params![&mid, &types_json, offset],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            Ok(seq)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn count_events(
         &self,
         mission_id: Uuid,
@@ -11573,6 +11610,100 @@ mod tests {
         assert_eq!(
             contents,
             vec!["msg-45", "msg-46", "msg-47", "msg-48", "msg-49"]
+        );
+    }
+
+    #[tokio::test]
+    async fn nth_recent_event_sequence_anchors_on_conversation_messages() {
+        use crate::api::control::AgentEvent;
+        // The conversation-anchored snapshot needs the sequence of the
+        // Nth-most-recent user/assistant message, ignoring the (far more
+        // numerous) tool calls in between.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Tool heavy"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        let anchor_types = ["user_message", "assistant_message"];
+
+        // No conversation messages yet → None.
+        assert_eq!(
+            store
+                .nth_recent_event_sequence(mission.id, &anchor_types, 1)
+                .await
+                .expect("query"),
+            None
+        );
+
+        // Interleave 5 assistant messages with 3 tool calls between each.
+        // Record each assistant message's sequence as we go.
+        let mut assistant_seqs: Vec<i64> = Vec::new();
+        for n in 0..5 {
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::AssistantMessage {
+                        id: Uuid::new_v4(),
+                        content: format!("assistant-{n}"),
+                        success: true,
+                        cost_cents: 0,
+                        cost_source: CostSource::Unknown,
+                        usage: None,
+                        model: None,
+                        model_normalized: None,
+                        mission_id: Some(mission.id),
+                        shared_files: None,
+                        resumable: false,
+                        completion_evidence: None,
+                    },
+                )
+                .await
+                .expect("log assistant");
+            assistant_seqs.push(store.max_event_sequence(mission.id).await.expect("max"));
+            for t in 0..3 {
+                store
+                    .log_event(
+                        mission.id,
+                        &AgentEvent::ToolCall {
+                            tool_call_id: format!("tc-{n}-{t}"),
+                            name: "bash".to_string(),
+                            args: serde_json::json!({"cmd": "echo hi"}),
+                            mission_id: Some(mission.id),
+                        },
+                    )
+                    .await
+                    .expect("log tool");
+            }
+        }
+
+        // 1st-most-recent conversation message = the last assistant (index 4).
+        assert_eq!(
+            store
+                .nth_recent_event_sequence(mission.id, &anchor_types, 1)
+                .await
+                .expect("query"),
+            Some(assistant_seqs[4])
+        );
+        // 3rd-most-recent = assistant index 2, even though ~6 tool calls
+        // sit between it and the head.
+        assert_eq!(
+            store
+                .nth_recent_event_sequence(mission.id, &anchor_types, 3)
+                .await
+                .expect("query"),
+            Some(assistant_seqs[2])
+        );
+        // Asking for more conversation messages than exist → None.
+        assert_eq!(
+            store
+                .nth_recent_event_sequence(mission.id, &anchor_types, 6)
+                .await
+                .expect("query"),
+            None
         );
     }
 
