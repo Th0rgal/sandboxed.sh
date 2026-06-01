@@ -9529,7 +9529,18 @@ export default function ControlClient() {
     activeMission?.status === "active" &&
     !!agentWorkingIndicator;
   const prevAgentWorkingPillVisible = useRef(false);
+  const pillLatchMissionId = useRef(viewingMissionId);
   useEffect(() => {
+    // Reset the latch synchronously when the viewed mission changes, *before*
+    // evaluating the transition. A separate mission-id effect can't do this:
+    // effects run in declaration order, so the auto-scroll below would see a
+    // stale `true` from the previous running mission (no false→true edge) and
+    // never scroll on the new timeline. Folding the reset in here guarantees
+    // the new mission's first pill appearance counts as a real edge.
+    if (pillLatchMissionId.current !== viewingMissionId) {
+      pillLatchMissionId.current = viewingMissionId;
+      prevAgentWorkingPillVisible.current = false;
+    }
     if (
       agentWorkingPillVisible &&
       !prevAgentWorkingPillVisible.current &&
@@ -9538,13 +9549,7 @@ export default function ControlClient() {
       scrollToBottom("smooth");
     }
     prevAgentWorkingPillVisible.current = agentWorkingPillVisible;
-  }, [agentWorkingPillVisible, isAtBottom, scrollToBottom]);
-  // Clear the latch when switching missions, otherwise the ref stays true from
-  // a previously-viewed running mission and the false→true transition never
-  // fires on the new timeline, so the pill never triggers its bottom scroll.
-  useEffect(() => {
-    prevAgentWorkingPillVisible.current = false;
-  }, [viewingMissionId]);
+  }, [agentWorkingPillVisible, isAtBottom, scrollToBottom, viewingMissionId]);
   const workspaceNameById = useMemo(() => {
     return Object.fromEntries(workspaces.map((ws) => [ws.id, ws.name]));
   }, [workspaces]);
