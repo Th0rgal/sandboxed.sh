@@ -572,13 +572,43 @@ async fn build_backend_handoff_context(
         body.push_str(&snippet);
     }
 
+    // The reconstructed content is prior agent/user output, so treat it as
+    // untrusted: neutralize any closing `</prior_reasoning>` so it can't break
+    // out of the framing tag (prompt injection). Case-insensitive.
+    let mut safe_body = body;
+    for variant in [
+        "</prior_reasoning",
+        "</PRIOR_REASONING",
+        "</Prior_reasoning",
+    ] {
+        safe_body = safe_body.replace(variant, "<\u{200b}/prior_reasoning");
+    }
+
+    // Backend names come from run-settings input; render only a sanitized
+    // identifier (alphanumeric/-/_) so a crafted value can't inject prompt
+    // text or break the markdown.
+    let sanitize_backend = |s: &str| -> String {
+        let cleaned: String = s
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(40)
+            .collect();
+        if cleaned.is_empty() {
+            "backend".to_string()
+        } else {
+            cleaned
+        }
+    };
+    let new_label = sanitize_backend(new_backend);
+    let old_label = sanitize_backend(old_backend);
+
     Some(format!(
-        "## Backend handoff: now continuing on `{new_backend}` (was `{old_backend}`)\n\n\
+        "## Backend handoff: now continuing on `{new_label}` (was `{old_label}`)\n\n\
          The previous backend's session is not carried over (different reasoning \
          format), but your work is intact in the workspace and the conversation \
          above is preserved. To keep continuity, here is your {label} from the \
-         `{old_backend}` session:\n\n\
-         <prior_reasoning>\n{body}\n</prior_reasoning>\n\n\
+         `{old_label}` session:\n\n\
+         <prior_reasoning>\n{safe_body}\n</prior_reasoning>\n\n\
          Pick up exactly where you left off and continue toward the goal. \
          Re-orient by checking the current workspace state first, then proceed."
     ))
