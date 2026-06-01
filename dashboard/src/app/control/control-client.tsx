@@ -259,18 +259,20 @@ export function appendUnpersistedLiveTail(
       .slice(lastHistoryUserIdx + 1)
       .some((item) => item.kind === "assistant");
 
-  const unpersistedTail = liveItems.slice(lastLiveUserIdx + 1).filter((item) => {
-    if (existingIds.has(item.id)) return false;
-    if (item.kind === "assistant") {
+  const unpersistedTail = liveItems
+    .slice(lastLiveUserIdx + 1)
+    .filter((item) => {
+      if (existingIds.has(item.id)) return false;
+      if (item.kind === "assistant") {
+        const content = item.content.trim();
+        return content.length > 0 && !existingAssistantContent.has(content);
+      }
+      if (item.kind !== "stream" || item.done) return false;
       const content = item.content.trim();
-      return content.length > 0 && !existingAssistantContent.has(content);
-    }
-    if (item.kind !== "stream" || item.done) return false;
-    const content = item.content.trim();
-    if (!content) return false;
-    if (existingAssistantContent.has(content)) return false;
-    return !historyHasAssistantAfterLastUser;
-  });
+      if (!content) return false;
+      if (existingAssistantContent.has(content)) return false;
+      return !historyHasAssistantAfterLastUser;
+    });
 
   return unpersistedTail.length > 0
     ? [...historyItems, ...unpersistedTail]
@@ -321,7 +323,9 @@ function formatMissionDocumentTitle(mission: Mission | null | undefined) {
     maxLength: MAX_DOCUMENT_MISSION_TITLE_LENGTH,
     fallback: getMissionShortName(mission.id),
   }).trim();
-  return title ? `${title} | ${DEFAULT_DOCUMENT_TITLE}` : DEFAULT_DOCUMENT_TITLE;
+  return title
+    ? `${title} | ${DEFAULT_DOCUMENT_TITLE}`
+    : DEFAULT_DOCUMENT_TITLE;
 }
 
 function readLegacyControlDraft(): string {
@@ -1223,7 +1227,6 @@ function formatTime(timestamp: number): string {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-
 function statusLabel(state: ControlRunState): {
   label: string;
   Icon: typeof Loader;
@@ -1257,7 +1260,10 @@ function missionStatusLabel(
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
     case "awaiting_user":
-      return { label: "Needs You", className: "bg-amber-500/20 text-amber-400" };
+      return {
+        label: "Needs You",
+        className: "bg-amber-500/20 text-amber-400",
+      };
     case "acknowledged":
       return {
         label: "Acknowledged",
@@ -2239,8 +2245,7 @@ const ThinkingPanel = memo(function ThinkingPanel({
     overscan: 6,
   });
   // See `chatVirtualizer` below for rationale.
-  thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () =>
-    false;
+  thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
   const {
     isAtBottom: isThoughtsAtBottom,
     scrollToBottom: scrollThoughtsToBottom,
@@ -2728,7 +2733,13 @@ function MissionWorkbenchPanel({
   );
 }
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
+function Row({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex items-center justify-between gap-2 py-0.5">
       <dt className="text-white/40">{label}</dt>
@@ -3779,7 +3790,9 @@ const ChatItemRow = memo(function ChatItemRow({
     // ServerShutdown turns auto-resume — render with the check icon so the
     // visual weight matches "this is being handled", not "agent died".
     const MessageStatusIcon =
-      item.success || item.terminalReason === "ServerShutdown" ? CheckCircle : XCircle;
+      item.success || item.terminalReason === "ServerShutdown"
+        ? CheckCircle
+        : XCircle;
     const displayModel = item.model
       ? item.model.includes("/")
         ? item.model.split("/").pop()
@@ -4821,7 +4834,9 @@ export default function ControlClient() {
   // `text_delta` on the assistant message). Reuse the previous reference
   // when the thinking subset is unchanged so `React.memo(ThinkingPanel)`
   // can skip the re-render.
-  const thinkingItems = useStableShallowArray(rawThinkingItems) as SidePanelItem[];
+  const thinkingItems = useStableShallowArray(
+    rawThinkingItems,
+  ) as SidePanelItem[];
 
   const containerRef = useRef<HTMLDivElement>(null);
   const chatVirtualizer = useVirtualizer({
@@ -4908,7 +4923,13 @@ export default function ControlClient() {
     if (hasInlineLiveness) return null;
     let since = 0;
     for (let i = items.length - 1; i >= 0; i--) {
-      const t = itemActivityTime(items[i]);
+      const it = items[i];
+      // Queued user messages sit at the tail while the agent keeps inserting
+      // tool/assistant rows before them, so they are not "latest activity" —
+      // anchoring the heartbeat to a queued row's (older) timestamp makes the
+      // timer read as stalled while the mission is actively running. Skip them.
+      if (it.kind === "user" && it.queued) continue;
+      const t = itemActivityTime(it);
       if (t != null) {
         since = t;
         break;
@@ -9149,7 +9170,13 @@ export default function ControlClient() {
         submittingRef.current = false;
       }
     },
-    [items, isBusy, applyDesktopSessionState, missionHistoryToItems, scrollToBottom],
+    [
+      items,
+      isBusy,
+      applyDesktopSessionState,
+      missionHistoryToItems,
+      scrollToBottom,
+    ],
   );
 
   const handleStop = async () => {
@@ -9167,31 +9194,34 @@ export default function ControlClient() {
     }
   };
 
-  const syncQueueForMission = useCallback(async (missionId: string) => {
-    if (!missionId || syncingQueueRef.current) return;
-    syncingQueueRef.current = true;
-    try {
-      const queuedMessages = await getQueue();
-      const queuedForMission = queuedMessages.filter(
-        (qm) => qm.mission_id === missionId,
-      );
-      const queuedIds = new Set(queuedForMission.map((qm) => qm.id));
+  const syncQueueForMission = useCallback(
+    async (missionId: string) => {
+      if (!missionId || syncingQueueRef.current) return;
+      syncingQueueRef.current = true;
+      try {
+        const queuedMessages = await getQueue();
+        const queuedForMission = queuedMessages.filter(
+          (qm) => qm.mission_id === missionId,
+        );
+        const queuedIds = new Set(queuedForMission.map((qm) => qm.id));
 
-      setItems((prev) =>
-        prev.map((item) => {
-          if (item.kind !== "user") return item;
-          if (item.id.startsWith("temp-")) return item;
-          const shouldBeQueued = queuedIds.has(item.id);
-          if (item.queued === shouldBeQueued) return item;
-          return { ...item, queued: shouldBeQueued };
-        }),
-      );
-    } catch (err) {
-      console.warn("[control] failed to sync queue", err);
-    } finally {
-      syncingQueueRef.current = false;
-    }
-  }, [setItems]);
+        setItems((prev) =>
+          prev.map((item) => {
+            if (item.kind !== "user") return item;
+            if (item.id.startsWith("temp-")) return item;
+            const shouldBeQueued = queuedIds.has(item.id);
+            if (item.queued === shouldBeQueued) return item;
+            return { ...item, queued: shouldBeQueued };
+          }),
+        );
+      } catch (err) {
+        console.warn("[control] failed to sync queue", err);
+      } finally {
+        syncingQueueRef.current = false;
+      }
+    },
+    [setItems],
+  );
 
   // Reload mission history from the API. Used for visibility change,
   // periodic sync, and SSE reconnect catch-up.
@@ -9500,11 +9530,21 @@ export default function ControlClient() {
     !!agentWorkingIndicator;
   const prevAgentWorkingPillVisible = useRef(false);
   useEffect(() => {
-    if (agentWorkingPillVisible && !prevAgentWorkingPillVisible.current && isAtBottom) {
+    if (
+      agentWorkingPillVisible &&
+      !prevAgentWorkingPillVisible.current &&
+      isAtBottom
+    ) {
       scrollToBottom("smooth");
     }
     prevAgentWorkingPillVisible.current = agentWorkingPillVisible;
   }, [agentWorkingPillVisible, isAtBottom, scrollToBottom]);
+  // Clear the latch when switching missions, otherwise the ref stays true from
+  // a previously-viewed running mission and the false→true transition never
+  // fires on the new timeline, so the pill never triggers its bottom scroll.
+  useEffect(() => {
+    prevAgentWorkingPillVisible.current = false;
+  }, [viewingMissionId]);
   const workspaceNameById = useMemo(() => {
     return Object.fromEntries(workspaces.map((ws) => [ws.id, ws.name]));
   }, [workspaces]);
@@ -9575,12 +9615,16 @@ export default function ControlClient() {
     }
 
     const applyTitle = (mission: Mission | null) =>
-      mission?.id === activeMission.id ? { ...mission, title: nextTitle } : mission;
+      mission?.id === activeMission.id
+        ? { ...mission, title: nextTitle }
+        : mission;
 
     setSavingMissionTitle(true);
     setRecentMissions((prev) =>
       prev.map((mission) =>
-        mission.id === activeMission.id ? { ...mission, title: nextTitle } : mission,
+        mission.id === activeMission.id
+          ? { ...mission, title: nextTitle }
+          : mission,
       ),
     );
     setCurrentMission(applyTitle);
@@ -9593,10 +9637,14 @@ export default function ControlClient() {
       console.error("Failed to update mission title:", error);
       toast.error("Failed to update mission title");
       const restoreTitle = (mission: Mission | null) =>
-        mission?.id === activeMission.id ? { ...mission, title: previousTitle } : mission;
+        mission?.id === activeMission.id
+          ? { ...mission, title: previousTitle }
+          : mission;
       setRecentMissions((prev) =>
         prev.map((mission) =>
-          mission.id === activeMission.id ? { ...mission, title: previousTitle } : mission,
+          mission.id === activeMission.id
+            ? { ...mission, title: previousTitle }
+            : mission,
         ),
       );
       setCurrentMission(restoreTitle);
@@ -10579,20 +10627,20 @@ export default function ControlClient() {
                   `agentWorkingIndicator` memo so each NowTick render doesn't
                   re-walk the whole items array. */}
                   {agentWorkingPillVisible && agentWorkingIndicator && (
-                      <div className="flex justify-start animate-fade-in">
-                        <div className="inline-flex items-center gap-2 rounded-full border border-indigo-500/20 bg-indigo-500/[0.08] px-3 py-1.5">
-                          <Loader className="h-3.5 w-3.5 text-indigo-400 animate-spin" />
-                          <span className="text-xs font-medium text-indigo-300">
-                            Agent is working
-                          </span>
-                          <span className="text-xs tabular-nums text-indigo-300/60">
-                            <LiveDuration
-                              startTime={agentWorkingIndicator.since}
-                            />
-                          </span>
-                        </div>
+                    <div className="flex justify-start animate-fade-in">
+                      <div className="inline-flex items-center gap-2 rounded-full border border-indigo-500/20 bg-indigo-500/[0.08] px-3 py-1.5">
+                        <Loader className="h-3.5 w-3.5 text-indigo-400 animate-spin" />
+                        <span className="text-xs font-medium text-indigo-300">
+                          Agent is working
+                        </span>
+                        <span className="text-xs tabular-nums text-indigo-300/60">
+                          <LiveDuration
+                            startTime={agentWorkingIndicator.since}
+                          />
+                        </span>
                       </div>
-                    )}
+                    </div>
+                  )}
 
                   {/* Waiting banner for interactive user-input tools */}
                   {hasPendingUserInput && (
@@ -10759,9 +10807,7 @@ export default function ControlClient() {
                 </div>
               )}
 
-              <div
-                className="mx-auto max-w-3xl w-full space-y-2"
-              >
+              <div className="mx-auto max-w-3xl w-full space-y-2">
                 {/*
                   Slim status banner above the composer for interrupted /
                   blocked / failed missions. Lives inside the composer
@@ -10801,7 +10847,8 @@ export default function ControlClient() {
                           {statusLabel}
                         </span>
                         <span className="text-white/50 hidden sm:inline truncate">
-                          Type below to continue, or use the action on the right.
+                          Type below to continue, or use the action on the
+                          right.
                         </span>
                         <span className="ml-auto inline-flex items-center gap-1 shrink-0">
                           <button
@@ -10935,9 +10982,7 @@ export default function ControlClient() {
           </div>
 
           {/* Right column: Workbench, Thinking Panel and Desktop Stream stacked */}
-          {(showWorkbenchPanel ||
-            showThinkingPanel ||
-            showDesktopStream) && (
+          {(showWorkbenchPanel || showThinkingPanel || showDesktopStream) && (
             <div
               className={cn(
                 // animate-fade-in is opacity-only and cheap; we drop the
