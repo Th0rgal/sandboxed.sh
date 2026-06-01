@@ -505,6 +505,25 @@ function formatDuration(seconds: number): string {
   return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
 }
 
+// Wall-clock (ms) of when this item last "did something" — used to anchor the
+// inline "Agent is working" heartbeat at the most recent event so the timer
+// resets each time a new event lands (healthy agent) and climbs when nothing
+// arrives (stalled/hung). Phase items carry no time of their own.
+function itemActivityTime(item: ChatItem): number | null {
+  switch (item.kind) {
+    case "tool":
+    case "thinking":
+    case "stream":
+      return item.endTime ?? item.startTime;
+    case "user":
+    case "assistant":
+    case "system":
+      return item.timestamp;
+    default:
+      return null;
+  }
+}
+
 // Renders a live-updating duration string anchored at `startTime`. ONLY this
 // component subscribes to `useNow()`, so the 1 Hz tick re-renders just the
 // active duration cell — not every visible done item/tool card. Wrapping a
@@ -4869,16 +4888,33 @@ export default function ControlClient() {
     resetKey: viewingMissionId,
   });
 
-  const showAgentWorkingIndicator = useMemo(() => {
-    if (items.length === 0) return false;
-    if (items[items.length - 1]?.kind === "assistant") return false;
-    return !items.some(
+  // The inline "Agent is working" pill. Shown whenever the mission is running
+  // and nothing else inline is already animating liveness — i.e. no in-flight
+  // thinking/stream (with the side panel closed) and no phase row, both of
+  // which render their own live indicators. Unlike before, this stays visible
+  // *after* an intermediate assistant message: the agent keeps working between
+  // steps, and the corner sidebar pill alone is too easy to miss. `since`
+  // anchors the heartbeat timer at the most recent event so it resets on every
+  // new event and climbs when the run goes quiet.
+  const agentWorkingIndicator = useMemo(() => {
+    if (items.length === 0) return null;
+    const hasInlineLiveness = items.some(
       (it) =>
         ((it.kind === "thinking" || it.kind === "stream") &&
           !it.done &&
           !showThinkingPanel) ||
         it.kind === "phase",
     );
+    if (hasInlineLiveness) return null;
+    let since = 0;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const t = itemActivityTime(items[i]);
+      if (t != null) {
+        since = t;
+        break;
+      }
+    }
+    return { since };
   }, [items, showThinkingPanel]);
 
   // Auto-show thinking panel when thinking starts (only on transition to active)
@@ -10520,23 +10556,25 @@ export default function ControlClient() {
                     })}
                   </div>
 
-                  {/* Show streaming indicator when running but no active thinking/phase visible inline.
-                  P2-#14: the items.some + last-index lookup live in `showAgentWorkingIndicator`
-                  memo so each NowTick render doesn't re-walk the whole items array. */}
+                  {/* Compact "Agent is working" pill + live heartbeat timer,
+                  shown while running but no thinking/stream/phase is animating
+                  inline. P2-#14: the items.some walk lives in the
+                  `agentWorkingIndicator` memo so each NowTick render doesn't
+                  re-walk the whole items array. */}
                   {viewingMissionIsRunning &&
                     activeMission?.status === "active" &&
-                    showAgentWorkingIndicator && (
-                      <div className="flex justify-start gap-3 animate-fade-in">
-                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                          <Bot className="h-4 w-4 text-indigo-400 animate-pulse" />
-                        </div>
-                        <div className="rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-                          <div className="flex items-center gap-2">
-                            <Loader className="h-4 w-4 text-indigo-400 animate-spin" />
-                            <span className="text-sm text-white/60">
-                              Agent is working...
-                            </span>
-                          </div>
+                    agentWorkingIndicator && (
+                      <div className="flex justify-start animate-fade-in">
+                        <div className="inline-flex items-center gap-2 rounded-full border border-indigo-500/20 bg-indigo-500/[0.08] px-3 py-1.5">
+                          <Loader className="h-3.5 w-3.5 text-indigo-400 animate-spin" />
+                          <span className="text-xs font-medium text-white/70">
+                            Agent is working
+                          </span>
+                          <span className="text-xs tabular-nums text-white/40">
+                            <LiveDuration
+                              startTime={agentWorkingIndicator.since}
+                            />
+                          </span>
                         </div>
                       </div>
                     )}
