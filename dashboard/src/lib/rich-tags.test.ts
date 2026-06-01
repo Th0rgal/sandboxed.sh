@@ -73,6 +73,11 @@ describe("parseRichTags", () => {
     const tags = parseRichTags('<file path="./r.pdf" name="Attr">Inner</file>');
     expect(tags[0].name).toBe("Attr");
   });
+
+  it("treats an empty name attribute as absent, matching the rendered label", () => {
+    const tags = parseRichTags('<file path="./r.pdf" name="">Inner</file>');
+    expect(tags[0].name).toBe("Inner");
+  });
 });
 
 describe("transformRichTags", () => {
@@ -136,6 +141,21 @@ describe("transformRichTags", () => {
       '<file path="./a.pdf">Report [v2]\n  draft</file>',
     );
     expect(result).toBe("[Report \\[v2\\] draft](sandboxed-file://.%2Fa.pdf)");
+  });
+
+  it("treats an empty name attribute as absent and uses inner text", () => {
+    const result = transformRichTags('<file path="./a.pdf" name="">Inner Label</file>');
+    expect(result).toBe("[Inner Label](sandboxed-file://.%2Fa.pdf)");
+  });
+
+  it("falls back to filename for a whitespace-only name (no empty label)", () => {
+    const result = transformRichTags('<file path="./a.pdf" name="   "></file>');
+    expect(result).toBe("[a.pdf](sandboxed-file://.%2Fa.pdf)");
+  });
+
+  it("falls back to filename for a whitespace-only image alt", () => {
+    const result = transformRichTags('<image path="./a.png" alt="  " />');
+    expect(result).toBe("![a.png](sandboxed-image://.%2Fa.png)");
   });
 });
 

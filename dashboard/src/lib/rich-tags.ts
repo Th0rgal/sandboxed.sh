@@ -22,9 +22,20 @@ const TAG_RE = /<(image|file)\s+([^>]*?)(?:\/\s*>|>([\s\S]*?)<\/\1\s*>)/gi;
 const PARTIAL_TAG_RE =
   /<(?:image|file)(?:\s+[^>]*)?$|<(?:image|file)\s+[^>]*[^/>]>(?:(?!<\/(?:image|file)\s*>)[\s\S])*$/i;
 
-/** Normalize a display name/alt to a single line safe for markdown link text. */
-function cleanDisplayText(value: string): string {
-  return value.trim().replace(/\s+/g, " ").replace(/[[\]]/g, "\\$&");
+/**
+ * Trim and collapse whitespace; returns undefined when the value is empty or
+ * whitespace-only. Used so an explicit empty/blank attribute (`name=""`,
+ * `alt="  "`) is treated as absent consistently across parse/transform/strip —
+ * falling back to inner text, then the path basename.
+ */
+function presentText(value: string | undefined): string | undefined {
+  const collapsed = value?.trim().replace(/\s+/g, " ");
+  return collapsed ? collapsed : undefined;
+}
+
+/** Escape markdown link/image label delimiters so freeform text stays inert. */
+function escapeLinkText(value: string): string {
+  return value.replace(/[[\]]/g, "\\$&");
 }
 
 interface RichTag {
@@ -54,12 +65,12 @@ export function parseRichTags(content: string): RichTag[] {
     const tagType = m[1].toLowerCase() as "image" | "file";
     const attrs = parseAttrs(m[2]);
     if (!attrs.path) continue;
-    const innerText = (m[3] ?? "").trim() || undefined;
+    const innerText = presentText(m[3]);
     tags.push({
       type: tagType,
       path: attrs.path,
-      alt: attrs.alt ?? (tagType === "image" ? innerText : undefined),
-      name: attrs.name ?? (tagType === "file" ? innerText : undefined),
+      alt: presentText(attrs.alt) ?? (tagType === "image" ? innerText : undefined),
+      name: presentText(attrs.name) ?? (tagType === "file" ? innerText : undefined),
     });
   }
   return tags;
@@ -78,14 +89,15 @@ export function transformRichTags(content: string): string {
     (_match, tagType: string, attrStr: string, inner?: string) => {
       const attrs = parseAttrs(attrStr);
       if (!attrs.path) return _match; // leave malformed tags as-is
-      const innerText = (inner ?? "").trim();
+      const innerText = presentText(inner);
+      const basename = attrs.path.split("/").pop();
       const encodedPath = encodeURIComponent(attrs.path);
       if (tagType.toLowerCase() === "image") {
-        const alt = attrs.alt || innerText || attrs.path.split("/").pop() || "image";
-        return `![${cleanDisplayText(alt)}](sandboxed-image://${encodedPath})`;
+        const alt = presentText(attrs.alt) ?? innerText ?? basename ?? "image";
+        return `![${escapeLinkText(alt)}](sandboxed-image://${encodedPath})`;
       } else {
-        const name = attrs.name || innerText || attrs.path.split("/").pop() || "file";
-        return `[${cleanDisplayText(name)}](sandboxed-file://${encodedPath})`;
+        const name = presentText(attrs.name) ?? innerText ?? basename ?? "file";
+        return `[${escapeLinkText(name)}](sandboxed-file://${encodedPath})`;
       }
     },
   );
@@ -130,7 +142,7 @@ export function stripRichFileTagsByName(
     if (tagType.toLowerCase() !== "file") return match;
     const attrs = parseAttrs(attrStr);
     const base = basename(attrs.path);
-    const displayName = attrs.name || (inner ?? "").trim() || base;
+    const displayName = presentText(attrs.name) ?? presentText(inner) ?? base;
     const candidates = [
       displayName,
       base,
