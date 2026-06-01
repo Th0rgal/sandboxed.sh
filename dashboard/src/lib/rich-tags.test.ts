@@ -54,6 +54,25 @@ describe("parseRichTags", () => {
       { type: "file", path: "./roadmap.md", alt: undefined, name: "Roadmap" },
     ]);
   });
+
+  it("uses inner text as the file name when no name attribute is given", () => {
+    const tags = parseRichTags(
+      '<file path="./report.pdf" type="application/pdf">Unlink Round-1 Scope Audit (final)</file>',
+    );
+    expect(tags).toEqual([
+      {
+        type: "file",
+        path: "./report.pdf",
+        alt: undefined,
+        name: "Unlink Round-1 Scope Audit (final)",
+      },
+    ]);
+  });
+
+  it("prefers the name attribute over inner text", () => {
+    const tags = parseRichTags('<file path="./r.pdf" name="Attr">Inner</file>');
+    expect(tags[0].name).toBe("Attr");
+  });
 });
 
 describe("transformRichTags", () => {
@@ -101,6 +120,22 @@ describe("transformRichTags", () => {
   it("transforms paired rich tags", () => {
     const result = transformRichTags("<file path='./report.md' name='Report'></file>");
     expect(result).toBe("[Report](sandboxed-file://.%2Freport.md)");
+  });
+
+  it("uses inner text as the link label for paired file tags", () => {
+    const result = transformRichTags(
+      '<file path="./report.pdf" type="application/pdf">Unlink Round-1 Scope Audit (final, table-layout fixes)</file>',
+    );
+    expect(result).toBe(
+      "[Unlink Round-1 Scope Audit (final, table-layout fixes)](sandboxed-file://.%2Freport.pdf)",
+    );
+  });
+
+  it("escapes brackets and collapses whitespace in inner text labels", () => {
+    const result = transformRichTags(
+      '<file path="./a.pdf">Report [v2]\n  draft</file>',
+    );
+    expect(result).toBe("[Report \\[v2\\] draft](sandboxed-file://.%2Fa.pdf)");
   });
 });
 
@@ -153,5 +188,13 @@ describe("hasPartialRichTag", () => {
 
   it("returns false for closed html tags", () => {
     expect(hasPartialRichTag("<b>bold</b>")).toBe(false);
+  });
+
+  it("detects a paired tag still streaming its inner text", () => {
+    expect(hasPartialRichTag('<file path="./r.pdf">Unlink Round-1 Sco')).toBe(true);
+  });
+
+  it("returns false for a fully closed paired tag", () => {
+    expect(hasPartialRichTag('<file path="./r.pdf">Report</file>')).toBe(false);
   });
 });
