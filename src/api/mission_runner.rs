@@ -3900,6 +3900,28 @@ fn get_backend_bool_setting(backend_id: &str, key: &str) -> Option<bool> {
     None
 }
 
+/// Map a mission `model_effort` to a Claude Code extended-thinking budget
+/// (`MAX_THINKING_TOKENS`).
+///
+/// `CLAUDE_CODE_EFFORT_LEVEL` alone only nudges *adaptive* reasoning: on
+/// tool-heavy turns the model frequently chooses not to think at all, so no
+/// `thinking_delta` blocks stream and the Thoughts panel stays empty (see
+/// mission 5aede562, which ran at effort=max yet recorded 0 thinking events
+/// across ~1600 tool calls). Pinning a non-zero budget forces an extended
+/// thinking block every turn, so thoughts are captured deterministically.
+///
+/// Returns 0 for unknown efforts, leaving thinking fully adaptive.
+fn claude_thinking_budget(effort: &str) -> u32 {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "max" => 32_000,
+        "xhigh" => 24_000,
+        "high" => 16_000,
+        "medium" => 8_000,
+        "low" => 4_000,
+        _ => 0,
+    }
+}
+
 /// Execute a turn using Claude Code CLI backend.
 ///
 /// For Host workspaces: spawns the CLI directly on the host.
@@ -4802,10 +4824,25 @@ pub fn run_claudecode_turn<'a>(
         // Claude Code reads CLAUDE_CODE_EFFORT_LEVEL to control adaptive reasoning depth.
         if let Some(effort) = model_effort {
             env.insert("CLAUDE_CODE_EFFORT_LEVEL".to_string(), effort.to_string());
+
+            // CLAUDE_CODE_EFFORT_LEVEL only nudges adaptive reasoning, which
+            // leaves the Thoughts panel empty on tool-heavy turns. Pin an
+            // explicit extended-thinking budget so every turn emits a thinking
+            // block we can capture and stream. (The capture pipeline already
+            // handles thinking_delta — see backend/shared.rs — the CLI just
+            // wasn't emitting any.)
+            let thinking_tokens = claude_thinking_budget(effort);
+            if thinking_tokens > 0 {
+                env.insert(
+                    "MAX_THINKING_TOKENS".to_string(),
+                    thinking_tokens.to_string(),
+                );
+            }
             tracing::info!(
                 mission_id = %mission_id,
                 effort = %effort,
-                "Setting Claude Code effort level via CLAUDE_CODE_EFFORT_LEVEL"
+                max_thinking_tokens = thinking_tokens,
+                "Setting Claude Code effort level + extended-thinking budget"
             );
         }
 
