@@ -505,6 +505,85 @@ fn clear_mission_metadata_refresh_state(mission_id: Uuid) {
     baselines.remove(&mission_id);
 }
 
+/// Build a one-time "backend handoff" context message used when a mission's
+/// backend is switched (e.g. claudecode ↔ codex) via run-settings.
+///
+/// Each backend keeps its own session/reasoning format (Claude's signed
+/// thinking blocks vs Codex reasoning), and on a switch the new backend starts
+/// a fresh session — so without this the prior *reasoning* is silently lost
+/// (the reconstructed history only carries user/assistant text, not `thinking`
+/// events). This carries the recent reasoning forward as plain text, which any
+/// backend can consume. The workspace files and user/assistant transcript carry
+/// over on their own. Returns `None` when there's nothing worth carrying.
+async fn build_backend_handoff_context(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    old_backend: &str,
+    new_backend: &str,
+) -> Option<String> {
+    const MAX_TRACES: usize = 6;
+    const MAX_TRACE_CHARS: usize = 1500;
+    const MAX_BODY_CHARS: usize = 6000;
+
+    // Scan recent events for the latest reasoning. Prefer `thinking` traces;
+    // fall back to recent assistant messages when a backend produced none.
+    let events = mission_store
+        .get_latest_events(mission_id, 600)
+        .await
+        .ok()?;
+    let pick = |event_type: &str, limit: usize| -> Vec<String> {
+        let mut picked: Vec<String> = events
+            .iter()
+            .rev()
+            .filter(|e| e.event_type == event_type && !e.content.trim().is_empty())
+            .take(limit)
+            .map(|e| e.content.trim().to_string())
+            .collect();
+        picked.reverse();
+        picked
+    };
+
+    let (label, traces) = {
+        let thinking = pick("thinking", MAX_TRACES);
+        if !thinking.is_empty() {
+            ("most recent reasoning", thinking)
+        } else {
+            ("most recent progress notes", pick("assistant_message", 4))
+        }
+    };
+    if traces.is_empty() {
+        return None;
+    }
+
+    let mut body = String::new();
+    for trace in traces {
+        let idx = safe_truncate_index(&trace, MAX_TRACE_CHARS);
+        let snippet = if idx < trace.len() {
+            format!("{}…", &trace[..idx])
+        } else {
+            trace
+        };
+        if body.len() + snippet.len() > MAX_BODY_CHARS && !body.is_empty() {
+            break;
+        }
+        if !body.is_empty() {
+            body.push_str("\n\n---\n\n");
+        }
+        body.push_str(&snippet);
+    }
+
+    Some(format!(
+        "## Backend handoff: now continuing on `{new_backend}` (was `{old_backend}`)\n\n\
+         The previous backend's session is not carried over (different reasoning \
+         format), but your work is intact in the workspace and the conversation \
+         above is preserved. To keep continuity, here is your {label} from the \
+         `{old_backend}` session:\n\n\
+         <prior_reasoning>\n{body}\n</prior_reasoning>\n\n\
+         Pick up exactly where you left off and continue toward the goal. \
+         Re-orient by checking the current workspace state first, then proceed."
+    ))
+}
+
 async fn clear_stale_mission_metadata_refresh_state(mission_store: &Arc<dyn MissionStore>) {
     let tracked_ids: std::collections::HashSet<Uuid> = {
         let tasks = MISSION_METADATA_REFRESH_TASKS
@@ -9329,6 +9408,13 @@ async fn control_actor_loop(
                             continue;
                         }
 
+                        // Capture the backend before the update so we can detect
+                        // a switch and carry reasoning across (see below).
+                        let old_backend = load_mission_record(&mission_store, id)
+                            .await
+                            .ok()
+                            .map(|m| m.backend);
+
                         let result = mission_store
                             .update_mission_run_settings(
                                 id,
@@ -9352,6 +9438,50 @@ async fn control_actor_loop(
                                 session_id: updated.session_id.clone(),
                                 updated_at: updated.updated_at.clone(),
                             });
+
+                            // Backend switch handoff: the new backend starts a
+                            // fresh session and can't replay the old backend's
+                            // reasoning format, so carry the recent reasoning
+                            // forward as a plain-text context message. It lands
+                            // in the conversation history and is picked up by
+                            // the next turn (resume or message) on either
+                            // backend. Workspace + transcript carry over already.
+                            let backend_switched = old_backend
+                                .as_deref()
+                                .map(|prev| prev != updated.backend.as_str())
+                                .unwrap_or(false);
+                            if backend_switched {
+                                let prev = old_backend.as_deref().unwrap_or("the previous backend");
+                                if let Some(handoff) = build_backend_handoff_context(
+                                    &mission_store,
+                                    id,
+                                    prev,
+                                    &updated.backend,
+                                )
+                                .await
+                                {
+                                    let event = AgentEvent::UserMessage {
+                                        id: Uuid::new_v4(),
+                                        content: handoff,
+                                        queued: false,
+                                        mission_id: Some(id),
+                                    };
+                                    if let Err(e) = mission_store.log_event(id, &event).await {
+                                        tracing::warn!(
+                                            mission_id = %id,
+                                            error = %e,
+                                            "Failed to persist backend handoff context"
+                                        );
+                                    }
+                                    let _ = events_tx.send(event);
+                                    tracing::info!(
+                                        mission_id = %id,
+                                        old_backend = ?old_backend,
+                                        new_backend = %updated.backend,
+                                        "Injected backend-switch handoff context to preserve reasoning"
+                                    );
+                                }
+                            }
                         }
 
                         let _ = respond.send(result);
