@@ -2601,7 +2601,7 @@ struct ControlView: View {
             _ = mergeMissionEvents(drain.events, for: id)
             applyDeltaEvents(drain.events)
         }
-        missionMaxSeq[id] = max(drain.finalCursor, initialCursor)
+        missionMaxSeq[id] = max(drain.finalCursor, missionMaxSeq[id] ?? initialCursor)
         return .applied
     }
 
