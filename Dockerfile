@@ -119,14 +119,6 @@ RUN curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash \
     && echo "[docker] Grok Build CLI installed: $(grok --version 2>/dev/null || echo 'unknown')" \
     || echo "[docker] WARNING: Grok Build CLI install failed (will be installed on first mission)"
 
-# -- RTK (CLI output compressor for token savings) --
-RUN RTK_ARCH=$(case "$(uname -m)" in aarch64|arm64) echo "aarch64";; *) echo "x86_64";; esac) \
-    && curl -fsSL "https://github.com/rtk-ai/rtk/releases/latest/download/rtk-${RTK_ARCH}-unknown-linux-gnu.tar.gz" \
-    | tar xz -C /usr/local/bin rtk \
-    && chmod +x /usr/local/bin/rtk \
-    && echo "[docker] RTK installed: $(rtk --version 2>/dev/null || echo 'unknown')" \
-    || echo "[docker] WARNING: RTK install failed (token savings will not be available)"
-
 # -- i3 config (from install_desktop.sh) -------------------------------------
 RUN mkdir -p /root/.config/i3
 COPY docker/i3config /root/.config/i3/config

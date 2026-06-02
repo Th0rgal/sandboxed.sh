@@ -5,7 +5,6 @@
 //! - View provider health status and cooldowns
 //! - Resolve a chain into ordered entries (for debugging)
 //! - Clear cooldowns
-//! - RTK token savings stats
 
 use std::sync::Arc;
 
@@ -18,7 +17,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::provider_health::{ChainEntry, ModelChain};
-use crate::tools::terminal::rtk_stats;
 
 /// Register model routing routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -36,8 +34,6 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/health/:account_id/clear", post(clear_cooldown))
         // Observability
         .route("/events", get(list_fallback_events))
-        // RTK stats
-        .route("/rtk-stats", get(get_rtk_stats))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -364,38 +360,4 @@ async fn list_fallback_events(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Json<Vec<crate::provider_health::FallbackEvent>> {
     Json(state.health_tracker.get_recent_events(200).await)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RTK Stats
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-struct RtkStatsResponse {
-    commands_processed: u64,
-    original_chars: u64,
-    compressed_chars: u64,
-    chars_saved: u64,
-    savings_percent: f64,
-}
-
-/// GET /api/model-routing/rtk-stats - Get RTK token savings stats.
-///
-/// Returns statistics about CLI output compression via RTK.
-async fn get_rtk_stats() -> Json<RtkStatsResponse> {
-    let (commands, original, compressed): (u64, u64, u64) = rtk_stats();
-    let chars_saved = original.saturating_sub(compressed);
-    let savings_percent = if original > 0 {
-        (chars_saved as f64 / original as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    Json(RtkStatsResponse {
-        commands_processed: commands,
-        original_chars: original,
-        compressed_chars: compressed,
-        chars_saved,
-        savings_percent,
-    })
 }

@@ -5,12 +5,6 @@
 //! Commands run in the workspace by default:
 //! - `run_command("ls")` → lists workspace contents
 //! - `run_command("cat output/report.md")` → reads workspace file
-//!
-//! ## RTK Integration
-//!
-//! When RTK is enabled (SANDBOXED_SH_RTK_ENABLED=1), commands are wrapped with
-//! `rtk` to compress output before returning to the LLM, reducing token consumption
-//! by 60-90% on common dev commands.
 
 use std::collections::HashMap;
 use std::env;
@@ -25,172 +19,6 @@ use tokio::process::Command;
 
 use super::{resolve_path_simple as resolve_path, Tool};
 use crate::nspawn;
-
-/// Return RTK stats: (commands_processed, original_tokens, compressed_tokens).
-///
-/// All three values come from `rtk gain -f json`, which reads RTK's own SQLite
-/// database. This reflects the real compression activity regardless of which
-/// execution path invoked `rtk` (MCP terminal tool, Claude Code Bash hook, or
-/// any other caller that exec'd the binary).
-pub fn rtk_stats() -> (u64, u64, u64) {
-    rtk_gain_stats().unwrap_or((0, 0, 0))
-}
-
-/// Query RTK's builtin stats via `rtk gain -f json`.
-/// Returns (total_commands, total_input_tokens, total_output_tokens) on success.
-fn rtk_gain_stats() -> Option<(u64, u64, u64)> {
-    let rtk_path = rtk_binary_path()?;
-    let output = std::process::Command::new(rtk_path)
-        .args(["gain", "-f", "json"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    let summary = json.get("summary")?;
-    let commands = summary.get("total_commands")?.as_u64()?;
-    let input = summary.get("total_input")?.as_u64()?;
-    let output_tokens = summary.get("total_output")?.as_u64()?;
-    Some((commands, input, output_tokens))
-}
-
-pub fn rtk_enabled() -> bool {
-    // Check the cached value from settings store first
-    if crate::settings::rtk_enabled_cached() {
-        return true;
-    }
-    // Fall back to env var for backwards compatibility
-    env::var("SANDBOXED_SH_RTK_ENABLED")
-        .map(|v| {
-            matches!(
-                v.trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "y" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-pub fn rtk_binary_path() -> Option<PathBuf> {
-    let candidates = [
-        PathBuf::from("/usr/local/bin/rtk"),
-        PathBuf::from("/usr/bin/rtk"),
-        PathBuf::from("/root/.local/bin/rtk"),
-        PathBuf::from("/home/opencode/.local/bin/rtk"),
-    ];
-    for path in candidates {
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    // Fallback: search PATH
-    if let Ok(path_var) = env::var("PATH") {
-        for dir in path_var.split(':') {
-            let candidate = PathBuf::from(dir).join("rtk");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-const RTK_WRAPPED_COMMANDS: &[&str] = &[
-    "git status",
-    "git diff",
-    "git log",
-    "git add",
-    "git commit",
-    "git push",
-    "git pull",
-    "git branch",
-    "git fetch",
-    "git stash",
-    "git show",
-    "git blame",
-    "gh pr",
-    "gh issue",
-    "gh run",
-    "gh repo",
-    "ls",
-    "ls -la",
-    "ls -lah",
-    "tree",
-    "cat",
-    "head",
-    "tail",
-    "grep",
-    "rg",
-    "ag",
-    "find",
-    "cargo test",
-    "cargo build",
-    "cargo clippy",
-    "cargo check",
-    "cargo run",
-    "npm test",
-    "npm run",
-    "bun test",
-    "bun run",
-    "bunx",
-    "pnpm test",
-    "pnpm run",
-    "yarn test",
-    "yarn run",
-    "vitest",
-    "jest",
-    "pytest",
-    "go test",
-    "go build",
-    "go vet",
-    "eslint",
-    "ruff",
-    "mypy",
-    "pylint",
-    "tsc",
-    "biome",
-    "docker ps",
-    "docker images",
-    "docker logs",
-    "kubectl get",
-    "kubectl logs",
-    "kubectl describe",
-];
-
-fn should_wrap_with_rtk(command: &str) -> bool {
-    let cmd_lower = command.trim().to_lowercase();
-    if cmd_lower.starts_with("rtk ") {
-        return false;
-    }
-    if cmd_lower.contains("&&") || cmd_lower.contains("||") || cmd_lower.contains("|") {
-        return false;
-    }
-    if cmd_lower.starts_with("cat <<") || cmd_lower.contains("<<") {
-        return false;
-    }
-    for pattern in RTK_WRAPPED_COMMANDS {
-        if cmd_lower == *pattern {
-            return true;
-        }
-        if cmd_lower.starts_with(pattern) {
-            // Ensure match is at a word boundary — the character after the pattern
-            // must be a space (or nothing). Without this, "ls" would match "lsof",
-            // "cat" would match "catkin_make", etc.
-            let next_char = cmd_lower.as_bytes().get(pattern.len());
-            if next_char.is_none() || next_char == Some(&b' ') {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn wrap_with_rtk(command: &str, rtk_path: &Path) -> String {
-    format!("{} {}", rtk_path.display(), command)
-}
 
 /// Context information read from the local context file.
 /// This is re-read before each container command to handle timing issues
@@ -209,115 +37,6 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    // ── should_wrap_with_rtk ──────────────────────────────────────────
-
-    #[test]
-    fn rtk_wraps_exact_command_match() {
-        assert!(should_wrap_with_rtk("git status"));
-        assert!(should_wrap_with_rtk("git diff"));
-        assert!(should_wrap_with_rtk("git log"));
-        assert!(should_wrap_with_rtk("ls"));
-        assert!(should_wrap_with_rtk("cat"));
-        assert!(should_wrap_with_rtk("head"));
-        assert!(should_wrap_with_rtk("tail"));
-        assert!(should_wrap_with_rtk("grep"));
-        assert!(should_wrap_with_rtk("rg"));
-        assert!(should_wrap_with_rtk("find"));
-        assert!(should_wrap_with_rtk("tree"));
-        assert!(should_wrap_with_rtk("cargo test"));
-        assert!(should_wrap_with_rtk("cargo build"));
-        assert!(should_wrap_with_rtk("cargo clippy"));
-        assert!(should_wrap_with_rtk("npm test"));
-        assert!(should_wrap_with_rtk("pytest"));
-        assert!(should_wrap_with_rtk("docker ps"));
-        assert!(should_wrap_with_rtk("kubectl get"));
-    }
-
-    #[test]
-    fn rtk_wraps_command_with_args() {
-        assert!(should_wrap_with_rtk("git status --short"));
-        assert!(should_wrap_with_rtk("git diff HEAD~1"));
-        assert!(should_wrap_with_rtk("git log --oneline -10"));
-        assert!(should_wrap_with_rtk("ls -la"));
-        assert!(should_wrap_with_rtk("ls -lah /tmp"));
-        assert!(should_wrap_with_rtk("cat README.md"));
-        assert!(should_wrap_with_rtk("grep -rn foo src/"));
-        assert!(should_wrap_with_rtk("rg pattern"));
-        assert!(should_wrap_with_rtk("find . -name '*.rs'"));
-        assert!(should_wrap_with_rtk("cargo test -- --nocapture"));
-        assert!(should_wrap_with_rtk("cargo build --release"));
-        assert!(should_wrap_with_rtk("npm test -- --coverage"));
-        assert!(should_wrap_with_rtk("docker ps -a"));
-        assert!(should_wrap_with_rtk("kubectl get pods -n default"));
-    }
-
-    #[test]
-    fn rtk_rejects_prefix_false_positives() {
-        // These commands start with an allowlisted prefix but are different commands.
-        // This is the bug that PR #160 fixed.
-        assert!(!should_wrap_with_rtk("lsof -i :8080"));
-        assert!(!should_wrap_with_rtk("catkin_make"));
-        assert!(!should_wrap_with_rtk("headless-chrome"));
-        assert!(!should_wrap_with_rtk("treeify something"));
-        assert!(!should_wrap_with_rtk("finding nemo"));
-        assert!(!should_wrap_with_rtk("grepping is not a word"));
-        assert!(!should_wrap_with_rtk("rgrep something")); // not "rg"
-    }
-
-    #[test]
-    fn rtk_case_insensitive() {
-        assert!(should_wrap_with_rtk("Git Status"));
-        assert!(should_wrap_with_rtk("GIT DIFF"));
-        assert!(should_wrap_with_rtk("LS -la"));
-        assert!(should_wrap_with_rtk("CARGO TEST"));
-    }
-
-    #[test]
-    fn rtk_skips_already_wrapped() {
-        assert!(!should_wrap_with_rtk("rtk git status"));
-        assert!(!should_wrap_with_rtk("rtk ls -la"));
-    }
-
-    #[test]
-    fn rtk_skips_piped_commands() {
-        assert!(!should_wrap_with_rtk("git log | head -5"));
-        assert!(!should_wrap_with_rtk("ls -la | grep foo"));
-        assert!(!should_wrap_with_rtk("cat file.txt | wc -l"));
-    }
-
-    #[test]
-    fn rtk_skips_chained_commands() {
-        assert!(!should_wrap_with_rtk("git add . && git commit -m 'test'"));
-        assert!(!should_wrap_with_rtk("ls -la || echo 'failed'"));
-    }
-
-    #[test]
-    fn rtk_skips_heredoc_commands() {
-        assert!(!should_wrap_with_rtk("cat << EOF\nhello\nEOF"));
-        assert!(!should_wrap_with_rtk("cat <<EOF"));
-    }
-
-    #[test]
-    fn rtk_handles_whitespace() {
-        assert!(should_wrap_with_rtk("  git status  "));
-        assert!(should_wrap_with_rtk("  ls  "));
-    }
-
-    #[test]
-    fn rtk_rejects_unknown_commands() {
-        assert!(!should_wrap_with_rtk("echo hello"));
-        assert!(!should_wrap_with_rtk("curl https://example.com"));
-        assert!(!should_wrap_with_rtk("python script.py"));
-        assert!(!should_wrap_with_rtk("node index.js"));
-        assert!(!should_wrap_with_rtk("make"));
-    }
-
-    #[test]
-    fn wrap_with_rtk_formats_correctly() {
-        let result = wrap_with_rtk("git status", Path::new("/usr/local/bin/rtk"));
-        assert_eq!(result, "/usr/local/bin/rtk git status");
     }
 
     // ── validate_command ──────────────────────────────────────────────
@@ -1376,36 +1095,7 @@ impl Tool for RunCommand {
             .unwrap_or_else(|| working_dir.to_path_buf());
         let options = parse_command_options(&args);
 
-        let (final_command, rtk_used) = if rtk_enabled() {
-            if let Some(rtk_path) = rtk_binary_path() {
-                if should_wrap_with_rtk(command) {
-                    tracing::info!(
-                        command = %command,
-                        rtk_path = %rtk_path.display(),
-                        "Wrapping command with RTK for token reduction"
-                    );
-                    (wrap_with_rtk(command, &rtk_path), true)
-                } else {
-                    tracing::debug!(
-                        command = %command,
-                        "Command not in RTK allowlist, running as-is"
-                    );
-                    (command.to_string(), false)
-                }
-            } else {
-                tracing::debug!(
-                    command = %command,
-                    "RTK binary not found, running command as-is"
-                );
-                (command.to_string(), false)
-            }
-        } else {
-            tracing::debug!(
-                command = %command,
-                "RTK is disabled, running command as-is"
-            );
-            (command.to_string(), false)
-        };
+        let final_command = command.to_string();
 
         tracing::info!("Executing command in {:?}: {}", cwd, final_command);
 
@@ -1426,13 +1116,6 @@ impl Tool for RunCommand {
             stdout.len(),
             stderr.len()
         );
-
-        if rtk_used {
-            tracing::debug!(
-                compressed_stdout_len = stdout.len(),
-                "RTK-wrapped command completed"
-            );
-        }
 
         let result = if options.raw_output {
             let mut raw = String::new();
