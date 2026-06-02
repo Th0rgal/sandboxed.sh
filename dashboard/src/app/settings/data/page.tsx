@@ -55,7 +55,9 @@ export default function DataSettingsPage() {
     setSavingAskModel(true);
     try {
       const trimmed = (askModelValue ?? '').trim();
-      await updateSettings({ ask_assistant_model: trimmed || null });
+      // Send "" (not null) to clear: a present empty string is normalized to
+      // None server-side, whereas JSON null is treated as "no change".
+      await updateSettings({ ask_assistant_model: trimmed });
       mutateSettings();
       toast.success(
         trimmed ? 'Assistant model updated' : 'Assistant model reset to default'
