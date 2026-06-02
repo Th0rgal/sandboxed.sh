@@ -91,9 +91,11 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
 
     let tools = tool_definitions();
     let mut final_answer = String::new();
+    let mut total_tokens: u64 = 0;
 
     for _ in 0..MAX_ITERATIONS {
         let completion = turn.llm.complete(&messages, &tools).await?;
+        total_tokens += completion.total_tokens.unwrap_or(0);
 
         if completion.tool_calls.is_empty() {
             final_answer = completion.content.unwrap_or_default();
@@ -164,7 +166,7 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
             &final_answer,
             None,
             None,
-            Some(json!({ "model": turn.llm.model() })),
+            Some(json!({ "model": turn.llm.model(), "total_tokens": total_tokens })),
         )
         .await?;
 
@@ -277,9 +279,9 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
             }
             // Snapshot the working tree before/after so we can report any
             // out-of-band writes to the working agent (the operator-note bridge).
-            let before = git_status_set(turn).await;
+            let baseline = capture_write_baseline(turn).await;
             let result = run_bash(turn, &cmd).await;
-            record_writes(turn, &cmd, before).await;
+            record_writes(turn, &cmd, baseline).await;
             result
         }
         "read_file" => {
@@ -379,25 +381,79 @@ async fn git_status_set(turn: &AskTurn) -> Option<HashSet<String>> {
     Some(text.lines().map(|l| l.to_string()).collect())
 }
 
-/// After an Ask bash command, diff the working tree against the `before`
-/// snapshot and enqueue an operator-note describing any new/changed paths so the
-/// working agent learns about edits it didn't make.
-async fn record_writes(turn: &AskTurn, command: &str, before: Option<HashSet<String>>) {
-    let Some(before) = before else { return };
-    let Some(after) = git_status_set(turn).await else {
-        return;
+/// Baseline of the working tree captured before an Ask bash command, used to
+/// detect writes afterwards. Git workspaces use a porcelain snapshot; non-git
+/// workspaces fall back to an mtime cutoff.
+enum WriteBaseline {
+    Git(HashSet<String>),
+    /// Epoch seconds, for `find -newermt @epoch` detection.
+    Mtime(String),
+    None,
+}
+
+async fn capture_write_baseline(turn: &AskTurn) -> WriteBaseline {
+    if let Some(set) = git_status_set(turn).await {
+        return WriteBaseline::Git(set);
+    }
+    // Non-git fallback: capture an epoch marker for mtime-based detection.
+    let args = vec!["-lc".to_string(), "date +%s".to_string()];
+    if let Ok(out) = turn
+        .workspace_exec
+        .output(&turn.work_dir, "/bin/bash", &args, HashMap::new())
+        .await
+    {
+        let epoch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !epoch.is_empty() && epoch.chars().all(|c| c.is_ascii_digit()) {
+            return WriteBaseline::Mtime(epoch);
+        }
+    }
+    WriteBaseline::None
+}
+
+/// After an Ask bash command, diff the working tree against the `baseline` and
+/// enqueue an operator-note describing any new/changed paths so the working
+/// agent learns about edits it didn't make.
+async fn record_writes(turn: &AskTurn, command: &str, baseline: WriteBaseline) {
+    let mut changed: Vec<String> = match baseline {
+        WriteBaseline::Git(before) => {
+            let Some(after) = git_status_set(turn).await else {
+                return;
+            };
+            // New porcelain lines that weren't present before — predominantly
+            // this command's writes (the window is a single command).
+            after
+                .difference(&before)
+                .map(|l| l.trim().to_string())
+                .collect()
+        }
+        WriteBaseline::Mtime(epoch) => {
+            let cmd = format!(
+                "find . -type f -newermt @{epoch} \
+                 -not -path './.git/*' -not -path './node_modules/*' \
+                 -not -path './target/*' 2>/dev/null | head -50"
+            );
+            let args = vec!["-lc".to_string(), cmd];
+            match turn
+                .workspace_exec
+                .output(&turn.work_dir, "/bin/bash", &args, HashMap::new())
+                .await
+            {
+                Ok(out) => String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect(),
+                Err(_) => return,
+            }
+        }
+        WriteBaseline::None => return,
     };
 
-    // New porcelain lines that weren't present before — predominantly this
-    // command's writes (the window is a single command).
-    let mut changed: Vec<String> = after
-        .difference(&before)
-        .map(|l| l.trim().to_string())
-        .collect();
     if changed.is_empty() {
         return;
     }
     changed.sort();
+    changed.dedup();
 
     let body = format!(
         "While you were working, the operator made out-of-band changes to this \

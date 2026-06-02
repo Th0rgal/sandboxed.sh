@@ -21,6 +21,21 @@ fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+/// Derive a short thread title from the operator's first message (first line,
+/// trimmed to ~48 chars). Cheap and synchronous — no extra LLM call.
+fn derive_title(content: &str) -> String {
+    let first_line = content.lines().next().unwrap_or("").trim();
+    let mut title: String = first_line.chars().take(48).collect();
+    if first_line.chars().count() > 48 {
+        title.push('…');
+    }
+    if title.is_empty() {
+        "Ask".to_string()
+    } else {
+        title
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AskSendRequest {
     /// Existing thread to continue. When absent, a new thread is created.
@@ -73,6 +88,7 @@ pub async fn ask_send(
     let ask_store = super::ask_store(&state.config).await.map_err(internal)?;
 
     // Resolve or create the thread.
+    let is_new_thread = req.thread_id.is_none();
     let thread = match req.thread_id {
         Some(tid) => {
             let t = ask_store
@@ -118,6 +134,14 @@ pub async fn ask_send(
     };
 
     let answer = run_ask_turn(&turn, &req.content).await.map_err(internal)?;
+
+    // Auto-title a freshly created thread from the operator's first message.
+    if is_new_thread {
+        let _ = ask_store
+            .set_thread_title(thread.id, &derive_title(&req.content))
+            .await;
+    }
+
     let messages = ask_store.list_messages(thread.id).await.map_err(internal)?;
 
     Ok(Json(AskSendResponse {

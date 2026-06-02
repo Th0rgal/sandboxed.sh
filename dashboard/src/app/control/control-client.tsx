@@ -4469,6 +4469,17 @@ export default function ControlClient() {
     () => searchParams.get("workbench") === "1",
   );
   const [showAskPanel, setShowAskPanel] = useState(false);
+  // ⌘/ (or Ctrl+/) toggles the Ask co-pilot panel.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "/") {
+        e.preventDefault();
+        setShowAskPanel((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const handleToggleThinkingPanel = useCallback(() => {
     setShowThinkingPanel((prev) => {
       const next = !prev;

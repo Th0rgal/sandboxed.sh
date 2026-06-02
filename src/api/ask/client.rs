@@ -30,6 +30,8 @@ pub struct ToolCall {
 pub struct AskCompletion {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Total tokens reported by the provider for this call (prompt + completion).
+    pub total_tokens: Option<u64>,
 }
 
 /// Thin chat client bound to a resolved LLM config.
@@ -134,9 +136,12 @@ impl AskClient {
             }
         }
 
+        let total_tokens = json["usage"]["total_tokens"].as_u64();
+
         Ok(AskCompletion {
             content,
             tool_calls,
+            total_tokens,
         })
     }
 }
