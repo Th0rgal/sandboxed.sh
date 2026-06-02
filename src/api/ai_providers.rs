@@ -279,9 +279,21 @@ fn grok_auth_paths() -> Vec<PathBuf> {
 }
 
 fn read_grok_auth_entry() -> Option<serde_json::Value> {
-    let contents = std::fs::read_to_string(grok_auth_path()).ok()?;
-    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    auth.get(GROK_OAUTH_CLIENT_KEY).cloned()
+    // Try every candidate path (home-based AND the service path
+    // `/var/lib/opencode/.grok/auth.json`) — `home_dir()` for the service
+    // process doesn't always resolve to where the Grok CLI wrote its auth.
+    for path in grok_auth_paths() {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(auth) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        if let Some(entry) = auth.get(GROK_OAUTH_CLIENT_KEY) {
+            return Some(entry.clone());
+        }
+    }
+    None
 }
 
 async fn wait_for_grok_auth_entry() -> Option<serde_json::Value> {
