@@ -3931,7 +3931,7 @@ const ChatItemRow = memo(function ChatItemRow({
               controlAskStore.set({ open: true, seed: item.content })
             }
             title="Ask the co-pilot about this"
-            className="opacity-0 group-hover:opacity-100 transition-opacity text-white/30 hover:text-sky-300"
+            className="opacity-0 group-hover:opacity-100 transition-opacity text-[rgb(var(--foreground)/0.4)] hover:text-[rgb(var(--copilot))]"
           >
             <Sparkles className="h-3.5 w-3.5" />
           </button>
@@ -10111,8 +10111,8 @@ export default function ControlClient() {
               className={cn(
                 "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
                 showAskPanel
-                  ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
-                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
+                  ? "border-[rgb(var(--copilot)/0.4)] bg-[rgb(var(--copilot)/0.12)] text-[rgb(var(--copilot))]"
+                  : "border-white/[0.06] bg-white/[0.02] text-[rgb(var(--foreground)/0.7)] hover:bg-white/[0.04]",
               )}
               title={
                 showAskPanel

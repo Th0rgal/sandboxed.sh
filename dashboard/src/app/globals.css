@@ -40,6 +40,10 @@
   /* Accent (single accent color - Indigo) */
   --accent: 99 102 241; /* Indigo-500 (#6366F1) */
 
+  /* Ask co-pilot identity (sky) - distinct from the indigo agent accent.
+     Lighter on dark surfaces, darker on light surfaces for readable contrast. */
+  --copilot: 56 189 248; /* Sky-400 (#38BDF8) - dark mode */
+
   /* Semantic Colors */
   --success: 34 197 94; /* #22C55E - emerald/green */
   --warning: 234 179 8; /* #EAB308 - amber */
@@ -93,6 +97,9 @@
   --foreground-secondary: 75 85 99; /* #4B5563 */
   --foreground-tertiary: 107 114 128; /* #6B7280 */
   --foreground-muted: 156 163 175; /* #9CA3AF */
+
+  /* Ask co-pilot identity (sky) - darker on light surfaces for contrast. */
+  --copilot: 2 132 199; /* Sky-600 (#0284C7) - light mode */
 
   /* Borders */
   --border: 17 24 39;

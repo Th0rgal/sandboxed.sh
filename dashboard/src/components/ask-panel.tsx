@@ -190,16 +190,23 @@ export function AskPanel({
     newThread();
   }, [missionId, threadId, refreshThreads, newThread]);
 
+  // Theme-aware tokens (the app theme is driven by data-theme, so we key off the
+  // CSS variables rather than Tailwind's media-based dark: variant, which can
+  // diverge from a manually-stored theme).
+  const copilot = "text-[rgb(var(--copilot))]";
+  const ctrl =
+    "border border-[rgb(var(--foreground)/0.1)] bg-[rgb(var(--foreground)/0.04)] text-[rgb(var(--foreground)/0.6)] hover:bg-[rgb(var(--foreground)/0.07)] hover:text-[rgb(var(--foreground)/0.85)]";
+
   return (
-    <div className="flex h-full w-[380px] shrink-0 flex-col rounded-2xl border border-sky-500/15 bg-sky-500/[0.03] backdrop-blur-sm">
+    <div className="flex h-full w-[380px] shrink-0 flex-col rounded-2xl border border-[rgb(var(--copilot)/0.25)] bg-[rgb(var(--background-elevated)/0.72)] backdrop-blur-xl">
       {/* Header */}
-      <div className="flex items-center justify-between gap-2 border-b border-white/[0.06] px-3 py-2.5">
+      <div className="flex items-center justify-between gap-2 border-b border-[rgb(var(--foreground)/0.1)] px-3 py-2.5">
         <div className="flex items-center gap-2">
-          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-sky-500/15">
-            <Sparkles className="h-3.5 w-3.5 text-sky-300" />
+          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-[rgb(var(--copilot)/0.15)]">
+            <Sparkles className={cn("h-3.5 w-3.5", copilot)} />
           </div>
-          <span className="text-sm font-medium text-sky-100">Ask</span>
-          <span className="rounded bg-white/[0.04] px-1.5 py-0.5 text-[10px] text-white/40">
+          <span className={cn("text-sm font-semibold", copilot)}>Ask</span>
+          <span className="rounded bg-[rgb(var(--foreground)/0.06)] px-1.5 py-0.5 text-[10px] text-[rgb(var(--foreground)/0.45)]">
             co-pilot
           </span>
         </div>
@@ -215,8 +222,8 @@ export function AskPanel({
             className={cn(
               "rounded-lg border p-1.5 transition-all active:scale-95",
               sandbox
-                ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
-                : "border-white/[0.06] bg-white/[0.02] text-white/40 hover:bg-white/[0.05] hover:text-white/70",
+                ? "border-amber-500/40 bg-amber-500/15 text-amber-600 dark:text-amber-300"
+                : ctrl,
             )}
           >
             <FlaskConical className="h-3.5 w-3.5" />
@@ -228,8 +235,11 @@ export function AskPanel({
             className={cn(
               "flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] tabular-nums transition-all active:scale-95",
               showThreadList
-                ? "border-sky-500/30 bg-sky-500/10 text-sky-200"
-                : "border-white/[0.06] bg-white/[0.02] text-white/60 hover:bg-white/[0.05]",
+                ? cn(
+                    "border-[rgb(var(--copilot)/0.4)] bg-[rgb(var(--copilot)/0.12)]",
+                    copilot,
+                  )
+                : ctrl,
             )}
           >
             {threads.length}
@@ -244,7 +254,7 @@ export function AskPanel({
             type="button"
             onClick={newThread}
             title="New thread"
-            className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-1.5 text-white/60 transition-all hover:bg-white/[0.05] hover:text-white/80 active:scale-95"
+            className={cn("rounded-lg p-1.5 transition-all active:scale-95", ctrl)}
           >
             <Plus className="h-3.5 w-3.5" />
           </button>
@@ -252,7 +262,7 @@ export function AskPanel({
             type="button"
             onClick={clearActive}
             title="Clear / delete thread"
-            className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-1.5 text-white/60 transition-all hover:bg-red-500/10 hover:text-red-300 active:scale-95"
+            className="rounded-lg border border-[rgb(var(--foreground)/0.1)] bg-[rgb(var(--foreground)/0.04)] p-1.5 text-[rgb(var(--foreground)/0.6)] transition-all hover:bg-red-500/10 hover:text-[rgb(var(--error))] active:scale-95"
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
@@ -260,7 +270,7 @@ export function AskPanel({
             type="button"
             onClick={onClose}
             title="Close"
-            className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-1.5 text-white/60 transition-all hover:bg-white/[0.05] hover:text-white/80 active:scale-95"
+            className={cn("rounded-lg p-1.5 transition-all active:scale-95", ctrl)}
           >
             <X className="h-3.5 w-3.5" />
           </button>
@@ -269,9 +279,11 @@ export function AskPanel({
 
       {/* Thread switcher */}
       {showThreadList && (
-        <div className="max-h-48 overflow-y-auto border-b border-white/[0.06] bg-black/20 p-1.5">
+        <div className="max-h-48 overflow-y-auto border-b border-[rgb(var(--foreground)/0.1)] bg-[rgb(var(--foreground)/0.03)] p-1.5">
           {threads.length === 0 && (
-            <p className="px-2 py-1.5 text-[11px] text-white/30">No threads yet.</p>
+            <p className="px-2 py-1.5 text-[11px] text-[rgb(var(--foreground)/0.4)]">
+              No threads yet.
+            </p>
           )}
           {threads.map((t) => (
             <button
@@ -281,12 +293,12 @@ export function AskPanel({
               className={cn(
                 "block w-full truncate rounded-md px-2 py-1.5 text-left text-[11px] transition-colors",
                 t.id === threadId
-                  ? "bg-sky-500/10 text-sky-200"
-                  : "text-white/60 hover:bg-white/[0.04]",
+                  ? cn("bg-[rgb(var(--copilot)/0.12)]", copilot)
+                  : "text-[rgb(var(--foreground)/0.6)] hover:bg-[rgb(var(--foreground)/0.05)]",
               )}
             >
               {t.title || "Untitled thread"}
-              <span className="ml-1 text-white/25">
+              <span className="ml-1 text-[rgb(var(--foreground)/0.35)]">
                 {new Date(t.updated_at).toLocaleTimeString()}
               </span>
             </button>
@@ -298,13 +310,13 @@ export function AskPanel({
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-3">
         {messages.length === 0 && !loading && (
           <div className="mx-auto mt-10 flex max-w-[15rem] flex-col items-center text-center">
-            <div className="mb-3 flex h-9 w-9 items-center justify-center rounded-xl bg-sky-500/10 ring-1 ring-inset ring-sky-400/20">
-              <Sparkles className="h-4 w-4 text-sky-300/70" />
+            <div className="mb-3 flex h-9 w-9 items-center justify-center rounded-xl bg-[rgb(var(--copilot)/0.12)] ring-1 ring-inset ring-[rgb(var(--copilot)/0.25)]">
+              <Sparkles className={cn("h-4 w-4", copilot)} />
             </div>
-            <p className="text-[13px] font-medium text-white/70">
+            <p className="text-[13px] font-medium text-[rgb(var(--foreground)/0.75)]">
               Ask about this mission
             </p>
-            <p className="mt-1 text-[11.5px] leading-relaxed text-white/35">
+            <p className="mt-1 text-[11.5px] leading-relaxed text-[rgb(var(--foreground)/0.45)]">
               What it&apos;s doing, why, or inspect the workspace. The working
               agent is never interrupted.
             </p>
@@ -314,12 +326,17 @@ export function AskPanel({
           <AskBubble key={m.id} message={m} onSendToAgent={onSendToAgent} />
         ))}
         {loading && (
-          <div className="flex items-center gap-2 pl-1 text-[12px] text-sky-300/70">
+          <div
+            className={cn(
+              "flex items-center gap-2 pl-1 text-[12px]",
+              "text-[rgb(var(--copilot)/0.85)]",
+            )}
+          >
             <span className="flex gap-1" aria-hidden>
               {[0, 150, 300].map((delay) => (
                 <span
                   key={delay}
-                  className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-300/70"
+                  className="h-1.5 w-1.5 animate-pulse rounded-full bg-[rgb(var(--copilot)/0.85)]"
                   style={{ animationDelay: `${delay}ms` }}
                 />
               ))}
@@ -328,15 +345,15 @@ export function AskPanel({
           </div>
         )}
         {error && (
-          <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-red-300">
+          <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-[rgb(var(--error))]">
             {error}
           </div>
         )}
       </div>
 
       {/* Composer */}
-      <div className="border-t border-white/[0.06] p-2.5">
-        <div className="flex items-end gap-2 rounded-xl border border-white/[0.08] bg-white/[0.02] px-2.5 py-1.5 focus-within:border-sky-500/30">
+      <div className="border-t border-[rgb(var(--foreground)/0.1)] p-2.5">
+        <div className="flex items-end gap-2 rounded-xl border border-[rgb(var(--foreground)/0.12)] bg-[rgb(var(--foreground)/0.04)] px-2.5 py-1.5 focus-within:border-[rgb(var(--copilot)/0.4)]">
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -348,13 +365,16 @@ export function AskPanel({
             }}
             rows={1}
             placeholder="Ask the co-pilot…"
-            className="max-h-32 min-h-[24px] flex-1 resize-none bg-transparent text-sm text-white/90 placeholder:text-white/30 focus:outline-none"
+            className="max-h-32 min-h-[24px] flex-1 resize-none bg-transparent text-sm text-[rgb(var(--foreground)/0.9)] placeholder:text-[rgb(var(--foreground)/0.4)] focus:outline-none"
           />
           <button
             type="button"
             onClick={() => void send()}
             disabled={loading || !input.trim()}
-            className="rounded-lg bg-sky-500/15 p-1.5 text-sky-300 transition-all hover:bg-sky-500/25 active:scale-95 disabled:opacity-30 disabled:active:scale-100"
+            className={cn(
+              "rounded-lg bg-[rgb(var(--copilot)/0.15)] p-1.5 transition-all hover:bg-[rgb(var(--copilot)/0.25)] active:scale-95 disabled:opacity-30 disabled:active:scale-100",
+              copilot,
+            )}
           >
             <Send className="h-4 w-4" />
           </button>
@@ -376,13 +396,13 @@ function AskBubble({
   if (role === "user") {
     return (
       <div className="flex justify-end gap-2">
-        <div className="max-w-[85%] rounded-2xl rounded-tr-md bg-white/[0.06] px-3 py-2">
-          <p className="whitespace-pre-wrap break-words text-sm text-white/90">
+        <div className="max-w-[85%] rounded-2xl rounded-tr-md bg-[rgb(var(--foreground)/0.07)] px-3 py-2">
+          <p className="whitespace-pre-wrap break-words text-sm text-[rgb(var(--foreground)/0.9)]">
             {content}
           </p>
         </div>
-        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white/[0.06]">
-          <User className="h-3.5 w-3.5 text-white/50" />
+        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[rgb(var(--foreground)/0.07)]">
+          <User className="h-3.5 w-3.5 text-[rgb(var(--foreground)/0.5)]" />
         </div>
       </div>
     );
@@ -391,10 +411,10 @@ function AskBubble({
   if (role === "tool_call" || role === "tool_result") {
     const isCall = role === "tool_call";
     return (
-      <div className="ml-8 flex items-start gap-1.5 text-[11px] text-white/40">
-        <Terminal className="mt-0.5 h-3 w-3 shrink-0 text-white/30" />
+      <div className="ml-8 flex items-start gap-1.5 text-[11px] text-[rgb(var(--foreground)/0.45)]">
+        <Terminal className="mt-0.5 h-3 w-3 shrink-0 text-[rgb(var(--foreground)/0.35)]" />
         <div className="min-w-0 flex-1">
-          <span className="text-white/30">
+          <span className="text-[rgb(var(--foreground)/0.35)]">
             {isCall ? `${message.tool_name ?? "tool"} →` : "↳"}
           </span>{" "}
           <span className="break-words font-mono">
@@ -408,17 +428,17 @@ function AskBubble({
   // assistant
   return (
     <div className="flex justify-start gap-2">
-      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-sky-500/15 ring-1 ring-inset ring-sky-400/20">
-        <Sparkles className="h-3.5 w-3.5 text-sky-300" />
+      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[rgb(var(--copilot)/0.15)] ring-1 ring-inset ring-[rgb(var(--copilot)/0.25)]">
+        <Sparkles className="h-3.5 w-3.5 text-[rgb(var(--copilot))]" />
       </div>
-      <div className="group max-w-[85%] rounded-2xl rounded-tl-md border border-sky-500/10 bg-sky-500/[0.04] px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
+      <div className="group max-w-[85%] rounded-2xl rounded-tl-md border border-[rgb(var(--copilot)/0.18)] bg-[rgb(var(--copilot)/0.07)] px-3 py-2">
         <LazyMarkdownContent content={content} className="text-sm" />
         {onSendToAgent && (
           <button
             type="button"
             onClick={() => onSendToAgent(content)}
             title="Send to the working agent's composer"
-            className="mt-1.5 inline-flex items-center gap-1 text-[10px] text-white/30 opacity-0 transition-all hover:text-sky-300 active:scale-95 group-hover:opacity-100"
+            className="mt-1.5 inline-flex items-center gap-1 text-[10px] text-[rgb(var(--foreground)/0.4)] opacity-0 transition-all hover:text-[rgb(var(--copilot))] active:scale-95 group-hover:opacity-100"
           >
             <CornerUpLeft className="h-3 w-3" /> Send to agent
           </button>
