@@ -268,37 +268,94 @@ pub async fn refresh_metadata_llm_config(ai_providers: &crate::ai_providers::AIP
     client.set_config(config).await;
 }
 
+/// Resolve the API key/token for a provider: use the stored key first, then
+/// OAuth credentials from disk, then the provider type's env var.
+pub(crate) fn resolve_provider_api_key(
+    provider: &crate::ai_providers::AIProvider,
+) -> Option<String> {
+    if let Some(ref key) = provider.api_key {
+        return Some(key.clone());
+    }
+    // Check OAuth credentials from disk (source of truth, updated by background
+    // refresh). The store's oauth.access_token can be stale.
+    if let Some(entry) = crate::api::ai_providers::read_oauth_token_entry(provider.provider_type) {
+        if !entry.access_token.is_empty()
+            && !crate::api::ai_providers::oauth_token_expired(entry.expires_at)
+        {
+            return Some(entry.access_token);
+        }
+    }
+    if let Some(env_var) = provider.provider_type.env_var_name() {
+        if let Ok(key) = std::env::var(env_var) {
+            if !key.trim().is_empty() {
+                return Some(key);
+            }
+        }
+    }
+    None
+}
+
+/// Build the config for the **Assistant** role (the Ask sidecar). Prefers a
+/// fast, smart, large-context model: Cerebras `gpt-oss-120b` by default
+/// (overridable via `ASK_ASSISTANT_MODEL`). Falls back to the metadata provider
+/// ladder so Ask still works with whatever provider is configured. The Ask
+/// client derives `reasoning_effort` from the model name itself, so this stays
+/// independent of the metadata config's reasoning fields.
+pub async fn build_assistant_llm_config(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+) -> Option<MetadataLlmConfig> {
+    use crate::ai_providers::ProviderType;
+
+    let assistant_model =
+        std::env::var("ASK_ASSISTANT_MODEL").unwrap_or_else(|_| "gpt-oss-120b".to_string());
+
+    // Prefer Cerebras (fast + large context) for the assistant role.
+    if let Some(provider) = ai_providers.get_by_type(ProviderType::Cerebras).await {
+        if let Some(api_key) = resolve_provider_api_key(&provider) {
+            tracing::info!(
+                "[AskLLM] Using Cerebras assistant model {}",
+                assistant_model
+            );
+            return Some(MetadataLlmConfig {
+                base_url: provider
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.cerebras.ai/v1".to_string()),
+                api_key,
+                model: assistant_model,
+                api_format: ApiFormat::OpenAI,
+            });
+        }
+    }
+    // Env-only Cerebras key (provider not in the store).
+    if let Ok(api_key) = std::env::var("CEREBRAS_API_KEY") {
+        if !api_key.trim().is_empty() {
+            tracing::info!(
+                "[AskLLM] Using Cerebras (env) assistant model {}",
+                assistant_model
+            );
+            return Some(MetadataLlmConfig {
+                base_url: "https://api.cerebras.ai/v1".to_string(),
+                api_key,
+                model: assistant_model,
+                api_format: ApiFormat::OpenAI,
+            });
+        }
+    }
+
+    // Fallback: reuse the metadata ladder so Ask works with any provider.
+    tracing::info!("[AskLLM] Cerebras unavailable; falling back to metadata provider ladder");
+    try_build_config_from_providers(ai_providers).await
+}
+
 async fn try_build_config_from_providers(
     ai_providers: &crate::ai_providers::AIProviderStore,
 ) -> Option<MetadataLlmConfig> {
     use crate::ai_providers::ProviderType;
 
-    /// Resolve the API key/token for a provider: use the stored key first,
-    /// then OAuth credentials from disk, then the provider type's env var.
-    fn resolve_api_key(provider: &crate::ai_providers::AIProvider) -> Option<String> {
-        if let Some(ref key) = provider.api_key {
-            return Some(key.clone());
-        }
-        // Check OAuth credentials from disk (source of truth, updated by
-        // background refresh). The store's oauth.access_token can be stale.
-        if let Some(entry) =
-            crate::api::ai_providers::read_oauth_token_entry(provider.provider_type)
-        {
-            if !entry.access_token.is_empty()
-                && !crate::api::ai_providers::oauth_token_expired(entry.expires_at)
-            {
-                return Some(entry.access_token);
-            }
-        }
-        if let Some(env_var) = provider.provider_type.env_var_name() {
-            if let Ok(key) = std::env::var(env_var) {
-                if !key.trim().is_empty() {
-                    return Some(key);
-                }
-            }
-        }
-        None
-    }
+    // Use the lifted resolver under the original local name so the call sites
+    // below stay unchanged.
+    let resolve_api_key = resolve_provider_api_key;
 
     // Provider candidates in priority order (cheapest/fastest first).
     // Each entry: (provider_type, default_base_url, model, api_format)

@@ -2863,6 +2863,25 @@ async fn run_mission_turn(
     boss_user_id: Option<String>,
 ) -> AgentResult {
     let mut config = config;
+    // Operator-note bridge: flush any pending Ask-assistant writes into this
+    // turn's message so the working agent learns about out-of-band edits it
+    // didn't make. Passive by construction — this only runs because a turn is
+    // already executing, so it can never wake an idle agent. Delivery is
+    // harness-agnostic (every backend receives `user_message` as a string); the
+    // note also becomes part of the logged turn, giving an inherent audit trail.
+    let mut user_message = user_message;
+    if let Ok(ask_store) = crate::api::ask::ask_store(&config).await {
+        let (msg, flushed) =
+            crate::api::ask::prepend_pending_operator_notes(&ask_store, mission_id, user_message)
+                .await;
+        user_message = msg;
+        if flushed > 0 {
+            tracing::info!(
+                mission_id = %mission_id,
+                "[Ask] flushed {flushed} operator note(s) into working-agent turn"
+            );
+        }
+    }
     let effective_agent = agent_override.clone();
     if let Some(ref agent) = effective_agent {
         config.opencode_agent = Some(agent.clone());

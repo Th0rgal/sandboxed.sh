@@ -3501,7 +3501,7 @@ async fn set_and_emit_status(
     });
 }
 
-async fn control_for_user(state: &Arc<AppState>, user: &AuthUser) -> ControlState {
+pub(crate) async fn control_for_user(state: &Arc<AppState>, user: &AuthUser) -> ControlState {
     state.control.get_or_spawn(user).await
 }
 

@@ -722,6 +722,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/:id/parallel",
             post(control::start_mission_parallel),
         )
+        // Ask assistant (non-interrupting sidecar co-pilot)
+        .route(
+            "/api/control/missions/:id/ask",
+            post(crate::api::ask::http::ask_send),
+        )
+        .route(
+            "/api/control/missions/:id/ask/threads",
+            get(crate::api::ask::http::list_ask_threads),
+        )
+        .route(
+            "/api/control/missions/:id/ask/threads/:tid",
+            get(crate::api::ask::http::get_ask_thread)
+                .delete(crate::api::ask::http::delete_ask_thread),
+        )
         .route(
             "/api/control/missions/:id",
             axum::routing::delete(control::delete_mission),
