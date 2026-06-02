@@ -48,6 +48,8 @@
 		B3680EB29951C459A8C8A35A /* DesktopStreamService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BE62F9666647C1F41F15251 /* DesktopStreamService.swift */; };
 		B6263AC356BE51962E2D0145 /* ChatMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 370F364BA05D1236D9B630AB /* ChatMessage.swift */; };
 		BAA09895377937393FF864A7 /* Mission.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C6DBBABC4AE0FD4368A185C /* Mission.swift */; };
+		A5A5A5A5A5A5A5A5A5A5A502 /* Ask.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5A5A5A5A5A5A5A5A5A5A501 /* Ask.swift */; };
+		A5A5A5A5A5A5A5A5A5A5A504 /* AskSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5A5A5A5A5A5A5A5A5A5A503 /* AskSheet.swift */; };
 		BFD7D29C1F46E9F130A05F34 /* BackendAgentService.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6993AD59CA0D7392AAACDC2 /* BackendAgentService.swift */; };
 		C159E476E057E6691D1E0E85 /* GlassCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27F5D3EB21B6FF298AF5CD32 /* GlassCard.swift */; };
 		C7C23F6559C34034D1680FC2 /* FileEntry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 492E8CF2E0A3AEF64A472C85 /* FileEntry.swift */; };
@@ -78,6 +80,7 @@
 		081ACA60E04DBCB6E7313072 /* WorkerSheetView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerSheetView.swift; sourceTree = "<group>"; };
 		0C2AB7D53F29AB97345FA4DA /* ThemeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeTests.swift; sourceTree = "<group>"; };
 		0C6DBBABC4AE0FD4368A185C /* Mission.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Mission.swift; sourceTree = "<group>"; };
+		A5A5A5A5A5A5A5A5A5A5A501 /* Ask.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ask.swift; sourceTree = "<group>"; };
 		1828D2FC9160FC8677E10502 /* NetworkResilienceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkResilienceTests.swift; sourceTree = "<group>"; };
 		1834CB7B575220FDE7679F7B /* NewMissionSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewMissionSheet.swift; sourceTree = "<group>"; };
 		1C19E1741AE5E4A19BDAAB98 /* SandboxedDashboard.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = SandboxedDashboard.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -109,6 +112,7 @@
 		880FCB82E3B58C3C3C6DABD6 /* DesktopStreamView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopStreamView.swift; sourceTree = "<group>"; };
 		8D9C3868787C973C5B65DFCD /* FilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesView.swift; sourceTree = "<group>"; };
 		8EAAE29E81F160F8E8409B7D /* QueueSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QueueSheet.swift; sourceTree = "<group>"; };
+		A5A5A5A5A5A5A5A5A5A5A503 /* AskSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskSheet.swift; sourceTree = "<group>"; };
 		8EB13B92B70F6884D323E5FF /* FidoApprovalState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FidoApprovalState.swift; sourceTree = "<group>"; };
 		97D6534BE4C1B5E0BEA90A5A /* Workspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Workspace.swift; sourceTree = "<group>"; };
 		A636998B83DD23C5D2688C2D /* RunningMissionsBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunningMissionsBar.swift; sourceTree = "<group>"; };
@@ -270,6 +274,7 @@
 				D2E4AC8C92D9F496B8152B8F /* ControlView.swift */,
 				1834CB7B575220FDE7679F7B /* NewMissionSheet.swift */,
 				8EAAE29E81F160F8E8409B7D /* QueueSheet.swift */,
+				A5A5A5A5A5A5A5A5A5A5A503 /* AskSheet.swift */,
 			);
 			path = Control;
 			sourceTree = "<group>";
@@ -303,6 +308,7 @@
 				CCD9630B60B3E470E64B1AB4 /* FidoSignRequest.swift */,
 				492E8CF2E0A3AEF64A472C85 /* FileEntry.swift */,
 				0C6DBBABC4AE0FD4368A185C /* Mission.swift */,
+				A5A5A5A5A5A5A5A5A5A5A501 /* Ask.swift */,
 				97D6534BE4C1B5E0BEA90A5A /* Workspace.swift */,
 			);
 			path = Models;
@@ -454,11 +460,13 @@
 				48ADF499E7EE67D254FBE45A /* LoadingView.swift in Sources */,
 				F14B1635CFA8338A1C733CAD /* MarkdownView.swift in Sources */,
 				BAA09895377937393FF864A7 /* Mission.swift in Sources */,
+				A5A5A5A5A5A5A5A5A5A5A502 /* Ask.swift in Sources */,
 				9380357DC269257F9E693388 /* NavigationState.swift in Sources */,
 				110C67FF7A62B86FB7AD4CD0 /* NetworkMonitor.swift in Sources */,
 				D0646F9EE2D2E984F0446C57 /* NewMissionSheet.swift in Sources */,
 				B2C28CDD378203A229D62B9B /* PhosphorIcon.swift in Sources */,
 				51E9D9F51934DFC8EAD58CDC /* QueueSheet.swift in Sources */,
+				A5A5A5A5A5A5A5A5A5A5A504 /* AskSheet.swift in Sources */,
 				95B7AB5DBEB42E107EBE06FB /* RunningMissionsBar.swift in Sources */,
 				6846AB79778CDF4CC216B7D1 /* SandboxedDashboardApp.swift in Sources */,
 				A9B4F30DDAD9DBAEB009F77B /* SettingsView.swift in Sources */,

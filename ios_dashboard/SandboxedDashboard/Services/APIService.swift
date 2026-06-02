@@ -517,6 +517,37 @@ final class APIService {
         let _: EmptyResponse = try await post("/api/control/cancel", body: EmptyBody())
     }
 
+    // MARK: - Ask Assistant (non-interrupting sidecar co-pilot)
+
+    func postAsk(
+        missionId: String,
+        content: String,
+        threadId: String? = nil
+    ) async throws -> AskSendResponse {
+        struct AskRequest: Encodable {
+            let content: String
+            let thread_id: String?
+        }
+        return try await post(
+            "/api/control/missions/\(missionId)/ask",
+            body: AskRequest(content: content, thread_id: threadId)
+        )
+    }
+
+    func listAskThreads(missionId: String) async throws -> [AskThread] {
+        try await get("/api/control/missions/\(missionId)/ask/threads")
+    }
+
+    func getAskThread(missionId: String, threadId: String) async throws -> AskThreadDetail {
+        try await get("/api/control/missions/\(missionId)/ask/threads/\(threadId)")
+    }
+
+    func deleteAskThread(missionId: String, threadId: String) async throws {
+        let _: EmptyResponse = try await delete(
+            "/api/control/missions/\(missionId)/ask/threads/\(threadId)"
+        )
+    }
+
     // MARK: - Queue Management
 
     func getQueue() async throws -> [QueuedMessage] {

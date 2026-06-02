@@ -222,6 +222,7 @@ struct ControlView: View {
 
     // Thoughts panel state
     @State private var showThoughts = false
+    @State private var showAskSheet = false
     @State private var textOpBuffers: [String: String] = [:]
 
     // Tool grouping state - track which groups are expanded
@@ -311,6 +312,21 @@ struct ControlView: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+        }
+        .sheet(isPresented: $showAskSheet) {
+            if let missionId = viewingMission?.id ?? currentMission?.id {
+                AskSheet(
+                    missionId: missionId,
+                    onSendToAgent: { text in
+                        inputText = inputText.isEmpty ? text : inputText + "\n\n" + text
+                        showAskSheet = false
+                    },
+                    onDismiss: { showAskSheet = false }
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+            }
         }
         .sheet(isPresented: $showWorkerSheet) {
             WorkerSheetView(workers: childMissions, runningWorkers: runningMissions)
@@ -500,6 +516,14 @@ struct ControlView: View {
                     .foregroundStyle(
                         messages.contains(where: { $0.isThinking }) ? Theme.accent : Theme.textSecondary
                     )
+            }
+            Button {
+                showAskSheet = true
+                HapticService.lightTap()
+            } label: {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 14))
+                    .foregroundStyle(Color.cyan)
             }
             if !childMissions.isEmpty {
                 Button {
