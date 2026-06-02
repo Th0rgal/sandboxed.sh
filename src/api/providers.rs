@@ -1715,8 +1715,7 @@ pub async fn validate_model_override(
             let xai = providers.iter().find(|p| p.id == "xai");
             if let Some(provider) = xai {
                 if provider.models.iter().any(|m| m.id == model_override)
-                    || model_override.starts_with("grok-")
-                    || model_override.starts_with("composer-")
+                    || is_custom_grok_model_id(model_override)
                 {
                     Ok(())
                 } else {
@@ -1732,11 +1731,11 @@ pub async fn validate_model_override(
                             .join(", ")
                     ))
                 }
-            } else if model_override.starts_with("grok-") {
+            } else if is_custom_grok_model_id(model_override) {
                 Ok(())
             } else {
                 Err(format!(
-                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.3'), got '{}'",
+                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.3' or 'composer-2.5'), got '{}'",
                     model_override
                 ))
             }
@@ -1746,6 +1745,10 @@ pub async fn validate_model_override(
             Ok(())
         }
     }
+}
+
+fn is_custom_grok_model_id(model_id: &str) -> bool {
+    model_id.starts_with("grok-") || model_id.starts_with("composer-")
 }
 
 #[cfg(test)]
@@ -1792,6 +1795,13 @@ mod tests {
         // current CLIs) plus the Composer model the Grok CLI now supports.
         assert!(xai.models.iter().any(|model| model.id == "grok-build-0.1"));
         assert!(xai.models.iter().any(|model| model.id == "composer-2.5"));
+    }
+
+    #[test]
+    fn grok_custom_model_prefixes_include_composer() {
+        assert!(is_custom_grok_model_id("grok-4.3"));
+        assert!(is_custom_grok_model_id("composer-2.5"));
+        assert!(!is_custom_grok_model_id("claude-opus-4-7"));
     }
 
     #[test]
