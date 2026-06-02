@@ -7,6 +7,7 @@ import {
   Plus,
   Trash2,
   Send,
+  Loader,
   ChevronDown,
   CornerUpLeft,
   Terminal,
@@ -336,22 +337,13 @@ export function AskPanel({
           <AskBubble key={m.id} message={m} onSendToAgent={onSendToAgent} />
         ))}
         {loading && (
-          <div
-            className={cn(
-              "flex items-center gap-2 pl-1 text-[12px]",
-              "text-[rgb(var(--copilot)/0.85)]",
-            )}
-          >
-            <span className="flex gap-1" aria-hidden>
-              {[0, 150, 300].map((delay) => (
-                <span
-                  key={delay}
-                  className="h-1.5 w-1.5 animate-pulse rounded-full bg-[rgb(var(--copilot)/0.85)]"
-                  style={{ animationDelay: `${delay}ms` }}
-                />
-              ))}
-            </span>
-            thinking
+          <div className="flex animate-fade-in justify-start">
+            <div className="inline-flex items-center gap-1.5 rounded-full border border-[rgb(var(--copilot)/0.25)] bg-[rgb(var(--copilot)/0.1)] px-2.5 py-1">
+              <Loader className="h-3 w-3 animate-spin text-[rgb(var(--copilot))]" />
+              <span className="text-xs font-medium text-[rgb(var(--copilot))]">
+                Thinking
+              </span>
+            </div>
           </div>
         )}
         {error && (
@@ -361,9 +353,9 @@ export function AskPanel({
         )}
       </div>
 
-      {/* Composer */}
+      {/* Composer — mirrors the main mission composer's treatment */}
       <div className="border-t border-[rgb(var(--foreground)/0.1)] p-2.5">
-        <div className="flex items-end gap-2 rounded-xl border border-[rgb(var(--foreground)/0.12)] bg-[rgb(var(--foreground)/0.04)] px-2.5 py-1.5 focus-within:border-[rgb(var(--copilot)/0.4)]">
+        <div className="flex items-end gap-2 rounded-xl border border-[rgb(var(--foreground)/0.08)] bg-[rgb(var(--foreground)/0.03)] px-3.5 py-2.5 transition-[border-color] duration-150 ease-out focus-within:border-[rgb(var(--copilot)/0.5)]">
           <textarea
             ref={textareaRef}
             value={input}
@@ -382,10 +374,8 @@ export function AskPanel({
             type="button"
             onClick={() => void send()}
             disabled={loading || !input.trim()}
-            className={cn(
-              "rounded-lg bg-[rgb(var(--copilot)/0.15)] p-1.5 transition-all hover:bg-[rgb(var(--copilot)/0.25)] active:scale-95 disabled:opacity-30 disabled:active:scale-100",
-              copilot,
-            )}
+            title="Send"
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-600 text-white transition-all hover:bg-sky-500 active:scale-95 disabled:opacity-40 disabled:active:scale-100"
           >
             <Send className="h-4 w-4" />
           </button>
