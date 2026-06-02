@@ -37,6 +37,7 @@ pub struct SettingsResponse {
     pub max_concurrent_tasks: Option<usize>,
     pub auto_cleanup_enabled: Option<bool>,
     pub auto_cleanup_days: Option<u32>,
+    pub ask_assistant_model: Option<String>,
 }
 
 impl From<Settings> for SettingsResponse {
@@ -48,6 +49,7 @@ impl From<Settings> for SettingsResponse {
             max_concurrent_tasks: settings.max_concurrent_tasks,
             auto_cleanup_enabled: settings.auto_cleanup_enabled,
             auto_cleanup_days: settings.auto_cleanup_days,
+            ask_assistant_model: settings.ask_assistant_model,
         }
     }
 }
@@ -67,6 +69,9 @@ pub struct UpdateSettingsRequest {
     pub auto_cleanup_enabled: Option<bool>,
     #[serde(default)]
     pub auto_cleanup_days: Option<u32>,
+    /// Double-Option so a present `null` clears it (back to env/default).
+    #[serde(default)]
+    pub ask_assistant_model: Option<Option<String>>,
 }
 
 /// Request to update library remote specifically.
@@ -140,6 +145,10 @@ async fn update_settings(
             ));
         }
         new_settings.auto_cleanup_days = Some(value);
+    }
+    if let Some(value) = req.ask_assistant_model {
+        // Normalize empty string to None (fall back to env/default).
+        new_settings.ask_assistant_model = value.filter(|s| !s.trim().is_empty());
     }
 
     state

@@ -95,3 +95,14 @@ export function useControlStreamingDiagnosticsStore() {
 export function useControlViewingMissionStore() {
   return useSliceStore(controlViewingMissionStore);
 }
+
+/** Ask co-pilot panel: open state + an optional seed to prefill the composer
+ * (set by the "ask about this" spark on a chat item). */
+export const controlAskStore = createSliceStore<{
+  open: boolean;
+  seed: string | null;
+}>({ open: false, seed: null });
+
+export function useControlAskStore() {
+  return useSliceStore(controlAskStore);
+}

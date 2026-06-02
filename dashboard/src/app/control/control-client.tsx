@@ -47,6 +47,8 @@ import {
   useControlStreamingDiagnosticsStore,
   useControlThinkingStore,
   useControlViewingMissionStore,
+  useControlAskStore,
+  controlAskStore,
   type StreamDiagnosticsState,
 } from "./control-stores";
 import { NowTickProvider, useNow } from "@/lib/now-tick";
@@ -3921,7 +3923,19 @@ const ChatItemRow = memo(function ChatItemRow({
             </div>
           )}
         </div>
-        <CopyButton text={item.content} className="self-start mt-8" />
+        <div className="flex flex-col items-center gap-1 self-start mt-8">
+          <CopyButton text={item.content} />
+          <button
+            type="button"
+            onClick={() =>
+              controlAskStore.set({ open: true, seed: item.content })
+            }
+            title="Ask the co-pilot about this"
+            className="opacity-0 group-hover:opacity-100 transition-opacity text-white/30 hover:text-sky-300"
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+          </button>
+        </div>
       </div>
     );
   }
@@ -4468,7 +4482,16 @@ export default function ControlClient() {
   const [showWorkbenchPanel, setShowWorkbenchPanel] = useState(
     () => searchParams.get("workbench") === "1",
   );
-  const [showAskPanel, setShowAskPanel] = useState(false);
+  const [askSlice, setAskSlice] = useControlAskStore();
+  const showAskPanel = askSlice.open;
+  const setShowAskPanel = useCallback(
+    (next: boolean | ((v: boolean) => boolean)) =>
+      setAskSlice((s) => ({
+        ...s,
+        open: typeof next === "function" ? next(s.open) : next,
+      })),
+    [setAskSlice],
+  );
   // ⌘/ (or Ctrl+/) toggles the Ask co-pilot panel.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -4479,7 +4502,7 @@ export default function ControlClient() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [setShowAskPanel]);
   const handleToggleThinkingPanel = useCallback(() => {
     setShowThinkingPanel((prev) => {
       const next = !prev;
@@ -11079,6 +11102,10 @@ export default function ControlClient() {
           {showAskPanel && viewingMissionId && (
             <AskPanel
               missionId={viewingMissionId}
+              seed={askSlice.seed}
+              onSeedConsumed={() =>
+                setAskSlice((s) => ({ ...s, seed: null }))
+              }
               onClose={() => setShowAskPanel(false)}
               onSendToAgent={(text) => {
                 setInput((prev) => (prev ? `${prev}\n\n${text}` : text));

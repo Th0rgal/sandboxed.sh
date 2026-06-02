@@ -77,13 +77,16 @@ pub async fn ask_send(
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Mission not found".to_string()))?;
 
-    // Resolve the assistant model/config (Cerebras gpt-oss-120b by default).
-    let cfg = crate::api::metadata_llm::build_assistant_llm_config(&state.ai_providers)
-        .await
-        .ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No assistant LLM configured (set a Cerebras key or ASK_ASSISTANT_MODEL)".to_string(),
-        ))?;
+    // Resolve the assistant model/config (Settings override → env → default).
+    let model_override = state.settings.get().await.ask_assistant_model;
+    let cfg =
+        crate::api::metadata_llm::build_assistant_llm_config(&state.ai_providers, model_override)
+            .await
+            .ok_or((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No assistant LLM configured (set a Cerebras key or ASK_ASSISTANT_MODEL)"
+                    .to_string(),
+            ))?;
 
     let ask_store = super::ask_store(&state.config).await.map_err(internal)?;
 

@@ -303,11 +303,16 @@ pub(crate) fn resolve_provider_api_key(
 /// independent of the metadata config's reasoning fields.
 pub async fn build_assistant_llm_config(
     ai_providers: &crate::ai_providers::AIProviderStore,
+    model_override: Option<String>,
 ) -> Option<MetadataLlmConfig> {
     use crate::ai_providers::ProviderType;
 
-    let assistant_model =
-        std::env::var("ASK_ASSISTANT_MODEL").unwrap_or_else(|_| "gpt-oss-120b".to_string());
+    // Precedence: explicit Settings override → ASK_ASSISTANT_MODEL env → default.
+    let assistant_model = model_override
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| std::env::var("ASK_ASSISTANT_MODEL").ok())
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| "gpt-oss-120b".to_string());
 
     // Prefer Cerebras (fast + large context) for the assistant role.
     if let Some(provider) = ai_providers.get_by_type(ProviderType::Cerebras).await {

@@ -30,6 +30,10 @@ interface AskPanelProps {
   onClose: () => void;
   /** Drop a piece of an Ask answer into the real mission composer. */
   onSendToAgent?: (text: string) => void;
+  /** Optional text to prefill the composer with (from the "ask about this" spark). */
+  seed?: string | null;
+  /** Called once the seed has been consumed into the composer. */
+  onSeedConsumed?: () => void;
 }
 
 /**
@@ -40,7 +44,13 @@ interface AskPanelProps {
  * and is rendered here with a distinct "co-pilot" identity (cyan/sky), separate
  * from the mission's indigo agent bubbles.
  */
-export function AskPanel({ missionId, onClose, onSendToAgent }: AskPanelProps) {
+export function AskPanel({
+  missionId,
+  onClose,
+  onSendToAgent,
+  seed,
+  onSeedConsumed,
+}: AskPanelProps) {
   const [threads, setThreads] = useState<AskThread[]>([]);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<AskMessage[]>([]);
@@ -90,6 +100,17 @@ export function AskPanel({ missionId, onClose, onSendToAgent }: AskPanelProps) {
     const node = scrollRef.current;
     if (node) node.scrollTop = node.scrollHeight;
   }, [messages, loading]);
+
+  // "Ask about this" spark: prefill the composer with the quoted item.
+  useEffect(() => {
+    if (seed && seed.trim()) {
+      const snippet = seed.length > 280 ? `${seed.slice(0, 280)}…` : seed;
+      setInput(`About this:\n"""\n${snippet}\n"""\n\n`);
+      onSeedConsumed?.();
+    }
+    // Only react to a new seed; onSeedConsumed clears it so this won't loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seed]);
 
   const selectThread = useCallback(
     async (id: string) => {

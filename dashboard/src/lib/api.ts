@@ -2941,6 +2941,7 @@ export interface SettingsResponse {
   max_concurrent_tasks: number | null;
   auto_cleanup_enabled: boolean | null;
   auto_cleanup_days: number | null;
+  ask_assistant_model: string | null;
 }
 
 export interface UpdateLibraryRemoteResponse {

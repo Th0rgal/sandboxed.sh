@@ -59,6 +59,11 @@ pub struct Settings {
     /// older than this becomes eligible for GC. When None, defaults to 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_cleanup_days: Option<u32>,
+    /// Model for the Ask assistant (sidecar co-pilot). When None, falls back to
+    /// the `ASK_ASSISTANT_MODEL` env var, then the built-in default
+    /// (`gpt-oss-120b`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_assistant_model: Option<String>,
 }
 
 /// In-memory store for global settings with disk persistence.
@@ -129,6 +134,7 @@ impl SettingsStore {
             max_concurrent_tasks,
             auto_cleanup_enabled: None,
             auto_cleanup_days: None,
+            ask_assistant_model: std::env::var("ASK_ASSISTANT_MODEL").ok(),
         }
     }
 
