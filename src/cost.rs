@@ -57,6 +57,11 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         pricing: pricing(1_000, 5_000, Some(1_250), Some(100)),
     },
     PricingEntry {
+        canonical: "claude-sonnet-4-6",
+        aliases: &["claude-sonnet-4-6", "claude-4-6-sonnet"],
+        pricing: pricing(3_000, 15_000, Some(3_750), Some(300)),
+    },
+    PricingEntry {
         canonical: "claude-sonnet-4-5",
         aliases: &["claude-sonnet-4-5", "claude-4-5-sonnet"],
         pricing: pricing(3_000, 15_000, Some(3_750), Some(300)),

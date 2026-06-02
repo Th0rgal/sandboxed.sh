@@ -557,6 +557,13 @@ fn default_providers_config() -> ProvidersConfig {
                         ),
                     },
                     ProviderModel {
+                        id: "claude-sonnet-4-6".to_string(),
+                        name: "Claude Sonnet 4.6".to_string(),
+                        description: Some(
+                            "Latest Sonnet, balanced speed and capability".to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "claude-sonnet-4-5-20250929".to_string(),
                         name: "Claude Sonnet 4.5".to_string(),
                         description: Some("Balanced speed and capability".to_string()),
