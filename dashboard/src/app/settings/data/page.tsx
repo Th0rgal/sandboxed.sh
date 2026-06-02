@@ -9,7 +9,6 @@ import {
   updateSettings,
   downloadBackup,
   restoreBackup,
-  updateRtkEnabled,
 } from '@/lib/api';
 import {
   GitBranch,
@@ -19,7 +18,6 @@ import {
   Download,
   Upload,
   Archive,
-  Terminal,
   Trash2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -31,7 +29,6 @@ export default function DataSettingsPage() {
   const [editingRepoPath, setEditingRepoPath] = useState(false);
   const [repoPathValue, setRepoPathValue] = useState('');
   const [savingRepoPath, setSavingRepoPath] = useState(false);
-  const [togglingRtk, setTogglingRtk] = useState(false);
   const [togglingAutoCleanup, setTogglingAutoCleanup] = useState(false);
   const [editingCleanupDays, setEditingCleanupDays] = useState(false);
   const [cleanupDaysValue, setCleanupDaysValue] = useState('');
@@ -119,46 +116,6 @@ export default function DataSettingsPage() {
       );
     } finally {
       setSavingRepoPath(false);
-    }
-  };
-
-  const handleToggleRtk = async (enabled: boolean) => {
-    setTogglingRtk(true);
-    try {
-      await mutateSettings(
-        async (current) => {
-          await updateRtkEnabled(enabled);
-          return {
-            library_remote: current?.library_remote ?? null,
-            sandboxed_repo_path: current?.sandboxed_repo_path ?? null,
-            rtk_enabled: enabled,
-            max_parallel_missions: current?.max_parallel_missions ?? 1,
-            max_concurrent_tasks: current?.max_concurrent_tasks ?? null,
-            auto_cleanup_enabled: current?.auto_cleanup_enabled ?? null,
-            auto_cleanup_days: current?.auto_cleanup_days ?? null,
-          };
-        },
-        {
-          optimisticData: (current) => ({
-            library_remote: current?.library_remote ?? null,
-            sandboxed_repo_path: current?.sandboxed_repo_path ?? null,
-            rtk_enabled: enabled,
-            max_parallel_missions: current?.max_parallel_missions ?? 1,
-            max_concurrent_tasks: current?.max_concurrent_tasks ?? null,
-            auto_cleanup_enabled: current?.auto_cleanup_enabled ?? null,
-            auto_cleanup_days: current?.auto_cleanup_days ?? null,
-          }),
-          rollbackOnError: true,
-          revalidate: true,
-        }
-      );
-      toast.success(enabled ? 'RTK enabled' : 'RTK disabled');
-    } catch (err) {
-      toast.error(
-        `Failed to update RTK setting: ${err instanceof Error ? err.message : 'Unknown error'}`
-      );
-    } finally {
-      setTogglingRtk(false);
     }
   };
 
@@ -425,59 +382,6 @@ export default function DataSettingsPage() {
           </div>
           </div>
 
-          {/* RTK Settings */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-violet-500/10">
-                <Terminal className="h-5 w-5 text-violet-400" />
-              </div>
-              <div>
-                <h2 className="text-sm font-medium text-white">RTK (Rich Terminal Kit)</h2>
-                <p className="text-xs text-white/40">
-                  Compress terminal output to reduce token consumption
-                </p>
-              </div>
-            </div>
-
-            <div className="flex items-start justify-between gap-4">
-              <div className="min-w-0">
-                <p className="text-sm text-white/70">
-                  {serverSettings?.rtk_enabled
-                    ? 'RTK compression is enabled for terminal commands'
-                    : 'RTK compression is disabled'}
-                </p>
-                <p className="mt-1 text-xs text-white/40">
-                  When enabled, eligible terminal commands are wrapped with RTK to compress output
-                  before returning to the LLM, reducing token consumption.
-                </p>
-              </div>
-              <div className="flex items-center gap-2 flex-shrink-0">
-                {togglingRtk && (
-                  <Loader className="h-3.5 w-3.5 animate-spin text-white/40" />
-                )}
-                <button
-                  type="button"
-                  aria-label="Toggle RTK compression"
-                  aria-pressed={Boolean(serverSettings?.rtk_enabled)}
-                  onClick={() => handleToggleRtk(!Boolean(serverSettings?.rtk_enabled))}
-                  disabled={togglingRtk || settingsLoading}
-                  className={cn(
-                    'relative inline-flex h-6 w-11 items-center rounded-full transition-colors disabled:opacity-60 disabled:cursor-not-allowed',
-                    serverSettings?.rtk_enabled
-                      ? 'bg-violet-500'
-                      : 'bg-white/10'
-                  )}
-                >
-                  <span
-                    className={cn(
-                      'inline-block h-4 w-4 rounded-full bg-white transition-transform',
-                      serverSettings?.rtk_enabled ? 'translate-x-6' : 'translate-x-1'
-                    )}
-                  />
-                </button>
-              </div>
-            </div>
-          </div>
 
           {/* Auto-cleanup of old mission workspace files */}
           <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">

@@ -26,7 +26,6 @@ use crate::library::env_crypto::strip_encrypted_tags;
 use crate::library::LibraryStore;
 use crate::mcp::{McpRegistry, McpScope, McpServerConfig, McpTransport};
 use crate::nspawn::{self, NspawnDistro};
-use crate::tools::terminal::{rtk_binary_path, rtk_enabled};
 use crate::util::{env_var_bool, home_dir, strip_jsonc_comments, AI_PROVIDERS_PATH};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1242,8 +1241,8 @@ async fn write_opencode_config(
     }
 
     // Write Claude PreToolUse hooks for Claude-compatible execution.
-    // These fix gh CLI hanging in PTY, optionally enable RTK compression for
-    // native Bash, and block oversized image Reads before provider submission.
+    // These fix gh CLI hanging in PTY and block oversized image Reads before
+    // provider submission.
     if let Some(hooks) =
         write_claude_pretool_hooks(workspace_dir, workspace_root, workspace_type).await?
     {
@@ -1261,8 +1260,7 @@ async fn write_opencode_config(
 
 /// Write Claude Code `PreToolUse` hooks for workspace execution.
 ///
-/// The Bash hook always exists because it fixes `gh` hanging in PTY contexts,
-/// and optionally prefixes eligible commands with `rtk` when enabled.
+/// The Bash hook always exists because it fixes `gh` hanging in PTY contexts.
 ///
 /// The Read hook blocks oversized image reads before Claude Code serializes the
 /// image into the next model request. Anthropic applies a 2000px per-dimension
@@ -1272,9 +1270,8 @@ async fn write_opencode_config(
 /// Returns the `hooks` JSON value to embed in `.claude/settings.local.json`,
 /// or `None` when no hooks were written.
 ///
-/// For container workspaces, the RTK binary is copied from the host into
-/// the container's `/usr/local/bin/`, and paths in the hook config are
-/// translated to container-relative paths.
+/// For container workspaces, paths in the hook config are translated to
+/// container-relative paths.
 ///
 /// For the OpenCode backend this also keeps Claude-compatible tool hooks available.
 async fn write_claude_pretool_hooks(
@@ -1282,46 +1279,14 @@ async fn write_claude_pretool_hooks(
     workspace_root: &Path,
     workspace_type: WorkspaceType,
 ) -> anyhow::Result<Option<serde_json::Value>> {
-    let use_rtk = rtk_enabled();
-
-    // For container workspaces, copy the RTK binary from host into the container
     let is_container = workspace_type == WorkspaceType::Container && nspawn::nspawn_available();
-    if use_rtk && is_container {
-        if let Some(host_rtk) = rtk_binary_path() {
-            let dest_dir = workspace_root.join("usr").join("local").join("bin");
-            std::fs::create_dir_all(&dest_dir).ok();
-            let dest = dest_dir.join("rtk");
-            if !dest.exists() {
-                if let Err(e) = std::fs::copy(&host_rtk, &dest) {
-                    tracing::warn!(
-                        src = %host_rtk.display(),
-                        dest = %dest.display(),
-                        "Failed to copy RTK binary into container: {}", e
-                    );
-                } else {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ =
-                            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
-                    }
-                    tracing::info!(
-                        dest = %dest.display(),
-                        "Copied RTK binary into container"
-                    );
-                }
-            }
-        } else {
-            tracing::warn!("RTK enabled but binary not found on host");
-        }
-    }
 
     // Write the Bash hook script to .claude/hooks/bash-pretool.sh.
     // See `render_bash_pretool_script` for the script body.
     let hooks_dir = workspace_dir.join(".claude").join("hooks");
     tokio::fs::create_dir_all(&hooks_dir).await?;
     let hook_path = hooks_dir.join("bash-pretool.sh");
-    let hook_script = render_bash_pretool_script(use_rtk);
+    let hook_script = render_bash_pretool_script();
     tokio::fs::write(&hook_path, &hook_script).await?;
     #[cfg(unix)]
     {
@@ -1343,7 +1308,6 @@ async fn write_claude_pretool_hooks(
     tracing::info!(
         hook_path = %hook_command,
         is_container = is_container,
-        use_rtk = use_rtk,
         "Bash PreToolUse hook written"
     );
 
@@ -1505,108 +1469,45 @@ PY
 
 /// Render the Claude Code Bash `PreToolUse` hook script.
 ///
-/// The hook has two responsibilities, independently toggleable:
-/// 1. **gh terminal fix** (always on): wraps `gh` commands with `env TERM=dumb`
-///    so lipgloss/glamour stops issuing terminal capability queries that hang
-///    forever in our PTY. This is a bugfix unrelated to RTK.
-/// 2. **RTK compression** (gated on `use_rtk`): when the dashboard RTK setting
-///    is enabled, rewrites eligible commands to their `rtk <sub>` equivalents.
-///    When disabled, the hook leaves commands alone even if `rtk` is installed.
-///
-/// The `use_rtk` flag is baked into the script at workspace preparation time,
-/// so toggling the dashboard setting only takes effect for workspaces prepared
-/// after the toggle.
-fn render_bash_pretool_script(use_rtk: bool) -> String {
-    let rtk_flag = if use_rtk { "true" } else { "false" };
-    format!(
-        r#"#!/bin/bash
+/// Its sole responsibility is the **gh terminal fix**: it wraps `gh` commands
+/// with `env TERM=dumb` so lipgloss/glamour stops issuing terminal capability
+/// queries (OSC 11, DSR, …) that never get a response in our PTY and hang
+/// forever. Compound commands are left untouched.
+fn render_bash_pretool_script() -> String {
+    r#"#!/bin/bash
 # PreToolUse hook for Bash commands.
-# 1. Fixes gh CLI hanging in PTY by setting TERM=dumb (prevents lipgloss terminal queries)
-# 2. Optionally rewrites commands to use RTK for token compression
+# Fixes gh CLI hanging in PTY by setting TERM=dumb (prevents lipgloss/glamour
+# terminal capability queries that never get a response in our PTY).
 set -euo pipefail
-
-# Baked in at workspace preparation time from the dashboard RTK setting.
-RTK_ENABLED={rtk_flag}
 
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
-# Skip if empty or already wrapped
 if [ -z "$COMMAND" ]; then exit 0; fi
-case "$COMMAND" in
-  rtk\ *|/*/rtk\ *) exit 0 ;;
-esac
-# Skip compound commands (pipes, chains, heredocs, subshells, semicolons)
+
+# Skip compound commands (pipes, chains, heredocs, subshells, semicolons).
 case "$COMMAND" in
   *"&&"*|*"||"*|*"|"*|*"<<"*|*"("*|*";"*|*'`'*|*'$('*) exit 0 ;;
 esac
 
-# Extract the base command (first word, ignoring path prefix)
-FIRST_WORD=$(echo "$COMMAND" | awk '{{print $1}}')
+# Extract the base command (first word, ignoring path prefix).
+FIRST_WORD=$(echo "$COMMAND" | awk '{print $1}')
 BASE_CMD=$(basename "$FIRST_WORD")
-REST=$(echo "$COMMAND" | sed "s|^[^ ]* *||")
 
-emit_rewrite() {{
-  jq -n --arg cmd "$1" '{{
-    hookSpecificOutput: {{
+emit_rewrite() {
+  jq -n --arg cmd "$1" '{
+    hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "allow",
-      updatedInput: {{ command: $cmd }}
-    }}
-  }}'
-}}
+      updatedInput: { command: $cmd }
+    }
+  }'
+}
 
-# Find rtk binary only when the dashboard setting is on.
-RTK_PATH=""
-if [ "$RTK_ENABLED" = "true" ]; then
-  for p in /usr/local/bin/rtk /usr/bin/rtk; do
-    if [ -x "$p" ]; then RTK_PATH="$p"; break; fi
-  done
-fi
-
-# Map base commands to RTK subcommands (only commands RTK natively supports)
-RTK_SUB=""
-if [ -n "$RTK_PATH" ]; then
-  case "$BASE_CMD" in
-    ls)        RTK_SUB="ls" ;;
-    tree)      RTK_SUB="tree" ;;
-    git)       RTK_SUB="git" ;;
-    gh)        RTK_SUB="gh" ;;
-    grep|rg)   RTK_SUB="grep" ;;
-    cargo)     RTK_SUB="cargo" ;;
-    npm)       RTK_SUB="npm" ;;
-    npx)       RTK_SUB="npx" ;;
-    bun)       RTK_SUB="npm" ;;
-    bunx)      RTK_SUB="npx" ;;
-    pnpm)      RTK_SUB="pnpm" ;;
-    docker)    RTK_SUB="docker" ;;
-    kubectl)   RTK_SUB="kubectl" ;;
-    vitest)    RTK_SUB="vitest" ;;
-    pytest)    RTK_SUB="pytest" ;;
-    go)        RTK_SUB="go" ;;
-    tsc)       RTK_SUB="tsc" ;;
-    eslint)    RTK_SUB="lint" ;;
-    ruff)      RTK_SUB="ruff" ;;
-    curl)      RTK_SUB="curl" ;;
-    pip|uv)    RTK_SUB="pip" ;;
-    diff)      RTK_SUB="diff" ;;
-  esac
-fi
-
-# If RTK supports this command, rewrite to use RTK (which pipes internally, fixing PTY too)
-if [ -n "$RTK_SUB" ]; then
-  if [ -n "$REST" ]; then
-    emit_rewrite "$RTK_PATH $RTK_SUB -- $REST"
-  else
-    emit_rewrite "$RTK_PATH $RTK_SUB"
-  fi
-  exit 0
-fi
-
-# No RTK available — still fix gh commands that hang in PTY environments.
-# The gh CLI (via lipgloss/glamour) sends terminal capability queries like
-# OSC 11 (background color) and DSR (cursor position) when TERM != dumb.
-# Our PTY has no terminal emulator to respond, causing indefinite hangs.
+# Fix gh commands that hang in PTY environments. The gh CLI (via
+# lipgloss/glamour) sends terminal capability queries like OSC 11 (background
+# color) and DSR (cursor position) when TERM != dumb; our PTY has no terminal
+# emulator to respond, causing indefinite hangs.
 case "$BASE_CMD" in
   gh)
     emit_rewrite "env TERM=dumb $COMMAND"
@@ -1616,7 +1517,7 @@ esac
 
 exit 0
 "#
-    )
+    .to_string()
 }
 
 /// Deep-merge `overlay` into `base`.
@@ -1712,7 +1613,7 @@ async fn write_claudecode_config(
         }
     });
 
-    // Add Claude PreToolUse hooks: Bash PTY/RTK handling plus image Read guard.
+    // Add Claude PreToolUse hooks: Bash gh-PTY fix plus image Read guard.
     if let Some(hooks) =
         write_claude_pretool_hooks(workspace_dir, workspace_root, workspace_type).await?
     {
@@ -1723,7 +1624,7 @@ async fn write_claudecode_config(
     }
 
     // Apply config profile settings: profile is the base, generated settings win on top.
-    // Arrays (e.g. hooks) are concatenated — profile hooks + RTK hooks both survive.
+    // Arrays (e.g. hooks) are concatenated — profile hooks + generated hooks both survive.
     if let Some(profile) = profile_overlay {
         let mut merged = profile.clone();
         merge_json(&mut merged, &settings);
@@ -1738,7 +1639,7 @@ async fn write_claudecode_config(
 
     // Write a dedicated MCP config for CLI flags like --mcp-config.
     // Use mcpServers from the merged settings (includes profile overlay MCPs)
-    // rather than only the RTK-generated MCPs.
+    // rather than only the generated MCPs.
     let final_mcp_servers = settings
         .get("mcpServers")
         .cloned()
@@ -3315,7 +3216,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     }
 
     // Load Claude Code config profile settings (hooks, custom defaults).
-    // Profile is base; generated settings (MCPs, permissions, RTK) win on top.
+    // Profile is base; generated settings (MCPs, permissions) win on top.
     let claudecode_profile_overlay: Option<serde_json::Value> = if backend_id == "claudecode" {
         if let Some(lib) = library {
             let profile = config_profile.unwrap_or("default");
@@ -4558,23 +4459,12 @@ mod tests {
     }
 
     #[test]
-    fn bash_pretool_script_bakes_rtk_flag() {
-        let on = render_bash_pretool_script(true);
-        let off = render_bash_pretool_script(false);
-        assert!(on.contains("RTK_ENABLED=true"));
-        assert!(off.contains("RTK_ENABLED=false"));
-    }
-
-    #[test]
-    fn bash_pretool_script_rtk_off_skips_rtk_binary_lookup() {
-        // When RTK_ENABLED=false the script must evaluate RTK_PATH to the
-        // empty string, so eligible commands fall through to the `gh` bugfix
-        // branch instead of being rewritten with rtk.
-        let script = render_bash_pretool_script(false);
+    fn bash_pretool_script_leaves_plain_commands_untouched() {
+        // Non-gh commands must pass through with no rewrite (empty stdout).
+        let script = render_bash_pretool_script();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &script).unwrap();
 
-        // ls → when RTK is off, script must NOT rewrite (no output); exits 0 with no stdout.
         let out = std::process::Command::new("bash")
             .arg(tmp.path())
             .stdin(std::process::Stdio::piped())
@@ -4600,9 +4490,9 @@ mod tests {
     }
 
     #[test]
-    fn bash_pretool_script_gh_bugfix_runs_even_when_rtk_off() {
-        // The `gh` TERM=dumb fix is independent of RTK and must fire regardless.
-        let script = render_bash_pretool_script(false);
+    fn bash_pretool_script_applies_gh_pty_fix() {
+        // The `gh` TERM=dumb fix wraps gh commands so they don't hang in PTY.
+        let script = render_bash_pretool_script();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &script).unwrap();
 

@@ -2520,38 +2520,89 @@ struct ControlView: View {
     /// (post SSE reconnect) and `reloadMissionFromServer` (post scene-phase active).
     /// Caller is responsible for the fallback path when this returns anything
     /// other than `.applied`.
-    private func tryDeltaResume(missionId id: String) async -> DeltaResumeOutcome {
-        guard let knownSeq = missionMaxSeq[id] else { return .noCursor }
-        do {
-            let result = try await diagnostics.measureAsync(
-                "control.fetch_delta",
-                detail: id
-            ) {
-                try await api.getMissionEventsWithMeta(
-                    id: id,
-                    types: historyEventTypes,
-                    limit: Self.deltaResumePageLimit,
-                    sinceSeq: knownSeq
-                )
+    /// Safety cap on the number of pages a single delta-resume will drain
+    /// (50 * 5000 = 250k events). Prevents an unbounded loop on a pathological
+    /// mission while still catching up multi-day backlogs in one pass.
+    static let deltaResumeMaxPages = 50
+
+    /// Result of draining the delta backlog: the events fetched and the
+    /// sequence the cursor should advance to.
+    struct DeltaDrain {
+        let events: [StoredEvent]
+        let finalCursor: Int64
+        let pages: Int
+    }
+
+    /// Pure, dependency-free paginator: keep calling `fetchPage(cursor)` until a
+    /// page comes back short (fully caught up), the page reaches the server's
+    /// reported max sequence, the page makes no forward progress (defensive
+    /// guard), or we hit `maxPages`. Returns every event drained plus the cursor
+    /// to persist.
+    ///
+    /// This loop is the fix for the staleness bug: the SSE stream does NOT
+    /// replay events missed while disconnected (the server ignores `since_seq`
+    /// on the stream), so this delta fetch is the only gap-filler. The previous
+    /// code fetched a single page, leaving a multi-day backlog permanently
+    /// behind (the tail froze on an old message). Extracted as `static` so it's
+    /// unit-testable without a live `APIService`.
+    static func drainDelta(
+        from initialCursor: Int64,
+        pageLimit: Int,
+        maxPages: Int,
+        fetchPage: (Int64) async throws -> (events: [StoredEvent], maxSeq: Int64)
+    ) async rethrows -> DeltaDrain {
+        var cursor = initialCursor
+        var collected: [StoredEvent] = []
+        var pages = 0
+        while pages < maxPages {
+            let (events, maxSeq) = try await fetchPage(cursor)
+            collected.append(contentsOf: events)
+            pages += 1
+            let pageMax = events.map { $0.sequence }.max() ?? cursor
+            let fullPage = events.count >= pageLimit
+            if !fullPage || pageMax >= maxSeq || pageMax <= cursor {
+                return DeltaDrain(events: collected, finalCursor: max(maxSeq, pageMax), pages: pages)
             }
-            guard viewingMissionId == id else { return .viewChanged }
-            let maxSeq = result.maxSequence ?? knownSeq
-            _ = mergeMissionEvents(result.events, for: id)
-            applyDeltaEvents(result.events)
-            // If the page was capped by the limit, advance the cursor to the
-            // largest sequence we actually saw so the next call resumes from
-            // there — otherwise we'd skip rows between this page and the
-            // true max. Use `max()` rather than `last`: the API contract is
-            // ASC-by-sequence but defensive callers shouldn't trust input
-            // ordering.
-            let pageMax = result.events.map { $0.sequence }.max() ?? knownSeq
-            let cursor = (result.events.count >= Self.deltaResumePageLimit && pageMax < maxSeq) ? pageMax : maxSeq
-            missionMaxSeq[id] = cursor
-            return .applied
+            cursor = pageMax
+        }
+        return DeltaDrain(events: collected, finalCursor: cursor, pages: pages)
+    }
+
+    private func tryDeltaResume(missionId id: String) async -> DeltaResumeOutcome {
+        guard let initialCursor = missionMaxSeq[id] else { return .noCursor }
+        let drain: DeltaDrain
+        do {
+            drain = try await Self.drainDelta(
+                from: initialCursor,
+                pageLimit: Self.deltaResumePageLimit,
+                maxPages: Self.deltaResumeMaxPages
+            ) { cursor in
+                let result = try await diagnostics.measureAsync(
+                    "control.fetch_delta",
+                    detail: id
+                ) {
+                    try await api.getMissionEventsWithMeta(
+                        id: id,
+                        types: historyEventTypes,
+                        limit: Self.deltaResumePageLimit,
+                        sinceSeq: cursor
+                    )
+                }
+                return (result.events, result.maxSequence ?? cursor)
+            }
         } catch {
             print("Delta resume failed: \(error)")
             return .failed
         }
+        // Apply only if the user is still viewing this mission (a long drain may
+        // have outlived the selection).
+        guard viewingMissionId == id else { return .viewChanged }
+        if !drain.events.isEmpty {
+            _ = mergeMissionEvents(drain.events, for: id)
+            applyDeltaEvents(drain.events)
+        }
+        missionMaxSeq[id] = max(drain.finalCursor, missionMaxSeq[id] ?? initialCursor)
+        return .applied
     }
 
     // Reload mission from server without showing loading state or cache.
