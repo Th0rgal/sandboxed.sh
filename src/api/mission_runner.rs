@@ -12343,6 +12343,11 @@ fn grok_line_requests_interactive_login(line: &str) -> bool {
         || lower.contains("oauth2/authorize")
 }
 
+fn grok_stdout_line_requests_interactive_login(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_err()
+        && grok_line_requests_interactive_login(line)
+}
+
 /// Execute a turn using the Grok Build CLI backend.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_grok_turn(
@@ -12580,26 +12585,24 @@ pub async fn run_grok_turn(
                         if line.trim().is_empty() {
                             continue;
                         }
-                        // Fail fast on interactive sign-in. When the CLI can't
-                        // authenticate non-interactively it prints a sign-in URL
-                        // and blocks on a local OAuth callback that never arrives
-                        // in a headless mission — the run would otherwise hang
-                        // until the watchdog kills it ("Agent is working"
-                        // forever). Detect it and abort with an actionable error.
-                        if grok_line_requests_interactive_login(&line) {
-                            let _ = child.kill().await;
-                            if let Some(handle) = stderr_handle.take() {
-                                handle.abort();
-                            }
-                            return AgentResult::failure(
-                                "Grok Build could not authenticate non-interactively (the CLI requested a browser sign-in). Reconnect the xAI / Grok Build provider in Settings → Providers, then retry the mission.".to_string(),
-                                0,
-                            )
-                            .with_terminal_reason(TerminalReason::LlmError);
-                        }
                         let value: serde_json::Value = match serde_json::from_str(&line) {
                             Ok(value) => value,
                             Err(_) => {
+                                // Fail fast on raw interactive sign-in prompts.
+                                // Valid streaming-json events may contain these
+                                // substrings as assistant/tool text, so only
+                                // inspect stdout after JSON parsing fails.
+                                if grok_stdout_line_requests_interactive_login(&line) {
+                                    let _ = child.kill().await;
+                                    if let Some(handle) = stderr_handle.take() {
+                                        handle.abort();
+                                    }
+                                    return AgentResult::failure(
+                                        "Grok Build could not authenticate non-interactively (the CLI requested a browser sign-in). Reconnect the xAI / Grok Build provider in Settings → Providers, then retry the mission.".to_string(),
+                                        0,
+                                    )
+                                    .with_terminal_reason(TerminalReason::LlmError);
+                                }
                                 if final_result.is_empty() {
                                     final_result.push_str(&line);
                                 } else {
@@ -14585,8 +14588,8 @@ mod tests {
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
-        inject_telegram_identity_into_claude_md, localhost_api_base_url, merge_stream_fragment,
-        public_api_base_url,
+        grok_stdout_line_requests_interactive_login, inject_telegram_identity_into_claude_md,
+        localhost_api_base_url, merge_stream_fragment, public_api_base_url,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
@@ -14677,6 +14680,21 @@ mod tests {
 
         assert_eq!(grok_event_text(&event).as_deref(), Some("visible answer"));
         assert_eq!(grok_event_reasoning(&event), None);
+    }
+
+    #[test]
+    fn grok_stdout_login_detection_ignores_json_content() {
+        let event = json!({
+            "type": "text",
+            "data": "The docs mention https://auth.x.ai/oauth2/authorize in passing"
+        });
+
+        assert!(!grok_stdout_line_requests_interactive_login(
+            &event.to_string()
+        ));
+        assert!(grok_stdout_line_requests_interactive_login(
+            "Open this URL to sign in: https://auth.x.ai/oauth2/authorize?client_id=abc"
+        ));
     }
 
     #[test]
