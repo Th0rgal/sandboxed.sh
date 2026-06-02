@@ -504,7 +504,9 @@ const CONVERSATION_EVENT_TYPES = new Set([
 // cache path so a cache hit behaves like `getMissionSnapshot` — without it a
 // stale or oversized cached tail would be replayed in full (slow load) and the
 // recent-message anchoring would be bypassed.
-function anchorEventsToRecentConversation(events: StoredEvent[]): StoredEvent[] {
+function anchorEventsToRecentConversation(
+  events: StoredEvent[],
+): StoredEvent[] {
   // Anchor ONLY when at least N conversation messages exist, matching the
   // server: `nth_recent_event_sequence(N)` returns None below N, in which case
   // get_mission_snapshot falls back to the plain recent-events tail (no
@@ -6042,7 +6044,6 @@ export default function ControlClient() {
     [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder, setItems],
   );
 
-
   // Load mission from URL param on mount (and retry on auth success)
   const [authRetryTrigger, setAuthRetryTrigger] = useState(0);
 
@@ -10850,6 +10851,44 @@ export default function ControlClient() {
                   onClearAll={handleClearQueue}
                 />
 
+                {(() => {
+                  // Goal-mode pill — a flow row above the composer (not an
+                  // absolute overlay) so it never overlaps the streaming /
+                  // working indicators in the message list. indigo-300 text
+                  // (vs indigo-200) so the light-theme remap renders it dark
+                  // and readable. Cleared by the SSE handler at terminal status.
+                  const activeMissionId =
+                    viewingMission?.id ?? currentMission?.id;
+                  const goal = activeMissionId
+                    ? goalInfoByMission[activeMissionId]
+                    : undefined;
+                  if (!goal) return null;
+                  const statusLabel =
+                    goal.status === "active"
+                      ? `iter ${goal.iteration}`
+                      : goal.status === "paused"
+                        ? "paused"
+                        : goal.status;
+                  return (
+                    <div
+                      className="mb-2 flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-300 max-w-fit"
+                      title={goal.objective}
+                    >
+                      <span className="font-semibold">Goal</span>
+                      <span className="text-indigo-300/60">·</span>
+                      <span>{statusLabel}</span>
+                      {goal.objective && (
+                        <>
+                          <span className="text-indigo-300/60">·</span>
+                          <span className="truncate max-w-[40ch] text-indigo-300/60">
+                            {goal.objective}
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
+
                 <form
                   onSubmit={(e) => e.preventDefault()}
                   className="flex gap-2 items-stretch"
@@ -10873,41 +10912,6 @@ export default function ControlClient() {
                     placeholder="Message the root agent… (paste files to upload)"
                     backend={viewingMission?.backend ?? currentMission?.backend}
                   />
-                  {(() => {
-                    // Goal-mode pill — shown above the composer while a codex
-                    // `/goal` continuation loop is active. Cleared automatically
-                    // by the SSE handler when status hits a terminal value.
-                    const activeMissionId =
-                      viewingMission?.id ?? currentMission?.id;
-                    const goal = activeMissionId
-                      ? goalInfoByMission[activeMissionId]
-                      : undefined;
-                    if (!goal) return null;
-                    const statusLabel =
-                      goal.status === "active"
-                        ? `iter ${goal.iteration}`
-                        : goal.status === "paused"
-                          ? "paused"
-                          : goal.status;
-                    return (
-                      <div
-                        className="absolute -top-9 left-2 right-2 flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-200 max-w-fit"
-                        title={goal.objective}
-                      >
-                        <span className="font-semibold">Goal</span>
-                        <span className="text-indigo-300/60">·</span>
-                        <span>{statusLabel}</span>
-                        {goal.objective && (
-                          <>
-                            <span className="text-indigo-300/60">·</span>
-                            <span className="truncate max-w-[40ch] text-indigo-200/70">
-                              {goal.objective}
-                            </span>
-                          </>
-                        )}
-                      </div>
-                    );
-                  })()}
 
                   {isBusy ? (
                     <div className="inline-flex h-[46px] shrink-0 rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
