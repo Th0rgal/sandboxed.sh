@@ -10652,9 +10652,9 @@ export default function ControlClient() {
                   `agentWorkingIndicator` memo so each NowTick render doesn't
                   re-walk the whole items array. */}
                   {agentWorkingPillVisible && agentWorkingIndicator && (
-                    <div className="flex justify-start animate-fade-in -mt-3">
-                      <div className="inline-flex items-center gap-2 rounded-full border border-indigo-500/20 bg-indigo-500/[0.08] px-3 py-1.5">
-                        <Loader className="h-3.5 w-3.5 text-indigo-400 animate-spin" />
+                    <div className="flex justify-start animate-fade-in my-2">
+                      <div className="inline-flex items-center gap-1.5 rounded-full border border-indigo-500/20 bg-indigo-500/[0.08] px-2.5 py-1">
+                        <Loader className="h-3 w-3 text-indigo-400 animate-spin" />
                         <span className="text-xs font-medium text-indigo-300">
                           Agent is working
                         </span>
