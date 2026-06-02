@@ -30,6 +30,12 @@ pub struct MetadataLlmConfig {
     pub model: String,
     /// API format to use.
     pub api_format: ApiFormat,
+    /// For reasoning models (e.g. Cerebras `gpt-oss-120b`): the OpenAI-style
+    /// `reasoning_effort` ("low"/"medium"/"high"). When set it's sent on the
+    /// request and the token budget is raised — reasoning models spend the
+    /// first tokens on hidden reasoning and would otherwise return empty
+    /// `content`. `None` for plain chat models (gemini-flash, gpt-4.1-nano, …).
+    pub reasoning_effort: Option<String>,
 }
 
 /// Lightweight client for metadata summarization.
@@ -141,15 +147,26 @@ impl MetadataLlmClient {
             }
             ApiFormat::OpenAI => {
                 let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-                let body = serde_json::json!({
+                // Reasoning models emit hidden reasoning before the visible
+                // answer, so an 80-token cap leaves `content` empty. Give them
+                // room; plain chat models hit the EOS well before this.
+                let max_tokens = if cfg.reasoning_effort.is_some() {
+                    512
+                } else {
+                    80
+                };
+                let mut body = serde_json::json!({
                     "model": cfg.model,
                     "messages": [
                         { "role": "system", "content": system_prompt },
                         { "role": "user", "content": user_content }
                     ],
-                    "max_tokens": 80,
+                    "max_tokens": max_tokens,
                     "temperature": 0.2,
                 });
+                if let Some(effort) = &cfg.reasoning_effort {
+                    body["reasoning_effort"] = serde_json::json!(effort);
+                }
                 (
                     url,
                     body,
@@ -301,41 +318,49 @@ async fn try_build_config_from_providers(
     }
 
     // Provider candidates in priority order (cheapest/fastest first).
-    // Each entry: (provider_type, default_base_url, model, api_format)
-    let candidates: &[(ProviderType, &str, &str, ApiFormat)] = &[
+    // (provider_type, default_base_url, model, api_format, reasoning_effort)
+    let candidates: &[(ProviderType, &str, &str, ApiFormat, Option<&str>)] = &[
         (
             ProviderType::OpenRouter,
             "https://openrouter.ai/api/v1",
             "google/gemini-2.0-flash-001",
             ApiFormat::OpenAI,
+            None,
         ),
         (
             ProviderType::Groq,
             "https://api.groq.com/openai/v1",
             "llama-3.3-70b-versatile",
             ApiFormat::OpenAI,
+            None,
         ),
         (
+            // Cerebras only serves reasoning models now (gpt-oss-120b,
+            // zai-glm-4.7); the old `llama3.1-8b` 404s. gpt-oss-120b with
+            // reasoning_effort=low returns a clean TITLE/STATUS in ~300ms.
             ProviderType::Cerebras,
             "https://api.cerebras.ai/v1",
-            "llama3.1-8b",
+            "gpt-oss-120b",
             ApiFormat::OpenAI,
+            Some("low"),
         ),
         (
             ProviderType::OpenAI,
             "https://api.openai.com/v1",
             "gpt-4.1-nano",
             ApiFormat::OpenAI,
+            None,
         ),
         (
             ProviderType::Anthropic,
             "https://api.anthropic.com",
             "claude-haiku-4-5-20251001",
             ApiFormat::Anthropic,
+            None,
         ),
     ];
 
-    for (provider_type, default_base_url, model, api_format) in candidates {
+    for (provider_type, default_base_url, model, api_format, reasoning_effort) in candidates {
         if let Some(provider) = ai_providers.get_by_type(*provider_type).await {
             if let Some(api_key) = resolve_api_key(&provider) {
                 tracing::info!(
@@ -350,6 +375,7 @@ async fn try_build_config_from_providers(
                     api_key,
                     model: model.to_string(),
                     api_format: *api_format,
+                    reasoning_effort: reasoning_effort.map(|s| s.to_string()),
                 });
             }
         }
@@ -375,45 +401,52 @@ async fn try_build_config_from_providers(
                     api_key: entry.access_token,
                     model: "gemini-2.0-flash".to_string(),
                     api_format: ApiFormat::OpenAI,
+                    reasoning_effort: None,
                 });
             }
         }
     }
 
     // Final fallback: check environment variables for providers not in the store
-    let env_providers: &[(&str, &str, &str, ApiFormat)] = &[
+    // (env_var, base_url, model, api_format, reasoning_effort)
+    let env_providers: &[(&str, &str, &str, ApiFormat, Option<&str>)] = &[
         (
             "OPENROUTER_API_KEY",
             "https://openrouter.ai/api/v1",
             "google/gemini-2.0-flash-001",
             ApiFormat::OpenAI,
+            None,
         ),
         (
             "CEREBRAS_API_KEY",
             "https://api.cerebras.ai/v1",
-            "llama3.1-8b",
+            "gpt-oss-120b",
             ApiFormat::OpenAI,
+            Some("low"),
         ),
         (
             "GROQ_API_KEY",
             "https://api.groq.com/openai/v1",
             "llama-3.3-70b-versatile",
             ApiFormat::OpenAI,
+            None,
         ),
         (
             "OPENAI_API_KEY",
             "https://api.openai.com/v1",
             "gpt-4.1-nano",
             ApiFormat::OpenAI,
+            None,
         ),
         (
             "ANTHROPIC_API_KEY",
             "https://api.anthropic.com",
             "claude-haiku-4-5-20251001",
             ApiFormat::Anthropic,
+            None,
         ),
     ];
-    for (env_var, base_url, model, api_format) in env_providers {
+    for (env_var, base_url, model, api_format, reasoning_effort) in env_providers {
         if let Ok(api_key) = std::env::var(env_var) {
             if !api_key.trim().is_empty() {
                 tracing::info!("[MetadataLLM] Using {} from environment", env_var);
@@ -422,6 +455,7 @@ async fn try_build_config_from_providers(
                     api_key,
                     model: model.to_string(),
                     api_format: *api_format,
+                    reasoning_effort: reasoning_effort.map(|s| s.to_string()),
                 });
             }
         }
