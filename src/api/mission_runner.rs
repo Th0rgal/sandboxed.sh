@@ -3570,13 +3570,17 @@ async fn run_mission_turn(
                         tracing::warn!(
                             mission_id = %mission_id,
                             requested_model = ?requested_model,
-                            "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
+                            "Retrying Codex turn on the requested model (not the stale Codex CLI default) after it stopped before tool use"
                         );
                         result = run_codex_turn(
                             &workspace,
                             &mission_work_dir,
                             codex_message,
-                            None,
+                            // Was `None`, which made the Codex CLI fall back to
+                            // its built-in default — currently the retired
+                            // `gpt-5.3-codex`, rejected by ChatGPT-account auth
+                            // with a 400. Retry on the requested (latest) model.
+                            requested_model,
                             model_effort.as_deref(),
                             effective_agent.as_deref(),
                             mission_id,
@@ -3707,13 +3711,16 @@ async fn run_mission_turn(
                                 attempt = attempt_idx,
                                 requested_model = ?requested_model,
                                 credential = %credential_label,
-                                "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
+                                "Retrying Codex turn on the requested model (not the stale Codex CLI default) after it stopped before tool use"
                             );
                             result = run_codex_turn(
                                 &workspace,
                                 &mission_work_dir,
                                 codex_message,
-                                None,
+                                // Was `None` (stale CLI default gpt-5.3-codex,
+                                // 400 on ChatGPT auth). Retry on the requested
+                                // (latest) model instead.
+                                requested_model,
                                 model_effort.as_deref(),
                                 effective_agent.as_deref(),
                                 mission_id,

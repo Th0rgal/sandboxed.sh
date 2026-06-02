@@ -591,46 +591,12 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "subscription".to_string(),
                 description: "ChatGPT Plus/Pro via OAuth".to_string(),
                 models: vec![
-                    // Keep this fallback list aligned with Codex upstream model IDs:
-                    // https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/models.json
-                    // (authoritative source for Codex CLI model catalog).
-                    // Codex-optimized models (for Codex CLI)
-                    ProviderModel {
-                        id: "gpt-5-codex".to_string(),
-                        name: "GPT-5 Codex".to_string(),
-                        description: Some("Purpose-built for agentic coding".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5-codex-mini".to_string(),
-                        name: "GPT-5 Codex Mini".to_string(),
-                        description: Some("Smaller, cost-effective variant".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1-codex".to_string(),
-                        name: "GPT-5.1 Codex".to_string(),
-                        description: Some("Balanced capability and speed".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1-codex-max".to_string(),
-                        name: "GPT-5.1 Codex Max".to_string(),
-                        description: Some("Highest reasoning capacity".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1-codex-mini".to_string(),
-                        name: "GPT-5.1 Codex Mini".to_string(),
-                        description: Some("Fast and economical".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.2-codex".to_string(),
-                        name: "GPT-5.2 Codex".to_string(),
-                        description: Some("Smart and precise coding agent".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.3-codex".to_string(),
-                        name: "GPT-5.3 Codex".to_string(),
-                        description: Some("Newest Codex coding model".to_string()),
-                    },
-                    // Additional OpenAI models
+                    // Only current models. OpenAI's ChatGPT-account Codex keeps
+                    // a small recent set, so the older codex variants (gpt-5-codex
+                    // … gpt-5.3-codex) and stale generics (gpt-5.1/5.2/5.3) were
+                    // removed — gpt-5.3-codex now 404s ("model not supported when
+                    // using Codex with a ChatGPT account"), and everything older
+                    // than it is dead too. Newest first.
                     ProviderModel {
                         id: "gpt-5.5".to_string(),
                         name: "GPT-5.5".to_string(),
@@ -639,24 +605,14 @@ fn default_providers_config() -> ProvidersConfig {
                         ),
                     },
                     ProviderModel {
+                        id: "gpt-5.5-codex".to_string(),
+                        name: "GPT-5.5 Codex".to_string(),
+                        description: Some("Latest Codex-optimized coding model".to_string()),
+                    },
+                    ProviderModel {
                         id: "gpt-5.4".to_string(),
                         name: "GPT-5.4".to_string(),
                         description: Some("Previous frontier coding model in Codex".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.3".to_string(),
-                        name: "GPT-5.3".to_string(),
-                        description: Some("General-purpose GPT-5.3".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.2".to_string(),
-                        name: "GPT-5.2".to_string(),
-                        description: Some("General-purpose GPT-5.2".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1".to_string(),
-                        name: "GPT-5.1".to_string(),
-                        description: Some("General-purpose GPT-5.1".to_string()),
                     },
                 ],
             },
