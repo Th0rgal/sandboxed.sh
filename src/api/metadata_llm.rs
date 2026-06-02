@@ -350,6 +350,9 @@ pub async fn build_assistant_llm_config(
                 api_key,
                 model: assistant_model,
                 api_format: ApiFormat::OpenAI,
+                // AskClient derives reasoning_effort from the model name itself,
+                // so the assistant config leaves this unset.
+                reasoning_effort: None,
             });
         }
     }
@@ -365,6 +368,9 @@ pub async fn build_assistant_llm_config(
                 api_key,
                 model: assistant_model,
                 api_format: ApiFormat::OpenAI,
+                // AskClient derives reasoning_effort from the model name itself,
+                // so the assistant config leaves this unset.
+                reasoning_effort: None,
             });
         }
     }
