@@ -308,10 +308,14 @@ pub async fn build_assistant_llm_config(
     use crate::ai_providers::ProviderType;
 
     // Precedence: explicit Settings override → ASK_ASSISTANT_MODEL env → default.
-    let assistant_model = model_override
-        .filter(|m| !m.trim().is_empty())
-        .or_else(|| std::env::var("ASK_ASSISTANT_MODEL").ok())
-        .filter(|m| !m.trim().is_empty())
+    // An explicit choice (Settings override → env) vs the built-in default.
+    let explicit_model = model_override.filter(|m| !m.trim().is_empty()).or_else(|| {
+        std::env::var("ASK_ASSISTANT_MODEL")
+            .ok()
+            .filter(|m| !m.trim().is_empty())
+    });
+    let assistant_model = explicit_model
+        .clone()
         .unwrap_or_else(|| "gpt-oss-120b".to_string());
 
     // Prefer Cerebras (fast + large context) for the assistant role.
@@ -348,9 +352,32 @@ pub async fn build_assistant_llm_config(
         }
     }
 
-    // Fallback: reuse the metadata ladder so Ask works with any provider.
+    // Fallback: reuse the metadata ladder so Ask still works without Cerebras.
     tracing::info!("[AskLLM] Cerebras unavailable; falling back to metadata provider ladder");
-    try_build_config_from_providers(ai_providers).await
+    let cfg = try_build_config_from_providers(ai_providers).await?;
+    // AskClient only speaks the OpenAI `/chat/completions` shape, so an
+    // Anthropic-format fallback would always fail at call time — treat it as
+    // "no assistant available" instead.
+    if cfg.api_format != ApiFormat::OpenAI {
+        tracing::warn!(
+            "[AskLLM] only an Anthropic-format provider is configured; Ask assistant is \
+             unavailable (needs an OpenAI-compatible provider such as Cerebras/OpenRouter/Groq)"
+        );
+        return None;
+    }
+    // The fallback provider serves its own model namespace, so we can't honor a
+    // Cerebras-specific override here — surface that rather than silently dropping it.
+    if let Some(model) = explicit_model {
+        if model != cfg.model {
+            tracing::warn!(
+                "[AskLLM] ignoring assistant model override '{}' — Cerebras unavailable; using \
+                 fallback provider's model '{}'",
+                model,
+                cfg.model
+            );
+        }
+    }
+    Some(cfg)
 }
 
 async fn try_build_config_from_providers(

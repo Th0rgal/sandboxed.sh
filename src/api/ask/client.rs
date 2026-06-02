@@ -13,7 +13,13 @@ use crate::api::metadata_llm::{ApiFormat, MetadataLlmConfig};
 /// (and token headroom) to return visible content on the OpenAI-compatible API.
 fn model_is_reasoning(model: &str) -> bool {
     let m = model.to_lowercase();
-    m.contains("gpt-oss") || m.contains("qwen") || m.contains("thinking") || m.contains("reasoning")
+    // Match only actual reasoning variants — not every Qwen model (e.g.
+    // qwen2.5-coder is NOT a reasoning model and rejects `reasoning_effort`).
+    m.contains("gpt-oss")
+        || m.contains("qwen3")
+        || m.contains("qwq")
+        || m.contains("thinking")
+        || m.contains("reasoning")
 }
 
 /// A tool call requested by the model.
