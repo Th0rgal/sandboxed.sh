@@ -504,7 +504,9 @@ const CONVERSATION_EVENT_TYPES = new Set([
 // cache path so a cache hit behaves like `getMissionSnapshot` — without it a
 // stale or oversized cached tail would be replayed in full (slow load) and the
 // recent-message anchoring would be bypassed.
-function anchorEventsToRecentConversation(events: StoredEvent[]): StoredEvent[] {
+function anchorEventsToRecentConversation(
+  events: StoredEvent[],
+): StoredEvent[] {
   // Anchor ONLY when at least N conversation messages exist, matching the
   // server: `nth_recent_event_sequence(N)` returns None below N, in which case
   // get_mission_snapshot falls back to the plain recent-events tail (no
@@ -6042,7 +6044,6 @@ export default function ControlClient() {
     [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder, setItems],
   );
 
-
   // Load mission from URL param on mount (and retry on auth success)
   const [authRetryTrigger, setAuthRetryTrigger] = useState(0);
 
@@ -10716,20 +10717,24 @@ export default function ControlClient() {
               )}
             </div>
 
-            {/* Auto-scroll pause chip */}
-            {!isAtBottom && items.length > 0 && (
-              <button
-                onClick={() => scrollToBottom()}
-                className="absolute bottom-20 right-6 inline-flex items-center gap-2 rounded-full border border-white/[0.12] bg-white/90 px-3 py-2 text-xs font-medium text-slate-700 shadow-lg backdrop-blur transition-all hover:bg-white hover:text-slate-950 dark:border-white/[0.1] dark:bg-black/70 dark:text-white/65 dark:hover:bg-white/[0.1] dark:hover:text-white/90"
-                title="Scroll to bottom"
-              >
-                <ArrowDown className="h-4 w-4" />
-                Auto-scroll paused
-              </button>
-            )}
-
             {/* Input */}
-            <div className="border-t border-white/[0.06] bg-white/[0.01] p-4">
+            <div className="relative border-t border-white/[0.06] bg-white/[0.01] p-4">
+              {/* Auto-scroll pause chip. Anchored to the composer with
+              `bottom-full` so it floats *just above* the input instead of
+              overlapping it — previously it sat at `bottom-20` with no z-index,
+              so it landed behind the textarea / queue / stop controls. `z-20`
+              keeps it above the scrolling messages without covering (and thus
+              blocking clicks on) the composer below. */}
+              {!isAtBottom && items.length > 0 && (
+                <button
+                  onClick={() => scrollToBottom()}
+                  className="absolute bottom-full right-6 z-20 mb-3 inline-flex items-center gap-2 rounded-full border border-white/[0.12] bg-white/90 px-3 py-2 text-xs font-medium text-slate-700 shadow-lg backdrop-blur transition-all hover:bg-white hover:text-slate-950 dark:border-white/[0.1] dark:bg-black/70 dark:text-white/65 dark:hover:bg-white/[0.1] dark:hover:text-white/90"
+                  title="Scroll to bottom"
+                >
+                  <ArrowDown className="h-4 w-4" />
+                  Auto-scroll paused
+                </button>
+              )}
               {/* Upload progress */}
               {uploadProgress && (
                 <div className="mx-auto max-w-3xl mb-3">
