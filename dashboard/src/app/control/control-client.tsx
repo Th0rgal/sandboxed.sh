@@ -505,17 +505,28 @@ const CONVERSATION_EVENT_TYPES = new Set([
 // stale or oversized cached tail would be replayed in full (slow load) and the
 // recent-message anchoring would be bypassed.
 function anchorEventsToRecentConversation(events: StoredEvent[]): StoredEvent[] {
+  // Anchor ONLY when at least N conversation messages exist, matching the
+  // server: `nth_recent_event_sequence(N)` returns None below N, in which case
+  // get_mission_snapshot falls back to the plain recent-events tail (no
+  // conversation trim). So set the anchor only on reaching the Nth-most-recent
+  // message; with fewer than N, leave `anchorIdx = -1` and keep everything
+  // (still bounded by the MAX cap below). Setting it on every message would
+  // drop any leading events before the oldest message and diverge from the
+  // backend for short (1–9 message) missions.
   let convoSeen = 0;
   let anchorIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
     if (CONVERSATION_EVENT_TYPES.has(events[i].event_type)) {
-      anchorIdx = i;
       convoSeen += 1;
-      if (convoSeen >= SNAPSHOT_CONVERSATIONAL_MESSAGES) break;
+      if (convoSeen >= SNAPSHOT_CONVERSATIONAL_MESSAGES) {
+        anchorIdx = i;
+        break;
+      }
     }
   }
-  // Fewer than N conversation messages → keep all (still capped below).
   let start = anchorIdx === -1 ? 0 : anchorIdx;
+  // Hard cap: never replay more than MAX events (mirrors the server's
+  // overflow fallback to the most-recent MAX).
   if (events.length - start > SNAPSHOT_MAX_EVENTS) {
     start = events.length - SNAPSHOT_MAX_EVENTS;
   }
