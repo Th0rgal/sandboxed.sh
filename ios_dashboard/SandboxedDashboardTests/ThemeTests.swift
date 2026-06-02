@@ -75,7 +75,10 @@ final class ThemeTests: XCTestCase {
     }
 
     func testStatusTypeIcons() {
-        // All status types should have an icon
+        // Every status must map to a Phosphor icon + weight. `phosphorIcon`
+        // replaced the old string `icon` property (Phosphor refactor); since
+        // it's a non-optional enum, exercising the full switch here is what
+        // guards against a missing/unhandled case.
         let statuses: [StatusType] = [
             .pending, .running, .active, .completed, .failed,
             .cancelled, .idle, .error, .connected, .disconnected,
@@ -83,7 +86,8 @@ final class ThemeTests: XCTestCase {
         ]
 
         for status in statuses {
-            XCTAssertFalse(status.icon.isEmpty, "Status \(status.label) should have an icon")
+            _ = status.phosphorIcon
+            _ = status.phosphorWeight
         }
     }
 

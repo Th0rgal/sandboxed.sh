@@ -152,6 +152,59 @@ final class NetworkResilienceTests: XCTestCase {
                        "idempotent: a fresh write after migration must not be touched again")
     }
 
+    /// Regression for the mission-staleness bug: a long catch-up gap (e.g. the
+    /// app away for days, the SSE stream not replaying missed events) must be
+    /// fully drained in one resume. The pre-fix logic fetched a single page, so
+    /// a backlog larger than one page left the conversation tail frozen on an
+    /// old message. `drainDelta` must page through the entire gap.
+    func testDeltaResumeDrainsEntireBacklogNotJustOnePage() async throws {
+        let pageLimit = 5000
+        let serverMax: Int64 = 16_001          // > 3 full pages
+        func makeEvent(_ seq: Int64) -> StoredEvent {
+            StoredEvent(id: seq, missionId: "m", sequence: seq, eventType: "assistant_message",
+                        timestamp: "t", eventId: nil, toolCallId: nil, toolName: nil,
+                        content: "c", metadata: [:])
+        }
+
+        var pageCalls = 0
+        let drain = await ControlView.drainDelta(
+            from: 0, pageLimit: pageLimit, maxPages: ControlView.deltaResumeMaxPages
+        ) { cursor in
+            pageCalls += 1
+            let start = cursor + 1
+            let end = min(cursor + Int64(pageLimit), serverMax)
+            guard start <= end else { return ([], serverMax) }
+            let events = (start...end).map { makeEvent($0) }
+            return (events, serverMax)
+        }
+
+        // Pre-fix behavior would stop after one page (5000 events). The drain
+        // must collect every event in the gap and advance the cursor to the max.
+        XCTAssertEqual(drain.events.count, Int(serverMax),
+                       "delta resume must drain the entire backlog, not a single page")
+        XCTAssertEqual(drain.finalCursor, serverMax,
+                       "cursor must advance to the server max after draining")
+        XCTAssertGreaterThanOrEqual(pageCalls, 4,
+                       "a >3-page backlog must require multiple page fetches")
+    }
+
+    /// A short first page (already caught up) must stop after one fetch and
+    /// advance the cursor to the server's max — even when the only events
+    /// returned are fewer than a page (or zero, when newer events are all
+    /// filtered-out types like tool calls).
+    func testDeltaResumeStopsWhenCaughtUp() async throws {
+        var pageCalls = 0
+        let drain = await ControlView.drainDelta(
+            from: 100, pageLimit: 5000, maxPages: 50
+        ) { _ in
+            pageCalls += 1
+            return ([], 137)   // no new conversation rows, but server advanced to 137
+        }
+        XCTAssertEqual(pageCalls, 1, "an empty/short page means caught up; stop immediately")
+        XCTAssertEqual(drain.finalCursor, 137, "cursor advances past filtered-only gap to server max")
+        XCTAssertTrue(drain.events.isEmpty)
+    }
+
     private func apiServiceSource() throws -> String {
         let testFile = URL(fileURLWithPath: #filePath)
         let apiService = testFile
