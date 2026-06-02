@@ -7,7 +7,6 @@ import {
   Plus,
   Trash2,
   Send,
-  Loader,
   ChevronDown,
   CornerUpLeft,
   Terminal,
@@ -214,10 +213,10 @@ export function AskPanel({
                 : "Run in an isolated copy of the workspace (git only)"
             }
             className={cn(
-              "rounded-md border p-1 transition-colors",
+              "rounded-lg border p-1.5 transition-all active:scale-95",
               sandbox
                 ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
-                : "border-white/[0.06] bg-white/[0.02] text-white/40 hover:bg-white/[0.04]",
+                : "border-white/[0.06] bg-white/[0.02] text-white/40 hover:bg-white/[0.05] hover:text-white/70",
             )}
           >
             <FlaskConical className="h-3.5 w-3.5" />
@@ -226,15 +225,26 @@ export function AskPanel({
             type="button"
             onClick={() => setShowThreadList((v) => !v)}
             title="Threads"
-            className="flex items-center gap-1 rounded-md border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-[11px] text-white/60 hover:bg-white/[0.04]"
+            className={cn(
+              "flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] tabular-nums transition-all active:scale-95",
+              showThreadList
+                ? "border-sky-500/30 bg-sky-500/10 text-sky-200"
+                : "border-white/[0.06] bg-white/[0.02] text-white/60 hover:bg-white/[0.05]",
+            )}
           >
-            {threads.length} <ChevronDown className="h-3 w-3" />
+            {threads.length}
+            <ChevronDown
+              className={cn(
+                "h-3 w-3 transition-transform",
+                showThreadList && "rotate-180",
+              )}
+            />
           </button>
           <button
             type="button"
             onClick={newThread}
             title="New thread"
-            className="rounded-md border border-white/[0.06] bg-white/[0.02] p-1 text-white/60 hover:bg-white/[0.04]"
+            className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-1.5 text-white/60 transition-all hover:bg-white/[0.05] hover:text-white/80 active:scale-95"
           >
             <Plus className="h-3.5 w-3.5" />
           </button>
@@ -242,7 +252,7 @@ export function AskPanel({
             type="button"
             onClick={clearActive}
             title="Clear / delete thread"
-            className="rounded-md border border-white/[0.06] bg-white/[0.02] p-1 text-white/60 hover:bg-red-500/10 hover:text-red-300"
+            className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-1.5 text-white/60 transition-all hover:bg-red-500/10 hover:text-red-300 active:scale-95"
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
@@ -250,7 +260,7 @@ export function AskPanel({
             type="button"
             onClick={onClose}
             title="Close"
-            className="rounded-md border border-white/[0.06] bg-white/[0.02] p-1 text-white/60 hover:bg-white/[0.04]"
+            className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-1.5 text-white/60 transition-all hover:bg-white/[0.05] hover:text-white/80 active:scale-95"
           >
             <X className="h-3.5 w-3.5" />
           </button>
@@ -287,22 +297,38 @@ export function AskPanel({
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-3">
         {messages.length === 0 && !loading && (
-          <div className="mt-8 text-center text-[12px] text-white/30">
-            <Sparkles className="mx-auto mb-2 h-5 w-5 text-sky-400/40" />
-            Ask about this mission — what it&apos;s doing, why, or inspect the
-            workspace. The working agent is never interrupted.
+          <div className="mx-auto mt-10 flex max-w-[15rem] flex-col items-center text-center">
+            <div className="mb-3 flex h-9 w-9 items-center justify-center rounded-xl bg-sky-500/10 ring-1 ring-inset ring-sky-400/20">
+              <Sparkles className="h-4 w-4 text-sky-300/70" />
+            </div>
+            <p className="text-[13px] font-medium text-white/70">
+              Ask about this mission
+            </p>
+            <p className="mt-1 text-[11.5px] leading-relaxed text-white/35">
+              What it&apos;s doing, why, or inspect the workspace. The working
+              agent is never interrupted.
+            </p>
           </div>
         )}
         {messages.map((m) => (
           <AskBubble key={m.id} message={m} onSendToAgent={onSendToAgent} />
         ))}
         {loading && (
-          <div className="flex items-center gap-2 text-[12px] text-sky-300/70">
-            <Loader className="h-3.5 w-3.5 animate-spin" /> thinking…
+          <div className="flex items-center gap-2 pl-1 text-[12px] text-sky-300/70">
+            <span className="flex gap-1" aria-hidden>
+              {[0, 150, 300].map((delay) => (
+                <span
+                  key={delay}
+                  className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-300/70"
+                  style={{ animationDelay: `${delay}ms` }}
+                />
+              ))}
+            </span>
+            thinking
           </div>
         )}
         {error && (
-          <div className="rounded-md border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-[11px] text-red-300">
+          <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-red-300">
             {error}
           </div>
         )}
@@ -328,7 +354,7 @@ export function AskPanel({
             type="button"
             onClick={() => void send()}
             disabled={loading || !input.trim()}
-            className="rounded-lg bg-sky-500/15 p-1.5 text-sky-300 transition-colors hover:bg-sky-500/25 disabled:opacity-30"
+            className="rounded-lg bg-sky-500/15 p-1.5 text-sky-300 transition-all hover:bg-sky-500/25 active:scale-95 disabled:opacity-30 disabled:active:scale-100"
           >
             <Send className="h-4 w-4" />
           </button>
@@ -382,17 +408,17 @@ function AskBubble({
   // assistant
   return (
     <div className="flex justify-start gap-2">
-      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-sky-500/15">
+      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-sky-500/15 ring-1 ring-inset ring-sky-400/20">
         <Sparkles className="h-3.5 w-3.5 text-sky-300" />
       </div>
-      <div className="group max-w-[85%] rounded-2xl rounded-tl-md border border-sky-500/10 bg-sky-500/[0.04] px-3 py-2">
+      <div className="group max-w-[85%] rounded-2xl rounded-tl-md border border-sky-500/10 bg-sky-500/[0.04] px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
         <LazyMarkdownContent content={content} className="text-sm" />
         {onSendToAgent && (
           <button
             type="button"
             onClick={() => onSendToAgent(content)}
             title="Send to the working agent's composer"
-            className="mt-1.5 inline-flex items-center gap-1 text-[10px] text-white/30 opacity-0 transition-opacity hover:text-sky-300 group-hover:opacity-100"
+            className="mt-1.5 inline-flex items-center gap-1 text-[10px] text-white/30 opacity-0 transition-all hover:text-sky-300 active:scale-95 group-hover:opacity-100"
           >
             <CornerUpLeft className="h-3 w-3" /> Send to agent
           </button>
