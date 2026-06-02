@@ -17,7 +17,7 @@ pub mod http;
 pub mod store;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -63,6 +63,9 @@ pub struct AskTurn {
     pub llm: AskClient,
     pub mission_id: Uuid,
     pub thread_id: Uuid,
+    /// When true, `work_dir` is an isolated sandbox copy of the workspace, so
+    /// writes are throwaway and we skip the operator-note bridge entirely.
+    pub sandbox: bool,
 }
 
 /// Run one Ask turn: persist the operator message, drive the tool loop, persist
@@ -277,8 +280,12 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
             if cmd.trim().is_empty() {
                 return "Error: empty command".to_string();
             }
-            // Snapshot the working tree before/after so we can report any
-            // out-of-band writes to the working agent (the operator-note bridge).
+            // In sandbox mode the writes land in a throwaway copy, so there's
+            // nothing to report to the working agent. Otherwise snapshot the
+            // working tree before/after for the operator-note bridge.
+            if turn.sandbox {
+                return run_bash(turn, &cmd).await;
+            }
             let baseline = capture_write_baseline(turn).await;
             let result = run_bash(turn, &cmd).await;
             record_writes(turn, &cmd, baseline).await;
@@ -502,6 +509,54 @@ pub async fn prepend_pending_operator_notes(
     block.push_str("</operator-note>\n\n");
     block.push_str(&user_message);
     (block, count)
+}
+
+/// Prepare an isolated sandbox copy of the workspace for "Ask in isolated copy"
+/// mode, using a detached git worktree (cheap, shares history, no full copy).
+/// Returns the sandbox path, or `None` if the workspace isn't a git repo (we
+/// deliberately do NOT `cp -a` a possibly-huge non-git tree). The caller treats
+/// `None` for an explicit sandbox request as an error rather than silently
+/// running against the live tree.
+pub async fn prepare_sandbox(exec: &WorkspaceExec, base_work_dir: &Path) -> Option<PathBuf> {
+    let sandbox = PathBuf::from(format!("/tmp/ask-sandbox-{}", Uuid::new_v4()));
+    let base_str = base_work_dir.to_string_lossy().to_string();
+    let sandbox_str = sandbox.to_string_lossy().to_string();
+    let cmd = format!(
+        "git -C {b} rev-parse --git-dir >/dev/null 2>&1 && \
+         git -C {b} worktree add --detach {s} HEAD >/dev/null 2>&1 && \
+         echo SANDBOX_OK",
+        b = single_quote(&base_str),
+        s = single_quote(&sandbox_str)
+    );
+    let args = vec!["-lc".to_string(), cmd];
+    match exec
+        .output(base_work_dir, "/bin/bash", &args, HashMap::new())
+        .await
+    {
+        Ok(out)
+            if out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("SANDBOX_OK") =>
+        {
+            Some(sandbox)
+        }
+        _ => None,
+    }
+}
+
+/// Tear down a sandbox created by [`prepare_sandbox`]. Best-effort: removes the
+/// git worktree if it is one, otherwise `rm -rf`s the copy.
+pub async fn cleanup_sandbox(exec: &WorkspaceExec, base_work_dir: &Path, sandbox: &Path) {
+    let base_str = base_work_dir.to_string_lossy().to_string();
+    let sandbox_str = sandbox.to_string_lossy().to_string();
+    let cmd = format!(
+        "git -C {b} worktree remove --force {s} 2>/dev/null || rm -rf {s}",
+        b = single_quote(&base_str),
+        s = single_quote(&sandbox_str)
+    );
+    let args = vec!["-lc".to_string(), cmd];
+    let _ = exec
+        .output(base_work_dir, "/bin/bash", &args, HashMap::new())
+        .await;
 }
 
 fn single_quote(s: &str) -> String {

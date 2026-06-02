@@ -42,6 +42,10 @@ pub struct AskSendRequest {
     #[serde(default)]
     pub thread_id: Option<Uuid>,
     pub content: String,
+    /// Run the Ask bash tool in an isolated copy of the workspace (git worktree
+    /// or temp copy) so writes never touch the live tree. Opt-in.
+    #[serde(default)]
+    pub sandbox: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,11 +124,28 @@ pub async fn ask_send(
         Some(mission.workspace_id),
     )
     .await;
-    let work_dir = mission
+    let base_work_dir = mission
         .working_directory
         .as_ref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| workspace.path.clone());
+
+    // Optional sandbox-copy isolation: writes go to a throwaway worktree/copy.
+    let setup_exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
+    let sandbox_dir = if req.sandbox {
+        super::prepare_sandbox(&setup_exec, &base_work_dir).await
+    } else {
+        None
+    };
+    if req.sandbox && sandbox_dir.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Sandbox mode requires a git workspace (no isolated worktree could be created)"
+                .to_string(),
+        ));
+    }
+    let used_sandbox = sandbox_dir.is_some();
+    let work_dir = sandbox_dir.clone().unwrap_or_else(|| base_work_dir.clone());
 
     let turn = AskTurn {
         ask_store: Arc::clone(&ask_store),
@@ -134,9 +155,16 @@ pub async fn ask_send(
         llm: AskClient::new(state.http_client.clone(), cfg),
         mission_id,
         thread_id: thread.id,
+        sandbox: used_sandbox,
     };
 
-    let answer = run_ask_turn(&turn, &req.content).await.map_err(internal)?;
+    let answer_result = run_ask_turn(&turn, &req.content).await;
+
+    // Tear down the sandbox regardless of how the turn ended.
+    if let Some(dir) = &sandbox_dir {
+        super::cleanup_sandbox(&setup_exec, &base_work_dir, dir).await;
+    }
+    let answer = answer_result.map_err(internal)?;
 
     // Auto-title a freshly created thread from the operator's first message.
     if is_new_thread {

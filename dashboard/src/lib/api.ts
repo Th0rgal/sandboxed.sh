@@ -522,15 +522,23 @@ export interface AskSendResponse {
   messages: AskMessage[];
 }
 
-/** Send a question to the Ask assistant for a mission (creates a thread if none). */
+/** Send a question to the Ask assistant for a mission (creates a thread if none).
+ * When `sandbox` is true, the Ask bash tool runs in an isolated git worktree so
+ * its writes never touch the live workspace. */
 export async function askSend(
   missionId: string,
   content: string,
   threadId?: string,
+  sandbox?: boolean,
 ): Promise<AskSendResponse> {
+  const body: { content: string; thread_id?: string; sandbox?: boolean } = {
+    content,
+  };
+  if (threadId) body.thread_id = threadId;
+  if (sandbox) body.sandbox = true;
   return apiPost<AskSendResponse>(
     `/api/control/missions/${missionId}/ask`,
-    threadId ? { content, thread_id: threadId } : { content },
+    body,
     "Failed to ask the assistant",
   );
 }

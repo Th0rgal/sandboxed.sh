@@ -12,6 +12,7 @@ import {
   CornerUpLeft,
   Terminal,
   User,
+  FlaskConical,
 } from "lucide-react";
 
 import {
@@ -58,6 +59,7 @@ export function AskPanel({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showThreadList, setShowThreadList] = useState(false);
+  const [sandbox, setSandbox] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -156,7 +158,12 @@ export function AskPanel({
     ]);
 
     try {
-      const res = await askSend(missionId, content, threadId ?? undefined);
+      const res = await askSend(
+        missionId,
+        content,
+        threadId ?? undefined,
+        sandbox,
+      );
       setThreadId(res.thread_id);
       setMessages(res.messages);
       void refreshThreads();
@@ -168,7 +175,7 @@ export function AskPanel({
     } finally {
       setLoading(false);
     }
-  }, [input, loading, missionId, threadId, refreshThreads]);
+  }, [input, loading, missionId, threadId, sandbox, refreshThreads]);
 
   const clearActive = useCallback(async () => {
     if (!threadId) {
@@ -198,6 +205,23 @@ export function AskPanel({
           </span>
         </div>
         <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setSandbox((v) => !v)}
+            title={
+              sandbox
+                ? "Isolated copy: writes go to a throwaway git worktree"
+                : "Run in an isolated copy of the workspace (git only)"
+            }
+            className={cn(
+              "rounded-md border p-1 transition-colors",
+              sandbox
+                ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
+                : "border-white/[0.06] bg-white/[0.02] text-white/40 hover:bg-white/[0.04]",
+            )}
+          >
+            <FlaskConical className="h-3.5 w-3.5" />
+          </button>
           <button
             type="button"
             onClick={() => setShowThreadList((v) => !v)}
