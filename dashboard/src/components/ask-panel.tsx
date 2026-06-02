@@ -1,0 +1,371 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Sparkles,
+  X,
+  Plus,
+  Trash2,
+  Send,
+  Loader,
+  ChevronDown,
+  CornerUpLeft,
+  Terminal,
+  User,
+} from "lucide-react";
+
+import {
+  askSend,
+  listAskThreads,
+  getAskThread,
+  deleteAskThread,
+  type AskThread,
+  type AskMessage,
+} from "@/lib/api";
+import { LazyMarkdownContent } from "@/components/markdown-content";
+import { cn } from "@/lib/utils";
+
+interface AskPanelProps {
+  missionId: string;
+  onClose: () => void;
+  /** Drop a piece of an Ask answer into the real mission composer. */
+  onSendToAgent?: (text: string) => void;
+}
+
+/**
+ * Ask panel — the web surface for the non-interrupting sidecar co-pilot.
+ *
+ * Runs in its own lane: it never touches the mission's queue or the working
+ * agent. Its conversation lives in a separate store (`ask_threads`/`ask_messages`)
+ * and is rendered here with a distinct "co-pilot" identity (cyan/sky), separate
+ * from the mission's indigo agent bubbles.
+ */
+export function AskPanel({ missionId, onClose, onSendToAgent }: AskPanelProps) {
+  const [threads, setThreads] = useState<AskThread[]>([]);
+  const [threadId, setThreadId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<AskMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [showThreadList, setShowThreadList] = useState(false);
+
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  const refreshThreads = useCallback(async () => {
+    try {
+      const t = await listAskThreads(missionId);
+      setThreads(t);
+      return t;
+    } catch {
+      return [];
+    }
+  }, [missionId]);
+
+  // On mission change: load threads and open the most recent (if any).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const t = await refreshThreads();
+      if (cancelled) return;
+      if (t.length > 0) {
+        setThreadId(t[0].id);
+        try {
+          const detail = await getAskThread(missionId, t[0].id);
+          if (!cancelled) setMessages(detail.messages ?? []);
+        } catch {
+          /* ignore */
+        }
+      } else {
+        setThreadId(null);
+        setMessages([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [missionId, refreshThreads]);
+
+  // Auto-scroll on new messages.
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [messages, loading]);
+
+  const selectThread = useCallback(
+    async (id: string) => {
+      setShowThreadList(false);
+      setThreadId(id);
+      setMessages([]);
+      try {
+        const detail = await getAskThread(missionId, id);
+        setMessages(detail.messages ?? []);
+      } catch {
+        setMessages([]);
+      }
+    },
+    [missionId],
+  );
+
+  const newThread = useCallback(() => {
+    setShowThreadList(false);
+    setThreadId(null);
+    setMessages([]);
+    setInput("");
+  }, []);
+
+  const send = useCallback(async () => {
+    const content = input.trim();
+    if (!content || loading) return;
+    setInput("");
+    setError(null);
+    setLoading(true);
+
+    // Optimistic user bubble.
+    const tempId = `temp-${Date.now()}`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: tempId,
+        thread_id: threadId ?? "",
+        seq: prev.length + 1,
+        role: "user",
+        content,
+        created_at: new Date().toISOString(),
+      },
+    ]);
+
+    try {
+      const res = await askSend(missionId, content, threadId ?? undefined);
+      setThreadId(res.thread_id);
+      setMessages(res.messages);
+      void refreshThreads();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Ask failed");
+      // Roll back the optimistic bubble.
+      setMessages((prev) => prev.filter((m) => m.id !== tempId));
+      setInput(content);
+    } finally {
+      setLoading(false);
+    }
+  }, [input, loading, missionId, threadId, refreshThreads]);
+
+  const clearActive = useCallback(async () => {
+    if (!threadId) {
+      newThread();
+      return;
+    }
+    try {
+      await deleteAskThread(missionId, threadId);
+    } catch {
+      /* ignore */
+    }
+    await refreshThreads();
+    newThread();
+  }, [missionId, threadId, refreshThreads, newThread]);
+
+  return (
+    <div className="flex h-full w-[380px] shrink-0 flex-col rounded-2xl border border-sky-500/15 bg-sky-500/[0.03] backdrop-blur-sm">
+      {/* Header */}
+      <div className="flex items-center justify-between gap-2 border-b border-white/[0.06] px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-sky-500/15">
+            <Sparkles className="h-3.5 w-3.5 text-sky-300" />
+          </div>
+          <span className="text-sm font-medium text-sky-100">Ask</span>
+          <span className="rounded bg-white/[0.04] px-1.5 py-0.5 text-[10px] text-white/40">
+            co-pilot
+          </span>
+        </div>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setShowThreadList((v) => !v)}
+            title="Threads"
+            className="flex items-center gap-1 rounded-md border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-[11px] text-white/60 hover:bg-white/[0.04]"
+          >
+            {threads.length} <ChevronDown className="h-3 w-3" />
+          </button>
+          <button
+            type="button"
+            onClick={newThread}
+            title="New thread"
+            className="rounded-md border border-white/[0.06] bg-white/[0.02] p-1 text-white/60 hover:bg-white/[0.04]"
+          >
+            <Plus className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={clearActive}
+            title="Clear / delete thread"
+            className="rounded-md border border-white/[0.06] bg-white/[0.02] p-1 text-white/60 hover:bg-red-500/10 hover:text-red-300"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            title="Close"
+            className="rounded-md border border-white/[0.06] bg-white/[0.02] p-1 text-white/60 hover:bg-white/[0.04]"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Thread switcher */}
+      {showThreadList && (
+        <div className="max-h-48 overflow-y-auto border-b border-white/[0.06] bg-black/20 p-1.5">
+          {threads.length === 0 && (
+            <p className="px-2 py-1.5 text-[11px] text-white/30">No threads yet.</p>
+          )}
+          {threads.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => selectThread(t.id)}
+              className={cn(
+                "block w-full truncate rounded-md px-2 py-1.5 text-left text-[11px] transition-colors",
+                t.id === threadId
+                  ? "bg-sky-500/10 text-sky-200"
+                  : "text-white/60 hover:bg-white/[0.04]",
+              )}
+            >
+              {t.title || "Untitled thread"}
+              <span className="ml-1 text-white/25">
+                {new Date(t.updated_at).toLocaleTimeString()}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Messages */}
+      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-3">
+        {messages.length === 0 && !loading && (
+          <div className="mt-8 text-center text-[12px] text-white/30">
+            <Sparkles className="mx-auto mb-2 h-5 w-5 text-sky-400/40" />
+            Ask about this mission — what it&apos;s doing, why, or inspect the
+            workspace. The working agent is never interrupted.
+          </div>
+        )}
+        {messages.map((m) => (
+          <AskBubble key={m.id} message={m} onSendToAgent={onSendToAgent} />
+        ))}
+        {loading && (
+          <div className="flex items-center gap-2 text-[12px] text-sky-300/70">
+            <Loader className="h-3.5 w-3.5 animate-spin" /> thinking…
+          </div>
+        )}
+        {error && (
+          <div className="rounded-md border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-[11px] text-red-300">
+            {error}
+          </div>
+        )}
+      </div>
+
+      {/* Composer */}
+      <div className="border-t border-white/[0.06] p-2.5">
+        <div className="flex items-end gap-2 rounded-xl border border-white/[0.08] bg-white/[0.02] px-2.5 py-1.5 focus-within:border-sky-500/30">
+          <textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+            rows={1}
+            placeholder="Ask the co-pilot…"
+            className="max-h-32 min-h-[24px] flex-1 resize-none bg-transparent text-sm text-white/90 placeholder:text-white/30 focus:outline-none"
+          />
+          <button
+            type="button"
+            onClick={() => void send()}
+            disabled={loading || !input.trim()}
+            className="rounded-lg bg-sky-500/15 p-1.5 text-sky-300 transition-colors hover:bg-sky-500/25 disabled:opacity-30"
+          >
+            <Send className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AskBubble({
+  message,
+  onSendToAgent,
+}: {
+  message: AskMessage;
+  onSendToAgent?: (text: string) => void;
+}) {
+  const { role, content } = message;
+
+  if (role === "user") {
+    return (
+      <div className="flex justify-end gap-2">
+        <div className="max-w-[85%] rounded-2xl rounded-tr-md bg-white/[0.06] px-3 py-2">
+          <p className="whitespace-pre-wrap break-words text-sm text-white/90">
+            {content}
+          </p>
+        </div>
+        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white/[0.06]">
+          <User className="h-3.5 w-3.5 text-white/50" />
+        </div>
+      </div>
+    );
+  }
+
+  if (role === "tool_call" || role === "tool_result") {
+    const isCall = role === "tool_call";
+    return (
+      <div className="ml-8 flex items-start gap-1.5 text-[11px] text-white/40">
+        <Terminal className="mt-0.5 h-3 w-3 shrink-0 text-white/30" />
+        <div className="min-w-0 flex-1">
+          <span className="text-white/30">
+            {isCall ? `${message.tool_name ?? "tool"} →` : "↳"}
+          </span>{" "}
+          <span className="break-words font-mono">
+            {truncate(isCall ? extractCommand(content) : content, 240)}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  // assistant
+  return (
+    <div className="flex justify-start gap-2">
+      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-sky-500/15">
+        <Sparkles className="h-3.5 w-3.5 text-sky-300" />
+      </div>
+      <div className="group max-w-[85%] rounded-2xl rounded-tl-md border border-sky-500/10 bg-sky-500/[0.04] px-3 py-2">
+        <LazyMarkdownContent content={content} className="text-sm" />
+        {onSendToAgent && (
+          <button
+            type="button"
+            onClick={() => onSendToAgent(content)}
+            title="Send to the working agent's composer"
+            className="mt-1.5 inline-flex items-center gap-1 text-[10px] text-white/30 opacity-0 transition-opacity hover:text-sky-300 group-hover:opacity-100"
+          >
+            <CornerUpLeft className="h-3 w-3" /> Send to agent
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function extractCommand(toolCallJson: string): string {
+  try {
+    const parsed = JSON.parse(toolCallJson);
+    return parsed.command ?? parsed.path ?? toolCallJson;
+  } catch {
+    return toolCallJson;
+  }
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}

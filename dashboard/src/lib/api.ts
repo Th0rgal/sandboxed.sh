@@ -492,6 +492,76 @@ export async function clearQueue(): Promise<{ cleared: number }> {
   return apiDel("/api/control/queue", "Failed to clear queue");
 }
 
+// ── Ask assistant (non-interrupting sidecar co-pilot) ──────────────────────
+
+export interface AskThread {
+  id: string;
+  mission_id: string;
+  title: string | null;
+  model: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AskMessage {
+  id: string;
+  thread_id: string;
+  seq: number;
+  /** "user" | "assistant" | "tool_call" | "tool_result" */
+  role: string;
+  content: string;
+  tool_name?: string | null;
+  tool_call_id?: string | null;
+  metadata?: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface AskSendResponse {
+  thread_id: string;
+  answer: string;
+  messages: AskMessage[];
+}
+
+/** Send a question to the Ask assistant for a mission (creates a thread if none). */
+export async function askSend(
+  missionId: string,
+  content: string,
+  threadId?: string,
+): Promise<AskSendResponse> {
+  return apiPost<AskSendResponse>(
+    `/api/control/missions/${missionId}/ask`,
+    threadId ? { content, thread_id: threadId } : { content },
+    "Failed to ask the assistant",
+  );
+}
+
+export async function listAskThreads(missionId: string): Promise<AskThread[]> {
+  return apiGet<AskThread[]>(
+    `/api/control/missions/${missionId}/ask/threads`,
+    "Failed to list Ask threads",
+  );
+}
+
+export async function getAskThread(
+  missionId: string,
+  threadId: string,
+): Promise<{ messages: AskMessage[] } & AskThread> {
+  return apiGet(
+    `/api/control/missions/${missionId}/ask/threads/${threadId}`,
+    "Failed to load Ask thread",
+  );
+}
+
+export async function deleteAskThread(
+  missionId: string,
+  threadId: string,
+): Promise<void> {
+  return apiDel(
+    `/api/control/missions/${missionId}/ask/threads/${threadId}`,
+    "Failed to delete Ask thread",
+  );
+}
+
 // Agent tree snapshot (for refresh resilience)
 export interface AgentTreeNode {
   id: string;
