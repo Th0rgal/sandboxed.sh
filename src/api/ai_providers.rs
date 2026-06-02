@@ -5842,11 +5842,63 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
 }
 
 /// GET /api/ai/providers - List all providers.
+/// Reconcile the stored xAI OAuth token from the Grok CLI's own auth file.
+///
+/// The Grok Build CLI refreshes `~/.grok/auth.json` on its own schedule. When
+/// it does, sandboxed's stored copy goes stale and the dashboard wrongly shows
+/// the xAI provider as "needs reauth" (NeedsReauth keys off the stored
+/// `expires_at`) even though the CLI's token is still valid. Adopt the CLI's
+/// token whenever it is fresher so the dashboard reflects reality and later
+/// runs reuse the freshest credential.
+pub async fn reconcile_xai_store_from_grok_cli(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+) {
+    let Some(entry) = read_grok_auth_entry() else {
+        return;
+    };
+    let access = entry
+        .get("key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let refresh = entry
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let (Some(access), Some(refresh)) = (access, refresh) else {
+        return;
+    };
+    let cli_expires_at = grok_auth_expires_at_millis(&entry);
+    for account in ai_providers.get_all_by_type(ProviderType::Xai).await {
+        if !account.has_oauth() {
+            continue;
+        }
+        let stored_expires = account.oauth.as_ref().map(|o| o.expires_at).unwrap_or(0);
+        if cli_expires_at > stored_expires {
+            let mut updated = account.clone();
+            updated.oauth = Some(crate::ai_providers::OAuthCredentials {
+                access_token: access.to_string(),
+                refresh_token: refresh.to_string(),
+                expires_at: cli_expires_at,
+            });
+            ai_providers.update(account.id, updated).await;
+            tracing::info!(
+                account_id = %account.id,
+                cli_expires_at,
+                "Reconciled xAI OAuth token from Grok CLI auth file"
+            );
+        }
+    }
+}
+
 async fn list_providers(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<Vec<ProviderResponse>>, (StatusCode, String)> {
     // Migrate any standard providers from opencode.json to the store on first call
     migrate_opencode_providers_to_store(&state.ai_providers, &state.config.working_dir).await;
+
+    // Keep the xAI provider's stored token in sync with the Grok CLI's own
+    // refreshed auth file so it doesn't show a false "needs reauth".
+    reconcile_xai_store_from_grok_cli(&state.ai_providers).await;
 
     // All providers live in AIProviderStore now
     let store_providers = state.ai_providers.list().await;

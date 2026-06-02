@@ -2353,10 +2353,20 @@ pub(crate) fn resolve_gemini_default_model() -> String {
 /// grok missions from inheriting the global `DEFAULT_MODEL`
 /// (e.g. `anthropic/claude-opus-4-6`) which grok rejects as "unknown model id".
 pub(crate) fn resolve_grok_default_model() -> String {
-    // Grok Build CLI currently advertises this coding model alias. xAI API
-    // model IDs live in the provider catalog instead:
-    // https://docs.x.ai/docs/models
-    "grok-build".to_string()
+    // Allow ops to override without a rebuild (e.g. when xAI renames the coding
+    // model again).
+    if let Ok(model) = std::env::var("GROK_DEFAULT_MODEL") {
+        let trimmed = model.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    // The Grok Build CLI's coding model id. NOTE: the bare `grok-build` alias is
+    // rejected by current CLIs ("unknown model id"); `grok models` lists
+    // `grok-build-0.1`. Passing an invalid id makes the very first turn fail, so
+    // keep this in sync with the CLI. xAI *API* model IDs (for the API-key
+    // provider catalog) live separately: https://docs.x.ai/docs/models
+    "grok-build-0.1".to_string()
 }
 
 async fn close_mission_desktop_sessions(

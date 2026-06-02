@@ -12332,6 +12332,17 @@ fn merge_stream_fragment(buffer: &mut String, fragment: &str) {
     buffer.push_str(&fragment[overlap..]);
 }
 
+/// Detect the Grok CLI's interactive sign-in prompt. The CLI prints these to
+/// stderr when it can't authenticate non-interactively, then blocks on a local
+/// OAuth callback that never arrives in a headless mission. Matching any of
+/// these lets the runner fail fast instead of hanging.
+fn grok_line_requests_interactive_login(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("signing in with grok")
+        || lower.contains("open this url to sign in")
+        || lower.contains("oauth2/authorize")
+}
+
 /// Execute a turn using the Grok Build CLI backend.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_grok_turn(
@@ -12385,6 +12396,12 @@ pub async fn run_grok_turn(
         args.push(model.to_string());
     }
 
+    // The Grok CLI authenticates non-interactively via the XAI_API_KEY env var.
+    // The xAI OAuth access token works as a bearer key against api.x.ai, so we
+    // capture the freshest one here and inject it below. Without it the CLI
+    // falls back to an interactive browser sign-in that never completes in a
+    // headless mission — the run then hangs forever ("Agent is working").
+    let mut oauth_access_token: Option<String> = None;
     if let Some(entry) =
         crate::api::ai_providers::read_oauth_token_entry(crate::ai_providers::ProviderType::Xai)
     {
@@ -12395,7 +12412,8 @@ pub async fn run_grok_turn(
             )
             .await
             {
-                Ok((_access, _refresh, expires_at)) => {
+                Ok((access, _refresh, expires_at)) => {
+                    oauth_access_token = Some(access);
                     tracing::info!(
                         mission_id = %mission_id,
                         expires_at,
@@ -12423,16 +12441,19 @@ pub async fn run_grok_turn(
                     .with_terminal_reason(TerminalReason::LlmError);
                 }
             }
-        } else if let Err(err) = crate::api::ai_providers::write_grok_oauth_auth_file(
-            &entry.refresh_token,
-            &entry.access_token,
-            entry.expires_at,
-        ) {
-            tracing::warn!(
-                mission_id = %mission_id,
-                error = %err,
-                "Failed to materialize fresh xAI OAuth token into Grok auth file"
-            );
+        } else {
+            oauth_access_token = Some(entry.access_token.clone());
+            if let Err(err) = crate::api::ai_providers::write_grok_oauth_auth_file(
+                &entry.refresh_token,
+                &entry.access_token,
+                entry.expires_at,
+            ) {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    error = %err,
+                    "Failed to materialize fresh xAI OAuth token into Grok auth file"
+                );
+            }
         }
     }
 
@@ -12440,17 +12461,29 @@ pub async fn run_grok_turn(
         tracing::warn!(mission_id = %mission_id, error = %err, "Failed to sync Grok OAuth auth file");
     }
 
+    // Authenticate the Grok CLI non-interactively via XAI_API_KEY. Priority:
+    // an explicit xAI API key, then the captured OAuth access token, then any
+    // ambient env key. Setting this is what prevents the interactive-sign-in
+    // hang; the CLI prints "You are using XAI_API_KEY" and goes straight to
+    // api.x.ai.
     let mut env = HashMap::new();
-    if let Some(key) = crate::api::ai_providers::get_xai_api_key_for_grok(app_working_dir) {
+    let xai_api_key = crate::api::ai_providers::get_xai_api_key_for_grok(app_working_dir)
+        .or_else(|| oauth_access_token.clone())
+        .or_else(|| {
+            std::env::var("XAI_API_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("GROK_CODE_XAI_API_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty())
+        });
+    if let Some(key) = xai_api_key {
+        // Newer Grok CLIs read XAI_API_KEY; keep GROK_CODE_XAI_API_KEY for
+        // backward compatibility with older builds.
+        env.insert("XAI_API_KEY".to_string(), key.clone());
         env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
-    } else if let Ok(key) = std::env::var("GROK_CODE_XAI_API_KEY") {
-        if !key.trim().is_empty() {
-            env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
-        }
-    } else if let Ok(key) = std::env::var("XAI_API_KEY") {
-        if !key.trim().is_empty() {
-            env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
-        }
     }
 
     let mut child = match workspace_exec
@@ -12475,6 +12508,11 @@ pub async fn run_grok_turn(
     let stderr = child.stderr.take();
     let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
     let stderr_capture_clone = stderr_capture.clone();
+    // The Grok CLI prints its interactive sign-in prompt to STDERR, then blocks
+    // on a local OAuth callback. Watch for it here and signal the main loop to
+    // abort so the mission fails fast instead of hanging forever.
+    let auth_fail = CancellationToken::new();
+    let auth_fail_signal = auth_fail.clone();
     let mut stderr_handle = stderr.map(|stderr| {
         tokio::spawn(async move {
             let reader = BufReader::new(stderr);
@@ -12483,6 +12521,9 @@ pub async fn run_grok_turn(
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
+                }
+                if grok_line_requests_interactive_login(trimmed) {
+                    auth_fail_signal.cancel();
                 }
                 let mut captured = stderr_capture_clone.lock().await;
                 if !captured.is_empty() {
@@ -12520,11 +12561,41 @@ pub async fn run_grok_turn(
                 cancelled = true;
                 break;
             }
+            _ = auth_fail.cancelled() => {
+                // Grok CLI emitted an interactive sign-in prompt (it can't
+                // authenticate non-interactively). Kill it and fail fast.
+                let _ = child.kill().await;
+                if let Some(handle) = stderr_handle.take() {
+                    handle.abort();
+                }
+                return AgentResult::failure(
+                    "Grok Build could not authenticate non-interactively (the CLI requested a browser sign-in). Reconnect the xAI / Grok Build provider in Settings → Providers, then retry the mission.".to_string(),
+                    0,
+                )
+                .with_terminal_reason(TerminalReason::LlmError);
+            }
             line_result = lines.next_line() => {
                 match line_result {
                     Ok(Some(line)) => {
                         if line.trim().is_empty() {
                             continue;
+                        }
+                        // Fail fast on interactive sign-in. When the CLI can't
+                        // authenticate non-interactively it prints a sign-in URL
+                        // and blocks on a local OAuth callback that never arrives
+                        // in a headless mission — the run would otherwise hang
+                        // until the watchdog kills it ("Agent is working"
+                        // forever). Detect it and abort with an actionable error.
+                        if grok_line_requests_interactive_login(&line) {
+                            let _ = child.kill().await;
+                            if let Some(handle) = stderr_handle.take() {
+                                handle.abort();
+                            }
+                            return AgentResult::failure(
+                                "Grok Build could not authenticate non-interactively (the CLI requested a browser sign-in). Reconnect the xAI / Grok Build provider in Settings → Providers, then retry the mission.".to_string(),
+                                0,
+                            )
+                            .with_terminal_reason(TerminalReason::LlmError);
                         }
                         let value: serde_json::Value = match serde_json::from_str(&line) {
                             Ok(value) => value,

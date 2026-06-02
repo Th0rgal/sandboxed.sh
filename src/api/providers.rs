@@ -703,12 +703,18 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "pay-per-token".to_string(),
                 description: "Grok models via xAI API key".to_string(),
                 models: vec![
-                    // Check xAI model IDs here:
-                    // https://docs.x.ai/docs/models
+                    // These IDs must match what the Grok Build CLI accepts
+                    // (`grok models`) — the bare `grok-build` alias is rejected
+                    // by current CLIs. xAI API model IDs: https://docs.x.ai/docs/models
                     ProviderModel {
-                        id: "grok-build".to_string(),
+                        id: "grok-build-0.1".to_string(),
                         name: "Grok Build".to_string(),
                         description: Some("Default Grok Build CLI coding model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "composer-2.5".to_string(),
+                        name: "Composer 2.5".to_string(),
+                        description: Some("Composer 2.5 coding model (Grok Build CLI)".to_string()),
                     },
                     ProviderModel {
                         id: "grok-4.3".to_string(),
@@ -716,9 +722,9 @@ fn default_providers_config() -> ProvidersConfig {
                         description: Some("Current flagship Grok model".to_string()),
                     },
                     ProviderModel {
-                        id: "grok-4.3-latest".to_string(),
-                        name: "Grok 4.3 Latest".to_string(),
-                        description: Some("Fast and economical".to_string()),
+                        id: "grok-4.20-0309-reasoning".to_string(),
+                        name: "Grok 4.20 (Reasoning)".to_string(),
+                        description: Some("Grok 4.20 reasoning model".to_string()),
                     },
                 ],
             },
@@ -1710,11 +1716,12 @@ pub async fn validate_model_override(
             if let Some(provider) = xai {
                 if provider.models.iter().any(|m| m.id == model_override)
                     || model_override.starts_with("grok-")
+                    || model_override.starts_with("composer-")
                 {
                     Ok(())
                 } else {
                     Err(format!(
-                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use format 'grok-*'",
+                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use format 'grok-*' or 'composer-*'",
                         model_override,
                         provider
                             .models
@@ -1781,7 +1788,10 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "xai")
             .expect("xai provider");
-        assert!(xai.models.iter().any(|model| model.id == "grok-build"));
+        // The CLI-valid coding model id (bare `grok-build` is rejected by
+        // current CLIs) plus the Composer model the Grok CLI now supports.
+        assert!(xai.models.iter().any(|model| model.id == "grok-build-0.1"));
+        assert!(xai.models.iter().any(|model| model.id == "composer-2.5"));
     }
 
     #[test]
