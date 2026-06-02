@@ -54,7 +54,15 @@ export default function DataSettingsPage() {
   const handleSaveAskModel = async () => {
     setSavingAskModel(true);
     try {
-      const trimmed = (askModelValue ?? '').trim();
+      // Use the effective displayed value, not just local edits: when the user
+      // hasn't typed, askModelValue is null and we must preserve the saved
+      // model rather than clear it. Clearing only happens when the user
+      // explicitly empties the field (askModelValue === "").
+      const trimmed = (
+        askModelValue ??
+        serverSettings?.ask_assistant_model ??
+        ''
+      ).trim();
       // Send "" (not null) to clear: a present empty string is normalized to
       // None server-side, whereas JSON null is treated as "no change".
       await updateSettings({ ask_assistant_model: trimmed });
