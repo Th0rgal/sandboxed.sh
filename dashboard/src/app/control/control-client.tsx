@@ -488,6 +488,40 @@ const PerfOverlay = dynamic(() =>
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
 
+// Mirror of the server's conversation-anchored snapshot (see
+// `get_mission_snapshot` in src/api/control.rs). Keep these in sync.
+const SNAPSHOT_CONVERSATIONAL_MESSAGES = 10;
+const SNAPSHOT_MAX_EVENTS = 1500;
+const CONVERSATION_EVENT_TYPES = new Set([
+  "user_message",
+  "assistant_message",
+  "assistant_message_canonical",
+]);
+
+// Trim a sequence-ASC event list to the conversation-anchored tail: everything
+// from the Nth-most-recent user/assistant message to the head (tool calls in
+// between included), hard-capped at SNAPSHOT_MAX_EVENTS. Applied to the IDB
+// cache path so a cache hit behaves like `getMissionSnapshot` — without it a
+// stale or oversized cached tail would be replayed in full (slow load) and the
+// recent-message anchoring would be bypassed.
+function anchorEventsToRecentConversation(events: StoredEvent[]): StoredEvent[] {
+  let convoSeen = 0;
+  let anchorIdx = -1;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (CONVERSATION_EVENT_TYPES.has(events[i].event_type)) {
+      anchorIdx = i;
+      convoSeen += 1;
+      if (convoSeen >= SNAPSHOT_CONVERSATIONAL_MESSAGES) break;
+    }
+  }
+  // Fewer than N conversation messages → keep all (still capped below).
+  let start = anchorIdx === -1 ? 0 : anchorIdx;
+  if (events.length - start > SNAPSHOT_MAX_EVENTS) {
+    start = events.length - SNAPSHOT_MAX_EVENTS;
+  }
+  return start === 0 ? events : events.slice(start);
+}
+
 // Module-level so all duration consumers share the same implementation.
 function formatDuration(seconds: number): string {
   if (seconds <= 0) return "<1s";
@@ -4596,7 +4630,12 @@ export default function ControlClient() {
               }
             }
             merged.sort((a, b) => a.sequence - b.sequence);
-            sorted = merged;
+            // Bound the cached tail to the conversation-anchored window, just
+            // like the server snapshot, so a cache hit doesn't replay a
+            // stale/oversized history or bypass the recent-message anchoring.
+            // `metaTotal` below stays the true server total, so trimming here
+            // simply leaves older events to the on-demand "Load older" path.
+            sorted = anchorEventsToRecentConversation(merged);
             metaMaxSeq = maxSequence;
             // The delta fetch above runs with `includeCounts: false`, so the
             // server omits `X-Total-Events` and `delta.meta.totalEvents` is
@@ -4613,7 +4652,7 @@ export default function ControlClient() {
                 ? cached.totalEvents + addedByDelta
                 : undefined);
             cacheHit = true;
-            eventMergeCount = merged.length;
+            eventMergeCount = sorted.length;
           }
         } catch {
           // Network or auth failure on the delta — fall through to the
