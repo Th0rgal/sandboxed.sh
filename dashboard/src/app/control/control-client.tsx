@@ -504,7 +504,9 @@ const CONVERSATION_EVENT_TYPES = new Set([
 // cache path so a cache hit behaves like `getMissionSnapshot` — without it a
 // stale or oversized cached tail would be replayed in full (slow load) and the
 // recent-message anchoring would be bypassed.
-function anchorEventsToRecentConversation(events: StoredEvent[]): StoredEvent[] {
+function anchorEventsToRecentConversation(
+  events: StoredEvent[],
+): StoredEvent[] {
   // Anchor ONLY when at least N conversation messages exist, matching the
   // server: `nth_recent_event_sequence(N)` returns None below N, in which case
   // get_mission_snapshot falls back to the plain recent-events tail (no
@@ -6042,7 +6044,6 @@ export default function ControlClient() {
     [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder, setItems],
   );
 
-
   // Load mission from URL param on mount (and retry on auth success)
   const [authRetryTrigger, setAuthRetryTrigger] = useState(0);
 
@@ -10411,7 +10412,7 @@ export default function ControlClient() {
             <div
               ref={containerRef}
               data-testid="chat-scroll-container"
-              className="flex-1 overflow-y-auto p-6"
+              className="flex-1 overflow-y-auto px-6 pt-6 pb-2"
             >
               {/* Backwards pagination — only when there's actually more older
               history to fetch and the chat isn't empty. Click prepends the
@@ -10594,7 +10595,7 @@ export default function ControlClient() {
                   `agentWorkingIndicator` memo so each NowTick render doesn't
                   re-walk the whole items array. */}
                   {agentWorkingPillVisible && agentWorkingIndicator && (
-                    <div className="flex justify-start animate-fade-in">
+                    <div className="flex justify-start animate-fade-in -mt-3">
                       <div className="inline-flex items-center gap-2 rounded-full border border-indigo-500/20 bg-indigo-500/[0.08] px-3 py-1.5">
                         <Loader className="h-3.5 w-3.5 text-indigo-400 animate-spin" />
                         <span className="text-xs font-medium text-indigo-300">
