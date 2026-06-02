@@ -504,7 +504,7 @@ pub async fn prepend_pending_operator_notes(
     let mut block = String::from("<operator-note>\n");
     for note in &notes {
         block.push_str(&note.body);
-        block.push_str("\n");
+        block.push('\n');
     }
     block.push_str("</operator-note>\n\n");
     block.push_str(&user_message);

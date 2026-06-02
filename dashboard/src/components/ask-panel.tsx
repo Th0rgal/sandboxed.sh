@@ -61,6 +61,16 @@ export function AskPanel({
   const [sandbox, setSandbox] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Auto-grow the composer with input, capped (lighter than the main composer's
+  // 10-line cap). Runs on every input change, including seed prefill and reset.
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(ta.scrollHeight, 120)}px`;
+  }, [input]);
 
   const refreshThreads = useCallback(async () => {
     try {
@@ -355,6 +365,7 @@ export function AskPanel({
       <div className="border-t border-[rgb(var(--foreground)/0.1)] p-2.5">
         <div className="flex items-end gap-2 rounded-xl border border-[rgb(var(--foreground)/0.12)] bg-[rgb(var(--foreground)/0.04)] px-2.5 py-1.5 focus-within:border-[rgb(var(--copilot)/0.4)]">
           <textarea
+            ref={textareaRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
@@ -365,7 +376,7 @@ export function AskPanel({
             }}
             rows={1}
             placeholder="Ask the co-pilot…"
-            className="max-h-32 min-h-[24px] flex-1 resize-none bg-transparent text-sm text-[rgb(var(--foreground)/0.9)] placeholder:text-[rgb(var(--foreground)/0.4)] focus:outline-none"
+            className="min-h-[24px] flex-1 resize-none overflow-y-auto bg-transparent text-sm leading-5 text-[rgb(var(--foreground)/0.9)] placeholder:text-[rgb(var(--foreground)/0.4)] focus:outline-none"
           />
           <button
             type="button"
