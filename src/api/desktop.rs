@@ -40,6 +40,11 @@ pub enum DesktopSessionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopSessionDetail {
     pub display: String,
+    /// Display server used by the streamed session, e.g. "wayland" or "x11".
+    pub display_server: String,
+    /// Compositor or window manager driving the session when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compositor: Option<String>,
     pub status: DesktopSessionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mission_id: Option<Uuid>,
@@ -418,6 +423,14 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
 
             let detail = DesktopSessionDetail {
                 display: session.display.clone(),
+                display_server: session
+                    .display_server
+                    .clone()
+                    .unwrap_or_else(|| "x11".to_string()),
+                compositor: session
+                    .compositor
+                    .clone()
+                    .or_else(|| Some("i3".to_string())),
                 status,
                 mission_id: session.mission_id.or(Some(mission.id)),
                 mission_title: mission.title.clone(),
@@ -450,6 +463,8 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
             .entry(display.clone())
             .or_insert_with(|| DesktopSessionDetail {
                 display: display.clone(),
+                display_server: "x11".to_string(),
+                compositor: Some("unknown".to_string()),
                 status: DesktopSessionStatus::Unknown,
                 mission_id: None,
                 mission_title: None,

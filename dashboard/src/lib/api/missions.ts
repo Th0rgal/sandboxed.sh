@@ -31,6 +31,8 @@ export interface MissionHistoryEntry {
 export interface DesktopSessionInfo {
   display: string;
   resolution?: string;
+  display_server?: "wayland" | "x11" | string;
+  compositor?: string;
   started_at: string;
   stopped_at?: string;
   screenshots_dir?: string;

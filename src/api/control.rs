@@ -3173,6 +3173,10 @@ pub struct DesktopSessionInfo {
     pub display: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compositor: Option<String>,
     pub started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_at: Option<String>,
@@ -11263,6 +11267,8 @@ async fn control_actor_loop(
                                                 sessions.push(DesktopSessionInfo {
                                                     display: disp.clone(),
                                                     resolution: None,
+                                                    display_server: Some("x11".to_string()),
+                                                    compositor: Some("i3".to_string()),
                                                     started_at: now_string(),
                                                     stopped_at: None,
                                                     screenshots_dir: None,
@@ -11416,6 +11422,16 @@ async fn control_actor_loop(
                                 .get("screenshots_dir")
                                 .and_then(|v| v.as_str())
                                 .map(|v| v.to_string());
+                            let display_server = obj
+                                .get("display_server")
+                                .and_then(|v| v.as_str())
+                                .map(|v| v.to_string())
+                                .or_else(|| Some("x11".to_string()));
+                            let compositor = obj
+                                .get("compositor")
+                                .and_then(|v| v.as_str())
+                                .map(|v| v.to_string())
+                                .or_else(|| Some("i3".to_string()));
                             let browser = obj
                                 .get("browser")
                                 .and_then(|v| v.as_str())
@@ -11431,6 +11447,8 @@ async fn control_actor_loop(
                                 .find(|session| session.display == display && session.stopped_at.is_none())
                             {
                                 existing.resolution = resolution;
+                                existing.display_server = display_server;
+                                existing.compositor = compositor;
                                 existing.screenshots_dir = screenshots_dir;
                                 existing.browser = browser;
                                 existing.url = url;
@@ -11439,6 +11457,8 @@ async fn control_actor_loop(
                                 sessions.push(DesktopSessionInfo {
                                     display,
                                     resolution,
+                                    display_server,
+                                    compositor,
                                     started_at: now.clone(),
                                     stopped_at: None,
                                     screenshots_dir,

@@ -155,7 +155,7 @@ import {
   Code,
   FolderOpen,
   Trash2,
-  Monitor,
+  AppWindow,
   HelpCircle,
   PanelRightClose,
   PanelRight,
@@ -5157,6 +5157,13 @@ export default function ControlClient() {
     hasDesktopSessionRef.current = hasDesktopSession;
   }, [hasDesktopSession]);
 
+  const selectedDesktopSession = useMemo(
+    () =>
+      desktopSessions.find((session) => session.display === desktopDisplayId) ??
+      null,
+    [desktopDisplayId, desktopSessions],
+  );
+
   useEffect(() => {
     // Only auto-show when transitioning from no active thinking to active thinking
     if (
@@ -6688,17 +6695,25 @@ export default function ControlClient() {
         const activeMission =
           viewingMissionRef.current ?? currentMissionRef.current;
         const activeMissionId = activeMission?.id;
+        const activeMissionIsRunning =
+          !!activeMissionId &&
+          runningMissionsRef.current.some(
+            (mission) =>
+              mission.mission_id === activeMissionId &&
+              mission.state !== "finished",
+          );
 
         // Only auto-open for sessions belonging to the current mission.
         // When expecting a desktop session (ToolCall detected but no ToolResult yet),
         // also include unattributed sessions (mission_id is null) since the backend
-        // background task may not have attributed them yet.
+        // background task may not have attributed them yet. A running mission can
+        // also adopt unattributed sessions discovered by the dev backend's Xvfb scan.
         const expecting = expectingDesktopSessionRef.current;
         const currentMissionSessions = activeMissionId
           ? runningSessions.filter(
               (s) =>
                 s.mission_id === activeMissionId ||
-                (expecting && !s.mission_id),
+                ((expecting || activeMissionIsRunning) && !s.mission_id),
             )
           : expecting
             ? runningSessions.filter((s) => !s.mission_id)
@@ -10517,9 +10532,9 @@ export default function ControlClient() {
               )}
             </button>
 
-            {/* Desktop stream toggle with display selector - only shown when a desktop session is active */}
+            {/* App stream toggle with display selector - only shown when a streamable session is active */}
             {hasDesktopSession && (
-              <div className="relative flex items-center">
+              <div className="relative flex items-center" data-testid="app-stream-toggle">
                 <button
                   onClick={() => setShowDesktopStream(!showDesktopStream)}
                   className={cn(
@@ -10530,12 +10545,12 @@ export default function ControlClient() {
                   )}
                   title={
                     showDesktopStream
-                      ? "Hide desktop stream"
-                      : "Show desktop stream"
+                      ? "Hide app stream"
+                      : "Show app stream"
                   }
                 >
-                  <Monitor className="h-4 w-4" />
-                  <span className="hidden lg:inline">Desktop</span>
+                  <AppWindow className="h-4 w-4" />
+                  <span className="hidden lg:inline">App Stream</span>
                   {showDesktopStream ? (
                     <PanelRightClose className="h-4 w-4" />
                   ) : (
@@ -10551,7 +10566,7 @@ export default function ControlClient() {
                         ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
                         : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
                     )}
-                    title="Select display"
+                    title="Select app stream"
                   >
                     <span className="text-sm font-mono">
                       {desktopDisplayId}
@@ -10599,16 +10614,23 @@ export default function ControlClient() {
                                   }
                                 />
 
-                                {/* Display ID */}
-                                <span
-                                  className={cn(
-                                    "font-mono",
-                                    desktopDisplayId === session.display
-                                      ? "text-emerald-400"
-                                      : "text-white/70",
-                                  )}
-                                >
-                                  {session.display}
+                                <span className="flex min-w-0 flex-1 flex-col">
+                                  <span
+                                    className={cn(
+                                      "font-mono leading-tight",
+                                      desktopDisplayId === session.display
+                                        ? "text-emerald-400"
+                                        : "text-white/70",
+                                    )}
+                                  >
+                                    {session.display}
+                                  </span>
+                                  <span className="truncate text-[11px] leading-tight text-white/35">
+                                    {(session.display_server ?? "wayland").toUpperCase()}
+                                    {session.compositor
+                                      ? ` / ${session.compositor.toUpperCase()}`
+                                      : ""}
+                                  </span>
                                 </span>
 
                                 {/* Status label */}
@@ -10752,13 +10774,16 @@ export default function ControlClient() {
                               setShowDisplaySelector(false);
                             }}
                             className={cn(
-                              "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
+                              "flex w-full items-center px-3 py-2 text-sm transition-colors hover:bg-white/[0.04]",
                               desktopDisplayId === display
                                 ? "text-emerald-400"
                                 : "text-white/70",
                             )}
                           >
-                            {display}
+                            <span className="font-mono">{display}</span>
+                            <span className="ml-2 text-[11px] text-white/35">
+                              Wayland-ready
+                            </span>
                             {desktopDisplayId === display && (
                               <CheckCircle className="ml-auto h-3.5 w-3.5" />
                             )}
@@ -11435,7 +11460,7 @@ export default function ControlClient() {
                 />
               )}
 
-              {/* Desktop Stream Panel */}
+              {/* App Stream Panel */}
               {showDesktopStream && (
                 <div
                   className={cn(
@@ -11445,6 +11470,8 @@ export default function ControlClient() {
                 >
                   <DesktopStream
                     displayId={desktopDisplayId}
+                    displayServer={selectedDesktopSession?.display_server}
+                    compositor={selectedDesktopSession?.compositor}
                     className="h-full"
                     onClose={() => setShowDesktopStream(false)}
                   />

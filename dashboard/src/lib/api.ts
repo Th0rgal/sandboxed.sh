@@ -2763,6 +2763,8 @@ export type DesktopSessionStatus =
 
 export interface DesktopSessionDetail {
   display: string;
+  display_server?: "wayland" | "x11" | string;
+  compositor?: string;
   status: DesktopSessionStatus;
   mission_id?: string;
   mission_title?: string;

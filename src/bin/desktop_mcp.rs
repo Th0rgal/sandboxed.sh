@@ -365,6 +365,8 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
         "display_num": display_num,
         "xvfb_pid": xvfb_pid,
         "i3_pid": i3_pid,
+        "display_server": "x11",
+        "compositor": "i3",
         "resolution": resolution,
         "screenshots_dir": screenshots_dir.to_string_lossy()
     });
@@ -386,7 +388,7 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
     write_display_info(&display_id)?;
 
     Ok(format!(
-        "{{\"success\": true, \"display\": \"{}\", \"resolution\": \"{}\", \"xvfb_pid\": {}, \"i3_pid\": {}, \"screenshots_dir\": \"{}\"{}}}",
+        "{{\"success\": true, \"display\": \"{}\", \"display_server\": \"x11\", \"compositor\": \"i3\", \"resolution\": \"{}\", \"xvfb_pid\": {}, \"i3_pid\": {}, \"screenshots_dir\": \"{}\"{}}}",
         display_id,
         resolution,
         xvfb_pid,

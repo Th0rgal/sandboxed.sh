@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { getValidJwt } from "@/lib/auth";
 import { getRuntimeApiBase } from "@/lib/settings";
 import {
+  AppWindow,
   MonitorOff,
   Play,
   Pause,
@@ -18,6 +19,8 @@ import {
 
 interface DesktopStreamProps {
   displayId?: string;
+  displayServer?: string;
+  compositor?: string;
   className?: string;
   onClose?: () => void;
   initialFps?: number;
@@ -28,6 +31,8 @@ type ConnectionState = "connecting" | "connected" | "disconnected" | "error";
 
 export function DesktopStream({
   displayId = ":99",
+  displayServer,
+  compositor,
   className,
   onClose,
   initialFps = 10,
@@ -44,6 +49,16 @@ export function DesktopStream({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isPipActive, setIsPipActive] = useState(false);
   const [isPipSupported, setIsPipSupported] = useState(false);
+  const streamBackend = (displayServer || "wayland").toLowerCase();
+  const isWayland = streamBackend === "wayland";
+  const backendLabel = isWayland
+    ? "Wayland native"
+    : "Wayland-first UI - X11 compatible";
+  const compositorLabel = compositor
+    ? compositor.toUpperCase()
+    : isWayland
+      ? "Compositor"
+      : "i3";
 
   const wsRef = useRef<WebSocket | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -705,8 +720,11 @@ export function DesktopStream({
       ref={containerRef}
       tabIndex={0}
       onKeyDown={handleKeyDown}
+      data-testid="app-stream-panel"
+      data-stream-display={displayId}
+      data-stream-backend={streamBackend}
       className={cn(
-        "relative flex flex-col bg-[#0a0a0a] rounded-xl overflow-hidden border border-white/[0.06]",
+        "relative flex flex-col bg-[#070707] rounded-xl overflow-hidden border border-white/[0.08]",
         className
       )}
       onMouseEnter={() => setShowControls(true)}
@@ -719,7 +737,18 @@ export function DesktopStream({
           showControls ? "opacity-100" : "opacity-0"
         )}
       >
-        <div className="pointer-events-auto flex items-center gap-3">
+        <div className="pointer-events-auto flex min-w-0 items-center gap-3">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-emerald-500/20 bg-emerald-500/10 text-emerald-300">
+            <AppWindow className="h-4 w-4" />
+          </div>
+          <div className="hidden min-w-0 flex-col leading-tight sm:flex">
+            <span className="truncate text-sm font-medium text-white/90">
+              App stream
+            </span>
+            <span className="truncate text-[11px] text-white/45">
+              {backendLabel} - {compositorLabel}
+            </span>
+          </div>
           <div
             className={cn(
               "flex items-center gap-2 text-xs",
@@ -748,8 +777,12 @@ export function DesktopStream({
               ? "Connecting..."
               : "Disconnected"}
           </div>
-          <span className="text-xs text-white/40 font-mono">{displayId}</span>
-          <span className="text-xs text-white/30">{frameCount} frames</span>
+          <span className="rounded-md border border-white/[0.08] bg-white/[0.04] px-1.5 py-0.5 text-xs font-mono text-white/55">
+            {displayId}
+          </span>
+          <span className="hidden text-xs text-white/30 md:inline">
+            {frameCount} frames
+          </span>
         </div>
 
         <div className="pointer-events-auto flex items-center gap-2">
@@ -798,6 +831,7 @@ export function DesktopStream({
         {connectionState === "connected" && !errorMessage ? (
           <canvas
             ref={canvasRef}
+            data-testid="app-stream-canvas"
             className="max-w-full max-h-full object-contain"
             onMouseMove={handleMouseMove}
             onMouseDown={handleMouseDown}
@@ -818,14 +852,14 @@ export function DesktopStream({
               <h3 className="text-base font-medium text-white/80">
                 {errorMessage?.includes("no longer available") ||
                 errorMessage?.includes("session may have")
-                  ? "Desktop Unavailable"
+                  ? "App Stream Unavailable"
                   : "Connection Lost"}
               </h3>
               <p className="max-w-[280px] text-sm text-white/50 leading-relaxed">
                 {errorMessage?.includes("no longer available") ||
                 errorMessage?.includes("session may have")
-                  ? `Display ${displayId} has been closed. Select another session from the dropdown above.`
-                  : errorMessage || "Unable to connect to the desktop stream."}
+                  ? `Session ${displayId} has been closed. Select another app stream above.`
+                  : errorMessage || "Unable to connect to the app stream."}
               </p>
             </div>
             <button
