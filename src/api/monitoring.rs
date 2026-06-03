@@ -70,6 +70,61 @@ pub struct ContainerMetrics {
     pub memory_percent: f64,
 }
 
+/// Severity of host memory pressure, used by the dashboard banner and by
+/// mission admission control. Thresholds: warn at >=80% RAM (or >=20% swap),
+/// critical at >=90% RAM (or >=50% swap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryHealthLevel {
+    Ok,
+    Warn,
+    Critical,
+}
+
+/// A single workspace/mission's memory footprint, for "who's the culprit"
+/// diagnostics in the warning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConsumer {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub memory_used: u64,
+    pub memory_percent: f64,
+}
+
+/// Host memory-health snapshot: overall level + top consuming workspaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryHealth {
+    pub level: MemoryHealthLevel,
+    pub memory_used: u64,
+    pub memory_total: u64,
+    pub memory_percent: f32,
+    pub swap_used: u64,
+    pub swap_total: u64,
+    pub swap_percent: f32,
+    /// Top memory-consuming container workspaces, largest first (max 5).
+    pub top_consumers: Vec<MemoryConsumer>,
+    pub timestamp_ms: u64,
+}
+
+/// Warn when RAM or swap usage reaches these percentages.
+const MEM_WARN_PCT: f32 = 80.0;
+const SWAP_WARN_PCT: f32 = 20.0;
+/// Escalate to critical at these percentages.
+const MEM_CRITICAL_PCT: f32 = 90.0;
+const SWAP_CRITICAL_PCT: f32 = 50.0;
+
+impl MemoryHealthLevel {
+    fn from_usage(memory_percent: f32, swap_percent: f32) -> Self {
+        if memory_percent >= MEM_CRITICAL_PCT || swap_percent >= SWAP_CRITICAL_PCT {
+            MemoryHealthLevel::Critical
+        } else if memory_percent >= MEM_WARN_PCT || swap_percent >= SWAP_WARN_PCT {
+            MemoryHealthLevel::Warn
+        } else {
+            MemoryHealthLevel::Ok
+        }
+    }
+}
+
 /// Container metrics update sent over WebSocket
 #[derive(Debug, Clone, Serialize)]
 struct ContainerMetricsMessage {
