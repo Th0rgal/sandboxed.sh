@@ -37,14 +37,11 @@ import {
   Power,
   PowerOff,
   Bot,
-  Cable,
   ChevronDown,
   ChevronUp,
   CheckCircle2,
-  CircleDashed,
   Settings,
   AlertTriangle,
-  GitBranch,
   Send,
   Search,
   Calendar,
@@ -884,150 +881,112 @@ export default function AssistantPage() {
           </button>
         </header>
 
-        <div className="grid gap-4 lg:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
-          <section className={cn(PANEL, HEALTH_TONE[healthTone].border, HEALTH_TONE[healthTone].bg, 'p-4')} aria-label="Assistant health summary">
-            <div className="flex items-start justify-between gap-4">
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
+        <section className={cn(PANEL, 'overflow-hidden')} aria-label="Assistant health summary">
+          <div className={cn('border-l-2 px-4 py-4', HEALTH_TONE[healthTone].border)}>
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
                   <span className={cn('h-2 w-2 rounded-full', HEALTH_TONE[healthTone].dot)} />
-                  <p className={cn('text-xs font-medium uppercase tracking-[0.08em]', HEALTH_TONE[healthTone].text)}>
-                    Assistant health
+                  <h2 className="text-sm font-semibold text-white">{healthCopy.title}</h2>
+                  <span className="rounded-md border border-white/[0.06] bg-white/[0.025] px-1.5 py-0.5 text-[10px] text-white/35">
+                    {hermesRuntimeReady
+                      ? activeGatewayCount > 0
+                        ? 'Mixed ownership'
+                        : 'Hermes owned'
+                      : 'Compatibility mode'}
+                  </span>
+                </div>
+                <p className="mt-1 max-w-3xl text-sm leading-5 text-white/50">{healthCopy.detail}</p>
+                <p className="mt-1 text-xs text-white/35">{healthCopy.action}</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-x-5 gap-y-2 text-xs sm:flex sm:flex-wrap sm:justify-end sm:gap-x-6 lg:max-w-md">
+                <div className="min-w-0">
+                  <p className="text-[10px] uppercase tracking-[0.08em] text-white/30">Bridge</p>
+                  <p className="mt-0.5 truncate font-medium text-white/75">
+                    {componentsLoading
+                      ? 'Checking'
+                      : assistantMcpReady
+                        ? `assistant-mcp ${assistantMcp.version || ''}`.trim()
+                        : 'Not ready'}
                   </p>
                 </div>
-                <h2 className="mt-2 text-base font-semibold text-white">{healthCopy.title}</h2>
-                <p className="mt-1 max-w-2xl text-sm leading-5 text-white/55">{healthCopy.detail}</p>
-                <p className="mt-2 text-xs text-white/40">{healthCopy.action}</p>
-              </div>
-              <div className="hidden rounded-lg border border-white/[0.06] bg-black/10 px-3 py-2 text-right sm:block">
-                <p className="text-[10px] uppercase tracking-[0.08em] text-white/35">Ownership</p>
-                <p className="mt-1 text-xs font-medium text-white/75">
-                  {hermesRuntimeReady
-                    ? activeGatewayCount > 0
-                      ? 'Mixed'
-                      : 'Hermes'
-                    : 'Compatibility'}
-                </p>
+                <div className="min-w-0">
+                  <p className="text-[10px] uppercase tracking-[0.08em] text-white/30">Runtime</p>
+                  <p className="mt-0.5 truncate font-medium text-white/75">
+                    {componentsLoading
+                      ? 'Checking'
+                      : hermesRuntimeReady
+                        ? 'Hermes runtime active'
+                        : hermesRuntime?.installed
+                          ? 'Unhealthy'
+                          : 'Not installed'}
+                  </p>
+                </div>
+                <div className="min-w-0">
+                  <p className="text-[10px] uppercase tracking-[0.08em] text-white/30">Messaging</p>
+                  <p className="mt-0.5 truncate font-medium text-white/75">
+                    {hermesStatus?.telegram_ok
+                      ? `@${hermesStatus.telegram_bot_username || 'telegram'}`
+                      : `${activeGatewayCount}/${bots.length || 0} active · ${knownConversationCount} chats`}
+                  </p>
+                </div>
+                <div className="min-w-0">
+                  <p className="text-[10px] uppercase tracking-[0.08em] text-white/30">Routing</p>
+                  <p className="mt-0.5 truncate font-medium text-white/75">
+                    {hermesStatus?.model || assistantChain?.id || 'builtin/smart'}
+                  </p>
+                </div>
               </div>
             </div>
 
-            <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-              <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-[10px] font-medium uppercase tracking-[0.08em] text-white/35">Bridge</p>
-                  {assistantMcpReady ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> : <CircleDashed className="h-3.5 w-3.5 text-amber-300" />}
+            <div className="mt-4 border-t border-white/[0.04] pt-3" aria-label="Recent assistant activity">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <Clock className="h-3.5 w-3.5 text-white/30" />
+                  <h2 className="text-xs font-medium text-white/65">Recent activity</h2>
                 </div>
-                <p className="mt-1 text-xs font-medium text-white">
-                  {componentsLoading
-                    ? 'Checking assistant-mcp'
-                    : assistantMcpReady
-                      ? `assistant-mcp ${assistantMcp.version || ''}`.trim()
-                      : 'Bridge not ready'}
-                </p>
-                <p className="mt-1 text-[11px] text-white/40">
-                  {assistantMcpReady ? 'Available for Hermes.' : 'Install assistant-mcp before handoff.'}
-                </p>
+                {loadedActivity.length > 0 && (
+                  <span className="text-[10px] text-white/30">
+                    {loadedActivity.length} loaded event{loadedActivity.length === 1 ? '' : 's'}
+                  </span>
+                )}
               </div>
-              <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-[10px] font-medium uppercase tracking-[0.08em] text-white/35">Messaging</p>
-                  <Cable className="h-3.5 w-3.5 text-white/30" />
-                </div>
-                <p className="mt-1 text-xs font-medium text-white">
-                  {hermesStatus?.telegram_ok
-                    ? `@${hermesStatus.telegram_bot_username || 'telegram'} via Hermes`
-                    : `${activeGatewayCount} active / ${bots.length || 0} configured`}
-                </p>
-                <p className="mt-1 text-[11px] text-white/40">
-                  {hermesStatus?.telegram_ok
-                    ? hermesStatus.telegram_webhook_configured
-                      ? 'Webhook may block polling.'
-                      : `${hermesStatus.telegram_pending_update_count ?? 0} pending updates.`
-                    : `${knownConversationCount} known conversation${knownConversationCount === 1 ? '' : 's'}.`}
-                </p>
-              </div>
-              <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-[10px] font-medium uppercase tracking-[0.08em] text-white/35">Runtime</p>
-                  {hermesRuntimeReady ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> : <CircleDashed className="h-3.5 w-3.5 text-amber-300" />}
-                </div>
-                <p className="mt-1 text-xs font-medium text-white">
-                  {componentsLoading
-                    ? 'Checking Hermes runtime'
-                    : hermesRuntimeReady
-                      ? 'Hermes runtime active'
-                      : hermesRuntime?.installed
-                        ? 'Hermes runtime not healthy'
-                        : 'Runtime not installed'}
-                </p>
-                <p className="mt-1 text-[11px] text-white/40">
-                  {hermesRuntimeReady
-                    ? 'Owns assistant execution.'
-                    : hermesRuntime?.installed
-                      ? `Service reported ${hermesRuntime.status || 'not healthy'}.`
-                      : 'Install runtime service.'}
-                </p>
-              </div>
-              <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-[10px] font-medium uppercase tracking-[0.08em] text-white/35">Routing</p>
-                  <GitBranch className="h-3.5 w-3.5 text-white/30" />
-                </div>
-                <p className="mt-1 text-xs font-medium text-white">
-                  {hermesStatus?.model || assistantChain?.id || 'builtin/smart'}
-                </p>
-                <p className="mt-1 text-[11px] text-white/40">
-                  {assistantChain
-                    ? `${assistantChain.entries.length} fallback ${assistantChain.entries.length === 1 ? 'entry' : 'entries'} via /v1.`
-                    : 'Uses sandboxed.sh /v1 chain.'}
-                </p>
-              </div>
-            </div>
-          </section>
-
-          <section className={cn(PANEL, 'p-4')} aria-label="Recent assistant activity">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <h2 className="text-sm font-medium text-white">Recent activity</h2>
-                <p className="mt-0.5 text-xs text-[rgb(var(--foreground-tertiary))]">Gateway events loaded in this view.</p>
-              </div>
-              <Clock className="h-4 w-4 text-white/30" />
-            </div>
-            <div className="mt-3">
               {loadedActivity.length === 0 ? (
-                <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] px-3 py-4 text-xs text-[rgb(var(--foreground-tertiary))]">
+                <p className="mt-2 text-xs text-white/35">
                   Open a gateway below to load conversations, actions, scheduled messages, and memory.
-                </div>
+                </p>
               ) : (
-                loadedActivity.map((item) => (
-                  <div key={item.id} className="flex items-start gap-3 border-t border-white/[0.04] py-2 first:border-t-0 first:pt-0">
-                    <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', item.status ? STATUS_DOT[item.status] || 'bg-white/25' : 'bg-indigo-400')} />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <p className="truncate text-xs font-medium text-[rgb(var(--foreground-secondary))]">{item.title}</p>
-                        <span className="shrink-0 rounded bg-white/[0.05] px-1.5 py-0.5 text-[9px] text-white/35">{item.kind}</span>
-                      </div>
-                      <p className="truncate text-[11px] text-[rgb(var(--foreground-tertiary))]">{item.detail}</p>
+                <div className="mt-2 grid gap-x-4 gap-y-1 lg:grid-cols-2">
+                  {loadedActivity.map((item) => (
+                    <div key={item.id} className="flex min-w-0 items-center gap-2 py-1">
+                      <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', item.status ? STATUS_DOT[item.status] || 'bg-white/25' : 'bg-indigo-400')} />
+                      <p className="min-w-0 flex-1 truncate text-xs text-white/60">
+                        <span className="font-medium text-white/75">{item.title}</span>
+                        <span className="text-white/25"> · </span>
+                        <span>{item.kind}</span>
+                      </p>
+                      <span className="shrink-0 font-mono text-[10px] text-white/25">{relTime(item.timestamp)}</span>
                     </div>
-                    <span className="shrink-0 font-mono text-[10px] text-white/25">{relTime(item.timestamp)}</span>
-                  </div>
-                ))
+                  ))}
+                </div>
               )}
             </div>
-          </section>
-        </div>
+          </div>
+        </section>
 
         {setupDiagnostics.length > 0 && (
-          <section className={cn(PANEL, 'overflow-hidden')} aria-label="Setup diagnostics">
-            <div className="flex items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
+          <section className={cn(PANEL, 'overflow-hidden border-amber-500/15 bg-amber-500/[0.035]')} aria-label="Setup diagnostics">
+            <div className="flex items-center justify-between gap-3 border-b border-white/[0.05] px-4 py-3">
               <div className="min-w-0">
                 <h2 className="text-sm font-medium text-white">Setup diagnostics</h2>
-                <p className="mt-0.5 text-xs text-white/40">Fix these before moving more Telegram ownership to Hermes.</p>
+                <p className="mt-0.5 text-xs text-white/40">Only the checks that need attention are shown.</p>
               </div>
-              <span className="rounded-md bg-white/[0.04] px-2 py-1 text-[11px] text-white/45">
+              <span className="rounded-md border border-amber-500/15 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-300">
                 {setupDiagnostics.length} item{setupDiagnostics.length === 1 ? '' : 's'}
               </span>
             </div>
-            <div className="divide-y divide-white/[0.04]">
+            <div className="grid divide-y divide-white/[0.04] lg:grid-cols-2 lg:divide-x lg:divide-y-0">
               {setupDiagnostics.map((item) => (
                 <div key={item.id} className="flex gap-3 px-4 py-3">
                   <AlertTriangle className={cn('mt-0.5 h-4 w-4 shrink-0', HEALTH_TONE[item.tone].text)} />
