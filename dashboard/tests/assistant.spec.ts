@@ -86,6 +86,7 @@ test.describe('Assistant page', () => {
 
     await expect(page.getByText('assistant-mcp not ready')).toBeVisible();
     await expect(page.getByText('Install assistant-mcp before handing mission control to Hermes.')).toBeVisible();
+    await expect(page.getByText('Assistant bridge is not ready')).toBeVisible();
     await expect(page.getByText('Hermes runtime not installed')).toBeVisible();
     await expect(page.getByText('Install hermes-assistant-dev.service before moving webhook ownership.')).toBeVisible();
 
@@ -180,7 +181,8 @@ test.describe('Assistant page', () => {
 
     await page.goto('/assistant');
 
-    await expect(page.getByText('@hermes_devbot')).toBeVisible();
+    await expect(page.getByLabel('Assistant gateways').getByText('@hermes_devbot')).toBeVisible();
+    await expect(page.getByLabel('Recent assistant activity').getByText('@hermes_devbot')).toBeVisible();
     await expect(page.getByText('Compatibility gateway still active')).toBeVisible();
     await expect(page.getByText('Hermes runtime is active while 1 compatibility gateway remains active. Use Adopt on the matching gateway to copy the existing token into Hermes and stop the legacy webhook.')).toBeVisible();
     await expect(page.getByRole('link', { name: 'Review gateways' })).toHaveAttribute('href', '#assistant-gateways');
@@ -196,11 +198,12 @@ test.describe('Assistant page', () => {
 
     await page.getByRole('button', { name: 'Expand @hermes_devbot details' }).click();
 
-    await expect(page.getByText('Recent Gateway Actions', { exact: true })).toBeVisible();
-    await expect(page.getByText('No gateway actions recorded yet.')).toBeVisible();
-    await expect(page.getByText('Scheduled Gateway Messages', { exact: true })).toBeVisible();
-    await expect(page.getByText('No scheduled gateway messages for this bot.')).toBeVisible();
     await expect(page.getByText('No conversations yet. Message the connected gateway to start one.')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Search structured memory for @hermes_devbot' })).toBeVisible();
+    await page.getByRole('button', { name: 'Actions' }).click();
+    await expect(page.getByText('No gateway actions recorded yet.')).toBeVisible();
+    await page.getByRole('button', { name: 'Scheduled' }).click();
+    await expect(page.getByText('No scheduled messages for this gateway.')).toBeVisible();
+    await page.getByRole('button', { name: 'Memory' }).click();
+    await expect(page.getByPlaceholder('Search structured memory...')).toBeVisible();
   });
 });

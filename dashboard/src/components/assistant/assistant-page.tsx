@@ -53,6 +53,7 @@ import {
   User,
   Activity,
   Brain,
+  Clock,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from '@/components/toast';
@@ -79,6 +80,22 @@ function gatewayLabel(bot: AssistantGateway) {
 }
 
 type GatewayTab = 'conversations' | 'actions' | 'scheduled' | 'tasks' | 'memory' | 'skills';
+type AssistantHealthTone = 'ok' | 'warn' | 'error' | 'neutral';
+type RecentAssistantActivity = {
+  id: string;
+  kind: 'Gateway' | 'Conversation' | 'Action' | 'Scheduled';
+  title: string;
+  detail: string;
+  timestamp: string;
+  status?: string;
+};
+type AssistantDiagnostic = {
+  id: string;
+  title: string;
+  detail: string;
+  tone: Exclude<AssistantHealthTone, 'neutral'>;
+  action?: { href: string; label: string };
+};
 
 const GATEWAY_TABS: { id: GatewayTab; label: string }[] = [
   { id: 'conversations', label: 'Conversations' },
@@ -91,6 +108,9 @@ const GATEWAY_TABS: { id: GatewayTab; label: string }[] = [
 
 // Solid, saturated status dots read cleanly on both light and dark surfaces.
 const STATUS_DOT: Record<string, string> = {
+  active: 'bg-emerald-400',
+  completed: 'bg-emerald-400',
+  inactive: 'bg-white/25',
   sent: 'bg-emerald-400',
   pending: 'bg-amber-300',
   failed: 'bg-red-400',
@@ -116,6 +136,14 @@ function relTime(iso: string): string {
 // the globals.css light remap (border-white/* and hover:bg-white/* are remapped).
 const ROW = 'group border-t border-white/[0.04] first:border-t-0';
 const ROW_PAD = 'flex items-start gap-3 px-1 py-2';
+const PANEL = 'rounded-xl border border-white/[0.06] bg-white/[0.02]';
+
+const HEALTH_TONE: Record<AssistantHealthTone, { dot: string; border: string; bg: string; text: string }> = {
+  ok: { dot: 'bg-emerald-400', border: 'border-emerald-500/20', bg: 'bg-emerald-500/[0.06]', text: 'text-emerald-300' },
+  warn: { dot: 'bg-amber-300', border: 'border-amber-500/20', bg: 'bg-amber-500/[0.06]', text: 'text-amber-300' },
+  error: { dot: 'bg-red-400', border: 'border-red-500/20', bg: 'bg-red-500/[0.06]', text: 'text-red-300' },
+  neutral: { dot: 'bg-white/30', border: 'border-white/[0.06]', bg: 'bg-white/[0.02]', text: 'text-white/55' },
+};
 
 function humanizeDuration(seconds: number): string {
   if (seconds <= 0) return '0s';
@@ -257,6 +285,8 @@ export default function AssistantPage() {
   const [createWorkspaceId, setCreateWorkspaceId] = useState('');
   const [createConfigProfile, setCreateConfigProfile] = useState('');
   const [creating, setCreating] = useState(false);
+  const [showCreateMissionDefaults, setShowCreateMissionDefaults] = useState(false);
+  const [showCreateGatewayBehavior, setShowCreateGatewayBehavior] = useState(false);
 
   // Model selector options helper
   const getModelOptionsForBackend = useCallback((backend: string) => {
@@ -294,6 +324,7 @@ export default function AssistantPage() {
   const [editWorkspaceId, setEditWorkspaceId] = useState('');
   const [editConfigProfile, setEditConfigProfile] = useState('');
   const [saving, setSaving] = useState(false);
+  const [showEditMissionDefaults, setShowEditMissionDefaults] = useState(false);
 
   const editModelOptions = useMemo(() => getModelOptionsForBackend(editBackend || 'claudecode'), [getModelOptionsForBackend, editBackend]);
 
@@ -460,6 +491,8 @@ export default function AssistantPage() {
       const bot = await createAssistantGateway(input);
       await mutateBots();
       setShowCreateDialog(false);
+      setShowCreateMissionDefaults(false);
+      setShowCreateGatewayBehavior(false);
       resetCreateForm();
       toast.success(`Bot @${bot.bot_username || 'bot'} created`);
     } catch (err) {
@@ -552,6 +585,7 @@ export default function AssistantPage() {
       });
       await mutateBots();
       setEditingBot(null);
+      setShowEditMissionDefaults(false);
       toast.success('Bot updated');
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to update bot');
@@ -613,13 +647,218 @@ export default function AssistantPage() {
       null,
     [modelChains]
   );
+  const setupDiagnostics = useMemo<AssistantDiagnostic[]>(() => {
+    if (componentsLoading) return [];
+
+    const diagnostics: AssistantDiagnostic[] = [];
+    if (!assistantMcpReady) {
+      diagnostics.push({
+        id: 'assistant-mcp',
+        title: 'assistant-mcp not ready',
+        detail: 'Install assistant-mcp before handing mission control to Hermes.',
+        tone: 'warn',
+      });
+    }
+
+    if (!hermesRuntimeReady) {
+      diagnostics.push({
+        id: 'hermes-runtime',
+        title: hermesRuntime?.installed ? 'Hermes runtime not healthy' : 'Hermes runtime not installed',
+        detail: hermesRuntime?.installed
+          ? `Service reported ${hermesRuntime.status || 'not healthy'}; keep Telegram in compatibility mode.`
+          : 'Install hermes-assistant-dev.service before moving webhook ownership.',
+        tone: hermesRuntime?.installed ? 'warn' : 'error',
+      });
+    }
+
+    if (hermesStatus) {
+      if (!hermesStatus.env_present) {
+        diagnostics.push({
+          id: 'hermes-env',
+          title: 'Hermes env file missing',
+          detail: `${hermesStatus.env_path || 'Hermes assistant env'} is not present, so credentials cannot be loaded.`,
+          tone: 'error',
+        });
+      }
+      if (!hermesStatus.config_present) {
+        diagnostics.push({
+          id: 'hermes-config',
+          title: 'Hermes config missing',
+          detail: `${hermesStatus.config_path || 'Hermes assistant config'} is not present, so runtime defaults are incomplete.`,
+          tone: 'error',
+        });
+      }
+      if (!hermesStatus.token_present) {
+        diagnostics.push({
+          id: 'telegram-token',
+          title: 'Telegram token missing',
+          detail: 'Adopt an existing gateway or set the Hermes assistant token before enabling Telegram ownership.',
+          tone: 'error',
+        });
+      }
+      if (hermesStatus.telegram_last_error) {
+        diagnostics.push({
+          id: 'telegram-error',
+          title: 'Telegram gateway needs attention',
+          detail: hermesStatus.telegram_last_error,
+          tone: 'error',
+        });
+      } else if (hermesStatus.telegram_webhook_configured) {
+        diagnostics.push({
+          id: 'telegram-webhook',
+          title: 'Telegram webhook still configured',
+          detail: 'Hermes polling can be blocked while Telegram still has a webhook registered for this bot.',
+          tone: 'warn',
+        });
+      }
+    }
+
+    if (hermesRuntimeReady && activeGatewayCount > 0) {
+      diagnostics.push({
+        id: 'compatibility-gateways',
+        title: 'Compatibility gateway still active',
+        detail: `Hermes runtime is active while ${activeGatewayCount} compatibility gateway${activeGatewayCount === 1 ? '' : 's'} ${activeGatewayCount === 1 ? 'remains' : 'remain'} active. Use Adopt on the matching gateway to copy the existing token into Hermes and stop the legacy webhook.`,
+        tone: 'warn',
+        action: { href: '#assistant-gateways', label: 'Review gateways' },
+      });
+    }
+
+    return diagnostics;
+  }, [
+    activeGatewayCount,
+    assistantMcpReady,
+    componentsLoading,
+    hermesRuntime,
+    hermesRuntimeReady,
+    hermesStatus,
+  ]);
+  const loadedActivity = useMemo<RecentAssistantActivity[]>(() => {
+    const items: RecentAssistantActivity[] = [];
+    for (const bot of bots) {
+      items.push({
+        id: `gateway:${bot.id}`,
+        kind: 'Gateway',
+        title: gatewayLabel(bot),
+        detail: bot.active ? 'Compatibility gateway active' : 'Gateway inactive',
+        timestamp: bot.updated_at || bot.created_at,
+        status: bot.active ? 'active' : 'inactive',
+      });
+    }
+    for (const [botId, chats] of Object.entries(chatsByBot)) {
+      const bot = bots.find((candidate) => candidate.id === botId);
+      for (const chat of chats) {
+        items.push({
+          id: `chat:${chat.id}`,
+          kind: 'Conversation',
+          title: chat.chat_title || `Chat ${chat.chat_id}`,
+          detail: `${gatewayLabel(bot || ({ bot_username: null } as AssistantGateway))} · ${getMissionTitle(chat.mission_id)}`,
+          timestamp: chat.created_at,
+        });
+      }
+    }
+    for (const [botId, actions] of Object.entries(actionsByBot)) {
+      const bot = bots.find((candidate) => candidate.id === botId);
+      for (const action of actions) {
+        items.push({
+          id: `action:${action.id}`,
+          kind: 'Action',
+          title: action.target_chat_title || `Chat ${action.target_chat_id}`,
+          detail: `${gatewayLabel(bot || ({ bot_username: null } as AssistantGateway))} · ${action.action_kind}`,
+          timestamp: action.updated_at,
+          status: action.status,
+        });
+      }
+    }
+    for (const [botId, scheduled] of Object.entries(scheduledByBot)) {
+      const bot = bots.find((candidate) => candidate.id === botId);
+      for (const message of scheduled) {
+        items.push({
+          id: `scheduled:${message.id}`,
+          kind: 'Scheduled',
+          title: message.chat_title || `Chat ${message.chat_id}`,
+          detail: `${gatewayLabel(bot || ({ bot_username: null } as AssistantGateway))} · ${message.status}`,
+          timestamp: message.sent_at || message.send_at,
+          status: message.status,
+        });
+      }
+    }
+    return items
+      .filter((item) => Boolean(item.timestamp))
+      .sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1))
+      .slice(0, 6);
+  }, [actionsByBot, bots, chatsByBot, getMissionTitle, scheduledByBot]);
+
+  const healthTone: AssistantHealthTone = componentsLoading
+    ? 'neutral'
+    : hermesStatus?.telegram_last_error
+      ? 'error'
+      : hermesRuntimeReady && activeGatewayCount > 0
+        ? 'warn'
+        : hermesRuntimeReady && (hermesStatus?.telegram_ok || activeGatewayCount === 0)
+          ? 'ok'
+          : assistantMcpReady || activeGatewayCount > 0
+            ? 'warn'
+            : 'neutral';
+  const healthCopy = useMemo(() => {
+    if (componentsLoading) {
+      return {
+        title: 'Checking assistant runtime',
+        detail: 'Reading Hermes, assistant-mcp, and Telegram ownership status.',
+        action: 'Status refreshes automatically.',
+      };
+    }
+    if (hermesStatus?.telegram_last_error) {
+      return {
+        title: 'Telegram needs attention',
+        detail: hermesStatus.telegram_last_error,
+        action: 'Fix the Telegram token/webhook state before adopting more gateways.',
+      };
+    }
+    if (hermesRuntimeReady && activeGatewayCount > 0) {
+      return {
+        title: 'Hermes is active, but compatibility gateways remain',
+        detail: `${activeGatewayCount} gateway${activeGatewayCount === 1 ? '' : 's'} still use the legacy Telegram webhook path.`,
+        action: 'Adopt each matching gateway once Hermes owns its bot token.',
+      };
+    }
+    if (hermesRuntimeReady) {
+      return {
+        title: 'Hermes owns the assistant runtime',
+        detail: hermesStatus?.telegram_ok
+          ? `Telegram polling ready for @${hermesStatus.telegram_bot_username || 'telegram'}.`
+          : 'Runtime is healthy; configure a Telegram bot only when you need messaging access.',
+        action: hermesStatus?.telegram_webhook_configured
+          ? 'Telegram webhook is still configured and may block polling.'
+          : `${hermesStatus?.telegram_pending_update_count ?? 0} pending Telegram update${(hermesStatus?.telegram_pending_update_count ?? 0) === 1 ? '' : 's'}.`,
+      };
+    }
+    if (!assistantMcpReady) {
+      return {
+        title: 'Assistant bridge is not ready',
+        detail: 'assistant-mcp is missing or unhealthy, so Hermes cannot safely take mission control yet.',
+        action: 'Install assistant-mcp, then install the Hermes runtime service.',
+      };
+    }
+    return {
+      title: 'Compatibility mode',
+      detail: 'Telegram gateways can run, but Hermes is not yet the owner of the assistant runtime.',
+      action: 'Install hermes-assistant-dev.service before moving bot ownership.',
+    };
+  }, [activeGatewayCount, assistantMcpReady, componentsLoading, hermesRuntimeReady, hermesStatus]);
 
   // ESC to close dialogs
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        if (showCreateDialog) setShowCreateDialog(false);
-        if (editingBot) setEditingBot(null);
+        if (showCreateDialog) {
+          setShowCreateDialog(false);
+          setShowCreateMissionDefaults(false);
+          setShowCreateGatewayBehavior(false);
+        }
+        if (editingBot) {
+          setEditingBot(null);
+          setShowEditMissionDefaults(false);
+        }
       }
     };
     document.addEventListener('keydown', handleKeyDown);
@@ -627,14 +866,13 @@ export default function AssistantPage() {
   }, [showCreateDialog, editingBot]);
 
   return (
-    <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
-      <div className="w-full min-w-[720px] max-w-5xl space-y-6">
-        {/* Header */}
+    <div className="flex-1 flex flex-col items-center overflow-auto p-4 sm:p-6">
+      <div className="w-full min-w-0 max-w-5xl space-y-6">
         <header className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             <h1 className="text-xl font-semibold text-white">Assistant</h1>
             <p className="mt-1 text-sm text-white/50">
-              Hermes runtime, Telegram gateways, and assistant memory.
+              Manage assistant messaging, Hermes ownership, and gateway memory.
             </p>
           </div>
           <button
@@ -646,120 +884,169 @@ export default function AssistantPage() {
           </button>
         </header>
 
-        <div className="grid gap-3 md:grid-cols-4">
-          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
+          <section className={cn(PANEL, HEALTH_TONE[healthTone].border, HEALTH_TONE[healthTone].bg, 'p-4')} aria-label="Assistant health summary">
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className={cn('h-2 w-2 rounded-full', HEALTH_TONE[healthTone].dot)} />
+                  <p className={cn('text-xs font-medium uppercase tracking-[0.08em]', HEALTH_TONE[healthTone].text)}>
+                    Assistant health
+                  </p>
+                </div>
+                <h2 className="mt-2 text-base font-semibold text-white">{healthCopy.title}</h2>
+                <p className="mt-1 max-w-2xl text-sm leading-5 text-white/55">{healthCopy.detail}</p>
+                <p className="mt-2 text-xs text-white/40">{healthCopy.action}</p>
+              </div>
+              <div className="hidden rounded-lg border border-white/[0.06] bg-black/10 px-3 py-2 text-right sm:block">
+                <p className="text-[10px] uppercase tracking-[0.08em] text-white/35">Ownership</p>
+                <p className="mt-1 text-xs font-medium text-white/75">
+                  {hermesRuntimeReady
+                    ? activeGatewayCount > 0
+                      ? 'Mixed'
+                      : 'Hermes'
+                    : 'Compatibility'}
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+              <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-[10px] font-medium uppercase tracking-[0.08em] text-white/35">Bridge</p>
+                  {assistantMcpReady ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> : <CircleDashed className="h-3.5 w-3.5 text-amber-300" />}
+                </div>
+                <p className="mt-1 text-xs font-medium text-white">
+                  {componentsLoading
+                    ? 'Checking assistant-mcp'
+                    : assistantMcpReady
+                      ? `assistant-mcp ${assistantMcp.version || ''}`.trim()
+                      : 'Bridge not ready'}
+                </p>
+                <p className="mt-1 text-[11px] text-white/40">
+                  {assistantMcpReady ? 'Available for Hermes.' : 'Install assistant-mcp before handoff.'}
+                </p>
+              </div>
+              <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-[10px] font-medium uppercase tracking-[0.08em] text-white/35">Messaging</p>
+                  <Cable className="h-3.5 w-3.5 text-white/30" />
+                </div>
+                <p className="mt-1 text-xs font-medium text-white">
+                  {hermesStatus?.telegram_ok
+                    ? `@${hermesStatus.telegram_bot_username || 'telegram'} via Hermes`
+                    : `${activeGatewayCount} active / ${bots.length || 0} configured`}
+                </p>
+                <p className="mt-1 text-[11px] text-white/40">
+                  {hermesStatus?.telegram_ok
+                    ? hermesStatus.telegram_webhook_configured
+                      ? 'Webhook may block polling.'
+                      : `${hermesStatus.telegram_pending_update_count ?? 0} pending updates.`
+                    : `${knownConversationCount} known conversation${knownConversationCount === 1 ? '' : 's'}.`}
+                </p>
+              </div>
+              <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-[10px] font-medium uppercase tracking-[0.08em] text-white/35">Runtime</p>
+                  {hermesRuntimeReady ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> : <CircleDashed className="h-3.5 w-3.5 text-amber-300" />}
+                </div>
+                <p className="mt-1 text-xs font-medium text-white">
+                  {componentsLoading
+                    ? 'Checking Hermes runtime'
+                    : hermesRuntimeReady
+                      ? 'Hermes runtime active'
+                      : hermesRuntime?.installed
+                        ? 'Hermes runtime not healthy'
+                        : 'Runtime not installed'}
+                </p>
+                <p className="mt-1 text-[11px] text-white/40">
+                  {hermesRuntimeReady
+                    ? 'Owns assistant execution.'
+                    : hermesRuntime?.installed
+                      ? `Service reported ${hermesRuntime.status || 'not healthy'}.`
+                      : 'Install runtime service.'}
+                </p>
+              </div>
+              <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-[10px] font-medium uppercase tracking-[0.08em] text-white/35">Routing</p>
+                  <GitBranch className="h-3.5 w-3.5 text-white/30" />
+                </div>
+                <p className="mt-1 text-xs font-medium text-white">
+                  {hermesStatus?.model || assistantChain?.id || 'builtin/smart'}
+                </p>
+                <p className="mt-1 text-[11px] text-white/40">
+                  {assistantChain
+                    ? `${assistantChain.entries.length} fallback ${assistantChain.entries.length === 1 ? 'entry' : 'entries'} via /v1.`
+                    : 'Uses sandboxed.sh /v1 chain.'}
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <section className={cn(PANEL, 'p-4')} aria-label="Recent assistant activity">
             <div className="flex items-center justify-between gap-3">
-              <p className="text-xs font-medium uppercase tracking-[0.08em] text-white/40">MCP</p>
-              {assistantMcpReady ? (
-                <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+              <div>
+                <h2 className="text-sm font-medium text-white">Recent activity</h2>
+                <p className="mt-0.5 text-xs text-[rgb(var(--foreground-tertiary))]">Gateway events loaded in this view.</p>
+              </div>
+              <Clock className="h-4 w-4 text-white/30" />
+            </div>
+            <div className="mt-3">
+              {loadedActivity.length === 0 ? (
+                <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] px-3 py-4 text-xs text-[rgb(var(--foreground-tertiary))]">
+                  Open a gateway below to load conversations, actions, scheduled messages, and memory.
+                </div>
               ) : (
-                <CircleDashed className="h-4 w-4 text-amber-300" />
+                loadedActivity.map((item) => (
+                  <div key={item.id} className="flex items-start gap-3 border-t border-white/[0.04] py-2 first:border-t-0 first:pt-0">
+                    <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', item.status ? STATUS_DOT[item.status] || 'bg-white/25' : 'bg-indigo-400')} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <p className="truncate text-xs font-medium text-[rgb(var(--foreground-secondary))]">{item.title}</p>
+                        <span className="shrink-0 rounded bg-white/[0.05] px-1.5 py-0.5 text-[9px] text-white/35">{item.kind}</span>
+                      </div>
+                      <p className="truncate text-[11px] text-[rgb(var(--foreground-tertiary))]">{item.detail}</p>
+                    </div>
+                    <span className="shrink-0 font-mono text-[10px] text-white/25">{relTime(item.timestamp)}</span>
+                  </div>
+                ))
               )}
             </div>
-            <p className="mt-2 text-sm font-medium text-white">
-              {componentsLoading
-                ? 'Checking assistant-mcp'
-                : assistantMcpReady
-                  ? `assistant-mcp ${assistantMcp.version || ''}`.trim()
-                  : 'assistant-mcp not ready'}
-            </p>
-            <p className="mt-1 text-xs text-white/45">
-              {assistantMcpReady
-                ? `${assistantMcp.path || 'assistant-mcp'} is available for Hermes.`
-                : 'Install assistant-mcp before handing mission control to Hermes.'}
-            </p>
-          </div>
-          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-xs font-medium uppercase tracking-[0.08em] text-white/40">Gateway</p>
-              <Cable className="h-4 w-4 text-white/30" />
-            </div>
-            <p className="mt-2 text-sm font-medium text-white">
-              {hermesStatus?.telegram_ok
-                ? `@${hermesStatus.telegram_bot_username || 'telegram'} via Hermes`
-                : `${activeGatewayCount} active / ${bots.length || 0} configured`}
-            </p>
-            <p className="mt-1 text-xs text-white/45">
-              {hermesStatus?.telegram_ok
-                ? hermesStatus.telegram_webhook_configured
-                  ? 'Telegram webhook is still configured; polling may be blocked.'
-                  : `Polling ready; ${hermesStatus.telegram_pending_update_count ?? 0} pending updates.`
-                : `${knownConversationCount} known conversation${knownConversationCount === 1 ? '' : 's'}.`}
-            </p>
-          </div>
-          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-xs font-medium uppercase tracking-[0.08em] text-white/40">Runtime</p>
-              {hermesRuntimeReady ? (
-                <CheckCircle2 className="h-4 w-4 text-emerald-400" />
-              ) : (
-                <CircleDashed className="h-4 w-4 text-amber-300" />
-              )}
-            </div>
-            <p className="mt-2 text-sm font-medium text-white">
-              {componentsLoading
-                ? 'Checking Hermes runtime'
-                : hermesRuntimeReady
-                  ? 'Hermes runtime active'
-                  : hermesRuntime?.installed
-                    ? 'Hermes runtime not healthy'
-                    : 'Hermes runtime not installed'}
-            </p>
-            <p className="mt-1 text-xs text-white/45">
-              {componentsLoading
-                ? 'Checking the host runtime service.'
-                : hermesRuntimeReady
-                  ? `${hermesRuntime.path || 'hermes-assistant.service'} owns the assistant runtime.`
-                  : hermesRuntime?.installed
-                    ? `Service reported ${hermesRuntime.status || 'not healthy'}; keep Telegram in compatibility mode.`
-                    : 'Install hermes-assistant-dev.service before moving webhook ownership.'}
-            </p>
-          </div>
-          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-xs font-medium uppercase tracking-[0.08em] text-white/40">Routing</p>
-              <GitBranch className="h-4 w-4 text-white/30" />
-            </div>
-            <p className="mt-2 text-sm font-medium text-white">
-              {hermesStatus?.model || assistantChain?.id || 'builtin/smart'}
-            </p>
-            <p className="mt-1 text-xs text-white/45">
-              {assistantChain
-                ? `${assistantChain.entries.length} fallback ${assistantChain.entries.length === 1 ? 'entry' : 'entries'} via /v1.`
-                : 'Hermes should use the sandboxed.sh /v1 proxy chain.'}
-            </p>
-          </div>
+          </section>
         </div>
 
-        {hermesRuntimeReady && activeGatewayCount > 0 && (
-          <div className="flex gap-3 rounded-lg border border-amber-500/20 bg-amber-500/[0.06] p-4">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
-            <div className="min-w-0">
-              <p className="text-sm font-medium text-white">Compatibility gateway still active</p>
-              <p className="mt-1 text-xs leading-5 text-white/50">
-                Hermes runtime is active while {activeGatewayCount} compatibility gateway{activeGatewayCount === 1 ? '' : 's'} {activeGatewayCount === 1 ? 'remains' : 'remain'} active.
-                Use Adopt on the matching gateway to copy the existing token into Hermes and stop the legacy webhook.
-              </p>
-              <a
-                href="#assistant-gateways"
-                className="mt-3 inline-flex text-xs font-medium text-amber-200 hover:text-amber-100"
-              >
-                Review gateways
-              </a>
+        {setupDiagnostics.length > 0 && (
+          <section className={cn(PANEL, 'overflow-hidden')} aria-label="Setup diagnostics">
+            <div className="flex items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
+              <div className="min-w-0">
+                <h2 className="text-sm font-medium text-white">Setup diagnostics</h2>
+                <p className="mt-0.5 text-xs text-white/40">Fix these before moving more Telegram ownership to Hermes.</p>
+              </div>
+              <span className="rounded-md bg-white/[0.04] px-2 py-1 text-[11px] text-white/45">
+                {setupDiagnostics.length} item{setupDiagnostics.length === 1 ? '' : 's'}
+              </span>
             </div>
-          </div>
-        )}
-
-        {hermesStatus?.telegram_last_error && (
-          <div className="flex gap-3 rounded-lg border border-red-500/20 bg-red-500/[0.06] p-4">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-300" />
-            <div className="min-w-0">
-              <p className="text-sm font-medium text-white">Telegram gateway needs attention</p>
-              <p className="mt-1 text-xs leading-5 text-white/50">
-                {hermesStatus.telegram_last_error}
-              </p>
+            <div className="divide-y divide-white/[0.04]">
+              {setupDiagnostics.map((item) => (
+                <div key={item.id} className="flex gap-3 px-4 py-3">
+                  <AlertTriangle className={cn('mt-0.5 h-4 w-4 shrink-0', HEALTH_TONE[item.tone].text)} />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium text-white">{item.title}</p>
+                    <p className="mt-1 text-xs leading-5 text-white/50">{item.detail}</p>
+                    {item.action && (
+                      <a
+                        href={item.action.href}
+                        className={cn('mt-3 inline-flex text-xs font-medium hover:text-white', HEALTH_TONE[item.tone].text)}
+                      >
+                        {item.action.label}
+                      </a>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
-          </div>
+          </section>
         )}
 
         {/* Gateway list */}
@@ -771,7 +1058,7 @@ export default function AssistantPage() {
                 key={i}
                 className="rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden animate-pulse"
               >
-                <div className="p-4 flex items-center gap-4">
+                <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:gap-4">
                   <div className="h-10 w-10 rounded-lg bg-white/[0.04] flex-shrink-0" />
                   <div className="flex-1 min-w-0 space-y-2">
                     <div className="flex items-center gap-2">
@@ -814,11 +1101,11 @@ export default function AssistantPage() {
                 key={bot.id}
                 className="rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden"
               >
-                <div className="p-4 flex items-center gap-4">
+                <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:gap-4">
                   {/* Bot icon */}
                   <div
                     className={cn(
-                      'flex h-10 w-10 items-center justify-center rounded-lg',
+                      'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg',
                       bot.active ? 'bg-emerald-500/10' : 'bg-white/[0.04]'
                     )}
                   >
@@ -876,7 +1163,7 @@ export default function AssistantPage() {
                   </div>
 
                   {/* Actions */}
-                  <div className="flex items-center gap-1">
+                  <div className="flex flex-wrap items-center gap-1 sm:flex-nowrap">
                     {assistantMcpReady && bot.active && (
                       <button
                         type="button"
@@ -898,6 +1185,7 @@ export default function AssistantPage() {
                       type="button"
                       onClick={() => {
                         setEditingBot(bot);
+                        setShowEditMissionDefaults(false);
                         setEditInstructions(bot.instructions || '');
                         setEditTriggerMode(bot.trigger_mode);
                         setEditBackend(bot.default_backend || 'claudecode');
@@ -1088,7 +1376,7 @@ export default function AssistantPage() {
                             ) : shownChats.length === 0 ? (
                               <EmptyHint icon={MessageCircle}>
                                 {chats.length === 0
-                                  ? 'No conversations yet. Message the gateway to start one.'
+                                  ? 'No conversations yet. Message the connected gateway to start one.'
                                   : 'No conversations match your search.'}
                               </EmptyHint>
                             ) : (
@@ -1476,13 +1764,34 @@ export default function AssistantPage() {
                   Auto-detected from token if omitted
                 </p>
               </div>
-
-              {/* Divider */}
-              <div className="border-t border-white/[0.06] pt-4">
-                <p className="text-xs text-white/40 mb-3">Default mission settings for new conversations</p>
+              <div>
+                <label className="block text-sm text-white/60 mb-1">Allowed Chat IDs (optional)</label>
+                <input
+                  type="text"
+                  placeholder="-1001234567890, 987654321"
+                  value={createAllowedChatIds}
+                  onChange={(e) => setCreateAllowedChatIds(e.target.value)}
+                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50 font-mono text-sm"
+                />
+                <p className="text-[10px] text-white/30 mt-1">
+                  Leave empty to allow all chats. Comma-separated Telegram chat IDs.
+                </p>
               </div>
 
-              <div>
+              <button
+                type="button"
+                onClick={() => setShowCreateMissionDefaults((open) => !open)}
+                className="flex w-full items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-left text-xs font-medium text-white/65 hover:bg-white/[0.04]"
+                aria-expanded={showCreateMissionDefaults}
+              >
+                <span>Advanced mission defaults</span>
+                {showCreateMissionDefaults ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+              </button>
+
+              {showCreateMissionDefaults && (
+                <div className="space-y-4 rounded-lg border border-white/[0.05] bg-white/[0.015] p-3">
+                  <p className="text-xs text-white/40">Defaults for new conversations created by this gateway.</p>
+                  <div>
                 <label className="block text-sm text-white/60 mb-1">Backend</label>
                 <select
                   value={createBackend}
@@ -1499,10 +1808,10 @@ export default function AssistantPage() {
                         <option key={id} value={id}>
                           {BACKEND_LABELS[id] || id}
                         </option>
-                      ))}
+                  ))}
                 </select>
-              </div>
-              <div>
+                  </div>
+                  <div>
                 <label className="block text-sm text-white/60 mb-1">Model Override (optional)</label>
                 <select
                   value={createModelOverride}
@@ -1530,7 +1839,7 @@ export default function AssistantPage() {
                     ));
                   })()}
                 </select>
-              </div>
+                  </div>
               {(createBackend === 'claudecode' || createBackend === 'codex') && (
                 <div>
                   <label className="block text-sm text-white/60 mb-1">Model Effort (optional)</label>
@@ -1565,7 +1874,7 @@ export default function AssistantPage() {
                   </select>
                 </div>
               )}
-              <div>
+                  <div>
                 <label className="block text-sm text-white/60 mb-1">Config Profile (optional)</label>
                 <select
                   value={createConfigProfile}
@@ -1579,14 +1888,23 @@ export default function AssistantPage() {
                     </option>
                   ))}
                 </select>
+                  </div>
               </div>
+              )}
 
-              {/* Divider */}
-              <div className="border-t border-white/[0.06] pt-4">
-                <p className="text-xs text-white/40 mb-3">Gateway behavior</p>
-              </div>
+              <button
+                type="button"
+                onClick={() => setShowCreateGatewayBehavior((open) => !open)}
+                className="flex w-full items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-left text-xs font-medium text-white/65 hover:bg-white/[0.04]"
+                aria-expanded={showCreateGatewayBehavior}
+              >
+                <span>Advanced gateway behavior</span>
+                {showCreateGatewayBehavior ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+              </button>
 
-              <div>
+              {showCreateGatewayBehavior && (
+                <div className="space-y-4 rounded-lg border border-white/[0.05] bg-white/[0.015] p-3">
+                  <div>
                 <label className="block text-sm text-white/60 mb-1">Trigger Mode</label>
                 <select
                   value={createTriggerMode}
@@ -1599,8 +1917,8 @@ export default function AssistantPage() {
                     </option>
                   ))}
                 </select>
-              </div>
-              <div>
+                  </div>
+                  <div>
                 <label className="block text-sm text-white/60 mb-1">Instructions (optional)</label>
                 <textarea
                   placeholder="You are a helpful assistant. Respond in plain text without markdown."
@@ -1612,25 +1930,16 @@ export default function AssistantPage() {
                 <p className="text-[10px] text-white/30 mt-1">
                   Prepended to every message. Set personality and formatting rules.
                 </p>
+                  </div>
               </div>
-              <div>
-                <label className="block text-sm text-white/60 mb-1">Allowed Chat IDs (optional)</label>
-                <input
-                  type="text"
-                  placeholder="-1001234567890, 987654321"
-                  value={createAllowedChatIds}
-                  onChange={(e) => setCreateAllowedChatIds(e.target.value)}
-                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50 font-mono text-sm"
-                />
-                <p className="text-[10px] text-white/30 mt-1">
-                  Leave empty to allow all chats. Comma-separated Telegram chat IDs.
-                </p>
-              </div>
+              )}
             </div>
             <div className="flex justify-end gap-2 mt-6">
               <button
                 onClick={() => {
                   setShowCreateDialog(false);
+                  setShowCreateMissionDefaults(false);
+                  setShowCreateGatewayBehavior(false);
                   resetCreateForm();
                 }}
                 className="px-4 py-2 text-sm text-white/60 hover:text-white"
@@ -1670,113 +1979,6 @@ export default function AssistantPage() {
               </div>
             )}
             <div className="space-y-4">
-              {/* Mission settings */}
-              <div className="border-b border-white/[0.06] pb-3">
-                <p className="text-xs text-white/40 mb-3">Default mission settings for new conversations</p>
-              </div>
-              <div>
-                <label className="block text-sm text-white/60 mb-1">Backend</label>
-                <select
-                  value={editBackend}
-                  onChange={(e) => setEditBackend(e.target.value)}
-                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
-                >
-                  {backends.length > 0
-                    ? backends.map((b: Backend) => (
-                        <option key={b.id} value={b.id}>
-                          {BACKEND_LABELS[b.id] || b.name || b.id}
-                        </option>
-                      ))
-                    : ['claudecode', 'opencode', 'codex', 'gemini', 'grok'].map((id) => (
-                        <option key={id} value={id}>
-                          {BACKEND_LABELS[id] || id}
-                        </option>
-                      ))}
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm text-white/60 mb-1">Model Override</label>
-                <select
-                  value={editModelOverride}
-                  onChange={(e) => setEditModelOverride(e.target.value)}
-                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50 text-sm [&>option]:bg-slate-800 [&>option]:text-white [&>optgroup]:bg-slate-900 [&>optgroup]:text-white/70"
-                >
-                  <option value="">No override (use default)</option>
-                  {(() => {
-                    const groupedOptions = new Map<string, Array<{ value: string; label: string; description?: string }>>();
-                    for (const option of editModelOptions) {
-                      const providerName = option.label.split(/\s[—·]\s/)[0] || 'Other';
-                      if (!groupedOptions.has(providerName)) groupedOptions.set(providerName, []);
-                      groupedOptions.get(providerName)!.push(option);
-                    }
-                    return Array.from(groupedOptions.entries()).map(([providerName, options]) => (
-                      <optgroup key={providerName} label={providerName}>
-                        {options.map((option) => {
-                          const modelName = option.label.split(/\s[—·]\s/)[1] || option.label;
-                          const displayText = option.description ? `${modelName} - ${option.description}` : modelName;
-                          return (
-                            <option key={option.value} value={option.value}>{displayText}</option>
-                          );
-                        })}
-                      </optgroup>
-                    ));
-                  })()}
-                </select>
-              </div>
-              {(editBackend === 'claudecode' || editBackend === 'codex') && (
-                <div>
-                  <label className="block text-sm text-white/60 mb-1">Model Effort</label>
-                  <select
-                    value={editModelEffort}
-                    onChange={(e) => setEditModelEffort(e.target.value)}
-                    className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
-                  >
-                    <option value="">Default</option>
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                    {editBackend === 'claudecode' && <option value="xhigh">XHigh</option>}
-                    {editBackend === 'claudecode' && <option value="max">Max</option>}
-                  </select>
-                </div>
-              )}
-              {workspaces.length > 0 && (
-                <div>
-                  <label className="block text-sm text-white/60 mb-1">Workspace</label>
-                  <select
-                    value={editWorkspaceId}
-                    onChange={(e) => setEditWorkspaceId(e.target.value)}
-                    className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
-                  >
-                    <option value="">Host (default)</option>
-                    {workspaces.map((w: Workspace) => (
-                      <option key={w.id} value={w.id}>
-                        {w.name || w.id.slice(0, 8) + '...'}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
-              <div>
-                <label className="block text-sm text-white/60 mb-1">Config Profile</label>
-                <select
-                  value={editConfigProfile}
-                  onChange={(e) => setEditConfigProfile(e.target.value)}
-                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
-                >
-                  <option value="">None (use workspace default)</option>
-                  {configProfiles.map((p: ConfigProfileSummary) => (
-                    <option key={p.name} value={p.name}>
-                      {p.name}{p.is_default ? ' (default)' : ''}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              {/* Gateway behavior */}
-              <div className="border-t border-white/[0.06] pt-4">
-                <p className="text-xs text-white/40 mb-3">Gateway behavior</p>
-              </div>
               <div>
                 <label className="block text-sm text-white/60 mb-1">Trigger Mode</label>
                 <select
@@ -1801,10 +2003,124 @@ export default function AssistantPage() {
                   className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50 resize-none text-sm"
                 />
               </div>
+              <button
+                type="button"
+                onClick={() => setShowEditMissionDefaults((open) => !open)}
+                className="flex w-full items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-left text-xs font-medium text-white/65 hover:bg-white/[0.04]"
+                aria-expanded={showEditMissionDefaults}
+              >
+                <span>Advanced mission defaults</span>
+                {showEditMissionDefaults ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+              </button>
+              {showEditMissionDefaults && (
+                <div className="space-y-4 rounded-lg border border-white/[0.05] bg-white/[0.015] p-3">
+                  <div>
+                    <label className="block text-sm text-white/60 mb-1">Backend</label>
+                    <select
+                      value={editBackend}
+                      onChange={(e) => setEditBackend(e.target.value)}
+                      className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                    >
+                      {backends.length > 0
+                        ? backends.map((b: Backend) => (
+                            <option key={b.id} value={b.id}>
+                              {BACKEND_LABELS[b.id] || b.name || b.id}
+                            </option>
+                          ))
+                        : ['claudecode', 'opencode', 'codex', 'gemini', 'grok'].map((id) => (
+                            <option key={id} value={id}>
+                              {BACKEND_LABELS[id] || id}
+                            </option>
+                          ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm text-white/60 mb-1">Model Override</label>
+                    <select
+                      value={editModelOverride}
+                      onChange={(e) => setEditModelOverride(e.target.value)}
+                      className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50 text-sm [&>option]:bg-slate-800 [&>option]:text-white [&>optgroup]:bg-slate-900 [&>optgroup]:text-white/70"
+                    >
+                      <option value="">No override (use default)</option>
+                      {(() => {
+                        const groupedOptions = new Map<string, Array<{ value: string; label: string; description?: string }>>();
+                        for (const option of editModelOptions) {
+                          const providerName = option.label.split(/\s[—·]\s/)[0] || 'Other';
+                          if (!groupedOptions.has(providerName)) groupedOptions.set(providerName, []);
+                          groupedOptions.get(providerName)!.push(option);
+                        }
+                        return Array.from(groupedOptions.entries()).map(([providerName, options]) => (
+                          <optgroup key={providerName} label={providerName}>
+                            {options.map((option) => {
+                              const modelName = option.label.split(/\s[—·]\s/)[1] || option.label;
+                              const displayText = option.description ? `${modelName} - ${option.description}` : modelName;
+                              return (
+                                <option key={option.value} value={option.value}>{displayText}</option>
+                              );
+                            })}
+                          </optgroup>
+                        ));
+                      })()}
+                    </select>
+                  </div>
+                  {(editBackend === 'claudecode' || editBackend === 'codex') && (
+                    <div>
+                      <label className="block text-sm text-white/60 mb-1">Model Effort</label>
+                      <select
+                        value={editModelEffort}
+                        onChange={(e) => setEditModelEffort(e.target.value)}
+                        className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                      >
+                        <option value="">Default</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        {editBackend === 'claudecode' && <option value="xhigh">XHigh</option>}
+                        {editBackend === 'claudecode' && <option value="max">Max</option>}
+                      </select>
+                    </div>
+                  )}
+                  {workspaces.length > 0 && (
+                    <div>
+                      <label className="block text-sm text-white/60 mb-1">Workspace</label>
+                      <select
+                        value={editWorkspaceId}
+                        onChange={(e) => setEditWorkspaceId(e.target.value)}
+                        className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                      >
+                        <option value="">Host (default)</option>
+                        {workspaces.map((w: Workspace) => (
+                          <option key={w.id} value={w.id}>
+                            {w.name || w.id.slice(0, 8) + '...'}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                  <div>
+                    <label className="block text-sm text-white/60 mb-1">Config Profile</label>
+                    <select
+                      value={editConfigProfile}
+                      onChange={(e) => setEditConfigProfile(e.target.value)}
+                      className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                    >
+                      <option value="">None (use workspace default)</option>
+                      {configProfiles.map((p: ConfigProfileSummary) => (
+                        <option key={p.name} value={p.name}>
+                          {p.name}{p.is_default ? ' (default)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="flex justify-end gap-2 mt-6">
               <button
-                onClick={() => setEditingBot(null)}
+                onClick={() => {
+                  setEditingBot(null);
+                  setShowEditMissionDefaults(false);
+                }}
                 className="px-4 py-2 text-sm text-white/60 hover:text-white"
               >
                 Cancel
