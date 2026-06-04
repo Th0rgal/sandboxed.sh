@@ -741,27 +741,27 @@ export function DesktopStream({
       data-stream-display={displayId}
       data-stream-backend={streamBackend}
       className={cn(
-        "app-stream-surface relative flex min-h-[320px] flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-[#08090b] shadow-[0_24px_80px_rgba(0,0,0,0.32)]",
+        "app-stream-surface relative flex min-h-[320px] flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-[0_18px_55px_rgba(15,23,42,0.12)] dark:border-white/[0.08] dark:bg-[#08090b] dark:shadow-[0_24px_80px_rgba(0,0,0,0.32)]",
         className
       )}
     >
-      <div className="flex items-center justify-between gap-3 border-b border-white/[0.08] bg-white/[0.035] px-3 py-2.5">
+      <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-slate-50/80 px-3 py-2.5 dark:border-white/[0.08] dark:bg-white/[0.035]">
         <div className="flex min-w-0 items-center gap-3">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-indigo-400/25 bg-indigo-400/12 text-indigo-200">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-indigo-200 bg-indigo-50 text-indigo-600 dark:border-indigo-400/25 dark:bg-indigo-400/12 dark:text-indigo-200">
             <AppWindow className="h-[18px] w-[18px]" />
           </div>
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-2">
-              <span className="truncate text-sm font-semibold text-white/90">
+              <span className="truncate text-sm font-semibold text-slate-950 dark:text-white/90">
                 {streamTitle}
               </span>
-              <span className="hidden rounded-md border border-white/[0.08] bg-black/30 px-1.5 py-0.5 font-mono text-[11px] text-white/55 sm:inline">
+              <span className="hidden rounded-md border border-slate-200 bg-white px-1.5 py-0.5 font-mono text-[11px] text-slate-500 sm:inline dark:border-white/[0.08] dark:bg-black/30 dark:text-white/55">
                 {displayId}
               </span>
             </div>
-            <div className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-white/45">
+            <div className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-slate-500 dark:text-white/45">
               <span className="truncate">{backendLabel}</span>
-              <span className="text-white/20">/</span>
+              <span className="text-slate-300 dark:text-white/20">/</span>
               <span>{compositorLabel}</span>
             </div>
           </div>
@@ -772,10 +772,10 @@ export function DesktopStream({
             className={cn(
               "hidden items-center gap-1.5 rounded-md border px-2 py-1 text-xs sm:flex",
               connectionState === "connected"
-                ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-400/20 dark:bg-emerald-400/10 dark:text-emerald-300"
                 : connectionState === "connecting"
-                ? "border-amber-400/20 bg-amber-400/10 text-amber-300"
-                : "border-red-400/20 bg-red-400/10 text-red-300"
+                ? "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-400/20 dark:bg-amber-400/10 dark:text-amber-300"
+                : "border-red-200 bg-red-50 text-red-700 dark:border-red-400/20 dark:bg-red-400/10 dark:text-red-300"
             )}
           >
             <span
@@ -783,7 +783,7 @@ export function DesktopStream({
                 "h-1.5 w-1.5 rounded-full",
                 connectionState === "connected"
                   ? "bg-emerald-300"
-                  : connectionState === "connecting"
+                : connectionState === "connecting"
                   ? "animate-pulse bg-amber-300"
                   : "bg-red-300"
               )}
@@ -804,9 +804,9 @@ export function DesktopStream({
                 "rounded-lg p-2 transition-colors",
                 connectionState === "connected"
                   ? isPipActive
-                    ? "bg-indigo-400/20 text-indigo-200 hover:bg-indigo-400/25"
-                    : "text-white/55 hover:bg-white/10 hover:text-white"
-                  : "text-white/30 cursor-not-allowed"
+                    ? "bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-400/20 dark:text-indigo-200 dark:hover:bg-indigo-400/25"
+                    : "text-slate-500 hover:bg-slate-100 hover:text-slate-950 dark:text-white/55 dark:hover:bg-white/10 dark:hover:text-white"
+                  : "cursor-not-allowed text-slate-300 dark:text-white/30"
               )}
               title={isPipActive ? "Exit Picture-in-Picture" : "Picture-in-Picture"}
             >
@@ -815,7 +815,7 @@ export function DesktopStream({
           )}
           <button
             onClick={handleFullscreen}
-            className="rounded-lg p-2 text-white/55 transition-colors hover:bg-white/10 hover:text-white"
+            className="rounded-lg p-2 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-950 dark:text-white/55 dark:hover:bg-white/10 dark:hover:text-white"
             title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
           >
             {isFullscreen ? (
@@ -827,7 +827,7 @@ export function DesktopStream({
           {onClose && (
             <button
               onClick={onClose}
-              className="rounded-lg p-2 text-white/55 transition-colors hover:bg-white/10 hover:text-white"
+              className="rounded-lg p-2 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-950 dark:text-white/55 dark:hover:bg-white/10 dark:hover:text-white"
               title="Close"
             >
               <X className="w-4 h-4" />
@@ -836,28 +836,28 @@ export function DesktopStream({
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2 border-b border-white/[0.06] bg-black/20 px-3 py-2 text-xs text-white/50">
-        <span className="inline-flex items-center gap-1.5 rounded-md bg-white/[0.04] px-2 py-1">
-          <Gauge className="h-3.5 w-3.5 text-indigo-200" />
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-white/[0.06] dark:bg-black/20 dark:text-white/50">
+        <span className="inline-flex items-center gap-1.5 rounded-md bg-white px-2 py-1 ring-1 ring-slate-200 dark:bg-white/[0.04] dark:ring-0">
+          <Gauge className="h-3.5 w-3.5 text-indigo-600 dark:text-indigo-200" />
           {latencyLabel}
         </span>
-        <span className="inline-flex items-center gap-1.5 rounded-md bg-white/[0.04] px-2 py-1">
-          <MousePointer2 className="h-3.5 w-3.5 text-white/45" />
+        <span className="inline-flex items-center gap-1.5 rounded-md bg-white px-2 py-1 ring-1 ring-slate-200 dark:bg-white/[0.04] dark:ring-0">
+          <MousePointer2 className="h-3.5 w-3.5 text-slate-500 dark:text-white/45" />
           Pointer
         </span>
-        <span className="inline-flex items-center gap-1.5 rounded-md bg-white/[0.04] px-2 py-1">
-          <Keyboard className="h-3.5 w-3.5 text-white/45" />
+        <span className="inline-flex items-center gap-1.5 rounded-md bg-white px-2 py-1 ring-1 ring-slate-200 dark:bg-white/[0.04] dark:ring-0">
+          <Keyboard className="h-3.5 w-3.5 text-slate-500 dark:text-white/45" />
           Keyboard
         </span>
-        <span className="ml-auto hidden font-mono text-[11px] text-white/35 sm:inline">
+        <span className="ml-auto hidden font-mono text-[11px] text-slate-400 dark:text-white/35 sm:inline">
           {frameCount} frames
         </span>
       </div>
 
       {/* App viewport */}
-      <div className="flex min-h-[220px] flex-1 items-center justify-center bg-[radial-gradient(circle_at_center,rgba(99,102,241,0.08),transparent_42%),#020203] p-2">
+      <div className="flex min-h-[220px] flex-1 items-center justify-center bg-slate-100 p-2 dark:bg-[radial-gradient(circle_at_center,rgba(99,102,241,0.08),transparent_42%),#020203]">
         {connectionState === "connected" && !errorMessage ? (
-          <div className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg border border-white/[0.06] bg-black shadow-inner">
+          <div className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg border border-slate-300 bg-slate-200 shadow-inner dark:border-white/[0.06] dark:bg-black">
             <canvas
               ref={canvasRef}
               data-testid="app-stream-canvas"
@@ -876,28 +876,28 @@ export function DesktopStream({
               onWheel={handleWheel}
             />
             {inputErrorMessage && (
-              <div className="pointer-events-none absolute left-3 right-3 top-3 rounded-lg border border-amber-400/25 bg-black/75 px-3 py-2 text-xs text-amber-200 shadow-lg">
+              <div className="pointer-events-none absolute left-3 right-3 top-3 rounded-lg border border-amber-300 bg-amber-50/95 px-3 py-2 text-xs text-amber-800 shadow-lg dark:border-amber-400/25 dark:bg-black/75 dark:text-amber-200">
                 {inputErrorMessage}
               </div>
             )}
           </div>
         ) : connectionState === "connecting" ? (
           <div className="h-full w-full p-4">
-            <div className="flex h-full min-h-[220px] items-center justify-center rounded-lg border border-white/[0.06] bg-white/[0.03]">
-              <div className="h-28 w-44 animate-pulse rounded-md border border-white/[0.05] bg-white/[0.04]" />
+            <div className="flex h-full min-h-[220px] items-center justify-center rounded-lg border border-slate-200 bg-white dark:border-white/[0.06] dark:bg-white/[0.03]">
+              <div className="h-28 w-44 animate-pulse rounded-md border border-slate-200 bg-slate-100 dark:border-white/[0.05] dark:bg-white/[0.04]" />
             </div>
           </div>
         ) : (
-          <div className="flex flex-col items-center gap-4 text-white/60 px-6 py-8">
-            <MonitorOff className="w-14 h-14 text-red-400/50" />
+          <div className="flex flex-col items-center gap-4 px-6 py-8 text-slate-600 dark:text-white/60">
+            <MonitorOff className="w-14 h-14 text-red-500/60 dark:text-red-400/50" />
             <div className="flex flex-col items-center gap-1.5 text-center">
-              <h3 className="text-base font-medium text-white/80">
+              <h3 className="text-base font-medium text-slate-900 dark:text-white/80">
                 {errorMessage?.includes("no longer available") ||
                 errorMessage?.includes("session may have")
                   ? "App Stream Unavailable"
                   : "Connection Lost"}
               </h3>
-              <p className="max-w-[280px] text-sm text-white/50 leading-relaxed">
+              <p className="max-w-[280px] text-sm leading-relaxed text-slate-500 dark:text-white/50">
                 {errorMessage?.includes("no longer available") ||
                 errorMessage?.includes("session may have")
                   ? `Session ${displayId} has been closed. Select another app stream above.`
@@ -915,7 +915,7 @@ export function DesktopStream({
         )}
       </div>
 
-      <div className="border-t border-white/[0.08] bg-white/[0.035] px-3 py-3">
+      <div className="border-t border-slate-200 bg-slate-50/80 px-3 py-3 dark:border-white/[0.08] dark:bg-white/[0.035]">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex items-center gap-2">
             <button
@@ -924,8 +924,8 @@ export function DesktopStream({
               className={cn(
                 "rounded-lg p-2 transition-colors",
                 connectionState === "connected"
-                  ? "bg-white/10 text-white hover:bg-white/20"
-                  : "bg-white/5 text-white/30 cursor-not-allowed"
+                  ? "bg-slate-200 text-slate-800 hover:bg-slate-300 dark:bg-white/10 dark:text-white dark:hover:bg-white/20"
+                  : "cursor-not-allowed bg-slate-100 text-slate-300 dark:bg-white/5 dark:text-white/30"
               )}
               title={isPaused ? "Resume" : "Pause"}
             >
@@ -938,13 +938,13 @@ export function DesktopStream({
 
             <button
               onClick={connect}
-              className="rounded-lg bg-white/10 p-2 text-white transition-colors hover:bg-white/20"
+              className="rounded-lg bg-slate-200 p-2 text-slate-800 transition-colors hover:bg-slate-300 dark:bg-white/10 dark:text-white dark:hover:bg-white/20"
               title="Reconnect"
             >
               <RefreshCw className="w-4 h-4" />
             </button>
 
-            <div className="ml-1 inline-flex overflow-hidden rounded-lg border border-white/[0.08] bg-black/20">
+            <div className="ml-1 inline-flex overflow-hidden rounded-lg border border-slate-200 bg-white dark:border-white/[0.08] dark:bg-black/20">
               {(["fit", "fill"] as const).map((mode) => (
                 <button
                   key={mode}
@@ -954,8 +954,8 @@ export function DesktopStream({
                   className={cn(
                     "inline-flex items-center gap-1.5 px-2.5 py-2 text-xs font-medium capitalize transition-colors",
                     viewportMode === mode
-                      ? "bg-indigo-400/18 text-indigo-100"
-                      : "text-white/45 hover:bg-white/[0.06] hover:text-white/75"
+                      ? "bg-indigo-100 text-indigo-700 dark:bg-indigo-400/18 dark:text-indigo-100"
+                      : "text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-white/45 dark:hover:bg-white/[0.06] dark:hover:text-white/75"
                   )}
                   title={mode === "fit" ? "Fit app to surface" : "Fill surface"}
                 >
@@ -968,7 +968,7 @@ export function DesktopStream({
 
           <div className="flex min-w-0 flex-1 flex-col gap-2 lg:flex-row lg:items-center xl:max-w-xl">
             <div className="flex min-w-0 flex-1 items-center gap-2">
-              <span className="flex w-14 items-center gap-1 text-xs text-white/45">
+              <span className="flex w-14 items-center gap-1 text-xs text-slate-500 dark:text-white/45">
                 <SlidersHorizontal className="h-3.5 w-3.5" />
                 FPS
               </span>
@@ -979,15 +979,15 @@ export function DesktopStream({
                 value={fps}
                 onChange={(e) => handleFpsChange(Number(e.target.value))}
                 aria-label="Stream FPS"
-                className="h-1 flex-1 cursor-pointer appearance-none rounded-full bg-white/20 accent-indigo-400 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-indigo-400"
+                className="h-1 flex-1 cursor-pointer appearance-none rounded-full bg-slate-300 accent-indigo-500 dark:bg-white/20 dark:accent-indigo-400 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-indigo-500 dark:[&::-webkit-slider-thumb]:bg-indigo-400"
               />
-              <span className="text-xs text-white/60 w-6 text-right tabular-nums">
+              <span className="w-6 text-right text-xs tabular-nums text-slate-600 dark:text-white/60">
                 {fps}
               </span>
             </div>
 
             <div className="flex min-w-0 flex-1 items-center gap-2">
-              <span className="w-14 text-xs text-white/45">Quality</span>
+              <span className="w-14 text-xs text-slate-500 dark:text-white/45">Quality</span>
               <input
                 type="range"
                 min={10}
@@ -996,9 +996,9 @@ export function DesktopStream({
                 value={quality}
                 onChange={(e) => handleQualityChange(Number(e.target.value))}
                 aria-label="Stream quality"
-                className="h-1 flex-1 cursor-pointer appearance-none rounded-full bg-white/20 accent-indigo-400 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-indigo-400"
+                className="h-1 flex-1 cursor-pointer appearance-none rounded-full bg-slate-300 accent-indigo-500 dark:bg-white/20 dark:accent-indigo-400 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-indigo-500 dark:[&::-webkit-slider-thumb]:bg-indigo-400"
               />
-              <span className="text-xs text-white/60 w-8 text-right tabular-nums">
+              <span className="w-8 text-right text-xs tabular-nums text-slate-600 dark:text-white/60">
                 {quality}%
               </span>
             </div>

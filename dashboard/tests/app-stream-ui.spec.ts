@@ -1,4 +1,5 @@
 import { mkdir } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { expect, test, type Page, type Route } from "@playwright/test";
 
@@ -15,7 +16,7 @@ async function fulfillJson(route: Route, body: unknown, status = 200) {
   });
 }
 
-async function mockAppStreamControl(page: Page) {
+async function mockAppStreamControl(page: Page, frameBase64: string) {
   const now = new Date().toISOString();
   const session = {
     display: ":42",
@@ -41,7 +42,11 @@ async function mockAppStreamControl(page: Page) {
     desktop_sessions: [session],
   };
 
-  await page.addInitScript(() => {
+  await page.addInitScript((base64Frame) => {
+    const frameBytes = Uint8Array.from(atob(base64Frame), (char) =>
+      char.charCodeAt(0)
+    );
+
     class MockWebSocket {
       static CONNECTING = 0;
       static OPEN = 1;
@@ -56,7 +61,13 @@ async function mockAppStreamControl(page: Page) {
       onclose: (() => void) | null = null;
 
       constructor() {
-        window.setTimeout(() => this.onopen?.(), 20);
+        window.setTimeout(() => {
+          this.onopen?.();
+          window.setTimeout(() => {
+            const frame = frameBytes.slice().buffer;
+            this.onmessage?.({ data: frame });
+          }, 20);
+        }, 20);
       }
 
       send() {}
@@ -72,7 +83,7 @@ async function mockAppStreamControl(page: Page) {
       writable: true,
       value: MockWebSocket,
     });
-  });
+  }, frameBase64);
 
   await page.route("**/api/**", async (route) => {
     const request = route.request();
@@ -173,7 +184,13 @@ async function mockAppStreamControl(page: Page) {
 
 test("control exposes a focused app-stream surface", async ({ page }) => {
   await mkdir(SCREENSHOT_DIR, { recursive: true });
-  await mockAppStreamControl(page);
+  const frameBase64 = readFileSync(
+    path.join(process.cwd(), "tests/fixtures/wayland-real-app-foot.jpg")
+  ).toString("base64");
+  await mockAppStreamControl(page, frameBase64);
+  await page.addInitScript(() => {
+    localStorage.setItem("sandboxed-theme", "dark");
+  });
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/control");
 
@@ -181,18 +198,57 @@ test("control exposes a focused app-stream surface", async ({ page }) => {
   await expect(page.getByText("Interactive app surface")).toBeVisible();
   await expect(page.getByText("Pointer")).toBeVisible();
   await expect(page.getByText("Keyboard")).toBeVisible();
+  await expect
+    .poll(async () =>
+      page.getByTestId("app-stream-canvas").evaluate((canvas) => {
+        const element = canvas as HTMLCanvasElement;
+        return `${element.width}x${element.height}`;
+      })
+    )
+    .toBe("1280x720");
+  const visiblePixels = await page
+    .getByTestId("app-stream-canvas")
+    .evaluate((canvas) => {
+      const element = canvas as HTMLCanvasElement;
+      const context = element.getContext("2d");
+      if (!context) return 0;
+      const { data } = context.getImageData(0, 0, element.width, element.height);
+      let visible = 0;
+      for (let i = 0; i < data.length; i += 400) {
+        if (data[i] > 40 || data[i + 1] > 40 || data[i + 2] > 40) {
+          visible += 1;
+        }
+      }
+      return visible;
+    });
+  expect(visiblePixels).toBeGreaterThan(1000);
 
   await page
     .getByTestId("app-stream-panel")
-    .screenshot({ path: path.join(SCREENSHOT_DIR, "app-stream-surface-desktop.png") });
+    .screenshot({ path: path.join(SCREENSHOT_DIR, "app-stream-surface-dark.png") });
   await page.screenshot({
-    path: path.join(SCREENSHOT_DIR, "app-stream-control-desktop.png"),
+    path: path.join(SCREENSHOT_DIR, "app-stream-control-dark.png"),
+    fullPage: true,
+  });
+
+  await page.evaluate(() => {
+    localStorage.setItem("sandboxed-theme", "light");
+    document.documentElement.dataset.theme = "light";
+  });
+  await page
+    .getByTestId("app-stream-panel")
+    .screenshot({ path: path.join(SCREENSHOT_DIR, "app-stream-surface-light.png") });
+  await page.screenshot({
+    path: path.join(SCREENSHOT_DIR, "app-stream-control-light.png"),
     fullPage: true,
   });
 
   await page.setViewportSize({ width: 390, height: 844 });
+  await page.evaluate(() => {
+    document.documentElement.dataset.theme = "light";
+  });
   await page.screenshot({
-    path: path.join(SCREENSHOT_DIR, "app-stream-control-mobile.png"),
+    path: path.join(SCREENSHOT_DIR, "app-stream-control-mobile-light.png"),
     fullPage: true,
   });
 });
