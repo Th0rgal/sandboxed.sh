@@ -60,7 +60,7 @@ pub struct DesktopSessionDetail {
     /// Seconds until auto-close (if orphaned and grace period applies).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_close_in_secs: Option<i64>,
-    /// Whether the Xvfb process is actually running.
+    /// Whether the session compositor process is actually running.
     pub process_running: bool,
 }
 
@@ -292,8 +292,14 @@ async fn cleanup_stopped_sessions(State(state): State<Arc<AppState>>) -> Json<Op
                 continue;
             }
 
-            // Check if process is actually running
-            if is_xvfb_running(&session.display).await {
+            let display_server = session.display_server.as_deref().unwrap_or("wayland");
+            if is_desktop_session_running(
+                &session.display,
+                display_server,
+                &state.config.working_dir,
+            )
+            .await
+            {
                 truly_active.push(session.clone());
             } else {
                 removed_count += 1;
@@ -380,7 +386,16 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
     // Collect sessions from missions
     for mission in missions {
         for session in &mission.desktop_sessions {
-            let process_running = is_xvfb_running(&session.display).await;
+            let display_server_value = session
+                .display_server
+                .clone()
+                .unwrap_or_else(|| "wayland".to_string());
+            let process_running = is_desktop_session_running(
+                &session.display,
+                &display_server_value,
+                &state.config.working_dir,
+            )
+            .await;
 
             // Determine session status
             let status = if session.stopped_at.is_some() || !process_running {
@@ -423,14 +438,11 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
 
             let detail = DesktopSessionDetail {
                 display: session.display.clone(),
-                display_server: session
-                    .display_server
-                    .clone()
-                    .unwrap_or_else(|| "x11".to_string()),
+                display_server: display_server_value,
                 compositor: session
                     .compositor
                     .clone()
-                    .or_else(|| Some("i3".to_string())),
+                    .or_else(|| Some("sway-headless".to_string())),
                 status,
                 mission_id: session.mission_id.or(Some(mission.id)),
                 mission_title: mission.title.clone(),
@@ -455,16 +467,16 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
         }
     }
 
-    // Also scan for any running Xvfb processes that might not be tracked in missions
-    let running_displays = get_running_xvfb_displays().await;
+    // Also scan for any running Wayland/Sway sessions that might not be tracked in missions.
+    let running_displays = get_running_wayland_displays(&state.config.working_dir).await;
     for display in running_displays {
         // Check if this display is already in our list
         sessions_by_display
             .entry(display.clone())
             .or_insert_with(|| DesktopSessionDetail {
                 display: display.clone(),
-                display_server: "x11".to_string(),
-                compositor: Some("unknown".to_string()),
+                display_server: "wayland".to_string(),
+                compositor: Some("sway-headless".to_string()),
                 status: DesktopSessionStatus::Unknown,
                 mission_id: None,
                 mission_title: None,
@@ -524,7 +536,41 @@ async fn get_desktop_config(library: &SharedLibrary) -> crate::library::types::D
     }
 }
 
-/// Check if Xvfb is running on a specific display.
+async fn is_desktop_session_running(
+    display: &str,
+    display_server: &str,
+    working_dir: &std::path::Path,
+) -> bool {
+    if display_server.eq_ignore_ascii_case("wayland") {
+        return is_wayland_session_running(display, working_dir).await;
+    }
+    is_xvfb_running(display).await
+}
+
+async fn is_wayland_session_running(display: &str, working_dir: &std::path::Path) -> bool {
+    let Ok(display_num) = display.trim_start_matches(':').parse::<u32>() else {
+        return false;
+    };
+    let session_file = working_dir.join(format!(".desktop_session_{}", display_num));
+    if let Ok(content) = tokio::fs::read_to_string(session_file).await {
+        if let Ok(session_info) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(pid) = session_info.get("sway_pid").and_then(|v| v.as_u64()) {
+                let status = Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .output()
+                    .await;
+                return status.map(|o| o.status.success()).unwrap_or(false);
+            }
+        }
+    }
+    let runtime_dir = working_dir
+        .join(".sandboxed-sh")
+        .join("wayland")
+        .join(display_num.to_string());
+    runtime_dir.join("wayland-1").exists()
+}
+
+/// Check if Xvfb is running on a specific display. Legacy-session fallback.
 async fn is_xvfb_running(display: &str) -> bool {
     let output = Command::new("pgrep")
         .args(["-f", &format!("Xvfb {}", display)])
@@ -537,27 +583,23 @@ async fn is_xvfb_running(display: &str) -> bool {
     }
 }
 
-/// Get list of running Xvfb displays.
-pub(crate) async fn get_running_xvfb_displays() -> Vec<String> {
-    let output = Command::new("pgrep").args(["-a", "Xvfb"]).output().await;
-
+/// Get list of running Sway/Wayland displays.
+pub(crate) async fn get_running_wayland_displays(working_dir: &std::path::Path) -> Vec<String> {
+    let base = working_dir.join(".sandboxed-sh").join("wayland");
     let mut displays = Vec::new();
-
-    if let Ok(o) = output {
-        let stdout = String::from_utf8_lossy(&o.stdout);
-        for line in stdout.lines() {
-            // Parse lines like "12345 Xvfb :99 -screen 0 1280x720x24"
-            if let Some(pos) = line.find(':') {
-                let rest = &line[pos..];
-                if let Some(space_pos) = rest.find(' ') {
-                    displays.push(rest[..space_pos].to_string());
-                } else {
-                    displays.push(rest.to_string());
-                }
+    let Ok(mut entries) = tokio::fs::read_dir(base).await else {
+        return displays;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.parse::<u32>().is_ok() {
+            let display = format!(":{}", name);
+            if is_wayland_session_running(&display, working_dir).await {
+                displays.push(display);
             }
         }
     }
-
     displays
 }
 
@@ -579,7 +621,7 @@ pub(crate) async fn close_desktop_session(
         if let Ok(content) = tokio::fs::read_to_string(&session_file).await {
             if let Ok(session_info) = serde_json::from_str::<serde_json::Value>(&content) {
                 // Kill processes by PID
-                for pid_key in ["xvfb_pid", "i3_pid", "browser_pid"] {
+                for pid_key in ["sway_pid", "browser_pid", "xvfb_pid", "i3_pid"] {
                     if let Some(pid) = session_info[pid_key].as_u64() {
                         let pid = pid as i32;
                         // SAFETY: PIDs are read from a session file we wrote;
@@ -594,17 +636,16 @@ pub(crate) async fn close_desktop_session(
         let _ = tokio::fs::remove_file(&session_file).await;
     }
 
-    // Also kill by display pattern (fallback)
     let _ = Command::new("pkill")
         .args(["-f", &format!("Xvfb {}", display)])
         .output()
         .await;
 
-    // Clean up lock files
-    let lock_file = format!("/tmp/.X{}-lock", display_num);
-    let socket_file = format!("/tmp/.X11-unix/X{}", display_num);
-    let _ = tokio::fs::remove_file(&lock_file).await;
-    let _ = tokio::fs::remove_file(&socket_file).await;
+    let runtime_dir = working_dir
+        .join(".sandboxed-sh")
+        .join("wayland")
+        .join(display_num.to_string());
+    let _ = tokio::fs::remove_dir_all(runtime_dir).await;
 
     Ok(())
 }

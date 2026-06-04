@@ -1,7 +1,7 @@
-//! WebSocket-based MJPEG streaming for virtual desktop display.
+//! WebSocket-based MJPEG streaming for Wayland app display.
 //!
-//! Provides real-time streaming of the X11 virtual desktop (Xvfb)
-//! to connected clients over WebSocket using MJPEG frames.
+//! Provides real-time streaming of the Wayland compositor output to connected
+//! clients over WebSocket using MJPEG frames.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +16,8 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::path::PathBuf;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -67,13 +69,15 @@ pub async fn desktop_stream_ws(
         }
     }
 
-    // Validate display format
+    // Validate display/session format. The public API keeps the historical
+    // ":99" shape, but the backend maps it to a Wayland socket.
     if !params.display.starts_with(':') {
         return (StatusCode::BAD_REQUEST, "Invalid display format").into_response();
     }
 
+    let working_dir = state.config.working_dir.clone();
     ws.protocols(["sandboxed"])
-        .on_upgrade(move |socket| handle_desktop_stream(socket, params))
+        .on_upgrade(move |socket| handle_desktop_stream(socket, params, working_dir))
 }
 
 /// Client command for controlling the stream
@@ -132,7 +136,7 @@ enum ClientCommand {
     /// Type literal text
     #[serde(rename = "type")]
     Type { text: String, delay_ms: Option<u64> },
-    /// Press a key (xdotool syntax, e.g. "Return" or "ctrl+shift+T")
+    /// Press a key (frontend normalized syntax, e.g. "Return" or "ctrl+shift+T")
     #[serde(rename = "key")]
     Key { key: String, delay_ms: Option<u64> },
 }
@@ -145,16 +149,16 @@ enum ClickButton {
 }
 
 /// Handle the WebSocket connection for desktop streaming
-async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
-    let x11_display = params.display;
+async fn handle_desktop_stream(socket: WebSocket, params: StreamParams, working_dir: PathBuf) {
+    let display_id = params.display;
     let fps = params.fps.unwrap_or(10).clamp(1, 30);
     let quality = params.quality.unwrap_or(70).clamp(10, 100);
 
     tracing::info!(
-        x11_display = %x11_display,
+        display_id = %display_id,
         fps = fps,
         quality = quality,
-        "Starting desktop stream"
+        "Starting Wayland app stream"
     );
 
     // Channels for client commands
@@ -197,22 +201,20 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
     let mut current_quality = quality;
     let mut frame_interval = Duration::from_millis(1000 / fps as u64);
 
-    let input_display = x11_display.clone();
+    let input_env = WaylandSessionEnv::from_display(&display_id, &working_dir);
     let mut input_task = tokio::spawn(async move {
         let mut scroll_acc_x: i32 = 0;
         let mut scroll_acc_y: i32 = 0;
         while let Some(cmd) = input_rx.recv().await {
             let result = match cmd {
-                ClientCommand::MouseMove { x, y } => {
-                    run_xdotool_mouse_move(&input_display, x, y).await
-                }
+                ClientCommand::MouseMove { x, y } => run_wlrctl_mouse_move(&input_env, x, y).await,
                 ClientCommand::MouseDown { x, y, button } => {
                     let button = resolve_button(button);
-                    run_xdotool_mouse_button(&input_display, x, y, button, true).await
+                    run_wlrctl_mouse_button(&input_env, x, y, button, true).await
                 }
                 ClientCommand::MouseUp { x, y, button } => {
                     let button = resolve_button(button);
-                    run_xdotool_mouse_button(&input_display, x, y, button, false).await
+                    run_wlrctl_mouse_button(&input_env, x, y, button, false).await
                 }
                 ClientCommand::Click {
                     x,
@@ -221,7 +223,7 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
                     double,
                 } => {
                     let button = resolve_button(button);
-                    run_xdotool_click(&input_display, x, y, button, double).await
+                    run_wlrctl_click(&input_env, x, y, button, double).await
                 }
                 ClientCommand::Scroll {
                     amount,
@@ -261,13 +263,13 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
                         scroll_acc_y = 0;
                     }
 
-                    run_xdotool_scroll_steps(&input_display, steps_x, steps_y, x, y).await
+                    run_wlrctl_scroll_steps(&input_env, steps_x, steps_y, x, y).await
                 }
                 ClientCommand::Type { text, delay_ms } => {
-                    run_xdotool_type(&input_display, &text, delay_ms).await
+                    run_wtype_type(&input_env, &text, delay_ms).await
                 }
                 ClientCommand::Key { key, delay_ms } => {
-                    run_xdotool_key(&input_display, &key, delay_ms).await
+                    run_wtype_key(&input_env, &key, delay_ms).await
                 }
                 _ => Ok(()),
             };
@@ -321,7 +323,7 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
             }
 
             // Capture frame
-            match capture_frame(&x11_display, current_quality).await {
+            match capture_frame(&display_id, &working_dir, current_quality).await {
                 Ok(jpeg_data) => {
                     frame_count += 1;
 
@@ -353,7 +355,7 @@ async fn handle_desktop_stream(socket: WebSocket, params: StreamParams) {
             tokio::time::sleep(frame_interval).await;
         }
 
-        tracing::info!(frames = frame_count, "Desktop stream ended");
+        tracing::info!(frames = frame_count, "Wayland app stream ended");
     });
 
     // Wait for either task to complete, then abort the other to prevent resource waste
@@ -406,62 +408,68 @@ fn resolve_button(button: Option<ClickButton>) -> u8 {
     }
 }
 
-async fn run_xdotool_mouse_move(display: &str, x: i32, y: i32) -> anyhow::Result<()> {
-    run_xdotool(
-        display,
-        &["mousemove", "--sync", &x.to_string(), &y.to_string()],
-    )
-    .await
+#[derive(Clone, Debug)]
+struct WaylandSessionEnv {
+    xdg_runtime_dir: PathBuf,
+    wayland_display: String,
 }
 
-async fn run_xdotool_mouse_button(
-    display: &str,
+impl WaylandSessionEnv {
+    fn from_display(display: &str, working_dir: &std::path::Path) -> Self {
+        let display_num = display.trim_start_matches(':');
+        Self {
+            xdg_runtime_dir: working_dir
+                .join(".sandboxed-sh")
+                .join("wayland")
+                .join(display_num),
+            wayland_display: "wayland-1".to_string(),
+        }
+    }
+}
+
+fn command_with_wayland_env(program: &str, env: &WaylandSessionEnv) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env("XDG_RUNTIME_DIR", &env.xdg_runtime_dir)
+        .env("WAYLAND_DISPLAY", &env.wayland_display);
+    cmd
+}
+
+async fn run_wlrctl_mouse_move(env: &WaylandSessionEnv, x: i32, y: i32) -> anyhow::Result<()> {
+    run_wlrctl(env, &["pointer", "move", &x.to_string(), &y.to_string()]).await
+}
+
+async fn run_wlrctl_mouse_button(
+    env: &WaylandSessionEnv,
     x: i32,
     y: i32,
     button: u8,
     is_down: bool,
 ) -> anyhow::Result<()> {
-    run_xdotool(
-        display,
-        &["mousemove", "--sync", &x.to_string(), &y.to_string()],
-    )
-    .await?;
-    let cmd = if is_down { "mousedown" } else { "mouseup" };
-    run_xdotool(display, &[cmd, &button.to_string()]).await
+    run_wlrctl_mouse_move(env, x, y).await?;
+    let action = if is_down { "down" } else { "up" };
+    run_wlrctl(env, &["pointer", "button", &button.to_string(), action]).await
 }
 
-async fn run_xdotool_click(
-    display: &str,
+async fn run_wlrctl_click(
+    env: &WaylandSessionEnv,
     x: i32,
     y: i32,
     button: u8,
     double_click: bool,
 ) -> anyhow::Result<()> {
-    run_xdotool(
-        display,
-        &["mousemove", "--sync", &x.to_string(), &y.to_string()],
-    )
-    .await?;
-    if double_click {
-        run_xdotool(
-            display,
-            &[
-                "click",
-                "--repeat",
-                "2",
-                "--delay",
-                "40",
-                &button.to_string(),
-            ],
-        )
-        .await
-    } else {
-        run_xdotool(display, &["click", &button.to_string()]).await
+    let repeat = if double_click { 2 } else { 1 };
+    run_wlrctl_mouse_move(env, x, y).await?;
+    for idx in 0..repeat {
+        run_wlrctl(env, &["pointer", "click", &button.to_string()]).await?;
+        if idx + 1 < repeat {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
     }
+    Ok(())
 }
 
-async fn run_xdotool_scroll_steps(
-    display: &str,
+async fn run_wlrctl_scroll_steps(
+    env: &WaylandSessionEnv,
     steps_x: i32,
     steps_y: i32,
     x: Option<i32>,
@@ -471,27 +479,21 @@ async fn run_xdotool_scroll_steps(
         return Ok(());
     }
     if let (Some(x), Some(y)) = (x, y) {
-        run_xdotool(
-            display,
-            &["mousemove", "--sync", &x.to_string(), &y.to_string()],
-        )
-        .await?;
+        run_wlrctl_mouse_move(env, x, y).await?;
     }
 
     if steps_y != 0 {
-        let button = if steps_y > 0 { "5" } else { "4" };
-        run_xdotool(
-            display,
-            &["click", "--repeat", &steps_y.abs().to_string(), button],
+        run_wlrctl(
+            env,
+            &["pointer", "scroll", "vertical", &steps_y.to_string()],
         )
         .await?;
     }
 
     if steps_x != 0 {
-        let button = if steps_x > 0 { "7" } else { "6" };
-        run_xdotool(
-            display,
-            &["click", "--repeat", &steps_x.abs().to_string(), button],
+        run_wlrctl(
+            env,
+            &["pointer", "scroll", "horizontal", &steps_x.to_string()],
         )
         .await?;
     }
@@ -499,84 +501,124 @@ async fn run_xdotool_scroll_steps(
     Ok(())
 }
 
-async fn run_xdotool_type(display: &str, text: &str, delay_ms: Option<u64>) -> anyhow::Result<()> {
+async fn run_wtype_type(
+    env: &WaylandSessionEnv,
+    text: &str,
+    delay_ms: Option<u64>,
+) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
     let delay = delay_ms.unwrap_or(1).to_string();
-    run_xdotool(
-        display,
-        &["type", "--delay", &delay, "--clearmodifiers", text],
-    )
-    .await
+    run_wtype(env, &["-d", &delay, text]).await
 }
 
-async fn run_xdotool_key(display: &str, key: &str, delay_ms: Option<u64>) -> anyhow::Result<()> {
+async fn run_wtype_key(
+    env: &WaylandSessionEnv,
+    key: &str,
+    delay_ms: Option<u64>,
+) -> anyhow::Result<()> {
     if key.trim().is_empty() {
         return Ok(());
     }
+    let key = key_for_wtype(key);
     let delay = delay_ms.unwrap_or(1).to_string();
-    run_xdotool(
-        display,
-        &["key", "--delay", &delay, "--clearmodifiers", key],
-    )
-    .await
+    run_wtype(env, &["-d", &delay, "-P", &key, "-p", &key]).await
 }
 
-async fn run_xdotool(display: &str, args: &[&str]) -> anyhow::Result<()> {
-    let output = Command::new("xdotool")
+async fn run_wtype(env: &WaylandSessionEnv, args: &[&str]) -> anyhow::Result<()> {
+    let output = command_with_wayland_env("wtype", env)
         .args(args)
-        .env("DISPLAY", display)
         .output()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to run xdotool: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to run wtype: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!("xdotool failed: {}", stderr.trim()));
+        return Err(anyhow::anyhow!("wtype failed: {}", stderr.trim()));
     }
 
     Ok(())
 }
 
-/// Capture a single frame from the X11 display as JPEG
-async fn capture_frame(display: &str, quality: u32) -> anyhow::Result<Vec<u8>> {
-    // Use import from ImageMagick to capture and convert directly to JPEG
-    // This avoids writing to disk and is more efficient
-    let output = Command::new("import")
-        .args([
-            "-window",
-            "root",
-            "-quality",
-            &quality.to_string(),
-            "jpeg:-", // Output JPEG to stdout
-        ])
-        .env("DISPLAY", display)
+async fn run_wlrctl(env: &WaylandSessionEnv, args: &[&str]) -> anyhow::Result<()> {
+    let output = command_with_wayland_env("wlrctl", env)
+        .args(args)
         .output()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to run import: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to run wlrctl: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Detect common error patterns and return user-friendly messages
-        if stderr.contains("unable to open X server") {
-            return Err(anyhow::anyhow!(
-                "Display {} is no longer available. The desktop session may have been closed.",
-                display
-            ));
-        }
-        if stderr.contains("Can't open display") || stderr.contains("cannot open display") {
-            return Err(anyhow::anyhow!(
-                "Cannot connect to display {}. The session may have ended.",
-                display
-            ));
-        }
-
-        return Err(anyhow::anyhow!("Screenshot failed: {}", stderr.trim()));
+        return Err(anyhow::anyhow!("wlrctl failed: {}", stderr.trim()));
     }
 
-    Ok(output.stdout)
+    Ok(())
+}
+
+fn key_for_wtype(key: &str) -> String {
+    key.split('+')
+        .map(|part| match part {
+            "ctrl" => "leftctrl",
+            "alt" => "leftalt",
+            "shift" => "leftshift",
+            "super" => "leftmeta",
+            "Return" => "enter",
+            "BackSpace" => "backspace",
+            "Escape" => "esc",
+            "Page_Up" => "pageup",
+            "Page_Down" => "pagedown",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// Capture a single frame from the Wayland display as JPEG.
+async fn capture_frame(
+    display: &str,
+    working_dir: &std::path::Path,
+    quality: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let env = WaylandSessionEnv::from_display(display, working_dir);
+    let output = command_with_wayland_env("grim", &env)
+        .arg("-")
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to run grim: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("failed to connect") || stderr.contains("No such file") {
+            return Err(anyhow::anyhow!(
+                "Wayland display {} is no longer available. The app session may have been closed.",
+                display
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "Wayland screenshot failed: {}",
+            stderr.trim()
+        ));
+    }
+
+    let mut convert = Command::new("convert")
+        .args(["png:-", "-quality", &quality.to_string(), "jpeg:-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to run convert: {}", e))?;
+
+    if let Some(stdin) = convert.stdin.as_mut() {
+        stdin.write_all(&output.stdout).await?;
+    }
+    let converted = convert.wait_with_output().await?;
+    if !converted.status.success() {
+        let stderr = String::from_utf8_lossy(&converted.stderr);
+        return Err(anyhow::anyhow!("JPEG encode failed: {}", stderr.trim()));
+    }
+
+    Ok(converted.stdout)
 }
 
 #[cfg(test)]

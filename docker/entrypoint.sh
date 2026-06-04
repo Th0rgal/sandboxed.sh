@@ -3,13 +3,12 @@ set -e
 
 # =============================================================================
 # Open Agent — Docker Entrypoint
-# Starts: (optional) Xvfb+i3, Rust backend, Next.js dashboard, Caddy (PID 1)
+# Starts: Rust backend, Next.js dashboard, Caddy (PID 1)
 # =============================================================================
 
 cleanup() {
     echo "[entrypoint] shutting down..."
     kill "$BACKEND_PID" "$DASHBOARD_PID" 2>/dev/null || true
-    [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
     wait
 }
 trap cleanup SIGTERM SIGINT
@@ -32,33 +31,10 @@ if [ -d /root/.ssh ]; then
     fi
 fi
 
-# -- Optional: Desktop (Xvfb + i3) -------------------------------------------
-if [ "${DESKTOP_ENABLED:-false}" = "true" ]; then
-    DISPLAY_NUM="${DESKTOP_DISPLAY:-:99}"
-    RESOLUTION="${DESKTOP_RESOLUTION:-1920x1080}"
+# Desktop sessions are started on demand by desktop-mcp/tools as isolated
+# headless Wayland compositors. The container entrypoint intentionally does not
+# start a shared desktop.
 
-    echo "[entrypoint] starting Xvfb on ${DISPLAY_NUM} at ${RESOLUTION}"
-    Xvfb "$DISPLAY_NUM" -screen 0 "${RESOLUTION}x24" -ac +extension GLX +render -noreset &
-    XVFB_PID=$!
-    export DISPLAY="$DISPLAY_NUM"
-
-    # Wait for X to be ready
-    for i in $(seq 1 20); do
-        if xdpyinfo -display "$DISPLAY_NUM" >/dev/null 2>&1; then
-            break
-        fi
-        sleep 0.2
-    done
-
-    echo "[entrypoint] starting i3 window manager"
-    i3 &
-
-    # Disable screensaver/DPMS
-    xset s off 2>/dev/null || true
-    xset -dpms 2>/dev/null || true
-    xset s noblank 2>/dev/null || true
-    xsetroot -solid "#1a1a2e" 2>/dev/null || true
-fi
 
 # -- Start Rust backend -------------------------------------------------------
 echo "[entrypoint] starting sandboxed-sh backend on ${HOST:-127.0.0.1}:${PORT:-3000}"

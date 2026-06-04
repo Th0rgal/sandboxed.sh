@@ -65,8 +65,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl jq unzip openssh-client ca-certificates gnupg \
     # nspawn / container workspaces
     systemd-container debootstrap \
-    # Desktop automation
-    xvfb i3 x11-utils x11-xserver-utils xdotool scrot imagemagick \
+    # Wayland app streaming and automation
+    sway grim wtype wlrctl wf-recorder wayvnc cage imagemagick \
     tesseract-ocr at-spi2-core \
     fonts-liberation fonts-dejavu fonts-noto \
     # Chromium
@@ -118,10 +118,6 @@ RUN curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path \
 RUN curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash \
     && echo "[docker] Grok Build CLI installed: $(grok --version 2>/dev/null || echo 'unknown')" \
     || echo "[docker] WARNING: Grok Build CLI install failed (will be installed on first mission)"
-
-# -- i3 config (from install_desktop.sh) -------------------------------------
-RUN mkdir -p /root/.config/i3
-COPY docker/i3config /root/.config/i3/config
 
 # -- Caddy config + entrypoint -----------------------------------------------
 COPY docker/Caddyfile /etc/caddy/Caddyfile

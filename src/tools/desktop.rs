@@ -1,13 +1,13 @@
 //! Desktop automation tools for controlling graphical applications.
 //!
 //! This module provides tools for:
-//! - Managing Xvfb virtual display sessions
+//! - Managing headless Wayland app sessions
 //! - Taking screenshots
 //! - Keyboard input (typing)
 //! - Mouse operations (clicking)
 //! - Extracting visible text (AT-SPI + OCR)
 //!
-//! Requires: Xvfb, i3, xdotool, scrot, tesseract, AT-SPI2
+//! Requires: sway, grim, wtype, wlrctl, convert, tesseract, AT-SPI2
 //! Only available when DESKTOP_ENABLED=true
 
 use std::path::{Path, PathBuf};
@@ -44,6 +44,105 @@ fn kill_pid(pid: u32) {
 /// Get the configured resolution
 fn get_resolution() -> String {
     std::env::var("DESKTOP_RESOLUTION").unwrap_or_else(|_| "1280x720".to_string())
+}
+
+#[derive(Clone, Debug)]
+struct WaylandEnv {
+    xdg_runtime_dir: PathBuf,
+    wayland_display: String,
+    sway_socket: PathBuf,
+}
+
+fn display_num(display: &str) -> anyhow::Result<u32> {
+    display
+        .trim_start_matches(':')
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid display format: {}", display))
+}
+
+fn wayland_env_for_display(display: &str, working_dir: &Path) -> anyhow::Result<WaylandEnv> {
+    let display_num = display_num(display)?;
+    let xdg_runtime_dir = working_dir
+        .join(".sandboxed-sh")
+        .join("wayland")
+        .join(display_num.to_string());
+    Ok(WaylandEnv {
+        sway_socket: xdg_runtime_dir.join("sway-ipc.sock"),
+        xdg_runtime_dir,
+        wayland_display: "wayland-1".to_string(),
+    })
+}
+
+fn configure_wayland_command(cmd: &mut Command, env: &WaylandEnv) {
+    cmd.env("XDG_RUNTIME_DIR", &env.xdg_runtime_dir)
+        .env("WAYLAND_DISPLAY", &env.wayland_display)
+        .env("SWAYSOCK", &env.sway_socket)
+        .env("GDK_BACKEND", "wayland")
+        .env("QT_QPA_PLATFORM", "wayland")
+        .env("MOZ_ENABLE_WAYLAND", "1");
+}
+
+async fn run_with_wayland(
+    env: &WaylandEnv,
+    program: &str,
+    args: &[&str],
+    timeout_secs: u64,
+) -> anyhow::Result<(String, String, i32)> {
+    let mut cmd = Command::new(program);
+    configure_wayland_command(&mut cmd, env);
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        cmd.args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to execute {}: {}", program, e)),
+        Err(_) => return Err(anyhow::anyhow!("Command {} timed out", program)),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok((stdout, stderr, exit_code))
+}
+
+fn write_sway_config(path: &Path, resolution: &str) -> anyhow::Result<()> {
+    let config = format!(
+        r#"output * resolution {resolution}
+default_border none
+default_floating_border none
+gaps inner 0
+gaps outer 0
+focus_follows_mouse no
+seat * hide_cursor 5000
+exec_always true
+"#
+    );
+    std::fs::write(path, config)?;
+    Ok(())
+}
+
+fn key_for_wtype(key: &str) -> String {
+    key.split('+')
+        .map(|part| match part {
+            "ctrl" => "leftctrl",
+            "alt" => "leftalt",
+            "shift" => "leftshift",
+            "super" => "leftmeta",
+            "Return" => "enter",
+            "BackSpace" => "backspace",
+            "Escape" => "esc",
+            "Page_Up" => "pageup",
+            "Page_Down" => "pagedown",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 pub fn find_browser_command() -> Option<String> {
@@ -156,9 +255,9 @@ async fn run_with_display(
     Ok((stdout, stderr, exit_code))
 }
 
-/// Start a new desktop session with Xvfb and i3.
+/// Start a new desktop session with headless Sway.
 ///
-/// Creates a virtual X11 display and starts the i3 window manager.
+/// Creates a headless Wayland compositor output.
 /// Returns the display identifier (e.g., ":99") for use with other desktop tools.
 pub struct StartSession;
 
@@ -169,7 +268,7 @@ impl Tool for StartSession {
     }
 
     fn description(&self) -> &str {
-        "Start a virtual desktop session (Xvfb + i3 window manager). Returns the DISPLAY identifier (e.g., ':99') needed for other desktop_* tools. Call this before using any other desktop tools. Optionally launches Chromium browser."
+        "Start a headless Wayland app session (Sway compositor). Returns the display identifier (e.g., ':99') needed for other desktop_* tools. Call this before using any other desktop tools. Optionally launches Chromium browser."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -196,124 +295,103 @@ impl Tool for StartSession {
             ));
         }
 
-        // Get next display number
         let display_num = DISPLAY_COUNTER.fetch_add(1, Ordering::SeqCst);
         let display_id = format!(":{}", display_num);
         let resolution = get_resolution();
+        let wayland_env = wayland_env_for_display(&display_id, working_dir)?;
 
-        tracing::info!(display = %display_id, resolution = %resolution, "Starting desktop session");
+        tracing::info!(display = %display_id, resolution = %resolution, "Starting Wayland desktop session");
 
-        // Clean up any stale lock files
-        let lock_file = format!("/tmp/.X{}-lock", display_num);
-        let socket_file = format!("/tmp/.X11-unix/X{}", display_num);
-        let _ = std::fs::remove_file(&lock_file);
-        let _ = std::fs::remove_file(&socket_file);
-
-        let x11_socket_dir = std::path::Path::new("/tmp/.X11-unix");
-        if !x11_socket_dir.exists() {
-            std::fs::create_dir_all(x11_socket_dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    x11_socket_dir,
-                    std::fs::Permissions::from_mode(0o1777),
-                );
-            }
+        let _ = std::fs::remove_dir_all(&wayland_env.xdg_runtime_dir);
+        std::fs::create_dir_all(&wayland_env.xdg_runtime_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &wayland_env.xdg_runtime_dir,
+                std::fs::Permissions::from_mode(0o700),
+            )?;
         }
 
-        // Start Xvfb
-        let xvfb_args = format!("{} -screen 0 {}x24", display_id, resolution);
-        let mut xvfb = Command::new("Xvfb")
-            .args(xvfb_args.split_whitespace())
+        let sway_config = wayland_env.xdg_runtime_dir.join("sway.config");
+        write_sway_config(&sway_config, &resolution)?;
+
+        let mut sway_cmd = Command::new("sway");
+        configure_wayland_command(&mut sway_cmd, &wayland_env);
+        let mut sway = sway_cmd
+            .args([
+                "--unsupported-gpu",
+                "-c",
+                sway_config.to_string_lossy().as_ref(),
+            ])
+            .env("WLR_BACKENDS", "headless")
+            .env("WLR_LIBINPUT_NO_DEVICES", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to start Xvfb: {}. Is Xvfb installed?", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to start sway: {}. Is sway installed?", e))?;
 
-        let xvfb_pid = xvfb.id().unwrap_or(0);
+        let sway_pid = sway.id().unwrap_or(0);
 
-        // Wait for Xvfb to be ready
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Verify Xvfb is running
-        if let Ok(Some(status)) = xvfb.try_wait() {
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        if let Ok(Some(status)) = sway.try_wait() {
             return Err(anyhow::anyhow!(
-                "Xvfb exited immediately with status: {:?}",
+                "Sway exited immediately with status: {:?}",
                 status
             ));
         }
-
-        // Start i3 window manager
-        let i3 = Command::new("i3")
-            .env("DISPLAY", &display_id)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to start i3: {}. Is i3 installed?", e))?;
-
-        let i3_pid = i3.id().unwrap_or(0);
-
-        // Wait for i3 to initialize
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let (_, stderr, exit_code) =
+            run_with_wayland(&wayland_env, "swaymsg", &["-t", "get_outputs"], 5).await?;
+        if exit_code != 0 {
+            kill_pid(sway_pid);
+            return Err(anyhow::anyhow!("Sway did not become ready: {}", stderr));
+        }
 
         // Create screenshots directory in working dir
         let screenshots_dir = working_dir.join("screenshots");
         std::fs::create_dir_all(&screenshots_dir)?;
 
-        // Save session info to a file for cleanup
-        let session_file = working_dir.join(format!(".desktop_session_{}", display_num));
-        let session_info = json!({
-            "display": display_id,
-            "display_num": display_num,
-            "xvfb_pid": xvfb_pid,
-            "i3_pid": i3_pid,
-            "display_server": "x11",
-            "compositor": "i3",
-            "resolution": resolution,
-            "screenshots_dir": screenshots_dir.to_string_lossy()
-        });
-        std::fs::write(&session_file, serde_json::to_string_pretty(&session_info)?)?;
-
         // Optionally launch browser
         let launch_browser = args["launch_browser"].as_bool().unwrap_or(false);
-        let browser_info = if launch_browser {
+        let (browser_pid, browser_info) = if launch_browser {
             let url = args["url"].as_str().unwrap_or("about:blank");
             let browser_cmd = match find_browser_command() {
                 Some(cmd) => cmd,
                 None => {
-                    kill_pid(xvfb_pid);
-                    kill_pid(i3_pid);
+                    kill_pid(sway_pid);
                     return Err(anyhow::anyhow!(
                         "Failed to find a Chromium-compatible browser in PATH. \
                         Set CHROMIUM_BIN or BROWSER, or install chromium/chromium-browser."
                     ));
                 }
             };
-            let mut chromium = Command::new(&browser_cmd)
+            let mut browser_command = Command::new(&browser_cmd);
+            configure_wayland_command(&mut browser_command, &wayland_env);
+            let browser_profile_dir = wayland_env.xdg_runtime_dir.join("browser-profile");
+            let mut chromium = browser_command
                 .args([
                     "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-software-rasterizer",
                     "--disable-dev-shm-usage",
                     "--force-renderer-accessibility",
+                    "--ozone-platform=wayland",
+                    "--enable-features=UseOzonePlatform",
+                    "--start-fullscreen",
+                    "--new-window",
+                    &format!("--user-data-dir={}", browser_profile_dir.display()),
                     url,
                 ])
-                .env("DISPLAY", &display_id)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .map_err(|e| {
-                    kill_pid(xvfb_pid);
-                    kill_pid(i3_pid);
+                    kill_pid(sway_pid);
                     anyhow::anyhow!("Failed to start Chromium: {}", e)
                 })?;
 
             let chromium_pid = chromium.id().unwrap_or(0);
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             if let Ok(Some(status)) = chromium.try_wait() {
-                kill_pid(xvfb_pid);
-                kill_pid(i3_pid);
+                kill_pid(sway_pid);
                 return Err(anyhow::anyhow!(
                     "Browser exited immediately with status: {:?}",
                     status
@@ -323,20 +401,44 @@ impl Tool for StartSession {
             // Wait for browser to load
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-            format!(
-                ", \"browser\": \"{}\", \"browser_pid\": {}, \"url\": \"{}\"",
-                browser_cmd, chromium_pid, url
+            let _ = run_with_wayland(&wayland_env, "swaymsg", &["fullscreen", "enable"], 5).await;
+
+            (
+                Some(chromium_pid),
+                format!(
+                    ", \"browser\": \"{}\", \"browser_pid\": {}, \"url\": \"{}\"",
+                    browser_cmd, chromium_pid, url
+                ),
             )
         } else {
-            String::new()
+            (None, String::new())
         };
 
+        let session_file = working_dir.join(format!(".desktop_session_{}", display_num));
+        let mut session_info = json!({
+            "display": display_id,
+            "display_num": display_num,
+            "sway_pid": sway_pid,
+            "display_server": "wayland",
+            "compositor": "sway-headless",
+            "resolution": resolution,
+            "xdg_runtime_dir": wayland_env.xdg_runtime_dir.to_string_lossy(),
+            "wayland_display": wayland_env.wayland_display,
+            "sway_socket": wayland_env.sway_socket.to_string_lossy(),
+            "screenshots_dir": screenshots_dir.to_string_lossy()
+        });
+        if let Some(pid) = browser_pid {
+            session_info["browser_pid"] = json!(pid);
+        };
+        std::fs::write(&session_file, serde_json::to_string_pretty(&session_info)?)?;
+
         Ok(format!(
-            "{{\"success\": true, \"display\": \"{}\", \"display_server\": \"x11\", \"compositor\": \"i3\", \"resolution\": \"{}\", \"xvfb_pid\": {}, \"i3_pid\": {}, \"screenshots_dir\": \"{}\"{}}}",
+            "{{\"success\": true, \"display\": \"{}\", \"display_server\": \"wayland\", \"compositor\": \"sway-headless\", \"resolution\": \"{}\", \"sway_pid\": {}, \"wayland_display\": \"{}\", \"xdg_runtime_dir\": \"{}\", \"screenshots_dir\": \"{}\"{}}}",
             display_id,
             resolution,
-            xvfb_pid,
-            i3_pid,
+            sway_pid,
+            wayland_env.wayland_display,
+            wayland_env.xdg_runtime_dir.display(),
             screenshots_dir.display(),
             browser_info
         ))
@@ -353,7 +455,7 @@ impl Tool for StopSession {
     }
 
     fn description(&self) -> &str {
-        "Stop a virtual desktop session. Kills Xvfb and all associated processes. Call this when done with desktop automation."
+        "Stop a Wayland app session. Kills Sway and all associated processes. Call this when done with desktop automation."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -390,7 +492,7 @@ impl Tool for StopSession {
             if let Ok(content) = std::fs::read_to_string(&session_file) {
                 if let Ok(session_info) = serde_json::from_str::<Value>(&content) {
                     // Kill processes by PID
-                    for pid_key in ["xvfb_pid", "i3_pid", "browser_pid"] {
+                    for pid_key in ["sway_pid", "browser_pid", "xvfb_pid", "i3_pid"] {
                         if let Some(pid) = session_info[pid_key].as_u64() {
                             let pid = pid as i32;
                             // SAFETY: PIDs are read from a session file we wrote;
@@ -406,17 +508,13 @@ impl Tool for StopSession {
             let _ = std::fs::remove_file(&session_file);
         }
 
-        // Also kill by display pattern (fallback)
-        let _ = Command::new("pkill")
-            .args(["-f", &format!("Xvfb {}", display_id)])
-            .output()
-            .await;
-
-        // Clean up lock files
-        let lock_file = format!("/tmp/.X{}-lock", display_num);
-        let socket_file = format!("/tmp/.X11-unix/X{}", display_num);
-        let _ = std::fs::remove_file(&lock_file);
-        let _ = std::fs::remove_file(&socket_file);
+        if let Ok(env) = wayland_env_for_display(display_id, working_dir) {
+            let _ = Command::new("pkill")
+                .args(["-f", &format!("WAYLAND_DISPLAY={}", env.wayland_display)])
+                .output()
+                .await;
+            let _ = std::fs::remove_dir_all(&env.xdg_runtime_dir);
+        }
 
         Ok(format!(
             "{{\"success\": true, \"display\": \"{}\", \"killed_pids\": {:?}}}",
@@ -437,7 +535,7 @@ impl Tool for Screenshot {
     fn description(&self) -> &str {
         "Take a screenshot of the virtual desktop and save it locally.
 
-IMPORTANT: After launching applications with i3 exec commands, use wait_seconds (3-5s recommended) to let them render before capturing. Otherwise the screenshot may be black.
+IMPORTANT: After launching applications, use wait_seconds (3-5s recommended) to let them render before capturing. Otherwise the screenshot may be black.
 
 Set return_image=true to SEE the screenshot yourself (vision). This lets you verify the layout is correct before responding."
     }
@@ -510,8 +608,8 @@ Set return_image=true to SEE the screenshot yourself (vision). This lets you ver
 
         tracing::info!(display = %display_id, path = %filepath.display(), "Taking screenshot");
 
-        // Build scrot command
-        let mut scrot_args = vec!["-o".to_string(), filepath.to_string_lossy().to_string()];
+        let wayland_env = wayland_env_for_display(display_id, working_dir)?;
+        let mut grim_args: Vec<String> = Vec::new();
 
         // Add region if specified
         if let Some(region) = args.get("region") {
@@ -520,36 +618,22 @@ Set return_image=true to SEE the screenshot yourself (vision). This lets you ver
                 let y = region["y"].as_i64().unwrap_or(0);
                 let w = region["width"].as_i64().unwrap_or(100);
                 let h = region["height"].as_i64().unwrap_or(100);
-                scrot_args.push("-a".to_string());
-                scrot_args.push(format!("{},{},{},{}", x, y, w, h));
+                grim_args.push("-g".to_string());
+                grim_args.push(format!("{},{} {}x{}", x, y, w, h));
             }
         }
+        grim_args.push(filepath.to_string_lossy().to_string());
 
-        let (_stdout, stderr, exit_code) = run_with_display(
-            display_id,
-            "scrot",
-            &scrot_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        let (_stdout, stderr, exit_code) = run_with_wayland(
+            &wayland_env,
+            "grim",
+            &grim_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             30,
         )
         .await?;
 
         if exit_code != 0 {
-            // Try import as fallback
-            let import_result = run_with_display(
-                display_id,
-                "import",
-                &["-window", "root", filepath.to_string_lossy().as_ref()],
-                30,
-            )
-            .await;
-
-            if let Err(e) = import_result {
-                return Err(anyhow::anyhow!(
-                    "Screenshot failed. scrot error: {}. import error: {}",
-                    stderr,
-                    e
-                ));
-            }
+            return Err(anyhow::anyhow!("Screenshot failed. grim error: {}", stderr));
         }
 
         // Verify file exists
@@ -633,16 +717,29 @@ impl Tool for TypeText {
 
         tracing::info!(display = %display_id, command = %command, "Sending keyboard input");
 
-        let (_stdout, stderr, exit_code) = run_with_display(
-            display_id,
-            "xdotool",
-            &[command, "--delay", &delay_ms.to_string(), &input],
+        let wayland_env = wayland_env_for_display(display_id, _working_dir)?;
+        let args = if command == "type" {
+            vec!["-d".to_string(), delay_ms.to_string(), input.clone()]
+        } else {
+            vec![
+                "-d".to_string(),
+                delay_ms.to_string(),
+                "-P".to_string(),
+                key_for_wtype(&input),
+                "-p".to_string(),
+                key_for_wtype(&input),
+            ]
+        };
+        let (_stdout, stderr, exit_code) = run_with_wayland(
+            &wayland_env,
+            "wtype",
+            &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             30,
         )
         .await?;
 
         if exit_code != 0 {
-            return Err(anyhow::anyhow!("xdotool failed: {}", stderr));
+            return Err(anyhow::anyhow!("wtype failed: {}", stderr));
         }
 
         Ok(format!(
@@ -724,33 +821,24 @@ impl Tool for Click {
 
         tracing::info!(display = %display_id, x = x, y = y, button = button, "Clicking");
 
-        // Move to position first
-        let (_, stderr, exit_code) = run_with_display(
-            display_id,
-            "xdotool",
-            &["mousemove", &x.to_string(), &y.to_string()],
+        let wayland_env = wayland_env_for_display(display_id, _working_dir)?;
+        let (_, stderr, exit_code) = run_with_wayland(
+            &wayland_env,
+            "wlrctl",
+            &["pointer", "move", &x.to_string(), &y.to_string()],
             10,
         )
         .await?;
 
         if exit_code != 0 {
-            return Err(anyhow::anyhow!("xdotool mousemove failed: {}", stderr));
+            return Err(anyhow::anyhow!("wlrctl pointer move failed: {}", stderr));
         }
-
-        // Small delay to ensure move completes
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Click
-        let (_, stderr, exit_code) = run_with_display(
-            display_id,
-            "xdotool",
-            &["click", "--repeat", repeat, button],
-            10,
-        )
-        .await?;
-
-        if exit_code != 0 {
-            return Err(anyhow::anyhow!("xdotool click failed: {}", stderr));
+        for _ in 0..repeat.parse::<usize>().unwrap_or(1) {
+            let (_, stderr, exit_code) =
+                run_with_wayland(&wayland_env, "wlrctl", &["pointer", "click", button], 10).await?;
+            if exit_code != 0 {
+                return Err(anyhow::anyhow!("wlrctl pointer click failed: {}", stderr));
+            }
         }
 
         Ok(format!(
@@ -938,11 +1026,11 @@ async fn get_ocr_text(display: &str, working_dir: &Path) -> anyhow::Result<Strin
 
     let screenshot_path = screenshots_dir.join("_ocr_temp.png");
 
-    // Take screenshot
-    let (_, stderr, exit_code) = run_with_display(
-        display,
-        "scrot",
-        &["-o", screenshot_path.to_string_lossy().as_ref()],
+    let wayland_env = wayland_env_for_display(display, working_dir)?;
+    let (_, stderr, exit_code) = run_with_wayland(
+        &wayland_env,
+        "grim",
+        &[screenshot_path.to_string_lossy().as_ref()],
         30,
     )
     .await?;
@@ -1026,16 +1114,17 @@ impl Tool for MouseMove {
 
         tracing::info!(display = %display_id, x = x, y = y, "Moving mouse");
 
-        let (_, stderr, exit_code) = run_with_display(
-            display_id,
-            "xdotool",
-            &["mousemove", &x.to_string(), &y.to_string()],
+        let wayland_env = wayland_env_for_display(display_id, _working_dir)?;
+        let (_, stderr, exit_code) = run_with_wayland(
+            &wayland_env,
+            "wlrctl",
+            &["pointer", "move", &x.to_string(), &y.to_string()],
             10,
         )
         .await?;
 
         if exit_code != 0 {
-            return Err(anyhow::anyhow!("xdotool mousemove failed: {}", stderr));
+            return Err(anyhow::anyhow!("wlrctl pointer move failed: {}", stderr));
         }
 
         Ok(format!("{{\"success\": true, \"x\": {}, \"y\": {}}}", x, y))
@@ -1089,18 +1178,20 @@ impl Tool for Scroll {
             .as_i64()
             .ok_or_else(|| anyhow::anyhow!("Missing 'amount' argument"))?;
 
+        let wayland_env = wayland_env_for_display(display_id, _working_dir)?;
+
         // Move to position if specified
         if let (Some(x), Some(y)) = (args["x"].as_i64(), args["y"].as_i64()) {
-            let (_, stderr, exit_code) = run_with_display(
-                display_id,
-                "xdotool",
-                &["mousemove", &x.to_string(), &y.to_string()],
+            let (_, stderr, exit_code) = run_with_wayland(
+                &wayland_env,
+                "wlrctl",
+                &["pointer", "move", &x.to_string(), &y.to_string()],
                 10,
             )
             .await?;
 
             if exit_code != 0 {
-                return Err(anyhow::anyhow!("xdotool mousemove failed: {}", stderr));
+                return Err(anyhow::anyhow!("wlrctl pointer move failed: {}", stderr));
             }
 
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1108,22 +1199,16 @@ impl Tool for Scroll {
 
         tracing::info!(display = %display_id, amount = amount, "Scrolling");
 
-        // xdotool uses button 4 for scroll up, button 5 for scroll down
-        let (button, clicks) = if amount >= 0 {
-            ("5", amount.unsigned_abs() as usize)
-        } else {
-            ("4", amount.unsigned_abs() as usize)
-        };
+        let (_, stderr, exit_code) = run_with_wayland(
+            &wayland_env,
+            "wlrctl",
+            &["pointer", "scroll", "vertical", &amount.to_string()],
+            10,
+        )
+        .await?;
 
-        for _ in 0..clicks {
-            let (_, stderr, exit_code) =
-                run_with_display(display_id, "xdotool", &["click", button], 10).await?;
-
-            if exit_code != 0 {
-                return Err(anyhow::anyhow!("xdotool scroll failed: {}", stderr));
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        if exit_code != 0 {
+            return Err(anyhow::anyhow!("wlrctl scroll failed: {}", stderr));
         }
 
         Ok(format!(
@@ -1134,7 +1219,7 @@ impl Tool for Scroll {
     }
 }
 
-/// Execute i3 window manager commands using i3-msg.
+/// Execute Sway compositor commands using swaymsg.
 pub struct I3Command;
 
 #[async_trait]
@@ -1144,26 +1229,17 @@ impl Tool for I3Command {
     }
 
     fn description(&self) -> &str {
-        "Execute i3 window manager commands using i3-msg. Use this to control window layout and launch applications.
+        "Execute Sway compositor commands using swaymsg. Use this to control the focused Wayland app or launch apps.
 
 IMPORTANT - Application launch requirements:
-- Chromium: MUST use 'exec chromium --no-sandbox' (required when running as root)
-- Terminal with command: Use 'exec xterm -hold -e <cmd>' (-hold keeps window open after command exits)
-- Example: 'exec xterm -hold -e fastfetch' (shows fastfetch output and stays open)
+- Chromium: use 'exec chromium --no-sandbox --ozone-platform=wayland'
+- Prefer one focused app per session; fullscreen the selected app.
 
 Common commands:
 - exec <app>: Launch an application
-- split h/v: Split container horizontally/vertically for next window
-- focus left/right/up/down: Focus adjacent window
-- move left/right/up/down: Move focused window
-- layout tabbed/stacking/splitv/splith: Change container layout
 - fullscreen toggle: Toggle fullscreen
 - kill: Close focused window
-
-Layout example (chrome left, terminal right):
-1. exec chromium --no-sandbox
-2. split h
-3. exec xterm -hold -e fastfetch"
+"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1192,16 +1268,17 @@ Layout example (chrome left, terminal right):
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
 
-        tracing::info!(display = %display_id, command = %command, "Executing i3 command");
+        tracing::info!(display = %display_id, command = %command, "Executing sway command");
 
+        let wayland_env = wayland_env_for_display(display_id, _working_dir)?;
         let (stdout, stderr, exit_code) =
-            run_with_display(display_id, "i3-msg", &[command], 30).await?;
+            run_with_wayland(&wayland_env, "swaymsg", &[command], 30).await?;
 
         if exit_code != 0 {
-            return Err(anyhow::anyhow!("i3-msg failed: {} {}", stdout, stderr));
+            return Err(anyhow::anyhow!("swaymsg failed: {} {}", stdout, stderr));
         }
 
-        // Parse i3-msg JSON output if present
+        // Parse swaymsg JSON output if present
         let result = if stdout.trim().starts_with('[') || stdout.trim().starts_with('{') {
             stdout.trim().to_string()
         } else {

@@ -43,6 +43,9 @@ export function DesktopStream({
   const [isPaused, setIsPaused] = useState(false);
   const [frameCount, setFrameCount] = useState(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [inputErrorMessage, setInputErrorMessage] = useState<string | null>(
+    null
+  );
   const [showControls, setShowControls] = useState(true);
   const [fps, setFps] = useState(initialFps);
   const [quality, setQuality] = useState(initialQuality);
@@ -51,14 +54,13 @@ export function DesktopStream({
   const [isPipSupported, setIsPipSupported] = useState(false);
   const streamBackend = (displayServer || "wayland").toLowerCase();
   const isWayland = streamBackend === "wayland";
-  const backendLabel = isWayland
-    ? "Wayland native"
-    : "Wayland-first UI - X11 compatible";
+  const backendLabel = isWayland ? "Wayland app stream" : "Legacy desktop stream";
   const compositorLabel = compositor
     ? compositor.toUpperCase()
     : isWayland
-      ? "Compositor"
-      : "i3";
+      ? "SWAY"
+      : "Legacy";
+  const streamTitle = isWayland ? "App stream" : "Legacy stream";
 
   const wsRef = useRef<WebSocket | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -122,6 +124,7 @@ export function DesktopStream({
 
     setConnectionState("connecting");
     setErrorMessage(null);
+    setInputErrorMessage(null);
 
     const url = buildWsUrl();
 
@@ -140,6 +143,7 @@ export function DesktopStream({
       if (connectionIdRef.current !== thisConnectionId) return;
       setConnectionState("connected");
       setErrorMessage(null);
+      setInputErrorMessage(null);
     };
 
     ws.onmessage = (event) => {
@@ -166,6 +170,7 @@ export function DesktopStream({
               }
               ctx.drawImage(img, 0, 0);
               setFrameCount((prev) => prev + 1);
+              setInputErrorMessage(null);
             }
           }
           URL.revokeObjectURL(imageUrl);
@@ -180,7 +185,12 @@ export function DesktopStream({
         try {
           const json = JSON.parse(event.data);
           if (json.error) {
-            setErrorMessage(json.message || json.error);
+            const message = json.message || json.error;
+            if (json.error === "input_failed") {
+              setInputErrorMessage(message);
+            } else {
+              setErrorMessage(message);
+            }
           }
         } catch {
           // Ignore parse errors
@@ -743,7 +753,7 @@ export function DesktopStream({
           </div>
           <div className="hidden min-w-0 flex-col leading-tight sm:flex">
             <span className="truncate text-sm font-medium text-white/90">
-              App stream
+              {streamTitle}
             </span>
             <span className="truncate text-[11px] text-white/45">
               {backendLabel} - {compositorLabel}
@@ -829,18 +839,25 @@ export function DesktopStream({
       {/* Canvas */}
       <div className="flex-1 flex items-center justify-center bg-black min-h-[200px]">
         {connectionState === "connected" && !errorMessage ? (
-          <canvas
-            ref={canvasRef}
-            data-testid="app-stream-canvas"
-            className="max-w-full max-h-full object-contain"
-            onMouseMove={handleMouseMove}
-            onMouseDown={handleMouseDown}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseLeave}
-            onAuxClick={handleAuxClick}
-            onContextMenu={handleContextMenu}
-            onWheel={handleWheel}
-          />
+          <div className="relative flex h-full w-full items-center justify-center">
+            <canvas
+              ref={canvasRef}
+              data-testid="app-stream-canvas"
+              className="max-w-full max-h-full object-contain"
+              onMouseMove={handleMouseMove}
+              onMouseDown={handleMouseDown}
+              onMouseUp={handleMouseUp}
+              onMouseLeave={handleMouseLeave}
+              onAuxClick={handleAuxClick}
+              onContextMenu={handleContextMenu}
+              onWheel={handleWheel}
+            />
+            {inputErrorMessage && (
+              <div className="pointer-events-none absolute left-3 right-3 top-3 rounded-lg border border-amber-500/20 bg-black/75 px-3 py-2 text-xs text-amber-200 shadow-lg">
+                {inputErrorMessage}
+              </div>
+            )}
+          </div>
         ) : connectionState === "connecting" ? (
           <div className="h-full w-full p-6">
             <div className="h-full min-h-[220px] rounded-lg border border-white/[0.04] bg-white/[0.03] animate-pulse" />

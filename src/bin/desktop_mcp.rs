@@ -1,6 +1,6 @@
 //! MCP Server for Desktop Tools
 //!
-//! This binary exposes the sandboxed.sh desktop tools (i3, Xvfb, screenshots, etc.)
+//! This binary exposes the sandboxed.sh desktop tools (Sway, Wayland screenshots, etc.)
 //! as an MCP server that can be used with OpenCode or other MCP-compatible clients.
 //!
 //! Communicates over stdio using JSON-RPC 2.0.
@@ -125,15 +125,51 @@ fn get_resolution() -> String {
     std::env::var("DESKTOP_RESOLUTION").unwrap_or_else(|_| "1280x720".to_string())
 }
 
-/// Run a command with DISPLAY environment variable set
-fn run_with_display(
-    display: &str,
+#[derive(Clone, Debug)]
+struct WaylandEnv {
+    xdg_runtime_dir: PathBuf,
+    wayland_display: String,
+    sway_socket: PathBuf,
+}
+
+fn display_num(display: &str) -> Result<u32, String> {
+    display
+        .trim_start_matches(':')
+        .parse()
+        .map_err(|_| format!("Invalid display format: {}", display))
+}
+
+fn wayland_env_for_display(display: &str) -> Result<WaylandEnv, String> {
+    let display_num = display_num(display)?;
+    let xdg_runtime_dir = get_working_dir()
+        .join(".sandboxed-sh")
+        .join("wayland")
+        .join(display_num.to_string());
+    Ok(WaylandEnv {
+        sway_socket: xdg_runtime_dir.join("sway-ipc.sock"),
+        xdg_runtime_dir,
+        wayland_display: "wayland-1".to_string(),
+    })
+}
+
+fn configure_wayland_command(cmd: &mut std::process::Command, env: &WaylandEnv) {
+    cmd.env("XDG_RUNTIME_DIR", &env.xdg_runtime_dir)
+        .env("WAYLAND_DISPLAY", &env.wayland_display)
+        .env("SWAYSOCK", &env.sway_socket)
+        .env("GDK_BACKEND", "wayland")
+        .env("QT_QPA_PLATFORM", "wayland")
+        .env("MOZ_ENABLE_WAYLAND", "1");
+}
+
+fn run_with_wayland(
+    env: &WaylandEnv,
     program: &str,
     args: &[&str],
 ) -> Result<(String, String, i32), String> {
-    let output = std::process::Command::new(program)
+    let mut cmd = std::process::Command::new(program);
+    configure_wayland_command(&mut cmd, env);
+    let output = cmd
         .args(args)
-        .env("DISPLAY", display)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -144,6 +180,39 @@ fn run_with_display(
     let exit_code = output.status.code().unwrap_or(-1);
 
     Ok((stdout, stderr, exit_code))
+}
+
+fn write_sway_config(path: &std::path::Path, resolution: &str) -> Result<(), String> {
+    let config = format!(
+        r#"output * resolution {resolution}
+default_border none
+default_floating_border none
+gaps inner 0
+gaps outer 0
+focus_follows_mouse no
+seat * hide_cursor 5000
+exec_always true
+"#
+    );
+    std::fs::write(path, config).map_err(|e| format!("Failed to write sway config: {}", e))
+}
+
+fn key_for_wtype(key: &str) -> String {
+    key.split('+')
+        .map(|part| match part {
+            "ctrl" => "leftctrl",
+            "alt" => "leftalt",
+            "shift" => "leftshift",
+            "super" => "leftmeta",
+            "Return" => "enter",
+            "BackSpace" => "backspace",
+            "Escape" => "esc",
+            "Page_Up" => "pageup",
+            "Page_Down" => "pagedown",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 fn get_working_dir() -> PathBuf {
@@ -205,68 +274,61 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
     let display_num = DISPLAY_COUNTER.fetch_add(1, Ordering::SeqCst);
     let display_id = format!(":{}", display_num);
     let resolution = get_resolution();
+    let wayland_env = wayland_env_for_display(&display_id)?;
 
-    // Clean up stale lock files
-    let lock_file = format!("/tmp/.X{}-lock", display_num);
-    let socket_file = format!("/tmp/.X11-unix/X{}", display_num);
-    let _ = std::fs::remove_file(&lock_file);
-    let _ = std::fs::remove_file(&socket_file);
+    let _ = std::fs::remove_dir_all(&wayland_env.xdg_runtime_dir);
+    std::fs::create_dir_all(&wayland_env.xdg_runtime_dir)
+        .map_err(|e| format!("Failed to create runtime dir: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &wayland_env.xdg_runtime_dir,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .map_err(|e| format!("Failed to set runtime dir permissions: {}", e))?;
+    }
 
-    // Start Xvfb
-    let xvfb_args = format!("{} -screen 0 {}x24", display_id, resolution);
-    let xvfb = std::process::Command::new("Xvfb")
-        .args(xvfb_args.split_whitespace())
+    let sway_config = wayland_env.xdg_runtime_dir.join("sway.config");
+    write_sway_config(&sway_config, &resolution)?;
+
+    let mut sway_cmd = std::process::Command::new("sway");
+    configure_wayland_command(&mut sway_cmd, &wayland_env);
+    let mut sway = match sway_cmd
+        .args([
+            "--unsupported-gpu",
+            "-c",
+            sway_config.to_string_lossy().as_ref(),
+        ])
+        .env("WLR_BACKENDS", "headless")
+        .env("WLR_LIBINPUT_NO_DEVICES", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("Failed to start Xvfb: {}. Is Xvfb installed?", e))?;
-
-    let xvfb_pid = xvfb.id();
-
-    // Wait for Xvfb to be ready
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    // Start i3 window manager with explicit config path - cleanup Xvfb on failure
-    // Try multiple config locations in order of preference
-    let config_paths = [
-        "/var/lib/opencode/.config/i3/config",
-        "/root/.config/i3/config",
-    ];
-    let config_path = config_paths
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(|s| s.to_string());
-
-    let mut i3_cmd = std::process::Command::new("i3");
-    i3_cmd
-        .env("DISPLAY", &display_id)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    // Use explicit config path if found to avoid first-run wizard
-    if let Some(ref cfg) = config_path {
-        i3_cmd.args(["-c", cfg]);
-    }
-
-    let i3 = match i3_cmd.spawn() {
-        Ok(i3) => i3,
+    {
+        Ok(sway) => sway,
         Err(e) => {
-            kill_process(xvfb_pid);
-            return Err(format!("Failed to start i3: {}. Is i3 installed?", e));
+            return Err(format!("Failed to start sway: {}. Is sway installed?", e));
         }
     };
 
-    let i3_pid = i3.id();
+    let sway_pid = sway.id();
 
-    // Wait for i3 to initialize
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    if let Ok(Some(status)) = sway.try_wait() {
+        return Err(format!("Sway exited immediately with status: {:?}", status));
+    }
+    let (_, stderr, exit_code) = run_with_wayland(&wayland_env, "swaymsg", &["-t", "get_outputs"])?;
+    if exit_code != 0 {
+        kill_process(sway_pid);
+        return Err(format!("Sway did not become ready: {}", stderr));
+    }
 
     // Create screenshots directory - cleanup on failure
     let working_dir = get_working_dir();
     let screenshots_dir = working_dir.join("screenshots");
     if let Err(e) = std::fs::create_dir_all(&screenshots_dir) {
-        kill_process(i3_pid);
-        kill_process(xvfb_pid);
+        kill_process(sway_pid);
         return Err(format!("Failed to create screenshots dir: {}", e));
     }
 
@@ -284,8 +346,7 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
         let browser_cmd = match find_browser_command() {
             Some(cmd) => cmd,
             None => {
-                kill_process(i3_pid);
-                kill_process(xvfb_pid);
+                kill_process(sway_pid);
                 return Err(
                     "Failed to start Chromium: no browser binary found (set CHROMIUM_BIN or BROWSER)"
                         .to_string(),
@@ -293,14 +354,14 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
             }
         };
 
-        let mut chromium = match std::process::Command::new(&browser_cmd)
+        let mut browser_command = std::process::Command::new(&browser_cmd);
+        configure_wayland_command(&mut browser_command, &wayland_env);
+        let browser_profile_dir = wayland_env.xdg_runtime_dir.join("browser-profile");
+        let mut chromium = match browser_command
             .args([
                 // Security/sandbox (required for running as root)
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-                // GPU/rendering
-                "--disable-gpu",
-                "--disable-software-rasterizer",
                 "--disable-dev-shm-usage",
                 // Accessibility for automation
                 "--force-renderer-accessibility",
@@ -319,19 +380,21 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
                 "--disable-background-networking", // No background requests
                 "--disable-sync",                  // No sync prompts
                 "--disable-extensions",            // No extension prompts
+                "--ozone-platform=wayland",
+                "--enable-features=UseOzonePlatform",
                 // Window behavior
-                "--start-maximized", // Fill the screen
+                "--start-fullscreen",
+                "--new-window",
+                &format!("--user-data-dir={}", browser_profile_dir.display()),
                 url,
             ])
-            .env("DISPLAY", &display_id)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
         {
             Ok(c) => c,
             Err(e) => {
-                kill_process(i3_pid);
-                kill_process(xvfb_pid);
+                kill_process(sway_pid);
                 return Err(format!("Failed to start Chromium: {}", e));
             }
         };
@@ -339,13 +402,14 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
         let chromium_pid = chromium.id();
         std::thread::sleep(std::time::Duration::from_millis(400));
         if let Ok(Some(status)) = chromium.try_wait() {
-            kill_process(i3_pid);
-            kill_process(xvfb_pid);
+            kill_process(sway_pid);
             return Err(format!(
                 "Browser exited immediately with status: {:?}",
                 status
             ));
         }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = run_with_wayland(&wayland_env, "swaymsg", &["fullscreen", "enable"]);
 
         (
             Some(chromium_pid),
@@ -363,11 +427,13 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
     let mut session_info = json!({
         "display": display_id,
         "display_num": display_num,
-        "xvfb_pid": xvfb_pid,
-        "i3_pid": i3_pid,
-        "display_server": "x11",
-        "compositor": "i3",
+        "sway_pid": sway_pid,
+        "display_server": "wayland",
+        "compositor": "sway-headless",
         "resolution": resolution,
+        "xdg_runtime_dir": wayland_env.xdg_runtime_dir.to_string_lossy(),
+        "wayland_display": wayland_env.wayland_display,
+        "sway_socket": wayland_env.sway_socket.to_string_lossy(),
         "screenshots_dir": screenshots_dir.to_string_lossy()
     });
     if let Some(pid) = browser_pid {
@@ -380,19 +446,19 @@ fn tool_start_session(args: &Value) -> Result<String, String> {
         if let Some(pid) = browser_pid {
             kill_process(pid);
         }
-        kill_process(i3_pid);
-        kill_process(xvfb_pid);
+        kill_process(sway_pid);
         return Err(format!("Failed to write session file: {}", e));
     }
 
     write_display_info(&display_id)?;
 
     Ok(format!(
-        "{{\"success\": true, \"display\": \"{}\", \"display_server\": \"x11\", \"compositor\": \"i3\", \"resolution\": \"{}\", \"xvfb_pid\": {}, \"i3_pid\": {}, \"screenshots_dir\": \"{}\"{}}}",
+        "{{\"success\": true, \"display\": \"{}\", \"display_server\": \"wayland\", \"compositor\": \"sway-headless\", \"resolution\": \"{}\", \"sway_pid\": {}, \"wayland_display\": \"{}\", \"xdg_runtime_dir\": \"{}\", \"screenshots_dir\": \"{}\"{}}}",
         display_id,
         resolution,
-        xvfb_pid,
-        i3_pid,
+        sway_pid,
+        wayland_env.wayland_display,
+        wayland_env.xdg_runtime_dir.display(),
         screenshots_dir.display(),
         browser_info
     ))
@@ -420,7 +486,7 @@ fn tool_stop_session(args: &Value) -> Result<String, String> {
     if session_file.exists() {
         if let Ok(content) = std::fs::read_to_string(&session_file) {
             if let Ok(session_info) = serde_json::from_str::<Value>(&content) {
-                for pid_key in ["xvfb_pid", "i3_pid", "browser_pid"] {
+                for pid_key in ["sway_pid", "browser_pid", "xvfb_pid", "i3_pid"] {
                     if let Some(pid) = session_info.get(pid_key).and_then(|v| v.as_u64()) {
                         let pid = pid as i32;
                         // SAFETY: PIDs are read from a session file we wrote;
@@ -436,16 +502,12 @@ fn tool_stop_session(args: &Value) -> Result<String, String> {
         let _ = std::fs::remove_file(&session_file);
     }
 
-    // Kill by display pattern (fallback)
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", &format!("Xvfb {}", display_id)])
-        .output();
-
-    // Clean up lock files
-    let lock_file = format!("/tmp/.X{}-lock", display_num);
-    let socket_file = format!("/tmp/.X11-unix/X{}", display_num);
-    let _ = std::fs::remove_file(&lock_file);
-    let _ = std::fs::remove_file(&socket_file);
+    if let Ok(env) = wayland_env_for_display(display_id) {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", &format!("WAYLAND_DISPLAY={}", env.wayland_display)])
+            .output();
+        let _ = std::fs::remove_dir_all(&env.xdg_runtime_dir);
+    }
     clear_display_info_if_current(display_id);
 
     Ok(format!(
@@ -488,8 +550,8 @@ fn tool_screenshot(args: &Value) -> Result<(String, Option<String>), String> {
 
     let filepath = screenshots_dir.join(&filename);
 
-    // Build scrot command
-    let mut scrot_args = vec!["-o".to_string(), filepath.to_string_lossy().to_string()];
+    let wayland_env = wayland_env_for_display(display_id)?;
+    let mut grim_args: Vec<String> = Vec::new();
 
     // Add region if specified
     if let Some(region) = args.get("region") {
@@ -498,25 +560,17 @@ fn tool_screenshot(args: &Value) -> Result<(String, Option<String>), String> {
             let y = region.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
             let w = region.get("width").and_then(|v| v.as_i64()).unwrap_or(100);
             let h = region.get("height").and_then(|v| v.as_i64()).unwrap_or(100);
-            scrot_args.push("-a".to_string());
-            scrot_args.push(format!("{},{},{},{}", x, y, w, h));
+            grim_args.push("-g".to_string());
+            grim_args.push(format!("{},{} {}x{}", x, y, w, h));
         }
     }
+    grim_args.push(filepath.to_string_lossy().to_string());
 
-    let scrot_args_refs: Vec<&str> = scrot_args.iter().map(|s| s.as_str()).collect();
-    let (_stdout, stderr, exit_code) = run_with_display(display_id, "scrot", &scrot_args_refs)?;
+    let grim_args_refs: Vec<&str> = grim_args.iter().map(|s| s.as_str()).collect();
+    let (_stdout, stderr, exit_code) = run_with_wayland(&wayland_env, "grim", &grim_args_refs)?;
 
     if exit_code != 0 {
-        // Try import as fallback
-        let (_, _, import_exit) = run_with_display(
-            display_id,
-            "import",
-            &["-window", "root", filepath.to_string_lossy().as_ref()],
-        )?;
-
-        if import_exit != 0 {
-            return Err(format!("Screenshot failed. scrot error: {}", stderr));
-        }
+        return Err(format!("Screenshot failed. grim error: {}", stderr));
     }
 
     if !filepath.exists() {
@@ -571,15 +625,25 @@ fn tool_type_text(args: &Value) -> Result<String, String> {
         return Err("Either 'text' or 'key' must be provided".to_string());
     };
 
+    let wayland_env = wayland_env_for_display(display_id)?;
     let delay_str = delay_ms.to_string();
-    let (_stdout, stderr, exit_code) = run_with_display(
-        display_id,
-        "xdotool",
-        &[command, "--delay", &delay_str, &input],
-    )?;
+    let wtype_args = if command == "type" {
+        vec!["-d".to_string(), delay_str, input.clone()]
+    } else {
+        vec![
+            "-d".to_string(),
+            delay_str,
+            "-P".to_string(),
+            key_for_wtype(&input),
+            "-p".to_string(),
+            key_for_wtype(&input),
+        ]
+    };
+    let refs: Vec<&str> = wtype_args.iter().map(|s| s.as_str()).collect();
+    let (_stdout, stderr, exit_code) = run_with_wayland(&wayland_env, "wtype", &refs)?;
 
     if exit_code != 0 {
-        return Err(format!("xdotool failed: {}", stderr));
+        return Err(format!("wtype failed: {}", stderr));
     }
 
     Ok(format!(
@@ -625,27 +689,26 @@ fn tool_click(args: &Value) -> Result<String, String> {
         .unwrap_or(false);
     let repeat = if double { "2" } else { "1" };
 
+    let wayland_env = wayland_env_for_display(display_id)?;
+
     // Move to position first
     let x_str = x.to_string();
     let y_str = y.to_string();
     let (_, stderr, exit_code) =
-        run_with_display(display_id, "xdotool", &["mousemove", &x_str, &y_str])?;
+        run_with_wayland(&wayland_env, "wlrctl", &["pointer", "move", &x_str, &y_str])?;
 
     if exit_code != 0 {
-        return Err(format!("xdotool mousemove failed: {}", stderr));
+        return Err(format!("wlrctl pointer move failed: {}", stderr));
     }
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    // Click
-    let (_, stderr, exit_code) = run_with_display(
-        display_id,
-        "xdotool",
-        &["click", "--repeat", repeat, button],
-    )?;
-
-    if exit_code != 0 {
-        return Err(format!("xdotool click failed: {}", stderr));
+    for _ in 0..repeat.parse::<usize>().unwrap_or(1) {
+        let (_, stderr, exit_code) =
+            run_with_wayland(&wayland_env, "wlrctl", &["pointer", "click", button])?;
+        if exit_code != 0 {
+            return Err(format!("wlrctl pointer click failed: {}", stderr));
+        }
     }
 
     Ok(format!(
@@ -680,11 +743,12 @@ fn tool_mouse_move(args: &Value) -> Result<String, String> {
 
     let x_str = x.to_string();
     let y_str = y.to_string();
+    let wayland_env = wayland_env_for_display(display_id)?;
     let (_, stderr, exit_code) =
-        run_with_display(display_id, "xdotool", &["mousemove", &x_str, &y_str])?;
+        run_with_wayland(&wayland_env, "wlrctl", &["pointer", "move", &x_str, &y_str])?;
 
     if exit_code != 0 {
-        return Err(format!("xdotool mousemove failed: {}", stderr));
+        return Err(format!("wlrctl pointer move failed: {}", stderr));
     }
 
     Ok(format!("{{\"success\": true, \"x\": {}, \"y\": {}}}", x, y))
@@ -705,6 +769,8 @@ fn tool_scroll(args: &Value) -> Result<String, String> {
         .and_then(|v| v.as_i64())
         .ok_or("Missing 'amount' argument")?;
 
+    let wayland_env = wayland_env_for_display(display_id)?;
+
     // Move to position if specified
     if let (Some(x), Some(y)) = (
         args.get("x").and_then(|v| v.as_i64()),
@@ -713,30 +779,22 @@ fn tool_scroll(args: &Value) -> Result<String, String> {
         let x_str = x.to_string();
         let y_str = y.to_string();
         let (_, stderr, exit_code) =
-            run_with_display(display_id, "xdotool", &["mousemove", &x_str, &y_str])?;
+            run_with_wayland(&wayland_env, "wlrctl", &["pointer", "move", &x_str, &y_str])?;
 
         if exit_code != 0 {
-            return Err(format!("xdotool mousemove failed: {}", stderr));
+            return Err(format!("wlrctl pointer move failed: {}", stderr));
         }
 
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    // xdotool uses button 4 for scroll up, button 5 for scroll down
-    let (button, clicks) = if amount >= 0 {
-        ("5", amount.unsigned_abs() as usize)
-    } else {
-        ("4", amount.unsigned_abs() as usize)
-    };
-
-    for _ in 0..clicks {
-        let (_, stderr, exit_code) = run_with_display(display_id, "xdotool", &["click", button])?;
-
-        if exit_code != 0 {
-            return Err(format!("xdotool scroll failed: {}", stderr));
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    let (_, stderr, exit_code) = run_with_wayland(
+        &wayland_env,
+        "wlrctl",
+        &["pointer", "scroll", "vertical", &amount.to_string()],
+    )?;
+    if exit_code != 0 {
+        return Err(format!("wlrctl scroll failed: {}", stderr));
     }
 
     Ok(format!(
@@ -761,10 +819,11 @@ fn tool_i3_command(args: &Value) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .ok_or("Missing 'command' argument")?;
 
-    let (stdout, stderr, exit_code) = run_with_display(display_id, "i3-msg", &[command])?;
+    let wayland_env = wayland_env_for_display(display_id)?;
+    let (stdout, stderr, exit_code) = run_with_wayland(&wayland_env, "swaymsg", &[command])?;
 
     if exit_code != 0 {
-        return Err(format!("i3-msg failed: {} {}", stdout, stderr));
+        return Err(format!("swaymsg failed: {} {}", stdout, stderr));
     }
 
     // Parse i3-msg JSON output if present
@@ -797,11 +856,11 @@ fn tool_get_text(args: &Value) -> Result<String, String> {
 
     let screenshot_path = screenshots_dir.join("_ocr_temp.png");
 
-    // Take screenshot
-    let (_, stderr, exit_code) = run_with_display(
-        display_id,
-        "scrot",
-        &["-o", screenshot_path.to_string_lossy().as_ref()],
+    let wayland_env = wayland_env_for_display(display_id)?;
+    let (_, stderr, exit_code) = run_with_wayland(
+        &wayland_env,
+        "grim",
+        &[screenshot_path.to_string_lossy().as_ref()],
     )?;
 
     if exit_code != 0 {

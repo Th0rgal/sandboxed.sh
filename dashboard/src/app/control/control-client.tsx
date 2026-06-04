@@ -5163,6 +5163,11 @@ export default function ControlClient() {
       null,
     [desktopDisplayId, desktopSessions],
   );
+  const selectedDesktopBackend = (
+    selectedDesktopSession?.display_server ?? "wayland"
+  ).toLowerCase();
+  const selectedStreamLabel =
+    selectedDesktopBackend === "wayland" ? "App Stream" : "Legacy Stream";
 
   useEffect(() => {
     // Only auto-show when transitioning from no active thinking to active thinking
@@ -6717,7 +6722,7 @@ export default function ControlClient() {
             )
           : expecting
             ? runningSessions.filter((s) => !s.mission_id)
-            : [];
+            : runningSessions.filter((s) => !s.mission_id);
         const hasCurrentMissionSession = currentMissionSessions.length > 0;
 
         // Auto-select first active session from current mission if current display isn't running anywhere
@@ -10532,7 +10537,7 @@ export default function ControlClient() {
               )}
             </button>
 
-            {/* App stream toggle with display selector - only shown when a streamable session is active */}
+            {/* Stream toggle with display selector - only shown when a streamable session is active */}
             {hasDesktopSession && (
               <div className="relative flex items-center" data-testid="app-stream-toggle">
                 <button
@@ -10545,12 +10550,12 @@ export default function ControlClient() {
                   )}
                   title={
                     showDesktopStream
-                      ? "Hide app stream"
-                      : "Show app stream"
+                      ? `Hide ${selectedStreamLabel.toLowerCase()}`
+                      : `Show ${selectedStreamLabel.toLowerCase()}`
                   }
                 >
                   <AppWindow className="h-4 w-4" />
-                  <span className="hidden lg:inline">App Stream</span>
+                  <span className="hidden lg:inline">{selectedStreamLabel}</span>
                   {showDesktopStream ? (
                     <PanelRightClose className="h-4 w-4" />
                   ) : (
