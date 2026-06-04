@@ -5167,7 +5167,7 @@ export default function ControlClient() {
     selectedDesktopSession?.display_server ?? "wayland"
   ).toLowerCase();
   const selectedStreamLabel =
-    selectedDesktopBackend === "wayland" ? "App Stream" : "Legacy Stream";
+    selectedDesktopBackend === "wayland" ? "App Surface" : "Legacy Surface";
 
   useEffect(() => {
     // Only auto-show when transitioning from no active thinking to active thinking
@@ -10571,7 +10571,7 @@ export default function ControlClient() {
                         ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
                         : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
                     )}
-                    title="Select app stream"
+                    title="Select app surface"
                   >
                     <span className="text-sm font-mono">
                       {desktopDisplayId}
@@ -10579,7 +10579,15 @@ export default function ControlClient() {
                     <ChevronDown className="h-3.5 w-3.5" />
                   </button>
                   {showDisplaySelector && (
-                    <div className="absolute right-0 top-full mt-1 z-50 min-w-[280px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
+                    <div className="absolute right-0 top-full mt-1 z-50 min-w-[320px] overflow-hidden rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
+                      <div className="border-b border-white/[0.06] px-3 py-2">
+                        <div className="text-xs font-medium text-white/75">
+                          App surfaces
+                        </div>
+                        <div className="mt-0.5 text-[11px] text-white/35">
+                          One interactive window stream per running app.
+                        </div>
+                      </div>
                       {/* Show sessions from API if available, otherwise show hardcoded list */}
                       {desktopSessions.length > 0 ? (
                         <>
@@ -10622,15 +10630,19 @@ export default function ControlClient() {
                                 <span className="flex min-w-0 flex-1 flex-col">
                                   <span
                                     className={cn(
-                                      "font-mono leading-tight",
+                                      "truncate leading-tight",
                                       desktopDisplayId === session.display
                                         ? "text-emerald-400"
                                         : "text-white/70",
                                     )}
                                   >
-                                    {session.display}
+                                    {session.mission_title || session.display}
                                   </span>
                                   <span className="truncate text-[11px] leading-tight text-white/35">
+                                    <span className="font-mono">
+                                      {session.display}
+                                    </span>
+                                    {" - "}
                                     {(session.display_server ?? "wayland").toUpperCase()}
                                     {session.compositor
                                       ? ` / ${session.compositor.toUpperCase()}`
@@ -10787,7 +10799,7 @@ export default function ControlClient() {
                           >
                             <span className="font-mono">{display}</span>
                             <span className="ml-2 text-[11px] text-white/35">
-                              Wayland-ready
+                              App surface ready
                             </span>
                             {desktopDisplayId === display && (
                               <CheckCircle className="ml-auto h-3.5 w-3.5" />
@@ -11407,7 +11419,9 @@ export default function ControlClient() {
                 // mount (the width change is what caused the chat-side reflow
                 // freeze when toggling the Workers panel).
                 "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0",
-                showDesktopStream ? "flex-1 max-w-md" : "w-80",
+                showDesktopStream
+                  ? "basis-[clamp(400px,44vw,820px)] min-w-[360px] max-w-[820px] resize-x overflow-hidden"
+                  : "w-80",
               )}
             >
               {showWorkbenchPanel && (

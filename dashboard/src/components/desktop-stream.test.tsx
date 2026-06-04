@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DesktopStream } from "./desktop-stream";
@@ -53,6 +53,26 @@ afterEach(() => {
 });
 
 describe("DesktopStream", () => {
+  it("renders the app-surface chrome and viewport controls", async () => {
+    render(<DesktopStream displayId=":99" displayServer="wayland" compositor="sway" />);
+
+    await waitFor(() => expect(sockets).toHaveLength(1));
+
+    await act(async () => {
+      sockets[0].onopen?.();
+    });
+
+    expect(screen.getByText("Interactive app surface")).toBeInTheDocument();
+    expect(screen.getByText("Wayland app stream")).toBeInTheDocument();
+    expect(screen.getByText("Pointer")).toBeInTheDocument();
+    expect(screen.getByText("Keyboard")).toBeInTheDocument();
+    expect(screen.getByRole("slider", { name: "Stream FPS" })).toBeInTheDocument();
+    expect(screen.getByRole("slider", { name: "Stream quality" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Fill surface" }));
+    expect(screen.getByTestId("app-stream-canvas")).toHaveClass("h-full");
+  });
+
   it("keeps the canvas mounted for transient input errors", async () => {
     render(<DesktopStream displayId=":99" />);
 
