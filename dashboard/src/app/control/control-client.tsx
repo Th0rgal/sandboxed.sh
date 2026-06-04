@@ -11413,6 +11413,7 @@ export default function ControlClient() {
           {/* Right column: Workbench, Thinking Panel and Desktop Stream stacked */}
           {(showWorkbenchPanel || showThinkingPanel || showDesktopStream) && (
             <div
+              data-testid="right-side-panel"
               className={cn(
                 // animate-fade-in is opacity-only and cheap; we drop the
                 // `transition-all duration-300` that was animating width on
@@ -11420,7 +11421,7 @@ export default function ControlClient() {
                 // freeze when toggling the Workers panel).
                 "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0",
                 showDesktopStream
-                  ? "basis-[clamp(400px,44vw,820px)] min-w-[360px] max-w-[820px] resize-x overflow-hidden"
+                  ? "basis-[clamp(400px,44vw,820px)] min-h-[420px] min-w-[360px] max-h-[calc(100vh-7rem)] max-w-[820px] resize overflow-hidden"
                   : "w-80",
               )}
             >

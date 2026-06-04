@@ -195,6 +195,17 @@ test("control exposes a focused app-stream surface", async ({ page }) => {
   await page.goto("/control");
 
   await expect(page.getByTestId("app-stream-panel")).toBeVisible();
+  const panelResize = await page.getByTestId("right-side-panel").evaluate((panel) => {
+    const styles = window.getComputedStyle(panel);
+    return {
+      maxHeight: Number.parseFloat(styles.maxHeight),
+      minHeight: Number.parseFloat(styles.minHeight),
+      resize: styles.resize,
+    };
+  });
+  expect(panelResize.resize).toBe("both");
+  expect(panelResize.minHeight).toBe(420);
+  expect(panelResize.maxHeight).toBeGreaterThan(panelResize.minHeight);
   await expect(page.getByText("Interactive app surface")).toBeVisible();
   await expect(page.getByText("Pointer")).toBeVisible();
   await expect(page.getByText("Keyboard")).toBeVisible();
