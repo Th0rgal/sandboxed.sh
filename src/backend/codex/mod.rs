@@ -147,50 +147,30 @@ fn resolve_model(session_model: Option<&str>, default_model: Option<&str>) -> Op
         .or_else(|| default_model.map(|s| s.to_string()))
 }
 
-/// How a codex `delta` field should be combined with prior content of
-/// the same item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeltaSemantics {
-    /// Each delta is a new token to append (`item/agentMessage/delta`,
-    /// `item/reasoning/textDelta`). In practice, some app-server builds
-    /// occasionally send full snapshots through these methods, so the fold
-    /// still treats prefix-extension payloads as replacement snapshots.
-    Incremental,
-    /// Each delta is the full text-so-far. Atomic replacement
-    /// (`item/reasoning/summaryTextDelta` — observed empirically on prod
-    /// after the snowball regression). New streams (where the delta
-    /// doesn't extend the buffer) replace it too — codex sometimes
-    /// resets the summary draft mid-item without firing item/completed.
-    CumulativeSnapshot,
-}
-
-/// Fold a codex delta into a per-item buffer with explicit semantics.
+/// Fold a codex delta into a per-item buffer.
 ///
-/// `Incremental` appends true token deltas, but treats prefix-extension
-/// payloads as snapshots because some app-server builds send full text-so-far
-/// through delta-shaped events. `CumulativeSnapshot` replaces the buffer even
-/// when the new snapshot doesn't extend the prior one, because codex's summary
-/// stream can restart mid-item. The earlier prod bug ("The saved goalThe saved
-/// goal is active…" 36×) was our heuristic-only fold appending a fresh-start
-/// summary on top of the stable reasoning text.
-fn fold_delta_into(buffer: &mut String, delta: &str, semantics: DeltaSemantics) {
-    match semantics {
-        DeltaSemantics::Incremental => {
-            if !buffer.is_empty() && delta.starts_with(buffer.as_str()) {
-                buffer.clear();
-                buffer.push_str(delta);
-            } else if !buffer.starts_with(delta) {
-                buffer.push_str(delta);
-            }
-        }
-        DeltaSemantics::CumulativeSnapshot => {
-            // Drop pure echoes (delta is an earlier substring of the buffer).
-            if !buffer.is_empty() && buffer.starts_with(delta) && buffer.len() > delta.len() {
-                return;
-            }
-            buffer.clear();
-            buffer.push_str(delta);
-        }
+/// All codex `*/delta` notifications (`item/agentMessage/delta`,
+/// `item/reasoning/textDelta`, `item/reasoning/summaryTextDelta`) carry
+/// incremental token deltas on current CLI builds (verified on 0.128.0:
+/// a ~500-char summary arrives as ~94 token-sized deltas). Append by
+/// default, but absorb two snapshot-shaped payloads some builds emit
+/// through the same methods:
+/// - prefix-extension (delta starts with the buffer) → replace, so a full
+///   text-so-far resend doesn't duplicate;
+/// - echo (buffer starts with the delta) → drop, so a shorter resend
+///   doesn't shrink or duplicate.
+///
+/// `summaryTextDelta` was previously treated as a cumulative snapshot
+/// (wholesale replacement per delta). On 0.128.0 that collapsed every
+/// reasoning summary to whichever single token chunk was longest — the
+/// Thoughts panel showed/stored 35-char fragments (mission 2e8af5f7,
+/// 87 identical truncated thinking events).
+fn fold_delta_into(buffer: &mut String, delta: &str) {
+    if !buffer.is_empty() && delta.starts_with(buffer.as_str()) {
+        buffer.clear();
+        buffer.push_str(delta);
+    } else if !buffer.starts_with(delta) {
+        buffer.push_str(delta);
     }
 }
 
@@ -685,7 +665,7 @@ impl AppServerEventTranslator {
                         .to_string();
                     let entry = self.delta_buffers.entry(item_id).or_default();
                     // Agent-message deltas are incremental tokens.
-                    fold_delta_into(entry, delta, DeltaSemantics::Incremental);
+                    fold_delta_into(entry, delta);
                     events.push(ExecutionEvent::TextDelta {
                         content: entry.clone(),
                     });
@@ -698,20 +678,20 @@ impl AppServerEventTranslator {
                         .and_then(|v| v.as_str())
                         .unwrap_or("__anon_reasoning")
                         .to_string();
-                    // The two reasoning sub-streams have different
-                    // semantics, observed empirically (PR #403 prod
-                    // smoke): `textDelta` is incremental,
-                    // `summaryTextDelta` is cumulative snapshot. They
-                    // get separate buffer keys to avoid one stream
-                    // contaminating the other.
-                    let (kind, semantics) = if method == "item/reasoning/summaryTextDelta" {
-                        ("summary", DeltaSemantics::CumulativeSnapshot)
+                    // Both reasoning sub-streams carry incremental token
+                    // deltas on current CLI builds (0.128.0 verified for
+                    // `summaryTextDelta`; treating it as a cumulative
+                    // snapshot collapsed summaries to single token chunks).
+                    // They keep separate buffer keys so one stream can't
+                    // contaminate the other.
+                    let kind = if method == "item/reasoning/summaryTextDelta" {
+                        "summary"
                     } else {
-                        ("reasoning", DeltaSemantics::Incremental)
+                        "reasoning"
                     };
                     let key = format!("{}:{}", kind, item_id);
                     let entry = self.delta_buffers.entry(key.clone()).or_default();
-                    fold_delta_into(entry, delta, semantics);
+                    fold_delta_into(entry, delta);
                     events.push(ExecutionEvent::Thinking {
                         content: entry.clone(),
                         item_id: Some(key),
@@ -1011,14 +991,16 @@ mod tests {
     fn fold_delta_appends_incremental_tokens() {
         let mut buf = String::new();
         for tok in ["P", "O", "N", "G"] {
-            fold_delta_into(&mut buf, tok, DeltaSemantics::Incremental);
+            fold_delta_into(&mut buf, tok);
         }
         assert_eq!(buf, "PONG");
     }
 
     #[test]
     fn fold_delta_replaces_cumulative_snapshots() {
-        // Snapshot stream extending normally.
+        // Snapshot-shaped stream (each payload extends the previous one)
+        // must replace, not append — older app-server builds send full
+        // text-so-far through delta methods.
         let mut buf = String::new();
         for snapshot in [
             "The",
@@ -1026,64 +1008,56 @@ mod tests {
             "The targeted Lean",
             "The targeted Lean module",
         ] {
-            fold_delta_into(&mut buf, snapshot, DeltaSemantics::CumulativeSnapshot);
+            fold_delta_into(&mut buf, snapshot);
         }
         assert_eq!(buf, "The targeted Lean module");
     }
 
     #[test]
-    fn fold_delta_cumulative_handles_stream_restart() {
-        // Codex sometimes restarts a summary draft mid-item: the
-        // existing buffer "Done with first draft." is followed by a
-        // fresh sequence beginning with "The". The new delta does NOT
-        // extend the buffer, but cumulative-snapshot semantics replace
-        // wholesale anyway — this is the regression that produced the
-        // 36x snowball "The saved goalThe saved goal isThe saved goal
-        // is active…" on prod.
-        let mut buf = String::from("Done with first draft.");
-        fold_delta_into(&mut buf, "The", DeltaSemantics::CumulativeSnapshot);
-        assert_eq!(buf, "The");
-    }
-
-    #[test]
-    fn fold_delta_cumulative_drops_echo() {
-        // Pure echo of an earlier substring should not shrink the buffer.
+    fn fold_delta_drops_echo() {
+        // Pure echo of an earlier prefix should not shrink the buffer.
         let mut buf = String::from("The targeted Lean");
-        fold_delta_into(&mut buf, "The targeted", DeltaSemantics::CumulativeSnapshot);
+        fold_delta_into(&mut buf, "The targeted");
         assert_eq!(buf, "The targeted Lean");
     }
 
     #[test]
     fn fold_delta_idempotent_on_repeated_snapshot() {
         let mut buf = String::new();
-        fold_delta_into(&mut buf, "stable", DeltaSemantics::CumulativeSnapshot);
-        fold_delta_into(&mut buf, "stable", DeltaSemantics::CumulativeSnapshot);
+        fold_delta_into(&mut buf, "stable");
+        fold_delta_into(&mut buf, "stable");
         assert_eq!(buf, "stable");
     }
 
     #[test]
-    fn incremental_fold_accepts_cumulative_snapshots_without_snowballing() {
+    fn fold_delta_accumulates_summary_token_deltas() {
+        // Regression for the truncated-thoughts bug (mission 2e8af5f7):
+        // `item/reasoning/summaryTextDelta` on CLI 0.128.0 streams token
+        // deltas; cumulative-snapshot replacement collapsed the summary to
+        // its longest single chunk. Token deltas must accumulate.
         let mut buf = String::new();
-        fold_delta_into(&mut buf, "The fix makes", DeltaSemantics::Incremental);
-        fold_delta_into(
-            &mut buf,
-            "The fix makes a parity pack's fork count",
-            DeltaSemantics::Incremental,
+        for tok in [
+            "**Solving the riddle carefully**\n\nI",
+            "'m",
+            " working",
+            " through",
+            " the",
+            " sheep",
+            " puzzle.",
+        ] {
+            fold_delta_into(&mut buf, tok);
+        }
+        assert_eq!(
+            buf,
+            "**Solving the riddle carefully**\n\nI'm working through the sheep puzzle."
         );
-        fold_delta_into(
-            &mut buf,
-            "The fix makes a parity pack's fork count as selected.",
-            DeltaSemantics::Incremental,
-        );
-
-        assert_eq!(buf, "The fix makes a parity pack's fork count as selected.");
     }
 
     #[test]
-    fn incremental_fold_still_appends_true_token_deltas() {
+    fn fold_delta_still_appends_true_token_deltas() {
         let mut buf = String::new();
-        fold_delta_into(&mut buf, "Hello ", DeltaSemantics::Incremental);
-        fold_delta_into(&mut buf, "world", DeltaSemantics::Incremental);
+        fold_delta_into(&mut buf, "Hello ");
+        fold_delta_into(&mut buf, "world");
         assert_eq!(buf, "Hello world");
     }
 
