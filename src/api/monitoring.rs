@@ -18,6 +18,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
+    Json,
 };
 use futures::{FutureExt, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,15 @@ impl MemoryHealthLevel {
     }
 }
 
+/// Percentage of `used` over `total` (0 when `total` is 0).
+fn pct(used: u64, total: u64) -> f32 {
+    if total > 0 {
+        (used as f64 / total as f64 * 100.0) as f32
+    } else {
+        0.0
+    }
+}
+
 /// Container metrics update sent over WebSocket
 #[derive(Debug, Clone, Serialize)]
 struct ContainerMetricsMessage {
@@ -193,6 +203,52 @@ impl MonitoringState {
     pub async fn set_workspaces(&self, ws: SharedWorkspaceStore) {
         let mut guard = self.workspaces.write().await;
         *guard = Some(ws);
+    }
+
+    /// Snapshot of host memory pressure + the top memory-consuming container
+    /// workspaces. Backs the in-app memory-pressure banner and (later) mission
+    /// admission control. Host figures come from a fresh `sysinfo` read; the
+    /// per-container figures reuse the latest sample the background collector
+    /// already keeps, so this is cheap to call on a poll.
+    pub async fn memory_health(&self) -> MemoryHealth {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let memory_total = sys.total_memory();
+        let memory_used = sys.used_memory();
+        let swap_total = sys.total_swap();
+        let swap_used = sys.used_swap();
+        let memory_percent = pct(memory_used, memory_total);
+        let swap_percent = pct(swap_used, swap_total);
+
+        let mut top_consumers: Vec<MemoryConsumer> = {
+            let ch = self.container_history.read().await;
+            ch.values()
+                .filter_map(|h| h.back())
+                .map(|cm| MemoryConsumer {
+                    workspace_id: cm.workspace_id.clone(),
+                    workspace_name: cm.workspace_name.clone(),
+                    memory_used: cm.memory_used,
+                    memory_percent: cm.memory_percent,
+                })
+                .collect()
+        };
+        top_consumers.sort_by_key(|c| std::cmp::Reverse(c.memory_used));
+        top_consumers.truncate(5);
+
+        MemoryHealth {
+            level: MemoryHealthLevel::from_usage(memory_percent, swap_percent),
+            memory_used,
+            memory_total,
+            memory_percent,
+            swap_used,
+            swap_total,
+            swap_percent,
+            top_consumers,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
     }
 
     /// Background task that continuously collects metrics
@@ -497,6 +553,14 @@ static MONITORING_STATE: std::sync::OnceLock<Arc<MonitoringState>> = std::sync::
 
 fn get_monitoring_state() -> Arc<MonitoringState> {
     MONITORING_STATE.get_or_init(MonitoringState::new).clone()
+}
+
+/// `GET /api/monitoring/memory-health` — current host memory pressure level
+/// (ok / warn / critical) plus the top container memory consumers, for the
+/// in-app memory-pressure banner. Auth is enforced by the protected-routes
+/// middleware.
+pub async fn memory_health_handler() -> Json<MemoryHealth> {
+    Json(get_monitoring_state().memory_health().await)
 }
 
 /// Initialize the monitoring background collector at server startup.

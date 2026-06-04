@@ -998,6 +998,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/providers/catalog",
             get(super::providers::list_full_model_catalog),
         )
+        .route(
+            "/api/monitoring/memory-health",
+            get(super::monitoring::memory_health_handler),
+        )
         // Library management endpoints
         .nest("/api/library", library_api::routes())
         // Workspace management endpoints
