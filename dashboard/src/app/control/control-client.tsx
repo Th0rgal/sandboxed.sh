@@ -11421,7 +11421,7 @@ export default function ControlClient() {
                 // freeze when toggling the Workers panel).
                 "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0",
                 showDesktopStream
-                  ? "basis-[clamp(400px,44vw,820px)] min-h-[420px] min-w-[360px] max-h-[calc(100vh-7rem)] max-w-[820px] resize overflow-hidden"
+                  ? "basis-auto w-[clamp(400px,44vw,820px)] h-[min(720px,calc(100vh-7rem))] min-h-[420px] min-w-[360px] max-h-[calc(100vh-7rem)] max-w-[820px] resize overflow-hidden"
                   : "w-80",
               )}
             >

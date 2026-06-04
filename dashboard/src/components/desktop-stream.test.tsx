@@ -88,13 +88,13 @@ describe("DesktopStream", () => {
       sockets[0].onmessage?.({
         data: JSON.stringify({
           error: "input_failed",
-          message: "xdotool failed",
+          message: "wlrctl failed",
         }),
       });
     });
 
     expect(screen.getByTestId("app-stream-canvas")).toBeInTheDocument();
-    expect(screen.getByText("xdotool failed")).toBeInTheDocument();
+    expect(screen.getByText("wlrctl failed")).toBeInTheDocument();
   });
 
   it("shows the fatal state for capture failures", async () => {

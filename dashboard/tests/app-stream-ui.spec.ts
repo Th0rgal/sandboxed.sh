@@ -43,6 +43,9 @@ async function mockAppStreamControl(page: Page, frameBase64: string) {
   };
 
   await page.addInitScript((base64Frame) => {
+    (
+      window as unknown as { __appStreamSentCommands: string[] }
+    ).__appStreamSentCommands = [];
     const frameBytes = Uint8Array.from(atob(base64Frame), (char) =>
       char.charCodeAt(0)
     );
@@ -70,7 +73,11 @@ async function mockAppStreamControl(page: Page, frameBase64: string) {
         }, 20);
       }
 
-      send() {}
+      send(data: string) {
+        (
+          window as unknown as { __appStreamSentCommands: string[] }
+        ).__appStreamSentCommands.push(data);
+      }
 
       close() {
         this.readyState = MockWebSocket.CLOSED;
@@ -233,6 +240,75 @@ test("control exposes a focused app-stream surface", async ({ page }) => {
       return visible;
     });
   expect(visiblePixels).toBeGreaterThan(1000);
+
+  const canvas = page.getByTestId("app-stream-canvas");
+  const canvasBox = await canvas.boundingBox();
+  expect(canvasBox).not.toBeNull();
+  if (!canvasBox) return;
+  await page.mouse.move(
+    canvasBox.x + canvasBox.width / 2,
+    canvasBox.y + canvasBox.height / 2
+  );
+  await page.mouse.down();
+  await page.mouse.up();
+  await page.waitForTimeout(300);
+  await canvas.click({
+    position: {
+      x: Math.round(canvasBox.width / 3),
+      y: Math.round(canvasBox.height / 3),
+    },
+  });
+  await page.keyboard.type("ok");
+  await canvas.dispatchEvent("wheel", { deltaY: 140, deltaX: 0 });
+
+  const sentCommands = await page.evaluate(() =>
+    (
+      window as unknown as { __appStreamSentCommands: string[] }
+    ).__appStreamSentCommands.map((raw) => JSON.parse(raw))
+  );
+  expect(sentCommands.some((cmd: { t: string }) => cmd.t === "move")).toBe(true);
+  expect(
+    sentCommands.some(
+      (cmd: { t: string; double?: boolean }) => cmd.t === "click" && !cmd.double
+    )
+  ).toBe(true);
+  expect(
+    sentCommands.some(
+      (cmd: { t: string; text?: string }) => cmd.t === "type" && cmd.text === "o"
+    )
+  ).toBe(true);
+  expect(
+    sentCommands.some(
+      (cmd: { t: string; text?: string }) => cmd.t === "type" && cmd.text === "k"
+    )
+  ).toBe(true);
+  expect(
+    sentCommands.some(
+      (cmd: { t: string; delta_y?: number }) =>
+        cmd.t === "scroll" && (cmd.delta_y ?? 0) > 0
+    )
+  ).toBe(true);
+
+  const panel = page.getByTestId("right-side-panel");
+  const beforeResize = await panel.boundingBox();
+  expect(beforeResize).not.toBeNull();
+  if (!beforeResize) return;
+  await page.mouse.move(
+    beforeResize.x + beforeResize.width - 4,
+    beforeResize.y + beforeResize.height - 4
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    beforeResize.x + beforeResize.width + 90,
+    beforeResize.y + beforeResize.height + 90,
+    { steps: 8 }
+  );
+  await page.mouse.up();
+  const afterResize = await panel.boundingBox();
+  expect(afterResize).not.toBeNull();
+  if (!afterResize) return;
+  expect(afterResize.width).toBeGreaterThan(beforeResize.width + 20);
+  expect(afterResize.height).toBeGreaterThan(beforeResize.height + 20);
 
   await page
     .getByTestId("app-stream-panel")
