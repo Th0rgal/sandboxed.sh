@@ -64,6 +64,11 @@ pub struct Settings {
     /// (`gpt-oss-120b`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_assistant_model: Option<String>,
+    /// Model for mission titles & status lines. Only routable values (a
+    /// Routing chain id or a provider/model passthrough) are honored; when
+    /// None or non-routable the auto provider ladder picks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_model: Option<String>,
 }
 
 /// In-memory store for global settings with disk persistence.
@@ -135,6 +140,7 @@ impl SettingsStore {
             auto_cleanup_enabled: None,
             auto_cleanup_days: None,
             ask_assistant_model: std::env::var("ASK_ASSISTANT_MODEL").ok(),
+            metadata_model: None,
         }
     }
 

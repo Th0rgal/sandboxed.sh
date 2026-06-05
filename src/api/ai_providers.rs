@@ -7272,7 +7272,12 @@ async fn create_provider(
     }
 
     // Refresh metadata LLM config so new API keys are picked up for title generation
-    super::metadata_llm::refresh_metadata_llm_config(&state.ai_providers).await;
+    super::metadata_llm::refresh_metadata_llm_config(
+        &state.ai_providers,
+        &state.chain_store,
+        state.settings.get().await.metadata_model,
+    )
+    .await;
 
     let response = build_response_from_store(&provider);
     Ok(Json(response))
@@ -7410,7 +7415,12 @@ async fn update_provider(
     let response = build_response_from_store(&result);
 
     // Refresh metadata LLM config so updated API keys are picked up for title generation
-    super::metadata_llm::refresh_metadata_llm_config(&state.ai_providers).await;
+    super::metadata_llm::refresh_metadata_llm_config(
+        &state.ai_providers,
+        &state.chain_store,
+        state.settings.get().await.metadata_model,
+    )
+    .await;
 
     tracing::info!(
         "Updated {} provider: {} ({})",
@@ -7470,7 +7480,12 @@ async fn delete_provider(
     }
 
     // Refresh metadata LLM config in case the deleted provider was being used
-    super::metadata_llm::refresh_metadata_llm_config(&state.ai_providers).await;
+    super::metadata_llm::refresh_metadata_llm_config(
+        &state.ai_providers,
+        &state.chain_store,
+        state.settings.get().await.metadata_model,
+    )
+    .await;
 
     Ok((
         StatusCode::OK,

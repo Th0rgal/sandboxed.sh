@@ -512,8 +512,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     {
         super::metadata_llm::init_metadata_llm(state.http_client.clone());
         let ai_providers = Arc::clone(&state.ai_providers);
+        let chain_store = Arc::clone(&state.chain_store);
+        let settings_store = Arc::clone(&state.settings);
         tokio::spawn(async move {
-            super::metadata_llm::refresh_metadata_llm_config(&ai_providers).await;
+            super::metadata_llm::refresh_metadata_llm_config(
+                &ai_providers,
+                &chain_store,
+                settings_store.get().await.metadata_model,
+            )
+            .await;
             // Store the AI providers reference for self-refresh (picks up new OAuth tokens)
             if let Some(client) = super::metadata_llm::metadata_llm() {
                 client.set_ai_providers(ai_providers).await;

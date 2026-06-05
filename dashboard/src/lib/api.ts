@@ -3033,6 +3033,7 @@ export interface SettingsResponse {
   auto_cleanup_enabled: boolean | null;
   auto_cleanup_days: number | null;
   ask_assistant_model: string | null;
+  metadata_model: string | null;
 }
 
 export interface UpdateLibraryRemoteResponse {
@@ -3061,6 +3062,8 @@ export interface LlmRolesResponse {
   assistant_source: "settings" | "env" | "auto";
   /** Mission titles & status lines. */
   metadata: LlmRoleStatus;
+  /** Where the metadata model came from. */
+  metadata_source: "settings" | "env" | "auto";
 }
 
 // Get the resolved provider/model for each backend LLM role

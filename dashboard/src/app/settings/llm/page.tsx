@@ -10,6 +10,7 @@ import {
   updateSettings,
   listProviders,
   type LlmRoleStatus,
+  type Provider,
 } from '@/lib/api';
 import { listModelChains, type ModelChain } from '@/lib/api/model-routing';
 import {
@@ -62,6 +63,196 @@ function RoleStatusChip({
   );
 }
 
+/**
+ * One backend LLM role: identity row, resolved status, and a model picker
+ * fed by Routing chains and configured provider models. Both cards on this
+ * page share this exact anatomy so the roles read as siblings.
+ */
+function RoleCard({
+  icon,
+  iconTint,
+  title,
+  subtitle,
+  role,
+  source,
+  rolesLoading,
+  settingsLoading,
+  savedValue,
+  defaultLabel,
+  extraOptions,
+  chains,
+  providers,
+  helpText,
+  onSave,
+}: {
+  icon: React.ReactNode;
+  iconTint: string;
+  title: string;
+  subtitle: string;
+  role: LlmRoleStatus | undefined;
+  source: string | undefined;
+  rolesLoading: boolean;
+  settingsLoading: boolean;
+  savedValue: string;
+  defaultLabel: string;
+  /** Extra fixed options between the default and the chains group. */
+  extraOptions?: { value: string; label: string }[];
+  chains: ModelChain[];
+  providers: Provider[];
+  helpText: React.ReactNode;
+  onSave: (value: string) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const [customMode, setCustomMode] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const effectiveValue = draft ?? savedValue;
+  const dirty = draft !== null && draft.trim() !== savedValue;
+
+  const chainIds = chains.map((c) => c.id);
+  const knownValues = new Set<string>([
+    '',
+    ...(extraOptions?.map((o) => o.value) ?? []),
+    ...chainIds,
+    ...providers.flatMap((p) => p.models.map((m) => `${p.id}/${m.id}`)),
+  ]);
+  const selectValue =
+    customMode || !knownValues.has(effectiveValue) ? '__custom__' : effectiveValue;
+
+  const save = async (value: string) => {
+    setSaving(true);
+    try {
+      await onSave(value.trim());
+      setDraft(null);
+      setCustomMode(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col rounded-xl border border-white/[0.04] bg-white/[0.02] p-5">
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-3">
+          <div
+            className={`flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl ${iconTint}`}
+          >
+            {icon}
+          </div>
+          <div className="min-w-0">
+            <h2 className="text-sm font-medium text-white">{title}</h2>
+            <p className="text-xs text-white/40">{subtitle}</p>
+          </div>
+        </div>
+        {!rolesLoading && source && (
+          <span className="flex-shrink-0 rounded-md bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-white/40">
+            {SOURCE_LABELS[source] ?? source}
+          </span>
+        )}
+      </div>
+
+      <div className="mb-4">
+        <RoleStatusChip role={role} loading={rolesLoading} />
+      </div>
+
+      <div className="mt-auto">
+        <label className="mb-1.5 block text-xs font-medium text-white/60">
+          Model
+        </label>
+        {settingsLoading ? (
+          <div className="space-y-2">
+            <div className="h-9 animate-pulse rounded-lg bg-white/[0.04]" />
+            <div className="h-7 w-24 animate-pulse rounded-lg bg-white/[0.03]" />
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <select
+              value={selectValue}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v === '__custom__') {
+                  setCustomMode(true);
+                  setDraft(effectiveValue);
+                } else {
+                  setCustomMode(false);
+                  setDraft(v);
+                }
+              }}
+              className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:border-indigo-500/50 focus:outline-none [&>optgroup]:bg-slate-900 [&>optgroup]:text-white/70 [&>option]:bg-slate-800 [&>option]:text-white"
+            >
+              <option value="">{defaultLabel}</option>
+              {extraOptions?.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+              {chainIds.length > 0 && (
+                <optgroup label="Routing chains (with fallbacks)">
+                  {chainIds.map((id) => (
+                    <option key={id} value={id}>
+                      {id}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {providers.map(
+                (p) =>
+                  p.models.length > 0 && (
+                    <optgroup key={p.id} label={p.name}>
+                      {p.models.map((m) => (
+                        <option key={`${p.id}/${m.id}`} value={`${p.id}/${m.id}`}>
+                          {p.id}/{m.id}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )
+              )}
+              <option value="__custom__">Custom...</option>
+            </select>
+            {selectValue === '__custom__' && (
+              <input
+                type="text"
+                value={effectiveValue}
+                onChange={(e) => setDraft(e.target.value)}
+                placeholder="chain id or provider/model"
+                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 font-mono text-sm text-white placeholder:text-white/20 focus:border-indigo-500/50 focus:outline-none"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') save(effectiveValue);
+                }}
+              />
+            )}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => save(effectiveValue)}
+                disabled={saving || !dirty}
+                className="flex cursor-pointer items-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white transition-colors hover:bg-indigo-600 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {saving ? (
+                  <Loader className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Check className="h-3 w-3" />
+                )}
+                Save
+              </button>
+              {savedValue && (
+                <button
+                  onClick={() => save('')}
+                  disabled={saving}
+                  className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-white/[0.06] px-3 py-1.5 text-xs text-white/60 transition-colors hover:bg-white/[0.04] active:scale-[0.98] disabled:opacity-50"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  Reset
+                </button>
+              )}
+            </div>
+            <p className="text-xs leading-relaxed text-white/30">{helpText}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function LLMSettingsPage() {
   const {
     data: serverSettings,
@@ -84,52 +275,23 @@ export default function LLMSettingsPage() {
   );
   const providers = providersData?.providers ?? [];
 
-  const [askModelValue, setAskModelValue] = useState<string | null>(null);
-  const [customMode, setCustomMode] = useState(false);
-  const [savingAskModel, setSavingAskModel] = useState(false);
-
-  const savedModel = serverSettings?.ask_assistant_model ?? '';
-  const effectiveValue = askModelValue ?? savedModel;
-  const dirty = askModelValue !== null && askModelValue.trim() !== savedModel;
-
-  // Options the picker knows about: routing chains + provider/model
-  // passthroughs (both served via the local /v1 router) + the Cerebras
-  // default shortcuts. Anything else is "Custom".
-  const chainIds = chains.map((c) => c.id);
-  const providerModelIds = providers.flatMap((p) =>
-    p.models.map((m) => `${p.id}/${m.id}`)
-  );
-  const knownValues = new Set<string>([
-    '',
-    'gpt-oss-120b',
-    'zai-glm-4.7',
-    ...chainIds,
-    ...providerModelIds,
-  ]);
-  const selectValue = customMode || !knownValues.has(effectiveValue)
-    ? '__custom__'
-    : effectiveValue;
-
-  const saveAskModel = async (value: string) => {
-    setSavingAskModel(true);
+  const saveRole = async (
+    field: 'ask_assistant_model' | 'metadata_model',
+    label: string,
+    value: string
+  ) => {
     try {
-      const trimmed = value.trim();
-      // Send "" (not null) to clear: a present empty string is normalized to
-      // None server-side, whereas JSON null is treated as "no change".
-      await updateSettings({ ask_assistant_model: trimmed });
-      setAskModelValue(null);
-      setCustomMode(false);
+      // "" (not null) clears: a present empty string is normalized to None
+      // server-side, whereas JSON null means "no change".
+      await updateSettings({ [field]: value });
       mutateSettings();
       mutateRoles();
-      toast.success(
-        trimmed ? 'Assistant model updated' : 'Assistant model reset to default'
-      );
+      toast.success(value ? `${label} model updated` : `${label} model reset to default`);
     } catch (err) {
       toast.error(
         `Failed to save: ${err instanceof Error ? err.message : 'Unknown error'}`
       );
-    } finally {
-      setSavingAskModel(false);
+      throw err;
     }
   };
 
@@ -137,206 +299,100 @@ export default function LLMSettingsPage() {
     !rolesLoading && roles && (!roles.assistant.available || !roles.metadata.available);
 
   return (
-    <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
+    <div className="flex flex-1 flex-col items-center overflow-auto p-6">
       <div className="w-full max-w-4xl space-y-6">
         <header>
           <h1 className="text-xl font-semibold text-white">LLM</h1>
           <p className="mt-1 text-sm text-white/50">
-            Server-side models powering the Ask assistant and mission metadata
+            Server-side models powering the copilot and mission metadata
           </p>
         </header>
 
-        <div className="space-y-5">
-          <div className="grid gap-5 md:grid-cols-2">
-            {/* Ask Assistant */}
-            <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col">
-              <div className="flex items-start justify-between gap-3 mb-4">
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/10 flex-shrink-0">
-                    <Sparkles className="h-5 w-5 text-sky-400" />
-                  </div>
-                  <div className="min-w-0">
-                    <h2 className="text-sm font-medium text-white">
-                      Ask Assistant
-                    </h2>
-                    <p className="text-xs text-white/40">
-                      Sidecar co-pilot for missions
-                    </p>
-                  </div>
-                </div>
-                {!rolesLoading && roles && (
-                  <span className="rounded-md bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-white/40 flex-shrink-0">
-                    {SOURCE_LABELS[roles.assistant_source] ?? roles.assistant_source}
-                  </span>
-                )}
-              </div>
+        <div className="grid gap-5 md:grid-cols-2">
+          <RoleCard
+            icon={<Sparkles className="h-5 w-5 text-sky-400" />}
+            iconTint="bg-sky-500/10"
+            title="Copilot"
+            subtitle="Mission co-pilot (Ask panel)"
+            role={roles?.assistant}
+            source={roles?.assistant_source}
+            rolesLoading={rolesLoading}
+            settingsLoading={settingsLoading}
+            savedValue={serverSettings?.ask_assistant_model ?? ''}
+            defaultLabel="Default: Cerebras gpt-oss-120b"
+            extraOptions={[
+              { value: 'zai-glm-4.7', label: 'Cerebras zai-glm-4.7 (larger, slower)' },
+            ]}
+            chains={chains}
+            providers={providers}
+            helpText={
+              <>
+                Chains and provider picks route through /v1 with fallbacks and
+                usage accounting. Bare model ids stay on direct Cerebras.
+              </>
+            }
+            onSave={(v) => saveRole('ask_assistant_model', 'Copilot', v)}
+          />
 
-              <div className="mb-4">
-                <RoleStatusChip role={roles?.assistant} loading={rolesLoading} />
-              </div>
+          <RoleCard
+            icon={<Type className="h-5 w-5 text-amber-400" />}
+            iconTint="bg-amber-500/10"
+            title="Mission Titles & Status"
+            subtitle="Summarizes missions after each turn"
+            role={roles?.metadata}
+            source={roles?.metadata_source}
+            rolesLoading={rolesLoading}
+            settingsLoading={settingsLoading}
+            savedValue={serverSettings?.metadata_model ?? ''}
+            defaultLabel="Auto: fastest configured provider"
+            chains={chains}
+            providers={providers}
+            helpText={
+              <>
+                Auto picks the cheapest fast provider and follows provider
+                changes without a restart. Overrides must be a chain or
+                provider/model.
+              </>
+            }
+            onSave={(v) => saveRole('metadata_model', 'Metadata', v)}
+          />
+        </div>
 
-              <div className="mt-auto">
-                <label className="block text-xs font-medium text-white/60 mb-1.5">
-                  Model ID
-                </label>
-                {settingsLoading ? (
-                  <div className="flex items-center gap-2 py-2.5">
-                    <Loader className="h-4 w-4 animate-spin text-white/40" />
-                    <span className="text-sm text-white/40">Loading...</span>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    <select
-                      value={selectValue}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        if (v === '__custom__') {
-                          setCustomMode(true);
-                          setAskModelValue(effectiveValue);
-                        } else {
-                          setCustomMode(false);
-                          setAskModelValue(v);
-                        }
-                      }}
-                      className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-sky-500/50 [&>option]:bg-slate-800 [&>optgroup]:bg-slate-900 [&>option]:text-white [&>optgroup]:text-white/70"
-                    >
-                      <option value="">Default — Cerebras · gpt-oss-120b</option>
-                      <option value="zai-glm-4.7">Cerebras · zai-glm-4.7 (larger, slower)</option>
-                      {chainIds.length > 0 && (
-                        <optgroup label="Routing chains (with fallbacks)">
-                          {chainIds.map((id) => (
-                            <option key={id} value={id}>
-                              {id}
-                            </option>
-                          ))}
-                        </optgroup>
-                      )}
-                      {providers.map(
-                        (p) =>
-                          p.models.length > 0 && (
-                            <optgroup key={p.id} label={p.name}>
-                              {p.models.map((m) => (
-                                <option key={`${p.id}/${m.id}`} value={`${p.id}/${m.id}`}>
-                                  {p.id}/{m.id}
-                                </option>
-                              ))}
-                            </optgroup>
-                          )
-                      )}
-                      <option value="__custom__">Custom…</option>
-                    </select>
-                    {selectValue === '__custom__' && (
-                      <input
-                        type="text"
-                        value={effectiveValue}
-                        onChange={(e) => setAskModelValue(e.target.value)}
-                        placeholder="provider/model, chain id, or bare Cerebras model"
-                        className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white font-mono placeholder:text-white/20 focus:outline-none focus:border-sky-500/50"
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') saveAskModel(effectiveValue);
-                        }}
-                      />
-                    )}
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => saveAskModel(effectiveValue)}
-                        disabled={savingAskModel || !dirty}
-                        className="flex items-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                        {savingAskModel ? (
-                          <Loader className="h-3 w-3 animate-spin" />
-                        ) : (
-                          <Check className="h-3 w-3" />
-                        )}
-                        Save
-                      </button>
-                      {savedModel && (
-                        <button
-                          onClick={() => saveAskModel('')}
-                          disabled={savingAskModel}
-                          className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] px-3 py-1.5 text-xs text-white/60 hover:bg-white/[0.04] transition-colors cursor-pointer disabled:opacity-50"
-                        >
-                          <RotateCcw className="h-3 w-3" />
-                          Reset to default
-                        </button>
-                      )}
-                    </div>
-                    <p className="text-xs text-white/30">
-                      Routing chains and provider/model picks (e.g.{' '}
-                      <code className="font-mono">builtin/assistant</code>,{' '}
-                      <code className="font-mono">xai/grok-code-fast-1</code>) are
-                      served through the /v1 router with fallbacks and usage
-                      accounting. Bare model ids stay on direct Cerebras.
-                    </p>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* Mission metadata */}
-            <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col">
-              <div className="flex items-center gap-3 mb-4">
-                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/10 flex-shrink-0">
-                  <Type className="h-5 w-5 text-amber-400" />
-                </div>
-                <div className="min-w-0">
-                  <h2 className="text-sm font-medium text-white">
-                    Mission Titles & Status
-                  </h2>
-                  <p className="text-xs text-white/40">
-                    Summarizes missions after each turn
-                  </p>
-                </div>
-              </div>
-
-              <div className="mb-4">
-                <RoleStatusChip role={roles?.metadata} loading={rolesLoading} />
-              </div>
-
-              <p className="text-xs text-white/40 leading-relaxed">
-                Generated server-side from conversation history. The model is
-                picked automatically from your configured providers, fastest
-                first, and follows provider changes without a restart.
-              </p>
-            </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.04] bg-white/[0.02] px-5 py-4">
+          <div className="flex min-w-0 items-center gap-3">
+            <Key className="h-4 w-4 flex-shrink-0 text-indigo-400" />
+            <p className="text-xs text-white/50">
+              Defaults need an OpenAI-compatible provider. Chains and models come
+              from Routing and Providers.
+            </p>
           </div>
-
-          {/* Providers */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div className="flex items-center gap-3 min-w-0">
-                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10 flex-shrink-0">
-                  <Key className="h-5 w-5 text-indigo-400" />
-                </div>
-                <div className="min-w-0">
-                  <h2 className="text-sm font-medium text-white">Providers</h2>
-                  <p className="text-xs text-white/40">
-                    Defaults need an OpenAI-compatible provider (Cerebras
-                    preferred, then OpenRouter, Groq, OpenAI, Gemini). The
-                    assistant can also use any Routing chain or provider model.
-                  </p>
-                </div>
-              </div>
-              <Link
-                href="/settings/providers"
-                className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.04] transition-colors flex-shrink-0"
-              >
-                Manage providers
-                <ArrowUpRight className="h-3 w-3" />
-              </Link>
-            </div>
-
-            {anyUnavailable && (
-              <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-400/90">
-                {!roles?.assistant.available && !roles?.metadata.available
-                  ? 'No usable provider found: the Ask assistant and title generation are disabled until one is configured.'
-                  : !roles?.assistant.available
-                    ? 'No usable provider found for the Ask assistant; it is disabled until one is configured.'
-                    : 'No usable provider found for mission titles; they fall back to raw text until one is configured.'}
-              </p>
-            )}
+          <div className="flex flex-shrink-0 items-center gap-2">
+            <Link
+              href="/model-routing"
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 transition-colors hover:bg-white/[0.04]"
+            >
+              Routing
+              <ArrowUpRight className="h-3 w-3" />
+            </Link>
+            <Link
+              href="/settings/providers"
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 transition-colors hover:bg-white/[0.04]"
+            >
+              Providers
+              <ArrowUpRight className="h-3 w-3" />
+            </Link>
           </div>
         </div>
+
+        {anyUnavailable && (
+          <p className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-400/90">
+            {!roles?.assistant.available && !roles?.metadata.available
+              ? 'No usable provider found: the copilot and title generation are disabled until one is configured.'
+              : !roles?.assistant.available
+                ? 'No usable provider found for the copilot; it is disabled until one is configured.'
+                : 'No usable provider found for mission titles; they fall back to raw text until one is configured.'}
+          </p>
+        )}
       </div>
     </div>
   );
