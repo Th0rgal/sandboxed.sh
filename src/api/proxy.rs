@@ -2970,6 +2970,14 @@ fn anthropic_content_blocks_from_openai(
         return Vec::new();
     };
     if let Some(text) = content.as_str() {
+        // Anthropic rejects empty/whitespace-only text blocks ("text content
+        // blocks must be non-empty"). An OpenAI assistant message commonly
+        // carries content:"" alongside tool_calls (MiniMax/most OpenAI-style
+        // models do this); emitting an empty text block next to the tool_use
+        // blocks 400s the whole replay. Drop it.
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
         return vec![serde_json::json!({ "type": "text", "text": text })];
     }
     let Some(parts) = content.as_array() else {
@@ -2980,7 +2988,10 @@ fn anthropic_content_blocks_from_openai(
         match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "text" => {
                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                    out.push(serde_json::json!({ "type": "text", "text": text }));
+                    // Skip empty/whitespace-only text blocks (see above).
+                    if !text.trim().is_empty() {
+                        out.push(serde_json::json!({ "type": "text", "text": text }));
+                    }
                 }
             }
             "image_url" => {
@@ -4315,6 +4326,50 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::StreamExt;
+
+    #[test]
+    fn anthropic_conversion_drops_empty_text_block_beside_tool_use() {
+        // OpenAI assistant turns routinely carry content:"" alongside
+        // tool_calls. Anthropic rejects empty text blocks, so the converted
+        // assistant message must contain ONLY the tool_use block — else the
+        // whole replay 400s (observed: MiniMax history replayed on Opus).
+        let messages = serde_json::json!([
+            { "role": "user", "content": "List files." },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "terminal", "arguments": "{\"cmd\":\"ls\"}" }
+                }]
+            },
+            { "role": "tool", "tool_call_id": "call_1", "content": "file1.txt" },
+            { "role": "user", "content": "Reply: pong" }
+        ]);
+        let (_system, out) =
+            anthropic_messages_from_openai(messages.as_array().unwrap().as_slice());
+        // The assistant message: exactly one block, the tool_use (no empty text).
+        let assistant = out
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .expect("assistant message present");
+        let blocks = assistant["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "empty text block must be dropped");
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["name"], "terminal");
+        // No message anywhere carries an empty text block.
+        for m in &out {
+            for b in m["content"].as_array().unwrap() {
+                if b.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    assert!(
+                        !b["text"].as_str().unwrap().trim().is_empty(),
+                        "no empty text blocks may survive conversion"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_direct_model_entry_accepts_known_provider_prefix() {
