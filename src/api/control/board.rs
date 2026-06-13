@@ -360,11 +360,11 @@ pub async fn scheduler_pass(
         let needs = board_needs_attention(&fresh);
         if !needs {
             wake_state.insert(boss_id, false);
-        } else if !wake_state.get(&boss_id).copied().unwrap_or(false) {
-            if self_send_message(cmd_tx, boss_id, BOARD_WAKE_PROMPT.to_string()) {
-                wake_state.insert(boss_id, true);
-                tracing::info!(boss = %boss_id, "board: sent wake (tasks awaiting decision)");
-            }
+        } else if !wake_state.get(&boss_id).copied().unwrap_or(false)
+            && self_send_message(cmd_tx, boss_id, BOARD_WAKE_PROMPT.to_string())
+        {
+            wake_state.insert(boss_id, true);
+            tracing::info!(boss = %boss_id, "board: sent wake (tasks awaiting decision)");
         }
     }
 }
