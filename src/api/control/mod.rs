@@ -3150,6 +3150,7 @@ pub async fn post_message(
             content,
             agent,
             target_mission_id,
+            strict: false,
             respond: queued_tx,
         })
         .await
@@ -3370,6 +3371,7 @@ pub async fn board_task_verdict(
                         ),
                         agent: None,
                         target_mission_id: Some(worker_id),
+                        strict: false,
                         respond: tx,
                     })
                     .await
@@ -7209,6 +7211,7 @@ async fn automation_scheduler_loop(
                         content: substituted_content.clone(),
                         agent: None,
                         target_mission_id: Some(mission.id),
+                        strict: false,
                         respond: respond_tx,
                     })
                     .await;
@@ -8491,10 +8494,13 @@ async fn control_actor_loop(
     > = std::collections::HashMap::new();
 
     // Task-board scheduler cadence: the 100ms tick is far too hot for store
-    // scans, so passes run every few seconds (and a settle triggers work via
-    // the digest message rather than a faster pass).
+    // scans, so passes run every few seconds. Each pass spawns ready workers,
+    // sweeps zombies, and wakes idle bosses whose board needs a decision.
     const BOARD_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
     let mut last_board_pass = tokio::time::Instant::now();
+    // Per-boss "wake outstanding" flags, coalescing board wakes across passes.
+    let mut board_wake_state: std::collections::HashMap<Uuid, bool> =
+        std::collections::HashMap::new();
 
     // Helper to extract file paths from text (for mission summaries)
     fn extract_file_paths(text: &str) -> Vec<String> {
@@ -8670,7 +8676,7 @@ async fn control_actor_loop(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, respond } => {
+                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, respond } => {
                         if !accept_user_message_id(&mut accepted_user_message_ids, id) {
                             let status_snapshot = status.read().await;
                             let _ = respond.send(if status_snapshot.state != ControlRunState::Idle {
@@ -8743,26 +8749,30 @@ async fn control_actor_loop(
                         // through unchanged. See `api/grok_goal.rs`.
                         let goal_target_mission = effective_target.or(main_mission_id);
                         let mut content = content;
-                        match maybe_begin_grok_goal(
-                            &mission_store,
-                            &events_tx,
-                            goal_target_mission,
-                            &content,
-                        )
-                        .await
-                        {
-                            GrokGoalKickoff::Passthrough => {}
-                            GrokGoalKickoff::Rewritten { prompt } => {
-                                content = prompt;
-                            }
-                            GrokGoalKickoff::Rejected { reason } => {
-                                let _ = events_tx.send(AgentEvent::Error {
-                                    message: reason,
-                                    mission_id: goal_target_mission,
-                                    resumable: true,
-                                });
-                                let _ = respond.send(UserMessageAck::Dropped);
-                                continue;
+                        // Strict (control-plane) messages are system-generated and must
+                        // never be reinterpreted as a `/goal` kickoff — skip the rewrite.
+                        if !strict {
+                            match maybe_begin_grok_goal(
+                                &mission_store,
+                                &events_tx,
+                                goal_target_mission,
+                                &content,
+                            )
+                            .await
+                            {
+                                GrokGoalKickoff::Passthrough => {}
+                                GrokGoalKickoff::Rewritten { prompt } => {
+                                    content = prompt;
+                                }
+                                GrokGoalKickoff::Rejected { reason } => {
+                                    let _ = events_tx.send(AgentEvent::Error {
+                                        message: reason,
+                                        mission_id: goal_target_mission,
+                                        resumable: true,
+                                    });
+                                    let _ = respond.send(UserMessageAck::Dropped);
+                                    continue;
+                                }
                             }
                         }
 
@@ -8934,6 +8944,22 @@ async fn control_actor_loop(
                                     }
                                 }
                             }
+                        }
+
+                        // Strict (control-plane) messages must reach their exact
+                        // target via Case 1/2 only. If we got here, the target
+                        // wasn't deliverable (e.g. capacity, or no target) — drop
+                        // it rather than fall through to the main session, which
+                        // would leak a board wake / worker dispatch into an
+                        // unrelated mission. The scheduler re-issues on its next
+                        // pass (wake) or via the zombie sweep (worker spawn).
+                        if strict {
+                            tracing::warn!(
+                                target = ?effective_target,
+                                "Dropping strict control-plane message: target not deliverable this pass"
+                            );
+                            let _ = respond.send(UserMessageAck::Dropped);
+                            continue;
                         }
 
                         // Case 3: Queue to main session (default behavior)
@@ -11078,7 +11104,6 @@ async fn control_actor_loop(
                                     // the boss. No-op otherwise.
                                     board::on_worker_settled(
                                         &mission_store,
-                                        &self_cmd_tx,
                                         *mission_id,
                                         &result.output,
                                         result.terminal_reason,
@@ -11109,8 +11134,21 @@ async fn control_actor_loop(
                 // would hammer sqlite for nothing.
                 if last_board_pass.elapsed() >= BOARD_PASS_INTERVAL {
                     last_board_pass = tokio::time::Instant::now();
+                    // Missions actively executing a turn (parallel runners +
+                    // the main session), so the scheduler won't wake a busy boss.
+                    let mut running_ids: std::collections::HashSet<Uuid> = parallel_runners
+                        .iter()
+                        .filter(|(_, r)| r.is_running())
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if running.is_some() {
+                        if let Some(mid) = running_mission_id {
+                            running_ids.insert(mid);
+                        }
+                    }
                     let snapshot = board::RunnerSnapshot {
                         present: parallel_runners.keys().copied().collect(),
+                        running_ids,
                         running_count: parallel_runners
                             .values()
                             .filter(|r| r.is_running())
@@ -11125,6 +11163,7 @@ async fn control_actor_loop(
                         &self_cmd_tx,
                         &snapshot,
                         max_parallel,
+                        &mut board_wake_state,
                     )
                     .await;
                 }
@@ -12342,6 +12381,7 @@ pub async fn create_automation(
                     content,
                     agent: None,
                     target_mission_id: Some(target_mission_id),
+                    strict: false,
                     respond: respond_tx,
                 })
                 .await;
@@ -13591,6 +13631,7 @@ pub async fn webhook_receiver(
             content: substituted_content,
             agent: None,
             target_mission_id: Some(mission.id),
+            strict: false,
             respond: respond_tx,
         })
         .await;
@@ -14744,6 +14785,7 @@ pub async fn send_telegram_message_api(
                     content,
                     agent: None,
                     target_mission_id: Some(mapping.mission_id),
+                    strict: false,
                     respond: tx,
                 })
                 .await;

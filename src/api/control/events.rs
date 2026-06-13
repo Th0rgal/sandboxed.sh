@@ -362,6 +362,13 @@ pub enum ControlCommand {
         agent: Option<String>,
         /// Target mission ID - if provided and differs from running mission, start in parallel
         target_mission_id: Option<Uuid>,
+        /// Control-plane delivery: when true this is a system-generated message
+        /// (board wake / worker dispatch) that MUST go only to `target_mission_id`.
+        /// The actor skips user-message heuristics for it — no `/goal` rewriting,
+        /// no untargeted inference, and no fall-through to the main session: if it
+        /// can't reach its exact target it is dropped, never delivered elsewhere.
+        /// This keeps the control plane from leaking into unrelated missions.
+        strict: bool,
         /// Respond with the delivery outcome (queued / delivered / dropped).
         respond: oneshot::Sender<UserMessageAck>,
     },

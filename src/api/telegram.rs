@@ -787,6 +787,7 @@ async fn send_user_message_to_mission(
             content: payload.to_string(),
             agent: None,
             target_mission_id: Some(mission.id),
+            strict: false,
             respond: queued_tx,
         })
         .await
@@ -4247,6 +4248,7 @@ pub async fn process_webhook_message(
             content,
             agent: None,
             target_mission_id: Some(target_mission_id),
+            strict: false,
             respond: queued_tx,
         })
         .await;
@@ -5551,6 +5553,7 @@ async fn relay_workflow_reply_to_origin(
             content,
             agent: None,
             target_mission_id: Some(origin_mission_id),
+            strict: false,
             respond: queued_tx,
         })
         .await;

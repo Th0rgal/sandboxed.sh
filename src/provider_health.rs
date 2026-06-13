@@ -1559,7 +1559,8 @@ mod tests {
             models,
             vec![
                 ("minimax".to_string(), "MiniMax-M3".to_string()),
-                ("zai".to_string(), "glm-5.1".to_string()),
+                // glm-5.1 is migrated to glm-5.2 by ensure_default_chain.
+                ("zai".to_string(), "glm-5.2".to_string()),
                 ("cerebras".to_string(), "zai-glm-4.7".to_string()),
             ]
         );

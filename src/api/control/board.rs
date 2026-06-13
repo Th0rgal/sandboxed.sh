@@ -6,18 +6,23 @@
 //!
 //! - `scheduler_pass` (throttled inside the actor's 100ms tick) spawns a
 //!   worker mission for every dependency-satisfied `pending` task while
-//!   capacity allows, and sweeps zombies (workers lost to a restart).
+//!   capacity allows, sweeps zombies (workers lost to a restart), and — this
+//!   is the control-plane part — sends a generic, content-free WAKE to a boss
+//!   when its board has tasks needing a decision and the boss is idle.
 //! - `on_worker_settled` (called when a parallel runner parks) classifies the
-//!   outcome, retries failures once, persists a digest, and notifies the boss
-//!   with a short message so it can judge the result.
+//!   outcome, retries failures once, and persists the result. It does NOT push
+//!   any message to the boss.
 //!
-//! The boss never waits or polls: parallelism is an invariant of this module,
-//! not of prompt compliance. Spawning and digest delivery both reuse the
-//! battle-tested `ControlCommand::UserMessage` routing path by self-sending
-//! into the actor's own command channel (never awaited — `try_send` only —
-//! because the scheduler runs on the consuming task).
+//! Pull model (why): the boss reacts to its OWN board state, not to a pushed
+//! per-task digest. The wake carries no task/board specifics, so even if it
+//! were misdelivered, the receiving mission would just read its own (empty)
+//! board and end its turn — one board's work can never leak into another
+//! mission. All control-plane sends are STRICT (`UserMessage { strict: true }`):
+//! delivered only to the exact target, never `/goal`-rewritten, never routed to
+//! the main session. They self-send into the actor's command channel via
+//! `try_send` (never awaited — the scheduler runs on the consuming task).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -48,6 +53,9 @@ const DIGEST_TAIL_CHARS: usize = 1200;
 pub struct RunnerSnapshot {
     /// Mission ids present in `parallel_runners` (running or parked).
     pub present: HashSet<Uuid>,
+    /// Mission ids currently executing a turn (main + parallel). Used to decide
+    /// whether a boss is busy before sending it a board wake.
+    pub running_ids: HashSet<Uuid>,
     /// Count of runners actively executing a turn.
     pub running_count: usize,
     /// Whether the main (non-parallel) session is executing a turn.
@@ -156,59 +164,31 @@ fn worker_contract(task: &BoardTask) -> String {
     )
 }
 
-fn board_summary_line(tasks: &[BoardTask]) -> String {
-    let keys_in = |status: BoardTaskStatus| -> Vec<&str> {
-        tasks
-            .iter()
-            .filter(|t| t.status == status)
-            .map(|t| t.task_key.as_str())
-            .collect()
-    };
-    let running = keys_in(BoardTaskStatus::Running);
-    let settled = keys_in(BoardTaskStatus::Settled);
-    let pending = tasks
+/// True when a board has at least one task needing a boss decision — a
+/// settled task awaiting a verdict, or a task that exhausted its retries and
+/// failed. This is the wake trigger.
+fn board_needs_attention(tasks: &[BoardTask]) -> bool {
+    tasks
         .iter()
-        .filter(|t| t.status == BoardTaskStatus::Pending)
-        .count();
-    let accepted = tasks
-        .iter()
-        .filter(|t| t.status == BoardTaskStatus::Accepted)
-        .count();
-    let failed = keys_in(BoardTaskStatus::Failed);
-    let mut line = format!(
-        "Board: {} running [{}] · {} pending · {} awaiting-verdict [{}] · {}/{} accepted",
-        running.len(),
-        running.join(","),
-        pending,
-        settled.len(),
-        settled.join(","),
-        accepted,
-        tasks.len(),
-    );
-    if !failed.is_empty() {
-        line.push_str(&format!(" · FAILED [{}]", failed.join(",")));
-    }
-    line
+        .any(|t| matches!(t.status, BoardTaskStatus::Settled | BoardTaskStatus::Failed))
 }
 
-/// True when no task can make further progress without boss action.
-fn board_drained(tasks: &[BoardTask]) -> bool {
-    !tasks.is_empty()
-        && tasks.iter().all(|t| {
-            t.status.is_terminal()
-                || (t.status == BoardTaskStatus::Settled
-                    && t.outcome != Some(BoardTaskOutcome::Success))
-        })
-        && !tasks.iter().any(|t| {
-            matches!(
-                t.status,
-                BoardTaskStatus::Pending | BoardTaskStatus::Running
-            )
-        })
-}
+/// Generic, content-free wake delivered to a boss when its board changes.
+/// Deliberately mentions NO specific task or other board — the boss reacts to
+/// its OWN board state. If this ever reaches the wrong mission, that mission
+/// finds nothing to act on and simply ends its turn, so a misroute can't leak
+/// one board's work into another mission.
+const BOARD_WAKE_PROMPT: &str = "[task-board] Your task board changed — one or more tasks \
+    settled, failed, or need a decision. Call board_status now and act on YOUR board only: \
+    judge each settled task with accept_task / reject_task (review_task for detail), \
+    merge_branch finished worktree branches, and plan_tasks for newly-unblocked or follow-up \
+    work. Scheduling, retries, and worker dispatch are automatic — never wait or poll. If \
+    board_status shows nothing needing action, just end your turn.";
 
-/// Fire-and-forget self-send into the actor's own command channel. Never
-/// await: the scheduler runs on the task that consumes this channel.
+/// Fire-and-forget control-plane send into the actor's own command channel.
+/// Always strict: delivered only to `target_mission_id`, never re-routed to
+/// the main session or rewritten as a `/goal`. Never awaits (the scheduler
+/// runs on the task that consumes this channel).
 fn self_send_message(
     cmd_tx: &mpsc::Sender<ControlCommand>,
     target_mission_id: Uuid,
@@ -220,6 +200,7 @@ fn self_send_message(
         content,
         agent: None,
         target_mission_id: Some(target_mission_id),
+        strict: true,
         respond,
     }) {
         Ok(()) => true,
@@ -243,6 +224,9 @@ pub async fn scheduler_pass(
     cmd_tx: &mpsc::Sender<ControlCommand>,
     snapshot: &RunnerSnapshot,
     max_parallel: usize,
+    // Per-boss "a wake is outstanding" flag, owned by the actor loop. Coalesces
+    // wakes: at most one pending wake per boss until it next runs (consuming it).
+    wake_state: &mut HashMap<Uuid, bool>,
 ) {
     let boards = match mission_store.list_active_board_missions().await {
         Ok(b) => b,
@@ -309,7 +293,6 @@ pub async fn scheduler_pass(
                         .unwrap_or_default();
                     settle_task(
                         mission_store,
-                        cmd_tx,
                         task.clone(),
                         classify_outcome(None, true, &last),
                         &last,
@@ -327,14 +310,7 @@ pub async fn scheduler_pass(
                         .find(|h| h.role == "assistant")
                         .map(|h| h.content.clone())
                         .unwrap_or_default();
-                    settle_task(
-                        mission_store,
-                        cmd_tx,
-                        task.clone(),
-                        BoardTaskOutcome::Failed,
-                        &last,
-                    )
-                    .await;
+                    settle_task(mission_store, task.clone(), BoardTaskOutcome::Failed, &last).await;
                 }
                 MissionStatus::Active => {
                     // Runner may exist in another control session or be mid-start;
@@ -344,27 +320,50 @@ pub async fn scheduler_pass(
         }
 
         // --- Spawn ready tasks while capacity allows.
-        if available == 0 {
+        if available > 0 {
+            if let Ok(Some(boss)) = mission_store.get_mission(boss_id).await {
+                let ready: Vec<BoardTask> = ready_tasks(&tasks).into_iter().cloned().collect();
+                for task in ready {
+                    if available == 0 {
+                        break;
+                    }
+                    match spawn_task_worker(mission_store, cmd_tx, &task, boss.workspace_id).await {
+                        Ok(worker_id) => {
+                            available -= 1;
+                            tracing::info!(task = %task.task_key, worker = %worker_id, boss = %boss_id,
+                                "board: spawned worker for ready task");
+                        }
+                        Err(e) => {
+                            tracing::warn!(task = %task.task_key, boss = %boss_id,
+                                "board: failed to spawn worker: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Wake decision (pull model): if the boss isn't currently running a
+        // turn and its board has tasks needing a decision, send ONE generic,
+        // content-free wake. Coalesced via wake_state so we don't re-wake every
+        // pass; cleared once the boss is observed running (it consumed the wake)
+        // and re-armed when it goes idle with work still pending.
+        let boss_running = snapshot.running_ids.contains(&boss_id);
+        if boss_running {
+            wake_state.insert(boss_id, false);
             continue;
         }
-        let Ok(Some(boss)) = mission_store.get_mission(boss_id).await else {
-            continue;
-        };
-        let ready: Vec<BoardTask> = ready_tasks(&tasks).into_iter().cloned().collect();
-        for task in ready {
-            if available == 0 {
-                break;
-            }
-            match spawn_task_worker(mission_store, cmd_tx, &task, boss.workspace_id).await {
-                Ok(worker_id) => {
-                    available -= 1;
-                    tracing::info!(task = %task.task_key, worker = %worker_id, boss = %boss_id,
-                        "board: spawned worker for ready task");
-                }
-                Err(e) => {
-                    tracing::warn!(task = %task.task_key, boss = %boss_id,
-                        "board: failed to spawn worker: {}", e);
-                }
+        // Re-read post-sweep/spawn state for an accurate decision.
+        let fresh = mission_store
+            .list_board_tasks(boss_id)
+            .await
+            .unwrap_or(tasks);
+        let needs = board_needs_attention(&fresh);
+        if !needs {
+            wake_state.insert(boss_id, false);
+        } else if !wake_state.get(&boss_id).copied().unwrap_or(false) {
+            if self_send_message(cmd_tx, boss_id, BOARD_WAKE_PROMPT.to_string()) {
+                wake_state.insert(boss_id, true);
+                tracing::info!(boss = %boss_id, "board: sent wake (tasks awaiting decision)");
             }
         }
     }
@@ -416,17 +415,16 @@ async fn spawn_task_worker(
     Ok(mission.id)
 }
 
-/// Settle a task: persist outcome + digest, retry failures once, and notify
-/// the boss. Shared by the live settle hook and the zombie sweep.
+/// Settle a task: persist outcome + result digest, and retry failures once.
+/// Does NOT notify the boss — the scheduler pass wakes the boss from board
+/// state (pull model), so a settle never pushes per-task content into any
+/// mission. Shared by the live settle hook and the zombie sweep.
 async fn settle_task(
     mission_store: &Arc<dyn MissionStore>,
-    cmd_tx: &mpsc::Sender<ControlCommand>,
     mut task: BoardTask,
     outcome: BoardTaskOutcome,
     output: &str,
 ) {
-    let boss_id = task.boss_mission_id;
-
     if outcome == BoardTaskOutcome::Failed && task.attempts < MAX_ATTEMPTS {
         // Silent automatic retry: back to pending, next pass respawns fresh.
         task.status = BoardTaskStatus::Pending;
@@ -453,43 +451,11 @@ async fn settle_task(
         BoardTaskStatus::Settled
     };
     task.outcome = Some(outcome);
+    // result_digest is stored for the UI / review_task, not pushed anywhere.
     task.result_digest = Some(digest_excerpt(output));
     if let Err(e) = mission_store.save_board_task(&task).await {
         tracing::warn!(task = %task.task_key, "board: failed to persist settle: {}", e);
-        return;
     }
-
-    // Compose the boss digest from the post-settle board state.
-    let tasks = mission_store
-        .list_board_tasks(boss_id)
-        .await
-        .unwrap_or_default();
-    let outcome_label = outcome.to_string().to_uppercase();
-    let mut msg = format!(
-        "[task-board] Task `{}` (\"{}\") settled: {} (attempt {}, worker mission {}).\n\nWorker final message (excerpt):\n{}\n\n{}",
-        task.task_key,
-        task.title,
-        outcome_label,
-        task.attempts,
-        task.worker_mission_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
-        task.result_digest.as_deref().unwrap_or("(empty)"),
-        board_summary_line(&tasks),
-    );
-    msg.push_str(
-        "\n\nAct now: judge this result with accept_task / reject_task (review_task for the \
-         full output). Add follow-up work with plan_tasks. Scheduling and re-dispatch are \
-         automatic — do NOT wait, poll, or call wait_for_* tools; end your turn once verdicts \
-         are given.",
-    );
-    if board_drained(&tasks) {
-        msg.push_str(
-            "\n\nBOARD DRAINED: no task can progress without your action. Judge the settled \
-             tasks, re-plan failed ones or finish the mission.",
-        );
-    }
-    self_send_message(cmd_tx, boss_id, msg);
 }
 
 /// Live settle hook: called from the control actor's tick when a parallel
@@ -497,7 +463,6 @@ async fn settle_task(
 /// board workers.
 pub async fn on_worker_settled(
     mission_store: &Arc<dyn MissionStore>,
-    cmd_tx: &mpsc::Sender<ControlCommand>,
     worker_mission_id: Uuid,
     output: &str,
     terminal_reason: Option<TerminalReason>,
@@ -518,7 +483,7 @@ pub async fn on_worker_settled(
         return; // already settled (sweep) or cancelled meanwhile
     }
     let outcome = classify_outcome(terminal_reason, success, output);
-    settle_task(mission_store, cmd_tx, task, outcome, output).await;
+    settle_task(mission_store, task, outcome, output).await;
 }
 
 #[cfg(test)]
@@ -676,53 +641,38 @@ mod tests {
     }
 
     #[test]
-    fn drained_detection() {
-        let drained = vec![
-            mk(
-                "a",
-                &[],
-                BoardTaskStatus::Accepted,
-                Some(BoardTaskOutcome::Success),
-            ),
-            mk(
-                "b",
-                &[],
-                BoardTaskStatus::Settled,
-                Some(BoardTaskOutcome::Blocked),
-            ),
-        ];
-        assert!(board_drained(&drained));
-        let active = vec![
-            mk(
-                "a",
-                &[],
-                BoardTaskStatus::Accepted,
-                Some(BoardTaskOutcome::Success),
-            ),
-            mk("b", &[], BoardTaskStatus::Running, None),
-        ];
-        assert!(!board_drained(&active));
-        // settled-success awaiting verdict: not drained in the "stuck" sense?
-        // It is: nothing progresses without the boss. But a settled success
-        // also unblocks dependents, which may be pending — covered by the
-        // Pending check.
-        let settled_with_dependent = vec![
-            mk(
-                "a",
-                &[],
-                BoardTaskStatus::Settled,
-                Some(BoardTaskOutcome::Success),
-            ),
-            mk("b", &["a"], BoardTaskStatus::Pending, None),
-        ];
-        assert!(!board_drained(&settled_with_dependent));
-        assert!(board_drained(&[mk(
-            "only",
+    fn needs_attention_detection() {
+        // Settled (awaiting verdict) or Failed → boss is needed.
+        assert!(board_needs_attention(&[mk(
+            "a",
             &[],
             BoardTaskStatus::Settled,
+            Some(BoardTaskOutcome::Success)
+        )]));
+        assert!(board_needs_attention(&[mk(
+            "a",
+            &[],
+            BoardTaskStatus::Settled,
+            Some(BoardTaskOutcome::Blocked)
+        )]));
+        assert!(board_needs_attention(&[mk(
+            "a",
+            &[],
+            BoardTaskStatus::Failed,
             Some(BoardTaskOutcome::Failed)
         )]));
-        assert!(!board_drained(&[]));
+        // Only running/pending/accepted/cancelled → nothing for the boss to do.
+        assert!(!board_needs_attention(&[
+            mk("a", &[], BoardTaskStatus::Running, None),
+            mk("b", &[], BoardTaskStatus::Pending, None),
+        ]));
+        assert!(!board_needs_attention(&[mk(
+            "a",
+            &[],
+            BoardTaskStatus::Accepted,
+            Some(BoardTaskOutcome::Success)
+        )]));
+        assert!(!board_needs_attention(&[]));
     }
 
     #[tokio::test]

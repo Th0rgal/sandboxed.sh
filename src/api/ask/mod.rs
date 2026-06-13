@@ -901,6 +901,7 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                     content,
                     agent: None,
                     target_mission_id: Some(turn.mission_id),
+                    strict: false,
                     respond: tx,
                 })
                 .await;
