@@ -2469,6 +2469,49 @@ pub struct QueuedMessage {
     pub agent: Option<String>,
 }
 
+/// Environment flag gating the background-task auto-resume feature.
+///
+/// Default enabled; set `BACKGROUND_TASK_AUTORESUME=0` (or `false`/`no`/`off`)
+/// to disable. When disabled, capture and the watcher both no-op.
+pub const BACKGROUND_TASK_AUTORESUME_ENV: &str = "BACKGROUND_TASK_AUTORESUME";
+
+/// Whether the background-task auto-resume feature is enabled.
+pub fn background_task_autoresume_enabled() -> bool {
+    crate::util::env_var_bool(BACKGROUND_TASK_AUTORESUME_ENV, true)
+}
+
+/// An in-flight Claude Code background shell task (`Bash` tool with
+/// `run_in_background: true`).
+///
+/// Recorded when the CLI emits the background-start marker (see
+/// `crate::api::runners::claudecode::parse_background_task_start`) and consumed
+/// by the auto-resume watcher (`crate::api::supervision::bg_autoresume`), which
+/// which polls for completion and wakes the agent with the output once the job
+/// finishes.
+#[derive(Debug, Clone)]
+pub struct BackgroundTask {
+    /// CLI-assigned background id (e.g. `bash_1`).
+    pub id: String,
+    /// Path the CLI writes the job's combined output to (inside the workspace).
+    pub output_path: String,
+    /// The shell command that was launched, for the resume message. Best-effort
+    /// (empty if the matching tool_call wasn't observed).
+    pub command: String,
+    /// When we first observed the task start. Used for the overall timeout.
+    pub started_at: Instant,
+}
+
+/// Shared, cross-task registry of in-flight background tasks per mission.
+///
+/// The control actor (writer) records tasks here from the `ToolResult` event
+/// arm, and the supervision watcher (reader) polls and resumes from it. A
+/// shared registry is required because a mission's [`MissionRunner`] is torn
+/// down once its turn ends and the mission parks in `AwaitingUser` — exactly
+/// when the watcher needs to act — so per-runner state alone would not survive.
+///
+/// Keyed by mission id, then by background-task id.
+pub type BackgroundTaskRegistry = Arc<RwLock<HashMap<Uuid, HashMap<String, BackgroundTask>>>>;
+
 /// Isolated runner for a single mission.
 /// Info about a tracked subtask (from delegate_task/Task tool calls).
 #[derive(Debug, Clone)]
@@ -2553,6 +2596,15 @@ pub struct MissionRunner {
     /// Shared with the turn loops via Arc so they can increment/decrement
     /// without holding the runner's outer lock.
     pub active_tool_calls: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// In-flight background shell tasks started this mission (`Bash` with
+    /// `run_in_background: true`), keyed by background-task id.
+    ///
+    /// This mirrors the shared [`BackgroundTaskRegistry`], which is the source
+    /// of truth used by the auto-resume watcher (the runner is torn down when
+    /// the mission parks in `AwaitingUser`, so this field is informational and
+    /// for in-process inspection only).
+    pub background_tasks: HashMap<String, BackgroundTask>,
 }
 
 impl MissionRunner {
@@ -2592,6 +2644,7 @@ impl MissionRunner {
             working_directory: None,
             user_id: None,
             active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            background_tasks: HashMap::new(),
         }
     }
 

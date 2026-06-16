@@ -41,8 +41,8 @@ use uuid::Uuid;
 
 #[allow(unused_imports)]
 use super::supervision::{
-    ack_promotion_loop, cleanup_stale_active_missions_once, recover_server_shutdown_missions,
-    stale_mission_cleanup_loop, stuck_mission_watchdog_loop,
+    ack_promotion_loop, background_task_autoresume_loop, cleanup_stale_active_missions_once,
+    recover_server_shutdown_missions, stale_mission_cleanup_loop, stuck_mission_watchdog_loop,
 };
 use crate::agents::{AgentContext, AgentRef, TerminalReason};
 use crate::config::Config;
@@ -6552,6 +6552,11 @@ fn spawn_control_session(
         mission_search_cache,
     };
 
+    // Shared registry of in-flight Claude Code background shell tasks. Written
+    // by the control actor's ToolResult arm; read by the auto-resume watcher.
+    let background_tasks: super::mission_runner::BackgroundTaskRegistry =
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
     // Spawn the main control actor
     tokio::spawn(control_actor_loop(
         config.clone(),
@@ -6573,6 +6578,7 @@ fn spawn_control_session(
         mission_store,
         secrets,
         user_id,
+        Arc::clone(&background_tasks),
     ));
 
     // Recover missions stopped by the previous backend process. Graceful
@@ -6621,6 +6627,27 @@ fn spawn_control_session(
             Arc::clone(&state.mission_store),
             events_tx.clone(),
         ));
+    }
+
+    // Spawn the background-task auto-resume watcher. When a mission agent
+    // launches a `Bash` job with `run_in_background: true` and then ends its
+    // turn, the mission parks in `AwaitingUser` with nothing to wake it when the
+    // job finishes. This watcher polls captured background tasks, detects
+    // completion inside the workspace, and resumes the agent with the output.
+    // Uses an in-memory registry (no persistent store required). Gated by
+    // `BACKGROUND_TASK_AUTORESUME` (default enabled).
+    if super::mission_runner::background_task_autoresume_enabled() {
+        tokio::spawn(background_task_autoresume_loop(
+            Arc::clone(&state.mission_store),
+            state.cmd_tx.clone(),
+            events_tx.clone(),
+            workspaces.clone(),
+            Arc::clone(&background_tasks),
+        ));
+    } else {
+        tracing::info!(
+            "Background-task auto-resume watcher not started (BACKGROUND_TASK_AUTORESUME disabled)"
+        );
     }
 
     // Spawn event logger task (logs all events to SQLite for debugging/replay)
@@ -8448,6 +8475,9 @@ async fn control_actor_loop(
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
     session_user_id: String,
+    // Shared registry of in-flight Claude Code background shell tasks. Written
+    // here from the `ToolResult` event arm; read by the auto-resume watcher.
+    background_tasks: super::mission_runner::BackgroundTaskRegistry,
 ) {
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
@@ -8492,6 +8522,16 @@ async fn control_actor_loop(
         Uuid,
         super::mission_runner::MissionRunner,
     > = std::collections::HashMap::new();
+
+    // Correlate Bash `tool_call_id` -> command string so that when the matching
+    // `Bash` ToolResult carries a background-start marker we can record the
+    // launched command in the background-task registry. Capped to avoid
+    // unbounded growth if a result is ever dropped; entries are removed when
+    // the matching result arrives. Only `Bash` calls are tracked.
+    let mut pending_bash_commands: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    const MAX_PENDING_BASH_COMMANDS: usize = 256;
+    let background_autoresume_enabled = super::mission_runner::background_task_autoresume_enabled();
 
     // Task-board scheduler cadence: the 100ms tick is far too hot for store
     // scans, so passes run every few seconds. Each pass spawns ready workers,
@@ -8564,6 +8604,28 @@ async fn control_actor_loop(
         if let Some(raw) = result.as_str() {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
                 return Some(parsed);
+            }
+        }
+        None
+    }
+
+    /// Extract the human-readable text from a tool result `Value`.
+    ///
+    /// The Claude Code runner emits either a plain string or an object of the
+    /// form `{ "content": ..., "stdout": ..., "stderr": ..., "is_error": ... }`
+    /// (see `runners::claudecode`). We prefer `content`, falling back to
+    /// `stdout`, then the whole string. Returns `None` when no text is present.
+    fn tool_result_text(result: &serde_json::Value) -> Option<String> {
+        if let Some(s) = result.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(obj) = result.as_object() {
+            for key in ["content", "stdout"] {
+                if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
             }
         }
         None
@@ -8946,17 +9008,23 @@ async fn control_actor_loop(
                             }
                         }
 
-                        // Strict (control-plane) messages must reach their exact
-                        // target via Case 1/2 only. If we got here, the target
-                        // wasn't deliverable (e.g. capacity, or no target) — drop
-                        // it rather than fall through to the main session, which
-                        // would leak a board wake / worker dispatch into an
-                        // unrelated mission. The scheduler re-issues on its next
-                        // pass (wake) or via the zombie sweep (worker spawn).
-                        if strict {
+                        // Strict (control-plane) messages must never leak into an
+                        // *unrelated* mission. If the target is some OTHER mission
+                        // than the main session's and we got here, Case 1/2 (queue
+                        // to / start a parallel runner) didn't fire — drop rather
+                        // than fall through to the main session, which would land a
+                        // board wake / bg-autoresume / worker dispatch in the wrong
+                        // mission. The scheduler re-issues on its next pass.
+                        //
+                        // When the target IS the main session's mission, there is
+                        // no leak: Case 3 below is exactly where we want it — it
+                        // activates an idle/AwaitingUser main mission and starts a
+                        // fresh turn (e.g. the bg-task auto-resume waking a mission
+                        // that parked on the user while a background job ran).
+                        if strict && !target_is_main {
                             tracing::warn!(
                                 target = ?effective_target,
-                                "Dropping strict control-plane message: target not deliverable this pass"
+                                "Dropping strict control-plane message: non-main target not deliverable this pass"
                             );
                             let _ = respond.send(UserMessageAck::Dropped);
                             continue;
@@ -11289,6 +11357,21 @@ async fn control_actor_loop(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
 
+                                // Background-task auto-resume: stash the command
+                                // for any `Bash` call so the matching ToolResult
+                                // can attach it to a captured background task.
+                                if background_autoresume_enabled
+                                    && name == "Bash"
+                                    && pending_bash_commands.len() < MAX_PENDING_BASH_COMMANDS
+                                {
+                                    if let Some(cmd) =
+                                        args.get("command").and_then(|v| v.as_str())
+                                    {
+                                        pending_bash_commands
+                                            .insert(tool_call_id.clone(), cmd.to_string());
+                                    }
+                                }
+
                                 // Emit activity event for real-time SSE
                                 let _ = events_tx.send(AgentEvent::MissionActivity {
                                     label,
@@ -11472,6 +11555,63 @@ async fn control_actor_loop(
                             }
                         }
                         _ => {}
+                    }
+
+                    // Background-task auto-resume capture: when a `Bash` tool
+                    // result is the CLI's background-launch confirmation, record
+                    // the task so the watcher can wake the agent once it finishes.
+                    // (Must run before the desktop block below, which `continue`s
+                    // past non-desktop tool results.)
+                    if background_autoresume_enabled {
+                        if let AgentEvent::ToolResult {
+                            tool_call_id,
+                            name,
+                            result,
+                            mission_id,
+                        } = &event
+                        {
+                            // Always reclaim the correlated command, even if this
+                            // isn't a background start, so the map can't leak.
+                            let command = pending_bash_commands.remove(tool_call_id);
+                            if name == "Bash" {
+                                if let (Some(mid), Some(text)) =
+                                    (mission_id, tool_result_text(result))
+                                {
+                                    if let Some((task_id, output_path)) =
+                                        super::runners::claudecode::parse_background_task_start(
+                                            &text,
+                                        )
+                                    {
+                                        let task = super::mission_runner::BackgroundTask {
+                                            id: task_id.clone(),
+                                            output_path: output_path.clone(),
+                                            command: command.unwrap_or_default(),
+                                            started_at: std::time::Instant::now(),
+                                        };
+                                        tracing::info!(
+                                            mission_id = %mid,
+                                            background_task_id = %task_id,
+                                            output_path = %output_path,
+                                            "Captured Claude Code background task; \
+                                             scheduling auto-resume on completion"
+                                        );
+                                        // Mirror onto the runner (informational).
+                                        if let Some(runner) = parallel_runners.get_mut(mid) {
+                                            runner
+                                                .background_tasks
+                                                .insert(task_id.clone(), task.clone());
+                                        }
+                                        // Source of truth: the shared registry.
+                                        background_tasks
+                                            .write()
+                                            .await
+                                            .entry(*mid)
+                                            .or_default()
+                                            .insert(task_id, task);
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Track desktop sessions for mission reconnect/resume.

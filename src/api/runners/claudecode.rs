@@ -46,6 +46,72 @@ fn claude_thinking_budget(effort: &str) -> u32 {
     }
 }
 
+/// Marker emitted by Claude Code's `Bash` tool when invoked with
+/// `run_in_background: true`. The CLI handles the launch locally and returns a
+/// confirmation `tool_result` of the exact form:
+///
+/// `Command running in background with ID: <id>. Output is being written to: <path>`
+///
+/// In `--print` (non-interactive) mode no further re-invocation happens when the
+/// job finishes, so nothing wakes the agent — the background-task auto-resume
+/// watcher (see `supervision::background_task_autoresume_loop`) closes that gap.
+const BACKGROUND_TASK_ID_MARKER: &str = "Command running in background with ID:";
+const BACKGROUND_TASK_OUTPUT_MARKER: &str = "Output is being written to:";
+
+/// Pure parser for the Claude Code background-start marker.
+///
+/// Given a `Bash` tool_result's textual content, returns `Some((id, output_path))`
+/// when the content is a background-launch confirmation, or `None` otherwise.
+///
+/// The marker format is:
+/// `Command running in background with ID: <id>. Output is being written to: <path>`
+///
+/// We locate both labels by substring (rather than a strict full-string match)
+/// so leading/trailing whitespace or a trailing newline in the CLI payload does
+/// not break detection.
+///
+/// Both the id and the output path are single whitespace-free tokens. The real
+/// marker continues with explanatory prose after the path
+/// (`... tasks/bokwqyjak.output. You will be notified when it completes. ...`),
+/// so for each label we take only the **first whitespace-delimited token** and
+/// strip a single trailing `.` (the sentence separator). This prevents the
+/// trailing marker sentence from being captured as part of the path.
+pub fn parse_background_task_start(content: &str) -> Option<(String, String)> {
+    let id_label = content.find(BACKGROUND_TASK_ID_MARKER)?;
+    let after_id = &content[id_label + BACKGROUND_TASK_ID_MARKER.len()..];
+
+    // The output label must come *after* the id label.
+    let out_rel = after_id.find(BACKGROUND_TASK_OUTPUT_MARKER)?;
+    let id_segment = &after_id[..out_rel];
+    let after_out = &after_id[out_rel + BACKGROUND_TASK_OUTPUT_MARKER.len()..];
+
+    // The id is the first whitespace-delimited token between the two labels,
+    // terminated by the literal "." that precedes the output label. Strip a
+    // single trailing period.
+    let id = id_segment
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_string();
+
+    // The path is the first whitespace-delimited token after the output label
+    // (paths contain no spaces). Strip a single trailing "." (sentence
+    // separator) so the trailing marker prose
+    // ("... .output. You will be notified ...") is not captured.
+    let path = after_out
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_string();
+
+    if id.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((id, path))
+}
+
 /// Execute a turn using Claude Code CLI backend.
 ///
 /// For Host workspaces: spawns the CLI directly on the host.
@@ -2986,4 +3052,67 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
     }
 
     result
+}
+
+#[cfg(test)]
+mod background_task_tests {
+    use super::parse_background_task_start;
+
+    #[test]
+    fn parses_real_marker() {
+        let content = "Command running in background with ID: bash_1. \
+             Output is being written to: /tmp/claude-bg/bash_1.log";
+        let (id, path) = parse_background_task_start(content).expect("should parse marker");
+        assert_eq!(id, "bash_1");
+        assert_eq!(path, "/tmp/claude-bg/bash_1.log");
+    }
+
+    #[test]
+    fn parses_real_marker_with_trailing_prose() {
+        // Exact marker emitted by the Claude CLI: the path is followed by
+        // explanatory prose on the same line. Only the path token must be
+        // captured (no trailing sentence).
+        let content = "Command running in background with ID: bokwqyjak. \
+             Output is being written to: \
+             /tmp/claude-0/-workspaces-mission-20b6ee43/3cd99fa9-c3f8-4127-954a-d3be352221bf/tasks/bokwqyjak.output. \
+             You will be notified when it completes. To check interim output, use Read on that file path.";
+        let (id, path) = parse_background_task_start(content).expect("should parse real marker");
+        assert_eq!(id, "bokwqyjak");
+        assert_eq!(
+            path,
+            "/tmp/claude-0/-workspaces-mission-20b6ee43/3cd99fa9-c3f8-4127-954a-d3be352221bf/tasks/bokwqyjak.output"
+        );
+    }
+
+    #[test]
+    fn parses_marker_with_surrounding_whitespace_and_newline() {
+        let content = "  Command running in background with ID: abc-123. \
+             Output is being written to: /var/tmp/out.log\n";
+        let (id, path) = parse_background_task_start(content).expect("should tolerate whitespace");
+        assert_eq!(id, "abc-123");
+        assert_eq!(path, "/var/tmp/out.log");
+    }
+
+    #[test]
+    fn returns_none_for_unrelated_content() {
+        assert!(parse_background_task_start("total 0\n-rw-r--r-- 1 root root 0 file").is_none());
+        assert!(parse_background_task_start("").is_none());
+    }
+
+    #[test]
+    fn returns_none_when_only_id_label_present() {
+        // Malformed: id label but no output label.
+        assert!(parse_background_task_start("Command running in background with ID: x").is_none());
+    }
+
+    #[test]
+    fn returns_none_when_id_or_path_empty() {
+        // Output label present but path missing.
+        let content = "Command running in background with ID: bash_2. Output is being written to:";
+        assert!(parse_background_task_start(content).is_none());
+        // Id missing.
+        let content = "Command running in background with ID: . \
+             Output is being written to: /tmp/x.log";
+        assert!(parse_background_task_start(content).is_none());
+    }
 }

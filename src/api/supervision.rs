@@ -9,6 +9,8 @@
 //!   detection of silent/orphaned runners (incl. OOM-kill reporting).
 //! - [`stale_mission_cleanup_loop`] — hour-scale cleanup of abandoned
 //!   missions.
+//! - [`background_task_autoresume_loop`] — wakes missions parked in
+//!   `AwaitingUser` when Claude Code background shell tasks finish.
 //!
 //! TODO(Phase 5b): replace their three independent "is this mission alive?"
 //! heuristics with one per-mission LivenessState fed by the event stream —
@@ -27,6 +29,10 @@ use super::control::MissionStatus;
 #[allow(unused_imports)]
 use super::control::*;
 use super::mission_store::MissionStore;
+
+mod bg_autoresume;
+
+pub(crate) use bg_autoresume::background_task_autoresume_loop;
 
 pub(crate) async fn recover_server_shutdown_missions(
     mission_store: Arc<dyn MissionStore>,
