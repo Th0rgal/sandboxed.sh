@@ -50,15 +50,24 @@ export function finishedTone(status: MissionStatus): FinishedTone {
  * Categorize a mission based on runtime state and stored status.
  *
  * Priority order:
- * 1. Running - mission is actually running (runtime state takes precedence)
- * 2. Needs You - awaiting_user AND not running
- * 3. Finished - completed/acknowledged/failed/interrupted/blocked/not_feasible AND not running
- * 4. Other - anything else (active-but-not-running, pending)
+ * 1. Needs You (waiting for tool) - the agent is parked on a frontend tool
+ *    (e.g. AskUserQuestion). The backend still reports this mission as
+ *    "running" (run state `waiting_for_tool`) because its harness is alive,
+ *    but it is blocked on the user, so it belongs in Needs You — not Running.
+ * 2. Running - mission is actually executing a turn
+ * 3. Needs You - awaiting_user AND not running
+ * 4. Finished - completed/acknowledged/failed/interrupted/blocked/not_feasible AND not running
+ * 5. Other - anything else (active-but-not-running, pending)
  */
 export function categorizeMission(
   status: MissionStatus,
-  isActuallyRunning: boolean
+  isActuallyRunning: boolean,
+  isWaitingForTool = false
 ): MissionCategory {
+  if (isWaitingForTool) {
+    return 'needs-you';
+  }
+
   if (isActuallyRunning) {
     return 'running';
   }
@@ -77,10 +86,15 @@ export function categorizeMission(
 /**
  * Categorize multiple missions into columns for display.
  * Returns missions grouped by category with each mission only in one category.
+ *
+ * `waitingForToolMissionIds` is the subset of running missions parked on a
+ * frontend tool (run state `waiting_for_tool`); they are surfaced as Needs You
+ * rather than Running even though the backend still reports them as running.
  */
 export function categorizeMissions<T extends { id: string; status: MissionStatus }>(
   missions: T[],
-  runningMissionIds: Set<string>
+  runningMissionIds: Set<string>,
+  waitingForToolMissionIds: Set<string> = new Set()
 ): Record<MissionCategory, T[]> {
   const result: Record<MissionCategory, T[]> = {
     running: [],
@@ -90,8 +104,9 @@ export function categorizeMissions<T extends { id: string; status: MissionStatus
   };
 
   for (const mission of missions) {
+    const isWaitingForTool = waitingForToolMissionIds.has(mission.id);
     const isActuallyRunning = runningMissionIds.has(mission.id);
-    const category = categorizeMission(mission.status, isActuallyRunning);
+    const category = categorizeMission(mission.status, isActuallyRunning, isWaitingForTool);
     result[category].push(mission);
   }
 

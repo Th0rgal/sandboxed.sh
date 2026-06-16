@@ -366,9 +366,26 @@ function OverviewPageContent() {
     }
   );
 
-  // Build a set of actually running mission IDs from the runtime state
+  // Missions parked on a frontend tool (e.g. AskUserQuestion). The backend
+  // reports them in the running list with run state `waiting_for_tool`, but
+  // they are blocked on the user, so they belong in "Needs You" — not
+  // "Running". Track them separately and keep them out of the running set.
+  const waitingForToolMissionIds = useMemo(() => {
+    return new Set(
+      runningMissions
+        .filter((rm) => rm.state === 'waiting_for_tool')
+        .map((rm) => rm.mission_id)
+    );
+  }, [runningMissions]);
+
+  // Build a set of actually-executing mission IDs from the runtime state
+  // (excluding those merely waiting on a frontend tool).
   const runningMissionIds = useMemo(() => {
-    return new Set(runningMissions.map((rm) => rm.mission_id));
+    return new Set(
+      runningMissions
+        .filter((rm) => rm.state !== 'waiting_for_tool')
+        .map((rm) => rm.mission_id)
+    );
   }, [runningMissions]);
 
   // Build a set of missions with active automations
@@ -387,8 +404,8 @@ function OverviewPageContent() {
 
   // Categorize missions using shared utility
   const categorized = useMemo(
-    () => categorizeMissions(missions, runningLikeMissionIds),
-    [missions, runningLikeMissionIds]
+    () => categorizeMissions(missions, runningLikeMissionIds, waitingForToolMissionIds),
+    [missions, runningLikeMissionIds, waitingForToolMissionIds]
   );
 
   // Set of mission IDs that have at least one child (boss missions)

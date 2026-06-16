@@ -111,6 +111,15 @@ describe('mission-status', () => {
         expect(categorizeMission('active', false)).toBe('other');
       });
     });
+
+    describe('waiting for tool takes priority over running', () => {
+      it('categorizes a mission parked on a frontend tool as needs-you', () => {
+        // Backend still reports the mission as running (run state
+        // waiting_for_tool), but it is blocked on the user.
+        expect(categorizeMission('active', true, true)).toBe('needs-you');
+        expect(categorizeMission('active', false, true)).toBe('needs-you');
+      });
+    });
   });
 
   describe('categorizeMissions', () => {
@@ -133,6 +142,21 @@ describe('mission-status', () => {
       expect(result['needs-you'].map(m => m.id)).toEqual(['2']);
       expect(result.finished.map(m => m.id)).toEqual(['3', '4', '5', '6']);
       expect(result.other).toEqual([]);
+    });
+
+    it('puts missions waiting on a frontend tool in needs-you, not running', () => {
+      const missions: TestMission[] = [
+        { id: 'asking', status: 'active' }, // parked on AskUserQuestion
+        { id: 'executing', status: 'active' }, // genuinely running a turn
+      ];
+      // Backend reports both in the running list, but `asking` is waiting_for_tool.
+      const runningIds = new Set(['executing']);
+      const waitingForToolIds = new Set(['asking']);
+
+      const result = categorizeMissions(missions, runningIds, waitingForToolIds);
+
+      expect(result.running.map(m => m.id)).toEqual(['executing']);
+      expect(result['needs-you'].map(m => m.id)).toEqual(['asking']);
     });
 
     it('handles resumed mission correctly (awaiting_user but running)', () => {
