@@ -37,8 +37,14 @@ const BG_START_GRACE_SECS: u64 = 20;
 
 /// Hard cap on how long we track a single background task before treating it as
 /// done regardless of the completion heuristic. Prevents a task whose process
-/// we can't observe (exotic shell, missing pgrep) from being watched forever.
+/// we can't observe (no readable /proc, e.g. a macOS host workspace) from being
+/// watched forever.
 const BG_OVERALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Per-probe timeout. The watcher checks tasks serially, so a single probe that
+/// blocks (a wedged/OOM-throttled container, an nspawn boot lock, a hung `fuser`)
+/// must not freeze completion detection for every other mission's tasks.
+const BG_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Max number of trailing bytes of the output file to include in the resume
 /// message, so we never blow up a turn's context with a huge log.
@@ -307,7 +313,19 @@ pub(crate) async fn background_task_autoresume_loop(
                         );
                     }
                     BgProbe::Unknown { reason } => {
-                        let prev = watches.get(&(mission_id, task.id.clone()));
+                        let key = (mission_id, task.id.clone());
+                        let was_busy = watches.get(&key).map(|w| w.was_busy).unwrap_or(false);
+                        // Reset the idle clock: a probe we couldn't observe must
+                        // not let `BG_IDLE_STABLE_SECS` accumulate across the gap
+                        // (the process could have been running the whole time).
+                        // We require a fresh stable not-busy window afterwards.
+                        watches.insert(
+                            key,
+                            BgWatch {
+                                was_busy,
+                                idle_since: None,
+                            },
+                        );
                         tracing::debug!(
                             mission_id = %mission_id,
                             task = %task.id,
@@ -315,7 +333,7 @@ pub(crate) async fn background_task_autoresume_loop(
                             exists = tracing::field::Empty,
                             mtime_epoch = tracing::field::Empty,
                             busy = tracing::field::Empty,
-                            was_busy = prev.map(|w| w.was_busy).unwrap_or(false),
+                            was_busy,
                             age_secs,
                             idle_secs = tracing::field::Empty,
                             decision = "probe_unknown",
@@ -507,20 +525,30 @@ fi
 BUSY=0
 HAS_PGREP=0
 SELF=$$
-# This script embeds the command pattern, so the probe shell (and the subshells
-# it forks for $(…), which share its argv) match `pgrep -f $PAT` themselves.
-# Skip our own pid and every pid whose /proc cmdline equals ours. Linux-only:
-# /proc is absent on macOS host workspaces, so SELFCMD stays empty and only $$
-# is skipped there. Production nspawn containers are Linux and get the full guard.
+# Match the launched command LITERALLY against each process's /proc cmdline.
+# (This used `pgrep -f -- "$PAT"`, but `pgrep -f` treats PAT as an EXTENDED
+# REGEX. Real commands contain (), [], ., *, +, | and the 120-char truncation
+# can split a regex group — so the pattern often fails to match or errors, BUSY
+# stays 0, and the watcher resumes the agent while the build is still running.
+# A quoted shell `case` glob (*"$PAT"*) is a literal substring test, and a
+# truncated PAT is just a prefix, which still matches.)
+# The probe shell and its $(…) subshells embed PAT in their own argv, so skip
+# our own pid and any pid whose cmdline equals ours. Linux-only (/proc): on a
+# macOS host workspace /proc is absent, so detection is reported unavailable
+# (HAS_PGREP=0) and the watcher fail-closes to the overall timeout — it never
+# resumes prematurely there. Production nspawn containers are Linux.
 SELFCMD=$(tr '\0' ' ' < /proc/$$/cmdline 2>/dev/null)
-if [ -n "$PAT" ] && command -v pgrep >/dev/null 2>&1; then
+if [ -n "$PAT" ] && [ -r /proc/$$/cmdline ]; then
   HAS_PGREP=1
-  for pid in $(pgrep -f -- "$PAT" 2>/dev/null); do
+  for d in /proc/[0-9]*; do
+    pid=$(basename "$d")
     [ "$pid" = "$SELF" ] && continue
-    PIDCMD=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
-    [ -n "$SELFCMD" ] && [ "$PIDCMD" = "$SELFCMD" ] && continue
-    BUSY=1
-    break
+    CMD=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+    [ -z "$CMD" ] && continue
+    [ -n "$SELFCMD" ] && [ "$CMD" = "$SELFCMD" ] && continue
+    case "$CMD" in
+      *"$PAT"*) BUSY=1; break ;;
+    esac
   done
 fi
 if [ "$BUSY" = "0" ] && [ "$EXISTS" = "1" ] && command -v fuser >/dev/null 2>&1; then
@@ -531,11 +559,20 @@ echo "BG $EXISTS $M $BUSY $HAS_PGREP"
     );
 
     let args = vec!["-c".to_string(), script];
-    let output = match exec.output(cwd, "/bin/sh", &args, HashMap::new()).await {
-        Ok(o) => o,
-        Err(e) => {
+    let probe = exec.output(cwd, "/bin/sh", &args, HashMap::new());
+    let output = match tokio::time::timeout(BG_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
             return BgProbe::Unknown {
                 reason: Some(e.to_string()),
+            };
+        }
+        Err(_) => {
+            return BgProbe::Unknown {
+                reason: Some(format!(
+                    "probe timed out after {}s",
+                    BG_PROBE_TIMEOUT.as_secs()
+                )),
             };
         }
     };
@@ -579,9 +616,10 @@ async fn read_output_tail(exec: &WorkspaceExec, cwd: &Path, output_path: &str) -
         r#"set -u; P={out_path}; [ -f "$P" ] && tail -c {bytes} "$P" 2>/dev/null || true"#,
     );
     let args = vec!["-c".to_string(), script];
-    let output = exec
-        .output(cwd, "/bin/sh", &args, HashMap::new())
+    let read = exec.output(cwd, "/bin/sh", &args, HashMap::new());
+    let output = tokio::time::timeout(BG_PROBE_TIMEOUT, read)
         .await
+        .ok()?
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout).to_string();
     let trimmed = text.trim_end_matches('\n');
@@ -756,6 +794,19 @@ mod tests {
         assert!(!finished);
         assert!(next.was_busy);
         assert!(next.idle_since.is_none());
+    }
+
+    #[test]
+    fn idle_clock_restarts_after_unknown_reset() {
+        // The Unknown-probe path keeps `was_busy` but clears `idle_since`. A
+        // single not-busy probe afterwards must NOT immediately finish — a fresh
+        // BG_IDLE_STABLE_SECS window is required, so an unobserved gap can't be
+        // counted as confirmed-idle time.
+        let now = Instant::now();
+        let reset = watch(true, None);
+        let (finished, next) = bg_decide_finished(Some(&reset), false, 9_999, now);
+        assert!(!finished, "must require a fresh idle window after a reset");
+        assert!(next.idle_since.is_some());
     }
 
     #[test]
