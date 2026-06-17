@@ -39,6 +39,41 @@ use crate::util::{
 static OAUTH_WARN_DEDUP: LazyLock<StdMutex<HashMap<String, Instant>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+/// Accounts whose stored OAuth refresh token the provider has *permanently*
+/// rejected (`invalid_grant` / "refresh token not found"). Keyed by account id
+/// → the exact dead refresh-token value. The proactive usage-refresh loop
+/// re-attempts a refresh for every account every ~2 min; without this, a single
+/// revoked token (e.g. an Anthropic account the user logged out of) floods the
+/// logs and burns calls forever. We skip re-hitting the OAuth endpoint while the
+/// stored token still equals the dead one; the moment a re-auth rotates the
+/// token (value differs) or any refresh succeeds, the entry is cleared and
+/// refresh resumes automatically. In-memory by design: a restart re-probes once
+/// (a single failure) and then re-trips, which is the desired behavior.
+static OAUTH_REFRESH_DEADLETTER: LazyLock<StdMutex<HashMap<uuid::Uuid, String>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// True when `token` is the exact refresh token already recorded dead for
+/// `account_id` — i.e. re-attempting it would just reproduce `invalid_grant`.
+fn oauth_refresh_token_is_dead(account_id: uuid::Uuid, token: &str) -> bool {
+    OAUTH_REFRESH_DEADLETTER
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&account_id).cloned())
+        .is_some_and(|dead| dead == token)
+}
+
+fn oauth_refresh_mark_token_dead(account_id: uuid::Uuid, token: &str) {
+    if let Ok(mut m) = OAUTH_REFRESH_DEADLETTER.lock() {
+        m.insert(account_id, token.to_string());
+    }
+}
+
+fn oauth_refresh_clear_dead(account_id: uuid::Uuid) {
+    if let Ok(mut m) = OAUTH_REFRESH_DEADLETTER.lock() {
+        m.remove(&account_id);
+    }
+}
+
 const OAUTH_WARN_COOLDOWN: Duration = Duration::from_secs(600);
 
 fn should_warn_oauth(key: &str) -> bool {
@@ -383,6 +418,28 @@ fn parse_grok_device_auth_line(line: &str) -> (Option<String>, Option<String>) {
     };
 
     (auth_url, user_code)
+}
+
+#[cfg(test)]
+mod oauth_deadletter_tests {
+    use super::{
+        oauth_refresh_clear_dead, oauth_refresh_mark_token_dead, oauth_refresh_token_is_dead,
+    };
+
+    #[test]
+    fn deadletter_blocks_same_token_until_rotated_or_cleared() {
+        let acct = uuid::Uuid::new_v4();
+        // Fresh account: not dead.
+        assert!(!oauth_refresh_token_is_dead(acct, "tok-A"));
+        // Mark the current token dead (invalid_grant).
+        oauth_refresh_mark_token_dead(acct, "tok-A");
+        assert!(oauth_refresh_token_is_dead(acct, "tok-A")); // skipped → no flood
+                                                             // A rotated token (re-auth) is NOT blocked → refresh retries.
+        assert!(!oauth_refresh_token_is_dead(acct, "tok-B"));
+        // A successful refresh clears the mark.
+        oauth_refresh_clear_dead(acct);
+        assert!(!oauth_refresh_token_is_dead(acct, "tok-A"));
+    }
 }
 
 #[cfg(test)]
@@ -9842,6 +9899,18 @@ pub async fn refresh_store_account_oauth_locked(
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| fallback_refresh_token.to_string());
 
+    // Circuit-breaker: if this exact refresh token was already permanently
+    // rejected (`invalid_grant`), don't re-hit the OAuth endpoint — that's the
+    // 2-min log flood. The block lifts the instant a re-auth rotates the token
+    // (the re-read value above differs from the dead one) or any refresh
+    // succeeds. Surface a permanent-looking error so callers log at debug.
+    if oauth_refresh_token_is_dead(account_id, &refresh_token) {
+        return Err(OAuthRefreshError::InvalidGrant(
+            "invalid_grant (cached): refresh token previously rejected; re-auth required"
+                .to_string(),
+        ));
+    }
+
     // Does this account currently back the shared credential tiers? If there is
     // no tier entry yet (e.g. a freshly connected single account), treat it as
     // the owner so the tiers get populated.
@@ -9850,7 +9919,21 @@ pub async fn refresh_store_account_oauth_locked(
         .map_or(true, |tier_token| tier_token == refresh_token);
 
     let (access, refresh, expires_at) =
-        refresh_oauth_token_internal(&provider_type, &refresh_token).await?;
+        match refresh_oauth_token_internal(&provider_type, &refresh_token).await {
+            Ok(v) => {
+                // Live again — clear any prior dead-letter mark for this account.
+                oauth_refresh_clear_dead(account_id);
+                v
+            }
+            Err(e) => {
+                // A permanently-revoked/expired token: record it so the next
+                // ~2-min cycle skips the doomed retry until re-auth.
+                if matches!(e, OAuthRefreshError::InvalidGrant(_)) {
+                    oauth_refresh_mark_token_dead(account_id, &refresh_token);
+                }
+                return Err(e);
+            }
+        };
 
     // Always update this account's own store record.
     if ai_providers
