@@ -7905,7 +7905,7 @@ fn parse_openai_authorization_input(input: &str) -> (Option<String>, Option<Stri
     (Some(value.to_string()), None)
 }
 
-/// POST /api/ai/providers/:id/oauth/authorize - Initiate OAuth authorization.
+// POST /api/ai/providers/:id/oauth/authorize - Initiate OAuth authorization.
 // ─────────────────────────────────────────────────────────────────────────────
 // Kimi (Moonshot) Code subscription — OAuth 2.0 Device Authorization Grant
 // ─────────────────────────────────────────────────────────────────────────────
@@ -9968,7 +9968,7 @@ pub async fn refresh_store_account_oauth_locked(
     // the owner so the tiers get populated.
     let owns_tiers = read_oauth_token_entry(provider_type)
         .map(|e| e.refresh_token)
-        .map_or(true, |tier_token| tier_token == refresh_token);
+        .is_none_or(|tier_token| tier_token == refresh_token);
 
     let (access, refresh, expires_at) =
         match refresh_oauth_token_internal(&provider_type, &refresh_token).await {

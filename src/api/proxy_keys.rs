@@ -368,6 +368,31 @@ async fn delete_key(
     }
 }
 
+/// Delete (or, with `dry_run`, list) keys that have seen no activity for
+/// `max_age_days` days (default 7).
+async fn cleanup_keys(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CleanupRequest>,
+) -> Result<Json<CleanupResponse>, (StatusCode, String)> {
+    let max_age_days = req.max_age_days.unwrap_or(7);
+    if max_age_days == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "max_age_days must be at least 1".to_string(),
+        ));
+    }
+    let dry_run = req.dry_run.unwrap_or(false);
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(max_age_days));
+    match state.proxy_api_keys.cleanup_unused(cutoff, dry_run).await {
+        Ok(keys) => Ok(Json(CleanupResponse {
+            dry_run,
+            cutoff,
+            keys,
+        })),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,30 +513,5 @@ mod tests {
         );
         // Persisted.
         assert_eq!(store.load_from_disk().unwrap().len(), 3);
-    }
-}
-
-/// Delete (or, with `dry_run`, list) keys that have seen no activity for
-/// `max_age_days` days (default 7).
-async fn cleanup_keys(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CleanupRequest>,
-) -> Result<Json<CleanupResponse>, (StatusCode, String)> {
-    let max_age_days = req.max_age_days.unwrap_or(7);
-    if max_age_days == 0 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "max_age_days must be at least 1".to_string(),
-        ));
-    }
-    let dry_run = req.dry_run.unwrap_or(false);
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(max_age_days));
-    match state.proxy_api_keys.cleanup_unused(cutoff, dry_run).await {
-        Ok(keys) => Ok(Json(CleanupResponse {
-            dry_run,
-            cutoff,
-            keys,
-        })),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
     }
 }

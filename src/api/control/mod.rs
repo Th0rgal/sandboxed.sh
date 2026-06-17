@@ -19516,7 +19516,7 @@ Investigate <service/> failures.
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        lagged = lagged.saturating_add(n as u64);
+                        lagged = lagged.saturating_add(n);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
