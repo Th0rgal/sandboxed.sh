@@ -451,7 +451,12 @@ pub(crate) fn reset_stall_guard(mission_id: Uuid) {
 /// won't arrive. Leaf missions (no children) are never touched, so a mission
 /// legitimately awaiting a human answer is never auto-resumed. Bounded per
 /// mission; a no-op when the agent already armed its own wakeup.
-async fn maybe_arm_stall_guard_wakeup(mission_store: &Arc<dyn MissionStore>, mission_id: Uuid) {
+/// Returns `true` when a fallback wakeup was armed (used by tests; callers may
+/// ignore it).
+async fn maybe_arm_stall_guard_wakeup(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+) -> bool {
     // Only orchestrators are guarded — leaf missions awaiting a human are not.
     let has_children = mission_store
         .get_child_missions(mission_id)
@@ -459,21 +464,21 @@ async fn maybe_arm_stall_guard_wakeup(mission_store: &Arc<dyn MissionStore>, mis
         .map(|c| !c.is_empty())
         .unwrap_or(false);
     if !has_children {
-        return;
+        return false;
     }
     // The agent self-armed a wakeup → it manages its own cadence; reset + skip.
     if mission_has_active_automation(mission_store, mission_id).await {
         reset_stall_guard(mission_id);
-        return;
+        return false;
     }
     // Bound consecutive auto-arms.
     let count = {
         let Ok(mut m) = STALL_GUARD_CONSECUTIVE_ARMS.lock() else {
-            return;
+            return false;
         };
         let c = m.entry(mission_id).or_insert(0);
         if *c >= STALL_GUARD_MAX_CONSECUTIVE_ARMS {
-            return;
+            return false;
         }
         *c += 1;
         *c
@@ -500,6 +505,47 @@ everything is truly done, report completion and stop."
         prompt,
         reason,
     );
+    true
+}
+
+#[cfg(test)]
+mod stall_guard_tests {
+    use super::*;
+
+    async fn mk(store: &Arc<dyn MissionStore>, parent: Option<Uuid>) -> Uuid {
+        store
+            .create_mission_with_parent(Some("m"), None, None, None, None, None, None, parent, None)
+            .await
+            .expect("create")
+            .id
+    }
+
+    #[tokio::test]
+    async fn leaf_mission_is_never_guarded() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let leaf = mk(&store, None).await;
+        // No children → never armed, regardless of how many times it parks.
+        for _ in 0..5 {
+            assert!(!maybe_arm_stall_guard_wakeup(&store, leaf).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_arms_then_caps_then_resets() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let boss = mk(&store, None).await;
+        let _child = mk(&store, Some(boss)).await; // makes `boss` an orchestrator
+        reset_stall_guard(boss);
+        // Arms up to the cap, then stops (leaves it for a human).
+        for _ in 0..STALL_GUARD_MAX_CONSECUTIVE_ARMS {
+            assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
+        }
+        assert!(!maybe_arm_stall_guard_wakeup(&store, boss).await); // capped
+                                                                    // A real user message resets the budget.
+        reset_stall_guard(boss);
+        assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
+        reset_stall_guard(boss);
+    }
 }
 
 struct MetadataRefreshTaskEntry {
