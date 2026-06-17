@@ -24,6 +24,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::mission_store::MissionStore;
 use super::routes::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -169,6 +170,41 @@ fn rel_path_is_safe(rel_clean: &str) -> bool {
         })
 }
 
+/// Walk a mission's `parent_mission_id` chain and return true if any ANCESTOR's
+/// id begins with `short` — the 8-char prefix encoded in a `mission-<short>`
+/// workspace dir name. Lets an orchestrator worker offload a build that lives in
+/// its parent/boss mission's shared workspace dir (per-PR worktrees). The walk
+/// is bounded; a missing record or cyclic chain just yields `false` (→ 403).
+async fn mission_has_ancestor_short(
+    store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    short: &str,
+) -> bool {
+    if short.is_empty() {
+        return false;
+    }
+    let mut cur = match store.get_mission(mission_id).await {
+        Ok(Some(m)) => m.parent_mission_id,
+        _ => None,
+    };
+    let mut depth = 0;
+    while let Some(id) = cur {
+        let id_str = id.to_string();
+        if id_str.len() >= 8 && id_str[..8] == *short {
+            return true;
+        }
+        cur = match store.get_mission(id).await {
+            Ok(Some(m)) => m.parent_mission_id,
+            _ => None,
+        };
+        depth += 1;
+        if depth > 64 {
+            break;
+        }
+    }
+    false
+}
+
 async fn offload_build(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -185,19 +221,6 @@ async fn offload_build(
     if !verify_spark_offload_token(req.mission_id, &token_in) {
         return (StatusCode::UNAUTHORIZED, "invalid spark offload token").into_response();
     }
-
-    // All three must be set, else tell the caller to build locally.
-    let (Some(url), Some(token), Some(ssh)) = (
-        state.config.spark_arbiter_url.as_deref(),
-        state.config.spark_arbiter_token.as_deref(),
-        state.config.spark_ssh_target.as_deref(),
-    ) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "spark offload not configured",
-        )
-            .into_response();
-    };
 
     // Security: confine host_dir to a genuine mission workspace directory.
     // A substring check (`contains("/workspaces/mission-")`) is not real
@@ -218,16 +241,47 @@ async fn offload_build(
 
     let name = host_dir.rsplit('/').next().unwrap_or("build").to_string();
     // The token authenticates a specific mission; the workspace dir is named
-    // `mission-<short>`. Reject any attempt to point a mission's token at a
-    // different mission's workspace (the rsync below WRITES into host_dir).
-    let expected_name = format!("mission-{}", &req.mission_id.to_string()[..8]);
-    if name != expected_name {
+    // `mission-<short>`. A mission's scoped token may target its OWN workspace
+    // dir, OR the shared workspace dir of an ANCESTOR mission. Orchestrator
+    // fleets build in per-PR git worktrees under the boss mission's dir
+    // (`mission-<boss>/wk-NNNN`), so a worker legitimately offloads a build that
+    // physically lives in its parent's dir. The worker already has filesystem
+    // r/w to that shared dir (its harness operates there), so authorizing the
+    // offload into it is no privilege escalation — but an UNRELATED mission's
+    // dir (not in the caller's ancestor chain) is still rejected, since the
+    // rsync below WRITES into host_dir.
+    let host_short = name.strip_prefix("mission-").unwrap_or("");
+    let req_short = &req.mission_id.to_string()[..8];
+    let host_dir_authorized = if host_short.is_empty() {
+        false
+    } else if host_short == req_short {
+        true
+    } else {
+        let store = state.control.get_mission_store().await;
+        mission_has_ancestor_short(&store, req.mission_id, host_short).await
+    };
+    if !host_dir_authorized {
         return (
             StatusCode::FORBIDDEN,
-            "host_dir does not belong to this mission",
+            "host_dir does not belong to this mission or an ancestor",
         )
             .into_response();
     }
+
+    // Availability check runs AFTER authorization so an unauthorized caller can
+    // never probe whether Spark is configured. All three must be set, else tell
+    // the (authorized) caller to build locally via a 503.
+    let (Some(url), Some(token), Some(ssh)) = (
+        state.config.spark_arbiter_url.as_deref(),
+        state.config.spark_arbiter_token.as_deref(),
+        state.config.spark_ssh_target.as_deref(),
+    ) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "spark offload not configured",
+        )
+            .into_response();
+    };
     let user = ssh.split('@').next().unwrap_or("th0rgal");
     let remote_rel = format!(".spark-builds/{}", name);
 
@@ -376,7 +430,60 @@ async fn offload_build(
 
 #[cfg(test)]
 mod tests {
+    use super::mission_has_ancestor_short;
     use super::rel_path_is_safe;
+    use crate::api::mission_store::{InMemoryMissionStore, MissionStore};
+    use std::sync::Arc;
+
+    async fn mk(
+        store: &Arc<dyn MissionStore>,
+        title: &str,
+        parent: Option<uuid::Uuid>,
+    ) -> uuid::Uuid {
+        store
+            .create_mission_with_parent(
+                Some(title),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                parent,
+                None,
+            )
+            .await
+            .expect("create mission")
+            .id
+    }
+
+    fn short(id: uuid::Uuid) -> String {
+        id.to_string()[..8].to_string()
+    }
+
+    #[tokio::test]
+    async fn ancestry_matches_parent_and_grandparent_not_strangers() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let boss = mk(&store, "boss", None).await;
+        let worker = mk(&store, "worker", Some(boss)).await;
+        let grandchild = mk(&store, "grandchild", Some(worker)).await;
+        let stranger = mk(&store, "stranger", None).await;
+
+        // A worker's token may offload into its boss (parent) dir.
+        assert!(mission_has_ancestor_short(&store, worker, &short(boss)).await);
+        // …and a grandchild reaches the boss two hops up.
+        assert!(mission_has_ancestor_short(&store, grandchild, &short(boss)).await);
+        assert!(mission_has_ancestor_short(&store, grandchild, &short(worker)).await);
+        // An unrelated mission's dir is never authorized.
+        assert!(!mission_has_ancestor_short(&store, worker, &short(stranger)).await);
+        // The own-dir case is handled by the caller (host_short == req_short),
+        // so the ancestor walk (parents only) must NOT self-match.
+        assert!(!mission_has_ancestor_short(&store, worker, &short(worker)).await);
+        // Empty short never authorizes.
+        assert!(!mission_has_ancestor_short(&store, worker, "").await);
+        // Unknown mission id → no ancestors → false.
+        assert!(!mission_has_ancestor_short(&store, uuid::Uuid::new_v4(), &short(boss)).await);
+    }
 
     #[test]
     fn rel_allows_real_verity_worktrees() {
