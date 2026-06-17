@@ -74,6 +74,28 @@ fn oauth_refresh_clear_dead(account_id: uuid::Uuid) {
     }
 }
 
+/// Per-provider-type in-process serialization gate for OAuth refresh. The
+/// cross-process file lock (`acquire_oauth_refresh_lock`) is a non-blocking
+/// `try_lock`, so concurrent in-process refreshes (e.g. the proxy firing many
+/// requests at once) sail past it and all consume the SAME rotating refresh
+/// token — Anthropic invalidates it on first use, so every loser of the race
+/// gets `invalid_grant`. This async mutex makes those refreshes wait for each
+/// other; combined with the double-checked expiry below, the first refresh
+/// rotates+persists the token and the rest simply reuse the fresh one.
+static OAUTH_REFRESH_GATES: LazyLock<StdMutex<HashMap<ProviderType, Arc<AsyncMutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn oauth_refresh_gate(provider_type: ProviderType) -> Arc<AsyncMutex<()>> {
+    let mut gates = OAUTH_REFRESH_GATES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Arc::clone(
+        gates
+            .entry(provider_type)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+    )
+}
+
 const OAUTH_WARN_COOLDOWN: Duration = Duration::from_secs(600);
 
 fn should_warn_oauth(key: &str) -> bool {
@@ -9899,16 +9921,32 @@ pub async fn refresh_store_account_oauth_locked(
     provider_type: ProviderType,
     fallback_refresh_token: &str,
 ) -> Result<(String, String, i64), OAuthRefreshError> {
-    // Serialize with every other refresh path for this provider type so a
-    // rotating refresh token is only ever consumed once.
+    // Serialize in-process refreshes for this provider type FIRST. The file
+    // lock below is a non-blocking `try_lock` (cross-process only), so without
+    // this async gate concurrent in-process refreshes race and each consumes the
+    // same rotating refresh token → all but one get `invalid_grant`.
+    let gate = oauth_refresh_gate(provider_type);
+    let _gate = gate.lock().await;
     let _lock = acquire_oauth_refresh_lock(provider_type).ok();
 
-    // Re-read the freshest refresh token now that we hold the lock — another
-    // path may have rotated it while we were waiting.
-    let refresh_token = ai_providers
-        .get(account_id)
-        .await
-        .and_then(|p| p.oauth)
+    // Re-read the freshest credentials now that we're serialized — a concurrent
+    // refresh may have just rotated the token while we waited on the gate.
+    let current_oauth = ai_providers.get(account_id).await.and_then(|p| p.oauth);
+
+    // Double-checked: if a concurrent refresh already produced a still-valid
+    // access token, reuse it instead of consuming the (now-rotated) refresh
+    // token a second time. This is what actually kills the rotating-token race.
+    if let Some(o) = &current_oauth {
+        if !o.refresh_token.trim().is_empty() && !oauth_token_expired(o.expires_at) {
+            return Ok((
+                o.access_token.clone(),
+                o.refresh_token.clone(),
+                o.expires_at,
+            ));
+        }
+    }
+
+    let refresh_token = current_oauth
         .map(|o| o.refresh_token)
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| fallback_refresh_token.to_string());
