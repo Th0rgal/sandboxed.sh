@@ -627,7 +627,15 @@ function OverviewPageContent() {
                           runningMissionIds.has(mission.id) ||
                           automationMissionIds.has(mission.id)
                         }
-                        isActuallyRunning={runningMissionIds.has(mission.id)}
+                        isActuallyRunning={
+                          // Offer Cancel (not Delete) whenever the harness is
+                          // still alive — including a mission parked on a
+                          // frontend tool (waiting_for_tool). It shows as
+                          // "Needs You", but its process is live and should be
+                          // cancellable, not deleted outright.
+                          runningMissionIds.has(mission.id) ||
+                          waitingForToolMissionIds.has(mission.id)
+                        }
                         runningMissionIds={runningMissionIds}
                         automationMissionIds={automationMissionIds}
                         onCancel={handleCancel}
