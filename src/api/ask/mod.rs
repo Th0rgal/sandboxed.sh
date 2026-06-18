@@ -596,12 +596,21 @@ async fn build_system_prompt(turn: &AskTurn, user_content: &str) -> String {
          facts instead of guesses.\n\n\
          Steering authority: you can stop the working agent (stop_agent) and send \
          it steering messages (send_to_agent) — the same controls the operator has. \
-         These are interventions, not observations: use them when the operator asks \
-         you to stop/steer/redirect the agent, or when it is burning resources in a \
-         clearly harmful loop. Otherwise, propose the steering message and let the \
-         operator decide. When you do steer, make the message self-contained and \
-         bounded (what to stop, what to do instead, when to stop doing it) — the \
-         working agent has no access to this conversation.\n\n\
+         send_to_agent has three modes: default queues for the next turn boundary; \
+         immediate=true injects the message INTO the agent's current turn (received \
+         within ~5s, no turn-end, no cancel) — prefer this for a quick mid-flight \
+         course-correction; interrupt=true cancels the current turn so it restarts \
+         on the message. These are interventions, not observations: use them when \
+         the operator asks you to stop/steer/redirect the agent, or when it is \
+         burning resources in a clearly harmful loop. Otherwise, propose the \
+         steering message and let the operator decide. When you do steer, make the \
+         message self-contained and bounded (what to stop, what to do instead, when \
+         to stop doing it) — the working agent has no access to this conversation.\n\n\
+         Starting new work: you can spin up an independent mission with \
+         start_mission (pass agent='orchestrator' for a boss mission that manages \
+         its own workers) — give the operator the returned link so they can open \
+         it. Use it when the operator asks you to kick off a new piece of work as \
+         its own mission, not to fix the current one.\n\n\
          You are strictly reactive: you run only when the operator sends a \
          message, and you cannot watch, poll, or follow up on your own. Never \
          promise to \"keep an eye on\" or \"let you know when\" something \
@@ -709,14 +718,33 @@ fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "send_to_agent",
-                "description": "Send a steering message to the working agent, exactly as if the operator typed it in the mission composer. If the agent is mid-turn the message is queued and picked up at the next turn boundary — set interrupt=true to cancel the current turn first so it takes effect immediately. If the agent is idle this STARTS a new turn. Use only when the operator asked you to steer/redirect the agent.",
+                "description": "Send a steering message to the working agent. Three delivery modes: (default) the message is queued and picked up at the next turn boundary; set immediate=true to inject it INTO the agent's current turn so it is received within a few seconds WITHOUT ending the turn (no cancel — the agent keeps its context and reacts mid-flight); set interrupt=true to cancel the current turn first so it restarts on the message. If the agent is idle, any mode STARTS a new turn. Prefer immediate=true for a quick course-correction while it works; use interrupt=true only when it must stop what it's doing now. Use only when the operator asked you to steer/redirect the agent.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "message": { "type": "string", "description": "The steering instructions for the working agent. Be specific: what to stop doing, what to do instead, and any bounds." },
-                        "interrupt": { "type": "boolean", "description": "Cancel the agent's current turn before delivering, so the steer applies now instead of after the turn ends. Default false." }
+                        "immediate": { "type": "boolean", "description": "Inject the message into the agent's current turn (delivered within ~5s, no turn-end, no cancel). Default false. Ignored if the agent is idle (a new turn starts either way)." },
+                        "interrupt": { "type": "boolean", "description": "Cancel the agent's current turn before delivering, so the steer applies now instead of after the turn ends. Default false. Takes precedence over immediate." }
                     },
                     "required": ["message"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "start_mission",
+                "description": "Create and START a brand-new mission, then return its dashboard link for the operator. The new mission runs independently of this one. Use when the operator asks you to kick off a new piece of work as its own mission — including a BOSS/orchestrator mission (pass agent='orchestrator') that will plan tasks and spawn its own worker missions. Always give the link back to the operator so they can open it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "Short, specific mission title." },
+                        "prompt": { "type": "string", "description": "The full initial instruction/goal for the new mission's agent: scope, success criteria, verification, and any bounds. This is the first message the agent receives and what kicks off its first turn." },
+                        "agent": { "type": "string", "description": "Optional library agent name. Pass 'orchestrator' to make this a boss mission that manages a worker fleet; omit for a plain single agent." },
+                        "backend": { "type": "string", "description": "Optional backend: 'claudecode' (default), 'codex', or 'opencode'." },
+                        "workspace_id": { "type": "string", "description": "Optional workspace UUID. Defaults to THIS mission's workspace." }
+                    },
+                    "required": ["title", "prompt"]
                 }
             }
         }),
@@ -895,6 +923,34 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                 return "Error: message is empty".to_string();
             }
             let interrupt = args["interrupt"].as_bool().unwrap_or(false);
+            let immediate = args["immediate"].as_bool().unwrap_or(false);
+            // Immediate mid-turn delivery (no cancel): route through the
+            // operator-note bridge, which the working-agent runner polls every
+            // ~5s and injects into the live turn via stream-json stdin — the
+            // agent sees it within seconds without ending its turn. `interrupt`
+            // wins if both are set (a hard stop is a stronger intent). Sandbox
+            // turns have no live working agent, so the bridge is a no-op there.
+            if immediate && !interrupt {
+                if turn.sandbox {
+                    return "Error: immediate mid-turn delivery isn't available in a sandbox \
+                            (throwaway) Ask thread — there is no live working agent attached."
+                        .to_string();
+                }
+                let body = format_steer_message(&message);
+                if let Err(e) = turn
+                    .ask_store
+                    .enqueue_operator_note(turn.mission_id, &body, Some(turn.thread_id))
+                    .await
+                {
+                    return format!("Error queuing immediate steer: {e}");
+                }
+                return "Steering message queued for immediate delivery. If the working agent is \
+                        mid-turn (stream-json input enabled) it is injected into the CURRENT turn \
+                        within ~5s — no turn-end, no cancel, context preserved. If the agent is \
+                        idle it is delivered when its next turn begins; to START an idle agent, \
+                        resend without immediate."
+                    .to_string();
+            }
             // Track whether the requested interrupt actually landed — a failed
             // cancel (timeout, control error) must not be reported as "delivered
             // after interrupting" when the agent may still be mid-turn.
@@ -987,6 +1043,97 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                     .collect::<Vec<_>>()
                     .join("\n")
             }
+        }
+        "start_mission" => {
+            let title = args["title"].as_str().unwrap_or("").trim().to_string();
+            let prompt = args["prompt"].as_str().unwrap_or("").trim().to_string();
+            if title.is_empty() || prompt.is_empty() {
+                return "Error: start_mission requires non-empty 'title' and 'prompt'".to_string();
+            }
+            let agent = args["agent"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let backend = args["backend"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            // Default to THIS mission's workspace unless the operator names another.
+            let workspace_id = args["workspace_id"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s.trim()).ok())
+                .unwrap_or(turn.workspace_id);
+
+            // 1) Create the mission record.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if turn
+                .control_cmd_tx
+                .send(crate::api::control::ControlCommand::CreateMission {
+                    title: Some(title.clone()),
+                    workspace_id: Some(workspace_id),
+                    agent,
+                    model_override: None,
+                    model_effort: None,
+                    backend,
+                    config_profile: None,
+                    parent_mission_id: None,
+                    working_directory: None,
+                    respond: tx,
+                })
+                .await
+                .is_err()
+            {
+                return "Error: the control session is unavailable".to_string();
+            }
+            let mission = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                Ok(Ok(Ok(m))) => m,
+                Ok(Ok(Err(e))) => return format!("Error creating mission: {e}"),
+                Ok(Err(_)) => return "Error: mission creation did not respond".to_string(),
+                Err(_) => return "Error: mission creation timed out".to_string(),
+            };
+
+            // 2) Start it by delivering the initial prompt — a UserMessage to a
+            // brand-new mission auto-starts its first turn.
+            let (tx2, rx2) = tokio::sync::oneshot::channel();
+            let _ = turn
+                .control_cmd_tx
+                .send(crate::api::control::ControlCommand::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: prompt,
+                    agent: None,
+                    target_mission_id: Some(mission.id),
+                    strict: false,
+                    respond: tx2,
+                })
+                .await;
+            let started = matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(15), rx2).await,
+                Ok(Ok(_))
+            );
+
+            // 3) Build the operator-facing link.
+            let base = std::env::var("SANDBOXED_PUBLIC_URL")
+                .ok()
+                .map(|s| s.trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty());
+            let link = match &base {
+                Some(b) => format!("{b}/control?mission={}", mission.id),
+                None => format!("/control?mission={}", mission.id),
+            };
+            format!(
+                "{verb} mission '{title}' (id {id}){caveat}. Give the operator this link: {link}",
+                verb = if started { "Started" } else { "Created" },
+                title = title,
+                id = mission.id,
+                caveat = if started {
+                    ""
+                } else {
+                    " — created, but the start signal wasn't confirmed; it may need a nudge"
+                },
+                link = link,
+            )
         }
         other => format!("Error: unknown tool '{other}'"),
     }
