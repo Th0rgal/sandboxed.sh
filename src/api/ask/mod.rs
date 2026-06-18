@@ -963,9 +963,18 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                         mission.goal_mode,
                     ) {
                         MidTurnKind::StreamJsonStdin | MidTurnKind::CodexAppServer => {
-                            "Steering message queued for active mission delivery — it should be \
-                             injected mid-turn within ~5s without cancelling or losing in-flight \
-                             work."
+                            // Capability is the mission-level best case; the
+                            // runner makes the final call per turn (a /goal loop
+                            // or a Claude argv-fallback turn turns mid-turn
+                            // polling off), so promise mid-turn *when possible*
+                            // and name the next-turn fallback rather than
+                            // guaranteeing ~5s injection. Either way the note is
+                            // enqueued and never lost.
+                            "Steering message queued for the active mission. If the current turn \
+                             can accept mid-turn input it is injected within ~5s without cancelling \
+                             or losing in-flight work; otherwise (e.g. a /goal loop or a fallback \
+                             turn) it is delivered at the next turn boundary. No work is lost \
+                             either way."
                                 .to_string()
                         }
                         MidTurnKind::None => format!(
