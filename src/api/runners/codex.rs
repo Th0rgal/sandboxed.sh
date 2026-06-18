@@ -884,7 +884,9 @@ pub async fn run_codex_turn(
     };
 
     // Send message streaming
-    let (mut event_rx, _handle) = match backend.send_message_streaming(&session, user_message).await
+    let (mut event_rx, _handle, inject_tx) = match backend
+        .send_message_streaming_with_inject(&session, user_message)
+        .await
     {
         Ok(result) => result,
         Err(e) => {
@@ -930,12 +932,14 @@ pub async fn run_codex_turn(
     // loop and let the post-loop finalization recover whatever it can.
     let mut cancelled = false;
     let mut codex_goal_cancel_deferred = false;
+    let mut last_note_poll = tokio::time::Instant::now();
+    let is_goal_request = codex_is_goal_request(user_message);
 
     loop {
         tokio::select! {
             _ = cancel.cancelled(), if !codex_goal_cancel_deferred => {
                 tracing::info!("Codex turn cancelled for mission {}", mission_id);
-                if codex_is_goal_request(user_message) && !codex_goal_cancel_deferred {
+                if is_goal_request && !codex_goal_cancel_deferred {
                     // Goal-mode cancellation must be handled by the app-server
                     // task because it owns the live thread id needed for
                     // `thread/goal/clear`. Keep draining events until it emits
@@ -947,6 +951,14 @@ pub async fn run_codex_turn(
                 // the event stream task ends.
                 cancelled = true;
                 break;
+            }
+            _ = tokio::time::sleep_until(last_note_poll + crate::api::runners::midturn::MID_TURN_POLL), if !is_goal_request => {
+                last_note_poll = tokio::time::Instant::now();
+                crate::api::runners::midturn::drain_and_inject(
+                    mission_id,
+                    &events_tx,
+                    |block| inject_tx.try_send(block.to_string()).is_ok(),
+                ).await;
             }
             Some(event) = event_rx.recv() => {
                 match event {

@@ -134,6 +134,7 @@ pub fn run_claudecode_turn<'a>(
     tool_hub: Option<Arc<FrontendToolHub>>,
     status: Option<Arc<RwLock<ControlStatus>>>,
     override_auth: Option<crate::api::ai_providers::ClaudeCodeAuth>,
+    force_argv_prompt: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
     Box::pin(async move {
         use crate::api::ai_providers::{
@@ -953,7 +954,8 @@ pub fn run_claudecode_turn<'a>(
         // MID-TURN (picked up after the current tool call completes, like
         // typing in the interactive CLI). The positional prompt is ignored
         // by the CLI in this mode, so it is not added.
-        let stream_input = crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false);
+        let stream_input = crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false)
+            && !force_argv_prompt;
         if stream_input {
             args.push("--input-format".to_string());
             args.push("stream-json".to_string());
@@ -1638,67 +1640,31 @@ pub fn run_claudecode_turn<'a>(
                 // immediately leaves the turn in AwaitingTerminalResult/
                 // AwaitingClaude (not this state), so those stalls remain subject
                 // to the watchdog as before.
-                _ = tokio::time::sleep_until(last_note_poll + Duration::from_secs(5)), if stream_input && stdin_writer.is_some() => {
+                _ = tokio::time::sleep_until(last_note_poll + crate::api::runners::midturn::MID_TURN_POLL), if stream_input && stdin_writer.is_some() => {
                     last_note_poll = Instant::now();
-                    if let Some(store) = crate::api::ask::ask_store_if_initialized() {
-                        match store.take_pending_operator_notes(mission_id).await {
-                            Ok(notes) if !notes.is_empty() => {
-                                let mut block = String::from("<operator-note>\n");
-                                for note in &notes {
-                                    block.push_str(&note.body);
-                                    block.push('\n');
-                                }
-                                block.push_str("</operator-note>");
+                    crate::api::runners::midturn::drain_and_inject(
+                        mission_id,
+                        &events_tx,
+                        |block| {
                                 let msg = serde_json::json!({
                                     "type": "user",
                                     "message": { "role": "user", "content": [{ "type": "text", "text": block }] }
                                 });
-                                let mut delivered = false;
                                 if let Some(w) = stdin_writer.as_mut() {
                                     use std::io::Write as _;
-                                    delivered = writeln!(w, "{}", msg).and_then(|_| w.flush()).is_ok();
-                                }
-                                if delivered {
-                                    tracing::info!(
-                                        mission_id = %mission_id,
-                                        notes = notes.len(),
-                                        "Injected operator notes mid-turn via stream-json stdin"
-                                    );
-                                    let _ = events_tx.send(AgentEvent::UserMessage {
-                                        id: Uuid::new_v4(),
-                                        content: block,
-                                        queued: false,
-                                        mission_id: Some(mission_id),
-                                    });
-                                } else {
-                                    // take_pending_operator_notes already marked them
-                                    // flushed — re-enqueue so they deliver at the next
-                                    // poll or the next turn-prep instead of being lost.
-                                    for note in &notes {
-                                        if let Err(e) = store
-                                            .enqueue_operator_note(
-                                                mission_id,
-                                                &note.body,
-                                                note.source_thread_id,
-                                            )
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                mission_id = %mission_id,
-                                                "Failed to re-enqueue operator note after injection failure: {e}"
-                                            );
-                                        }
+                                    let delivered = writeln!(w, "{}", msg).and_then(|_| w.flush()).is_ok();
+                                    if delivered {
+                                        tracing::info!(
+                                            mission_id = %mission_id,
+                                            "Injected operator notes mid-turn via stream-json stdin"
+                                        );
                                     }
-                                    tracing::warn!(
-                                        mission_id = %mission_id,
-                                        notes = notes.len(),
-                                        "Mid-turn note injection failed; notes re-enqueued for next delivery"
-                                    );
+                                    delivered
+                                } else {
+                                    false
                                 }
-                            }
-                            _ => {}
                         }
-                    }
+                    ).await;
                 }
                 _ = tokio::time::sleep_until(last_heartbeat_at + heartbeat_interval),
                     if saw_non_init_event
@@ -2117,6 +2083,7 @@ pub fn run_claudecode_turn<'a>(
                                                             tool_hub,
                                                             status,
                                                             override_auth_for_continuation,
+                                                            force_argv_prompt,
                                                         ).await;
                                                     }
                                                 }
@@ -2718,6 +2685,16 @@ pub fn run_claudecode_turn<'a>(
     }) // end Box::pin(async move { ... })
 }
 
+fn claudecode_result_is_startup_transport_failure(result: &AgentResult) -> bool {
+    result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("claudecode_transport_failure"))
+        .and_then(|value| value.get("stage"))
+        .and_then(|value| value.as_str())
+        == Some("startup")
+}
+
 /// Claude Code turn with the full recovery orchestration:
 /// transport-failure retries (resume current session, then fresh-session
 /// reset with condensed history), SIGKILL-driven proactive OAuth refresh,
@@ -2772,8 +2749,42 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
         tool_hub.clone(),
         status.clone(),
         None, // override_auth: use default credential resolution
+        false,
     )
     .await;
+
+    let mut force_argv_prompt = false;
+    if crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false)
+        && claudecode_result_is_startup_transport_failure(&result)
+        && !cancel.is_cancelled()
+        && !crate::api::routes::is_shutdown_initiated()
+    {
+        force_argv_prompt = true;
+        tracing::warn!(
+            mission_id = %mission_id,
+            "Claude stream-input turn emitted zero usable events; retrying once with argv prompt delivery"
+        );
+        result = run_claudecode_turn(
+            workspace,
+            work_dir,
+            &effective_msg,
+            model,
+            model_effort,
+            agent,
+            mission_id,
+            events_tx.clone(),
+            cancel.clone(),
+            secrets.clone(),
+            app_working_dir,
+            effective_sid.as_deref(),
+            is_continuation,
+            tool_hub.clone(),
+            status.clone(),
+            None,
+            true,
+        )
+        .await;
+    }
 
     loop {
         if cancel.is_cancelled() || crate::api::routes::is_shutdown_initiated() {
@@ -2817,6 +2828,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                     tool_hub.clone(),
                     status.clone(),
                     None,
+                    force_argv_prompt,
                 )
                 .await;
             }
@@ -2882,6 +2894,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                     tool_hub.clone(),
                     status.clone(),
                     None,
+                    force_argv_prompt,
                 )
                 .await;
             }
@@ -2944,6 +2957,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
             tool_hub.clone(),
             status.clone(),
             None,
+            force_argv_prompt,
         )
         .await;
     }
@@ -3000,6 +3014,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                     tool_hub.clone(),
                     status.clone(),
                     Some(alt_auth),
+                    force_argv_prompt,
                 )
                 .await;
                 // Continue rotating on account-specific failures.
@@ -3054,6 +3069,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
             tool_hub.clone(),
             status.clone(),
             None,
+            force_argv_prompt,
         )
         .await;
     }

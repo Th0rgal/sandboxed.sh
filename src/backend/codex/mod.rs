@@ -62,6 +62,23 @@ impl CodexBackend {
     pub async fn get_config(&self) -> CodexConfig {
         self.config.read().await.clone()
     }
+
+    pub(crate) async fn send_message_streaming_with_inject(
+        &self,
+        session: &Session,
+        message: &str,
+    ) -> Result<
+        (
+            mpsc::Receiver<ExecutionEvent>,
+            JoinHandle<()>,
+            mpsc::Sender<String>,
+        ),
+        Error,
+    > {
+        let config = self.config.read().await.clone();
+        send_message_streaming_app_server(config, session, message, self.workspace_exec.as_ref())
+            .await
+    }
 }
 
 impl Default for CodexBackend {
@@ -111,13 +128,14 @@ impl Backend for CodexBackend {
         session: &Session,
         message: &str,
     ) -> Result<(mpsc::Receiver<ExecutionEvent>, JoinHandle<()>), Error> {
-        let config = self.config.read().await.clone();
         // All codex missions go through app-server now (Path A). The legacy
         // `codex exec` branch was removed because it can't parse slash
         // commands, never arms goals.rs, and the new path covers both
         // regular and goal missions.
-        send_message_streaming_app_server(config, session, message, self.workspace_exec.as_ref())
-            .await
+        let (rx, handle, _inject_tx) = self
+            .send_message_streaming_with_inject(session, message)
+            .await?;
+        Ok((rx, handle))
     }
 }
 
@@ -196,7 +214,14 @@ async fn send_message_streaming_app_server(
     session: &Session,
     message: &str,
     workspace_exec: Option<&crate::workspace_exec::WorkspaceExec>,
-) -> Result<(mpsc::Receiver<ExecutionEvent>, JoinHandle<()>), Error> {
+) -> Result<
+    (
+        mpsc::Receiver<ExecutionEvent>,
+        JoinHandle<()>,
+        mpsc::Sender<String>,
+    ),
+    Error,
+> {
     use app_server::{
         AppServerConfig, AppServerSession, GoalSetParams, InboundMessage, ThreadStartParams,
         TurnStartParams, UserInputItem,
@@ -288,6 +313,7 @@ async fn send_message_streaming_app_server(
     };
 
     let (tx, rx) = mpsc::channel::<ExecutionEvent>(256);
+    let (inject_tx, mut inject_rx) = mpsc::channel::<String>(8);
 
     // Take the inbound channel before issuing any further RPC — `goal/set`
     // and `turn/start` start emitting notifications before they return.
@@ -443,6 +469,22 @@ async fn send_message_streaming_app_server(
                         Some(m) => m,
                         None => break, // inner loop → check whether to reconnect
                     },
+                    Some(text) = inject_rx.recv(), if !is_goal_mission => {
+                        if let Err(e) = session_arc
+                            .turn_start(TurnStartParams {
+                                thread_id: thread_id.clone(),
+                                input: vec![UserInputItem::Text { text }],
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                thread_id = %thread_id,
+                                "codex app-server mid-turn injection failed: {}",
+                                e
+                            );
+                        }
+                        continue;
+                    }
                 };
 
                 match msg {
@@ -601,7 +643,7 @@ async fn send_message_streaming_app_server(
         let _ = session_arc.shutdown().await;
     });
 
-    Ok((rx, handle))
+    Ok((rx, handle, inject_tx))
 }
 
 /// Auto-approve any server-initiated elicitation. Matches exec-mode's

@@ -10,6 +10,7 @@ pub(crate) mod codex;
 pub(crate) mod errors;
 pub(crate) mod gemini;
 pub(crate) mod grok;
+pub(crate) mod midturn;
 pub(crate) mod opencode;
 
 use std::future::Future;
@@ -72,10 +73,20 @@ pub(crate) enum TurnExtras<'a> {
 /// reintroduces the async stack overflow this codebase already fixed once.
 pub(crate) trait HarnessRunner: Send + Sync {
     fn name(&self) -> &'static str;
+    fn mid_turn_kind(&self) -> MidTurnKind {
+        MidTurnKind::None
+    }
     fn run_turn<'a>(
         &'a self,
         ctx: TurnContext<'a>,
     ) -> Pin<Box<dyn Future<Output = AgentResult> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MidTurnKind {
+    None,
+    StreamJsonStdin,
+    CodexAppServer,
 }
 
 pub(crate) struct ClaudeCodeRunner;
@@ -87,6 +98,9 @@ pub(crate) struct GeminiRunner;
 impl HarnessRunner for ClaudeCodeRunner {
     fn name(&self) -> &'static str {
         "claudecode"
+    }
+    fn mid_turn_kind(&self) -> MidTurnKind {
+        MidTurnKind::StreamJsonStdin
     }
     fn run_turn<'a>(
         &'a self,
@@ -155,6 +169,9 @@ impl HarnessRunner for OpenCodeRunner {
 impl HarnessRunner for CodexRunner {
     fn name(&self) -> &'static str {
         "codex"
+    }
+    fn mid_turn_kind(&self) -> MidTurnKind {
+        MidTurnKind::CodexAppServer
     }
     fn run_turn<'a>(
         &'a self,
@@ -236,6 +253,20 @@ pub(crate) fn runner_for(backend_id: &str) -> Option<&'static dyn HarnessRunner>
     }
 }
 
+pub(crate) fn effective_mid_turn_kind(
+    backend_id: &str,
+    stream_input_enabled: bool,
+    is_goal: bool,
+) -> MidTurnKind {
+    match backend_id {
+        "claudecode" if !stream_input_enabled => MidTurnKind::None,
+        "codex" if is_goal => MidTurnKind::None,
+        _ => runner_for(backend_id)
+            .map(|runner| runner.mid_turn_kind())
+            .unwrap_or(MidTurnKind::None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +279,40 @@ mod tests {
         }
         assert!(runner_for("unknown").is_none());
         assert!(runner_for("").is_none());
+
+        assert_eq!(
+            runner_for("claudecode").unwrap().mid_turn_kind(),
+            MidTurnKind::StreamJsonStdin
+        );
+        assert_eq!(
+            runner_for("codex").unwrap().mid_turn_kind(),
+            MidTurnKind::CodexAppServer
+        );
+        for backend in ["opencode", "grok", "gemini"] {
+            assert_eq!(
+                runner_for(backend).unwrap().mid_turn_kind(),
+                MidTurnKind::None
+            );
+        }
+        assert_eq!(
+            effective_mid_turn_kind("claudecode", true, false),
+            MidTurnKind::StreamJsonStdin
+        );
+        assert_eq!(
+            effective_mid_turn_kind("claudecode", false, false),
+            MidTurnKind::None
+        );
+        assert_eq!(
+            effective_mid_turn_kind("codex", true, false),
+            MidTurnKind::CodexAppServer
+        );
+        assert_eq!(
+            effective_mid_turn_kind("codex", true, true),
+            MidTurnKind::None
+        );
+        assert_eq!(
+            effective_mid_turn_kind("opencode", true, false),
+            MidTurnKind::None
+        );
     }
 }
