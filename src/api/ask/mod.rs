@@ -26,7 +26,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use crate::api::control::MissionStatus;
 use crate::api::mission_store::MissionStore;
 use crate::api::proxy_keys::SharedProxyApiKeyStore;
 use crate::api::runners::{effective_mid_turn_kind, MidTurnKind};
@@ -946,7 +945,28 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                     Ok(None) => return "Error: mission not found".to_string(),
                     Err(error) => return format!("Error loading mission: {error}"),
                 };
-                if mission.status == MissionStatus::Active {
+                // Mid-turn injection is only correct when BOTH hold:
+                //   (a) a turn is genuinely in flight for this mission — confirmed
+                //       with the control session, not the DB status, which can lag
+                //       a restart (Active row, no runner) and would otherwise leave
+                //       the note queued with nothing to deliver it; and
+                //   (b) the harness can accept mid-turn input.
+                // The operator-note bridge does not start a turn, so anything else
+                // (idle mission, or a running mission on a harness that can't take
+                // mid-turn input) falls through to the authoritative UserMessage
+                // path below — which starts a turn when idle and queues for the
+                // next boundary when running, and reports honestly either way.
+                let stream_input_enabled =
+                    crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false);
+                let capable = matches!(
+                    effective_mid_turn_kind(
+                        &mission.backend,
+                        stream_input_enabled,
+                        mission.goal_mode,
+                    ),
+                    MidTurnKind::StreamJsonStdin | MidTurnKind::CodexAppServer
+                );
+                if capable && !turn.sandbox && mission_has_live_turn(turn).await {
                     let content = format_steer_message(&message);
                     if let Err(error) = turn
                         .ask_store
@@ -955,35 +975,16 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                     {
                         return format!("Error queuing steer: {error}");
                     }
-                    let stream_input_enabled =
-                        crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false);
-                    return match effective_mid_turn_kind(
-                        &mission.backend,
-                        stream_input_enabled,
-                        mission.goal_mode,
-                    ) {
-                        MidTurnKind::StreamJsonStdin | MidTurnKind::CodexAppServer => {
-                            // Capability is the mission-level best case; the
-                            // runner makes the final call per turn (a /goal loop
-                            // or a Claude argv-fallback turn turns mid-turn
-                            // polling off), so promise mid-turn *when possible*
-                            // and name the next-turn fallback rather than
-                            // guaranteeing ~5s injection. Either way the note is
-                            // enqueued and never lost.
-                            "Steering message queued for the active mission. If the current turn \
-                             can accept mid-turn input it is injected within ~5s without cancelling \
-                             or losing in-flight work; otherwise (e.g. a /goal loop or a fallback \
-                             turn) it is delivered at the next turn boundary. No work is lost \
-                             either way."
-                                .to_string()
-                        }
-                        MidTurnKind::None => format!(
-                            "Steering message queued for the next turn — the `{}` harness can't \
-                             receive mid-turn messages in its current mode, so in-flight work is \
-                             preserved and the agent will see it at the next turn boundary.",
-                            mission.backend
-                        ),
-                    };
+                    // Capability is the best case; the runner still makes the
+                    // final per-turn call (a /goal loop or a Claude argv-fallback
+                    // turn disables mid-turn polling), so name the next-turn
+                    // fallback rather than guaranteeing ~5s. No work is lost.
+                    return "Steering message queued for the active mission. If the current turn \
+                            can accept mid-turn input it is injected within ~5s without cancelling \
+                            or losing in-flight work; otherwise (e.g. a /goal loop or a fallback \
+                            turn) it is delivered at the next turn boundary. No work is lost \
+                            either way."
+                        .to_string();
                 }
             }
             let content = format_steer_message(&message);
@@ -1175,6 +1176,30 @@ async fn cancel_working_agent(turn: &AskTurn) -> Result<(), String> {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err("the control session dropped the request".to_string()),
         Err(_) => Err("timed out waiting for the cancellation to be acknowledged".to_string()),
+    }
+}
+
+/// Ask the control session whether this mission has a turn **actually in
+/// flight** right now (main or a parallel runner). This is the authoritative
+/// signal: the DB `MissionStatus::Active` can lag reality — a restart leaves the
+/// row `Active` with no runner attached until autoresume re-attaches — so it must
+/// not be used as a proxy for "a turn is executing" when choosing between
+/// mid-turn injection (needs a live turn to drain the note) and starting a turn.
+/// On any failure we return `false`, degrading to the authoritative UserMessage
+/// path (which starts a turn when idle and queues when running).
+async fn mission_has_live_turn(turn: &AskTurn) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if turn
+        .control_cmd_tx
+        .send(crate::api::control::ControlCommand::ListRunning { respond: tx })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(list)) => list.iter().any(|m| m.mission_id == turn.mission_id),
+        _ => false,
     }
 }
 

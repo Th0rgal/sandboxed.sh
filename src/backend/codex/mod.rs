@@ -475,26 +475,34 @@ async fn send_message_streaming_app_server(
                         Some(m) => m,
                         None => break, // inner loop → check whether to reconnect
                     },
-                    Some((text, ack)) = inject_rx.recv(), if !is_goal_mission => {
-                        let delivered = match session_arc
-                            .turn_start(TurnStartParams {
-                                thread_id: thread_id.clone(),
-                                input: vec![UserInputItem::Text { text }],
-                            })
-                            .await
-                        {
-                            Ok(_) => true,
-                            Err(e) => {
-                                tracing::warn!(
-                                    thread_id = %thread_id,
-                                    "codex app-server mid-turn injection failed: {}",
-                                    e
-                                );
-                                false
+                    Some((text, ack)) = inject_rx.recv() => {
+                        // Always consume the inject channel and ack so the caller
+                        // (which awaits this ack to decide whether to flush or
+                        // re-enqueue the operator notes) can never block. Goal
+                        // turns own a persistent thread that must not receive an
+                        // extra turn/start, so they ack `false` → the notes are
+                        // re-enqueued for next-turn delivery.
+                        let delivered = if is_goal_mission {
+                            false
+                        } else {
+                            match session_arc
+                                .turn_start(TurnStartParams {
+                                    thread_id: thread_id.clone(),
+                                    input: vec![UserInputItem::Text { text }],
+                                })
+                                .await
+                            {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        thread_id = %thread_id,
+                                        "codex app-server mid-turn injection failed: {}",
+                                        e
+                                    );
+                                    false
+                                }
                             }
                         };
-                        // Report the real RPC outcome so the caller re-enqueues
-                        // the notes when delivery failed.
                         let _ = ack.send(delivered);
                         continue;
                     }
