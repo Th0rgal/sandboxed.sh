@@ -719,7 +719,7 @@ fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "send_to_agent",
-                "description": "Send a steering message to the working agent. By default, active missions receive it through the operator-note bridge: Claude Code with stream input and non-goal Codex inject it mid-turn within ~5s without cancelling; other harnesses queue it for the next turn boundary. If the agent is idle, a new turn starts on the message now. Set interrupt=true only to cancel the current turn first and restart on the message, losing in-flight work. Use only when the operator asked you to steer/redirect the agent.",
+                "description": "Send a steering message to the working agent. By default, when a turn is actually running, Claude Code with stream input injects it mid-turn within ~5s without cancelling; other harnesses queue it for the next turn boundary (in-flight work preserved). If the agent is idle, a new turn starts on the message now. Set interrupt=true only to cancel the current turn first and restart on the message, losing in-flight work. Use only when the operator asked you to steer/redirect the agent.",
                 "parameters": {
                     "type": "object",
                     "properties": {

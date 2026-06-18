@@ -883,8 +883,13 @@ pub async fn run_codex_turn(
         }
     };
 
-    // Send message streaming
-    let (mut event_rx, _handle, inject_tx) = match backend
+    // Send message streaming. Mid-turn injection (`_inject_tx`) is intentionally
+    // unused: Codex mid-turn steering is disabled because the non-goal driver
+    // ends the mission on the first `turn/completed`, so an injected `turn/start`
+    // would be abandoned. Steers fall back to the authoritative next-turn path
+    // (see effective_mid_turn_kind). Keep the channel so the backend signature is
+    // stable for when injected-turn tracking (or a turn/steer RPC) lands.
+    let (mut event_rx, _handle, _inject_tx) = match backend
         .send_message_streaming_with_inject(&session, user_message)
         .await
     {
@@ -932,7 +937,6 @@ pub async fn run_codex_turn(
     // loop and let the post-loop finalization recover whatever it can.
     let mut cancelled = false;
     let mut codex_goal_cancel_deferred = false;
-    let mut last_note_poll = tokio::time::Instant::now();
     let is_goal_request = codex_is_goal_request(user_message);
 
     loop {
@@ -951,28 +955,6 @@ pub async fn run_codex_turn(
                 // the event stream task ends.
                 cancelled = true;
                 break;
-            }
-            _ = tokio::time::sleep_until(last_note_poll + crate::api::runners::midturn::MID_TURN_POLL), if !is_goal_request => {
-                last_note_poll = tokio::time::Instant::now();
-                crate::api::runners::midturn::drain_and_inject(
-                    mission_id,
-                    &events_tx,
-                    |block| {
-                        let inject_tx = inject_tx.clone();
-                        async move {
-                            // Delivery is two-stage: enqueue onto the inject
-                            // channel, then wait for the driver task to report
-                            // whether the deferred `turn/start` RPC succeeded.
-                            // Returning the real outcome lets drain_and_inject
-                            // re-enqueue the notes if injection ultimately fails.
-                            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                            if inject_tx.try_send((block, ack_tx)).is_err() {
-                                return false;
-                            }
-                            ack_rx.await.unwrap_or(false)
-                        }
-                    },
-                ).await;
             }
             Some(event) = event_rx.recv() => {
                 match event {

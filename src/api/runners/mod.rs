@@ -171,6 +171,12 @@ impl HarnessRunner for CodexRunner {
         "codex"
     }
     fn mid_turn_kind(&self) -> MidTurnKind {
+        // Raw backend capability: the app-server accepts a second `turn/start`
+        // on the live thread. NOTE: this is gated OFF in
+        // `effective_mid_turn_kind` — the non-goal driver marks the turn
+        // terminal on the first `turn/completed` (see codex/mod.rs), so an
+        // injected turn would be abandoned. Re-enable once the driver tracks
+        // injected turns (or a `turn/steer`-style append RPC is wired).
         MidTurnKind::CodexAppServer
     }
     fn run_turn<'a>(
@@ -258,9 +264,17 @@ pub(crate) fn effective_mid_turn_kind(
     stream_input_enabled: bool,
     is_goal: bool,
 ) -> MidTurnKind {
+    // `is_goal` is retained for API stability / future re-enable; Codex is
+    // currently gated off entirely (see below), so it is unused for now.
+    let _ = is_goal;
     match backend_id {
         "claudecode" if !stream_input_enabled => MidTurnKind::None,
-        "codex" if is_goal => MidTurnKind::None,
+        // Codex mid-turn injection is disabled: the app-server can start a
+        // second turn, but the non-goal driver ends the mission on the first
+        // `turn/completed`, so the injected turn is abandoned and the steer
+        // never reaches the model. Fall back to the authoritative next-turn
+        // path until the driver can consume an injected turn.
+        "codex" => MidTurnKind::None,
         _ => runner_for(backend_id)
             .map(|runner| runner.mid_turn_kind())
             .unwrap_or(MidTurnKind::None),
@@ -302,9 +316,12 @@ mod tests {
             effective_mid_turn_kind("claudecode", false, false),
             MidTurnKind::None
         );
+        // Codex is gated off in effective_mid_turn_kind (driver can't consume
+        // an injected turn yet) even though its raw mid_turn_kind is
+        // CodexAppServer — regardless of goal mode.
         assert_eq!(
             effective_mid_turn_kind("codex", true, false),
-            MidTurnKind::CodexAppServer
+            MidTurnKind::None
         );
         assert_eq!(
             effective_mid_turn_kind("codex", true, true),
