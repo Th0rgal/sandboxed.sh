@@ -883,15 +883,11 @@ pub async fn run_codex_turn(
         }
     };
 
-    // Send message streaming. Mid-turn injection (`_inject_tx`) is intentionally
-    // unused: Codex mid-turn steering is disabled because the non-goal driver
-    // ends the mission on the first `turn/completed`, so an injected `turn/start`
-    // would be abandoned. Steers fall back to the authoritative next-turn path
-    // (see effective_mid_turn_kind). Keep the channel so the backend signature is
-    // stable for when injected-turn tracking (or a turn/steer RPC) lands.
-    let (mut event_rx, _handle, _inject_tx) = match backend
-        .send_message_streaming_with_inject(&session, user_message)
-        .await
+    // Send message streaming. Codex has no mid-turn injection: the non-goal
+    // driver ends the mission on the first `turn/completed`, so an injected
+    // `turn/start` would be abandoned. Steers fall back to the authoritative
+    // next-turn path (see effective_mid_turn_kind).
+    let (mut event_rx, _handle) = match backend.send_message_streaming(&session, user_message).await
     {
         Ok(result) => result,
         Err(e) => {

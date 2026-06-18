@@ -13,12 +13,6 @@ use crate::backend::{AgentInfo, Backend, Session, SessionConfig};
 
 use client::CodexConfig;
 
-/// Mid-turn injection request: the note block plus a one-shot the driver task
-/// uses to report whether the deferred `turn/start` RPC actually succeeded. The
-/// caller awaits this ack so a failed injection re-enqueues the notes instead of
-/// dropping them (they were already taken off the operator-note queue).
-pub(crate) type InjectRequest = (String, tokio::sync::oneshot::Sender<bool>);
-
 /// Codex backend that spawns the Codex CLI for mission execution.
 pub struct CodexBackend {
     id: String,
@@ -67,23 +61,6 @@ impl CodexBackend {
     /// Get the current configuration.
     pub async fn get_config(&self) -> CodexConfig {
         self.config.read().await.clone()
-    }
-
-    pub(crate) async fn send_message_streaming_with_inject(
-        &self,
-        session: &Session,
-        message: &str,
-    ) -> Result<
-        (
-            mpsc::Receiver<ExecutionEvent>,
-            JoinHandle<()>,
-            mpsc::Sender<InjectRequest>,
-        ),
-        Error,
-    > {
-        let config = self.config.read().await.clone();
-        send_message_streaming_app_server(config, session, message, self.workspace_exec.as_ref())
-            .await
     }
 }
 
@@ -138,10 +115,9 @@ impl Backend for CodexBackend {
         // `codex exec` branch was removed because it can't parse slash
         // commands, never arms goals.rs, and the new path covers both
         // regular and goal missions.
-        let (rx, handle, _inject_tx) = self
-            .send_message_streaming_with_inject(session, message)
-            .await?;
-        Ok((rx, handle))
+        let config = self.config.read().await.clone();
+        send_message_streaming_app_server(config, session, message, self.workspace_exec.as_ref())
+            .await
     }
 }
 
@@ -220,14 +196,7 @@ async fn send_message_streaming_app_server(
     session: &Session,
     message: &str,
     workspace_exec: Option<&crate::workspace_exec::WorkspaceExec>,
-) -> Result<
-    (
-        mpsc::Receiver<ExecutionEvent>,
-        JoinHandle<()>,
-        mpsc::Sender<InjectRequest>,
-    ),
-    Error,
-> {
+) -> Result<(mpsc::Receiver<ExecutionEvent>, JoinHandle<()>), Error> {
     use app_server::{
         AppServerConfig, AppServerSession, GoalSetParams, InboundMessage, ThreadStartParams,
         TurnStartParams, UserInputItem,
@@ -319,7 +288,6 @@ async fn send_message_streaming_app_server(
     };
 
     let (tx, rx) = mpsc::channel::<ExecutionEvent>(256);
-    let (inject_tx, mut inject_rx) = mpsc::channel::<InjectRequest>(8);
 
     // Take the inbound channel before issuing any further RPC — `goal/set`
     // and `turn/start` start emitting notifications before they return.
@@ -475,37 +443,6 @@ async fn send_message_streaming_app_server(
                         Some(m) => m,
                         None => break, // inner loop → check whether to reconnect
                     },
-                    Some((text, ack)) = inject_rx.recv() => {
-                        // Always consume the inject channel and ack so the caller
-                        // (which awaits this ack to decide whether to flush or
-                        // re-enqueue the operator notes) can never block. Goal
-                        // turns own a persistent thread that must not receive an
-                        // extra turn/start, so they ack `false` → the notes are
-                        // re-enqueued for next-turn delivery.
-                        let delivered = if is_goal_mission {
-                            false
-                        } else {
-                            match session_arc
-                                .turn_start(TurnStartParams {
-                                    thread_id: thread_id.clone(),
-                                    input: vec![UserInputItem::Text { text }],
-                                })
-                                .await
-                            {
-                                Ok(_) => true,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        thread_id = %thread_id,
-                                        "codex app-server mid-turn injection failed: {}",
-                                        e
-                                    );
-                                    false
-                                }
-                            }
-                        };
-                        let _ = ack.send(delivered);
-                        continue;
-                    }
                 };
 
                 match msg {
@@ -664,7 +601,7 @@ async fn send_message_streaming_app_server(
         let _ = session_arc.shutdown().await;
     });
 
-    Ok((rx, handle, inject_tx))
+    Ok((rx, handle))
 }
 
 /// Auto-approve any server-initiated elicitation. Matches exec-mode's
