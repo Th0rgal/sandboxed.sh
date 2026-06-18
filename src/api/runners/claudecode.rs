@@ -1646,23 +1646,28 @@ pub fn run_claudecode_turn<'a>(
                         mission_id,
                         &events_tx,
                         |block| {
+                                // Claude delivery is synchronous: a successful
+                                // blocking write to the live stream-json stdin
+                                // means the frame is handed to the CLI, so the
+                                // returned `bool` is the true outcome.
                                 let msg = serde_json::json!({
                                     "type": "user",
                                     "message": { "role": "user", "content": [{ "type": "text", "text": block }] }
                                 });
-                                if let Some(w) = stdin_writer.as_mut() {
+                                let delivered = if let Some(w) = stdin_writer.as_mut() {
                                     use std::io::Write as _;
-                                    let delivered = writeln!(w, "{}", msg).and_then(|_| w.flush()).is_ok();
-                                    if delivered {
+                                    let ok = writeln!(w, "{}", msg).and_then(|_| w.flush()).is_ok();
+                                    if ok {
                                         tracing::info!(
                                             mission_id = %mission_id,
                                             "Injected operator notes mid-turn via stream-json stdin"
                                         );
                                     }
-                                    delivered
+                                    ok
                                 } else {
                                     false
-                                }
+                                };
+                                std::future::ready(delivered)
                         }
                     ).await;
                 }

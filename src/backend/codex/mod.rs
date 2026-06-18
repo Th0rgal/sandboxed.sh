@@ -13,6 +13,12 @@ use crate::backend::{AgentInfo, Backend, Session, SessionConfig};
 
 use client::CodexConfig;
 
+/// Mid-turn injection request: the note block plus a one-shot the driver task
+/// uses to report whether the deferred `turn/start` RPC actually succeeded. The
+/// caller awaits this ack so a failed injection re-enqueues the notes instead of
+/// dropping them (they were already taken off the operator-note queue).
+pub(crate) type InjectRequest = (String, tokio::sync::oneshot::Sender<bool>);
+
 /// Codex backend that spawns the Codex CLI for mission execution.
 pub struct CodexBackend {
     id: String,
@@ -71,7 +77,7 @@ impl CodexBackend {
         (
             mpsc::Receiver<ExecutionEvent>,
             JoinHandle<()>,
-            mpsc::Sender<String>,
+            mpsc::Sender<InjectRequest>,
         ),
         Error,
     > {
@@ -218,7 +224,7 @@ async fn send_message_streaming_app_server(
     (
         mpsc::Receiver<ExecutionEvent>,
         JoinHandle<()>,
-        mpsc::Sender<String>,
+        mpsc::Sender<InjectRequest>,
     ),
     Error,
 > {
@@ -313,7 +319,7 @@ async fn send_message_streaming_app_server(
     };
 
     let (tx, rx) = mpsc::channel::<ExecutionEvent>(256);
-    let (inject_tx, mut inject_rx) = mpsc::channel::<String>(8);
+    let (inject_tx, mut inject_rx) = mpsc::channel::<InjectRequest>(8);
 
     // Take the inbound channel before issuing any further RPC — `goal/set`
     // and `turn/start` start emitting notifications before they return.
@@ -469,20 +475,27 @@ async fn send_message_streaming_app_server(
                         Some(m) => m,
                         None => break, // inner loop → check whether to reconnect
                     },
-                    Some(text) = inject_rx.recv(), if !is_goal_mission => {
-                        if let Err(e) = session_arc
+                    Some((text, ack)) = inject_rx.recv(), if !is_goal_mission => {
+                        let delivered = match session_arc
                             .turn_start(TurnStartParams {
                                 thread_id: thread_id.clone(),
                                 input: vec![UserInputItem::Text { text }],
                             })
                             .await
                         {
-                            tracing::warn!(
-                                thread_id = %thread_id,
-                                "codex app-server mid-turn injection failed: {}",
-                                e
-                            );
-                        }
+                            Ok(_) => true,
+                            Err(e) => {
+                                tracing::warn!(
+                                    thread_id = %thread_id,
+                                    "codex app-server mid-turn injection failed: {}",
+                                    e
+                                );
+                                false
+                            }
+                        };
+                        // Report the real RPC outcome so the caller re-enqueues
+                        // the notes when delivery failed.
+                        let _ = ack.send(delivered);
                         continue;
                     }
                 };

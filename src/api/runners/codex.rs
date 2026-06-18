@@ -957,7 +957,21 @@ pub async fn run_codex_turn(
                 crate::api::runners::midturn::drain_and_inject(
                     mission_id,
                     &events_tx,
-                    |block| inject_tx.try_send(block.to_string()).is_ok(),
+                    |block| {
+                        let inject_tx = inject_tx.clone();
+                        async move {
+                            // Delivery is two-stage: enqueue onto the inject
+                            // channel, then wait for the driver task to report
+                            // whether the deferred `turn/start` RPC succeeded.
+                            // Returning the real outcome lets drain_and_inject
+                            // re-enqueue the notes if injection ultimately fails.
+                            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                            if inject_tx.try_send((block, ack_tx)).is_err() {
+                                return false;
+                            }
+                            ack_rx.await.unwrap_or(false)
+                        }
+                    },
                 ).await;
             }
             Some(event) = event_rx.recv() => {

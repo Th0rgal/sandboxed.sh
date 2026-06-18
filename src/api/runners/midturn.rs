@@ -7,12 +7,13 @@ use crate::api::control::AgentEvent;
 
 pub(crate) const MID_TURN_POLL: Duration = Duration::from_secs(5);
 
-pub(crate) async fn drain_and_inject<F>(
+pub(crate) async fn drain_and_inject<F, Fut>(
     mission_id: Uuid,
     events_tx: &broadcast::Sender<AgentEvent>,
     inject: F,
 ) where
-    F: FnOnce(&str) -> bool,
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
 {
     let Some(store) = crate::api::ask::ask_store_if_initialized() else {
         return;
@@ -20,13 +21,20 @@ pub(crate) async fn drain_and_inject<F>(
     drain_and_inject_from_store(store, mission_id, events_tx, inject).await;
 }
 
-async fn drain_and_inject_from_store<F>(
+// The injection closure is `async` and its `bool` MUST mean the note block was
+// *actually accepted by the backend* — not merely queued for delivery. Backends
+// whose delivery is deferred (e.g. Codex enqueues onto an inject channel that a
+// driver task later turns into a `turn/start` RPC) must therefore await the real
+// outcome before returning, so a failed RPC re-enqueues the notes here instead
+// of silently dropping them after we already took them off the queue.
+async fn drain_and_inject_from_store<F, Fut>(
     store: std::sync::Arc<crate::api::ask::AskStore>,
     mission_id: Uuid,
     events_tx: &broadcast::Sender<AgentEvent>,
     inject: F,
 ) where
-    F: FnOnce(&str) -> bool,
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
 {
     let notes = match store.take_pending_operator_notes(mission_id).await {
         Ok(notes) if !notes.is_empty() => notes,
@@ -47,7 +55,7 @@ async fn drain_and_inject_from_store<F>(
     }
     block.push_str("</operator-note>");
 
-    if inject(&block) {
+    if inject(block.clone()).await {
         tracing::info!(
             mission_id = %mission_id,
             notes = notes.len(),
@@ -109,8 +117,11 @@ mod tests {
         let captured = Arc::new(Mutex::new(String::new()));
         let captured_for_inject = Arc::clone(&captured);
         drain_and_inject_from_store(Arc::clone(&store), mission_id, &events_tx, |block| {
-            *captured_for_inject.lock().unwrap() = block.to_string();
-            true
+            let captured_for_inject = Arc::clone(&captured_for_inject);
+            async move {
+                *captured_for_inject.lock().unwrap() = block.clone();
+                true
+            }
         })
         .await;
 
@@ -132,7 +143,10 @@ mod tests {
             .enqueue_operator_note(mission_id, "retry me", None)
             .await
             .unwrap();
-        drain_and_inject_from_store(Arc::clone(&store), mission_id, &events_tx, |_| false).await;
+        drain_and_inject_from_store(Arc::clone(&store), mission_id, &events_tx, |_| async {
+            false
+        })
+        .await;
 
         let pending = store.take_pending_operator_notes(mission_id).await.unwrap();
         assert_eq!(pending.len(), 1);
