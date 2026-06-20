@@ -85,7 +85,11 @@ fn prepare_codex_per_mission_home(
         }
     }
 
-    for file_name in ["auth.json", "config.toml"] {
+    // Only copy user/auth material from the shared Codex home. The generated
+    // `config.toml` contains mission-scoped MCP env and is written separately
+    // into the mission workspace; copying a stale shared config can point
+    // automation-manager/orchestrator at another mission.
+    for file_name in ["auth.json"] {
         if let Err(e) = copy_file_if_exists(
             &source_codex_dir.join(file_name),
             &mission_codex_dir.join(file_name),
@@ -95,7 +99,7 @@ fn prepare_codex_per_mission_home(
                 source = %source_codex_dir.join(file_name).display(),
                 dest = %mission_codex_dir.join(file_name).display(),
                 error = %e,
-                "Failed to copy Codex config file into per-mission home"
+                "Failed to copy Codex auth file into per-mission home"
             );
         }
     }

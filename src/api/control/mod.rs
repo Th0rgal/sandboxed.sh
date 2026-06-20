@@ -12556,6 +12556,24 @@ pub async fn create_automation(
 ) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
+    if control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .is_none()
+    {
+        tracing::warn!(
+            mission_id = %mission_id,
+            user_id = %user.id,
+            "Rejecting automation create for missing mission"
+        );
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Mission {} not found; cannot create automation", mission_id),
+        ));
+    }
+
     // Validate the command exists in the library if CommandSource::Library
     if let mission_store::CommandSource::Library { ref name } = req.command_source {
         validate_library_command(&state, name).await?;
@@ -12639,6 +12657,16 @@ pub async fn create_automation(
         .get("__wakeup_source")
         .map(String::as_str)
         == Some("claude-builtin");
+
+    tracing::info!(
+        mission_id = %mission_id,
+        automation_id = %automation.id,
+        command_source = ?automation.command_source,
+        trigger = ?automation.trigger,
+        fresh_session = ?automation.fresh_session,
+        is_builtin_wakeup,
+        "Creating mission automation"
+    );
 
     let mut automation = control
         .mission_store

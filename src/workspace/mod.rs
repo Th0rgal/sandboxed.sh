@@ -2141,21 +2141,34 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         None
     };
 
-    // Inject MISSION_ID and API_URL into stdio MCP server env vars,
-    // and JWT_SECRET only into the orchestrator MCP (not third-party MCPs).
+    // Inject mission runtime env into stdio MCP server env vars. Mission-owned
+    // fields are authoritative per generated workspace: profile/workspace env
+    // must not be allowed to preserve a stale MISSION_ID from another mission.
     let mcp_configs: Vec<McpServerConfig> = mcp_configs
         .into_iter()
         .map(|mut cfg| {
             if let McpTransport::Stdio { ref mut env, .. } = cfg.transport {
-                env.entry("MISSION_ID".to_string())
-                    .or_insert_with(|| mission_id.to_string());
+                let previous_mission_id =
+                    env.insert("MISSION_ID".to_string(), mission_id.to_string());
+                if let Some(previous) = previous_mission_id.as_deref() {
+                    if previous != mission_id.to_string() {
+                        tracing::warn!(
+                            mission = %mission_id,
+                            mcp = %cfg.name,
+                            stale_mission_id = %previous,
+                            "Overriding stale MCP MISSION_ID in generated workspace config"
+                        );
+                    }
+                }
                 // Use the server's own address so MCPs can reach the API.
                 // Private-network containers (Tailscale veth) cannot reach
                 // the host on 127.0.0.1 — use the veth gateway address there.
                 if let Ok(port) = std::env::var("PORT") {
                     let host_ip = workspace.host_ip_from_workspace();
-                    env.entry("API_URL".to_string())
-                        .or_insert_with(|| format!("http://{}:{}", host_ip, port));
+                    env.insert(
+                        "API_URL".to_string(),
+                        format!("http://{}:{}", host_ip, port),
+                    );
                 }
                 // Forward JWT_SECRET to trusted internal MCPs so they can
                 // mint service tokens.  Other MCPs (including third-party ones)
@@ -2172,8 +2185,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                 // breaking the dashboard's worker chips and the WorkerPanel.
                 if cfg.name == "orchestrator" {
                     if let Some(user_id) = boss_user_id {
-                        env.entry("BOSS_USER_ID".to_string())
-                            .or_insert_with(|| user_id.to_string());
+                        env.insert("BOSS_USER_ID".to_string(), user_id.to_string());
                     }
                 }
             }
@@ -3493,6 +3505,38 @@ mod tests {
         assert!(result.contains("[otel]"));
         assert!(result.contains("\"new\""));
         assert!(!result.contains("\"old\""));
+    }
+
+    #[test]
+    fn test_codex_profile_replaces_stale_mcp_env() {
+        let profile = r#"[mcp_servers.automation_manager]
+command = "/usr/local/bin/automation-manager-mcp"
+
+[mcp_servers.automation_manager.env]
+MISSION_ID = "old-mission"
+WORKING_DIR = "/workspaces/mission-old"
+"#;
+        let mut env = HashMap::new();
+        env.insert("MISSION_ID".to_string(), "new-mission".to_string());
+        env.insert(
+            "WORKING_DIR".to_string(),
+            "/workspaces/mission-new".to_string(),
+        );
+        let entries = vec![CodexMcpEntry {
+            name: "automation_manager".to_string(),
+            command: Some("/usr/local/bin/automation-manager-mcp".to_string()),
+            args: vec![],
+            env,
+            url: None,
+            headers: HashMap::new(),
+        }];
+
+        let result = update_codex_mcp_config(profile, &entries);
+
+        assert!(result.contains("MISSION_ID = \"new-mission\""));
+        assert!(result.contains("WORKING_DIR = \"/workspaces/mission-new\""));
+        assert!(!result.contains("old-mission"));
+        assert!(!result.contains("mission-old"));
     }
 
     #[test]
