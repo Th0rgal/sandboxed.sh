@@ -200,6 +200,18 @@ const MAX_MISSION_DRAFT_CACHE_BYTES = 64 * 1024;
 const MAX_MISSION_DRAFT_CACHE_ENTRIES = 50;
 const DEFAULT_DOCUMENT_TITLE = "Sandboxed.sh";
 const MAX_DOCUMENT_MISSION_TITLE_LENGTH = 80;
+const CONTROL_MISSION_SCOPED_EVENT_TYPES = new Set([
+  "user_message",
+  "assistant_message",
+  "thinking",
+  "text_delta",
+  "text_op",
+  "tool_call",
+  "tool_result",
+  "phase",
+  "goal_iteration",
+  "goal_status",
+]);
 
 type EventsWorkerRequest = {
   id: number;
@@ -241,6 +253,7 @@ function isRetriableSendError(error: unknown): boolean {
 export function appendUnpersistedLiveTail(
   historyItems: ChatItem[],
   liveItems: ChatItem[],
+  missionId?: string,
 ): ChatItem[] {
   if (liveItems.length === 0) return historyItems;
 
@@ -270,6 +283,14 @@ export function appendUnpersistedLiveTail(
   const unpersistedTail = liveItems
     .slice(lastLiveUserIdx + 1)
     .filter((item) => {
+      if (
+        missionId &&
+        "missionId" in item &&
+        item.missionId != null &&
+        item.missionId !== missionId
+      ) {
+        return false;
+      }
       if (existingIds.has(item.id)) return false;
       if (item.kind === "assistant") {
         const content = item.content.trim();
@@ -289,6 +310,9 @@ export function appendUnpersistedLiveTail(
   const lastLiveUser = liveItems[lastLiveUserIdx];
   const carryUnpersistedUser =
     lastLiveUser.kind === "user" &&
+    (!missionId ||
+      lastLiveUser.missionId == null ||
+      lastLiveUser.missionId === missionId) &&
     !existingIds.has(lastLiveUser.id) &&
     (lastLiveUser.sendStatus === "failed" ||
       lastLiveUser.sendStatus === "sending");
@@ -6539,6 +6563,7 @@ export default function ControlClient() {
     content: string;
     done: boolean;
     id: string;
+    missionId?: string;
     startTime: number;
   } | null>(null);
   const thinkingFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -6549,6 +6574,7 @@ export default function ControlClient() {
 
   const pendingStreamRef = useRef<{
     content: string;
+    missionId?: string;
     startTime: number;
   } | null>(null);
   const streamFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -6619,7 +6645,9 @@ export default function ControlClient() {
           // CLOSED and drop it — history catch-up backfills it on the next
           // sync — rather than risk rendering a main-session message inside an
           // unrelated parallel mission's view (cross-mission leak).
-          if (viewingId !== currentMissionId) {
+          if (CONTROL_MISSION_SCOPED_EVENT_TYPES.has(event.type)) {
+            filterReason = "mission-scoped event has no mission_id";
+          } else if (viewingId !== currentMissionId) {
             if (event.type !== "status") {
               filterReason = currentMissionId
                 ? "event has no mission_id for parallel mission"
@@ -6974,6 +7002,7 @@ export default function ControlClient() {
         const content = String(data["content"] ?? "");
         const done = Boolean(data["done"]);
         const now = Date.now();
+        const acceptedMissionId = eventMissionId ?? viewingId ?? undefined;
 
         // Debounced thinking updates to reduce re-renders during streaming
         const flushThinking = () => {
@@ -6984,12 +7013,20 @@ export default function ControlClient() {
             // Remove phase items when thinking starts
             const filtered = prev.filter((it) => it.kind !== "phase");
             let existingIdx = filtered.findIndex(
-              (it) => it.kind === "thinking" && !it.done,
+              (it) =>
+                it.kind === "thinking" &&
+                !it.done &&
+                (pending.missionId == null ||
+                  it.missionId == null ||
+                  it.missionId === pending.missionId),
             );
             if (existingIdx < 0) {
               existingIdx = filtered.findLastIndex(
                 (it) =>
                   it.kind === "thinking" &&
+                  (pending.missionId == null ||
+                    it.missionId == null ||
+                    it.missionId === pending.missionId) &&
                   isStreamContinuation(pending.content, it.content),
               );
             }
@@ -7014,6 +7051,7 @@ export default function ControlClient() {
                   ),
                   done: pending.done,
                   endTime: pending.done ? now : existing.endTime,
+                  missionId: pending.missionId ?? existing.missionId,
                 };
                 if (pending.done) {
                   pendingThinkingRef.current = null;
@@ -7037,6 +7075,7 @@ export default function ControlClient() {
                   id: pending.id,
                   content: pending.content,
                   done: pending.done,
+                  missionId: pending.missionId,
                   startTime: pending.startTime,
                   endTime: pending.done ? now : undefined,
                 },
@@ -7052,6 +7091,7 @@ export default function ControlClient() {
                   id: pending.id,
                   content: pending.content,
                   done: pending.done,
+                  missionId: pending.missionId,
                   startTime: pending.startTime,
                   endTime: pending.done ? now : undefined,
                 },
@@ -7077,6 +7117,7 @@ export default function ControlClient() {
             id:
               existingPending?.id ??
               `thinking-${thinkingIdCounterRef.current++}`,
+            missionId: existingPending?.missionId ?? acceptedMissionId,
             startTime: existingPending?.startTime ?? now,
           };
           flushThinking();
@@ -7095,6 +7136,7 @@ export default function ControlClient() {
           content: content || existingPending?.content || "",
           done,
           id: thinkingId,
+          missionId: acceptedMissionId,
           startTime,
         };
 
@@ -7135,6 +7177,7 @@ export default function ControlClient() {
         const content = String(data["content"] ?? "");
         const now = Date.now();
         if (!content.trim()) return;
+        const acceptedMissionId = eventMissionId ?? viewingId ?? undefined;
 
         // Debounced stream updates to reduce re-renders during rapid delta streaming.
         const flushStream = () => {
@@ -7146,7 +7189,12 @@ export default function ControlClient() {
             const filtered = prev.filter((it) => it.kind !== "phase");
             const streamId = "text_delta_latest";
             const existingIdx = filtered.findIndex(
-              (it) => it.kind === "stream" && it.id === streamId,
+              (it) =>
+                it.kind === "stream" &&
+                it.id === streamId &&
+                (pending.missionId == null ||
+                  it.missionId == null ||
+                  it.missionId === pending.missionId),
             );
             if (existingIdx >= 0) {
               const updated = [...filtered];
@@ -7164,6 +7212,7 @@ export default function ControlClient() {
                 ...existing,
                 content: pending.content || existing.content,
                 done: false,
+                missionId: pending.missionId ?? existing.missionId,
                 startTime:
                   isContinuation && !existing.done
                     ? existing.startTime
@@ -7181,6 +7230,7 @@ export default function ControlClient() {
                 id: "text_delta_latest",
                 content: pending.content,
                 done: false,
+                missionId: pending.missionId,
                 startTime: pending.startTime,
                 endTime: undefined,
               },
@@ -7195,6 +7245,7 @@ export default function ControlClient() {
 
         pendingStreamRef.current = {
           content: mergeStreamFragment(existingContent, content),
+          missionId: acceptedMissionId,
           startTime: isContinuation ? (existingPending?.startTime ?? now) : now,
         };
 
@@ -8644,6 +8695,7 @@ export default function ControlClient() {
         historyItems = appendUnpersistedLiveTail(
           historyItems,
           itemsRef.current,
+          missionId,
         );
 
         // Pre-queue length: pagination uses this to find the live tail

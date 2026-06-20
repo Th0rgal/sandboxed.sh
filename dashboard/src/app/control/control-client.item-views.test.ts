@@ -217,6 +217,30 @@ describe("appendUnpersistedLiveTail", () => {
     expect(views).toEqual([userItem, streamItem]);
   });
 
+  it("does not carry a live stream from another mission", () => {
+    const missionAUser: Extract<ChatItem, { kind: "user" }> = {
+      ...userItem,
+      missionId: "mission-a",
+    };
+    const missionAStream: Extract<ChatItem, { kind: "stream" }> = {
+      ...streamItem,
+      missionId: "mission-a",
+    };
+    const missionBUser: Extract<ChatItem, { kind: "user" }> = {
+      ...userItem,
+      id: "user-b",
+      missionId: "mission-b",
+    };
+
+    const views = appendUnpersistedLiveTail(
+      [missionBUser],
+      [missionAUser, missionAStream],
+      "mission-b",
+    );
+
+    expect(views).toEqual([missionBUser]);
+  });
+
   it("carries over a failed user row not present in server history", () => {
     const failed: Extract<ChatItem, { kind: "user" }> = {
       id: "user-failed",

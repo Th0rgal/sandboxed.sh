@@ -61,6 +61,7 @@ export type ChatItem =
       done: boolean;
       startTime: number;
       endTime?: number;
+      missionId?: string;
     }
   | {
       kind: "stream";
@@ -69,6 +70,7 @@ export type ChatItem =
       done: boolean;
       startTime: number;
       endTime?: number;
+      missionId?: string;
     }
   | {
       kind: "tool";

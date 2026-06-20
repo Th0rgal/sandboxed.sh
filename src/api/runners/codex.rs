@@ -4,7 +4,8 @@
 //! Account/credential plumbing (cooldowns, leasing, CLI bootstrap) still
 //! lives in `mission_runner` and is consumed via `pub(crate)` items.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -14,8 +15,126 @@ use crate::agents::{AgentResult, CompletionConfidence, CompletionSignal, Termina
 use crate::api::control::AgentEvent;
 use crate::api::mission_runner::*;
 use crate::cost::resolve_cost_cents_and_source;
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
+
+fn codex_workspace_home_dir(workspace: &Workspace) -> PathBuf {
+    match workspace.workspace_type {
+        WorkspaceType::Container => workspace.path.join("root"),
+        WorkspaceType::Host => PathBuf::from(crate::util::home_dir()),
+    }
+}
+
+fn copy_file_if_exists(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dst)?;
+    Ok(())
+}
+
+fn copy_dir_recursive_if_exists(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_recursive_if_exists(&src_path, &dst_path)?;
+        } else if ty.is_file() {
+            copy_file_if_exists(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_codex_per_mission_home(
+    workspace: &Workspace,
+    workspace_exec: &WorkspaceExec,
+    mission_work_dir: &Path,
+    mission_id: Uuid,
+) -> HashMap<String, String> {
+    let source_codex_dir = codex_workspace_home_dir(workspace).join(".codex");
+    let mission_codex_dir = mission_work_dir.join(".codex");
+    let xdg_config_home = mission_work_dir.join(".config");
+    let xdg_data_home = mission_work_dir.join(".local").join("share");
+    let xdg_state_home = mission_work_dir.join(".local").join("state");
+    let xdg_cache_home = mission_work_dir.join(".cache");
+
+    for dir in [
+        &mission_codex_dir,
+        &xdg_config_home,
+        &xdg_data_home,
+        &xdg_state_home,
+        &xdg_cache_home,
+    ] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(
+                mission_id = %mission_id,
+                path = %dir.display(),
+                error = %e,
+                "Failed to create per-mission Codex directory"
+            );
+        }
+    }
+
+    for file_name in ["auth.json", "config.toml"] {
+        if let Err(e) = copy_file_if_exists(
+            &source_codex_dir.join(file_name),
+            &mission_codex_dir.join(file_name),
+        ) {
+            tracing::warn!(
+                mission_id = %mission_id,
+                source = %source_codex_dir.join(file_name).display(),
+                dest = %mission_codex_dir.join(file_name).display(),
+                error = %e,
+                "Failed to copy Codex config file into per-mission home"
+            );
+        }
+    }
+    if let Err(e) = copy_dir_recursive_if_exists(
+        &source_codex_dir.join("skills"),
+        &mission_codex_dir.join("skills"),
+    ) {
+        tracing::warn!(
+            mission_id = %mission_id,
+            source = %source_codex_dir.join("skills").display(),
+            dest = %mission_codex_dir.join("skills").display(),
+            error = %e,
+            "Failed to copy Codex skills into per-mission home"
+        );
+    }
+
+    let mut env = HashMap::new();
+    env.insert(
+        "HOME".to_string(),
+        workspace_exec.translate_path_for_container(mission_work_dir),
+    );
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        workspace_exec.translate_path_for_container(&xdg_config_home),
+    );
+    env.insert(
+        "XDG_DATA_HOME".to_string(),
+        workspace_exec.translate_path_for_container(&xdg_data_home),
+    );
+    env.insert(
+        "XDG_STATE_HOME".to_string(),
+        workspace_exec.translate_path_for_container(&xdg_state_home),
+    );
+    env.insert(
+        "XDG_CACHE_HOME".to_string(),
+        workspace_exec.translate_path_for_container(&xdg_cache_home),
+    );
+    env
+}
 
 pub(crate) fn codex_turn_requires_tool_activity(
     user_message: &str,
@@ -841,10 +960,19 @@ pub async fn run_codex_turn(
         "Starting Codex execution via WorkspaceExec"
     );
 
+    // Run Codex app-server with per-mission HOME/XDG state. Codex 0.137 keeps
+    // SQLite state under `$HOME/.codex`; sharing `/root/.codex` across
+    // concurrent container missions can make initialize fail with
+    // `database is locked` before the mission starts.
+    let mut extra_env =
+        prepare_codex_per_mission_home(workspace, &workspace_exec, mission_work_dir, mission_id);
+
     // DGX Spark build offload (opt-in per workspace) — see
     // Workspace::spark_offload_env. Exported to the codex app-server process so
     // the in-workspace `spark-build` wrapper can reach the host offload endpoint.
-    let extra_env = workspace.spark_offload_env(mission_id).unwrap_or_default();
+    if let Some(spark_env) = workspace.spark_offload_env(mission_id) {
+        extra_env.extend(spark_env);
+    }
 
     let codex_config = crate::backend::codex::client::CodexConfig {
         cli_path,

@@ -828,6 +828,19 @@ const ORCHESTRATOR_WIDE_EVENT_TYPES = new Set([
   "stream_lagged",
 ]);
 
+const MISSION_SCOPED_EVENT_TYPES = new Set([
+  "user_message",
+  "assistant_message",
+  "thinking",
+  "text_delta",
+  "text_op",
+  "tool_call",
+  "tool_result",
+  "phase",
+  "goal_iteration",
+  "goal_status",
+]);
+
 function shouldDropForMission(
   data: unknown,
   expectedMissionId: string | undefined,
@@ -837,7 +850,13 @@ function shouldDropForMission(
   if (ORCHESTRATOR_WIDE_EVENT_TYPES.has(eventType)) return false;
   if (!data || typeof data !== "object") return false;
   const evMissionId = (data as { mission_id?: unknown }).mission_id;
-  if (evMissionId === undefined || evMissionId === null) return false;
+  if (evMissionId === undefined || evMissionId === null) {
+    // A mission-scoped stream can receive an unattributed first event during
+    // backend fallback/race paths. Content-bearing events without a mission id
+    // are not safe to render into a specific mission view; history catch-up can
+    // backfill the correct rows once they are persisted.
+    return MISSION_SCOPED_EVENT_TYPES.has(eventType);
+  }
   if (typeof evMissionId !== "string") return false;
   return evMissionId !== expectedMissionId;
 }
