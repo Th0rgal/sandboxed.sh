@@ -250,6 +250,12 @@ function isRetriableSendError(error: unknown): boolean {
   );
 }
 
+function chatItemMatchesMission(item: ChatItem, missionId?: string): boolean {
+  if (!missionId) return true;
+  if (!("missionId" in item)) return true;
+  return item.missionId == null || item.missionId === missionId;
+}
+
 export function appendUnpersistedLiveTail(
   historyItems: ChatItem[],
   liveItems: ChatItem[],
@@ -258,7 +264,7 @@ export function appendUnpersistedLiveTail(
   if (liveItems.length === 0) return historyItems;
 
   const lastLiveUserIdx = liveItems.findLastIndex(
-    (item) => item.kind === "user",
+    (item) => item.kind === "user" && chatItemMatchesMission(item, missionId),
   );
   if (lastLiveUserIdx === -1) return historyItems;
 
@@ -283,14 +289,7 @@ export function appendUnpersistedLiveTail(
   const unpersistedTail = liveItems
     .slice(lastLiveUserIdx + 1)
     .filter((item) => {
-      if (
-        missionId &&
-        "missionId" in item &&
-        item.missionId != null &&
-        item.missionId !== missionId
-      ) {
-        return false;
-      }
+      if (!chatItemMatchesMission(item, missionId)) return false;
       if (existingIds.has(item.id)) return false;
       if (item.kind === "assistant") {
         const content = item.content.trim();
@@ -310,9 +309,7 @@ export function appendUnpersistedLiveTail(
   const lastLiveUser = liveItems[lastLiveUserIdx];
   const carryUnpersistedUser =
     lastLiveUser.kind === "user" &&
-    (!missionId ||
-      lastLiveUser.missionId == null ||
-      lastLiveUser.missionId === missionId) &&
+    chatItemMatchesMission(lastLiveUser, missionId) &&
     !existingIds.has(lastLiveUser.id) &&
     (lastLiveUser.sendStatus === "failed" ||
       lastLiveUser.sendStatus === "sending");
@@ -3113,7 +3110,10 @@ export default function ControlClient() {
   const [items, setItems] = useControlItemsStore();
   // Agent task board + next-wakeup marker for the Workbench panel, derived
   // from the same chat items the transcript renders (single source of truth).
-  const workbenchMissionState = useMemo(() => extractMissionState(items), [items]);
+  const workbenchMissionState = useMemo(
+    () => extractMissionState(items),
+    [items],
+  );
   const itemsRef = useRef<ChatItem[]>([]);
   const [input, setInput] = useState(() => loadControlDraftForMission(null));
   const [canSubmitInput, setCanSubmitInput] = useState(false);
@@ -7101,7 +7101,20 @@ export default function ControlClient() {
         };
 
         // Get or create stable ID for current thinking session
-        const existingPending = pendingThinkingRef.current;
+        let existingPending = pendingThinkingRef.current;
+        const pendingMissionChanged = Boolean(
+          existingPending?.missionId &&
+          acceptedMissionId &&
+          existingPending.missionId !== acceptedMissionId,
+        );
+        if (pendingMissionChanged) {
+          pendingThinkingRef.current = {
+            ...existingPending!,
+            done: true,
+          };
+          flushThinking();
+          existingPending = null;
+        }
         const existingContent = existingPending?.content ?? "";
         // P1-#8: tolerant continuation check (see stream-continuation.ts).
         const isContinuation = isStreamContinuation(content, existingContent);
@@ -7238,7 +7251,17 @@ export default function ControlClient() {
           });
         };
 
-        const existingPending = pendingStreamRef.current;
+        let existingPending = pendingStreamRef.current;
+        const pendingMissionChanged = Boolean(
+          existingPending?.missionId &&
+          acceptedMissionId &&
+          existingPending.missionId !== acceptedMissionId,
+        );
+        if (pendingMissionChanged) {
+          flushStream();
+          pendingStreamRef.current = null;
+          existingPending = null;
+        }
         const existingContent = existingPending?.content ?? "";
         // P1-#8: tolerant continuation check (see stream-continuation.ts).
         const isContinuation = isStreamContinuation(content, existingContent);
@@ -9061,7 +9084,10 @@ export default function ControlClient() {
   useFaviconStatus(faviconStatus, viewingMissionIsRunning, hasPendingUserInput);
 
   useEffect(() => {
-    document.title = formatMissionDocumentTitle(activeMission, hasPendingUserInput);
+    document.title = formatMissionDocumentTitle(
+      activeMission,
+      hasPendingUserInput,
+    );
     return () => {
       document.title = DEFAULT_DOCUMENT_TITLE;
     };
