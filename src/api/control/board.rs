@@ -201,6 +201,7 @@ fn self_send_message(
         agent: None,
         target_mission_id: Some(target_mission_id),
         strict: true,
+        source: None,
         respond,
     }) {
         Ok(()) => true,

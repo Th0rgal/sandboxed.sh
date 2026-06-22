@@ -27,6 +27,11 @@ pub enum AgentEvent {
         /// Mission this message belongs to (for parallel execution)
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
+        /// Origin of this message for audit/attribution (e.g. `api:<user_id>`,
+        /// `task-board`, `telegram`, `relay`). None for internally-generated
+        /// control messages.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     AssistantMessage {
         id: Uuid,
@@ -369,6 +374,10 @@ pub enum ControlCommand {
         /// can't reach its exact target it is dropped, never delivered elsewhere.
         /// This keeps the control plane from leaking into unrelated missions.
         strict: bool,
+        /// Origin of this message for audit/attribution (e.g. `api:<user_id>`,
+        /// `task-board`, `telegram`, `relay`). None for internally-generated
+        /// control messages.
+        source: Option<String>,
         /// Respond with the delivery outcome (queued / delivered / dropped).
         respond: oneshot::Sender<UserMessageAck>,
     },

@@ -400,6 +400,7 @@ pub(crate) async fn background_task_autoresume_loop(
                     agent: None,
                     target_mission_id: Some(mission_id),
                     strict: true,
+                    source: None,
                     respond: ack_tx,
                 })
                 .await;

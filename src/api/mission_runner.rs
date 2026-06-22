@@ -2816,6 +2816,7 @@ impl MissionRunner {
             content: user_message.clone(),
             queued: false,
             mission_id: Some(mission_id),
+            source: None,
         });
 
         let handle = tokio::spawn(async move {

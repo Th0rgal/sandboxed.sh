@@ -3636,6 +3636,7 @@ impl MissionStore for SqliteMissionStore {
                 id,
                 content,
                 queued,
+                source,
                 ..
             } => (
                 "user_message",
@@ -3643,7 +3644,17 @@ impl MissionStore for SqliteMissionStore {
                 None,
                 None,
                 content.clone(),
-                serde_json::json!({ "queued": queued }),
+                {
+                    // Always record `queued`; record `source` only when present so
+                    // the persisted metadata is the forensic record of who/what
+                    // posted this message (audit/attribution).
+                    let mut meta = serde_json::Map::new();
+                    meta.insert("queued".to_string(), serde_json::json!(queued));
+                    if let Some(src) = source {
+                        meta.insert("source".to_string(), serde_json::json!(src));
+                    }
+                    serde_json::Value::Object(meta)
+                },
             ),
             AgentEvent::AssistantMessage {
                 id,
@@ -11559,6 +11570,7 @@ mod tests {
                     content: "B".to_string(),
                     queued: true,
                     mission_id: Some(mission.id),
+                    source: None,
                 },
             )
             .await
@@ -11581,6 +11593,7 @@ mod tests {
                     content: "A".to_string(),
                     queued: false,
                     mission_id: Some(mission.id),
+                    source: None,
                 },
             )
             .await
@@ -11613,6 +11626,7 @@ mod tests {
                     content: "B".to_string(),
                     queued: false,
                     mission_id: Some(mission.id),
+                    source: None,
                 },
             )
             .await
@@ -11656,6 +11670,51 @@ mod tests {
                 ("user".to_string(), "B".to_string()),
                 ("assistant".to_string(), "reply B".to_string()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn user_message_source_is_persisted_in_metadata() {
+        use crate::api::control::AgentEvent;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("source attribution"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: "hello".to_string(),
+                    queued: false,
+                    mission_id: Some(mission.id),
+                    source: Some("api:user-123".to_string()),
+                },
+            )
+            .await
+            .expect("user message with source");
+
+        let events = store
+            .get_events(mission.id, None, None, None)
+            .await
+            .expect("events");
+        let user_event = events
+            .iter()
+            .find(|e| e.event_type == "user_message")
+            .expect("user_message row");
+        // The persisted metadata JSON is the forensic record of who/what posted
+        // this message — it must carry the attribution source.
+        assert_eq!(
+            user_event.metadata.get("source").and_then(|v| v.as_str()),
+            Some("api:user-123"),
+            "persisted metadata should contain the attribution source, got {}",
+            user_event.metadata
         );
     }
 
@@ -12750,6 +12809,7 @@ mod tests {
                         content: format!("msg {i}"),
                         queued: false,
                         mission_id: Some(mission.id),
+                        source: None,
                     },
                 )
                 .await
@@ -12849,6 +12909,7 @@ mod tests {
                         content: format!("msg {i}"),
                         queued: false,
                         mission_id: Some(mission.id),
+                        source: None,
                     },
                 )
                 .await

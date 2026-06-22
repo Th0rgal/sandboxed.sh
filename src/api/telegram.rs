@@ -788,6 +788,7 @@ async fn send_user_message_to_mission(
             agent: None,
             target_mission_id: Some(mission.id),
             strict: false,
+            source: Some("telegram".to_string()),
             respond: queued_tx,
         })
         .await
@@ -4221,6 +4222,7 @@ pub async fn process_webhook_message(
                     content: content.clone(),
                     queued: false,
                     mission_id: Some(target_mission_id),
+                    source: Some("telegram".to_string()),
                 },
             )
             .await;
@@ -4249,6 +4251,7 @@ pub async fn process_webhook_message(
             agent: None,
             target_mission_id: Some(target_mission_id),
             strict: false,
+            source: Some("telegram".to_string()),
             respond: queued_tx,
         })
         .await;
@@ -5554,6 +5557,7 @@ async fn relay_workflow_reply_to_origin(
             agent: None,
             target_mission_id: Some(origin_mission_id),
             strict: false,
+            source: Some("telegram".to_string()),
             respond: queued_tx,
         })
         .await;

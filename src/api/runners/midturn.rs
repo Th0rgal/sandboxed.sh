@@ -66,6 +66,7 @@ async fn drain_and_inject_from_store<F, Fut>(
             content: block,
             queued: false,
             mission_id: Some(mission_id),
+            source: None,
         });
         return;
     }

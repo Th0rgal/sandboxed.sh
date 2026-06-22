@@ -3324,6 +3324,7 @@ pub async fn post_message(
             agent,
             target_mission_id,
             strict: false,
+            source: Some(format!("api:{}", user.id)),
             respond: queued_tx,
         })
         .await
@@ -3545,6 +3546,7 @@ pub async fn board_task_verdict(
                         agent: None,
                         target_mission_id: Some(worker_id),
                         strict: false,
+                        source: Some("task-board".to_string()),
                         respond: tx,
                     })
                     .await
@@ -5976,6 +5978,11 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
             content: event.content.clone(),
             queued: false,
             mission_id,
+            source: event
+                .metadata
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         }),
         "assistant_message" => {
             let meta = event.metadata.as_object();
@@ -7412,6 +7419,7 @@ async fn automation_scheduler_loop(
                         agent: None,
                         target_mission_id: Some(mission.id),
                         strict: false,
+                        source: None,
                         respond: respond_tx,
                     })
                     .await;
@@ -8683,6 +8691,7 @@ async fn control_actor_loop(
                             agent: it.agent,
                             target_mission_id: it.mission_id,
                             strict: false,
+                            source: None,
                             respond: ack_tx,
                         }) {
                             tracing::warn!("Failed to re-queue restored control message: {e}");
@@ -8979,7 +8988,7 @@ async fn control_actor_loop(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, respond } => {
+                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
                         if !accept_user_message_id(&mut accepted_user_message_ids, id) {
                             let status_snapshot = status.read().await;
                             let _ = respond.send(if status_snapshot.state != ControlRunState::Idle {
@@ -9090,6 +9099,7 @@ async fn control_actor_loop(
                                         content: content.clone(),
                                         queued: was_running,
                                         mission_id: Some(tid),
+                                        source: source.clone(),
                                     });
                                     // Surface the parallel queue growth to all
                                     // clients (Status events otherwise only
@@ -9207,6 +9217,7 @@ async fn control_actor_loop(
                                                 content: content.clone(),
                                                 queued: false,
                                                 mission_id: Some(tid),
+                                                source: source.clone(),
                                             });
                                             // Start execution
                                             runner.start_next(
@@ -9438,6 +9449,7 @@ async fn control_actor_loop(
                                 content: content_clone,
                                 queued: true,
                                 mission_id: target_mission_id,
+                                source: source.clone(),
                             });
                         }
                         if running.is_none() {
@@ -9458,7 +9470,7 @@ async fn control_actor_loop(
                                     queue.len(),
                                     msg_target_mid,
                                 ).await;
-                                let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid });
+                                let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid, source: source.clone() });
 
                                 // Immediately persist user message so it's visible when loading mission
                                 history.push(("user".to_string(), msg.clone()));
@@ -9852,6 +9864,7 @@ async fn control_actor_loop(
                                         content: handoff,
                                         queued: false,
                                         mission_id: Some(id),
+                                        source: None,
                                     };
                                     if let Err(e) = mission_store.log_event(id, &event).await {
                                         tracing::warn!(
@@ -10365,7 +10378,7 @@ async fn control_actor_loop(
                                             queue.len(),
                                             Some(target_mid),
                                         ).await;
-                                        let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: Some(target_mid) });
+                                        let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: Some(target_mid), source: None });
                                         let cfg = config.clone();
                                         let agent = Arc::clone(&root_agent);
                                         let mcp_ref = Arc::clone(&mcp);
@@ -11126,7 +11139,7 @@ async fn control_actor_loop(
                         queue.len(),
                         msg_target_mid,
                     ).await;
-                    let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid });
+                    let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid, source: None });
 
                     // Immediately persist user message so it's visible when loading mission
                     history.push(("user".to_string(), msg.clone()));
@@ -12820,6 +12833,7 @@ pub async fn create_automation(
                     agent: None,
                     target_mission_id: Some(target_mission_id),
                     strict: false,
+                    source: None,
                     respond: respond_tx,
                 })
                 .await;
@@ -14070,6 +14084,7 @@ pub async fn webhook_receiver(
             agent: None,
             target_mission_id: Some(mission.id),
             strict: false,
+            source: None,
             respond: respond_tx,
         })
         .await;
@@ -15224,6 +15239,7 @@ pub async fn send_telegram_message_api(
                     agent: None,
                     target_mission_id: Some(mapping.mission_id),
                     strict: false,
+                    source: Some("telegram".to_string()),
                     respond: tx,
                 })
                 .await;
