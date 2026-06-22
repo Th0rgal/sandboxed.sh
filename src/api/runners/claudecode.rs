@@ -112,6 +112,96 @@ pub fn parse_background_task_start(content: &str) -> Option<(String, String)> {
     Some((id, path))
 }
 
+/// Classify a proxy health-probe result into pass/fast-fail.
+///
+/// The probe (`check_claudecode_proxy_health`) GETs `<base>/v1/models` through
+/// the same CLI proxy the Claude CLI will use. The verdict is deliberately
+/// conservative so it can only catch a genuinely-down/erroring proxy and never
+/// false-blocks a slow-but-working one:
+/// - any HTTP status in 2xx/3xx/4xx (incl. 401/404) proves the proxy is up and
+///   routing → pass (the `/v1/models` route does not even need to exist);
+/// - 5xx means the proxy's upstream is erroring (e.g. provider cooldown / 502),
+///   which is exactly the stall we want to fail fast on → fail;
+/// - a connection-level failure or no response (refused / DNS / unreachable /
+///   timeout / `000`) → fail.
+fn claudecode_proxy_health_verdict(combined: &str, http_code: &str) -> Result<(), String> {
+    if combined.contains("Could not resolve host") {
+        return Err("Claude CLI proxy unreachable: DNS resolution failed".to_string());
+    }
+    if combined.contains("Connection refused") {
+        return Err("Claude CLI proxy unreachable: connection refused (proxy not listening?)"
+            .to_string());
+    }
+    if combined.contains("Network is unreachable") {
+        return Err("Claude CLI proxy unreachable: network is unreachable".to_string());
+    }
+    if combined.contains("Connection timed out") || combined.contains("Operation timed out") {
+        return Err("Claude CLI proxy unreachable: connection timed out".to_string());
+    }
+
+    let code = http_code.trim();
+    if let Ok(n) = code.parse::<u16>() {
+        if n == 0 {
+            // curl's `000` sentinel: TCP/TLS connected attempt produced no HTTP
+            // response (proxy down or hung).
+            return Err(
+                "Claude CLI proxy did not return an HTTP response (proxy down or hung)".to_string(),
+            );
+        }
+        if (500..=599).contains(&n) {
+            return Err(format!(
+                "Claude CLI proxy upstream is erroring (HTTP {n}); failing fast instead of \
+                 waiting out the startup timeout"
+            ));
+        }
+        // Any other HTTP response (2xx/3xx/4xx, including 401/404) proves the
+        // proxy is up and routing requests.
+        return Ok(());
+    }
+
+    // Unparseable/empty code: treat as no response.
+    Err("Claude CLI proxy did not return an HTTP response (proxy down or hung)".to_string())
+}
+
+/// Fast health check for the CLI proxy auth path. Mirrors `check_api_reachability`'s
+/// in-sandbox curl, but probes the proxy (which proxy environments allow) rather
+/// than api.anthropic.com (which they block). The API key is passed via env so it
+/// never lands in the command string or logs.
+async fn check_claudecode_proxy_health(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    base_url: &str,
+    api_key: &str,
+) -> Result<(), String> {
+    let timeout_secs = std::env::var("SANDBOXED_SH_CLAUDECODE_PROXY_HEALTH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(8);
+    let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let test_cmd = format!(
+        "curl -sS -o /dev/null -w '%{{http_code}}' --max-time {timeout_secs} \
+         -H \"Authorization: Bearer ${{CLAUDE_PROXY_HEALTH_KEY}}\" {url}"
+    );
+    let mut env = std::collections::HashMap::new();
+    env.insert("CLAUDE_PROXY_HEALTH_KEY".to_string(), api_key.to_string());
+
+    let output = match workspace_exec
+        .output(cwd, "/bin/sh", &["-c".to_string(), test_cmd], env)
+        .await
+    {
+        Ok(out) => out,
+        // An exec error here is about the sandbox, not the proxy; don't block.
+        Err(e) => {
+            tracing::debug!("Claude proxy health probe could not run ({e}); skipping fast-fail");
+            return Ok(());
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    claudecode_proxy_health_verdict(&combined, stdout.trim())
+}
+
 /// Execute a turn using Claude Code CLI backend.
 ///
 /// For Host workspaces: spawns the CLI directly on the host.
@@ -741,6 +831,26 @@ pub fn run_claudecode_turn<'a>(
                 tracing::error!(mission_id = %mission_id, "{}", err_msg);
                 return AgentResult::failure(err_msg, 0)
                     .with_terminal_reason(TerminalReason::LlmError);
+            }
+        } else if let Some(ref proxy) = proxy_auth {
+            // The CLI proxy is the auth path; the direct-Anthropic probe above is
+            // skipped because proxy environments block direct egress. Probe the
+            // proxy instead so a down/hung/erroring proxy fails fast (≈8s) and
+            // routes through ResetSessionFresh recovery, instead of silently
+            // burning the full startup timeout (90s, ×2 with recovery).
+            if let Err(err_msg) =
+                check_claudecode_proxy_health(&workspace_exec, work_dir, &proxy.base_url, &proxy.api_key)
+                    .await
+            {
+                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
+                return AgentResult::failure(err_msg, 0)
+                    .with_terminal_reason(TerminalReason::LlmError)
+                    .with_data(claudecode_transport_failure_data(
+                        ClaudeTransportFailureStage::Startup,
+                        false,
+                        false,
+                        &[],
+                    ));
             }
         }
 
@@ -3233,5 +3343,89 @@ mod background_task_tests {
         let content = "Command running in background with ID: . \
              Output is being written to: /tmp/x.log";
         assert!(parse_background_task_start(content).is_none());
+    }
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::{claudecode_oversized_resume_transcript, claudecode_proxy_health_verdict};
+
+    // --- Proxy health verdict (fail-fast classification) ---
+
+    #[test]
+    fn proxy_verdict_passes_on_any_http_response() {
+        // 2xx/3xx/4xx all prove the proxy is up and routing — including 404
+        // (route may not exist) and 401 (auth) — so none should block.
+        for code in ["200", "204", "301", "400", "401", "403", "404", "429"] {
+            assert!(
+                claudecode_proxy_health_verdict("", code).is_ok(),
+                "HTTP {code} should pass"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_verdict_fails_on_upstream_5xx() {
+        // The observed production stall: provider cooldown / 502 surfaced by the proxy.
+        for code in ["500", "502", "503", "529"] {
+            assert!(
+                claudecode_proxy_health_verdict("", code).is_err(),
+                "HTTP {code} should fast-fail"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_verdict_fails_on_connection_errors_and_no_response() {
+        assert!(claudecode_proxy_health_verdict("curl: (7) Connection refused", "000").is_err());
+        assert!(claudecode_proxy_health_verdict("Could not resolve host: proxy", "000").is_err());
+        assert!(claudecode_proxy_health_verdict("Network is unreachable", "000").is_err());
+        assert!(claudecode_proxy_health_verdict("Operation timed out", "000").is_err());
+        // Empty / unparseable code with no recognizable error → treated as no response.
+        assert!(claudecode_proxy_health_verdict("", "000").is_err());
+        assert!(claudecode_proxy_health_verdict("", "").is_err());
+    }
+
+    // --- Oversized resume transcript detection ---
+
+    #[test]
+    fn oversized_transcript_detected_above_cap_only() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = tmp.path();
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let proj = work_dir.join(".claude").join("projects").join("somehash");
+        std::fs::create_dir_all(&proj).unwrap();
+        let transcript = proj.join(format!("{session_id}.jsonl"));
+
+        // Small transcript: under the (default 25MB) cap → not flagged.
+        {
+            let mut f = std::fs::File::create(&transcript).unwrap();
+            f.write_all(b"{\"x\":1}\n").unwrap();
+        }
+        assert_eq!(
+            claudecode_oversized_resume_transcript(work_dir, session_id),
+            None
+        );
+
+        // Force a tiny cap via env so the test stays fast and deterministic.
+        std::env::set_var("SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES", "4");
+        let got = claudecode_oversized_resume_transcript(work_dir, session_id);
+        assert!(got.is_some(), "transcript above tiny cap should be flagged");
+
+        // Cap of 0 disables the check entirely.
+        std::env::set_var("SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES", "0");
+        assert_eq!(
+            claudecode_oversized_resume_transcript(work_dir, session_id),
+            None
+        );
+
+        // Unknown session id → nothing found.
+        std::env::set_var("SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES", "4");
+        assert_eq!(
+            claudecode_oversized_resume_transcript(work_dir, "no-such-session"),
+            None
+        );
+        std::env::remove_var("SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES");
     }
 }
