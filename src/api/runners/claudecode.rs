@@ -2710,6 +2710,43 @@ fn claudecode_result_is_startup_transport_failure(result: &AgentResult) -> bool 
 /// previously carried near-duplicate copies of this loop, with the control
 /// copy missing the SIGKILL refresh and initial auth retry.
 #[allow(clippy::too_many_arguments)]
+/// Returns the byte size of the on-disk Claude session transcript for
+/// `session_id` when it exceeds the configured resume cap, otherwise `None`.
+///
+/// Resuming a very large transcript can make the CLI spend the entire startup
+/// window replaying it before emitting any stream-json event, tripping the
+/// startup timeout (see `run_claudecode_turn_with_recovery`). The cap is
+/// configurable via `SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES`
+/// (default 25 MB); set it to `0` to disable the check entirely.
+fn claudecode_oversized_resume_transcript(
+    work_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<u64> {
+    let cap = std::env::var("SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(25_000_000);
+    if cap == 0 {
+        return None;
+    }
+    // Claude stores transcripts at
+    // <work_dir>/.claude/projects/<hash>/<session_id>.jsonl. The <hash> dir
+    // depends on the absolute cwd inside the container, so scan every project
+    // dir rather than guessing the hash.
+    let projects_dir = work_dir.join(".claude").join("projects");
+    let entries = std::fs::read_dir(&projects_dir).ok()?;
+    let file_name = format!("{session_id}.jsonl");
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(&file_name);
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            if meta.is_file() && meta.len() > cap {
+                return Some(meta.len());
+            }
+        }
+    }
+    None
+}
+
 pub(crate) async fn run_claudecode_turn_with_recovery(
     workspace: &Workspace,
     work_dir: &std::path::Path,
@@ -2737,6 +2774,60 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
     let mut attempted_same_session_resume = false;
     let mut attempted_session_reset = false;
 
+    // Proactive guard: resuming a very large session transcript can make the
+    // Claude CLI spend the entire startup window replaying it before emitting
+    // any stream-json event, tripping the startup timeout. When the would-be
+    // resumed transcript exceeds the configured cap, rotate to a fresh session
+    // up front (same mechanism as the ResetSessionFresh recovery arm below) so
+    // the first attempt starts clean with rebuilt history instead of hanging.
+    let mut first_turn_is_continuation = is_continuation;
+    if is_continuation && !cancel.is_cancelled() && !crate::api::routes::is_shutdown_initiated() {
+        if let Some(sid) = effective_sid.clone() {
+            if let Some(size) = claudecode_oversized_resume_transcript(work_dir, &sid) {
+                let new_session_id = Uuid::new_v4().to_string();
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    old_session_id = %sid,
+                    new_session_id = %new_session_id,
+                    transcript_bytes = size,
+                    "Resume transcript exceeds cap; rotating to a fresh session before first attempt"
+                );
+                let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                    mission_id,
+                    session_id: new_session_id.clone(),
+                });
+                let session_marker = work_dir.join(".claude-session-initiated");
+                if session_marker.exists() {
+                    let _ = std::fs::remove_file(&session_marker);
+                }
+                let history_for_retry = match history.last() {
+                    Some((role, content)) if role == "user" && content == message => {
+                        &history[..history.len() - 1]
+                    }
+                    _ => history,
+                };
+                effective_msg = if history_for_retry.is_empty() {
+                    message.to_string()
+                } else {
+                    let history_ctx =
+                        build_history_context(history_for_retry, max_history_total_chars);
+                    format!(
+                        "## Prior conversation (session was reset: prior transcript too large to resume)\n\n\
+                         {history_ctx}\
+                         ## Current message\n\n\
+                         {message}"
+                    )
+                };
+                effective_sid = Some(new_session_id);
+                first_turn_is_continuation = false;
+                // A fresh session has no transcript to replay; if it still
+                // times out at startup the cause is environmental, so don't let
+                // recovery burn another reset on it.
+                attempted_session_reset = true;
+            }
+        }
+    }
+
     let mut result = run_claudecode_turn(
         workspace,
         work_dir,
@@ -2750,7 +2841,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
         secrets.clone(),
         app_working_dir,
         effective_sid.as_deref(),
-        is_continuation,
+        first_turn_is_continuation,
         tool_hub.clone(),
         status.clone(),
         None, // override_auth: use default credential resolution
