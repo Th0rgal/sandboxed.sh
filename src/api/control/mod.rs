@@ -9427,9 +9427,25 @@ async fn control_actor_loop(
 
                         let was_running = running.is_some();
                         let content_clone = content.clone();
-                        // Capture the target mission ID once, before queuing
-                        // This ensures we use the same mission_id for events and execution
-                        let target_mission_id = *current_mission.read().await;
+                        // Capture the target mission ID once, before queuing.
+                        // This ensures we use the same mission_id for events and execution.
+                        //
+                        // Honor the message's EXPLICIT target; fall back to the session
+                        // `current_mission` pointer only for untargeted messages. We only
+                        // reach Case 3 when the target is absent or equals the main mission
+                        // (`target_is_main`), so an explicit `effective_target` here is the
+                        // main mission the runner is on — and its history is already what
+                        // the next turn will use. Previously this read `*current_mission`
+                        // unconditionally: when the runner was busy on one mission
+                        // (`running_mission_id`) while the session pointer had drifted to
+                        // another (e.g. the dashboard/MCP moved it), an explicitly-targeted
+                        // follow-up got silently re-pinned to the drifted mission and
+                        // executed there. (Prod 2026-06-23: a Hermes follow-up for mission
+                        // 91f7… ran in the unrelated 4f3f… instead.)
+                        let target_mission_id = match effective_target {
+                            Some(tid) => Some(tid),
+                            None => *current_mission.read().await,
+                        };
                         queue.push_back((id, content, msg_agent, target_mission_id));
                         let status_mission_id = if running.is_some() {
                             running_mission_id
