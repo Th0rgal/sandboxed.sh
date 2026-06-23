@@ -129,8 +129,9 @@ fn claudecode_proxy_health_verdict(combined: &str, http_code: &str) -> Result<()
         return Err("Claude CLI proxy unreachable: DNS resolution failed".to_string());
     }
     if combined.contains("Connection refused") {
-        return Err("Claude CLI proxy unreachable: connection refused (proxy not listening?)"
-            .to_string());
+        return Err(
+            "Claude CLI proxy unreachable: connection refused (proxy not listening?)".to_string(),
+        );
     }
     if combined.contains("Network is unreachable") {
         return Err("Claude CLI proxy unreachable: network is unreachable".to_string());
@@ -838,9 +839,13 @@ pub fn run_claudecode_turn<'a>(
             // proxy instead so a down/hung/erroring proxy fails fast (≈8s) and
             // routes through ResetSessionFresh recovery, instead of silently
             // burning the full startup timeout (90s, ×2 with recovery).
-            if let Err(err_msg) =
-                check_claudecode_proxy_health(&workspace_exec, work_dir, &proxy.base_url, &proxy.api_key)
-                    .await
+            if let Err(err_msg) = check_claudecode_proxy_health(
+                &workspace_exec,
+                work_dir,
+                &proxy.base_url,
+                &proxy.api_key,
+            )
+            .await
             {
                 tracing::warn!(mission_id = %mission_id, "{}", err_msg);
                 return AgentResult::failure(err_msg, 0)

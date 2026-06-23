@@ -11682,7 +11682,15 @@ mod tests {
             .await
             .expect("sqlite store");
         let mission = store
-            .create_mission(Some("source attribution"), None, None, None, None, None, None)
+            .create_mission(
+                Some("source attribution"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("mission");
 
