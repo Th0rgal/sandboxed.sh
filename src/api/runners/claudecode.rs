@@ -2862,6 +2862,7 @@ fn claudecode_oversized_resume_transcript(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_claudecode_turn_with_recovery(
     workspace: &Workspace,
     work_dir: &std::path::Path,
