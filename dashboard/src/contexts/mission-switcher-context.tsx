@@ -13,6 +13,7 @@ import {
   resumeMission,
   createMission,
   getMission,
+  updateMissionTitle,
   type Mission,
   type RunningMissionInfo,
 } from '@/lib/api';
@@ -147,6 +148,32 @@ export function MissionSwitcherProvider({ children }: { children: React.ReactNod
     }
   }, [missions, mutateMissions, mutateRunningMissions, router]);
 
+  const handleRenameMission = useCallback(async (missionId: string, nextTitle: string) => {
+    const trimmed = nextTitle.trim();
+    if (!trimmed) return;
+    const applyTitle = (list: Mission[] = []) =>
+      list.map((mission) =>
+        mission.id === missionId ? { ...mission, title: trimmed } : mission
+      );
+    try {
+      // Optimistic: patch the cached list immediately, then persist and
+      // revalidate. On failure SWR rolls back to the server value.
+      await mutateMissions(
+        async () => {
+          await updateMissionTitle(missionId, trimmed);
+          return listMissions();
+        },
+        {
+          optimisticData: applyTitle,
+          rollbackOnError: true,
+          revalidate: true,
+        }
+      );
+    } catch {
+      toast.error('Failed to rename mission');
+    }
+  }, [mutateMissions]);
+
   const contextValue = useMemo(() => ({
     open: () => setIsOpen(true),
     close: () => setIsOpen(false),
@@ -170,6 +197,7 @@ export function MissionSwitcherProvider({ children }: { children: React.ReactNod
           onResumeMission={handleResumeMission}
           onOpenFailingToolCall={handleOpenFailingToolCall}
           onFollowUpMission={handleFollowUpMission}
+          onRenameMission={handleRenameMission}
           onRefresh={handleRefresh}
         />
       )}

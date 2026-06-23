@@ -13,12 +13,14 @@ import {
   ChevronRight,
   ChevronDown,
   Pin,
+  Pencil,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { searchMissions, type Mission, type RunningMissionInfo } from '@/lib/api';
 import { getMissionShortName } from '@/lib/mission-display';
 import { STATUS_LABELS, getMissionDotColor, getMissionTitle } from '@/lib/mission-status';
 import { AsyncButton } from '@/components/ui/async-button';
+import { getStatusIcon } from '@/components/ui/status-icons';
 
 interface MissionSwitcherProps {
   open: boolean;
@@ -33,6 +35,7 @@ interface MissionSwitcherProps {
   onResumeMission?: (missionId: string) => Promise<void> | void;
   onOpenFailingToolCall?: (missionId: string) => Promise<void> | void;
   onFollowUpMission?: (missionId: string) => Promise<void> | void;
+  onRenameMission?: (missionId: string, title: string) => Promise<void> | void;
   onRefresh?: () => void;
 }
 
@@ -155,6 +158,54 @@ function getMissionBackendLabel(mission: Mission): string {
 
 function getMissionStatusLabel(mission: Mission): string {
   return STATUS_LABELS[mission.status] ?? mission.status ?? 'Unknown';
+}
+
+function getMissionStatusToneClass(status: string | undefined, isRunning: boolean): string {
+  if (isRunning && status !== 'waiting_for_tool') return 'text-indigo-300/85';
+  switch (status) {
+    case 'waiting_for_tool':
+    case 'awaiting_user':
+    case 'pending':
+      return 'text-amber-300/90';
+    case 'completed':
+    case 'acknowledged':
+      return 'text-emerald-300/85';
+    case 'failed':
+    case 'interrupted':
+    case 'blocked':
+    case 'not_feasible':
+      return 'text-rose-300/85';
+    default:
+      return 'text-white/40';
+  }
+}
+
+// Render the status as a small color-coded glyph instead of a word — the icon
+// (Bell = Needs You, spinner = running, check = done, ✕ = failed) reads as fast
+// as text in a fraction of the width, and the full label rides along in the
+// tooltip. The left dot still carries the same color for redundancy.
+function getMissionStatusDisplay(
+  mission: Mission | undefined,
+  isRunning: boolean,
+  runningState?: string
+): { Icon: ReturnType<typeof getStatusIcon>; tone: string; label: string; spin: boolean } | null {
+  if (isRunning) {
+    const waiting = runningState === 'waiting_for_tool';
+    const statusKey = waiting ? 'awaiting_user' : 'running';
+    return {
+      Icon: getStatusIcon(statusKey),
+      tone: getMissionStatusToneClass(runningState, true),
+      label: waiting ? 'Needs You' : (runningState || 'running').replace(/_/g, ' '),
+      spin: !waiting,
+    };
+  }
+  if (!mission) return null;
+  return {
+    Icon: getStatusIcon(mission.status),
+    tone: getMissionStatusToneClass(mission.status, false),
+    label: getMissionStatusLabel(mission),
+    spin: false,
+  };
 }
 
 export interface MissionQuickAction {
@@ -641,6 +692,7 @@ export function MissionSwitcher({
   onResumeMission,
   onOpenFailingToolCall,
   onFollowUpMission,
+  onRenameMission,
   onRefresh,
 }: MissionSwitcherProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -683,6 +735,44 @@ export function MissionSwitcher({
     }
     return map;
   }, [missions]);
+
+  // Inline rename state. Only one row edits at a time; `renameValue` is the
+  // working draft. The id is mirrored in a ref so commit/cancel stay idempotent:
+  // Enter (or a pencil click) commits and unmounts the input, and the unmount
+  // blur fires a second commit — the ref short-circuits it so we never
+  // double-call the API.
+  const [renamingMissionId, setRenamingMissionId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const renamingIdRef = useRef<string | null>(null);
+
+  const startRename = useCallback((mission: Mission | undefined, missionId: string) => {
+    if (!onRenameMission || !mission) return;
+    renamingIdRef.current = missionId;
+    setRenameValue(mission.title?.trim() ?? '');
+    setRenamingMissionId(missionId);
+  }, [onRenameMission]);
+
+  const cancelRename = useCallback(() => {
+    renamingIdRef.current = null;
+    setRenamingMissionId(null);
+  }, []);
+
+  const commitRename = useCallback(
+    async (missionId: string, rawValue: string) => {
+      if (renamingIdRef.current !== missionId) return;
+      renamingIdRef.current = null;
+      setRenamingMissionId(null);
+      const next = rawValue.trim();
+      const current = missionById.get(missionId)?.title?.trim() ?? '';
+      if (!next || next === current) return;
+      try {
+        await onRenameMission?.(missionId, next);
+      } catch (error) {
+        console.error('Failed to rename mission:', error);
+      }
+    },
+    [missionById, onRenameMission]
+  );
 
   // Handle mission selection with loading state
   const handleSelect = useCallback(async (missionId: string) => {
@@ -980,6 +1070,12 @@ export function MissionSwitcher({
   const rowVirtualizer = useVirtualizer({
     count: renderedRows.length,
     getScrollElement: () => listRef.current,
+    // Key measurements by stable row id, not array index. When pinning
+    // reorders the list, a tall row (title + description + activity) can land
+    // on an index whose cached height was a short row — index-keyed caches
+    // then stack rows on top of each other until the async re-measure lands.
+    // Keying by id makes each row carry its own measured height across reorders.
+    getItemKey: (index) => renderedRows[index]?.id ?? index,
     estimateSize: (index) => {
       const row = renderedRows[index];
       if (row?.kind === 'section') return 34;
@@ -1094,8 +1190,21 @@ export function MissionSwitcher({
         }
         return;
       }
-      
+
+      // While an inline rename is open, the row's <input> owns the keyboard
+      // (Enter saves, Escape cancels, arrows move the caret). Its own handler
+      // stops propagation, but guard here too in case focus drifts.
+      if (renamingMissionId) return;
+
       switch (e.key) {
+        case 'F2': {
+          const selected = orderedItems[selectedIndex];
+          if (onRenameMission && selected?.mission && !selected.isWorkerOf) {
+            e.preventDefault();
+            startRename(selected.mission, selected.id);
+          }
+          break;
+        }
         case 'Escape':
           e.preventDefault();
           onClose();
@@ -1166,6 +1275,9 @@ export function MissionSwitcher({
     bossesWithGroupedWorkers,
     expandedBossIds,
     toggleBossExpansion,
+    renamingMissionId,
+    onRenameMission,
+    startRename,
   ]);
 
   // Scroll selected item into view — only when the user actually navigates
@@ -1361,15 +1473,22 @@ export function MissionSwitcher({
                         <span className="rounded bg-cyan-500/10 border border-cyan-500/20 px-1 py-0.5 text-[8px] font-medium text-cyan-400 shrink-0">
                           W
                         </span>
-                        <span className="text-[9px] text-white/30 shrink-0">
-                          {isLoading
-                            ? 'Loading...'
-                            : isRunning
-                              ? runningInfo?.state || 'running'
-                              : mission
-                                ? getMissionStatusLabel(mission)
-                                : ''}
-                        </span>
+                        {isLoading ? (
+                          <Loader2 className="h-3 w-3 animate-spin text-indigo-400 shrink-0" />
+                        ) : (() => {
+                          const status = getMissionStatusDisplay(
+                            mission,
+                            isRunning,
+                            runningInfo?.state
+                          );
+                          if (!status) return null;
+                          const { Icon, tone, label, spin } = status;
+                          return (
+                            <span title={label} aria-label={label} className={cn('shrink-0', tone)}>
+                              <Icon className={cn('h-3 w-3', spin && 'animate-spin')} />
+                            </span>
+                          );
+                        })()}
                         {isViewing && !isLoading && (
                           <Check className="h-3 w-3 text-indigo-400 shrink-0" />
                         )}
@@ -1438,11 +1557,42 @@ export function MissionSwitcher({
                       {/* Mission info */}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className={cn("font-medium truncate", isWorkerItem ? "text-[13px]" : "text-sm")}>
-                            {mission
-                              ? getMissionDisplayName(mission)
-                              : getMissionShortName(item.id)}
-                          </span>
+                          {renamingMissionId === item.id ? (
+                            <input
+                              autoFocus
+                              value={renameValue}
+                              onChange={(e) => setRenameValue(e.target.value)}
+                              onFocus={(e) => e.currentTarget.select()}
+                              onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                              }}
+                              onMouseDown={(e) => e.stopPropagation()}
+                              onBlur={() => commitRename(item.id, renameValue)}
+                              onKeyDown={(e) => {
+                                // Keep Enter/Escape/arrows inside the editor.
+                                e.stopPropagation();
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  commitRename(item.id, renameValue);
+                                } else if (e.key === 'Escape') {
+                                  e.preventDefault();
+                                  cancelRename();
+                                }
+                              }}
+                              placeholder={getMissionShortName(item.id)}
+                              className={cn(
+                                'min-w-0 flex-1 rounded border border-indigo-400/50 bg-white/[0.08] px-1.5 py-0.5 font-medium text-white outline-none placeholder:text-white/30 focus:border-indigo-400',
+                                isWorkerItem ? 'text-[13px]' : 'text-sm'
+                              )}
+                            />
+                          ) : (
+                            <span className={cn("font-medium truncate min-w-0", isWorkerItem ? "text-[13px]" : "text-sm")}>
+                              {mission
+                                ? getMissionDisplayName(mission)
+                                : getMissionShortName(item.id)}
+                            </span>
+                          )}
                           {mission && (() => {
                             const ws = getWorkspaceLabel(mission, workspaceNameById);
                             return ws ? (
@@ -1516,16 +1666,46 @@ export function MissionSwitcher({
                         )}
                       </div>
 
-                      {/* Status label or loading text */}
-                      <span className="text-[10px] text-white/30 shrink-0">
-                        {isLoading
-                          ? 'Loading...'
-                          : isRunning
-                          ? runningInfo?.state || 'running'
-                          : mission
-                          ? `${getMissionStatusLabel(mission)} · ${getMissionBackendLabel(mission)}`
-                          : ''}
-                      </span>
+                      {/* Status glyph — an icon in place of the old
+                          "Needs You · claudecode" text. Frees the row width for
+                          the title; the full label rides in the tooltip and the
+                          backend stays searchable + shown on the mission page. */}
+                      {isLoading ? (
+                        <Loader2 className="h-4 w-4 animate-spin text-indigo-400 shrink-0" />
+                      ) : (() => {
+                        const status = getMissionStatusDisplay(
+                          mission,
+                          isRunning,
+                          runningInfo?.state
+                        );
+                        if (!status) return null;
+                        const { Icon, tone, label, spin } = status;
+                        return (
+                          <span
+                            title={label}
+                            aria-label={label}
+                            className={cn('shrink-0', tone)}
+                          >
+                            <Icon className={cn('h-4 w-4', spin && 'animate-spin')} />
+                          </span>
+                        );
+                      })()}
+
+                      {onRenameMission && mission && renamingMissionId !== item.id && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            startRename(mission, item.id);
+                          }}
+                          className="p-1 rounded transition-all shrink-0 hover:bg-white/[0.08] text-white/25 opacity-0 group-hover:opacity-100 hover:text-white/60"
+                          title="Rename mission (F2)"
+                          aria-label="Rename mission"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                      )}
 
                       <button
                         type="button"
@@ -1592,18 +1772,18 @@ export function MissionSwitcher({
                                 onClose();
                               }
                             }}
-                            spinnerClassName="h-3 w-3"
-                            className="px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-white/[0.08] text-[10px] text-white/40 hover:text-emerald-300 transition-all shrink-0 inline-flex items-center gap-1 data-[busy=true]:opacity-100"
-                            title={action.title}
+                            spinnerClassName="h-3.5 w-3.5"
+                            className="p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-white/[0.08] text-white/40 hover:text-emerald-300 transition-all shrink-0 inline-flex items-center justify-center data-[busy=true]:opacity-100"
+                            title={`${action.label} — ${action.title}`}
+                            aria-label={action.label}
                           >
                             {action.action === 'resume' ? (
-                              <RotateCcw className="h-3 w-3" />
+                              <RotateCcw className="h-3.5 w-3.5" />
                             ) : action.action === 'open_failure' ? (
-                              <AlertTriangle className="h-3 w-3" />
+                              <AlertTriangle className="h-3.5 w-3.5" />
                             ) : (
-                              <MessageSquarePlus className="h-3 w-3" />
+                              <MessageSquarePlus className="h-3.5 w-3.5" />
                             )}
-                            {action.label}
                           </AsyncButton>
                         ))}
                     </a>

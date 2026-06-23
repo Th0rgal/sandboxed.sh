@@ -6558,6 +6558,51 @@ export default function ControlClient() {
     ],
   );
 
+  // Rename any mission by id from the Cmd+K switcher. Optimistic across the
+  // three places a mission title is mirrored (recent list, current, viewing);
+  // reverts on failure.
+  const handleRenameMissionById = useCallback(
+    async (missionId: string, nextTitle: string) => {
+      const trimmed = nextTitle.trim();
+      if (!trimmed) return;
+      const previousById = new Map<string, string | null | undefined>();
+      previousById.set(missionId, recentMissions.find((m) => m.id === missionId)?.title);
+
+      const applyTitle = (mission: Mission | null) =>
+        mission?.id === missionId ? { ...mission, title: trimmed } : mission;
+
+      setRecentMissions((prev) =>
+        prev.map((mission) =>
+          mission.id === missionId ? { ...mission, title: trimmed } : mission,
+        ),
+      );
+      setCurrentMission(applyTitle);
+      setViewingMission(applyTitle);
+
+      try {
+        await updateMissionTitle(missionId, trimmed);
+      } catch (error) {
+        console.error("Failed to rename mission:", error);
+        toast.error("Failed to rename mission");
+        const restore = (mission: Mission | null) =>
+          mission?.id === missionId
+            ? { ...mission, title: previousById.get(missionId) ?? null }
+            : mission;
+        setRecentMissions((prev) =>
+          prev.map((mission) =>
+            mission.id === missionId
+              ? { ...mission, title: previousById.get(missionId) ?? null }
+              : mission,
+          ),
+        );
+        setCurrentMission(restore);
+        setViewingMission(restore);
+        throw error;
+      }
+    },
+    [recentMissions],
+  );
+
   // Debouncing for thinking updates to reduce re-renders during streaming
   const pendingThinkingRef = useRef<{
     content: string;
@@ -7295,6 +7340,7 @@ export default function ControlClient() {
         const bubbleId = String(data["bubble_id"] ?? "text-op-latest");
         const rawOps = Array.isArray(data["ops"]) ? data["ops"] : [];
         const now = Date.now();
+        const acceptedMissionId = eventMissionId ?? viewingId ?? undefined;
 
         setItems((prev) => {
           const filtered = prev.filter((it) => it.kind !== "phase");
@@ -7340,6 +7386,7 @@ export default function ControlClient() {
               ...existing,
               content,
               done: finalized,
+              missionId: acceptedMissionId ?? existing.missionId,
               endTime: finalized ? now : undefined,
             };
             return updated;
@@ -7352,6 +7399,7 @@ export default function ControlClient() {
               id: bubbleId,
               content,
               done: finalized,
+              missionId: acceptedMissionId,
               startTime: now,
               endTime: finalized ? now : undefined,
             },
@@ -9225,6 +9273,7 @@ export default function ControlClient() {
           onResumeMission={handleResumeMissionById}
           onOpenFailingToolCall={handleOpenFailingToolCallById}
           onFollowUpMission={handleFollowUpMissionById}
+          onRenameMission={handleRenameMissionById}
           onRefresh={refreshRecentMissions}
         />
 
