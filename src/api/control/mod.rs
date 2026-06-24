@@ -2583,20 +2583,26 @@ pub struct QueuedMessage {
     pub agent: Option<String>,
     /// Which mission this queued message belongs to
     pub mission_id: Option<Uuid>,
+    /// Attribution for the message (e.g. `api:<user_id>`, `telegram`). Persisted
+    /// so a queued message keeps its source after a restart. Defaults to `None`
+    /// for snapshots written before this field existed.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Serialize the control session queue to a stable JSON snapshot for
 /// persistence across restarts (see `MissionStore::save_control_queue`).
 fn serialize_queue_snapshot(
-    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>, Option<String>)>,
 ) -> String {
     let items: Vec<QueuedMessage> = queue
         .iter()
-        .map(|(id, content, agent, target_mid)| QueuedMessage {
+        .map(|(id, content, agent, target_mid, source)| QueuedMessage {
             id: *id,
             content: content.clone(),
             agent: agent.clone(),
             mission_id: *target_mid,
+            source: source.clone(),
         })
         .collect();
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
@@ -2614,7 +2620,7 @@ fn serialize_queue_snapshot(
 async fn persist_control_queue_if_changed(
     mission_store: &Arc<dyn MissionStore>,
     session_user_id: &str,
-    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>, Option<String>)>,
     last_persisted: &mut String,
 ) {
     let snapshot = serialize_queue_snapshot(queue);
@@ -7790,7 +7796,7 @@ struct RoutedAutomationMessage {
 }
 
 fn enqueue_agent_finished_messages(
-    queue: &mut VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    queue: &mut VecDeque<(Uuid, String, Option<String>, Option<Uuid>, Option<String>)>,
     messages: Vec<RoutedAutomationMessage>,
 ) {
     for message in messages {
@@ -7799,6 +7805,7 @@ fn enqueue_agent_finished_messages(
             message.content,
             None,
             Some(message.target_mission_id),
+            Some("automation".to_string()),
         ));
     }
 }
@@ -8077,12 +8084,12 @@ async fn post_turn_handle_grok_goal(
 }
 
 fn queue_has_pending_target_mission(
-    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>, Option<String>)>,
     mission_id: Uuid,
 ) -> bool {
     queue
         .iter()
-        .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id))
+        .any(|(_id, _msg, _agent, target_mid, _source)| *target_mid == Some(mission_id))
 }
 
 fn accept_user_message_id(accepted: &mut HashSet<Uuid>, id: Uuid) -> bool {
@@ -8850,7 +8857,8 @@ async fn control_actor_loop(
 ) {
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
-    let mut queue: VecDeque<(Uuid, String, Option<String>, Option<Uuid>)> = VecDeque::new();
+    let mut queue: VecDeque<(Uuid, String, Option<String>, Option<Uuid>, Option<String>)> =
+        VecDeque::new();
     // Re-drive any messages that were queued before the last restart. They are
     // persisted as a JSON snapshot (see `persist_control_queue_if_changed`) so a
     // restart doesn't lose pending work. We re-inject them through the normal
@@ -8873,7 +8881,7 @@ async fn control_actor_loop(
                             agent: it.agent,
                             target_mission_id: it.mission_id,
                             strict: false,
-                            source: None,
+                            source: it.source,
                             respond: ack_tx,
                         }) {
                             tracing::warn!("Failed to re-queue restored control message: {e}");
@@ -9640,7 +9648,7 @@ async fn control_actor_loop(
                             Some(tid) => Some(tid),
                             None => *current_mission.read().await,
                         };
-                        queue.push_back((id, content, msg_agent, target_mission_id));
+                        queue.push_back((id, content, msg_agent, target_mission_id, source.clone()));
                         let status_mission_id = if running.is_some() {
                             running_mission_id
                         } else {
@@ -9663,7 +9671,7 @@ async fn control_actor_loop(
                             });
                         }
                         if running.is_none() {
-                            if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                            if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                                 // Persist the dequeue before the awaits that start
                                 // the run, so a crash here can't restore + re-run it.
                                 persist_control_queue_if_changed(
@@ -9680,7 +9688,7 @@ async fn control_actor_loop(
                                     queue.len(),
                                     msg_target_mid,
                                 ).await;
-                                let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid, source: source.clone() });
+                                let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid, source: msg_source.clone() });
 
                                 // Immediately persist user message so it's visible when loading mission
                                 history.push(("user".to_string(), msg.clone()));
@@ -10621,12 +10629,18 @@ async fn control_actor_loop(
                                 // Skip if the caller just wants to update the status (e.g., before sending a custom message)
                                 if !skip_message {
                                     let msg_id = Uuid::new_v4();
-                                    queue.push_back((msg_id, resume_prompt, None, Some(mission_id)));
+                                    queue.push_back((
+                                        msg_id,
+                                        resume_prompt,
+                                        None,
+                                        Some(mission_id),
+                                        Some("system:resume".to_string()),
+                                    ));
                                 }
 
                                 // Start execution if not already running
                                 if running.is_none() {
-                                    if let Some((mid, msg, _per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                                    if let Some((mid, msg, _per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                                         // Persist the dequeue before the awaits that
                                         // start the run, so a crash here can't
                                         // restore + re-run it.
@@ -10645,7 +10659,7 @@ async fn control_actor_loop(
                                             queue.len(),
                                             Some(target_mid),
                                         ).await;
-                                        let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: Some(target_mid), source: None });
+                                        let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: Some(target_mid), source: msg_source.clone() });
                                         let cfg = config.clone();
                                         let agent = Arc::clone(&root_agent);
                                         let mcp_ref = Arc::clone(&mcp);
@@ -10823,11 +10837,12 @@ async fn control_actor_loop(
                         // Collect queued messages from main runner with their target mission IDs
                         let mut queued: Vec<QueuedMessage> = queue
                             .iter()
-                            .map(|(id, content, agent, target_mid)| QueuedMessage {
+                            .map(|(id, content, agent, target_mid, source)| QueuedMessage {
                                 id: *id,
                                 content: content.clone(),
                                 agent: agent.clone(),
                                 mission_id: *target_mid,
+                                source: source.clone(),
                             })
                             .collect();
                         // Also collect queued messages from parallel runners
@@ -10838,6 +10853,7 @@ async fn control_actor_loop(
                                     content: qm.content.clone(),
                                     agent: qm.agent.clone(),
                                     mission_id: Some(*mid),
+                                    source: None,
                                 });
                             }
                         }
@@ -10848,7 +10864,7 @@ async fn control_actor_loop(
 
                         // Try to remove from main queue
                         let before_len = queue.len();
-                        queue.retain(|(id, _, _, _)| *id != message_id);
+                        queue.retain(|(id, _, _, _, _)| *id != message_id);
                         if queue.len() < before_len {
                             removed = true;
                             // Emit event for main queue change
@@ -10906,7 +10922,7 @@ async fn control_actor_loop(
                                 // from one mission's view must not wipe other
                                 // missions' queues.
                                 let before_len = queue.len();
-                                queue.retain(|(_, _, _, target_mid)| *target_mid != Some(target));
+                                queue.retain(|(_, _, _, target_mid, _)| *target_mid != Some(target));
                                 let main_removed = before_len - queue.len();
                                 cleared += main_removed;
                                 if main_removed > 0 {
@@ -11338,7 +11354,7 @@ async fn control_actor_loop(
                         );
                         let already_queued_for_mission = queue
                             .iter()
-                            .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id));
+                            .any(|(_id, _msg, _agent, target_mid, _source)| *target_mid == Some(mission_id));
 
                         // Grok `/goal` post-turn: parse the sentinel from the
                         // assistant's last text and either disable the goal
@@ -11389,7 +11405,7 @@ async fn control_actor_loop(
                 }
 
                 // Start next queued message, if any.
-                if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                     // Persist the dequeue before the awaits that start the run, so
                     // a crash here can't restore + re-run it.
                     persist_control_queue_if_changed(
@@ -11406,7 +11422,7 @@ async fn control_actor_loop(
                         queue.len(),
                         msg_target_mid,
                     ).await;
-                    let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid, source: None });
+                    let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid, source: msg_source.clone() });
 
                     // Immediately persist user message so it's visible when loading mission
                     history.push(("user".to_string(), msg.clone()));
@@ -11670,6 +11686,7 @@ async fn control_actor_loop(
                                         message.content,
                                         None,
                                         Some(message.target_mission_id),
+                                        Some("automation".to_string()),
                                     ));
                                 }
                             }
@@ -19024,6 +19041,7 @@ Investigate <service/> failures.
             "queued user message".to_string(),
             None,
             Some(existing_target),
+            Some("api:test-user".to_string()),
         )]);
 
         enqueue_agent_finished_messages(
@@ -19042,7 +19060,7 @@ Investigate <service/> failures.
 
         let ordered: Vec<(String, Option<Uuid>)> = queue
             .into_iter()
-            .map(|(_, content, _, mission_id)| (content, mission_id))
+            .map(|(_, content, _, mission_id, _)| (content, mission_id))
             .collect();
         assert_eq!(
             ordered,
@@ -19064,12 +19082,14 @@ Investigate <service/> failures.
                 "other mission".to_string(),
                 None,
                 Some(other_mission_id),
+                None,
             ),
             (
                 Uuid::new_v4(),
                 "current mission".to_string(),
                 None,
                 Some(mission_id),
+                None,
             ),
         ]);
 

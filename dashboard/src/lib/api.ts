@@ -554,6 +554,7 @@ export interface QueuedMessage {
   content: string;
   agent: string | null;
   mission_id: string | null;
+  source?: string | null;
 }
 
 export async function getQueue(): Promise<QueuedMessage[]> {

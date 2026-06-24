@@ -6565,8 +6565,21 @@ export default function ControlClient() {
     async (missionId: string, nextTitle: string) => {
       const trimmed = nextTitle.trim();
       if (!trimmed) return;
+      // Capture the pre-rename title from whichever source currently holds the
+      // mission. It may be open in current/viewing but absent from the recent
+      // list, in which case restoring from `recentMissions` alone would wipe the
+      // title to null on a failed API call.
+      const previousTitle =
+        recentMissions.find((m) => m.id === missionId)?.title ??
+        (currentMissionRef.current?.id === missionId
+          ? currentMissionRef.current.title
+          : undefined) ??
+        (viewingMissionRef.current?.id === missionId
+          ? viewingMissionRef.current.title
+          : undefined) ??
+        null;
       const previousById = new Map<string, string | null | undefined>();
-      previousById.set(missionId, recentMissions.find((m) => m.id === missionId)?.title);
+      previousById.set(missionId, previousTitle);
 
       const applyTitle = (mission: Mission | null) =>
         mission?.id === missionId ? { ...mission, title: trimmed } : mission;
