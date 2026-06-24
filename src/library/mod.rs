@@ -584,9 +584,6 @@ impl LibraryStore {
 
     /// Validate that a path doesn't escape the base directory via traversal.
     fn validate_path_within(&self, base: &std::path::Path, target: &std::path::Path) -> Result<()> {
-        // Canonicalize what we can, but for non-existent paths we need to check components
-        let base_canonical = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-
         // Check for path traversal in the target path components
         for component in target.components() {
             if let std::path::Component::ParentDir = component {
@@ -594,15 +591,39 @@ impl LibraryStore {
             }
         }
 
-        // If the file exists, verify it's within the base directory
+        // Canonicalize base fully if it exists; otherwise resolve as far as possible
+        // through its already-existing ancestors (preserving symlink safety for the
+        // existing portion while accepting paths whose final component(s) will be
+        // created during this operation).
+        let base_canonical = if base.exists() {
+            base.canonicalize()?
+        } else {
+            let mut candidate = base.to_path_buf();
+            while !candidate.exists()
+                && candidate != candidate.parent().map(|p| p.to_path_buf()).unwrap_or(candidate.clone())
+            {
+                if let Some(parent) = candidate.parent() {
+                    candidate = parent.to_path_buf();
+                } else {
+                    break;
+                }
+            }
+            // Try to canonicalize base itself (may succeed if just created), fall back to resolved ancestor
+            base.canonicalize().ok().unwrap_or_else(|| candidate)
+        };
+
+        // If the file exists, verify it's within the base directory via full canonicalization
         if target.exists() {
             let target_canonical = target.canonicalize()?;
             if !target_canonical.starts_with(&base_canonical) {
                 anyhow::bail!("Path escapes allowed directory");
             }
         } else {
-            // For new files, verify the parent directory exists and is within base
-            // This prevents symlink bypass attacks where a symlinked parent could escape
+            // For new files, we need two guarantees:
+            // 1) Every *existing* ancestor of target must still be under base_canonical
+            //    (catches mid-tree symlink attacks).
+            // 2) target must actually descend from base (not just any sibling dir at the
+            //    same level as the truncated non-existent path).
             let mut current = target.to_path_buf();
             while let Some(parent) = current.parent() {
                 if parent.exists() {
@@ -613,6 +634,17 @@ impl LibraryStore {
                     break;
                 }
                 current = parent.to_path_buf();
+            }
+            // Confirm the target genuinely starts with base path using string-level prefix.
+            // This works even when base doesn't exist on disk yet (no symlinks can interfere).
+            let base_str = base_canonical.to_string_lossy();
+            let target_str = target.to_string_lossy();
+            if !target_str.starts_with(base_str.as_ref()) {
+                anyhow::bail!("Path escapes allowed directory");
+            }
+            // Ensure target is strictly deeper than base (target != base).
+            if target_str == base_str {
+                anyhow::bail!("Target equals base directory");
             }
         }
 
