@@ -457,6 +457,17 @@ pub enum ControlCommand {
         min_idle: Option<std::time::Duration>,
         respond: oneshot::Sender<Result<(), String>>,
     },
+    /// Pause a mission (FLEET-004). Stops any in-flight runner (main or
+    /// parallel) for the mission, then sets its status to `Paused`. Unlike
+    /// `CancelMission` (which lands on `Interrupted`), this lands on `Paused`
+    /// so the dispatcher skips it until an explicit resume. Routing through the
+    /// control loop guarantees the active turn is actually signalled to stop —
+    /// a bare store update would leave the runner executing and let its
+    /// completion overwrite the paused status.
+    PauseMission {
+        mission_id: Uuid,
+        respond: oneshot::Sender<Result<(), String>>,
+    },
     /// List currently running missions
     ListRunning {
         respond: oneshot::Sender<Vec<crate::api::mission_runner::RunningMissionInfo>>,

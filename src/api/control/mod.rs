@@ -5657,16 +5657,21 @@ pub async fn pause_mission(
         ));
     }
 
+    // Route through the control loop so any in-flight runner is actually
+    // stopped before the mission is parked. A bare store update would leave the
+    // active turn executing and let its completion overwrite `Paused`.
+    let (tx, rx) = oneshot::channel();
     control
-        .mission_store
-        .update_mission_status(mission_id, MissionStatus::Paused)
+        .cmd_tx
+        .send(ControlCommand::PauseMission {
+            mission_id,
+            respond: tx,
+        })
         .await
-        .map_err(internal_error)?;
-    let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
-        mission_id,
-        status: MissionStatus::Paused,
-        summary: None,
-    });
+        .map_err(session_unavailable)?;
+    rx.await
+        .map_err(recv_failed)?
+        .map_err(|e| (StatusCode::CONFLICT, e))?;
 
     let updated = control
         .mission_store
@@ -10337,6 +10342,62 @@ async fn control_actor_loop(
                                 }
                             } else {
                                 let _ = respond.send(Err(format!("Mission {} not found", mission_id)));
+                            }
+                        }
+                    }
+                    ControlCommand::PauseMission { mission_id, respond } => {
+                        // Stop any in-flight runner before parking the mission so
+                        // the agent turn can't keep executing (and overwrite the
+                        // paused status on completion). Mirrors CancelMission's
+                        // stop logic but lands on `Paused` instead of `Interrupted`.
+                        if let Some(runner) = parallel_runners.get_mut(&mission_id) {
+                            runner.cancel();
+                            parallel_runners.remove(&mission_id);
+                            close_mission_desktop_sessions(
+                                &mission_store,
+                                mission_id,
+                                &config.working_dir,
+                            )
+                            .await;
+                        } else if running_mission_id == Some(mission_id) {
+                            if let Some(token) = &running_cancel {
+                                token.cancel();
+                                // Arm the force-clear deadline so a zombie runner
+                                // that never observes the cancel still gets torn
+                                // down (matches CancelMission).
+                                runner_force_clear_deadline = Some(
+                                    tokio::time::Instant::now() + RUNNER_FORCE_CLEAR_GRACE,
+                                );
+                            }
+                            close_mission_desktop_sessions(
+                                &mission_store,
+                                mission_id,
+                                &config.working_dir,
+                            )
+                            .await;
+                        }
+
+                        // Set Paused last so it survives the runner teardown above.
+                        // maybe_finalize_terminal_mission skips non-Active/Pending/
+                        // Interrupted statuses, so the cancelled turn's completion
+                        // won't promote this back out of Paused.
+                        match mission_store
+                            .update_mission_status(mission_id, MissionStatus::Paused)
+                            .await
+                        {
+                            Ok(()) => {
+                                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    mission_id,
+                                    status: MissionStatus::Paused,
+                                    summary: None,
+                                });
+                                let _ = respond.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = respond.send(Err(format!(
+                                    "Failed to pause mission {}: {}",
+                                    mission_id, e
+                                )));
                             }
                         }
                     }
