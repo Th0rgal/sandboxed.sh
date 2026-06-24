@@ -4183,6 +4183,14 @@ pub struct CreateMissionRequest {
     pub parent_mission_id: Option<Uuid>,
     /// Working directory override (for git worktrees etc.)
     pub working_directory: Option<String>,
+    /// FLEET-001 scheduling hint: dispatch priority (higher = more important,
+    /// default 0). The dispatcher prefers higher-priority Pending missions,
+    /// FIFO within the same priority.
+    pub priority: Option<i32>,
+    /// FLEET-001 scheduling hint: do not dispatch before this timestamp.
+    pub not_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// FLEET-001 scheduling hint: soft deadline for observability/enforcement.
+    pub deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn deserialize_string_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
@@ -4281,6 +4289,9 @@ pub async fn create_mission(
         backend: None,
         parent_mission_id: None,
         working_directory: None,
+        priority: None,
+        not_before: None,
+        deadline: None,
     });
 
     let title = req.title.clone();
@@ -4411,6 +4422,11 @@ pub async fn create_mission(
             config_profile: effective_config_profile,
             parent_mission_id: req.parent_mission_id,
             working_directory: req.working_directory,
+            scheduling: crate::api::mission_store::MissionScheduling {
+                priority: req.priority.unwrap_or(0),
+                not_before: req.not_before.map(|t| t.to_rfc3339()),
+                deadline: req.deadline.map(|t| t.to_rfc3339()),
+            },
             respond: tx,
         })
         .await
@@ -5600,6 +5616,72 @@ pub async fn cancel_mission(
         .map_err(|e| (StatusCode::NOT_FOUND, e))
 }
 
+/// Pause a mission (FLEET-004). Sets the mission to `Paused`, a non-terminal
+/// state the dispatcher deliberately skips when selecting the next runnable
+/// mission. Resume via `POST /missions/:id/resume`, which transitions a
+/// `Paused` mission back to `Pending` so the dispatcher re-queues it.
+///
+/// Rejects missions that are already terminal (nothing to pause) or already
+/// paused (no-op kept explicit for the operator).
+pub async fn pause_mission(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+
+    if mission.status == MissionStatus::Paused {
+        return Err((
+            StatusCode::CONFLICT,
+            "Mission is already paused".to_string(),
+        ));
+    }
+    if mission_status_is_terminal(mission.status) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot pause a terminal mission (status: {})",
+                mission.status
+            ),
+        ));
+    }
+
+    control
+        .mission_store
+        .update_mission_status(mission_id, MissionStatus::Paused)
+        .await
+        .map_err(internal_error)?;
+    let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        mission_id,
+        status: MissionStatus::Paused,
+        summary: None,
+    });
+
+    let updated = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+    Ok(Json(updated))
+}
+
 /// Request body for resuming a mission
 #[derive(Debug, Deserialize, Default)]
 pub struct ResumeMissionRequest {
@@ -5623,9 +5705,41 @@ pub async fn resume_mission(
     let (clean_workspace, skip_message) = body
         .map(|b| (b.clean_workspace, b.skip_message))
         .unwrap_or((false, false));
-    let (tx, rx) = oneshot::channel();
 
     let control = control_for_user(&state, &user).await;
+
+    // FLEET-004: a Paused mission resumes by returning to the dispatcher queue
+    // (Paused → Pending) rather than going through the interrupted-mission
+    // context-reconstruction path below. The dispatcher re-selects it on its
+    // next pass, honoring priority/not_before ordering (FLEET-001).
+    if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
+        if mission.status == MissionStatus::Paused {
+            control
+                .mission_store
+                .update_mission_status(mission_id, MissionStatus::Pending)
+                .await
+                .map_err(internal_error)?;
+            let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                mission_id,
+                status: MissionStatus::Pending,
+                summary: None,
+            });
+            let updated = control
+                .mission_store
+                .get_mission(mission_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("Mission {} not found", mission_id),
+                    )
+                })?;
+            return Ok(Json(updated));
+        }
+    }
+
+    let (tx, rx) = oneshot::channel();
     control
         .cmd_tx
         .send(ControlCommand::ResumeMission {
@@ -8892,11 +9006,13 @@ async fn control_actor_loop(
             None,
             None,
             None,
+            crate::api::mission_store::MissionScheduling::default(),
         )
         .await
     }
 
     // Helper to create a new mission with title
+    #[allow(clippy::too_many_arguments)]
     async fn create_new_mission_with_title(
         mission_store: &Arc<dyn MissionStore>,
         title: Option<&str>,
@@ -8908,8 +9024,9 @@ async fn control_actor_loop(
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
+        scheduling: crate::api::mission_store::MissionScheduling,
     ) -> Result<Mission, String> {
-        mission_store
+        let mut mission = mission_store
             .create_mission_with_parent(
                 title,
                 workspace_id,
@@ -8921,7 +9038,16 @@ async fn control_actor_loop(
                 parent_mission_id,
                 working_directory,
             )
-            .await
+            .await?;
+        // FLEET-001: persist scheduling metadata as a focused follow-up write so
+        // the wide `create_mission_with_parent` signature stays untouched.
+        if scheduling != crate::api::mission_store::MissionScheduling::default() {
+            mission_store
+                .set_mission_scheduling(mission.id, &scheduling)
+                .await?;
+            mission.scheduling = scheduling;
+        }
+        Ok(mission)
     }
 
     // Helper to validate and prepare an interrupted or blocked mission for resume.
@@ -9691,7 +9817,7 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, scheduling, respond } => {
                         // First persist current mission history
                         persist_mission_history(
                             &mission_store,
@@ -9713,6 +9839,7 @@ async fn control_actor_loop(
                             config_profile.as_deref(),
                             parent_mission_id,
                             working_directory.as_deref(),
+                            scheduling,
                         )
                         .await {
                             Ok(mission) => {
@@ -18286,6 +18413,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -18317,6 +18445,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let strong_score = mission_search_relevance_score(
@@ -18363,6 +18492,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -18406,6 +18536,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -18449,6 +18580,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -18492,6 +18624,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -18619,6 +18752,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {

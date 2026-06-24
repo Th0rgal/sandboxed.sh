@@ -770,6 +770,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::cancel_mission),
         )
         .route(
+            "/api/control/missions/:id/pause",
+            post(control::pause_mission),
+        )
+        .route(
             "/api/control/missions/:id/resume",
             post(control::resume_mission),
         )

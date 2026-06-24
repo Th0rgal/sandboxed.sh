@@ -168,6 +168,7 @@ impl MissionStore for FileMissionStore {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
         self.missions
             .write()

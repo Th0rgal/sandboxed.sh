@@ -397,6 +397,10 @@ pub async fn scheduler_pass(
                     // Runner may exist in another control session or be mid-start;
                     // leave it alone.
                 }
+                MissionStatus::Paused => {
+                    // Operator-paused worker: leave it alone, the dispatcher will
+                    // resume it when unpaused.
+                }
             }
         }
 

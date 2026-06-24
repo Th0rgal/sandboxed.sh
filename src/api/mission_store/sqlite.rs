@@ -3,7 +3,7 @@
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, BoardTask, BoardTaskOutcome,
     BoardTaskStatus, CommandSource, DailyUsageStats, ExecutionStatus, FreshSession,
-    HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode, MissionStatus,
+    HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode, MissionScheduling, MissionStatus,
     MissionStatusCounts, MissionStore, ModelUsageStats, NewBoardTask, PalomaCooldownState,
     PalomaDecision, PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig,
     StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
@@ -491,7 +491,10 @@ CREATE TABLE IF NOT EXISTS missions (
     resumable INTEGER NOT NULL DEFAULT 0,
     desktop_sessions TEXT,
     terminal_reason TEXT,
-    first_viewed_at TEXT
+    first_viewed_at TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    not_before TEXT,
+    deadline TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
@@ -2017,6 +2020,44 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add first_viewed_at column: {}", e))?;
         }
 
+        // FLEET-001 scheduling columns: priority (dispatch ordering), not_before
+        // (earliest dispatch time), deadline (soft deadline for observability).
+        let has_priority_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'priority'")
+            .map_err(|e| format!("Failed to check for priority column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_priority_column {
+            tracing::info!("Running migration: adding 'priority' column to missions table");
+            conn.execute(
+                "ALTER TABLE missions ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("Failed to add priority column: {}", e))?;
+        }
+
+        let has_not_before_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'not_before'")
+            .map_err(|e| format!("Failed to check for not_before column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_not_before_column {
+            tracing::info!("Running migration: adding 'not_before' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN not_before TEXT", [])
+                .map_err(|e| format!("Failed to add not_before column: {}", e))?;
+        }
+
+        let has_deadline_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'deadline'")
+            .map_err(|e| format!("Failed to check for deadline column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_deadline_column {
+            tracing::info!("Running migration: adding 'deadline' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN deadline TEXT", [])
+                .map_err(|e| format!("Failed to add deadline column: {}", e))?;
+        }
+
         Ok(())
     }
 
@@ -2279,6 +2320,7 @@ fn parse_status(s: &str) -> MissionStatus {
         "interrupted" => MissionStatus::Interrupted,
         "blocked" => MissionStatus::Blocked,
         "not_feasible" => MissionStatus::NotFeasible,
+        "paused" => MissionStatus::Paused,
         _ => MissionStatus::Pending,
     }
 }
@@ -2294,6 +2336,7 @@ fn status_to_string(status: MissionStatus) -> &'static str {
         MissionStatus::Interrupted => "interrupted",
         MissionStatus::Blocked => "blocked",
         MissionStatus::NotFeasible => "not_feasible",
+        MissionStatus::Paused => "paused",
     }
 }
 
@@ -2315,7 +2358,8 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode,
-                            COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at
+                            COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
+                            COALESCE(priority, 0) as priority, not_before, deadline
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2368,6 +2412,11 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
                             first_viewed_at: row.get(27).ok().flatten(),
+                            scheduling: MissionScheduling {
+                                priority: row.get::<_, i32>(28).unwrap_or(0),
+                                not_before: row.get(29).ok().flatten(),
+                                deadline: row.get(30).ok().flatten(),
+                            },
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2427,7 +2476,8 @@ impl MissionStore for SqliteMissionStore {
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
-                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at FROM missions WHERE id = ?1",
+                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
+                            COALESCE(priority, 0) as priority, not_before, deadline FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -2477,6 +2527,11 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
                             first_viewed_at: row.get(27).ok().flatten(),
+                            scheduling: MissionScheduling {
+                                priority: row.get::<_, i32>(28).unwrap_or(0),
+                                not_before: row.get(29).ok().flatten(),
+                                deadline: row.get(30).ok().flatten(),
+                            },
                     })
                 })
                 .optional()
@@ -2596,6 +2651,7 @@ impl MissionStore for SqliteMissionStore {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let m = mission.clone();
@@ -2685,6 +2741,7 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(23).unwrap_or(0) != 0,
                             goal_objective: row.get(24).ok().flatten(),
                             first_viewed_at: None,
+                            scheduling: Default::default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2699,6 +2756,29 @@ impl MissionStore for SqliteMissionStore {
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String> {
         self.update_mission_status_with_reason(id, status, None)
             .await
+    }
+
+    async fn set_mission_scheduling(
+        &self,
+        id: Uuid,
+        scheduling: &MissionScheduling,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let priority = scheduling.priority;
+        let not_before = scheduling.not_before.clone();
+        let deadline = scheduling.deadline.clone();
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET priority = ?1, not_before = ?2, deadline = ?3, updated_at = ?4 WHERE id = ?5",
+                params![priority, not_before, deadline, now, id.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     async fn update_mission_status_with_reason(
@@ -3341,6 +3421,7 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: false,
                         goal_objective: None,
                         first_viewed_at: None,
+                        scheduling: Default::default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3415,6 +3496,7 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: row.get::<_, i32>(14).unwrap_or(0) != 0,
                         goal_objective: row.get(15).ok().flatten(),
                         first_viewed_at: None,
+                        scheduling: Default::default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -5839,6 +5921,7 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: false,
                         goal_objective: None,
                         first_viewed_at: None,
+                        scheduling: Default::default(),
                     })
                 })
                 .map_err(|e| e.to_string())?

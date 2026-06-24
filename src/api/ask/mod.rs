@@ -1102,6 +1102,7 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                     config_profile: None,
                     parent_mission_id: None,
                     working_directory: None,
+                    scheduling: Default::default(),
                     respond: tx,
                 })
                 .await

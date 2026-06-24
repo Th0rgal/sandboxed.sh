@@ -407,6 +407,7 @@ fn mission_rank(mission: &Mission, interest: TelegramMissionInterestLevel) -> i3
         MissionStatus::Active => 40,
         MissionStatus::Pending => 25,
         MissionStatus::Interrupted => 20,
+        MissionStatus::Paused => 10,
         MissionStatus::Acknowledged | MissionStatus::Completed | MissionStatus::NotFeasible => 0,
     };
     if mission.parent_mission_id.is_none() {
@@ -3477,6 +3478,7 @@ async fn resolve_or_create_mission(
             config_profile: ctx.channel.default_config_profile.clone(),
             parent_mission_id: None,
             working_directory: None,
+            scheduling: Default::default(),
             respond: tx,
         })
         .await;
@@ -6650,6 +6652,7 @@ mod tests {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         }
     }
 
