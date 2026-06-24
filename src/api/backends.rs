@@ -336,3 +336,248 @@ pub async fn update_backend_config(
         "message": "Backend configuration updated."
     })))
 }
+
+// ---- FLEET-003: normalized backend quota ----
+
+/// A vendor-neutral quota snapshot for one provider account serving a backend.
+///
+/// Providers expose rate-limit state through different header families
+/// (Anthropic input/output token windows, OpenAI request/token windows, …).
+/// This struct presents a single normalized shape so callers don't branch on
+/// the vendor. `raw` carries the untouched [`RateLimitSnapshot`] for anyone
+/// who needs the provider-specific detail.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendQuota {
+    pub backend_id: String,
+    pub provider_id: String,
+    /// Account-scoped health id the snapshot came from.
+    pub account_id: uuid::Uuid,
+    /// Amount consumed in the reported window (`limit - remaining`), if both known.
+    pub used: Option<u64>,
+    /// Amount left in the reported window.
+    pub remaining: Option<u64>,
+    /// Window maximum.
+    pub limit: Option<u64>,
+    /// When the reported window resets.
+    pub reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Which window the normalized numbers describe
+    /// (`input_tokens` | `tokens` | `requests`).
+    pub window_kind: String,
+    /// Untouched provider snapshot for vendor-specific detail.
+    pub raw: serde_json::Value,
+}
+
+/// The normalized window extracted from a provider snapshot.
+struct NormalizedQuota {
+    used: Option<u64>,
+    remaining: Option<u64>,
+    limit: Option<u64>,
+    reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    window_kind: &'static str,
+}
+
+type QuotaNormalizer = fn(&crate::provider_health::RateLimitSnapshot) -> NormalizedQuota;
+
+fn build_window(
+    remaining: Option<u64>,
+    limit: Option<u64>,
+    reset: Option<chrono::DateTime<chrono::Utc>>,
+    window_kind: &'static str,
+) -> NormalizedQuota {
+    let used = match (limit, remaining) {
+        (Some(l), Some(r)) => Some(l.saturating_sub(r)),
+        _ => None,
+    };
+    NormalizedQuota {
+        used,
+        remaining,
+        limit,
+        reset_at: reset,
+        window_kind,
+    }
+}
+
+/// Anthropic reports per-input/output token windows; prefer the input window
+/// and fall back to the combined token window.
+fn normalize_anthropic(s: &crate::provider_health::RateLimitSnapshot) -> NormalizedQuota {
+    if s.input_tokens_limit.is_some() || s.input_tokens_remaining.is_some() {
+        build_window(
+            s.input_tokens_remaining,
+            s.input_tokens_limit,
+            s.tokens_reset,
+            "input_tokens",
+        )
+    } else {
+        build_window(s.tokens_remaining, s.tokens_limit, s.tokens_reset, "tokens")
+    }
+}
+
+/// OpenAI reports request and token windows; prefer the token window.
+fn normalize_openai(s: &crate::provider_health::RateLimitSnapshot) -> NormalizedQuota {
+    if s.tokens_limit.is_some() || s.tokens_remaining.is_some() {
+        build_window(s.tokens_remaining, s.tokens_limit, s.tokens_reset, "tokens")
+    } else {
+        build_window(
+            s.requests_remaining,
+            s.requests_limit,
+            s.requests_reset,
+            "requests",
+        )
+    }
+}
+
+/// Generic fallback: take whichever window the provider populated.
+fn normalize_generic(s: &crate::provider_health::RateLimitSnapshot) -> NormalizedQuota {
+    if s.tokens_limit.is_some() || s.tokens_remaining.is_some() {
+        build_window(s.tokens_remaining, s.tokens_limit, s.tokens_reset, "tokens")
+    } else if s.requests_limit.is_some() || s.requests_remaining.is_some() {
+        build_window(
+            s.requests_remaining,
+            s.requests_limit,
+            s.requests_reset,
+            "requests",
+        )
+    } else {
+        build_window(
+            s.input_tokens_remaining,
+            s.input_tokens_limit,
+            s.tokens_reset,
+            "input_tokens",
+        )
+    }
+}
+
+/// Select the per-provider normalizer. A small dispatch table keeps the
+/// vendor-specific logic in named functions instead of one sprawling match.
+fn normalizer_for(provider_id: &str) -> QuotaNormalizer {
+    match provider_id {
+        "anthropic" => normalize_anthropic,
+        "openai" => normalize_openai,
+        _ => normalize_generic,
+    }
+}
+
+/// GET /api/backends/:id/quota — normalized quota snapshot(s) for the
+/// provider account(s) that serve this backend (FLEET-003).
+///
+/// A backend maps to one or more providers via each provider's
+/// `use_for_backends`. For every such provider account that has reported
+/// rate-limit headers, we emit one normalized [`BackendQuota`]. Returns an
+/// empty list (200) for a known backend with no quota data yet, and 404 for
+/// an unknown backend.
+pub async fn get_backend_quota(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<BackendQuota>>, (StatusCode, String)> {
+    {
+        let registry = state.backend_registry.read().await;
+        if registry.get(&id).is_none() {
+            return Err((StatusCode::NOT_FOUND, format!("Backend {} not found", id)));
+        }
+    }
+
+    // Provider type ids whose `use_for_backends` includes this backend.
+    let provider_ids: std::collections::HashSet<String> = state
+        .ai_providers
+        .list()
+        .await
+        .into_iter()
+        .filter(|p| p.enabled)
+        .filter(|p| {
+            p.use_for_backends
+                .as_ref()
+                .map(|bs| bs.iter().any(|b| b == &id))
+                .unwrap_or(false)
+        })
+        .map(|p| p.provider_type.id().to_string())
+        .collect();
+
+    if provider_ids.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let mut quotas = Vec::new();
+    for health in state.health_tracker.get_all_health().await {
+        let Some(provider_id) = health.provider_id.clone() else {
+            continue;
+        };
+        if !provider_ids.contains(&provider_id) {
+            continue;
+        }
+        let Some(snapshot) = health.rate_limit_snapshot.as_ref() else {
+            continue;
+        };
+        let normalized = normalizer_for(&provider_id)(snapshot);
+        quotas.push(BackendQuota {
+            backend_id: id.clone(),
+            provider_id,
+            account_id: health.account_id,
+            used: normalized.used,
+            remaining: normalized.remaining,
+            limit: normalized.limit,
+            reset_at: normalized.reset_at,
+            window_kind: normalized.window_kind.to_string(),
+            raw: serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null),
+        });
+    }
+
+    Ok(Json(quotas))
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+    use crate::provider_health::RateLimitSnapshot;
+
+    /// FLEET-003: Anthropic snapshots normalize off the input-token window and
+    /// derive `used` as `limit - remaining`.
+    #[test]
+    fn test_anthropic_quota_normalization() {
+        let snap = RateLimitSnapshot {
+            input_tokens_limit: Some(1000),
+            input_tokens_remaining: Some(250),
+            tokens_reset: chrono::DateTime::parse_from_rfc3339("2026-06-24T12:00:00Z")
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc)),
+            ..Default::default()
+        };
+        let n = normalize_anthropic(&snap);
+        assert_eq!(n.window_kind, "input_tokens");
+        assert_eq!(n.limit, Some(1000));
+        assert_eq!(n.remaining, Some(250));
+        assert_eq!(n.used, Some(750));
+        assert!(n.reset_at.is_some());
+    }
+
+    /// FLEET-003: OpenAI snapshots prefer the token window; `used` is absent
+    /// when the limit is unknown.
+    #[test]
+    fn test_openai_quota_normalization() {
+        let snap = RateLimitSnapshot {
+            tokens_remaining: Some(500),
+            requests_remaining: Some(9),
+            requests_limit: Some(10),
+            ..Default::default()
+        };
+        let n = normalize_openai(&snap);
+        assert_eq!(n.window_kind, "tokens");
+        assert_eq!(n.remaining, Some(500));
+        assert_eq!(n.limit, None);
+        assert_eq!(n.used, None);
+    }
+
+    /// FLEET-003: the dispatch table routes by provider id and falls back to
+    /// the generic normalizer for unknown providers.
+    #[test]
+    fn test_normalizer_dispatch() {
+        let snap = RateLimitSnapshot {
+            requests_limit: Some(100),
+            requests_remaining: Some(40),
+            ..Default::default()
+        };
+        let n = normalizer_for("some-unknown-provider")(&snap);
+        assert_eq!(n.window_kind, "requests");
+        assert_eq!(n.used, Some(60));
+    }
+}

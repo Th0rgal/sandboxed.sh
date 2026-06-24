@@ -1134,6 +1134,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/backends", get(backends_api::list_backends))
         .route("/api/backends/:id", get(backends_api::get_backend))
         .route(
+            "/api/backends/:id/quota",
+            get(backends_api::get_backend_quota),
+        )
+        .route(
             "/api/backends/:id/agents",
             get(backends_api::list_backend_agents),
         )
