@@ -5793,38 +5793,61 @@ pub async fn resume_mission(
     // context and restart the runner. (Pending would be wrong here: the FLEET-001
     // dispatcher only dispatches `not_before`-scheduled missions that carry a
     // fresh `deferred_goal`, not paused missions continuing from history.)
-    if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
-        if mission.status == MissionStatus::Paused {
-            control
-                .mission_store
-                .update_mission_status(mission_id, MissionStatus::Interrupted)
-                .await
-                .map_err(internal_error)?;
-            let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
-                mission_id,
-                status: MissionStatus::Interrupted,
-                summary: None,
-            });
-            // fall through to ResumeMission below
-        }
+    let was_paused = matches!(
+        control.mission_store.get_mission(mission_id).await,
+        Ok(Some(ref m)) if m.status == MissionStatus::Paused
+    );
+    if was_paused {
+        control
+            .mission_store
+            .update_mission_status(mission_id, MissionStatus::Interrupted)
+            .await
+            .map_err(internal_error)?;
+        let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+            mission_id,
+            status: MissionStatus::Interrupted,
+            summary: None,
+        });
     }
 
-    let (tx, rx) = oneshot::channel();
-    control
-        .cmd_tx
-        .send(ControlCommand::ResumeMission {
-            mission_id,
-            clean_workspace,
-            skip_message,
-            respond: tx,
-        })
-        .await
-        .map_err(session_unavailable)?;
+    let outcome: Result<Mission, (StatusCode, String)> = async {
+        let (tx, rx) = oneshot::channel();
+        control
+            .cmd_tx
+            .send(ControlCommand::ResumeMission {
+                mission_id,
+                clean_workspace,
+                skip_message,
+                respond: tx,
+            })
+            .await
+            .map_err(session_unavailable)?;
+        rx.await
+            .map_err(recv_failed)?
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))
+    }
+    .await;
 
-    rx.await
-        .map_err(recv_failed)?
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))
+    match outcome {
+        Ok(mission) => Ok(Json(mission)),
+        Err(err) => {
+            // A failed resume must not leave a paused mission stranded in
+            // Interrupted: restore the operator-visible Paused state (best
+            // effort) before surfacing the error.
+            if was_paused {
+                let _ = control
+                    .mission_store
+                    .update_mission_status(mission_id, MissionStatus::Paused)
+                    .await;
+                let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                    mission_id,
+                    status: MissionStatus::Paused,
+                    summary: None,
+                });
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Delete a mission by ID.
@@ -8963,6 +8986,14 @@ async fn control_actor_loop(
     // idle, dispatches the highest-priority dispatchable one.
     const SCHEDULER_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
     let mut last_scheduler_pass = tokio::time::Instant::now();
+    // Guards against double-dispatch: a scheduled mission stays Pending (with its
+    // goal) until the dispatched message is processed and flips it to Active. If
+    // the actor is slow or the start is dropped, that window can exceed one pass,
+    // so we record each dispatch and skip re-dispatching the same mission until
+    // this cooldown elapses (after which a still-Pending mission is retried).
+    const SCHEDULER_DISPATCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut scheduler_inflight: std::collections::HashMap<Uuid, tokio::time::Instant> =
+        std::collections::HashMap::new();
     // Per-boss "wake outstanding" flags, coalescing board wakes across passes.
     let mut board_wake_state: std::collections::HashMap<Uuid, bool> =
         std::collections::HashMap::new();
@@ -11889,11 +11920,17 @@ async fn control_actor_loop(
                 // the main session is idle. Throttled like the board pass.
                 if last_scheduler_pass.elapsed() >= SCHEDULER_PASS_INTERVAL {
                     last_scheduler_pass = tokio::time::Instant::now();
+                    // Drop cooldown records that have aged out so a still-Pending
+                    // (dropped) mission becomes eligible for retry.
+                    scheduler_inflight
+                        .retain(|_, at| at.elapsed() < SCHEDULER_DISPATCH_COOLDOWN);
                     match mission_store.get_scheduled_pending_missions().await {
                         Ok(pending) => {
                             let now = chrono::Utc::now();
                             // 1. Expire any scheduled mission whose deadline elapsed
-                            //    before it ever dispatched.
+                            //    before it ever dispatched. Missions still within the
+                            //    dispatch cooldown are skipped (not added to `live`) so
+                            //    a slow/lost start can't trigger a duplicate dispatch.
                             let mut live: Vec<Mission> = Vec::with_capacity(pending.len());
                             for m in pending {
                                 if m.is_past_deadline(now) {
@@ -11931,6 +11968,9 @@ async fn control_actor_loop(
                                             ),
                                         });
                                     }
+                                } else if scheduler_inflight.contains_key(&m.id) {
+                                    // A dispatch for this mission is still settling;
+                                    // skip until the cooldown record ages out.
                                 } else {
                                     live.push(m);
                                 }
@@ -11974,11 +12014,21 @@ async fn control_actor_loop(
                                             source: Some("scheduler".to_string()),
                                             respond: ack_tx,
                                         }) {
-                                            Ok(()) => tracing::info!(
-                                                mission_id = %mission_id,
-                                                priority,
-                                                "Scheduler: dispatching scheduled mission"
-                                            ),
+                                            Ok(()) => {
+                                                // Record the dispatch so the next passes
+                                                // skip this mission until it flips to
+                                                // Active (or the cooldown lets a dropped
+                                                // start retry).
+                                                scheduler_inflight.insert(
+                                                    mission_id,
+                                                    tokio::time::Instant::now(),
+                                                );
+                                                tracing::info!(
+                                                    mission_id = %mission_id,
+                                                    priority,
+                                                    "Scheduler: dispatching scheduled mission"
+                                                );
+                                            }
                                             Err(e) => tracing::warn!(
                                                 mission_id = %mission_id,
                                                 "Scheduler: dispatch enqueue failed; will retry: {e}"
