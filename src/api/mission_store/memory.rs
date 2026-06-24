@@ -19,6 +19,9 @@ pub struct InMemoryMissionStore {
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
     board_tasks: Arc<RwLock<HashMap<Uuid, BoardTask>>>,
+    /// FLEET-001 scheduling: deferred goals held outside the Mission struct
+    /// (mirrors the sqlite `deferred_goal` column).
+    deferred_goals: Arc<RwLock<HashMap<Uuid, String>>>,
 }
 
 impl InMemoryMissionStore {
@@ -27,6 +30,7 @@ impl InMemoryMissionStore {
             missions: Arc::new(RwLock::new(HashMap::new())),
             trees: Arc::new(RwLock::new(HashMap::new())),
             board_tasks: Arc::new(RwLock::new(HashMap::new())),
+            deferred_goals: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -455,6 +459,41 @@ impl MissionStore for InMemoryMissionStore {
             .filter(|m| m.status == MissionStatus::Active)
             .cloned()
             .collect();
+        Ok(missions)
+    }
+
+    async fn set_deferred_goal(
+        &self,
+        mission_id: Uuid,
+        goal: Option<String>,
+    ) -> Result<(), String> {
+        let mut goals = self.deferred_goals.write().await;
+        match goal {
+            Some(g) => {
+                goals.insert(mission_id, g);
+            }
+            None => {
+                goals.remove(&mission_id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_deferred_goal(&self, mission_id: Uuid) -> Result<Option<String>, String> {
+        Ok(self.deferred_goals.read().await.get(&mission_id).cloned())
+    }
+
+    async fn get_scheduled_pending_missions(&self) -> Result<Vec<Mission>, String> {
+        let goals = self.deferred_goals.read().await;
+        let mut missions: Vec<Mission> = self
+            .missions
+            .read()
+            .await
+            .values()
+            .filter(|m| m.status == MissionStatus::Pending && goals.contains_key(&m.id))
+            .cloned()
+            .collect();
+        missions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         Ok(missions)
     }
 

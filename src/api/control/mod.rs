@@ -4193,12 +4193,14 @@ pub struct CreateMissionRequest {
     /// Working directory override (for git worktrees etc.)
     pub working_directory: Option<String>,
     /// FLEET-001 scheduling hint: dispatch priority (higher = more important,
-    /// default 0). The dispatcher prefers higher-priority Pending missions,
-    /// FIFO within the same priority.
+    /// default 0). The scheduler dispatches higher-priority scheduled missions
+    /// first, FIFO within the same priority.
     pub priority: Option<i32>,
-    /// FLEET-001 scheduling hint: do not dispatch before this timestamp.
+    /// FLEET-001 scheduling hint: do not dispatch before this timestamp. The
+    /// mission's first message is held (as `deferred_goal`) until then.
     pub not_before: Option<chrono::DateTime<chrono::Utc>>,
-    /// FLEET-001 scheduling hint: soft deadline for observability/enforcement.
+    /// FLEET-001 scheduling hint: deadline. A scheduled mission that never
+    /// dispatches before this is failed with reason `deadline_exceeded`.
     pub deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -5785,22 +5787,22 @@ pub async fn resume_mission(
 
     let control = control_for_user(&state, &user).await;
 
-    // FLEET-004: a Paused mission first returns to Pending, then falls through to
-    // the ResumeMission path below to actually rebuild context and start the
-    // runner. The FLEET-001 priority/not_before dispatcher that would otherwise
-    // re-select a Pending mission is not yet wired in production, so resuming has
-    // to start the mission directly rather than parking it in Pending — otherwise
-    // the agent never runs again from the resume API alone.
+    // FLEET-004: a Paused mission resumes its *prior work* from history, so it
+    // first transitions to Interrupted (the status `resume_mission_impl`
+    // accepts) and then falls through to the ResumeMission path below to rebuild
+    // context and restart the runner. (Pending would be wrong here: the FLEET-001
+    // dispatcher only dispatches `not_before`-scheduled missions that carry a
+    // fresh `deferred_goal`, not paused missions continuing from history.)
     if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
         if mission.status == MissionStatus::Paused {
             control
                 .mission_store
-                .update_mission_status(mission_id, MissionStatus::Pending)
+                .update_mission_status(mission_id, MissionStatus::Interrupted)
                 .await
                 .map_err(internal_error)?;
             let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
                 mission_id,
-                status: MissionStatus::Pending,
+                status: MissionStatus::Interrupted,
                 summary: None,
             });
             // fall through to ResumeMission below
@@ -8955,6 +8957,12 @@ async fn control_actor_loop(
     // sweeps zombies, and wakes idle bosses whose board needs a decision.
     const BOARD_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
     let mut last_board_pass = tokio::time::Instant::now();
+    // FLEET-001 scheduling dispatch cadence: same throttling rationale as the
+    // board pass — a store scan on every 100ms tick is wasteful. Each pass
+    // expires past-deadline scheduled missions and, when the main session is
+    // idle, dispatches the highest-priority dispatchable one.
+    const SCHEDULER_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut last_scheduler_pass = tokio::time::Instant::now();
     // Per-boss "wake outstanding" flags, coalescing board wakes across passes.
     let mut board_wake_state: std::collections::HashMap<Uuid, bool> =
         std::collections::HashMap::new();
@@ -9276,6 +9284,66 @@ async fn control_actor_loop(
                                     });
                                     let _ = respond.send(UserMessageAck::Dropped);
                                     continue;
+                                }
+                            }
+                        }
+
+                        // FLEET-001 scheduled-mission deferral: if the target is a
+                        // Pending mission whose `not_before` is still in the future
+                        // and it isn't already running, stash the goal and leave it
+                        // Pending. The scheduler tick re-injects it as a normal user
+                        // message once the dispatch window opens. Strict control-plane
+                        // messages are operational and never deferred.
+                        if !strict {
+                            if let Some(tid) = effective_target {
+                                let target_running =
+                                    target_in_parallel || running_mid == Some(tid);
+                                if !target_running {
+                                    if let Ok(Some(m)) = mission_store.get_mission(tid).await {
+                                        let now = chrono::Utc::now();
+                                        if m.status == MissionStatus::Pending
+                                            && !m.is_dispatchable_at(now)
+                                        {
+                                            // Append to any previously-stashed goal so
+                                            // multiple pre-dispatch messages aren't lost.
+                                            let combined = match mission_store
+                                                .get_deferred_goal(tid)
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                            {
+                                                Some(prev) if !prev.is_empty() => {
+                                                    format!("{prev}\n{content}")
+                                                }
+                                                _ => content.clone(),
+                                            };
+                                            if let Err(e) = mission_store
+                                                .set_deferred_goal(tid, Some(combined))
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    mission_id = %tid,
+                                                    "Failed to stash deferred goal: {e}"
+                                                );
+                                            }
+                                            // Surface the queued goal so the UI shows it
+                                            // as pending until dispatch.
+                                            let _ = events_tx.send(AgentEvent::UserMessage {
+                                                id,
+                                                content: content.clone(),
+                                                queued: true,
+                                                mission_id: Some(tid),
+                                                source: source.clone(),
+                                            });
+                                            tracing::info!(
+                                                mission_id = %tid,
+                                                not_before = ?m.scheduling.not_before,
+                                                "Deferred scheduled mission: goal stashed until dispatch window"
+                                            );
+                                            let _ = respond.send(UserMessageAck::Queued);
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -11814,6 +11882,118 @@ async fn control_actor_loop(
                         &mut board_wake_state,
                     )
                     .await;
+                }
+
+                // FLEET-001 scheduling dispatch: expire past-deadline scheduled
+                // missions, then start the highest-priority dispatchable one when
+                // the main session is idle. Throttled like the board pass.
+                if last_scheduler_pass.elapsed() >= SCHEDULER_PASS_INTERVAL {
+                    last_scheduler_pass = tokio::time::Instant::now();
+                    match mission_store.get_scheduled_pending_missions().await {
+                        Ok(pending) => {
+                            let now = chrono::Utc::now();
+                            // 1. Expire any scheduled mission whose deadline elapsed
+                            //    before it ever dispatched.
+                            let mut live: Vec<Mission> = Vec::with_capacity(pending.len());
+                            for m in pending {
+                                if m.is_past_deadline(now) {
+                                    tracing::info!(
+                                        mission_id = %m.id,
+                                        deadline = ?m.scheduling.deadline,
+                                        "Scheduler: expiring scheduled mission past deadline"
+                                    );
+                                    let _ = mission_store.set_deferred_goal(m.id, None).await;
+                                    if let Err(e) = mission_store
+                                        .update_mission_status_with_reason(
+                                            m.id,
+                                            MissionStatus::Failed,
+                                            Some("deadline_exceeded"),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            mission_id = %m.id,
+                                            "Scheduler: failed to expire mission: {e}"
+                                        );
+                                    } else {
+                                        maybe_schedule_mission_metadata_refresh_for_status(
+                                            &mission_store,
+                                            &events_tx,
+                                            m.id,
+                                            MissionStatus::Failed,
+                                        );
+                                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            mission_id: m.id,
+                                            status: MissionStatus::Failed,
+                                            summary: Some(
+                                                "Scheduled mission expired: deadline passed before dispatch"
+                                                    .to_string(),
+                                            ),
+                                        });
+                                    }
+                                } else {
+                                    live.push(m);
+                                }
+                            }
+                            // 2. Dispatch the next runnable mission. Only when the
+                            //    main session is idle AND there is a free parallel slot
+                            //    — an explicitly-targeted message starts a parallel
+                            //    runner (Case 2), which DROPS at capacity, so dispatching
+                            //    without a slot would surface a spurious error.
+                            let parallel_running = parallel_runners
+                                .values()
+                                .filter(|r| r.is_running())
+                                .count();
+                            let max_parallel = crate::settings::max_parallel_missions_cached_or(
+                                config.max_parallel_missions,
+                            );
+                            if running.is_none() && parallel_running < max_parallel {
+                                if let Some(next) =
+                                    super::mission_store::select_next_runnable_mission(&live, now)
+                                {
+                                    let mission_id = next.id;
+                                    let priority = next.scheduling.priority;
+                                    if let Ok(Some(goal)) =
+                                        mission_store.get_deferred_goal(mission_id).await
+                                    {
+                                        // Deliberately do NOT clear the goal here. The
+                                        // Pending->Active transition that the dispatched
+                                        // message triggers is what removes the mission from
+                                        // `get_scheduled_pending_missions` (status filter),
+                                        // so it can't be re-dispatched. Leaving the goal in
+                                        // place means a rare dispatch drop (capacity race)
+                                        // simply retries on the next pass instead of losing
+                                        // the scheduled work.
+                                        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+                                        match self_cmd_tx.try_send(ControlCommand::UserMessage {
+                                            id: Uuid::new_v4(),
+                                            content: goal,
+                                            agent: None,
+                                            target_mission_id: Some(mission_id),
+                                            strict: false,
+                                            source: Some("scheduler".to_string()),
+                                            respond: ack_tx,
+                                        }) {
+                                            Ok(()) => tracing::info!(
+                                                mission_id = %mission_id,
+                                                priority,
+                                                "Scheduler: dispatching scheduled mission"
+                                            ),
+                                            Err(e) => tracing::warn!(
+                                                mission_id = %mission_id,
+                                                "Scheduler: dispatch enqueue failed; will retry: {e}"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Scheduler: failed to list scheduled pending missions: {e}"
+                            );
+                        }
+                    }
                 }
             }
             // Force-reap a runner whose cancel was fired but whose

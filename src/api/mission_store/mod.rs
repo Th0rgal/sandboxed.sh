@@ -33,10 +33,12 @@ pub struct MissionScheduling {
     /// Dispatch priority; higher wins. FIFO (by `created_at`) within a tier.
     #[serde(default)]
     pub priority: i32,
-    /// Do not dispatch before this RFC3339 timestamp.
+    /// Do not dispatch before this RFC3339 timestamp. The scheduler holds the
+    /// mission's goal in `deferred_goal` and only dispatches once `now` passes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<String>,
-    /// Soft deadline (RFC3339) for observability/enforcement.
+    /// Deadline (RFC3339). The scheduler fails a still-undispatched scheduled
+    /// mission with reason `deadline_exceeded` once this passes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<String>,
 }
@@ -1465,6 +1467,19 @@ pub trait MissionStore: Send + Sync {
     /// Get all missions currently in active status (for startup recovery).
     async fn get_all_active_missions(&self) -> Result<Vec<Mission>, String>;
 
+    /// FLEET-001 scheduling: persist (or clear, with `None`) the deferred goal a
+    /// `not_before`-scheduled mission will run once the dispatcher picks it up.
+    async fn set_deferred_goal(&self, mission_id: Uuid, goal: Option<String>)
+        -> Result<(), String>;
+
+    /// FLEET-001 scheduling: read the deferred goal for a mission, if any.
+    async fn get_deferred_goal(&self, mission_id: Uuid) -> Result<Option<String>, String>;
+
+    /// FLEET-001 scheduling: all `Pending` missions that carry a deferred goal
+    /// (i.e. are armed for scheduled dispatch). Scheduling fields are populated
+    /// so the dispatcher can order/expire them; history is not loaded.
+    async fn get_scheduled_pending_missions(&self) -> Result<Vec<Mission>, String>;
+
     /// Record the first time the user opened this mission, if not already set.
     /// Returns `Some(timestamp)` if the field was set by this call, or `None`
     /// if it was already populated (no-op). Used by the new
@@ -2888,6 +2903,73 @@ mod tests {
             active_missions.is_empty(),
             "Pending missions should not appear in active missions list"
         );
+    }
+
+    /// FLEET-001: a Pending mission appears in the scheduled-pending list only
+    /// while it carries a deferred goal, and disappears once dispatched (Active)
+    /// or the goal is cleared.
+    #[tokio::test]
+    async fn test_scheduled_pending_missions_track_deferred_goal() {
+        let store = InMemoryMissionStore::new();
+        let mission = store
+            .create_mission(Some("Scheduled"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+
+        // No goal yet -> not scheduled-pending.
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
+
+        // Stash a goal -> appears, with the goal readable.
+        store
+            .set_deferred_goal(mission.id, Some("do the thing".to_string()))
+            .await
+            .expect("set goal");
+        assert_eq!(
+            store
+                .get_deferred_goal(mission.id)
+                .await
+                .expect("get goal")
+                .as_deref(),
+            Some("do the thing")
+        );
+        let pending = store.get_scheduled_pending_missions().await.expect("list");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, mission.id);
+
+        // Dispatched (Active) -> no longer scheduled-pending even with goal set.
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("activate");
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
+
+        // Back to Pending but goal cleared -> still not scheduled-pending.
+        store
+            .update_mission_status(mission.id, MissionStatus::Pending)
+            .await
+            .expect("repend");
+        store
+            .set_deferred_goal(mission.id, None)
+            .await
+            .expect("clear goal");
+        assert!(store
+            .get_deferred_goal(mission.id)
+            .await
+            .expect("get goal")
+            .is_none());
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     /// Test that missions transition correctly from Pending to Active.
