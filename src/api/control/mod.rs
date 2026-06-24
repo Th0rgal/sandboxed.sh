@@ -63,6 +63,11 @@ use super::routes::AppState;
 pub(crate) const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
 const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
 
+/// One entry in the main control queue: (message id, content, optional per-message
+/// agent override, target mission id, source). Aliased to keep signatures under
+/// clippy's `type_complexity` threshold.
+type ControlQueueEntry = (Uuid, String, Option<String>, Option<Uuid>, Option<String>);
+
 /// Silence threshold before declaring a mission stuck. Conservative so
 /// legitimately long codex turns (Lean compiles, CI polls) don't trigger
 /// false positives. Shared between the watchdog loop and the actor's
@@ -2592,9 +2597,7 @@ pub struct QueuedMessage {
 
 /// Serialize the control session queue to a stable JSON snapshot for
 /// persistence across restarts (see `MissionStore::save_control_queue`).
-fn serialize_queue_snapshot(
-    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>, Option<String>)>,
-) -> String {
+fn serialize_queue_snapshot(queue: &VecDeque<ControlQueueEntry>) -> String {
     let items: Vec<QueuedMessage> = queue
         .iter()
         .map(|(id, content, agent, target_mid, source)| QueuedMessage {
@@ -2620,7 +2623,7 @@ fn serialize_queue_snapshot(
 async fn persist_control_queue_if_changed(
     mission_store: &Arc<dyn MissionStore>,
     session_user_id: &str,
-    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>, Option<String>)>,
+    queue: &VecDeque<ControlQueueEntry>,
     last_persisted: &mut String,
 ) {
     let snapshot = serialize_queue_snapshot(queue);
@@ -5782,10 +5785,12 @@ pub async fn resume_mission(
 
     let control = control_for_user(&state, &user).await;
 
-    // FLEET-004: a Paused mission resumes by returning to the dispatcher queue
-    // (Paused → Pending) rather than going through the interrupted-mission
-    // context-reconstruction path below. The dispatcher re-selects it on its
-    // next pass, honoring priority/not_before ordering (FLEET-001).
+    // FLEET-004: a Paused mission first returns to Pending, then falls through to
+    // the ResumeMission path below to actually rebuild context and start the
+    // runner. The FLEET-001 priority/not_before dispatcher that would otherwise
+    // re-select a Pending mission is not yet wired in production, so resuming has
+    // to start the mission directly rather than parking it in Pending — otherwise
+    // the agent never runs again from the resume API alone.
     if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
         if mission.status == MissionStatus::Paused {
             control
@@ -5798,18 +5803,7 @@ pub async fn resume_mission(
                 status: MissionStatus::Pending,
                 summary: None,
             });
-            let updated = control
-                .mission_store
-                .get_mission(mission_id)
-                .await
-                .map_err(internal_error)?
-                .ok_or_else(|| {
-                    (
-                        StatusCode::NOT_FOUND,
-                        format!("Mission {} not found", mission_id),
-                    )
-                })?;
-            return Ok(Json(updated));
+            // fall through to ResumeMission below
         }
     }
 
@@ -7796,7 +7790,7 @@ struct RoutedAutomationMessage {
 }
 
 fn enqueue_agent_finished_messages(
-    queue: &mut VecDeque<(Uuid, String, Option<String>, Option<Uuid>, Option<String>)>,
+    queue: &mut VecDeque<ControlQueueEntry>,
     messages: Vec<RoutedAutomationMessage>,
 ) {
     for message in messages {
@@ -8083,10 +8077,7 @@ async fn post_turn_handle_grok_goal(
     }
 }
 
-fn queue_has_pending_target_mission(
-    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>, Option<String>)>,
-    mission_id: Uuid,
-) -> bool {
+fn queue_has_pending_target_mission(queue: &VecDeque<ControlQueueEntry>, mission_id: Uuid) -> bool {
     queue
         .iter()
         .any(|(_id, _msg, _agent, target_mid, _source)| *target_mid == Some(mission_id))
@@ -8857,8 +8848,7 @@ async fn control_actor_loop(
 ) {
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
-    let mut queue: VecDeque<(Uuid, String, Option<String>, Option<Uuid>, Option<String>)> =
-        VecDeque::new();
+    let mut queue: VecDeque<ControlQueueEntry> = VecDeque::new();
     // Re-drive any messages that were queued before the last restart. They are
     // persisted as a JSON snapshot (see `persist_control_queue_if_changed`) so a
     // restart doesn't lose pending work. We re-inject them through the normal
@@ -9295,7 +9285,7 @@ async fn control_actor_loop(
                             if target_in_parallel {
                                 if let Some(runner) = parallel_runners.get_mut(&tid) {
                                     let was_running = runner.is_running();
-                                    runner.queue_message(id, content.clone(), msg_agent);
+                                    runner.queue_message(id, content.clone(), msg_agent, source.clone());
                                     let _ = events_tx.send(AgentEvent::UserMessage {
                                         id,
                                         content: content.clone(),
@@ -9412,7 +9402,7 @@ async fn control_actor_loop(
                                                 runner.history.push((entry.role.clone(), entry.content.clone()));
                                             }
                                             // Queue the message
-                                            runner.queue_message(id, content.clone(), msg_agent);
+                                            runner.queue_message(id, content.clone(), msg_agent, source.clone());
                                             // Emit user message event
                                             let _ = events_tx.send(AgentEvent::UserMessage {
                                                 id,
@@ -10151,7 +10141,7 @@ async fn control_actor_loop(
                             }
 
                             // Queue the initial message (no per-message agent override for parallel start)
-                            runner.queue_message(Uuid::new_v4(), content, None);
+                            runner.queue_message(Uuid::new_v4(), content, None, None);
 
                             // Start execution
                             let started = runner.start_next(
@@ -10534,7 +10524,7 @@ async fn control_actor_loop(
                                             .history
                                             .push((entry.role.clone(), entry.content.clone()));
                                     }
-                                    runner.queue_message(Uuid::new_v4(), resume_prompt, None);
+                                    runner.queue_message(Uuid::new_v4(), resume_prompt, None, None);
 
                                     let started = runner.start_next(
                                         config.clone(),
@@ -10853,7 +10843,7 @@ async fn control_actor_loop(
                                     content: qm.content.clone(),
                                     agent: qm.agent.clone(),
                                     mission_id: Some(*mid),
-                                    source: None,
+                                    source: qm.source.clone(),
                                 });
                             }
                         }
@@ -11675,7 +11665,7 @@ async fn control_actor_loop(
                                 .await;
                                 for message in messages {
                                     if message.target_mission_id == *mission_id {
-                                        runner.queue_message(Uuid::new_v4(), message.content, None);
+                                        runner.queue_message(Uuid::new_v4(), message.content, None, None);
                                         continue;
                                     }
 
