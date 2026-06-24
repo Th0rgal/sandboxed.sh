@@ -2809,6 +2809,7 @@ impl MissionRunner {
         let user_id = self.user_id.clone();
         let user_message = msg.content.clone();
         let msg_id = msg.id;
+        let msg_source = msg.source.clone();
         tracing::info!(
             mission_id = %mission_id,
             workspace_id = %workspace_id,
@@ -2824,13 +2825,14 @@ impl MissionRunner {
             cmd_tx: mission_cmd_tx,
         };
 
-        // Emit user message event with mission context
+        // Emit user message event with mission context, preserving the original
+        // attribution (api:/telegram/…) stored on the queued message.
         let _ = events_tx.send(AgentEvent::UserMessage {
             id: msg_id,
             content: user_message.clone(),
             queued: false,
             mission_id: Some(mission_id),
-            source: None,
+            source: msg_source,
         });
 
         let handle = tokio::spawn(async move {

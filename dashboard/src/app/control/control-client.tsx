@@ -7357,8 +7357,17 @@ export default function ControlClient() {
 
         setItems((prev) => {
           const filtered = prev.filter((it) => it.kind !== "phase");
+          // Match the live row by id AND mission scope, mirroring the
+          // text_delta flush. Without the mission guard a shared bubble id
+          // (e.g. the "text-op-latest" default) could merge a text_op into
+          // another mission's stream bubble.
           const existingIdx = filtered.findIndex(
-            (it) => it.kind === "stream" && it.id === bubbleId,
+            (it) =>
+              it.kind === "stream" &&
+              it.id === bubbleId &&
+              (acceptedMissionId == null ||
+                it.missionId == null ||
+                it.missionId === acceptedMissionId),
           );
           const existing =
             existingIdx >= 0 && filtered[existingIdx]?.kind === "stream"
