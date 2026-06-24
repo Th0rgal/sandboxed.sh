@@ -11975,19 +11975,23 @@ async fn control_actor_loop(
                                     live.push(m);
                                 }
                             }
-                            // 2. Dispatch the next runnable mission. Only when the
-                            //    main session is idle AND there is a free parallel slot
-                            //    — an explicitly-targeted message starts a parallel
-                            //    runner (Case 2), which DROPS at capacity, so dispatching
-                            //    without a slot would surface a spurious error.
+                            // 2. Dispatch the next runnable mission when there is spare
+                            //    concurrency. The targeted scheduler message starts a
+                            //    parallel runner (Case 2, explicit target => force
+                            //    parallel), which DROPS at capacity — so mirror its check
+                            //    (main + parallel < max_parallel) rather than requiring the
+                            //    main session to be idle, otherwise eligible scheduled
+                            //    missions stall behind a busy main runner.
                             let parallel_running = parallel_runners
                                 .values()
                                 .filter(|r| r.is_running())
                                 .count();
+                            let total_running =
+                                parallel_running + if running.is_some() { 1 } else { 0 };
                             let max_parallel = crate::settings::max_parallel_missions_cached_or(
                                 config.max_parallel_missions,
                             );
-                            if running.is_none() && parallel_running < max_parallel {
+                            if total_running < max_parallel {
                                 if let Some(next) =
                                     super::mission_store::select_next_runnable_mission(&live, now)
                                 {
