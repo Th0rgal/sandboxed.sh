@@ -5682,6 +5682,69 @@ pub async fn pause_mission(
     Ok(Json(updated))
 }
 
+/// Overrides accepted when cloning a mission (FLEET-002). Any field left unset
+/// inherits from the source mission.
+#[derive(Debug, Default, Deserialize)]
+pub struct CloneMissionRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub model_effort: Option<String>,
+    #[serde(default)]
+    pub model_override: Option<String>,
+}
+
+/// Clone an existing mission's configuration into a fresh `Pending` mission
+/// (FLEET-002). Copies title, workspace, agent, config profile, working
+/// directory and model settings; the optional body overrides
+/// title/backend/model_effort/model_override. Conversation history is **not**
+/// copied — the clone starts fresh. Reuses the standard create path so all
+/// backend/agent/model validation applies identically.
+pub async fn clone_mission(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    body: Option<Json<CloneMissionRequest>>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let overrides = body.map(|b| b.0).unwrap_or_default();
+
+    let control = control_for_user(&state, &user).await;
+    let source = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+
+    let req = CreateMissionRequest {
+        title: overrides.title.or_else(|| source.title.clone()),
+        workspace_id: Some(source.workspace_id),
+        agent: source.agent.clone(),
+        model_override: overrides
+            .model_override
+            .or_else(|| source.model_override.clone()),
+        model_effort: overrides
+            .model_effort
+            .or_else(|| source.model_effort.clone()),
+        config_profile: source.config_profile.clone(),
+        backend: overrides.backend.or_else(|| Some(source.backend.clone())),
+        parent_mission_id: None,
+        working_directory: source.working_directory.clone(),
+        priority: None,
+        not_before: None,
+        deadline: None,
+    };
+
+    create_mission(State(state), Extension(user), Some(Json(req))).await
+}
+
 /// Request body for resuming a mission
 #[derive(Debug, Deserialize, Default)]
 pub struct ResumeMissionRequest {
