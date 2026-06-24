@@ -9360,6 +9360,21 @@ async fn control_actor_loop(
                                     // Load mission and start in parallel
                                     match load_mission_record(&mission_store, tid).await {
                                         Ok(mission) => {
+                                            // A paused mission must not be auto-started by an
+                                            // incoming message — respect the pause. The user
+                                            // resumes it explicitly via the resume API.
+                                            if mission.status == MissionStatus::Paused {
+                                                let _ = events_tx.send(AgentEvent::Error {
+                                                    message: format!(
+                                                        "Mission {} is paused; resume it before sending messages",
+                                                        tid
+                                                    ),
+                                                    mission_id: Some(tid),
+                                                    resumable: true,
+                                                });
+                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                continue;
+                                            }
                                             // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
                                             if matches!(
                                                 mission.status,
@@ -10120,6 +10135,15 @@ async fn control_actor_loop(
                                     continue;
                                 }
                             };
+
+                            // Don't start a paused mission — resume it explicitly first.
+                            if mission.status == MissionStatus::Paused {
+                                let _ = respond.send(Err(format!(
+                                    "Mission {} is paused; resume it before starting",
+                                    mission_id
+                                )));
+                                continue;
+                            }
 
                             // Create a new MissionRunner
                             let mut runner = super::mission_runner::MissionRunner::new(
