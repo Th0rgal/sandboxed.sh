@@ -551,6 +551,33 @@ mod stall_guard_tests {
         assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
         reset_stall_guard(boss);
     }
+
+    #[tokio::test]
+    async fn delete_rejects_paused_mission_until_resumed_or_cancelled() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mid = mk(&store, None).await;
+        store
+            .update_mission_status(mid, MissionStatus::Paused)
+            .await
+            .expect("pause");
+
+        // Deleting a paused mission is refused with 409 and leaves it intact.
+        let err = delete_mission_with_children(&store, mid, &[])
+            .await
+            .expect_err("paused delete should be refused");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(store.get_mission(mid).await.expect("get").is_some());
+
+        // Once it leaves Paused (e.g. resumed → Interrupted), delete succeeds.
+        store
+            .update_mission_status(mid, MissionStatus::Interrupted)
+            .await
+            .expect("resume");
+        delete_mission_with_children(&store, mid, &[])
+            .await
+            .expect("delete after resume");
+        assert!(store.get_mission(mid).await.expect("get").is_none());
+    }
 }
 
 struct MetadataRefreshTaskEntry {
@@ -5916,13 +5943,26 @@ async fn delete_mission_with_children(
     mission_id: Uuid,
     running: &[super::mission_runner::RunningMissionInfo],
 ) -> Result<Vec<Uuid>, (StatusCode, String)> {
-    let Some(_) = mission_store
+    let Some(target) = mission_store
         .get_mission(mission_id)
         .await
         .map_err(internal_error)?
     else {
         return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
     };
+
+    // FLEET-004: a Paused mission is deliberately parked for later resume —
+    // deleting it would silently discard work the operator chose to keep. Require
+    // an explicit resume-or-cancel first (mirrors the pause endpoint's 409s).
+    if target.status == MissionStatus::Paused {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot delete a paused mission ({}). Resume or cancel it first.",
+                mission_id
+            ),
+        ));
+    }
 
     let child_ids = collect_child_mission_ids(mission_store, mission_id).await?;
     let mut ids_to_delete = Vec::with_capacity(child_ids.len() + 1);
