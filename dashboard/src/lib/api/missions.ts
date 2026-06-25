@@ -59,6 +59,8 @@ export interface Mission {
   created_at: string;
   updated_at: string;
   interrupted_at?: string;
+  /** FLEET-004: when this mission was last paused (set while status is `paused`). */
+  paused_at?: string;
   /**
    * Timestamp of the user's first open since this mission last entered
    * `awaiting_user`. Drives the 1h ack grace timer (backend) and the

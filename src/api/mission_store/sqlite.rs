@@ -495,7 +495,8 @@ CREATE TABLE IF NOT EXISTS missions (
     priority INTEGER NOT NULL DEFAULT 0,
     not_before TEXT,
     deadline TEXT,
-    deferred_goal TEXT
+    deferred_goal TEXT,
+    paused_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
@@ -2074,6 +2075,19 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add deferred_goal column: {}", e))?;
         }
 
+        // FLEET-004: when a mission was last paused (status Paused). Drives pause
+        // age in the UI and future zombie-pause cleanup.
+        let has_paused_at_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'paused_at'")
+            .map_err(|e| format!("Failed to check for paused_at column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_paused_at_column {
+            tracing::info!("Running migration: adding 'paused_at' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN paused_at TEXT", [])
+                .map_err(|e| format!("Failed to add paused_at column: {}", e))?;
+        }
+
         Ok(())
     }
 
@@ -2375,7 +2389,7 @@ impl MissionStore for SqliteMissionStore {
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode,
                             COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
-                            COALESCE(priority, 0) as priority, not_before, deadline
+                            COALESCE(priority, 0) as priority, not_before, deadline, paused_at
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2414,6 +2428,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(13)?,
                         updated_at: row.get(14)?,
                         interrupted_at: row.get(15)?,
+                        paused_at: row.get(31).ok().flatten(),
                         resumable: row.get::<_, i32>(16)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -2493,7 +2508,7 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
-                            COALESCE(priority, 0) as priority, not_before, deadline FROM missions WHERE id = ?1",
+                            COALESCE(priority, 0) as priority, not_before, deadline, paused_at FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -2529,6 +2544,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(13)?,
                         updated_at: row.get(14)?,
                         interrupted_at: row.get(15)?,
+                        paused_at: row.get(31).ok().flatten(),
                         resumable: row.get::<_, i32>(16)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -2657,6 +2673,7 @@ impl MissionStore for SqliteMissionStore {
             created_at: now.clone(),
             updated_at: now.clone(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: Some(session_id.clone()),
@@ -2745,6 +2762,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(14)?,
                         updated_at: row.get(15)?,
                         interrupted_at: row.get(16)?,
+                        paused_at: None,
                         resumable: row.get::<_, i32>(17)? != 0,
                         desktop_sessions: Vec::new(),
                         session_id: row.get(18)?,
@@ -3425,6 +3443,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(7)?,
                         updated_at: row.get(8)?,
                         interrupted_at: row.get(9)?,
+                        paused_at: None,
                         resumable: row.get::<_, i32>(10)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -3497,6 +3516,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(7)?,
                         updated_at: row.get(8)?,
                         interrupted_at: row.get(9)?,
+                        paused_at: None,
                         resumable: row.get::<_, i32>(10)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -3561,6 +3581,26 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn set_mission_paused_at(
+        &self,
+        mission_id: Uuid,
+        paused_at: Option<String>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET paused_at = ?1 WHERE id = ?2",
+                params![paused_at, id],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn get_scheduled_pending_missions(&self) -> Result<Vec<Mission>, String> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -3609,6 +3649,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(7)?,
                         updated_at: row.get(8)?,
                         interrupted_at: row.get(9)?,
+                        paused_at: None,
                         resumable: row.get::<_, i32>(10)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -6042,6 +6083,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(6).unwrap_or_default(),
                         updated_at: row.get(7).unwrap_or_default(),
                         interrupted_at: None,
+                        paused_at: None,
                         resumable: false,
                         desktop_sessions: vec![],
                         session_id: None,

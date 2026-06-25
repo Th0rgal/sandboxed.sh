@@ -86,6 +86,10 @@ pub struct Mission {
     /// When this mission was interrupted (if status is Interrupted)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interrupted_at: Option<String>,
+    /// FLEET-004: when this mission was last paused (if status is Paused). RFC3339.
+    /// Lets the UI show pause age and enables future zombie-pause cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
     /// Whether this mission can be resumed
     #[serde(default)]
     pub resumable: bool,
@@ -1479,6 +1483,14 @@ pub trait MissionStore: Send + Sync {
     /// (i.e. are armed for scheduled dispatch). Scheduling fields are populated
     /// so the dispatcher can order/expire them; history is not loaded.
     async fn get_scheduled_pending_missions(&self) -> Result<Vec<Mission>, String>;
+
+    /// FLEET-004: set (or clear, with `None`) the timestamp at which a mission
+    /// was paused. Set on pause, cleared on resume.
+    async fn set_mission_paused_at(
+        &self,
+        mission_id: Uuid,
+        paused_at: Option<String>,
+    ) -> Result<(), String>;
 
     /// Record the first time the user opened this mission, if not already set.
     /// Returns `Some(timestamp)` if the field was set by this call, or `None`
@@ -2972,6 +2984,44 @@ mod tests {
             .is_empty());
     }
 
+    /// FLEET-004: paused_at round-trips through the store (set on pause, read
+    /// back on the mission, cleared on resume).
+    #[tokio::test]
+    async fn test_paused_at_round_trip() {
+        let store = InMemoryMissionStore::new();
+        let mission = store
+            .create_mission(Some("Pausable"), None, None, None, None, None, None)
+            .await
+            .expect("create");
+        assert!(mission.paused_at.is_none());
+
+        store
+            .set_mission_paused_at(mission.id, Some("2026-06-25T05:00:00+00:00".to_string()))
+            .await
+            .expect("set paused_at");
+        let loaded = store
+            .get_mission(mission.id)
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!(
+            loaded.paused_at.as_deref(),
+            Some("2026-06-25T05:00:00+00:00")
+        );
+
+        store
+            .set_mission_paused_at(mission.id, None)
+            .await
+            .expect("clear paused_at");
+        assert!(store
+            .get_mission(mission.id)
+            .await
+            .expect("get")
+            .expect("some")
+            .paused_at
+            .is_none());
+    }
+
     /// Test that missions transition correctly from Pending to Active.
     #[tokio::test]
     async fn test_mission_status_transition_pending_to_active() {
@@ -3103,6 +3153,7 @@ mod tests {
             created_at: created_at.to_string(),
             updated_at: created_at.to_string(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,

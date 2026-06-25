@@ -5926,6 +5926,11 @@ pub async fn resume_mission(
             .update_mission_status(mission_id, MissionStatus::Interrupted)
             .await
             .map_err(internal_error)?;
+        // FLEET-004: leaving Paused clears the pause timestamp.
+        let _ = control
+            .mission_store
+            .set_mission_paused_at(mission_id, None)
+            .await;
         let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
             mission_id,
             status: MissionStatus::Interrupted,
@@ -10643,6 +10648,13 @@ async fn control_actor_loop(
                             .await
                         {
                             Ok(()) => {
+                                // FLEET-004: stamp the pause time for UI pause-age.
+                                let _ = mission_store
+                                    .set_mission_paused_at(
+                                        mission_id,
+                                        Some(chrono::Utc::now().to_rfc3339()),
+                                    )
+                                    .await;
                                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
                                     mission_id,
                                     status: MissionStatus::Paused,
@@ -18928,6 +18940,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now.clone(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -18960,6 +18973,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -19007,6 +19021,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -19051,6 +19066,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -19095,6 +19111,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -19139,6 +19156,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -19267,6 +19285,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now.clone(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,

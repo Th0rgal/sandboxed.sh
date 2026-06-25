@@ -117,6 +117,7 @@ impl MissionStore for InMemoryMissionStore {
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: Some(Uuid::new_v4().to_string()),
@@ -481,6 +482,17 @@ impl MissionStore for InMemoryMissionStore {
 
     async fn get_deferred_goal(&self, mission_id: Uuid) -> Result<Option<String>, String> {
         Ok(self.deferred_goals.read().await.get(&mission_id).cloned())
+    }
+
+    async fn set_mission_paused_at(
+        &self,
+        mission_id: Uuid,
+        paused_at: Option<String>,
+    ) -> Result<(), String> {
+        if let Some(m) = self.missions.write().await.get_mut(&mission_id) {
+            m.paused_at = paused_at;
+        }
+        Ok(())
     }
 
     async fn get_scheduled_pending_missions(&self) -> Result<Vec<Mission>, String> {

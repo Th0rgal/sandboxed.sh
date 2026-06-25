@@ -6642,6 +6642,7 @@ mod tests {
             created_at: "2026-05-20T00:00:00Z".to_string(),
             updated_at: "2026-05-20T00:00:00Z".to_string(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: vec![],
             session_id: None,
