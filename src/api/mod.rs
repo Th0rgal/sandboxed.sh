@@ -59,6 +59,7 @@ pub(crate) mod supervision;
 pub mod system;
 pub mod telegram;
 pub mod types;
+pub mod usage_optimize;
 pub mod workspaces;
 
 pub use routes::serve;

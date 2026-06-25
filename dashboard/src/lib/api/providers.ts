@@ -352,8 +352,48 @@ export interface ProviderUsage {
   codex_credits_balance?: number;
   codex_credits_unlimited?: boolean;
   codex_source?: "probe" | "passive";
+  // Provider-faithful normalized view for token-spend optimization. Each window
+  // only carries the fields its provider actually reports (so shapes differ by
+  // vendor); `burn` is null unless a pace/rate could be derived. One call gives
+  // pct_remaining, reset_at, and burn rate together.
+  optimize?: UsageOptimize;
   // Any additional fields
   [key: string]: unknown;
+}
+
+export interface UsageOptimizeBurn {
+  /** %-window providers: projected utilization at reset (>=100 ⇒ will exhaust). */
+  projected_pct_at_reset?: number | null;
+  on_track_to_exhaust?: boolean | null;
+  /** Absolute-token windows: observed consumption rate from the snapshot delta. */
+  tokens_per_min?: number | null;
+  sample_seconds?: number | null;
+  projected_exhaustion_at?: string | null;
+  basis?: "window_pace" | "observed_delta" | "window_pace+observed_delta";
+}
+
+export interface UsageOptimizeWindow {
+  key: string;
+  label: string;
+  metric: "tokens" | "requests" | "mixed";
+  source: string;
+  pct_used: number | null;
+  pct_remaining: number | null;
+  limit: number | null;
+  remaining: number | null;
+  used: number | null;
+  window_seconds: number | null;
+  reset_at: string | null;
+  reset_in_seconds: number | null;
+  burn: UsageOptimizeBurn | null;
+  [key: string]: unknown;
+}
+
+export interface UsageOptimize {
+  as_of: string;
+  /** Key of the most binding window (lowest pct_remaining), or null. */
+  primary_window: string | null;
+  windows: UsageOptimizeWindow[];
 }
 
 export async function getProviderUsage(id: string): Promise<ProviderUsage> {

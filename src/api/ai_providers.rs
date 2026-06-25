@@ -7322,8 +7322,22 @@ async fn live_fetch_and_cache(
     state: Arc<super::routes::AppState>,
     id: String,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
+    // Grab the previous snapshot (value + age) BEFORE we overwrite it, so the
+    // optimize block can derive an observed burn rate from the delta between
+    // the two samples.
+    let prev = state.provider_usage_cache.get(&id).await;
     let result = get_provider_usage(State(Arc::clone(&state)), AxumPath(id.clone())).await?;
-    let value = result.0;
+    let mut value = result.0;
+
+    // Append the provider-faithful normalized `optimize` block (pct_remaining,
+    // reset_at, burn) so a client gets all three in one call. Computed here,
+    // once, so both the single and bulk cached endpoints serve it.
+    let prev_ref = prev.as_ref().map(|c| (&c.value, c.fetched_at.elapsed()));
+    let optimize = super::usage_optimize::build_optimize_block(&value, prev_ref);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("optimize".to_string(), optimize);
+    }
+
     state.provider_usage_cache.insert(id, value.clone()).await;
     Ok(value)
 }
