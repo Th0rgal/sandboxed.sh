@@ -598,18 +598,21 @@ impl LibraryStore {
         let base_canonical = if base.exists() {
             base.canonicalize()?
         } else {
+            // Walk up to the nearest existing ancestor and canonicalize THAT, so the
+            // prefix checks below compare fully-resolved paths — exactly how the
+            // target's ancestors are canonicalized. Leaving the ancestor unresolved
+            // makes a base that crosses a symlink (e.g. macOS /var → /private/var,
+            // or a Docker volume mount) spuriously reject legitimate fresh-install
+            // writes, because the target side resolves the symlink and the base side
+            // does not.
             let mut candidate = base.to_path_buf();
-            while !candidate.exists()
-                && candidate != candidate.parent().map(|p| p.to_path_buf()).unwrap_or(candidate.clone())
-            {
-                if let Some(parent) = candidate.parent() {
-                    candidate = parent.to_path_buf();
-                } else {
-                    break;
+            while !candidate.exists() {
+                match candidate.parent() {
+                    Some(parent) if parent != candidate => candidate = parent.to_path_buf(),
+                    _ => break,
                 }
             }
-            // Try to canonicalize base itself (may succeed if just created), fall back to resolved ancestor
-            base.canonicalize().ok().unwrap_or_else(|| candidate)
+            candidate.canonicalize().unwrap_or(candidate)
         };
 
         // If the file exists, verify it's within the base directory via full canonicalization
@@ -635,15 +638,18 @@ impl LibraryStore {
                 }
                 current = parent.to_path_buf();
             }
-            // Confirm the target genuinely starts with base path using string-level prefix.
-            // This works even when base doesn't exist on disk yet (no symlinks can interfere).
-            let base_str = base_canonical.to_string_lossy();
-            let target_str = target.to_string_lossy();
-            if !target_str.starts_with(base_str.as_ref()) {
+            // Confirm the target genuinely descends from base. Use component-aware
+            // `Path::starts_with` (NOT string-level `str::starts_with`): a raw string
+            // prefix would let a sibling that merely shares a name prefix slip through
+            // — e.g. base `…/lib` vs target `…/library/evil`. Compared against the
+            // literal `base` the target was built from; symlink safety for the
+            // already-existing portion is enforced by the ancestor canonicalization
+            // check above (base itself may not exist yet on a fresh install).
+            if !target.starts_with(base) {
                 anyhow::bail!("Path escapes allowed directory");
             }
             // Ensure target is strictly deeper than base (target != base).
-            if target_str == base_str {
+            if target == base {
                 anyhow::bail!("Target equals base directory");
             }
         }
@@ -2414,6 +2420,62 @@ This is the body."#;
     fn test_validate_relative_file_path_allows_profile_paths() {
         assert!(LibraryStore::validate_relative_file_path(".opencode/settings.json").is_ok());
         assert!(LibraryStore::validate_relative_file_path(".sandboxed-sh/config.json").is_ok());
+    }
+
+    // `validate_path_within` doesn't read any `self` fields, so a bare store
+    // with a dummy path is enough to exercise it.
+    fn test_store() -> LibraryStore {
+        LibraryStore {
+            path: std::path::PathBuf::from("/unused"),
+            remote: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_validate_path_within_allows_descendant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("lib");
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("sub/file.json");
+        assert!(test_store().validate_path_within(&base, &target).is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_within_allows_fresh_install_missing_base() {
+        // The fresh-install case (#563): base directory doesn't exist yet but
+        // the file underneath it must still be creatable.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("configs/default"); // does not exist
+        let target = base.join(".opencode/settings.json");
+        assert!(test_store().validate_path_within(&base, &target).is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_within_rejects_parent_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("lib");
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("../escape.json");
+        assert!(test_store().validate_path_within(&base, &target).is_err());
+    }
+
+    #[test]
+    fn test_validate_path_within_rejects_sibling_name_prefix() {
+        // Regression guard: a sibling sharing a name *prefix* with base
+        // (`…/lib` vs `…/library/…`) must NOT pass via raw string-prefix match.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("lib");
+        let sibling = tmp.path().join("library/evil.json");
+        assert!(test_store().validate_path_within(&base, &sibling).is_err());
+    }
+
+    #[test]
+    fn test_validate_path_within_rejects_target_equal_base() {
+        // base not yet created (fresh-install path): target == base must not be
+        // treated as a writable file under base.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("lib");
+        assert!(test_store().validate_path_within(&base, &base).is_err());
     }
 }
 
