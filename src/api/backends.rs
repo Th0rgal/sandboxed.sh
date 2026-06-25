@@ -467,7 +467,7 @@ fn normalizer_for(provider_id: &str) -> QuotaNormalizer {
 /// an unknown backend.
 pub async fn get_backend_quota(
     State(state): State<Arc<AppState>>,
-    Extension(_user): Extension<AuthUser>,
+    Extension(user): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<BackendQuota>>, (StatusCode, String)> {
     {
@@ -522,7 +522,74 @@ pub async fn get_backend_quota(
         });
     }
 
+    // Best-effort fallback: when no provider account has reported rate-limit
+    // headers (typical for CLI backends like codex/claudecode), the watcher is
+    // left blind. Derive a `used` figure per provider from the last 5 hours of
+    // token usage so dashboards have *some* signal. We never invent a `limit`.
+    // The 5-hour window matches Anthropic's reset cadence and is documented
+    // back to the client via `window_kind: "usage_5h"`.
+    if quotas.is_empty() {
+        let now = chrono::Utc::now();
+        let five_hours_ago = now - chrono::Duration::hours(5);
+        let control_state = state.control.get_or_spawn(&user).await;
+        let rows = control_state
+            .mission_store
+            .get_usage_by_model(Some(&five_hours_ago.to_rfc3339()))
+            .await
+            .unwrap_or_default();
+        quotas = fallback_quotas_from_usage(&id, &provider_ids, &rows, five_hours_ago, now);
+    }
+
     Ok(Json(quotas))
+}
+
+/// Pure helper: build best-effort quotas from token-usage rows. Sums
+/// `input + output + cache_creation + cache_read` per provider for rows whose
+/// model maps to a provider in `provider_ids`. `limit`/`remaining` are
+/// intentionally `None` — we do not invent a quota cap. Returns at most one
+/// quota per provider in `provider_ids` that has any matching usage.
+fn fallback_quotas_from_usage(
+    backend_id: &str,
+    provider_ids: &std::collections::HashSet<String>,
+    rows: &[crate::api::mission_store::ModelUsageStats],
+    window_start: chrono::DateTime<chrono::Utc>,
+    window_end: chrono::DateTime<chrono::Utc>,
+) -> Vec<BackendQuota> {
+    use std::collections::BTreeMap;
+    let mut sums: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for r in rows {
+        let Some(pid) = super::routes::infer_provider_for_model(&r.model) else {
+            continue;
+        };
+        if !provider_ids.contains(&pid) {
+            continue;
+        }
+        let used = r
+            .input_tokens
+            .saturating_add(r.output_tokens)
+            .saturating_add(r.cache_creation_tokens)
+            .saturating_add(r.cache_read_tokens);
+        let entry = sums.entry(pid).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(used);
+        entry.1 = entry.1.saturating_add(1);
+    }
+    sums.into_iter()
+        .map(|(provider_id, (used, model_count))| BackendQuota {
+            backend_id: backend_id.to_string(),
+            provider_id,
+            account_id: uuid::Uuid::nil(),
+            used: Some(used),
+            remaining: None,
+            limit: None,
+            reset_at: Some(window_end),
+            window_kind: "usage_5h".to_string(),
+            raw: serde_json::json!({
+                "source": "usage_5h_derived",
+                "window_start": window_start,
+                "model_count": model_count,
+            }),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -565,6 +632,94 @@ mod quota_tests {
         assert_eq!(n.remaining, Some(500));
         assert_eq!(n.limit, None);
         assert_eq!(n.used, None);
+    }
+
+    /// FLEET-003 fallback: when no rate-limit snapshot exists, derive a `used`
+    /// figure per provider from token-usage rows in the 5h window. `limit` and
+    /// `remaining` must stay `None` (we never invent a quota cap), and the
+    /// fallback must only contribute providers that are actually configured
+    /// for the backend.
+    #[test]
+    fn test_fallback_to_usage_summary_5h() {
+        use crate::api::mission_store::ModelUsageStats;
+        use std::collections::HashSet;
+
+        let provider_ids: HashSet<String> = ["openai".to_string()].into_iter().collect();
+        let rows = vec![
+            ModelUsageStats {
+                model: "gpt-4o".to_string(),
+                requests: 3,
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_tokens: 10,
+                cache_read_tokens: 5,
+                cost_cents: 0,
+            },
+            ModelUsageStats {
+                model: "gpt-4o-mini".to_string(),
+                requests: 2,
+                input_tokens: 200,
+                output_tokens: 30,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                cost_cents: 0,
+            },
+            // Anthropic rows must be ignored when only `openai` is configured.
+            ModelUsageStats {
+                model: "claude-3-5-sonnet".to_string(),
+                requests: 1,
+                input_tokens: 999,
+                output_tokens: 999,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                cost_cents: 0,
+            },
+        ];
+
+        let now = chrono::Utc::now();
+        let start = now - chrono::Duration::hours(5);
+        let quotas = fallback_quotas_from_usage("codex", &provider_ids, &rows, start, now);
+
+        assert_eq!(quotas.len(), 1, "exactly one quota for the openai provider");
+        let q = &quotas[0];
+        assert_eq!(q.backend_id, "codex");
+        assert_eq!(q.provider_id, "openai");
+        assert_eq!(q.account_id, uuid::Uuid::nil());
+        assert_eq!(q.used, Some(100 + 50 + 10 + 5 + 200 + 30));
+        assert_eq!(q.limit, None, "fallback must never invent a limit");
+        assert_eq!(q.remaining, None, "fallback must never invent remaining");
+        assert_eq!(q.window_kind, "usage_5h");
+        assert_eq!(q.reset_at, Some(now));
+        assert_eq!(
+            q.raw.get("source").and_then(|v| v.as_str()),
+            Some("usage_5h_derived")
+        );
+        assert_eq!(q.raw.get("model_count").and_then(|v| v.as_u64()), Some(2));
+    }
+
+    /// FLEET-003 fallback: with no configured providers the fallback emits
+    /// nothing. A real rate-limit snapshot path never reaches the fallback,
+    /// but the helper itself must also not synthesize entries for unknown
+    /// providers.
+    #[test]
+    fn test_fallback_skips_unconfigured_providers() {
+        use crate::api::mission_store::ModelUsageStats;
+        use std::collections::HashSet;
+
+        let provider_ids: HashSet<String> = HashSet::new();
+        let rows = vec![ModelUsageStats {
+            model: "gpt-4o".to_string(),
+            requests: 1,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            cost_cents: 0,
+        }];
+        let now = chrono::Utc::now();
+        let start = now - chrono::Duration::hours(5);
+        let quotas = fallback_quotas_from_usage("codex", &provider_ids, &rows, start, now);
+        assert!(quotas.is_empty());
     }
 
     /// FLEET-003: the dispatch table routes by provider id and falls back to

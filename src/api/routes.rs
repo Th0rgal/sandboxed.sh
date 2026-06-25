@@ -1545,7 +1545,7 @@ pub struct HourlyUsageResponse {
 }
 
 /// Map a normalized model identifier to a provider type id.
-fn infer_provider_for_model(model: &str) -> Option<String> {
+pub(super) fn infer_provider_for_model(model: &str) -> Option<String> {
     let m = model.to_lowercase();
     if m.contains("claude") {
         Some("anthropic".to_string())
