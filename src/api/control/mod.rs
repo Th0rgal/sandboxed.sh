@@ -578,6 +578,28 @@ mod stall_guard_tests {
             .expect("delete after resume");
         assert!(store.get_mission(mid).await.expect("get").is_none());
     }
+
+    #[test]
+    fn resolve_actor_prefers_explicit_then_falls_back_to_user() {
+        let user = AuthUser {
+            id: "u-123".to_string(),
+            username: "thomas".to_string(),
+        };
+        // Explicit override wins (trimmed).
+        assert_eq!(
+            resolve_actor(Some("  system:fleet-watcher ".to_string()), &user),
+            "system:fleet-watcher"
+        );
+        // Blank override is ignored → falls back to the user.
+        assert_eq!(resolve_actor(Some("   ".to_string()), &user), "user:thomas");
+        assert_eq!(resolve_actor(None, &user), "user:thomas");
+        // No username → fall back to the id.
+        let anon = AuthUser {
+            id: "u-123".to_string(),
+            username: String::new(),
+        };
+        assert_eq!(resolve_actor(None, &anon), "user:u-123");
+    }
 }
 
 struct MetadataRefreshTaskEntry {
@@ -5654,6 +5676,14 @@ pub async fn cancel_mission(
         .map_err(|e| (StatusCode::NOT_FOUND, e))
 }
 
+/// Optional body for the pause endpoint (FLEET-004). Carries attribution only.
+#[derive(Debug, Default, Deserialize)]
+pub struct PauseMissionRequest {
+    /// Optional attribution override (e.g. `"system:fleet-watcher"`).
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
 /// Pause a mission (FLEET-004). Sets the mission to `Paused`, a non-terminal
 /// state the dispatcher deliberately skips when selecting the next runnable
 /// mission. Resume via `POST /missions/:id/resume`, which transitions a
@@ -5665,7 +5695,9 @@ pub async fn pause_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(mission_id): Path<Uuid>,
+    body: Option<Json<PauseMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
+    let actor = resolve_actor(body.and_then(|b| b.0.actor), &user);
     let control = control_for_user(&state, &user).await;
     let mission = control
         .mission_store
@@ -5710,6 +5742,7 @@ pub async fn pause_mission(
     rx.await
         .map_err(recv_failed)?
         .map_err(|e| (StatusCode::CONFLICT, e))?;
+    tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission paused");
 
     let updated = control
         .mission_store
@@ -5725,6 +5758,24 @@ pub async fn pause_mission(
     Ok(Json(updated))
 }
 
+/// Resolve the acting principal for a FLEET control action. An explicit
+/// `actor` override (e.g. `"system:fleet-watcher"`) wins; otherwise we attribute
+/// it to the authenticated user. Recorded in structured logs so a post-mortem
+/// can answer "who paused/cloned/resumed this mission?".
+fn resolve_actor(explicit: Option<String>, user: &AuthUser) -> String {
+    explicit
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| {
+            let who = if user.username.is_empty() {
+                &user.id
+            } else {
+                &user.username
+            };
+            format!("user:{}", who)
+        })
+}
+
 /// Overrides accepted when cloning a mission (FLEET-002). Any field left unset
 /// inherits from the source mission.
 #[derive(Debug, Default, Deserialize)]
@@ -5737,6 +5788,17 @@ pub struct CloneMissionRequest {
     pub model_effort: Option<String>,
     #[serde(default)]
     pub model_override: Option<String>,
+    /// When true, copy the source mission's conversation history into the clone
+    /// (retry-with-context). Default false — the clone starts fresh.
+    #[serde(default)]
+    pub clone_messages: bool,
+    /// Optional parent to record on the clone for lineage tracing in the UI.
+    /// Left unset, the clone has no parent (independent mission).
+    #[serde(default)]
+    pub parent_mission_id: Option<Uuid>,
+    /// Optional attribution override (e.g. `"system:fleet-watcher"`).
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 /// Clone an existing mission's configuration into a fresh `Pending` mission
@@ -5752,6 +5814,9 @@ pub async fn clone_mission(
     body: Option<Json<CloneMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let overrides = body.map(|b| b.0).unwrap_or_default();
+    let actor = resolve_actor(overrides.actor.clone(), &user);
+    let clone_messages = overrides.clone_messages;
+    let parent_mission_id = overrides.parent_mission_id;
 
     let control = control_for_user(&state, &user).await;
     let source = control
@@ -5778,14 +5843,37 @@ pub async fn clone_mission(
             .or_else(|| source.model_effort.clone()),
         config_profile: source.config_profile.clone(),
         backend: overrides.backend.or_else(|| Some(source.backend.clone())),
-        parent_mission_id: None,
+        parent_mission_id,
         working_directory: source.working_directory.clone(),
         priority: None,
         not_before: None,
         deadline: None,
     };
 
-    create_mission(State(state), Extension(user), Some(Json(req))).await
+    let cloned = create_mission(State(state), Extension(user), Some(Json(req))).await?;
+    let clone_id = cloned.0.id;
+
+    // Optionally seed the clone with the source's conversation history
+    // (retry-with-context). `control` still holds the store handle after the
+    // create above moved `state`.
+    if clone_messages && !source.history.is_empty() {
+        control
+            .mission_store
+            .update_mission_history(clone_id, &source.history)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    tracing::info!(
+        source_mission = %mission_id,
+        clone_mission = %clone_id,
+        actor = %actor,
+        clone_messages,
+        parent = ?parent_mission_id,
+        "FLEET-002 mission cloned"
+    );
+
+    Ok(cloned)
 }
 
 /// Request body for resuming a mission
@@ -5798,6 +5886,9 @@ pub struct ResumeMissionRequest {
     /// Useful when the user is about to send their own custom message.
     #[serde(default)]
     pub skip_message: bool,
+    /// Optional attribution override (e.g. `"system:fleet-watcher"`).
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 /// Resume an interrupted mission.
@@ -5808,11 +5899,16 @@ pub async fn resume_mission(
     Path(mission_id): Path<Uuid>,
     body: Option<Json<ResumeMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
-    let (clean_workspace, skip_message) = body
-        .map(|b| (b.clean_workspace, b.skip_message))
-        .unwrap_or((false, false));
+    let (clean_workspace, skip_message, actor_override) = body
+        .map(|b| {
+            let r = b.0;
+            (r.clean_workspace, r.skip_message, r.actor)
+        })
+        .unwrap_or((false, false, None));
+    let actor = resolve_actor(actor_override, &user);
 
     let control = control_for_user(&state, &user).await;
+    tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
 
     // FLEET-004: a Paused mission resumes its *prior work* from history, so it
     // first transitions to Interrupted (the status `resume_mission_impl`
