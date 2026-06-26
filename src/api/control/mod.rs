@@ -6993,6 +6993,95 @@ pub async fn stream(
     ))
 }
 
+/// Statuses worth forwarding to an external consumer (Hermes): a mission that
+/// FINISHED, hit a terminal failure, or now needs the user. We deliberately skip
+/// intermediate churn (pending→active→paused→acknowledged) so the callback means
+/// "something actionable happened", not "the status field moved". `Interrupted`
+/// is intentionally excluded: it is emitted transiently as resume-prep when a
+/// paused mission resumes (not a terminal outcome), so forwarding it would fire
+/// a spurious callback on every resume.
+fn webhook_forwardable_status(status: MissionStatus) -> bool {
+    matches!(
+        status,
+        MissionStatus::Completed
+            | MissionStatus::Failed
+            | MissionStatus::NotFeasible
+            | MissionStatus::Blocked
+            | MissionStatus::AwaitingUser
+    )
+}
+
+async fn paloma_webhook_forwarder_loop(
+    mut events_rx: broadcast::Receiver<AgentEvent>,
+    mission_store: Arc<dyn MissionStore>,
+    url: String,
+    http: reqwest::Client,
+) {
+    tracing::info!(webhook_url = %url, "Paloma mission-status webhook forwarder started");
+    // Track the last status seen per mission (for ALL transitions, not just
+    // forwardable ones) so we forward a status only when it actually CHANGED.
+    // This drops the re-emit `mark_mission_opened` broadcasts (it re-sends the
+    // current, unchanged status on first view) while still forwarding a genuine
+    // re-entry into a state. Single-task loop → a plain map needs no locking.
+    let mut last_status: std::collections::HashMap<Uuid, MissionStatus> =
+        std::collections::HashMap::new();
+    // Bound concurrent in-flight callbacks (each does a get_mission + HTTP POST).
+    let sem = Arc::new(tokio::sync::Semaphore::new(8));
+    loop {
+        match events_rx.recv().await {
+            Ok(AgentEvent::MissionStatusChanged {
+                mission_id, status, ..
+            }) => {
+                // `insert` returns the prior value; forward only on a real change.
+                let changed = last_status.insert(mission_id, status) != Some(status);
+                if !changed || !webhook_forwardable_status(status) {
+                    continue;
+                }
+
+                // Everything else (the mission load + POST) runs in a spawned,
+                // concurrency-bounded task so neither a slow DB read nor a slow
+                // webhook can stall the broadcast receiver and lag-drop events.
+                let http = http.clone();
+                let url = url.clone();
+                let mission_store = Arc::clone(&mission_store);
+                let sem = Arc::clone(&sem);
+                tokio::spawn(async move {
+                    let _permit = sem.acquire_owned().await;
+                    let title = mission_store
+                        .get_mission(mission_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|mission| mission.title)
+                        .unwrap_or_else(|| mission_id.to_string());
+                    let body = serde_json::json!({
+                        "mission_id": mission_id,
+                        "status": status,
+                        "title": title,
+                    });
+                    if let Err(err) = http.post(&url).json(&body).send().await {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            webhook_url = %url,
+                            "Failed to forward Paloma mission status webhook: {}",
+                            err
+                        );
+                    }
+                });
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                tracing::warn!(
+                    dropped,
+                    webhook_url = %url,
+                    "Paloma webhook forwarder lagged; continuing with latest event"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// Spawn the global control session actor.
 #[allow(clippy::too_many_arguments)]
 fn spawn_control_session(
@@ -7079,6 +7168,30 @@ fn spawn_control_session(
         mission_store: Arc::clone(&mission_store),
         mission_search_cache,
     };
+
+    // Mission-status alerts are event-driven for low latency. The existing
+    // Paloma scheduler poll still runs as a restart/missed-event backstop and
+    // continues to own the other periodic Paloma jobs.
+    if let Some(bridge) = telegram_bridge.as_ref() {
+        bridge.start_event_alert_loop(events_tx.subscribe());
+    }
+
+    if let Some(url) = config
+        .paloma_webhook_forward_url
+        .as_ref()
+        .filter(|url| !url.is_empty())
+    {
+        tokio::spawn(paloma_webhook_forwarder_loop(
+            events_tx.subscribe(),
+            Arc::clone(&state.mission_store),
+            url.clone(),
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        ));
+    }
 
     // Shared registry of in-flight Claude Code background shell tasks. Written
     // by the control actor's ToolResult arm; read by the auto-resume watcher.

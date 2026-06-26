@@ -22,7 +22,7 @@ use crate::api::mission_store::{
     TelegramWorkflowKind, TelegramWorkflowStatus,
 };
 use crate::api::paloma::queue::{PalomaQueue, QueueKey, QueueMetrics};
-use crate::api::paloma::scheduler::{PalomaJobRegistry, PalomaJobState};
+use crate::api::paloma::scheduler::{paloma_channel_job_name, PalomaJobRegistry, PalomaJobState};
 use crate::api::paloma::{
     commands as paloma_commands, cooldown, decision_log, digest, mission_card, planner,
     preferences as paloma_prefs,
@@ -41,10 +41,6 @@ use uuid::Uuid;
 pub type SharedTelegramBridge = Arc<TelegramBridge>;
 type TelegramChatLockMap = HashMap<(Uuid, i64), Arc<Mutex<()>>>;
 type PalomaSessionLockMap = HashMap<(Uuid, i64), Arc<Mutex<()>>>;
-
-fn paloma_channel_job_name(base_name: &str, channel_id: Uuid) -> String {
-    format!("{base_name}:{channel_id}")
-}
 
 fn paloma_scheduler_lease_expires_at() -> String {
     (Utc::now() + ChronoDuration::seconds(PALOMA_SCHEDULER_JOB_LEASE_SECONDS)).to_rfc3339()
@@ -107,6 +103,7 @@ pub struct TelegramBridge {
     /// Sent outbound reply messages keyed by the inbound Telegram message they reply to.
     recent_replies: RwLock<HashMap<TelegramReplyKey, TelegramReplyRecord>>,
     scheduler_started: AtomicBool,
+    event_alert_started: AtomicBool,
     http: Client,
 }
 
@@ -1323,152 +1320,163 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, _http: &Client) {
     };
 
     for mission in missions {
-        let Some(base_kind) = paloma_alert_kind_for_status(mission.status) else {
-            continue;
-        };
-        let interest = subscriptions
-            .get(&mission.id)
-            .copied()
-            .unwrap_or(TelegramMissionInterestLevel::Normal);
-        let title = mission_label(&mission);
-        let events = ctx
-            .mission_store
-            .get_latest_events(mission.id, 40)
-            .await
-            .unwrap_or_default();
-        let alert_now = Utc::now();
-        let policy_snapshot = paloma_policy_snapshot_json(&mission, interest, alert_now);
-        if interest == TelegramMissionInterestLevel::Muted {
-            log_paloma_alert_decision(
-                ctx,
-                owner_id,
-                &mission,
-                base_kind,
-                "create_alert",
-                false,
-                Some("mission_muted"),
-                policy_snapshot,
-                None,
-            )
+        plan_paloma_alert_for_mission(ctx, owner_id, &subscriptions, &alert_preferences, mission)
             .await;
-            continue;
-        }
-        if paloma_mission_has_failure_only_preference(&alert_preferences, mission.id)
-            && mission.status != MissionStatus::Failed
-        {
-            log_paloma_alert_decision(
-                ctx,
-                owner_id,
-                &mission,
-                base_kind,
-                "create_alert",
-                false,
-                Some("only_failures_preference"),
-                policy_snapshot,
-                None,
-            )
-            .await;
-            continue;
-        }
-        if !paloma_should_alert_mission_at(&mission, &events, interest, alert_now) {
-            log_paloma_alert_decision(
-                ctx,
-                owner_id,
-                &mission,
-                base_kind,
-                "create_alert",
-                false,
-                Some(paloma_alert_suppression_reason(
-                    &mission, &events, interest, alert_now,
-                )),
-                policy_snapshot,
-                None,
-            )
-            .await;
-            continue;
-        }
-        // Cooldown gate: per (mission, class) backoff. The first send of a
-        // class is always eligible; subsequent sends walk the ladder until
-        // the user replies, the mission status changes, or `/resume` is
-        // called.
-        let cooldown_state = ctx
-            .mission_store
-            .get_paloma_cooldown_state(owner_id, mission.id, base_kind)
-            .await
-            .ok()
-            .flatten();
-        if !cooldown::is_eligible(cooldown_state.as_ref(), alert_now) {
-            log_paloma_alert_decision(
-                ctx,
-                owner_id,
-                &mission,
-                base_kind,
-                "create_alert",
-                false,
-                Some("cooldown_active"),
-                policy_snapshot,
-                None,
-            )
-            .await;
-            continue;
-        }
-        let body = paloma_alert_body(&mission, &events);
+    }
+}
+
+async fn plan_paloma_alert_for_mission(
+    ctx: &ChannelContext,
+    owner_id: i64,
+    subscriptions: &HashMap<Uuid, TelegramMissionInterestLevel>,
+    alert_preferences: &[TelegramAlertPreference],
+    mission: Mission,
+) {
+    let Some(base_kind) = paloma_alert_kind_for_status(mission.status) else {
+        return;
+    };
+    let interest = subscriptions
+        .get(&mission.id)
+        .copied()
+        .unwrap_or(TelegramMissionInterestLevel::Normal);
+    let title = mission_label(&mission);
+    let events = ctx
+        .mission_store
+        .get_latest_events(mission.id, 40)
+        .await
+        .unwrap_or_default();
+    let alert_now = Utc::now();
+    let policy_snapshot = paloma_policy_snapshot_json(&mission, interest, alert_now);
+    if interest == TelegramMissionInterestLevel::Muted {
         log_paloma_alert_decision(
             ctx,
             owner_id,
             &mission,
             base_kind,
             "create_alert",
-            true,
-            None,
+            false,
+            Some("mission_muted"),
             policy_snapshot,
-            Some(&body),
+            None,
         )
         .await;
-        let now = now_string();
-        let event_kind = paloma_alert_event_kind_at(&mission, base_kind, &events, alert_now);
-        let importance = paloma_alert_importance_for_mission(&mission, interest).to_string();
-        let _ = ctx
-            .mission_store
-            .create_telegram_alert_if_absent(TelegramAlert {
-                id: Uuid::new_v4(),
-                telegram_user_id: owner_id,
-                mission_id: Some(mission.id),
-                event_kind: event_kind.clone(),
-                importance: importance.clone(),
-                title: title.clone(),
-                body: body.clone(),
-                status: "pending".to_string(),
-                telegram_message_id: None,
-                last_error: None,
-                created_at: now,
-                sent_at: None,
-                acknowledged_at: None,
-            })
-            .await;
-        // Long-running alerts now collide on a single `event_kind` per
-        // mission, so `INSERT OR IGNORE` keeps the *first* body forever
-        // unless we refresh it. Without this, a pending row that was
-        // queued at 01:00 still shows "running for 0m" when finally
-        // flushed at 04:00. Refresh is a no-op when the row was just
-        // inserted (same values written back).
-        let _ = ctx
-            .mission_store
-            .refresh_pending_telegram_alert_body(
-                owner_id,
-                mission.id,
-                &event_kind,
-                &title,
-                &body,
-                &importance,
-            )
-            .await;
-        // Cooldown is *not* bumped here. The alert is only queued at this
-        // point — quiet hours, rate ceilings, or other delivery gates
-        // downstream may still suppress it. Bumping the ladder now would
-        // delay future alerts the user never actually saw. Cooldown is
-        // advanced in `flush_pending_paloma_digest` after a successful send.
+        return;
     }
+    if paloma_mission_has_failure_only_preference(alert_preferences, mission.id)
+        && mission.status != MissionStatus::Failed
+    {
+        log_paloma_alert_decision(
+            ctx,
+            owner_id,
+            &mission,
+            base_kind,
+            "create_alert",
+            false,
+            Some("only_failures_preference"),
+            policy_snapshot,
+            None,
+        )
+        .await;
+        return;
+    }
+    if !paloma_should_alert_mission_at(&mission, &events, interest, alert_now) {
+        log_paloma_alert_decision(
+            ctx,
+            owner_id,
+            &mission,
+            base_kind,
+            "create_alert",
+            false,
+            Some(paloma_alert_suppression_reason(
+                &mission, &events, interest, alert_now,
+            )),
+            policy_snapshot,
+            None,
+        )
+        .await;
+        return;
+    }
+    // Cooldown gate: per (mission, class) backoff. The first send of a
+    // class is always eligible; subsequent sends walk the ladder until
+    // the user replies, the mission status changes, or `/resume` is
+    // called.
+    let cooldown_state = ctx
+        .mission_store
+        .get_paloma_cooldown_state(owner_id, mission.id, base_kind)
+        .await
+        .ok()
+        .flatten();
+    if !cooldown::is_eligible(cooldown_state.as_ref(), alert_now) {
+        log_paloma_alert_decision(
+            ctx,
+            owner_id,
+            &mission,
+            base_kind,
+            "create_alert",
+            false,
+            Some("cooldown_active"),
+            policy_snapshot,
+            None,
+        )
+        .await;
+        return;
+    }
+    let body = paloma_alert_body(&mission, &events);
+    log_paloma_alert_decision(
+        ctx,
+        owner_id,
+        &mission,
+        base_kind,
+        "create_alert",
+        true,
+        None,
+        policy_snapshot,
+        Some(&body),
+    )
+    .await;
+    let now = now_string();
+    let event_kind = paloma_alert_event_kind_at(&mission, base_kind, &events, alert_now);
+    let importance = paloma_alert_importance_for_mission(&mission, interest).to_string();
+    let _ = ctx
+        .mission_store
+        .create_telegram_alert_if_absent(TelegramAlert {
+            id: Uuid::new_v4(),
+            telegram_user_id: owner_id,
+            mission_id: Some(mission.id),
+            event_kind: event_kind.clone(),
+            importance: importance.clone(),
+            title: title.clone(),
+            body: body.clone(),
+            status: "pending".to_string(),
+            telegram_message_id: None,
+            last_error: None,
+            created_at: now,
+            sent_at: None,
+            acknowledged_at: None,
+        })
+        .await;
+    // Long-running alerts now collide on a single `event_kind` per
+    // mission, so `INSERT OR IGNORE` keeps the *first* body forever
+    // unless we refresh it. Without this, a pending row that was
+    // queued at 01:00 still shows "running for 0m" when finally
+    // flushed at 04:00. Refresh is a no-op when the row was just
+    // inserted (same values written back).
+    let _ = ctx
+        .mission_store
+        .refresh_pending_telegram_alert_body(
+            owner_id,
+            mission.id,
+            &event_kind,
+            &title,
+            &body,
+            &importance,
+        )
+        .await;
+    // Cooldown is *not* bumped here. The alert is only queued at this
+    // point because quiet hours, rate ceilings, or other delivery gates
+    // downstream may still suppress it. Bumping the ladder now would
+    // delay future alerts the user never actually saw. Cooldown is
+    // advanced in `flush_pending_paloma_digest` after a successful send.
 }
 
 async fn flush_pending_paloma_digest(
@@ -2294,6 +2302,7 @@ impl TelegramBridge {
             recent_updates: RwLock::new(HashMap::new()),
             recent_replies: RwLock::new(HashMap::new()),
             scheduler_started: AtomicBool::new(false),
+            event_alert_started: AtomicBool::new(false),
             http: Client::new(),
         }
     }
@@ -2476,6 +2485,184 @@ impl TelegramBridge {
 
     async fn record_paloma_job_failure(&self, name: &'static str, error: String) {
         self.paloma_jobs.lock().await.record_failure(name, error);
+    }
+
+    pub fn start_event_alert_loop(
+        self: &Arc<Self>,
+        mut events_rx: broadcast::Receiver<AgentEvent>,
+    ) {
+        if self
+            .event_alert_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let bridge = Arc::clone(self);
+        // Bound concurrent event handling: each handler does several DB queries +
+        // a lease claim + a Telegram send. Without a cap, a flapping mission's
+        // status churn would spawn unbounded tasks and amplify DB load. Excess
+        // events queue cheaply on the permit; the scheduler poll is the backstop.
+        let handler_sem = Arc::new(tokio::sync::Semaphore::new(4));
+        tokio::spawn(async move {
+            loop {
+                match events_rx.recv().await {
+                    Ok(AgentEvent::MissionStatusChanged {
+                        mission_id, status, ..
+                    }) => {
+                        // Handle off the recv loop so a slow Telegram send (the
+                        // bridge http client has no per-request timeout) can't
+                        // stall event draining and lag-drop later events. The
+                        // per-channel digest lease inside serializes concurrent
+                        // flushes, so spawning can't produce duplicate digests.
+                        let bridge = Arc::clone(&bridge);
+                        let sem = Arc::clone(&handler_sem);
+                        tokio::spawn(async move {
+                            let _permit = sem.acquire_owned().await;
+                            bridge
+                                .plan_and_flush_paloma_alert_for_mission(mission_id, status)
+                                .await;
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                        tracing::warn!(
+                            dropped,
+                            "Paloma event alert loop lagged; scheduler poll remains as fallback"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    async fn plan_and_flush_paloma_alert_for_mission(
+        &self,
+        mission_id: Uuid,
+        emitted_status: MissionStatus,
+    ) {
+        let Some(owner_id) =
+            configured_telegram_id("PALOMA_TELEGRAM_OWNER_ID", DEFAULT_PALOMA_OWNER_TELEGRAM_ID)
+        else {
+            return;
+        };
+        let channels: Vec<_> = self
+            .active_channels
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+
+        for ctx in channels {
+            let mission = match ctx.mission_store.get_mission(mission_id).await {
+                Ok(Some(mission)) => mission,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        "Failed to load mission for event-driven Paloma alert: {}",
+                        err
+                    );
+                    continue;
+                }
+            };
+            if mission.status != emitted_status {
+                tracing::debug!(
+                    mission_id = %mission_id,
+                    emitted_status = %emitted_status,
+                    current_status = %mission.status,
+                    "Skipping stale Paloma status-change event"
+                );
+                continue;
+            }
+
+            let subscriptions = ctx
+                .mission_store
+                .list_telegram_mission_subscriptions(owner_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|sub| (sub.mission_id, sub.interest_level))
+                .collect::<HashMap<_, _>>();
+            let alert_preferences = ctx
+                .mission_store
+                .list_telegram_alert_preferences(owner_id)
+                .await
+                .unwrap_or_default();
+
+            plan_paloma_alert_for_mission(
+                &ctx,
+                owner_id,
+                &subscriptions,
+                &alert_preferences,
+                mission,
+            )
+            .await;
+
+            // Flush under the SAME per-channel digest lease the scheduler poll
+            // uses, so an event-driven flush can never race the scheduler (or a
+            // concurrent event) and send a duplicate digest / double-advance the
+            // cooldown. If the lease is held, the pending alert we just queued is
+            // picked up by whoever owns it (or the next scheduler tick) — a touch
+            // more latency, never a double-send.
+            //
+            // The owner MUST be unique per claimer: claim_paloma_scheduler_job's
+            // `OR lease_owner = ?` re-entrancy clause lets the *same* owner string
+            // re-claim an unexpired lease, so a PID-only owner (shared with the
+            // scheduler and sibling event tasks) would defeat the mutual exclusion
+            // entirely and let two flushes run concurrently. A per-claim UUID
+            // closes that hole while still matching on finish (same variable).
+            let digest_job_name = paloma_channel_job_name("paloma_digest_flush", ctx.channel.id);
+            let lease_owner = format!("telegram-bridge-{}-{}", std::process::id(), Uuid::new_v4());
+            if ctx
+                .mission_store
+                .claim_paloma_scheduler_job(
+                    &digest_job_name,
+                    &lease_owner,
+                    &now_string(),
+                    &paloma_scheduler_lease_expires_at(),
+                )
+                .await
+                .unwrap_or(false)
+            {
+                match flush_pending_paloma_digest(&ctx, &self.http, owner_id).await {
+                    Ok(_) => {
+                        let _ = ctx
+                            .mission_store
+                            .finish_paloma_scheduler_job(
+                                &digest_job_name,
+                                &lease_owner,
+                                &now_string(),
+                                None,
+                            )
+                            .await;
+                        self.record_paloma_job_success("paloma_digest_flush").await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            channel_id = %ctx.channel.id,
+                            mission_id = %mission_id,
+                            "Event-driven Paloma alert flush failed: {}",
+                            err
+                        );
+                        let _ = ctx
+                            .mission_store
+                            .finish_paloma_scheduler_job(
+                                &digest_job_name,
+                                &lease_owner,
+                                &now_string(),
+                                Some("digest_flush_failed"),
+                            )
+                            .await;
+                        self.record_paloma_job_failure("paloma_digest_flush", err)
+                            .await;
+                    }
+                }
+            }
+        }
     }
 
     /// Register a webhook for a Telegram channel and store routing context.

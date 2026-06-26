@@ -1,4 +1,9 @@
 use std::collections::HashMap;
+use uuid::Uuid;
+
+pub fn paloma_channel_job_name(base_name: &str, channel_id: Uuid) -> String {
+    format!("{base_name}:{channel_id}")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PalomaJobState {
