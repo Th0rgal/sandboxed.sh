@@ -569,6 +569,7 @@ mod tests {
             library_path: PathBuf::from("/tmp/library"),
             default_backend: None,
             automations_enabled: true,
+            paloma_webhook_forward_url: None,
             max_concurrent_tasks: 5,
             spark_arbiter_url: None,
             spark_arbiter_token: None,

@@ -19,6 +19,7 @@
 //!   If not set, defaults to: https://github.com/Th0rgal/sandboxed-library-template.git
 //! - `DEFAULT_BACKEND` - Optional. Default backend to use.
 //!   If not set, defaults to the first available backend with priority: claudecode → opencode → grok → gemini → codex.
+//! - `PALOMA_WEBHOOK_FORWARD_URL` - Optional. External webhook to receive mission status changes.
 //!
 //! Note: The agent has **full system access**. It can read/write any file, execute any command,
 //! and search anywhere on the machine. The `WORKING_DIR` is just the default for relative paths.
@@ -236,6 +237,9 @@ pub struct Config {
 
     /// Whether mission automations are enabled
     pub automations_enabled: bool,
+
+    /// Optional external webhook that receives Paloma mission status-change events.
+    pub paloma_webhook_forward_url: Option<String>,
 
     /// DGX Spark build-offload config (all optional; offload is disabled unless
     /// all three are set). The host holds these credentials so workspaces never
@@ -615,6 +619,11 @@ impl Config {
             .transpose()?
             .unwrap_or(true);
 
+        let paloma_webhook_forward_url = std::env::var("PALOMA_WEBHOOK_FORWARD_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let env_opt = |k: &str| {
             std::env::var(k)
                 .ok()
@@ -643,6 +652,7 @@ impl Config {
             library_path,
             default_backend,
             automations_enabled,
+            paloma_webhook_forward_url,
             spark_arbiter_url,
             spark_arbiter_token,
             spark_ssh_target,
@@ -670,6 +680,7 @@ impl Config {
             library_path,
             default_backend: None,
             automations_enabled: true,
+            paloma_webhook_forward_url: None,
             spark_arbiter_url: None,
             spark_arbiter_token: None,
             spark_ssh_target: None,

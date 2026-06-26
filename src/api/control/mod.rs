@@ -6822,6 +6822,52 @@ pub async fn stream(
     ))
 }
 
+async fn paloma_webhook_forwarder_loop(
+    mut events_rx: broadcast::Receiver<AgentEvent>,
+    mission_store: Arc<dyn MissionStore>,
+    url: String,
+    http: reqwest::Client,
+) {
+    loop {
+        match events_rx.recv().await {
+            Ok(AgentEvent::MissionStatusChanged {
+                mission_id, status, ..
+            }) => {
+                let title = mission_store
+                    .get_mission(mission_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|mission| mission.title)
+                    .unwrap_or_else(|| mission_id.to_string());
+                let body = serde_json::json!({
+                    "mission_id": mission_id,
+                    "status": status,
+                    "title": title,
+                });
+
+                if let Err(err) = http.post(&url).json(&body).send().await {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        webhook_url = %url,
+                        "Failed to forward Paloma mission status webhook: {}",
+                        err
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                tracing::warn!(
+                    dropped,
+                    webhook_url = %url,
+                    "Paloma webhook forwarder lagged; continuing with latest event"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// Spawn the global control session actor.
 #[allow(clippy::too_many_arguments)]
 fn spawn_control_session(
@@ -6908,6 +6954,26 @@ fn spawn_control_session(
         mission_store: Arc::clone(&mission_store),
         mission_search_cache,
     };
+
+    // Mission-status alerts are event-driven for low latency. The existing
+    // Paloma scheduler poll still runs as a restart/missed-event backstop and
+    // continues to own the other periodic Paloma jobs.
+    if let Some(bridge) = telegram_bridge.as_ref() {
+        bridge.start_event_alert_loop(events_tx.subscribe());
+    }
+
+    if let Some(url) = config
+        .paloma_webhook_forward_url
+        .as_ref()
+        .filter(|url| !url.is_empty())
+    {
+        tokio::spawn(paloma_webhook_forwarder_loop(
+            events_tx.subscribe(),
+            Arc::clone(&state.mission_store),
+            url.clone(),
+            reqwest::Client::new(),
+        ));
+    }
 
     // Shared registry of in-flight Claude Code background shell tasks. Written
     // by the control actor's ToolResult arm; read by the auto-resume watcher.
