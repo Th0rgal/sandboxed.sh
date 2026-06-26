@@ -331,28 +331,20 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
         </div>
       )}
 
-      {/* Minimax model usage */}
-      {type === 'minimax' && Array.isArray(usage.model_usage) && (
+      {/* Minimax coding plan — per-category 5h + weekly windows (remaining %) */}
+      {type === 'minimax' && Array.isArray(usage.model_usage) && usage.model_usage.length > 0 && (
         <div className="space-y-3">
-          {(usage.model_usage as Array<{
-            model: string;
-            interval_total: number;
-            interval_remaining: number;
-            weekly_total: number;
-            weekly_remaining: number;
-            interval_reset: number;
-            weekly_reset: number;
-          }>).map((m) => (
+          {usage.model_usage.map((m) => (
             <div key={m.model} className="space-y-1">
               <div className="text-[11px] text-white/50 font-medium">{m.model}</div>
-              <UsageBar remaining={m.interval_remaining} limit={m.interval_total} label="Interval" />
-              <UsageBar remaining={m.weekly_remaining} limit={m.weekly_total} label="Weekly" />
+              <UsageBar remaining={m.interval_remaining_percent} limit={100} label="5h window" />
+              <UsageBar remaining={m.weekly_remaining_percent} limit={100} label="Weekly" />
               <div className="flex gap-4 text-[10px] text-white/30">
                 {m.interval_reset > 0 && (
-                  <span>Interval reset: {fmtReset(new Date(m.interval_reset).toISOString())}</span>
+                  <span>5h reset: {fmtResetEpoch(m.interval_reset)}</span>
                 )}
                 {m.weekly_reset > 0 && (
-                  <span>Weekly reset: {fmtReset(new Date(m.weekly_reset).toISOString())}</span>
+                  <span>Weekly reset: {fmtResetEpoch(m.weekly_reset)}</span>
                 )}
               </div>
             </div>
@@ -361,13 +353,37 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
       )}
 
       {/* Minimax connected without model data */}
-      {type === 'minimax' && usage.status === 'connected' && !Array.isArray(usage.model_usage) && (
+      {type === 'minimax' && usage.status === 'connected' &&
+        !(Array.isArray(usage.model_usage) && usage.model_usage.length > 0) && (
         <div className="text-[11px] text-emerald-400/70">Connected</div>
       )}
 
-      {/* Z.AI - minimal info */}
-      {type === 'zai' && usage.status === 'connected' && (
-        <div className="text-[11px] text-emerald-400/70">Connected - Z.AI does not expose rate limit headers</div>
+      {/* Z.AI GLM coding plan — 5h + weekly token windows (percent used) */}
+      {type === 'zai' && usage.zai_weekly_used_percent != null && (
+        <div className="space-y-2">
+          {usage.zai_plan && (
+            <div className="text-[11px] text-white/50">
+              <span className="text-white/30">Plan:</span> {usage.zai_plan}
+            </div>
+          )}
+          {usage.zai_5h_used_percent != null && (
+            <UsageBar remaining={100 - usage.zai_5h_used_percent} limit={100} label="5h window" />
+          )}
+          <UsageBar remaining={100 - usage.zai_weekly_used_percent} limit={100} label="Weekly" />
+          <div className="flex gap-4 text-[10px] text-white/30">
+            {usage.zai_5h_reset != null && usage.zai_5h_reset > 0 && (
+              <span>5h reset: {fmtResetEpoch(usage.zai_5h_reset)}</span>
+            )}
+            {usage.zai_weekly_reset != null && usage.zai_weekly_reset > 0 && (
+              <span>Weekly reset: {fmtResetEpoch(usage.zai_weekly_reset)}</span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Z.AI connected without quota data (non-coding-plan key) */}
+      {type === 'zai' && usage.status === 'connected' && usage.zai_weekly_used_percent == null && (
+        <div className="text-[11px] text-emerald-400/70">Connected</div>
       )}
 
       {/* Google - account info only */}

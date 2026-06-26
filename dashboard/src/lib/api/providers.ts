@@ -337,8 +337,26 @@ export interface ProviderUsage {
   tokens_reset_minute?: string;
   // Minimax coding plan
   coding_plan?: Record<string, unknown>;
-  // Z.AI last call usage
-  last_call_usage?: Record<string, unknown>;
+  // MiniMax coding plan — per-category remaining percentages (0..100) and reset
+  // times (unix epoch seconds). Representative-window fields feed `optimize`.
+  model_usage?: Array<{
+    model: string;
+    interval_remaining_percent: number;
+    weekly_remaining_percent: number;
+    interval_reset: number;
+    weekly_reset: number;
+  }>;
+  minimax_interval_remaining_percent?: number;
+  minimax_weekly_remaining_percent?: number;
+  minimax_interval_reset?: number;
+  minimax_weekly_reset?: number;
+  // Z.AI GLM coding plan — `percentage` is percent USED; reset is unix epoch
+  // seconds (absent for an untouched window). `zai_plan` is the tier (max/pro/…).
+  zai_plan?: string;
+  zai_5h_used_percent?: number;
+  zai_5h_reset?: number;
+  zai_weekly_used_percent?: number;
+  zai_weekly_reset?: number;
   // Codex (OpenAI ChatGPT subscription) limits — primary = 5h window,
   // secondary = weekly (7d) window. Reset fields are unix epoch seconds.
   codex_plan_type?: string;

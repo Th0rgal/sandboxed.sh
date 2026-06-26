@@ -36,6 +36,12 @@ use serde_json::{json, Map, Value};
 const ANTHROPIC_5H_SECONDS: i64 = 5 * 3600;
 const ANTHROPIC_7D_SECONDS: i64 = 7 * 24 * 3600;
 
+/// MiniMax coding plan and Z.AI GLM coding plan both meter on a 5-hour rolling
+/// window plus a weekly window. Like Anthropic, the response carries only the
+/// reset time, so we pin the documented spans to derive a pace.
+const FIVE_HOURS_SECONDS: i64 = 5 * 3600;
+const WEEKLY_SECONDS: i64 = 7 * 24 * 3600;
+
 /// A single normalized usage window plus the derived pace/burn for it.
 struct Window {
     key: &'static str,
@@ -97,6 +103,16 @@ impl Window {
         let used_pct = used_pct.max(0.0);
         self.pct_used = Some(used_pct);
         self.pct_remaining = Some((100.0 - used_pct).max(0.0));
+        self
+    }
+
+    /// Fill pct_used/pct_remaining from a 0..=100 remaining-percent value.
+    /// MiniMax reports `*_remaining_percent` directly, so we take it as truth
+    /// rather than recomputing it from the (often zero / unreliable) raw counts.
+    fn with_remaining_percent(mut self, remaining_pct: f64) -> Self {
+        let remaining_pct = remaining_pct.clamp(0.0, 100.0);
+        self.pct_remaining = Some(remaining_pct);
+        self.pct_used = Some(100.0 - remaining_pct);
         self
     }
 
@@ -355,6 +371,64 @@ fn collect_windows(v: &Value) -> Vec<Window> {
             .with_absolute(limit, remaining);
         w.reset_at = normalize_reset(v.get("requests_reset_day"));
         out.push(w);
+    }
+
+    // ── MiniMax coding plan (5-hour interval + weekly) — remaining-percent ──
+    // MiniMax exposes `current_interval_remaining_percent` / weekly equivalent;
+    // the raw token counts are frequently 0/0 for the text pool, so the percent
+    // is the binding signal. Resets are normalized to epoch seconds by the
+    // handler before they reach here.
+    for (rem_key, reset_key, key, label, window_seconds) in [
+        (
+            "minimax_interval_remaining_percent",
+            "minimax_interval_reset",
+            "minimax_5h",
+            "5-hour",
+            FIVE_HOURS_SECONDS,
+        ),
+        (
+            "minimax_weekly_remaining_percent",
+            "minimax_weekly_reset",
+            "minimax_weekly",
+            "weekly",
+            WEEKLY_SECONDS,
+        ),
+    ] {
+        if let Some(rem_pct) = get_f64(v, rem_key) {
+            let mut w =
+                Window::new(key, label, "tokens", "minimax").with_remaining_percent(rem_pct);
+            w.window_seconds = Some(window_seconds);
+            w.reset_at = get_epoch_secs(v, reset_key);
+            out.push(w);
+        }
+    }
+
+    // ── Z.AI GLM coding plan (5-hour + weekly) — used-percent windows ──
+    // Z.AI's monitor endpoint reports `percentage` as percent USED; it omits a
+    // reset time for a window that hasn't been touched yet. Resets are
+    // normalized to epoch seconds by the handler before they reach here.
+    for (pct_key, reset_key, key, label, window_seconds) in [
+        (
+            "zai_5h_used_percent",
+            "zai_5h_reset",
+            "zai_5h",
+            "5-hour",
+            FIVE_HOURS_SECONDS,
+        ),
+        (
+            "zai_weekly_used_percent",
+            "zai_weekly_reset",
+            "zai_weekly",
+            "weekly",
+            WEEKLY_SECONDS,
+        ),
+    ] {
+        if let Some(used_pct) = get_f64(v, pct_key) {
+            let mut w = Window::new(key, label, "tokens", "zai").with_used_percent(used_pct);
+            w.window_seconds = Some(window_seconds);
+            w.reset_at = get_epoch_secs(v, reset_key);
+            out.push(w);
+        }
     }
 
     out
@@ -635,6 +709,49 @@ mod tests {
         assert_eq!((from_dur - n).num_seconds(), 90);
         let from_epoch = normalize_reset_at(Some(&json!(n.timestamp() + 100)), n).unwrap();
         assert_eq!((from_epoch - n).num_seconds(), 100);
+    }
+
+    #[test]
+    fn minimax_remaining_percent_windows() {
+        // 93% remaining on the 5h window, reset 3h out (epoch seconds).
+        let reset = (now() + chrono::Duration::hours(3)).timestamp();
+        let v = json!({
+            "minimax_interval_remaining_percent": 93,
+            "minimax_interval_reset": reset,
+            "minimax_weekly_remaining_percent": 100,
+            "minimax_weekly_reset": (now() + chrono::Duration::days(4)).timestamp(),
+        });
+        let opt = build_optimize_block_at(&v, None, now());
+        let w = window(&opt, "minimax_5h");
+        assert_eq!(w["pct_remaining"], json!(93.0));
+        assert_eq!(w["pct_used"], json!(7.0));
+        assert_eq!(w["window_seconds"], json!(18000));
+        assert_eq!(w["source"], json!("minimax"));
+        assert_eq!(w["reset_in_seconds"], json!(10800));
+        // Most binding window = the 5h (93% < 100%).
+        assert_eq!(opt["primary_window"], json!("minimax_5h"));
+    }
+
+    #[test]
+    fn zai_used_percent_windows() {
+        // Weekly window 12% used, reset 2 days out; 5h window untouched (no reset).
+        let weekly_reset = (now() + chrono::Duration::days(2)).timestamp();
+        let v = json!({
+            "zai_5h_used_percent": 0,
+            "zai_weekly_used_percent": 12,
+            "zai_weekly_reset": weekly_reset,
+        });
+        let opt = build_optimize_block_at(&v, None, now());
+        let w5 = window(&opt, "zai_5h");
+        assert_eq!(w5["pct_remaining"], json!(100.0));
+        assert_eq!(w5["reset_at"], Value::Null);
+        let ww = window(&opt, "zai_weekly");
+        assert_eq!(ww["pct_used"], json!(12.0));
+        assert_eq!(ww["pct_remaining"], json!(88.0));
+        assert_eq!(ww["source"], json!("zai"));
+        assert_eq!(ww["window_seconds"], json!(604800));
+        // 5h is least-remaining is 100, weekly is 88 → weekly binds.
+        assert_eq!(opt["primary_window"], json!("zai_weekly"));
     }
 
     #[test]

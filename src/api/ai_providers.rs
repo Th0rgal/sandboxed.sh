@@ -7071,31 +7071,81 @@ async fn get_provider_usage(
                     if let Ok(data) = r.json::<serde_json::Value>().await {
                         let map = info.as_object_mut().unwrap();
                         map.insert("status".to_string(), serde_json::json!("connected"));
-                        // Extract model_remains into a structured array.
-                        // Only include coding models (MiniMax-M*) since all models
-                        // share the same quota pool and showing 20+ entries is noisy.
+                        // MiniMax meters the coding plan per category ("general"
+                        // for the text/LLM pool, "video", …) on a 5-hour rolling
+                        // window plus a weekly window. The binding signal is
+                        // `current_*_remaining_percent` (0..100); the raw token
+                        // counts are routinely 0/0 for the text pool, so we don't
+                        // rely on them. Reset times arrive as epoch milliseconds.
                         if let Some(models) = data.get("model_remains").and_then(|v| v.as_array()) {
+                            let ms_to_secs = |m: &serde_json::Value, key: &str| -> i64 {
+                                m.get(key).and_then(|v| v.as_i64()).unwrap_or(0) / 1000
+                            };
                             let model_usage: Vec<serde_json::Value> = models
                                 .iter()
-                                .filter(|m| {
-                                    m.get("model_name")
-                                        .and_then(|v| v.as_str())
-                                        .map(|n| n.starts_with("MiniMax-M"))
-                                        .unwrap_or(false)
-                                })
                                 .map(|m| {
                                     serde_json::json!({
                                         "model": m.get("model_name").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                                        "interval_total": m.get("current_interval_total_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        "interval_remaining": m.get("current_interval_usage_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        "weekly_total": m.get("current_weekly_total_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        "weekly_remaining": m.get("current_weekly_usage_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        "interval_reset": m.get("end_time").and_then(|v| v.as_i64()).unwrap_or(0),
-                                        "weekly_reset": m.get("weekly_end_time").and_then(|v| v.as_i64()).unwrap_or(0),
+                                        "interval_remaining_percent": m.get("current_interval_remaining_percent").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                                        "weekly_remaining_percent": m.get("current_weekly_remaining_percent").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                                        "interval_reset": ms_to_secs(m, "end_time"),
+                                        "weekly_reset": ms_to_secs(m, "weekly_end_time"),
                                     })
                                 })
                                 .collect();
                             map.insert("model_usage".to_string(), serde_json::json!(model_usage));
+
+                            // Flat representative-window fields for the optimize
+                            // block. The "general" category is the text/coding
+                            // pool the subscription is really about; fall back to
+                            // the most-consumed (lowest remaining) category, else
+                            // the first one.
+                            let representative = models
+                                .iter()
+                                .find(|m| {
+                                    m.get("model_name").and_then(|v| v.as_str()) == Some("general")
+                                })
+                                .or_else(|| {
+                                    models.iter().min_by(|a, b| {
+                                        let ra = a
+                                            .get("current_interval_remaining_percent")
+                                            .and_then(|v| v.as_f64())
+                                            .unwrap_or(100.0);
+                                        let rb = b
+                                            .get("current_interval_remaining_percent")
+                                            .and_then(|v| v.as_f64())
+                                            .unwrap_or(100.0);
+                                        ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+                                    })
+                                });
+                            if let Some(rep) = representative {
+                                if let Some(p) = rep
+                                    .get("current_interval_remaining_percent")
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    map.insert(
+                                        "minimax_interval_remaining_percent".into(),
+                                        serde_json::json!(p),
+                                    );
+                                    map.insert(
+                                        "minimax_interval_reset".into(),
+                                        serde_json::json!(ms_to_secs(rep, "end_time")),
+                                    );
+                                }
+                                if let Some(p) = rep
+                                    .get("current_weekly_remaining_percent")
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    map.insert(
+                                        "minimax_weekly_remaining_percent".into(),
+                                        serde_json::json!(p),
+                                    );
+                                    map.insert(
+                                        "minimax_weekly_reset".into(),
+                                        serde_json::json!(ms_to_secs(rep, "weekly_end_time")),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -7156,29 +7206,88 @@ async fn get_provider_usage(
                 }
             };
 
-            // Z.AI doesn't expose rate-limit headers. Previously we sent a
-            // 1-token chat completion as a probe, but that burns quota every
-            // 60s and quickly hits 429 on free tiers. The `/models` endpoint
-            // is auth-checked without consuming inference budget, so use it
-            // instead — same connectedness signal, no rate-limit churn.
+            // Z.AI's coding plan exposes a monitor endpoint with the 5-hour and
+            // weekly token windows (`percentage` = percent USED, `nextResetTime`
+            // = epoch ms; an untouched window omits the reset). It does NOT
+            // consume inference budget. Two quirks vs. every other provider:
+            //   * the Authorization header carries the raw token, NO "Bearer".
+            //   * the payload is nested under `data.limits[]`, tagged by
+            //     (unit, number): unit=3,number=5 ⇒ 5-hour; unit=6,number=1 ⇒ weekly.
+            let mut info = serde_json::json!({
+                "provider_type": "zai",
+                "provider_name": provider_name,
+            });
             let resp = client
-                .get("https://open.bigmodel.cn/api/paas/v4/models")
-                .header("Authorization", format!("Bearer {}", key))
+                .get("https://api.z.ai/api/monitor/usage/quota/limit")
+                .header("Authorization", key) // intentionally no "Bearer" prefix
+                .header("Accept-Language", "en-US,en")
+                .header("Content-Type", "application/json")
                 .send()
                 .await;
 
             match resp {
+                Ok(r) if r.status().is_success() => {
+                    let map = info.as_object_mut().unwrap();
+                    map.insert("status".to_string(), serde_json::json!("connected"));
+                    if let Ok(data) = r.json::<serde_json::Value>().await {
+                        let body = data.get("data").unwrap_or(&data);
+                        if let Some(level) = body.get("level").and_then(|v| v.as_str()) {
+                            map.insert("zai_plan".to_string(), serde_json::json!(level));
+                        }
+                        if let Some(limits) = body.get("limits").and_then(|v| v.as_array()) {
+                            for limit in limits {
+                                // Only the token windows feed the optimize block.
+                                if limit.get("type").and_then(|v| v.as_str())
+                                    != Some("TOKENS_LIMIT")
+                                {
+                                    continue;
+                                }
+                                let unit = limit.get("unit").and_then(|v| v.as_i64());
+                                let number = limit.get("number").and_then(|v| v.as_i64());
+                                let pct = limit
+                                    .get("percentage")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+                                // epoch ms → seconds; absent for an untouched window.
+                                let reset = limit
+                                    .get("nextResetTime")
+                                    .and_then(|v| v.as_i64())
+                                    .map(|ms| ms / 1000);
+                                let (pct_key, reset_key) = match (unit, number) {
+                                    (Some(3), Some(5)) => ("zai_5h_used_percent", "zai_5h_reset"),
+                                    (Some(6), Some(1)) => {
+                                        ("zai_weekly_used_percent", "zai_weekly_reset")
+                                    }
+                                    _ => continue,
+                                };
+                                map.insert(pct_key.to_string(), serde_json::json!(pct));
+                                if let Some(reset) = reset {
+                                    map.insert(reset_key.to_string(), serde_json::json!(reset));
+                                }
+                            }
+                        }
+                    }
+                    info
+                }
                 Ok(r) => {
+                    // Not a coding-plan token (or endpoint unavailable). Fall back
+                    // to a budget-free connectivity check so pay-as-you-go API
+                    // keys still report "connected" instead of erroring.
                     let status_code = r.status().as_u16();
-                    let mut info = serde_json::json!({
-                        "provider_type": "zai",
-                        "provider_name": provider_name,
-                        "status": if status_code < 400 { "connected" } else { "error" },
-                    });
-                    if status_code >= 400 {
-                        info.as_object_mut().unwrap().insert(
+                    let models = client
+                        .get("https://open.bigmodel.cn/api/paas/v4/models")
+                        .header("Authorization", format!("Bearer {}", key))
+                        .send()
+                        .await;
+                    let connected = matches!(models, Ok(ref m) if m.status().is_success());
+                    let map = info.as_object_mut().unwrap();
+                    if connected {
+                        map.insert("status".to_string(), serde_json::json!("connected"));
+                    } else {
+                        map.insert("status".to_string(), serde_json::json!("error"));
+                        map.insert(
                             "error".to_string(),
-                            serde_json::json!(format!("API returned {}", status_code)),
+                            serde_json::json!(format!("Quota endpoint returned {}", status_code)),
                         );
                     }
                     info
