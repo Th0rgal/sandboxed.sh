@@ -209,8 +209,11 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     const methods = getProviderAuthMethods(providerType);
 
     // Default backend targeting by provider (may be adjusted after method selection).
+    // Mirror the server's `default_backends_for_provider` (src/api/ai_providers.rs):
+    // Anthropic targets BOTH opencode and claudecode by default — Claude Code is the
+    // primary Anthropic backend, so it must be preselected, not just opencode.
     if (providerType === 'anthropic') {
-      setSelectedBackends(['opencode']);
+      setSelectedBackends(['opencode', 'claudecode']);
     } else if (providerType === 'openai') {
       setSelectedBackends(['opencode', 'codex']);
     } else if (providerType === 'google') {
@@ -240,6 +243,9 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     // Providers that support multiple backends should select targeting first.
     if (selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google' || selectedProvider === 'xai') {
       // For OpenAI, default backends depend on auth method.
+      if (selectedProvider === 'anthropic') {
+        setSelectedBackends(['opencode', 'claudecode']);
+      }
       if (selectedProvider === 'openai') {
         setSelectedBackends(['opencode', 'codex']);
       }
