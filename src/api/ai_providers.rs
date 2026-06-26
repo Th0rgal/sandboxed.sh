@@ -68,7 +68,7 @@ fn oauth_refresh_mark_token_dead(account_id: uuid::Uuid, token: &str) {
     }
 }
 
-fn oauth_refresh_clear_dead(account_id: uuid::Uuid) {
+pub(crate) fn oauth_refresh_clear_dead(account_id: uuid::Uuid) {
     if let Ok(mut m) = OAUTH_REFRESH_DEADLETTER.lock() {
         m.remove(&account_id);
     }

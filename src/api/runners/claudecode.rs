@@ -407,23 +407,53 @@ pub fn run_claudecode_turn<'a>(
                         .map(|(e, _)| e)
                         .unwrap_or(i64::MIN);
                     if m_expires > host_expires {
+                        // Capture the host's pre-rotation refresh token so the
+                        // store-reconcile pass can find the owning account record.
+                        let host_old_refresh = read_claude_cli_credentials(&host_path)
+                            .map(|(_, _, r, _)| r)
+                            .unwrap_or_default();
                         tracing::info!(
                             mission_id = %mission_id,
                             mission_expires_at = m_expires,
                             host_expires_at = host_expires,
                             "Mission credentials are fresher than host; syncing back to all storage tiers"
                         );
-                        if let Err(e) = crate::api::ai_providers::sync_oauth_to_all_tiers(
+                        match crate::api::ai_providers::sync_oauth_to_all_tiers(
                             crate::ai_providers::ProviderType::Anthropic,
                             &m_refresh,
                             &m_access,
                             m_expires,
                         ) {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                error = %e,
-                                "Failed to write mission-rotated Anthropic credentials back to host"
-                            );
+                            Ok(()) => {
+                                // The runner has no safe handle on the in-memory
+                                // AIProviderStore (a second instance would
+                                // split-brain ai_providers.json), so queue the
+                                // rotation for the proactive loop — which owns the
+                                // store — to apply against the matching record.
+                                if let Err(e) = crate::api::oauth_reconcile::record_pending_rotation(
+                                    &crate::api::oauth_reconcile::sidecar_path(app_working_dir),
+                                    crate::api::oauth_reconcile::PendingRotation {
+                                        provider: "anthropic".to_string(),
+                                        old_refresh_token: host_old_refresh,
+                                        new_refresh_token: m_refresh.clone(),
+                                        new_access_token: m_access.clone(),
+                                        expires_at: m_expires,
+                                    },
+                                ) {
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        error = %e,
+                                        "Failed to queue Anthropic rotation for store reconcile"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    mission_id = %mission_id,
+                                    error = %e,
+                                    "Failed to write mission-rotated Anthropic credentials back to host"
+                                );
+                            }
                         }
                     }
                 }

@@ -2765,6 +2765,23 @@ async fn oauth_token_refresher_loop(
     let store_oauth_types = [ProviderType::Anthropic, ProviderType::Xai];
 
     loop {
+        // Heal any out-of-band tier rotations FIRST: per-mission Claude Code
+        // harnesses rotate the Anthropic token inside their isolated HOME and the
+        // runner queues the rotation here. Reconciling the store record before
+        // the refresh passes below stops the store pass from refreshing a token
+        // the mission already rotated (which would revoke the live family).
+        let reconciled = crate::api::oauth_reconcile::drain_pending(
+            &ai_providers,
+            &crate::api::oauth_reconcile::sidecar_path(&working_dir),
+        )
+        .await;
+        if reconciled > 0 {
+            tracing::info!(
+                reconciled,
+                "Reconciled store records from queued tier rotations"
+            );
+        }
+
         // Refresh store-backed OAuth accounts FIRST. For any account that also
         // owns the shared credential tiers, this rotates the token AND writes it
         // to the tiers before the file-tier pass runs below — otherwise that
@@ -2836,7 +2853,7 @@ async fn oauth_token_refresher_loop(
             match ai_providers_api::refresh_oauth_token_with_lock(provider_type, entry.expires_at)
                 .await
             {
-                Ok((_new_access, _new_refresh, new_expires_at)) => {
+                Ok((new_access, new_refresh, new_expires_at)) => {
                     let new_time_until = new_expires_at - now_ms;
                     tracing::info!(
                         provider_type = ?provider_type,
@@ -2844,6 +2861,28 @@ async fn oauth_token_refresher_loop(
                         "Successfully refreshed OAuth token proactively"
                     );
                     refreshed_count += 1;
+                    // The file-tier pass just rotated the token without touching
+                    // the AIProviderStore record. Propagate it into the matching
+                    // record (by the pre-rotation token) so the next store pass
+                    // doesn't try to refresh a now-dead token and revoke the
+                    // family. Anthropic is the only provider with both a tier and
+                    // multi-account store records.
+                    if provider_type == ProviderType::Anthropic
+                        && new_refresh != entry.refresh_token
+                    {
+                        crate::api::oauth_reconcile::apply_rotation(
+                            &ai_providers,
+                            provider_type,
+                            &crate::api::oauth_reconcile::PendingRotation {
+                                provider: "anthropic".to_string(),
+                                old_refresh_token: entry.refresh_token.clone(),
+                                new_refresh_token: new_refresh,
+                                new_access_token: new_access,
+                                expires_at: new_expires_at,
+                            },
+                        )
+                        .await;
+                    }
                 }
                 Err(e) => match e {
                     ai_providers_api::OAuthRefreshError::InvalidGrant(reason) => {

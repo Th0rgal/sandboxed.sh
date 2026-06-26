@@ -43,6 +43,7 @@ pub mod mission_workspace_gc;
 mod model_routing;
 mod monitoring;
 mod native_loop_observer;
+pub mod oauth_reconcile;
 pub mod opencode;
 pub mod paloma;
 mod provider_usage_cache;
