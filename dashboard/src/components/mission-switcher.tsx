@@ -18,7 +18,7 @@ import {
 import { cn } from '@/lib/utils';
 import { searchMissions, type Mission, type RunningMissionInfo } from '@/lib/api';
 import { getMissionShortName } from '@/lib/mission-display';
-import { STATUS_LABELS, getMissionDotColor, getMissionTitle } from '@/lib/mission-status';
+import { statusLabel, getMissionDotColor, getMissionTitle } from '@/lib/mission-status';
 import { AsyncButton } from '@/components/ui/async-button';
 import { getStatusIcon } from '@/components/ui/status-icons';
 
@@ -157,7 +157,9 @@ function getMissionBackendLabel(mission: Mission): string {
 }
 
 function getMissionStatusLabel(mission: Mission): string {
-  return STATUS_LABELS[mission.status] ?? mission.status ?? 'Unknown';
+  // Distinguish "Needs Decision" vs "Awaiting Review" for awaiting_user using
+  // awaiting_kind, matching the control workbench/header.
+  return statusLabel(mission.status, mission.awaiting_kind) ?? mission.status ?? 'Unknown';
 }
 
 function getMissionStatusToneClass(status: string | undefined, isRunning: boolean): string {

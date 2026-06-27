@@ -3869,8 +3869,10 @@ pub async fn list_missions(
         page
     } else {
         // Filtered path: predicate-match runs in memory, so a single 200-row
-        // page would silently drop matches on a larger fleet. Scan pages from
-        // `offset` until we have `limit` matches or hit a bounded ceiling.
+        // page would silently drop matches on a larger fleet. Scan from the
+        // start, collecting matches, until we have `offset + limit` of them or
+        // hit a bounded ceiling. `offset` here means "skip this many MATCHING
+        // missions" (consistent with filtered pagination), not raw rows.
         const PAGE: usize = 200;
         const MAX_SCAN: usize = 5_000;
         let status = query.status.as_deref();
@@ -3878,9 +3880,10 @@ pub async fn list_missions(
         let tag = query.tag.as_deref();
         let workspace_lower = query.workspace.as_deref().map(|w| w.to_lowercase());
         let workspace_raw = query.workspace.as_deref();
+        let want = offset.saturating_add(limit);
 
         let mut matched: Vec<Mission> = Vec::new();
-        let mut scan_offset = offset;
+        let mut scan_offset = 0usize;
         let mut scanned = 0usize;
         loop {
             let mut page = control
@@ -3905,14 +3908,14 @@ pub async fn list_missions(
                     };
                 if keep {
                     matched.push(m);
-                    if matched.len() >= limit {
+                    if matched.len() >= want {
                         break;
                     }
                 }
             }
             scanned += page_len;
-            if matched.len() >= limit || page_len < PAGE || scanned >= MAX_SCAN {
-                if scanned >= MAX_SCAN && matched.len() < limit {
+            if matched.len() >= want || page_len < PAGE || scanned >= MAX_SCAN {
+                if scanned >= MAX_SCAN && matched.len() < want {
                     tracing::warn!(
                         "list_missions filter scan hit cap ({}); results may be incomplete",
                         MAX_SCAN
@@ -3922,7 +3925,8 @@ pub async fn list_missions(
             }
             scan_offset += PAGE;
         }
-        matched
+        // Apply the offset to matches (not raw rows) and cap at limit.
+        matched.into_iter().skip(offset).take(limit).collect()
     };
 
     populate_activity(&control, &mut missions).await;
@@ -9293,30 +9297,19 @@ async fn maybe_finalize_terminal_mission(
                 context = log_context,
                 "Finalizing mission after terminal turn"
             );
-            // Classify the awaiting reason *before* flipping the status so the
-            // `awaiting_kind` column is populated by the time the
-            // MissionStatusChanged event (and the Paloma webhook it triggers)
-            // fires. The status write only clears awaiting_kind for non-awaiting
-            // statuses, so setting it first here is safe.
-            if new_status == MissionStatus::AwaitingUser {
-                // Prefer the in-hand turn output; fall back to history only when
-                // the caller didn't supply it (event log may lag the turn).
-                let kind = match final_output {
+            // Classify the awaiting reason now (uses the in-hand turn output;
+            // falls back to history only when the caller didn't supply it, since
+            // the event log can lag the turn). Applied *after* a successful
+            // status write below so a failed write can't orphan awaiting_kind on
+            // a mission that never became AwaitingUser.
+            let awaiting_kind = if new_status == MissionStatus::AwaitingUser {
+                Some(match final_output {
                     Some(text) if !text.trim().is_empty() => classify_awaiting_kind_text(text),
                     _ => classify_awaiting_kind(&mission.history),
-                };
-                if let Err(e) = mission_store
-                    .set_mission_awaiting_kind(mission_id, Some(kind))
-                    .await
-                {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        context = log_context,
-                        "Failed to set awaiting_kind: {}",
-                        e
-                    );
-                }
-            }
+                })
+            } else {
+                None
+            };
 
             if let Err(e) = mission_store
                 .update_mission_status_with_reason(
@@ -9333,6 +9326,23 @@ async fn maybe_finalize_terminal_mission(
                     e
                 );
             } else {
+                // Set awaiting_kind after the status is committed to AwaitingUser
+                // and before emitting the event the Paloma webhook keys on, so
+                // the webhook sees it without risking an orphan on write failure.
+                if let Some(kind) = awaiting_kind {
+                    if let Err(e) = mission_store
+                        .set_mission_awaiting_kind(mission_id, Some(kind))
+                        .await
+                    {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            context = log_context,
+                            "Failed to set awaiting_kind: {}",
+                            e
+                        );
+                    }
+                }
+
                 maybe_schedule_mission_metadata_refresh_for_status(
                     mission_store,
                     events_tx,
