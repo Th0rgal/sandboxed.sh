@@ -16,7 +16,7 @@ import {
   Pencil,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { searchMissions, type Mission, type RunningMissionInfo } from '@/lib/api';
+import { searchMissions, type AwaitingKind, type Mission, type RunningMissionInfo } from '@/lib/api';
 import { getMissionShortName } from '@/lib/mission-display';
 import { statusLabel, getMissionDotColor, getMissionTitle } from '@/lib/mission-status';
 import { AsyncButton } from '@/components/ui/async-button';
@@ -162,8 +162,17 @@ function getMissionStatusLabel(mission: Mission): string {
   return statusLabel(mission.status, mission.awaiting_kind) ?? mission.status ?? 'Unknown';
 }
 
-function getMissionStatusToneClass(status: string | undefined, isRunning: boolean): string {
+function getMissionStatusToneClass(
+  status: string | undefined,
+  isRunning: boolean,
+  awaitingKind?: AwaitingKind | null,
+): string {
   if (isRunning && status !== 'waiting_for_tool') return 'text-indigo-300/85';
+  // Ack ("Awaiting Review") uses the sky tone to match the workbench/header;
+  // decision (and unclassified) stay amber.
+  if (status === 'awaiting_user' && awaitingKind === 'ack') {
+    return 'text-sky-300/90';
+  }
   switch (status) {
     case 'waiting_for_tool':
     case 'awaiting_user':
@@ -204,7 +213,7 @@ function getMissionStatusDisplay(
   if (!mission) return null;
   return {
     Icon: getStatusIcon(mission.status),
-    tone: getMissionStatusToneClass(mission.status, false),
+    tone: getMissionStatusToneClass(mission.status, false, mission.awaiting_kind),
     label: getMissionStatusLabel(mission),
     spin: false,
   };
