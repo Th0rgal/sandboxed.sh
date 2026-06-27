@@ -147,6 +147,19 @@ struct SendMessageParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct AskMissionParams {
+    mission_id: String,
+    content: String,
+    /// Continue an existing Ask thread. Omit to start a new one.
+    #[serde(default)]
+    thread_id: Option<String>,
+    /// Run the Ask bash tool in an isolated copy of the workspace (writes never
+    /// touch the live tree). Opt-in.
+    #[serde(default)]
+    sandbox: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct WorkspaceBashParams {
     command: String,
     #[serde(default)]
@@ -527,6 +540,20 @@ impl AssistantMcp {
                 }),
             },
             ToolDefinition {
+                name: "ask_mission".to_string(),
+                description: "Ask a read-only question to a mission's Ask copilot (a sidecar with bash + workspace access) WITHOUT disturbing the mission or waking its main agent. Use this to inspect a mission's workspace/state or get analysis. Returns the copilot's answer and a thread_id; pass thread_id back to continue the same conversation. This does NOT send a message to the mission agent — use send_message_to_mission for that.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id", "content"],
+                    "properties": {
+                        "mission_id": {"type": "string"},
+                        "content": {"type": "string", "description": "The question for the copilot."},
+                        "thread_id": {"type": "string", "description": "Optional: continue an existing Ask thread."},
+                        "sandbox": {"type": "boolean", "description": "Optional: isolate bash writes in a throwaway copy of the workspace (default false)."}
+                    }
+                }),
+            },
+            ToolDefinition {
                 name: "cancel_mission".to_string(),
                 description: "Cancel a running or pending mission.".to_string(),
                 input_schema: json!({
@@ -876,6 +903,36 @@ impl AssistantMcp {
             .json()
             .await
             .map_err(|error| format!("Failed to parse send result: {error}"))
+    }
+
+    async fn ask_mission(&self, params: AskMissionParams) -> Result<Value, String> {
+        let id = parse_uuid(&params.mission_id)?;
+        let mut body = json!({
+            "content": params.content,
+            "sandbox": params.sandbox,
+        });
+        if let Some(tid) = params.thread_id.as_deref() {
+            let tid = parse_uuid(tid)?;
+            body["thread_id"] = json!(tid.to_string());
+        }
+        let response = self
+            .api_post(&format!("/api/control/missions/{id}/ask"), body)
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to ask mission ({status}): {text}"));
+        }
+        let result: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("Failed to parse ask result: {error}"))?;
+        // Return just the answer + thread_id (drop the full message history to
+        // keep the tool result compact).
+        Ok(json!({
+            "thread_id": result.get("thread_id").cloned().unwrap_or(Value::Null),
+            "answer": result.get("answer").cloned().unwrap_or(Value::Null),
+        }))
     }
 
     async fn cancel_mission(&self, params: MissionIdParams) -> Result<Value, String> {
@@ -1261,6 +1318,11 @@ impl AssistantMcp {
                 let params: SendMessageParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
                 self.send_message(params).await
+            }
+            "ask_mission" => {
+                let params: AskMissionParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.ask_mission(params).await
             }
             "cancel_mission" => {
                 let params: MissionIdParams = serde_json::from_value(arguments)
