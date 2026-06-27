@@ -115,7 +115,7 @@ impl MissionStore for InMemoryMissionStore {
             config_profile: config_profile.map(|s| s.to_string()),
             history: vec![],
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
             interrupted_at: None,
             paused_at: None,
             resumable: false,
@@ -129,6 +129,12 @@ impl MissionStore for InMemoryMissionStore {
             goal_objective: None,
             first_viewed_at: None,
             scheduling: Default::default(),
+            project: Default::default(),
+            activity: super::MissionActivity {
+                last_status_change_at: Some(now.clone()),
+                ..Default::default()
+            },
+            awaiting_kind: None,
         };
         self.missions
             .write()
@@ -161,9 +167,13 @@ impl MissionStore for InMemoryMissionStore {
         let mission = missions
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
+        let status_changed = mission.status != status;
         mission.status = status;
         let now = now_string();
         mission.updated_at = now.clone();
+        if status_changed {
+            mission.activity.last_status_change_at = Some(now.clone());
+        }
         mission.terminal_reason = terminal_reason.map(|s| s.to_string());
         // AwaitingUser is resumable too (any user message wakes the agent).
         // Failed missions with LlmError are also resumable (transient API errors).
@@ -183,6 +193,11 @@ impl MissionStore for InMemoryMissionStore {
             };
         if matches!(status, MissionStatus::Active) {
             mission.first_viewed_at = None;
+        }
+        // awaiting_kind only describes an AwaitingUser mission; clear it on any
+        // change away from that state (parity with the sqlite store).
+        if !matches!(status, MissionStatus::AwaitingUser) {
+            mission.awaiting_kind = None;
         }
         Ok(())
     }
@@ -368,6 +383,50 @@ impl MissionStore for InMemoryMissionStore {
         let now = now_string();
         mission.metadata_updated_at = Some(now.clone());
         mission.updated_at = now;
+        Ok(())
+    }
+
+    async fn update_mission_project(
+        &self,
+        id: Uuid,
+        patch: super::MissionProjectPatch,
+    ) -> Result<(), String> {
+        if patch.is_empty() {
+            return Ok(());
+        }
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+        if let Some(project) = patch.project {
+            mission.project.project = project;
+        }
+        if let Some(track) = patch.track {
+            mission.project.track = track;
+        }
+        if let Some(intent) = patch.intent {
+            mission.project.intent = intent;
+        }
+        if let Some(github_pr) = patch.github_pr {
+            mission.project.github_pr = github_pr;
+        }
+        if let Some(tags) = patch.tags {
+            mission.project.tags = tags;
+        }
+        mission.updated_at = now_string();
+        Ok(())
+    }
+
+    async fn set_mission_awaiting_kind(
+        &self,
+        id: Uuid,
+        kind: Option<super::AwaitingKind>,
+    ) -> Result<(), String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+        mission.awaiting_kind = kind;
         Ok(())
     }
 

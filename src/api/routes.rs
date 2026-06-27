@@ -694,6 +694,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // State snapshots (for refresh resilience)
         .route("/api/control/progress", get(control::get_progress))
         // Mission management endpoints
+        .route("/api/health/fleet", get(control::fleet_health))
         .route("/api/control/missions", get(control::list_missions))
         .route("/api/control/missions", post(control::create_mission))
         .route(
@@ -760,6 +761,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/:id/settings",
             patch(control::update_mission_settings),
+        )
+        .route(
+            "/api/control/missions/:id/project",
+            post(control::update_mission_project),
         )
         .route(
             "/api/control/missions/:id/mode",

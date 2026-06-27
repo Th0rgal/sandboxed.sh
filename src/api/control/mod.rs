@@ -55,7 +55,7 @@ use super::auth::AuthUser;
 use super::desktop;
 use super::library::SharedLibrary;
 use super::mission_store::{
-    self, create_mission_store, now_string, BoardTask, BoardTaskStatus, Mission,
+    self, create_mission_store, now_string, AwaitingKind, BoardTask, BoardTaskStatus, Mission,
     MissionHistoryEntry, MissionStore, MissionStoreType, NewBoardTask,
 };
 use super::routes::AppState;
@@ -3829,6 +3829,18 @@ pub struct ListMissionsQuery {
     pub limit: Option<usize>,
     #[serde(default)]
     pub offset: Option<usize>,
+    /// Optional filter: exact mission status (e.g. "awaiting_user").
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Optional filter: exact project identifier.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Optional filter: missions carrying this tag.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Optional filter: workspace by id or (case-insensitive) name.
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 pub async fn list_missions(
@@ -3839,15 +3851,137 @@ pub async fn list_missions(
     let control = control_for_user(&state, &user).await;
     // Default to the most recent 50; honor an explicit limit so callers (e.g.
     // the assistant MCP) can request more, capped to keep the response bounded.
+    let has_filters = query.status.is_some()
+        || query.project.is_some()
+        || query.tag.is_some()
+        || query.workspace.is_some();
+    // When filtering, scan a wider window so the requested count can still be
+    // filled after dropping non-matching rows; otherwise honor the limit as-is.
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0);
+    let fetch_limit = if has_filters { 200 } else { limit };
     let mut missions = control
         .mission_store
-        .list_missions(limit, offset)
+        .list_missions(fetch_limit, offset)
         .await
         .map_err(internal_error)?;
     populate_workspace_names(&state, &mut missions).await;
+
+    if let Some(status) = query.status.as_deref() {
+        missions.retain(|m| m.status.to_string() == status);
+    }
+    if let Some(project) = query.project.as_deref() {
+        missions.retain(|m| m.project.project.as_deref() == Some(project));
+    }
+    if let Some(tag) = query.tag.as_deref() {
+        missions.retain(|m| m.project.tags.iter().any(|t| t == tag));
+    }
+    if let Some(workspace) = query.workspace.as_deref() {
+        let ws_lower = workspace.to_lowercase();
+        missions.retain(|m| {
+            m.workspace_id.to_string() == workspace
+                || m.workspace_name
+                    .as_deref()
+                    .is_some_and(|name| name.to_lowercase() == ws_lower)
+        });
+    }
+    if has_filters {
+        missions.truncate(limit);
+    }
+
+    populate_activity(&control, &mut missions).await;
     Ok(Json(missions))
+}
+
+/// Targeted post-deploy/observability health for the mission fleet (P#8). One
+/// authenticated GET confirms the critical loop is alive after a restart:
+/// the control actor responds (scheduler heartbeat), the webhook forwarder and
+/// offload are configured, and the current queue/running/status counts.
+#[derive(Debug, Serialize)]
+pub struct FleetHealth {
+    pub status: &'static str,
+    pub version: String,
+    /// True iff the control actor answered our ListRunning/GetQueue probes —
+    /// i.e. the scheduler/dispatch loop is not wedged.
+    pub control_responsive: bool,
+    pub running: usize,
+    pub queue_depth: usize,
+    pub missions: crate::api::mission_store::MissionStatusCounts,
+    pub webhook_forwarder_configured: bool,
+    pub offload_configured: bool,
+}
+
+pub async fn fleet_health(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<FleetHealth>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    // Probe the control actor; a wedged scheduler surfaces as a failed probe.
+    let running = get_running_missions(&control).await.map(|r| r.len());
+    let (tx, rx) = oneshot::channel();
+    let queue_depth = if control
+        .cmd_tx
+        .send(ControlCommand::GetQueue { respond: tx })
+        .await
+        .is_ok()
+    {
+        rx.await.ok().map(|q| q.len())
+    } else {
+        None
+    };
+    let control_responsive = running.is_ok() && queue_depth.is_some();
+
+    let missions = control
+        .mission_store
+        .count_missions_by_status()
+        .await
+        .map_err(internal_error)?;
+
+    let cfg = &state.config;
+    Ok(Json(FleetHealth {
+        status: if control_responsive { "ok" } else { "degraded" },
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        control_responsive,
+        running: running.unwrap_or(0),
+        queue_depth: queue_depth.unwrap_or(0),
+        missions,
+        webhook_forwarder_configured: cfg.paloma_webhook_forward_url.is_some(),
+        offload_configured: cfg.spark_arbiter_url.is_some() || cfg.spark_ssh_target.is_some(),
+    }))
+}
+
+/// Enrich missions with computed activity timestamps (P#5): the most recent
+/// event and assistant output from the event log, plus a `last_activity_at`
+/// convenience = max(updated_at, last_agent_event_at). Best-effort: a store
+/// without an event log (or a failed query) leaves the computed fields unset.
+async fn populate_activity(control: &ControlState, missions: &mut [Mission]) {
+    if missions.is_empty() {
+        return;
+    }
+    let ids: Vec<Uuid> = missions.iter().map(|m| m.id).collect();
+    let activity = match control.mission_store.get_mission_activity(&ids).await {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!("Failed to load mission activity: {}", e);
+            return;
+        }
+    };
+    for mission in missions.iter_mut() {
+        if let Some((last_event, last_output)) = activity.get(&mission.id) {
+            mission.activity.last_agent_event_at = last_event.clone();
+            mission.activity.last_output_at = last_output.clone();
+        }
+        // last_activity_at = the most recent of updated_at and the newest event.
+        let last_activity = [
+            Some(mission.updated_at.clone()),
+            mission.activity.last_agent_event_at.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        mission.activity.last_activity_at = last_activity;
+    }
 }
 
 async fn populate_workspace_names(state: &Arc<AppState>, missions: &mut [Mission]) {
@@ -4201,7 +4335,7 @@ pub async fn get_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Mission>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     match control
         .mission_store
@@ -4210,11 +4344,39 @@ pub async fn get_mission(
         .map_err(internal_error)?
     {
         Some(mut mission) => {
-            // Populate workspace_name
-            if let Some(workspace) = state.workspaces.get(mission.workspace_id).await {
-                mission.workspace_name = Some(workspace.name);
+            // Populate workspace_name + spark_offload from the workspace (P#7).
+            let workspace = state.workspaces.get(mission.workspace_id).await;
+            if let Some(ws) = workspace.as_ref() {
+                mission.workspace_name = Some(ws.name.clone());
             }
-            Ok(Json(mission))
+            let mut one = [mission];
+            populate_activity(&control, &mut one).await;
+            let [mission] = one;
+
+            // Serialize then attach the computed spark_offload block so Paloma
+            // can route heavy builds without probing the host each time.
+            let mut value = serde_json::to_value(&mission).map_err(internal_error)?;
+            let host_configured =
+                state.config.spark_arbiter_url.is_some() || state.config.spark_ssh_target.is_some();
+            let enabled = workspace
+                .as_ref()
+                .map(|ws| ws.spark_offload_enabled())
+                .unwrap_or(false);
+            let env_injected = workspace
+                .as_ref()
+                .map(|ws| ws.spark_offload_env(mission.id).is_some())
+                .unwrap_or(false);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "spark_offload".to_string(),
+                    serde_json::json!({
+                        "enabled": enabled,
+                        "env_injected": env_injected,
+                        "host_configured": host_configured,
+                    }),
+                );
+            }
+            Ok(Json(value))
         }
         None => Err((StatusCode::NOT_FOUND, format!("Mission {} not found", id))),
     }
@@ -4251,6 +4413,16 @@ pub struct CreateMissionRequest {
     /// FLEET-001 scheduling hint: deadline. A scheduled mission that never
     /// dispatches before this is failed with reason `deadline_exceeded`.
     pub deadline: Option<chrono::DateTime<chrono::Utc>>,
+    /// Project tagging: stable project identifier (e.g. "verity-core").
+    pub project: Option<String>,
+    /// Project tagging: track / workstream within the project.
+    pub track: Option<String>,
+    /// Project tagging: intent (e.g. "repair-build").
+    pub intent: Option<String>,
+    /// Project tagging: associated GitHub PR number.
+    pub github_pr: Option<i64>,
+    /// Project tagging: freeform tags.
+    pub tags: Option<Vec<String>>,
 }
 
 fn deserialize_string_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
@@ -4258,6 +4430,15 @@ where
     D: Deserializer<'de>,
 {
     Option::<String>::deserialize(deserializer).map(Some)
+}
+
+/// Like [`deserialize_string_patch`] but for an optional integer: present field
+/// (even `null`) → `Some(..)`, absent → `None`.
+fn deserialize_i64_patch<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4352,6 +4533,11 @@ pub async fn create_mission(
         priority: None,
         not_before: None,
         deadline: None,
+        project: None,
+        track: None,
+        intent: None,
+        github_pr: None,
+        tags: None,
     });
 
     let title = req.title.clone();
@@ -4492,10 +4678,142 @@ pub async fn create_mission(
         .await
         .map_err(session_unavailable)?;
 
-    rx.await
-        .map_err(recv_failed)?
-        .map(Json)
-        .map_err(internal_error)
+    let mut mission = rx.await.map_err(recv_failed)?.map_err(internal_error)?;
+
+    // Apply project tagging metadata if provided at creation time. Empty/blank
+    // strings are treated as unset; tags are trimmed and empties dropped.
+    let nonblank = |s: &Option<String>| -> Option<String> {
+        s.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let project = nonblank(&req.project);
+    let track = nonblank(&req.track);
+    let intent = nonblank(&req.intent);
+    let github_pr = req.github_pr;
+    let tags: Option<Vec<String>> = req.tags.as_ref().map(|tags| {
+        tags.iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    });
+    if project.is_some()
+        || track.is_some()
+        || intent.is_some()
+        || github_pr.is_some()
+        || tags.is_some()
+    {
+        control
+            .mission_store
+            .update_mission_project(
+                mission.id,
+                crate::api::mission_store::MissionProjectPatch {
+                    project: project.clone().map(Some),
+                    track: track.clone().map(Some),
+                    intent: intent.clone().map(Some),
+                    github_pr: github_pr.map(Some),
+                    tags: tags.clone(),
+                },
+            )
+            .await
+            .map_err(internal_error)?;
+        // Reflect the applied values in the returned mission without a re-fetch.
+        if let Some(v) = project {
+            mission.project.project = Some(v);
+        }
+        if let Some(v) = track {
+            mission.project.track = Some(v);
+        }
+        if let Some(v) = intent {
+            mission.project.intent = Some(v);
+        }
+        if github_pr.is_some() {
+            mission.project.github_pr = github_pr;
+        }
+        if let Some(v) = tags {
+            mission.project.tags = v;
+        }
+    }
+
+    Ok(Json(mission))
+}
+
+/// Request body for `POST /api/control/missions/:id/project`. Tri-state per
+/// field: omit to leave unchanged, `null` to clear, a value to set. `tags`
+/// replaces the whole list when present.
+#[derive(Debug, Deserialize)]
+pub struct UpdateMissionProjectRequest {
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub project: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub track: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub intent: Option<Option<String>>,
+    /// Tri-state: omit to leave unchanged, `null` to clear, a number to set.
+    #[serde(default, deserialize_with = "deserialize_i64_patch")]
+    pub github_pr: Option<Option<i64>>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Set or update project tagging metadata for a mission.
+pub async fn update_mission_project(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateMissionProjectRequest>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
+
+    // Normalize: blank string patches clear the field; tags are trimmed.
+    let normalize = |patch: Option<Option<String>>| -> Option<Option<String>> {
+        patch.map(|inner| {
+            inner.and_then(|s| {
+                let t = s.trim().to_string();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            })
+        })
+    };
+    let tags: Option<Vec<String>> = req.tags.map(|tags| {
+        tags.into_iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    });
+
+    control
+        .mission_store
+        .update_mission_project(
+            id,
+            crate::api::mission_store::MissionProjectPatch {
+                project: normalize(req.project),
+                track: normalize(req.track),
+                intent: normalize(req.intent),
+                github_pr: req.github_pr,
+                tags,
+            },
+        )
+        .await
+        .map_err(internal_error)?;
+
+    let updated = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
+    Ok(Json(updated))
 }
 
 /// Update mission run settings for future turns.
@@ -5848,6 +6166,17 @@ pub async fn clone_mission(
         priority: None,
         not_before: None,
         deadline: None,
+        // Inherit project tagging from the source mission so clones stay
+        // grouped under the same project/track/intent.
+        project: source.project.project.clone(),
+        track: source.project.track.clone(),
+        intent: source.project.intent.clone(),
+        github_pr: source.project.github_pr,
+        tags: if source.project.tags.is_empty() {
+            None
+        } else {
+            Some(source.project.tags.clone())
+        },
     };
 
     let cloned = create_mission(State(state), Extension(user), Some(Json(req))).await?;
@@ -6993,13 +7322,15 @@ pub async fn stream(
     ))
 }
 
-/// Statuses worth forwarding to an external consumer (Hermes): a mission that
-/// FINISHED, hit a terminal failure, or now needs the user. We deliberately skip
-/// intermediate churn (pending→active→paused→acknowledged) so the callback means
-/// "something actionable happened", not "the status field moved". `Interrupted`
-/// is intentionally excluded: it is emitted transiently as resume-prep when a
-/// paused mission resumes (not a terminal outcome), so forwarding it would fire
-/// a spurious callback on every resume.
+/// Statuses worth forwarding to an external consumer (Paloma/Hermes): a mission
+/// that FINISHED, hit a terminal failure, now needs the user, or was
+/// acknowledged. We still skip the live churn (pending→active→paused) so a
+/// callback means "something actionable happened", not "the status field moved".
+///
+/// `Interrupted` is included (P#1 asks for it) even though it can be emitted
+/// transiently as resume-prep when a paused mission resumes — consumers dedupe
+/// on the `event_id`/`sequence` carried in the payload and can treat a quickly
+/// superseded interrupted→active as a no-op.
 fn webhook_forwardable_status(status: MissionStatus) -> bool {
     matches!(
         status,
@@ -7008,6 +7339,8 @@ fn webhook_forwardable_status(status: MissionStatus) -> bool {
             | MissionStatus::NotFeasible
             | MissionStatus::Blocked
             | MissionStatus::AwaitingUser
+            | MissionStatus::Interrupted
+            | MissionStatus::Acknowledged
     )
 }
 
@@ -7027,6 +7360,10 @@ async fn paloma_webhook_forwarder_loop(
         std::collections::HashMap::new();
     // Bound concurrent in-flight callbacks (each does a get_mission + HTTP POST).
     let sem = Arc::new(tokio::sync::Semaphore::new(8));
+    // Process-monotonic sequence so the consumer can order events and dedupe
+    // (at-least-once delivery: a single logical event keeps one `event_id`
+    // across retries). Resets on restart — `event_id` is the durable key.
+    let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
     loop {
         match events_rx.recv().await {
             Ok(AgentEvent::MissionStatusChanged {
@@ -7038,6 +7375,10 @@ async fn paloma_webhook_forwarder_loop(
                     continue;
                 }
 
+                // Stable per-logical-event identity for idempotent consumers.
+                let event_id = Uuid::new_v4();
+                let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
                 // Everything else (the mission load + POST) runs in a spawned,
                 // concurrency-bounded task so neither a slow DB read nor a slow
                 // webhook can stall the broadcast receiver and lag-drop events.
@@ -7047,25 +7388,81 @@ async fn paloma_webhook_forwarder_loop(
                 let sem = Arc::clone(&sem);
                 tokio::spawn(async move {
                     let _permit = sem.acquire_owned().await;
-                    let title = mission_store
-                        .get_mission(mission_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|mission| mission.title)
+                    let mission = mission_store.get_mission(mission_id).await.ok().flatten();
+                    let title = mission
+                        .as_ref()
+                        .and_then(|mission| mission.title.clone())
                         .unwrap_or_else(|| mission_id.to_string());
+                    let project = mission.as_ref().map(|m| &m.project);
                     let body = serde_json::json!({
+                        // Idempotency / ordering (P#6): consumers dedupe on
+                        // `event_id` and may order by `sequence`.
+                        "event_id": event_id,
+                        "sequence": seq,
                         "mission_id": mission_id,
                         "status": status,
                         "title": title,
+                        "short_description": mission
+                            .as_ref()
+                            .and_then(|m| m.short_description.clone()),
+                        "workspace_id": mission.as_ref().map(|m| m.workspace_id),
+                        "workspace_name": mission
+                            .as_ref()
+                            .and_then(|m| m.workspace_name.clone()),
+                        "backend": mission.as_ref().map(|m| m.backend.clone()),
+                        "updated_at": mission.as_ref().map(|m| m.updated_at.clone()),
+                        // When the status itself last changed (P#5) — the most
+                        // relevant staleness anchor for a status-change webhook.
+                        "last_status_change_at": mission
+                            .as_ref()
+                            .and_then(|m| m.activity.last_status_change_at.clone()),
+                        // Project tagging so Paloma can route by project/track/
+                        // intent/PR instead of parsing titles.
+                        "project": project.and_then(|p| p.project.clone()),
+                        "track": project.and_then(|p| p.track.clone()),
+                        "intent": project.and_then(|p| p.intent.clone()),
+                        "github_pr": project.and_then(|p| p.github_pr),
+                        "tags": project.map(|p| p.tags.clone()).unwrap_or_default(),
+                        // For awaiting_user, whether the agent needs a decision
+                        // or is just waiting to be acked/merged.
+                        "awaiting_kind": mission
+                            .as_ref()
+                            .and_then(|m| m.awaiting_kind)
+                            .map(|k| k.as_str()),
                     });
-                    if let Err(err) = http.post(&url).json(&body).send().await {
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            webhook_url = %url,
-                            "Failed to forward Paloma mission status webhook: {}",
-                            err
-                        );
+
+                    // At-least-once: retry transient failures with the SAME
+                    // event_id so the consumer can dedupe. Bounded so a dead
+                    // endpoint can't pile up tasks.
+                    const MAX_ATTEMPTS: u32 = 3;
+                    for attempt in 1..=MAX_ATTEMPTS {
+                        match http.post(&url).json(&body).send().await {
+                            Ok(resp) if resp.status().is_success() => break,
+                            Ok(resp) => {
+                                tracing::warn!(
+                                    mission_id = %mission_id,
+                                    webhook_url = %url,
+                                    attempt,
+                                    status = %resp.status(),
+                                    "Paloma webhook returned non-success status"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    mission_id = %mission_id,
+                                    webhook_url = %url,
+                                    attempt,
+                                    "Failed to forward Paloma mission status webhook: {}",
+                                    err
+                                );
+                            }
+                        }
+                        if attempt < MAX_ATTEMPTS {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                250 * attempt as u64,
+                            ))
+                            .await;
+                        }
                     }
                 });
             }
@@ -8394,6 +8791,57 @@ fn mission_status_for_terminal_reason(
     }
 }
 
+/// Classify *why* a mission is parking in `AwaitingUser` by inspecting the last
+/// assistant message: a trailing question (or interrogative phrasing) means the
+/// agent needs a `Decision`; anything else means it finished its turn / work and
+/// is waiting for an `Ack`. This is a heuristic — consumers (Paloma) can refine
+/// it — but it is far better than the old all-`awaiting_user`-is-the-same signal.
+fn classify_awaiting_kind(history: &[MissionHistoryEntry]) -> AwaitingKind {
+    let Some(last) = history.iter().rev().find(|entry| entry.role == "assistant") else {
+        // No assistant text to read (e.g. tool-only turn) — default to Ack so a
+        // "done" turn doesn't masquerade as an open question.
+        return AwaitingKind::Ack;
+    };
+
+    let text = last.content.trim();
+    if text.is_empty() {
+        return AwaitingKind::Ack;
+    }
+
+    // Only look at the tail of the message — the closing lines carry the intent
+    // (a long answer that ends with "Want me to proceed?" is a decision).
+    let tail: String = text.chars().rev().take(600).collect::<String>();
+    let tail: String = tail.chars().rev().collect();
+    let lower = tail.to_lowercase();
+
+    let ends_with_question = tail.trim_end().ends_with('?');
+    // Interrogative / approval-seeking lead-ins that signal an open decision even
+    // when the literal '?' lands earlier than the very last character.
+    const DECISION_CUES: &[&str] = &[
+        "should i ",
+        "shall i ",
+        "do you want",
+        "would you like",
+        "which option",
+        "which one",
+        "let me know",
+        "how would you like",
+        "what would you like",
+        "can you confirm",
+        "please confirm",
+        "your call",
+        "proceed?",
+        "go ahead?",
+    ];
+    let has_cue = DECISION_CUES.iter().any(|cue| lower.contains(cue));
+
+    if ends_with_question || has_cue {
+        AwaitingKind::Decision
+    } else {
+        AwaitingKind::Ack
+    }
+}
+
 fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<String> {
     match reason {
         TerminalReason::TurnComplete | TerminalReason::Completed => None,
@@ -8785,6 +9233,26 @@ async fn maybe_finalize_terminal_mission(
                 context = log_context,
                 "Finalizing mission after terminal turn"
             );
+            // Classify the awaiting reason *before* flipping the status so the
+            // `awaiting_kind` column is populated by the time the
+            // MissionStatusChanged event (and the Paloma webhook it triggers)
+            // fires. The status write only clears awaiting_kind for non-awaiting
+            // statuses, so setting it first here is safe.
+            if new_status == MissionStatus::AwaitingUser {
+                let kind = classify_awaiting_kind(&mission.history);
+                if let Err(e) = mission_store
+                    .set_mission_awaiting_kind(mission_id, Some(kind))
+                    .await
+                {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        context = log_context,
+                        "Failed to set awaiting_kind: {}",
+                        e
+                    );
+                }
+            }
+
             if let Err(e) = mission_store
                 .update_mission_status_with_reason(
                     mission_id,
@@ -19065,6 +19533,9 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -19098,6 +19569,9 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
 
         let strong_score = mission_search_relevance_score(
@@ -19146,6 +19620,9 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
 
         let score = mission_search_relevance_score(
@@ -19191,6 +19668,9 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
 
         let score = mission_search_relevance_score(
@@ -19236,6 +19716,9 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
 
         let score = mission_search_relevance_score(
@@ -19281,6 +19764,9 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
 
         let score = mission_search_relevance_score(
@@ -19410,6 +19896,9 @@ And the report:
             goal_objective: None,
             first_viewed_at: None,
             scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {
@@ -19620,6 +20109,50 @@ Investigate <service/> failures.
 
         assert!(accept_user_message_id(&mut accepted, message_id));
         assert!(!accept_user_message_id(&mut accepted, message_id));
+    }
+
+    fn assistant(content: &str) -> MissionHistoryEntry {
+        MissionHistoryEntry {
+            role: "assistant".to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn classify_awaiting_kind_detects_decisions_and_acks() {
+        // Trailing question → decision.
+        assert_eq!(
+            classify_awaiting_kind(&[assistant("I found two options. Which one do you prefer?")]),
+            AwaitingKind::Decision
+        );
+        // Approval-seeking phrasing without a literal trailing '?'.
+        assert_eq!(
+            classify_awaiting_kind(&[assistant(
+                "The migration is ready. Should I apply it now to prod?"
+            )]),
+            AwaitingKind::Decision
+        );
+        // Plain "done" statement → ack.
+        assert_eq!(
+            classify_awaiting_kind(&[assistant("Done. Opened PR #569 and merged it.")]),
+            AwaitingKind::Ack
+        );
+        // No assistant text at all → ack (don't fabricate an open question).
+        assert_eq!(
+            classify_awaiting_kind(&[MissionHistoryEntry {
+                role: "user".to_string(),
+                content: "go".to_string(),
+            }]),
+            AwaitingKind::Ack
+        );
+        // Only the *last* assistant message matters.
+        assert_eq!(
+            classify_awaiting_kind(&[
+                assistant("Should I start? "),
+                assistant("All set, deployed and verified."),
+            ]),
+            AwaitingKind::Ack
+        );
     }
 
     #[test]

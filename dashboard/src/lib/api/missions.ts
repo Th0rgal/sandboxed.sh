@@ -74,6 +74,45 @@ export interface Mission {
   mission_mode?: "task" | "assistant";
   goal_mode?: boolean;
   goal_objective?: string | null;
+  /** Project tagging: stable project identifier (e.g. "verity-core"). */
+  project?: string | null;
+  /** Project tagging: track / workstream within the project. */
+  track?: string | null;
+  /** Project tagging: intent (e.g. "repair-build"). */
+  intent?: string | null;
+  /** Project tagging: associated GitHub PR number. */
+  github_pr?: number | null;
+  /** Project tagging: freeform tags. */
+  tags?: string[];
+  /**
+   * When `status` is `awaiting_user`, classifies whether the agent needs a
+   * decision (a real question) or is just waiting to be acked/merged.
+   */
+  awaiting_kind?: AwaitingKind | null;
+  /** Activity (P#5): when the status last changed (persisted). */
+  last_status_change_at?: string | null;
+  /** Activity: timestamp of the most recent mission event (computed). */
+  last_agent_event_at?: string | null;
+  /** Activity: timestamp of the most recent assistant output (computed). */
+  last_output_at?: string | null;
+  /** Activity: max(updated_at, last_agent_event_at) — single staleness anchor. */
+  last_activity_at?: string | null;
+  /**
+   * Spark build-offload status for this mission's workspace (mission detail
+   * endpoint only). Lets consumers route heavy builds without probing the host.
+   */
+  spark_offload?: SparkOffload | null;
+}
+
+export type AwaitingKind = "decision" | "ack";
+
+export interface SparkOffload {
+  /** Workspace opted into Spark build offload. */
+  enabled: boolean;
+  /** The per-mission offload env was actually injected into the harness. */
+  env_injected: boolean;
+  /** The host has Spark arbiter/SSH configured. */
+  host_configured: boolean;
 }
 
 export interface StoredEvent {
@@ -394,6 +433,33 @@ export async function markMissionOpened(id: string): Promise<Mission | null> {
   });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("Failed to mark mission opened");
+  return res.json();
+}
+
+/**
+ * Set or update project/workstream tagging metadata for a mission. Each field
+ * is tri-state: omit to leave unchanged, `null` to clear, a value to set.
+ * `tags` replaces the whole list when present.
+ */
+export async function updateMissionProject(
+  id: string,
+  patch: {
+    project?: string | null;
+    track?: string | null;
+    intent?: string | null;
+    github_pr?: number | null;
+    tags?: string[];
+  },
+): Promise<Mission> {
+  const res = await apiFetch(`/api/control/missions/${id}/project`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text || "Failed to update mission project");
+  }
   return res.json();
 }
 

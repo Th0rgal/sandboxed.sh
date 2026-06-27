@@ -3,7 +3,7 @@
  * based on runtime state and stored status.
  */
 
-import type { MissionStatus } from './api/missions';
+import type { AwaitingKind, MissionStatus } from './api/missions';
 
 export type MissionCategory = 'running' | 'needs-you' | 'finished' | 'other';
 export type FinishedTone = 'green' | 'red';
@@ -151,6 +151,31 @@ export const STATUS_LABELS: Record<MissionStatus, string> = {
   blocked: 'Blocked',
   not_feasible: 'Not Feasible',
 };
+
+/**
+ * Labels for the two flavors of `awaiting_user`. `decision` means the agent
+ * asked a real question; `ack` means it finished and is waiting to be
+ * acknowledged/merged. The old single "Needs You" / "Waiting for your input"
+ * conflated these, which was misleading.
+ */
+export const AWAITING_KIND_LABELS: Record<AwaitingKind, string> = {
+  decision: 'Needs Decision',
+  ack: 'Awaiting Review',
+};
+
+/**
+ * Display label for a mission status, refined by `awaiting_kind` when the
+ * mission is parked in `awaiting_user`. Falls back to the generic status label.
+ */
+export function statusLabel(
+  status: MissionStatus,
+  awaitingKind?: AwaitingKind | null,
+): string {
+  if (status === 'awaiting_user' && awaitingKind) {
+    return AWAITING_KIND_LABELS[awaitingKind];
+  }
+  return STATUS_LABELS[status] ?? status;
+}
 
 /**
  * Get the display dot color for a mission, considering runtime state.

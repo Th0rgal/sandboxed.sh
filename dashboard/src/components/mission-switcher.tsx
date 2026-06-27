@@ -306,6 +306,13 @@ export function getMissionSearchText(mission: Mission): string {
   if (mission.mission_mode === 'assistant') {
     textParts.push('assistant telegram');
   }
+  // Project tagging so missions are findable by project/track/intent/tag.
+  if (mission.project?.trim()) textParts.push(mission.project.trim());
+  if (mission.track?.trim()) textParts.push(mission.track.trim());
+  if (mission.intent?.trim()) textParts.push(mission.intent.trim());
+  if (mission.tags && mission.tags.length > 0) {
+    textParts.push(mission.tags.join(' '));
+  }
   return textParts.join(' ');
 }
 
@@ -576,6 +583,14 @@ export function missionSearchRelevanceScore(
   const workspaceLabel = getWorkspaceLabel(mission, workspaceNameById) ?? '';
   const backend = mission.backend?.trim() ?? '';
   const status = mission.status ?? '';
+  const projectText = [
+    mission.project,
+    mission.track,
+    mission.intent,
+    ...(mission.tags ?? []),
+  ]
+    .filter(Boolean)
+    .join(' ');
   const combined = `${displayName} ${workspaceLabel} ${getMissionSearchText(mission)}`;
 
   const normalizedCombined = normalizeMetadataText(combined);
@@ -587,6 +602,7 @@ export function missionSearchRelevanceScore(
     { weight: 7, tokens: tokenSetFromText(shortDescription) },
     { weight: 3, tokens: tokenSetFromText(workspaceLabel) },
     { weight: 3, tokens: tokenSetFromText(backend) },
+    { weight: 6, tokens: tokenSetFromText(projectText) },
     { weight: 2, tokens: tokenSetFromText(status) },
     { weight: 1, tokens: tokenSetFromText(combined) },
   ];

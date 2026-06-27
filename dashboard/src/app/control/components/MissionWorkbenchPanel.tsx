@@ -77,7 +77,9 @@ export function MissionWorkbenchPanel({
   const title =
     mission?.title?.trim() ||
     (mission ? getMissionShortName(mission.id) : "No mission selected");
-  const status = mission ? missionStatusLabel(mission.status, isRunning) : null;
+  const status = mission
+    ? missionStatusLabel(mission.status, isRunning, mission.awaiting_kind)
+    : null;
   const canResume =
     mission &&
     !isRunning &&
@@ -244,7 +246,41 @@ export function MissionWorkbenchPanel({
                   className="font-mono text-white/70"
                 />
               </Row>
+              {mission.project && (
+                <Row label="Project">
+                  <span
+                    className="truncate font-mono text-white/70 max-w-[160px]"
+                    title={[mission.project, mission.track, mission.intent]
+                      .filter(Boolean)
+                      .join(" / ")}
+                  >
+                    {[mission.project, mission.track, mission.intent]
+                      .filter(Boolean)
+                      .join(" / ")}
+                  </span>
+                </Row>
+              )}
+              {mission.github_pr != null && (
+                <Row label="PR">
+                  <span className="font-mono text-white/70">
+                    #{mission.github_pr}
+                  </span>
+                </Row>
+              )}
             </dl>
+
+            {mission.tags && mission.tags.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {mission.tags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="rounded-full border border-white/[0.08] bg-white/[0.04] px-1.5 py-0.5 text-[10px] font-medium text-white/55"
+                  >
+                    {tag}
+                  </span>
+                ))}
+              </div>
+            )}
 
             {mission.short_description && (
               <p className="workbench-mission-description mt-2 rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-[11px] leading-relaxed text-white/50">

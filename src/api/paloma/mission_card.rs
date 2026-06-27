@@ -282,6 +282,9 @@ mod tests {
             goal_objective: None,
             first_viewed_at: None,
             scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         }
     }
 

@@ -43,6 +43,116 @@ pub struct MissionScheduling {
     pub deadline: Option<String>,
 }
 
+/// Project tagging metadata for a mission. Flattened into `Mission` so the
+/// fields appear top-level in serialized output. Lets external consumers (e.g.
+/// Paloma) group/filter/route missions by project, track, intent, PR, or
+/// freeform tags instead of parsing conventions out of free-text titles like
+/// `[beal-research] BR-07 ...`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissionProject {
+    /// Stable project identifier (e.g. "verity-core").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Track / workstream within the project (e.g. "C3-bridge-collapse").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<String>,
+    /// Intent of the mission (e.g. "repair-build", "investigate").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    /// Associated GitHub PR number, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_pr: Option<i64>,
+    /// Freeform tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+impl MissionProject {
+    /// True when no project metadata is set.
+    pub fn is_empty(&self) -> bool {
+        self.project.is_none()
+            && self.track.is_none()
+            && self.intent.is_none()
+            && self.github_pr.is_none()
+            && self.tags.is_empty()
+    }
+}
+
+/// Tri-state patch for project metadata: each field is `None` to leave
+/// unchanged, `Some(None)` to clear, `Some(Some(v))` to set. `tags` is
+/// `Some(vec)` to replace the whole list.
+#[derive(Debug, Clone, Default)]
+pub struct MissionProjectPatch {
+    pub project: Option<Option<String>>,
+    pub track: Option<Option<String>>,
+    pub intent: Option<Option<String>>,
+    pub github_pr: Option<Option<i64>>,
+    pub tags: Option<Vec<String>>,
+}
+
+impl MissionProjectPatch {
+    /// True when the patch would change nothing.
+    pub fn is_empty(&self) -> bool {
+        self.project.is_none()
+            && self.track.is_none()
+            && self.intent.is_none()
+            && self.github_pr.is_none()
+            && self.tags.is_none()
+    }
+}
+
+/// Activity timestamps for a mission, surfaced so watchdogs/consumers can
+/// reason about staleness without guessing from `updated_at` alone (which also
+/// bumps on metadata edits). `last_status_change_at` is persisted; the event
+/// timestamps are computed on read from the event log and may be `None` when
+/// not requested (e.g. internal store reads that skip enrichment).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissionActivity {
+    /// When the mission's status last changed (persisted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status_change_at: Option<String>,
+    /// Timestamp of the most recent mission event of any kind (computed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent_event_at: Option<String>,
+    /// Timestamp of the most recent assistant output (computed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<String>,
+    /// Convenience: max(updated_at, last_agent_event_at) (computed). Lets a
+    /// consumer derive staleness with a single field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
+}
+
+/// Disambiguates *why* a mission is parked in `AwaitingUser`: the agent asked a
+/// real question that needs a decision, vs. it just finished a turn / its work
+/// and is waiting to be acknowledged or merged. Only meaningful while the
+/// status is `AwaitingUser`; `None` for every other status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwaitingKind {
+    /// The agent is asking the user something and needs an answer to proceed.
+    Decision,
+    /// The agent finished its turn / work and is waiting for acknowledgement.
+    Ack,
+}
+
+impl AwaitingKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AwaitingKind::Decision => "decision",
+            AwaitingKind::Ack => "ack",
+        }
+    }
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "decision" => Some(AwaitingKind::Decision),
+            "ack" => Some(AwaitingKind::Ack),
+            _ => None,
+        }
+    }
+}
+
 /// A mission (persistent goal-oriented session).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mission {
@@ -133,10 +243,22 @@ pub struct Mission {
     /// Flattened so the fields appear top-level in serialized output.
     #[serde(default, flatten)]
     pub scheduling: MissionScheduling,
+    /// Project tagging metadata (project, track, intent, github_pr, tags).
+    /// Flattened so the fields appear top-level.
+    #[serde(default, flatten)]
+    pub project: MissionProject,
+    /// Activity timestamps (last_status_change_at persisted; event timestamps
+    /// computed on read). Flattened so the fields appear top-level.
+    #[serde(default, flatten)]
+    pub activity: MissionActivity,
+    /// When `status` is `AwaitingUser`, classifies whether the agent needs a
+    /// decision or just an acknowledgement. `None` for every other status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_kind: Option<AwaitingKind>,
 }
 
 /// Aggregate mission counts by status.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct MissionStatusCounts {
     pub total: usize,
     pub active: usize,
@@ -1432,6 +1554,40 @@ pub trait MissionStore: Send + Sync {
         metadata_model: Option<Option<&str>>,
         metadata_version: Option<Option<&str>>,
     ) -> Result<(), String>;
+
+    /// Update project tagging metadata (see [`MissionProjectPatch`] for the
+    /// tri-state semantics). Default no-op for stores that do not persist it.
+    async fn update_mission_project(
+        &self,
+        id: Uuid,
+        patch: MissionProjectPatch,
+    ) -> Result<(), String> {
+        let _ = (id, patch);
+        Ok(())
+    }
+
+    /// Computed activity timestamps for the given missions, keyed by id:
+    /// `(last_agent_event_at, last_output_at)` derived from the event log.
+    /// Empty map by default (stores without an event log skip this).
+    async fn get_mission_activity(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, (Option<String>, Option<String>)>, String> {
+        let _ = ids;
+        Ok(std::collections::HashMap::new())
+    }
+
+    /// Set (or clear) the `awaiting_kind` classification for a mission. Only
+    /// meaningful while the mission is in `AwaitingUser`. Default no-op for
+    /// stores that do not persist it.
+    async fn set_mission_awaiting_kind(
+        &self,
+        id: Uuid,
+        kind: Option<AwaitingKind>,
+    ) -> Result<(), String> {
+        let _ = (id, kind);
+        Ok(())
+    }
 
     /// Update mission session ID (for backends that generate their own IDs).
     async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String>;
@@ -3169,6 +3325,9 @@ mod tests {
                 not_before: not_before.map(|s| s.to_string()),
                 deadline: None,
             },
+            project: MissionProject::default(),
+            activity: MissionActivity::default(),
+            awaiting_kind: None,
         }
     }
 
