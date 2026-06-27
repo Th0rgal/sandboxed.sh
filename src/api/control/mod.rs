@@ -7383,6 +7383,7 @@ fn webhook_forwardable_status(status: MissionStatus) -> bool {
 async fn paloma_webhook_forwarder_loop(
     mut events_rx: broadcast::Receiver<AgentEvent>,
     mission_store: Arc<dyn MissionStore>,
+    workspaces: workspace::SharedWorkspaceStore,
     url: String,
     http: reqwest::Client,
 ) {
@@ -7421,6 +7422,7 @@ async fn paloma_webhook_forwarder_loop(
                 let http = http.clone();
                 let url = url.clone();
                 let mission_store = Arc::clone(&mission_store);
+                let workspaces = workspaces.clone();
                 let sem = Arc::clone(&sem);
                 tokio::spawn(async move {
                     let _permit = sem.acquire_owned().await;
@@ -7430,6 +7432,15 @@ async fn paloma_webhook_forwarder_loop(
                         .and_then(|mission| mission.title.clone())
                         .unwrap_or_else(|| mission_id.to_string());
                     let project = mission.as_ref().map(|m| &m.project);
+                    // Resolve workspace_name from the registry (the store row
+                    // usually leaves it null), so the payload is self-contained.
+                    let workspace_name = match mission.as_ref() {
+                        Some(m) => match m.workspace_name.clone() {
+                            Some(name) => Some(name),
+                            None => workspaces.get(m.workspace_id).await.map(|ws| ws.name),
+                        },
+                        None => None,
+                    };
                     let body = serde_json::json!({
                         // Idempotency / ordering (P#6): consumers dedupe on
                         // `event_id` and may order by `sequence`.
@@ -7442,9 +7453,7 @@ async fn paloma_webhook_forwarder_loop(
                             .as_ref()
                             .and_then(|m| m.short_description.clone()),
                         "workspace_id": mission.as_ref().map(|m| m.workspace_id),
-                        "workspace_name": mission
-                            .as_ref()
-                            .and_then(|m| m.workspace_name.clone()),
+                        "workspace_name": workspace_name,
                         "backend": mission.as_ref().map(|m| m.backend.clone()),
                         "updated_at": mission.as_ref().map(|m| m.updated_at.clone()),
                         // When the status itself last changed (P#5) — the most
@@ -7617,6 +7626,7 @@ fn spawn_control_session(
         tokio::spawn(paloma_webhook_forwarder_loop(
             events_tx.subscribe(),
             Arc::clone(&state.mission_store),
+            workspaces.clone(),
             url.clone(),
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
@@ -8832,14 +8842,23 @@ fn mission_status_for_terminal_reason(
 /// agent needs a `Decision`; anything else means it finished its turn / work and
 /// is waiting for an `Ack`. This is a heuristic — consumers (Paloma) can refine
 /// it — but it is far better than the old all-`awaiting_user`-is-the-same signal.
+///
+/// Prefer [`classify_awaiting_kind_text`] with the just-completed turn's output
+/// when available: mission history is derived from the event log, which can lag
+/// behind the in-hand turn output at finalization time.
 fn classify_awaiting_kind(history: &[MissionHistoryEntry]) -> AwaitingKind {
-    let Some(last) = history.iter().rev().find(|entry| entry.role == "assistant") else {
+    match history.iter().rev().find(|entry| entry.role == "assistant") {
+        Some(last) => classify_awaiting_kind_text(&last.content),
         // No assistant text to read (e.g. tool-only turn) — default to Ack so a
         // "done" turn doesn't masquerade as an open question.
-        return AwaitingKind::Ack;
-    };
+        None => AwaitingKind::Ack,
+    }
+}
 
-    let text = last.content.trim();
+/// Heuristic core of [`classify_awaiting_kind`], operating on a raw assistant
+/// message string (the authoritative turn output).
+fn classify_awaiting_kind_text(text: &str) -> AwaitingKind {
+    let text = text.trim();
     if text.is_empty() {
         return AwaitingKind::Ack;
     }
@@ -9155,6 +9174,7 @@ fn looks_like_structured_provider_error(output: &str) -> bool {
         || lower.contains("internal server error")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maybe_finalize_terminal_mission(
     mission_store: &Arc<dyn MissionStore>,
     events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
@@ -9162,6 +9182,10 @@ async fn maybe_finalize_terminal_mission(
     terminal_reason: Option<TerminalReason>,
     completion_confidence: Option<crate::agents::CompletionConfidence>,
     complete_turn_without_follow_up: bool,
+    // The just-completed turn's assistant output, if available. Used to classify
+    // `awaiting_kind` authoritatively — the mission's event-log-derived history
+    // can lag behind at finalization time.
+    final_output: Option<&str>,
     log_context: &str,
 ) {
     let Some(reason) = terminal_reason else {
@@ -9275,7 +9299,12 @@ async fn maybe_finalize_terminal_mission(
             // fires. The status write only clears awaiting_kind for non-awaiting
             // statuses, so setting it first here is safe.
             if new_status == MissionStatus::AwaitingUser {
-                let kind = classify_awaiting_kind(&mission.history);
+                // Prefer the in-hand turn output; fall back to history only when
+                // the caller didn't supply it (event log may lag the turn).
+                let kind = match final_output {
+                    Some(text) if !text.trim().is_empty() => classify_awaiting_kind_text(text),
+                    _ => classify_awaiting_kind(&mission.history),
+                };
                 if let Err(e) = mission_store
                     .set_mission_awaiting_kind(mission_id, Some(kind))
                     .await
@@ -12067,6 +12096,7 @@ async fn control_actor_loop(
                                     agent_result.terminal_reason,
                                     Some(completion_evidence.completion_confidence),
                                     false,
+                                    Some(agent_result.output.as_str()),
                                     "turn finished before follow-up enqueue",
                                 )
                                 .await;
@@ -12275,6 +12305,7 @@ async fn control_actor_loop(
                                 completed_terminal_reason,
                                 completed_completion_confidence,
                                 true,
+                                Some(completed_agent_output.as_str()),
                                 "turn finished with no same-mission follow-up queued",
                             )
                             .await;
@@ -12608,6 +12639,7 @@ async fn control_actor_loop(
                                         result.terminal_reason,
                                         Some(completion_evidence.completion_confidence),
                                         true,
+                                        Some(result.output.as_str()),
                                         "parallel turn finished with no follow-up queued",
                                     )
                                     .await;
@@ -20234,6 +20266,7 @@ Investigate <service/> failures.
             Some(TerminalReason::LlmError),
             None,
             false,
+            None,
             "shutdown race test",
         )
         .await;
@@ -20269,6 +20302,7 @@ Investigate <service/> failures.
             Some(TerminalReason::Completed),
             Some(crate::agents::CompletionConfidence::Low),
             true,
+            None,
             "low confidence completion test",
         )
         .await;
