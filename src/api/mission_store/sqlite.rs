@@ -3396,10 +3396,7 @@ impl MissionStore for SqliteMissionStore {
         let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let placeholders = std::iter::repeat("?")
-                .take(id_strings.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = vec!["?"; id_strings.len()].join(",");
             // last_agent_event_at = newest event of any kind; last_output_at =
             // newest assistant message. Backed by idx_events_mission_timestamp.
             let sql = format!(
