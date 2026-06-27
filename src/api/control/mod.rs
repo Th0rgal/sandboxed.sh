@@ -3855,39 +3855,75 @@ pub async fn list_missions(
         || query.project.is_some()
         || query.tag.is_some()
         || query.workspace.is_some();
-    // When filtering, scan a wider window so the requested count can still be
-    // filled after dropping non-matching rows; otherwise honor the limit as-is.
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0);
-    let fetch_limit = if has_filters { 200 } else { limit };
-    let mut missions = control
-        .mission_store
-        .list_missions(fetch_limit, offset)
-        .await
-        .map_err(internal_error)?;
-    populate_workspace_names(&state, &mut missions).await;
 
-    if let Some(status) = query.status.as_deref() {
-        missions.retain(|m| m.status.to_string() == status);
-    }
-    if let Some(project) = query.project.as_deref() {
-        missions.retain(|m| m.project.project.as_deref() == Some(project));
-    }
-    if let Some(tag) = query.tag.as_deref() {
-        missions.retain(|m| m.project.tags.iter().any(|t| t == tag));
-    }
-    if let Some(workspace) = query.workspace.as_deref() {
-        let ws_lower = workspace.to_lowercase();
-        missions.retain(|m| {
-            m.workspace_id.to_string() == workspace
-                || m.workspace_name
-                    .as_deref()
-                    .is_some_and(|name| name.to_lowercase() == ws_lower)
-        });
-    }
-    if has_filters {
-        missions.truncate(limit);
-    }
+    let mut missions = if !has_filters {
+        // Fast path: no filters, list the page directly.
+        let mut page = control
+            .mission_store
+            .list_missions(limit, offset)
+            .await
+            .map_err(internal_error)?;
+        populate_workspace_names(&state, &mut page).await;
+        page
+    } else {
+        // Filtered path: predicate-match runs in memory, so a single 200-row
+        // page would silently drop matches on a larger fleet. Scan pages from
+        // `offset` until we have `limit` matches or hit a bounded ceiling.
+        const PAGE: usize = 200;
+        const MAX_SCAN: usize = 5_000;
+        let status = query.status.as_deref();
+        let project = query.project.as_deref();
+        let tag = query.tag.as_deref();
+        let workspace_lower = query.workspace.as_deref().map(|w| w.to_lowercase());
+        let workspace_raw = query.workspace.as_deref();
+
+        let mut matched: Vec<Mission> = Vec::new();
+        let mut scan_offset = offset;
+        let mut scanned = 0usize;
+        loop {
+            let mut page = control
+                .mission_store
+                .list_missions(PAGE, scan_offset)
+                .await
+                .map_err(internal_error)?;
+            let page_len = page.len();
+            populate_workspace_names(&state, &mut page).await;
+            for m in page {
+                let keep = status.is_none_or(|s| m.status.to_string() == s)
+                    && project.is_none_or(|p| m.project.project.as_deref() == Some(p))
+                    && tag.is_none_or(|t| m.project.tags.iter().any(|x| x == t))
+                    && match (workspace_raw, workspace_lower.as_deref()) {
+                        (Some(raw), Some(lower)) => {
+                            m.workspace_id.to_string() == raw
+                                || m.workspace_name
+                                    .as_deref()
+                                    .is_some_and(|name| name.to_lowercase() == lower)
+                        }
+                        _ => true,
+                    };
+                if keep {
+                    matched.push(m);
+                    if matched.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            scanned += page_len;
+            if matched.len() >= limit || page_len < PAGE || scanned >= MAX_SCAN {
+                if scanned >= MAX_SCAN && matched.len() < limit {
+                    tracing::warn!(
+                        "list_missions filter scan hit cap ({}); results may be incomplete",
+                        MAX_SCAN
+                    );
+                }
+                break;
+            }
+            scan_offset += PAGE;
+        }
+        matched
+    };
 
     populate_activity(&control, &mut missions).await;
     Ok(Json(missions))

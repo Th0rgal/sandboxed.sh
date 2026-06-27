@@ -609,29 +609,27 @@ impl AssistantMcp {
 
     async fn list_missions(&self, params: ListMissionsParams) -> Result<Value, String> {
         let limit = params.limit.clamp(1, 100);
-        let response = self
-            .api_get(&format!("/api/control/missions?limit={limit}&offset=0"))
-            .await?;
+        // Forward filters to the API so it does the (paginated, scan-bounded)
+        // matching server-side — filtering only the fetched page here would miss
+        // matches outside the window on a larger fleet.
+        let mut path = format!("/api/control/missions?limit={limit}&offset=0");
+        if let Some(status) = params.status.as_deref() {
+            path.push_str(&format!("&status={}", urlencoding::encode(status)));
+        }
+        if let Some(project) = params.project.as_deref() {
+            path.push_str(&format!("&project={}", urlencoding::encode(project)));
+        }
+        if let Some(tag) = params.tag.as_deref() {
+            path.push_str(&format!("&tag={}", urlencoding::encode(tag)));
+        }
+        let response = self.api_get(&path).await?;
         if !response.status().is_success() {
             return Err(format!("Failed to list missions: {}", response.status()));
         }
-        let mut missions: Vec<Value> = response
+        let missions: Vec<Value> = response
             .json()
             .await
             .map_err(|error| format!("Failed to parse missions: {error}"))?;
-        if let Some(status) = params.status {
-            missions.retain(|mission| mission["status"].as_str() == Some(status.as_str()));
-        }
-        if let Some(project) = params.project.as_deref() {
-            missions.retain(|mission| mission["project"].as_str() == Some(project));
-        }
-        if let Some(tag) = params.tag.as_deref() {
-            missions.retain(|mission| {
-                mission["tags"]
-                    .as_array()
-                    .is_some_and(|tags| tags.iter().any(|t| t.as_str() == Some(tag)))
-            });
-        }
         let missions = missions
             .into_iter()
             .map(compact_mission_summary)

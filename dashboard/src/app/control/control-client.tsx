@@ -9013,7 +9013,11 @@ export default function ControlClient() {
   const missionIsRunningOrActive =
     viewingMissionIsRunning || activeMission?.status === "active";
   const missionStatus = activeMission
-    ? missionStatusLabel(activeMission.status, viewingMissionIsRunning)
+    ? missionStatusLabel(
+        activeMission.status,
+        viewingMissionIsRunning,
+        activeMission.awaiting_kind,
+      )
     : null;
   const faviconStatus = useMemo<MissionStatus | null>(() => {
     if (!activeMission) return null;

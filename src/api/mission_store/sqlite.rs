@@ -3398,10 +3398,12 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let placeholders = vec!["?"; id_strings.len()].join(",");
             // last_agent_event_at = newest event of any kind; last_output_at =
-            // newest assistant message. Backed by idx_events_mission_timestamp.
+            // newest assistant message (assistant text is logged as either
+            // `assistant_message` or `assistant_message_canonical`). Backed by
+            // idx_events_mission_timestamp.
             let sql = format!(
                 "SELECT mission_id, MAX(timestamp) AS last_event, \
-                 MAX(CASE WHEN event_type = 'assistant_message' THEN timestamp END) AS last_output \
+                 MAX(CASE WHEN event_type IN ('assistant_message', 'assistant_message_canonical') THEN timestamp END) AS last_output \
                  FROM mission_events WHERE mission_id IN ({placeholders}) GROUP BY mission_id"
             );
             let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
