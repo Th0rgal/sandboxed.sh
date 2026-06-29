@@ -3991,6 +3991,129 @@ pub async fn fleet_health(
     }))
 }
 
+/// Per project/track rollup so Paloma can reason about a track in one call
+/// instead of scanning the fleet and parsing titles. Keyed by (project, track).
+#[derive(Debug, Clone, Serialize)]
+pub struct TrackSummary {
+    pub project: Option<String>,
+    pub track: Option<String>,
+    pub total: usize,
+    pub active: usize,
+    pub pending: usize,
+    pub awaiting_user: usize,
+    /// `updated_at` of the most recently updated mission in the track.
+    pub last_activity_at: Option<String>,
+    /// `updated_at` of the most recent terminal (completed/failed/…) mission.
+    pub latest_terminal_at: Option<String>,
+    /// Operator-declared state / PR / next-check, taken from the most recently
+    /// updated mission in the track that has each set.
+    pub desired_state: Option<String>,
+    pub github_pr: Option<String>,
+    pub next_check_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TracksQuery {
+    /// Optional: restrict to one project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// GET /api/control/tracks — roll missions up by (project, track). Untagged
+/// missions (no project and no track) are omitted. Scans newest-first up to a
+/// bounded ceiling.
+pub async fn list_tracks(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<TracksQuery>,
+) -> Result<Json<Vec<TrackSummary>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    const PAGE: usize = 200;
+    const MAX_SCAN: usize = 5_000;
+
+    // Preserve newest-first arrival order of groups, and let the first (most
+    // recent) mission seed each track's desired_state/github_pr/next_check_at.
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut groups: std::collections::HashMap<(String, String), TrackSummary> =
+        std::collections::HashMap::new();
+
+    let mut offset = 0usize;
+    while offset < MAX_SCAN {
+        let page = control
+            .mission_store
+            .list_missions(PAGE, offset)
+            .await
+            .map_err(internal_error)?;
+        let page_len = page.len();
+        for m in page {
+            let proj = m.project.project.clone();
+            let track = m.project.track.clone();
+            if proj.is_none() && track.is_none() {
+                continue; // untagged — not part of any track
+            }
+            if let Some(want) = query.project.as_deref() {
+                if proj.as_deref() != Some(want) {
+                    continue;
+                }
+            }
+            let key = (
+                proj.clone().unwrap_or_default(),
+                track.clone().unwrap_or_default(),
+            );
+            let entry = groups.entry(key.clone()).or_insert_with(|| {
+                order.push(key.clone());
+                TrackSummary {
+                    project: proj.clone(),
+                    track: track.clone(),
+                    total: 0,
+                    active: 0,
+                    pending: 0,
+                    awaiting_user: 0,
+                    last_activity_at: None,
+                    latest_terminal_at: None,
+                    desired_state: None,
+                    github_pr: None,
+                    next_check_at: None,
+                }
+            });
+            entry.total += 1;
+            match m.status {
+                MissionStatus::Active => entry.active += 1,
+                MissionStatus::Pending => entry.pending += 1,
+                MissionStatus::AwaitingUser => entry.awaiting_user += 1,
+                _ => {}
+            }
+            // Missions arrive newest-first, so the first non-None value wins
+            // (most recent). last_activity_at is the first (max) updated_at.
+            if entry.last_activity_at.is_none() {
+                entry.last_activity_at = Some(m.updated_at.clone());
+            }
+            if entry.latest_terminal_at.is_none() && m.status.is_terminal() {
+                entry.latest_terminal_at = Some(m.updated_at.clone());
+            }
+            if entry.desired_state.is_none() {
+                entry.desired_state = m.project.desired_state.clone();
+            }
+            if entry.github_pr.is_none() {
+                entry.github_pr = m.project.github_pr.clone();
+            }
+            if entry.next_check_at.is_none() {
+                entry.next_check_at = m.project.next_check_at.clone();
+            }
+        }
+        if page_len < PAGE {
+            break;
+        }
+        offset += PAGE;
+    }
+
+    let tracks = order
+        .into_iter()
+        .filter_map(|k| groups.remove(&k))
+        .collect::<Vec<_>>();
+    Ok(Json(tracks))
+}
+
 /// Enrich missions with computed activity timestamps (P#5): the most recent
 /// event and assistant output from the event log, plus a `last_activity_at`
 /// convenience = max(updated_at, last_agent_event_at). Best-effort: a store
@@ -4457,12 +4580,16 @@ pub struct CreateMissionRequest {
     pub project: Option<String>,
     /// Project tagging: track / workstream within the project.
     pub track: Option<String>,
-    /// Project tagging: intent (e.g. "repair-build").
+    /// Project tagging: intent (e.g. "review_merge_pr").
     pub intent: Option<String>,
-    /// Project tagging: associated GitHub PR number.
-    pub github_pr: Option<i64>,
+    /// Project tagging: associated GitHub PR ref (e.g. "owner/repo#123").
+    pub github_pr: Option<String>,
     /// Project tagging: freeform tags.
     pub tags: Option<Vec<String>>,
+    /// Track state, e.g. "waiting_ci" / "waiting_review" / "blocked_external".
+    pub desired_state: Option<String>,
+    /// When the track should next be checked (RFC3339).
+    pub next_check_at: Option<String>,
 }
 
 fn deserialize_string_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
@@ -4470,15 +4597,6 @@ where
     D: Deserializer<'de>,
 {
     Option::<String>::deserialize(deserializer).map(Some)
-}
-
-/// Like [`deserialize_string_patch`] but for an optional integer: present field
-/// (even `null`) → `Some(..)`, absent → `None`.
-fn deserialize_i64_patch<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<i64>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4578,6 +4696,8 @@ pub async fn create_mission(
         intent: None,
         github_pr: None,
         tags: None,
+        desired_state: None,
+        next_check_at: None,
     });
 
     let title = req.title.clone();
@@ -4731,7 +4851,9 @@ pub async fn create_mission(
     let project = nonblank(&req.project);
     let track = nonblank(&req.track);
     let intent = nonblank(&req.intent);
-    let github_pr = req.github_pr;
+    let github_pr = nonblank(&req.github_pr);
+    let desired_state = nonblank(&req.desired_state);
+    let next_check_at = nonblank(&req.next_check_at);
     let tags: Option<Vec<String>> = req.tags.as_ref().map(|tags| {
         tags.iter()
             .map(|t| t.trim().to_string())
@@ -4743,6 +4865,8 @@ pub async fn create_mission(
         || intent.is_some()
         || github_pr.is_some()
         || tags.is_some()
+        || desired_state.is_some()
+        || next_check_at.is_some()
     {
         control
             .mission_store
@@ -4752,25 +4876,21 @@ pub async fn create_mission(
                     project: project.clone().map(Some),
                     track: track.clone().map(Some),
                     intent: intent.clone().map(Some),
-                    github_pr: github_pr.map(Some),
+                    github_pr: github_pr.clone().map(Some),
                     tags: tags.clone(),
+                    desired_state: desired_state.clone().map(Some),
+                    next_check_at: next_check_at.clone().map(Some),
                 },
             )
             .await
             .map_err(internal_error)?;
         // Reflect the applied values in the returned mission without a re-fetch.
-        if let Some(v) = project {
-            mission.project.project = Some(v);
-        }
-        if let Some(v) = track {
-            mission.project.track = Some(v);
-        }
-        if let Some(v) = intent {
-            mission.project.intent = Some(v);
-        }
-        if github_pr.is_some() {
-            mission.project.github_pr = github_pr;
-        }
+        mission.project.project = project.or(mission.project.project);
+        mission.project.track = track.or(mission.project.track);
+        mission.project.intent = intent.or(mission.project.intent);
+        mission.project.github_pr = github_pr.or(mission.project.github_pr);
+        mission.project.desired_state = desired_state.or(mission.project.desired_state);
+        mission.project.next_check_at = next_check_at.or(mission.project.next_check_at);
         if let Some(v) = tags {
             mission.project.tags = v;
         }
@@ -4790,11 +4910,14 @@ pub struct UpdateMissionProjectRequest {
     pub track: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_string_patch")]
     pub intent: Option<Option<String>>,
-    /// Tri-state: omit to leave unchanged, `null` to clear, a number to set.
-    #[serde(default, deserialize_with = "deserialize_i64_patch")]
-    pub github_pr: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub github_pr: Option<Option<String>>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub desired_state: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub next_check_at: Option<Option<String>>,
 }
 
 /// Set or update project tagging metadata for a mission.
@@ -4840,8 +4963,10 @@ pub async fn update_mission_project(
                 project: normalize(req.project),
                 track: normalize(req.track),
                 intent: normalize(req.intent),
-                github_pr: req.github_pr,
+                github_pr: normalize(req.github_pr),
                 tags,
+                desired_state: normalize(req.desired_state),
+                next_check_at: normalize(req.next_check_at),
             },
         )
         .await
@@ -6211,12 +6336,14 @@ pub async fn clone_mission(
         project: source.project.project.clone(),
         track: source.project.track.clone(),
         intent: source.project.intent.clone(),
-        github_pr: source.project.github_pr,
+        github_pr: source.project.github_pr.clone(),
         tags: if source.project.tags.is_empty() {
             None
         } else {
             Some(source.project.tags.clone())
         },
+        desired_state: source.project.desired_state.clone(),
+        next_check_at: source.project.next_check_at.clone(),
     };
 
     let cloned = create_mission(State(state), Extension(user), Some(Json(req))).await?;
@@ -7470,8 +7597,12 @@ async fn paloma_webhook_forwarder_loop(
                         "project": project.and_then(|p| p.project.clone()),
                         "track": project.and_then(|p| p.track.clone()),
                         "intent": project.and_then(|p| p.intent.clone()),
-                        "github_pr": project.and_then(|p| p.github_pr),
+                        "github_pr": project.and_then(|p| p.github_pr.clone()),
                         "tags": project.map(|p| p.tags.clone()).unwrap_or_default(),
+                        // Track state so a watchdog can tell "intentionally
+                        // waiting (CI/review/external)" from "no worker = stuck".
+                        "desired_state": project.and_then(|p| p.desired_state.clone()),
+                        "next_check_at": project.and_then(|p| p.next_check_at.clone()),
                         // For awaiting_user, whether the agent needs a decision
                         // or is just waiting to be acked/merged.
                         "awaiting_kind": mission

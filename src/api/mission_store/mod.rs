@@ -56,15 +56,26 @@ pub struct MissionProject {
     /// Track / workstream within the project (e.g. "C3-bridge-collapse").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track: Option<String>,
-    /// Intent of the mission (e.g. "repair-build", "investigate").
+    /// Intent of the mission (e.g. "repair-build", "review_merge_pr").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
-    /// Associated GitHub PR number, if any.
+    /// Associated GitHub PR, as a free-form reference (e.g.
+    /// "lfglabs-dev/verity#2070" or just "2070").
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub github_pr: Option<i64>,
+    pub github_pr: Option<String>,
     /// Freeform tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Operator-declared desired/track state, e.g. "waiting_ci",
+    /// "waiting_review", "blocked_external". Free-form so consumers can evolve
+    /// the vocabulary without a server enum. Lets a watchdog tell "no worker =
+    /// problem" apart from "no worker = intentionally waiting on CI".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_state: Option<String>,
+    /// When the track should next be checked (RFC3339). Paired with
+    /// `desired_state` so a watchdog knows when a `waiting_*` mission is overdue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_check_at: Option<String>,
 }
 
 impl MissionProject {
@@ -75,6 +86,8 @@ impl MissionProject {
             && self.intent.is_none()
             && self.github_pr.is_none()
             && self.tags.is_empty()
+            && self.desired_state.is_none()
+            && self.next_check_at.is_none()
     }
 }
 
@@ -86,8 +99,10 @@ pub struct MissionProjectPatch {
     pub project: Option<Option<String>>,
     pub track: Option<Option<String>>,
     pub intent: Option<Option<String>>,
-    pub github_pr: Option<Option<i64>>,
+    pub github_pr: Option<Option<String>>,
     pub tags: Option<Vec<String>>,
+    pub desired_state: Option<Option<String>>,
+    pub next_check_at: Option<Option<String>>,
 }
 
 impl MissionProjectPatch {
@@ -98,6 +113,8 @@ impl MissionProjectPatch {
             && self.intent.is_none()
             && self.github_pr.is_none()
             && self.tags.is_none()
+            && self.desired_state.is_none()
+            && self.next_check_at.is_none()
     }
 }
 

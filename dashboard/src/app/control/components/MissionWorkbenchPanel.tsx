@@ -260,10 +260,20 @@ export function MissionWorkbenchPanel({
                   </span>
                 </Row>
               )}
-              {mission.github_pr != null && (
+              {mission.github_pr && (
                 <Row label="PR">
-                  <span className="font-mono text-white/70">
-                    #{mission.github_pr}
+                  <span
+                    className="truncate font-mono text-white/70 max-w-[160px]"
+                    title={mission.github_pr}
+                  >
+                    {mission.github_pr}
+                  </span>
+                </Row>
+              )}
+              {mission.desired_state && (
+                <Row label="State">
+                  <span className="font-mono text-sky-300/80">
+                    {mission.desired_state}
                   </span>
                 </Row>
               )}

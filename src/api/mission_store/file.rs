@@ -477,6 +477,12 @@ impl MissionStore for FileMissionStore {
         if let Some(tags) = patch.tags {
             mission.project.tags = tags;
         }
+        if let Some(desired_state) = patch.desired_state {
+            mission.project.desired_state = desired_state;
+        }
+        if let Some(next_check_at) = patch.next_check_at {
+            mission.project.next_check_at = next_check_at;
+        }
         mission.updated_at = now_string();
         drop(missions);
         self.persist().await

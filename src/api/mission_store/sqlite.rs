@@ -501,8 +501,10 @@ CREATE TABLE IF NOT EXISTS missions (
     project TEXT,
     track TEXT,
     intent TEXT,
-    github_pr INTEGER,
+    github_pr TEXT,
     tags TEXT,
+    desired_state TEXT,
+    next_check_at TEXT,
     awaiting_kind TEXT,
     last_status_change_at TEXT
 );
@@ -2096,20 +2098,42 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add paused_at column: {}", e))?;
         }
 
-        // Project tagging + awaiting_kind classification + activity timestamps.
-        // Lets external consumers (Paloma) group/filter/route missions, tell
-        // "needs a decision" apart from "finished, please ack", and reason about
-        // staleness without parsing titles or replaying events. All nullable,
-        // added if missing.
+        // Project tagging + awaiting_kind classification + activity timestamps +
+        // track state. Lets external consumers (Paloma) group/filter/route
+        // missions, tell "needs a decision" apart from "finished, please ack",
+        // tell "no worker = problem" apart from "intentionally waiting on CI",
+        // and reason about staleness without parsing titles. All nullable.
         for (column, sql_type) in [
             ("project", "TEXT"),
             ("track", "TEXT"),
             ("intent", "TEXT"),
-            ("github_pr", "INTEGER"),
+            ("github_pr", "TEXT"),
             ("tags", "TEXT"),
+            ("desired_state", "TEXT"),
+            ("next_check_at", "TEXT"),
             ("awaiting_kind", "TEXT"),
             ("last_status_change_at", "TEXT"),
         ] {
+            // `github_pr` shipped briefly as INTEGER; it now holds a free-form
+            // PR reference string (e.g. "owner/repo#123"). The column is freshly
+            // added and always NULL in practice, so converting affinity via a
+            // lossless DROP + re-add as TEXT is safe and idempotent.
+            if column == "github_pr" {
+                let is_integer: bool = conn
+                    .prepare(
+                        "SELECT 1 FROM pragma_table_info('missions') WHERE name = 'github_pr' AND UPPER(type) = 'INTEGER'",
+                    )
+                    .map_err(|e| format!("Failed to check github_pr type: {}", e))?
+                    .exists([])
+                    .map_err(|e| format!("Failed to query table info: {}", e))?;
+                if is_integer {
+                    tracing::info!(
+                        "Running migration: converting 'github_pr' column from INTEGER to TEXT"
+                    );
+                    conn.execute("ALTER TABLE missions DROP COLUMN github_pr", [])
+                        .map_err(|e| format!("Failed to drop github_pr column: {}", e))?;
+                }
+            }
             let exists: bool = conn
                 .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = ?1")
                 .map_err(|e| format!("Failed to check for {} column: {}", column, e))?
@@ -2428,10 +2452,10 @@ fn tags_from_json(raw: Option<String>) -> Vec<String> {
 }
 
 /// Read the trailing project/activity columns from a mission row in the
-/// canonical order `project, track, intent, github_pr, tags, awaiting_kind,
-/// last_status_change_at` starting at `base`. Shared by the full SELECTs so the
-/// index math lives in one place. Returns the project metadata, the awaiting
-/// classification, and the persisted `last_status_change_at`.
+/// canonical order `project, track, intent, github_pr, tags, desired_state,
+/// next_check_at, awaiting_kind, last_status_change_at` starting at `base`.
+/// Shared by the full SELECTs so the index math lives in one place. Returns the
+/// project metadata, the awaiting classification, and `last_status_change_at`.
 fn read_project_columns(
     row: &rusqlite::Row,
     base: usize,
@@ -2442,12 +2466,14 @@ fn read_project_columns(
         intent: row.get(base + 2)?,
         github_pr: row.get(base + 3)?,
         tags: tags_from_json(row.get(base + 4)?),
+        desired_state: row.get(base + 5)?,
+        next_check_at: row.get(base + 6)?,
     };
     let awaiting_kind = row
-        .get::<_, Option<String>>(base + 5)?
+        .get::<_, Option<String>>(base + 7)?
         .as_deref()
         .and_then(AwaitingKind::from_str_opt);
-    let last_status_change_at: Option<String> = row.get(base + 6)?;
+    let last_status_change_at: Option<String> = row.get(base + 8)?;
     Ok((project, awaiting_kind, last_status_change_at))
 }
 
@@ -2471,7 +2497,7 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(mission_mode, 'task') as mission_mode,
                             COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
                             COALESCE(priority, 0) as priority, not_before, deadline, paused_at,
-                            project, track, intent, github_pr, tags, awaiting_kind, last_status_change_at
+                            project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2599,7 +2625,7 @@ impl MissionStore for SqliteMissionStore {
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
                             COALESCE(priority, 0) as priority, not_before, deadline, paused_at,
-                            project, track, intent, github_pr, tags, awaiting_kind, last_status_change_at FROM missions WHERE id = ?1",
+                            project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -3346,11 +3372,15 @@ impl MissionStore for SqliteMissionStore {
         let intent_set = patch.intent.is_some();
         let github_pr_set = patch.github_pr.is_some();
         let tags_set = patch.tags.is_some();
+        let desired_state_set = patch.desired_state.is_some();
+        let next_check_at_set = patch.next_check_at.is_some();
         let project = patch.project.flatten();
         let track = patch.track.flatten();
         let intent = patch.intent.flatten();
         let github_pr = patch.github_pr.flatten();
         let tags_json = patch.tags.as_deref().and_then(tags_to_json);
+        let desired_state = patch.desired_state.flatten();
+        let next_check_at = patch.next_check_at.flatten();
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -3361,8 +3391,10 @@ impl MissionStore for SqliteMissionStore {
                      intent = CASE WHEN ?5 THEN ?6 ELSE intent END,
                      github_pr = CASE WHEN ?7 THEN ?8 ELSE github_pr END,
                      tags = CASE WHEN ?9 THEN ?10 ELSE tags END,
-                     updated_at = ?11
-                 WHERE id = ?12",
+                     desired_state = CASE WHEN ?11 THEN ?12 ELSE desired_state END,
+                     next_check_at = CASE WHEN ?13 THEN ?14 ELSE next_check_at END,
+                     updated_at = ?15
+                 WHERE id = ?16",
                 params![
                     project_set,
                     project,
@@ -3374,6 +3406,10 @@ impl MissionStore for SqliteMissionStore {
                     github_pr,
                     tags_set,
                     tags_json,
+                    desired_state_set,
+                    desired_state,
+                    next_check_at_set,
+                    next_check_at,
                     now,
                     id.to_string(),
                 ],
@@ -11509,9 +11545,11 @@ mod tests {
                 MissionProjectPatch {
                     project: Some(Some("verity-core".to_string())),
                     track: Some(Some("C3-bridge-collapse".to_string())),
-                    intent: Some(Some("repair-build".to_string())),
-                    github_pr: Some(Some(2061)),
+                    intent: Some(Some("review_merge_pr".to_string())),
+                    github_pr: Some(Some("lfglabs-dev/verity#2070".to_string())),
                     tags: Some(vec!["c3".to_string(), "blocking".to_string()]),
+                    desired_state: Some(Some("waiting_ci".to_string())),
+                    next_check_at: Some(Some("2026-07-01T00:00:00Z".to_string())),
                 },
             )
             .await
@@ -11524,9 +11562,17 @@ mod tests {
             .expect("exists");
         assert_eq!(fetched.project.project.as_deref(), Some("verity-core"));
         assert_eq!(fetched.project.track.as_deref(), Some("C3-bridge-collapse"));
-        assert_eq!(fetched.project.intent.as_deref(), Some("repair-build"));
-        assert_eq!(fetched.project.github_pr, Some(2061));
+        assert_eq!(fetched.project.intent.as_deref(), Some("review_merge_pr"));
+        assert_eq!(
+            fetched.project.github_pr.as_deref(),
+            Some("lfglabs-dev/verity#2070")
+        );
         assert_eq!(fetched.project.tags, vec!["c3", "blocking"]);
+        assert_eq!(fetched.project.desired_state.as_deref(), Some("waiting_ci"));
+        assert_eq!(
+            fetched.project.next_check_at.as_deref(),
+            Some("2026-07-01T00:00:00Z")
+        );
 
         // Partial update leaves untouched fields intact and can clear one.
         store
@@ -11546,7 +11592,11 @@ mod tests {
             .expect("exists");
         assert_eq!(fetched.project.project, None);
         assert_eq!(fetched.project.track.as_deref(), Some("C3-bridge-collapse"));
-        assert_eq!(fetched.project.github_pr, Some(2061));
+        assert_eq!(
+            fetched.project.github_pr.as_deref(),
+            Some("lfglabs-dev/verity#2070")
+        );
+        assert_eq!(fetched.project.desired_state.as_deref(), Some("waiting_ci"));
         assert_eq!(fetched.project.tags, vec!["c3", "blocking"]);
 
         // awaiting_kind persists, and is cleared on a status change away from
