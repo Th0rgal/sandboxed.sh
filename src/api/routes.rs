@@ -695,6 +695,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/control/progress", get(control::get_progress))
         // Mission management endpoints
         .route("/api/health/fleet", get(control::fleet_health))
+        .route("/api/control/tracks", get(control::list_tracks))
         .route("/api/control/missions", get(control::list_missions))
         .route("/api/control/missions", post(control::create_mission))
         .route(

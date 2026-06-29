@@ -138,6 +138,22 @@ struct StartMissionParams {
     config_profile: Option<String>,
     #[serde(default)]
     agent: Option<String>,
+    // Project tagging — forwarded so missions are created WITH structured
+    // metadata instead of null (watchdogs then don't have to parse titles).
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    track: Option<String>,
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    github_pr: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    desired_state: Option<String>,
+    #[serde(default)]
+    next_check_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -511,7 +527,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "start_mission".to_string(),
-                description: "Create a new sandboxed.sh mission and send its initial prompt.".to_string(),
+                description: "Create a new sandboxed.sh mission and send its initial prompt. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title).".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -523,7 +539,14 @@ impl AssistantMcp {
                         "model_override": {"type": "string"},
                         "model_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                         "config_profile": {"type": "string"},
-                        "agent": {"type": "string"}
+                        "agent": {"type": "string"},
+                        "project": {"type": "string", "description": "Stable project id (e.g. \"verity\")."},
+                        "track": {"type": "string", "description": "Track/workstream (e.g. \"core-c3\")."},
+                        "intent": {"type": "string", "description": "Intent (e.g. \"review_merge_pr\")."},
+                        "github_pr": {"type": "string", "description": "Associated PR ref (e.g. \"owner/repo#123\")."},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "desired_state": {"type": "string", "description": "Track state, e.g. waiting_ci / waiting_review / blocked_external."},
+                        "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."}
                     }
                 }),
             },
@@ -827,6 +850,15 @@ impl AssistantMcp {
             "model_effort": params.model_effort,
             "config_profile": params.config_profile,
             "agent": params.agent,
+            // Project tagging at creation so the mission isn't born with null
+            // metadata (Paloma watchdogs then route by these, not titles).
+            "project": params.project,
+            "track": params.track,
+            "intent": params.intent,
+            "github_pr": params.github_pr,
+            "tags": params.tags,
+            "desired_state": params.desired_state,
+            "next_check_at": params.next_check_at,
         });
         let response = self.api_post("/api/control/missions", body).await?;
         if !response.status().is_success() {
@@ -1433,6 +1465,8 @@ fn compact_mission_summary(mission: Value) -> Value {
         "intent": mission.get("intent").cloned().unwrap_or(Value::Null),
         "github_pr": mission.get("github_pr").cloned().unwrap_or(Value::Null),
         "tags": mission.get("tags").cloned().unwrap_or_else(|| json!([])),
+        "desired_state": mission.get("desired_state").cloned().unwrap_or(Value::Null),
+        "next_check_at": mission.get("next_check_at").cloned().unwrap_or(Value::Null),
         "awaiting_kind": mission.get("awaiting_kind").cloned().unwrap_or(Value::Null),
         "last_activity_at": mission.get("last_activity_at").cloned().unwrap_or(Value::Null),
         "last_status_change_at": mission.get("last_status_change_at").cloned().unwrap_or(Value::Null),
@@ -1850,8 +1884,9 @@ mod tests {
             "updated_at": "2026-05-28T12:00:00Z",
             "project": "verity-core",
             "track": "C3-bridge-collapse",
-            "github_pr": 2061,
+            "github_pr": "lfglabs-dev/verity#2070",
             "tags": ["c3", "sprint-2"],
+            "desired_state": "waiting_ci",
             "awaiting_kind": "decision",
             "prompt": "secret prompt",
             "api_token": "sk-test",
@@ -1861,7 +1896,8 @@ mod tests {
         assert_eq!(summary["workspace_name"], "assistant");
         assert_eq!(summary["project"], "verity-core");
         assert_eq!(summary["track"], "C3-bridge-collapse");
-        assert_eq!(summary["github_pr"], 2061);
+        assert_eq!(summary["github_pr"], "lfglabs-dev/verity#2070");
+        assert_eq!(summary["desired_state"], "waiting_ci");
         assert_eq!(summary["tags"][1], "sprint-2");
         assert_eq!(summary["awaiting_kind"], "decision");
         // Missions without tags get an empty array, not null.

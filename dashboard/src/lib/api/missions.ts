@@ -78,12 +78,16 @@ export interface Mission {
   project?: string | null;
   /** Project tagging: track / workstream within the project. */
   track?: string | null;
-  /** Project tagging: intent (e.g. "repair-build"). */
+  /** Project tagging: intent (e.g. "review_merge_pr"). */
   intent?: string | null;
-  /** Project tagging: associated GitHub PR number. */
-  github_pr?: number | null;
+  /** Project tagging: associated GitHub PR ref (e.g. "owner/repo#123"). */
+  github_pr?: string | null;
   /** Project tagging: freeform tags. */
   tags?: string[];
+  /** Track state, e.g. "waiting_ci" / "waiting_review" / "blocked_external". */
+  desired_state?: string | null;
+  /** When the track should next be checked (RFC3339). */
+  next_check_at?: string | null;
   /**
    * When `status` is `awaiting_user`, classifies whether the agent needs a
    * decision (a real question) or is just waiting to be acked/merged.
@@ -447,8 +451,10 @@ export async function updateMissionProject(
     project?: string | null;
     track?: string | null;
     intent?: string | null;
-    github_pr?: number | null;
+    github_pr?: string | null;
     tags?: string[];
+    desired_state?: string | null;
+    next_check_at?: string | null;
   },
 ): Promise<Mission> {
   const res = await apiFetch(`/api/control/missions/${id}/project`, {
@@ -465,6 +471,27 @@ export async function updateMissionProject(
 
 export async function getRunningMissions(): Promise<RunningMissionInfo[]> {
   return apiGet("/api/control/running", "Failed to fetch running missions");
+}
+
+/** Per project/track rollup (`GET /api/control/tracks`). */
+export interface TrackSummary {
+  project?: string | null;
+  track?: string | null;
+  total: number;
+  active: number;
+  pending: number;
+  awaiting_user: number;
+  last_activity_at?: string | null;
+  latest_terminal_at?: string | null;
+  desired_state?: string | null;
+  github_pr?: string | null;
+  next_check_at?: string | null;
+}
+
+/** List project/track rollups, optionally restricted to one project. */
+export async function listTracks(project?: string): Promise<TrackSummary[]> {
+  const qs = project ? `?project=${encodeURIComponent(project)}` : "";
+  return apiGet(`/api/control/tracks${qs}`, "Failed to fetch tracks");
 }
 
 export async function startMissionParallel(
