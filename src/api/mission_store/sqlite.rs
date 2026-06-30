@@ -919,6 +919,14 @@ impl SqliteMissionStore {
             let conn = Connection::open(&db_path)
                 .map_err(|e| format!("Failed to open SQLite database: {}", e))?;
 
+            // A global store and the per-user store can open the same DB file
+            // and run schema/migrations concurrently at startup. Without a busy
+            // timeout, the second writer's DDL fails with SQLITE_BUSY and aborts
+            // store init (→ silent in-memory fallback). Make concurrent writers
+            // wait for the lock instead.
+            conn.busy_timeout(std::time::Duration::from_secs(10))
+                .map_err(|e| format!("Failed to set busy_timeout: {}", e))?;
+
             // Run schema
             conn.execute_batch(SCHEMA)
                 .map_err(|e| format!("Failed to run schema: {}", e))?;
@@ -2117,7 +2125,16 @@ impl SqliteMissionStore {
             // `github_pr` shipped briefly as INTEGER; it now holds a free-form
             // PR reference string (e.g. "owner/repo#123"). The column is freshly
             // added and always NULL in practice, so converting affinity via a
-            // lossless DROP + re-add as TEXT is safe and idempotent.
+            // lossless DROP + re-add as TEXT is safe.
+            //
+            // CRITICAL: this runs concurrently — a global store and the per-user
+            // store both initialize on the same DB file at startup. The DDL here
+            // MUST be non-fatal: a previous (#572) version returned Err when the
+            // racing init had already dropped the column ("no such column"),
+            // which failed the whole sqlite store init and silently fell the
+            // service back to an in-memory store (losing visibility of all
+            // persisted missions). So tolerate "already done" / concurrent races
+            // on every ALTER below instead of propagating them.
             if column == "github_pr" {
                 let is_integer: bool = conn
                     .prepare(
@@ -2130,8 +2147,12 @@ impl SqliteMissionStore {
                     tracing::info!(
                         "Running migration: converting 'github_pr' column from INTEGER to TEXT"
                     );
-                    conn.execute("ALTER TABLE missions DROP COLUMN github_pr", [])
-                        .map_err(|e| format!("Failed to drop github_pr column: {}", e))?;
+                    if let Err(e) = conn.execute("ALTER TABLE missions DROP COLUMN github_pr", []) {
+                        tracing::warn!(
+                            "github_pr INTEGER→TEXT drop skipped (already converted or concurrent migration): {}",
+                            e
+                        );
+                    }
                 }
             }
             let exists: bool = conn
@@ -2144,11 +2165,18 @@ impl SqliteMissionStore {
                     "Running migration: adding '{}' column to missions table",
                     column
                 );
-                conn.execute(
+                // Non-fatal: a concurrent init may have added the column between
+                // our `exists` check and here ("duplicate column name").
+                if let Err(e) = conn.execute(
                     &format!("ALTER TABLE missions ADD COLUMN {} {}", column, sql_type),
                     [],
-                )
-                .map_err(|e| format!("Failed to add {} column: {}", column, e))?;
+                ) {
+                    tracing::warn!(
+                        "Adding '{}' column skipped (already present or concurrent migration): {}",
+                        column,
+                        e
+                    );
+                }
             }
         }
 
@@ -11522,6 +11550,80 @@ mod tests {
         assert_eq!(mission.short_description, None);
         assert_eq!(mission.metadata_source, None);
         assert_eq!(mission.metadata_version, None);
+    }
+
+    /// Regression for the #572 incident: a global store and the per-user store
+    /// open the same DB file and run migrations concurrently at startup. The
+    /// `github_pr` INTEGER→TEXT conversion's DROP must NOT fail the store init
+    /// when a racing init already dropped/re-added the column — otherwise the
+    /// service silently falls back to an in-memory store and loses visibility of
+    /// every persisted mission.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_init_on_integer_github_pr_does_not_fall_back() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let base = temp_dir.path().to_path_buf();
+
+        // Seed a DB, then force it into the pre-#572 shape: github_pr is INTEGER
+        // and the newer columns are absent.
+        {
+            let store = SqliteMissionStore::new(base.clone(), "race")
+                .await
+                .expect("seed store");
+            drop(store);
+            let db = base.join("missions-race.db");
+            let conn = rusqlite::Connection::open(&db).expect("open seed");
+            conn.execute("ALTER TABLE missions DROP COLUMN github_pr", [])
+                .expect("drop text github_pr");
+            conn.execute("ALTER TABLE missions ADD COLUMN github_pr INTEGER", [])
+                .expect("re-add integer github_pr");
+            conn.execute("ALTER TABLE missions DROP COLUMN desired_state", [])
+                .ok();
+            conn.execute("ALTER TABLE missions DROP COLUMN next_check_at", [])
+                .ok();
+        }
+
+        // Two concurrent initializations on the SAME db file — both must succeed.
+        let h1 = {
+            let p = base.clone();
+            tokio::spawn(async move { SqliteMissionStore::new(p, "race").await.map(|_| ()) })
+        };
+        let h2 = {
+            let p = base.clone();
+            tokio::spawn(async move { SqliteMissionStore::new(p, "race").await.map(|_| ()) })
+        };
+        let (r1, r2) = tokio::join!(h1, h2);
+        assert!(
+            r1.expect("join1").is_ok(),
+            "concurrent init 1 must not fail (would fall back to in-memory)"
+        );
+        assert!(
+            r2.expect("join2").is_ok(),
+            "concurrent init 2 must not fail (would fall back to in-memory)"
+        );
+
+        // github_pr is TEXT and the new columns exist after the race.
+        let db = base.join("missions-race.db");
+        let conn = rusqlite::Connection::open(&db).expect("open verify");
+        let ty: String = conn
+            .query_row(
+                "SELECT type FROM pragma_table_info('missions') WHERE name = 'github_pr'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("github_pr column present");
+        assert_eq!(ty.to_uppercase(), "TEXT");
+        for col in ["desired_state", "next_check_at"] {
+            let exists: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = ?1")
+                .unwrap()
+                .exists([col])
+                .unwrap();
+            assert!(
+                exists,
+                "{} column must exist after concurrent migration",
+                col
+            );
+        }
     }
 
     #[tokio::test]
