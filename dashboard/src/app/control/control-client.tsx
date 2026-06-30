@@ -3332,6 +3332,16 @@ export default function ControlClient() {
   // Mission state lives in `controlViewingMissionStore`; these local states
   // cover lower-churn loading/list UI around it.
   const [missionLoading, setMissionLoading] = useState(false);
+  // Mission id whose conversation-history fetch *failed* (network/5xx), as
+  // opposed to a mission that genuinely has no history yet. Both used to
+  // collapse to "no events" because the load swallowed errors with
+  // `.catch(() => null)`, so an active mission with a failed history fetch
+  // rendered the misleading "Agent is working…" placeholder forever (until a
+  // live SSE event happened to arrive). We track the failure separately so the
+  // empty-state can offer a Retry instead of pretending the agent is busy.
+  const [historyLoadFailedMissionId, setHistoryLoadFailedMissionId] = useState<
+    string | null
+  >(null);
   const [recentMissions, setRecentMissions] = useState<Mission[]>([]);
   const [dismissedResumeUI, setDismissedResumeUI] = useState(false);
 
@@ -5199,9 +5209,15 @@ export default function ControlClient() {
       try {
         // Load mission, events, and queue in parallel for faster load
         const queueGenAtFetch = queueMutationGenRef.current;
+        // Distinguish a *failed* history fetch from a genuinely empty one: the
+        // former should surface a Retry, the latter is a normal empty mission.
+        let historyFetchFailed = false;
         const [mission, events, queuedMessages] = await Promise.all([
           loadMission(id),
-          loadHistoryEvents(id).catch(() => null), // Don't fail if events unavailable
+          loadHistoryEvents(id).catch(() => {
+            historyFetchFailed = true;
+            return null;
+          }), // Don't fail the whole load if events are unavailable
           getQueue().catch(() => []), // Don't fail if queue unavailable
         ]);
         if (cancelled || fetchingMissionIdRef.current !== id) return;
@@ -5292,6 +5308,11 @@ export default function ControlClient() {
           queueGenAtFetch === queueMutationGenRef.current,
         );
         setItems(historyItems);
+        // Only flag a load failure when the fetch threw *and* we ended up with
+        // nothing to show — a partial/cached fallback is still a usable view.
+        setHistoryLoadFailedMissionId(
+          historyFetchFailed && historyItems.length === 0 ? id : null,
+        );
         adjustVisibleItemsLimit(historyItems);
         seedPaginationStateAfterInitialLoad(id, historicEventsLen);
         applyDesktopSessionState(mission);
@@ -5850,9 +5871,13 @@ export default function ControlClient() {
       try {
         // Load mission, events, and queue in parallel for faster load
         const queueGenAtFetch = queueMutationGenRef.current;
+        let historyFetchFailed = false;
         const [mission, events, queuedMessages] = await Promise.all([
           getMission(missionId),
-          loadHistoryEvents(missionId).catch(() => null), // Don't fail if events unavailable
+          loadHistoryEvents(missionId).catch(() => {
+            historyFetchFailed = true;
+            return null;
+          }), // Don't fail the whole load if events are unavailable
           getQueue().catch(() => []), // Don't fail if queue unavailable
         ]);
 
@@ -5881,6 +5906,9 @@ export default function ControlClient() {
         );
 
         setItems(historyItems);
+        setHistoryLoadFailedMissionId(
+          historyFetchFailed && historyItems.length === 0 ? missionId : null,
+        );
         adjustVisibleItemsLimit(historyItems);
         seedPaginationStateAfterInitialLoad(missionId, historicEventsLen);
         // Check if mission has an active desktop session (stored metadata or fallback to history)
@@ -9972,9 +10000,18 @@ export default function ControlClient() {
               ) : items.length === 0 ? (
                 <div className="flex h-full items-center justify-center">
                   <div className="text-center">
-                    <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
-                      {viewingMissionIsRunning &&
-                      activeMission?.status === "active" ? (
+                    <div
+                      className={cn(
+                        "mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl",
+                        historyLoadFailedMissionId === viewingMissionId
+                          ? "bg-amber-500/10"
+                          : "bg-indigo-500/10",
+                      )}
+                    >
+                      {historyLoadFailedMissionId === viewingMissionId ? (
+                        <AlertTriangle className="h-8 w-8 text-amber-400" />
+                      ) : viewingMissionIsRunning &&
+                        activeMission?.status === "active" ? (
                         <Loader className="h-8 w-8 text-indigo-400 animate-spin" />
                       ) : (
                         <Bot className="h-8 w-8 text-indigo-400" />
@@ -9982,6 +10019,28 @@ export default function ControlClient() {
                     </div>
                     {missionLoading ? (
                       <Shimmer className="max-w-xs mx-auto" />
+                    ) : historyLoadFailedMissionId === viewingMissionId ? (
+                      <>
+                        <h2 className="text-lg font-medium text-white">
+                          Couldn’t load conversation
+                        </h2>
+                        <p className="mt-2 text-sm text-white/40 max-w-sm">
+                          The mission history failed to load (network or server
+                          error). The agent may still be running — retry to
+                          reconnect.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (viewingMissionId)
+                              void handleViewMission(viewingMissionId);
+                          }}
+                          className="mt-4 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-1.5 text-xs text-white/70 transition-colors hover:bg-white/[0.06] hover:text-white"
+                        >
+                          <RefreshCw className="h-3.5 w-3.5" />
+                          Retry
+                        </button>
+                      </>
                     ) : viewingMissionIsRunning &&
                       activeMission?.status === "active" ? (
                       <>
