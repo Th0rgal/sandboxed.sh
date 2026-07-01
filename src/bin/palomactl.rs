@@ -168,6 +168,7 @@ struct ProjectDoc {
     path: String,
     mission_refs: Vec<String>,
     pr_refs: Vec<u64>,
+    owner_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -259,6 +260,9 @@ fn scan_project_docs(root: &Path) -> Result<Vec<ProjectDoc>> {
     let mut out = Vec::new();
     let mission_re = Regex::new(r"(?i)\bmission(?:[_ -]?id)?[:# ]+([0-9a-f][0-9a-f-]{5,36})\b")?;
     let pr_re = Regex::new(r"(?i)\b(?:pr|pull request)\s*#?(\d+)\b")?;
+    let repo_re = Regex::new(
+        r"(?im)\b(?:repo|repository|github repo|github_repository|owner/repo)\s*[:=]\s*(?:https://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)",
+    )?;
     for path in paths {
         let text = fs::read_to_string(&path)?;
         let mission_refs = mission_re
@@ -269,6 +273,9 @@ fn scan_project_docs(root: &Path) -> Result<Vec<ProjectDoc>> {
             .captures_iter(&text)
             .filter_map(|c| c.get(1)?.as_str().parse().ok())
             .collect();
+        let owner_repo = repo_re
+            .captures(&text)
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
         out.push(ProjectDoc {
             path: path
                 .strip_prefix(root)
@@ -277,6 +284,7 @@ fn scan_project_docs(root: &Path) -> Result<Vec<ProjectDoc>> {
                 .to_string(),
             mission_refs,
             pr_refs,
+            owner_repo,
         });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -343,7 +351,7 @@ fn detect_drift(root: &Path, docs: &[ProjectDoc], missions: &[MissionRef]) -> Re
 
         for pr in &doc.pr_refs {
             if line_mentions_open_pr(&text, *pr) {
-                if let Some(gates) = load_pr_fixture(root, "fixture/repo", *pr) {
+                if let Some(gates) = load_doc_pr_fixture(root, doc, *pr) {
                     if gates.merged {
                         drift.push(Drift {
                             kind: DriftKind::PrListedOpenButMerged,
@@ -356,6 +364,13 @@ fn detect_drift(root: &Path, docs: &[ProjectDoc], missions: &[MissionRef]) -> Re
         }
     }
     Ok(drift)
+}
+
+fn load_doc_pr_fixture(root: &Path, doc: &ProjectDoc, number: u64) -> Option<PrGates> {
+    doc.owner_repo
+        .as_deref()
+        .and_then(|owner_repo| load_pr_fixture(root, owner_repo, number))
+        .or_else(|| load_pr_fixture(root, "fixture/repo", number))
 }
 
 fn is_uuid_like(value: &str) -> bool {
@@ -466,10 +481,13 @@ fn pr_gates(root: &Path, owner_repo: &str, number: u64) -> Result<PrGates> {
         )
         || gates.mergeable == Some(false);
     let checks_green = !gates.checks.is_empty()
-        && gates
-            .checks
-            .iter()
-            .all(|c| c.status == "completed" && c.conclusion.as_deref() == Some("success"));
+        && gates.checks.iter().all(|c| {
+            c.status.eq_ignore_ascii_case("completed")
+                && c.conclusion
+                    .as_deref()
+                    .map(|conclusion| conclusion.eq_ignore_ascii_case("success"))
+                    .unwrap_or(false)
+        });
     let closed = gates.state.eq_ignore_ascii_case("closed");
     gates.recommendation = if gates.draft {
         Some("wait_for_ready_for_review".to_string())
@@ -919,6 +937,26 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_fixture_checks_are_treated_as_green() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/fixtures/pr-105.json"),
+            r#"{
+              "state":"OPEN",
+              "draft":false,
+              "merged":false,
+              "mergeable":true,
+              "checks":[{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]
+            }"#,
+        );
+        let gates = pr_gates(tmp.path(), "lfglabs-dev/verity", 105).unwrap();
+        assert_eq!(
+            gates.recommendation.as_deref(),
+            Some("ready_for_review_or_merge")
+        );
+    }
+
+    #[test]
     fn intent_routing_matches_exploration_tokens_not_substrings() {
         let safe_intents = ["proofread docs", "waterproof deployment notes"];
         for intent in safe_intents {
@@ -1107,6 +1145,31 @@ mod tests {
         );
         write(
             &tmp.path().join(".paloma/fixtures/pr-103.json"),
+            r#"{
+              "state":"closed",
+              "draft":false,
+              "merged":true,
+              "checks":[{"name":"ci","status":"completed","conclusion":"success"}]
+            }"#,
+        );
+
+        let state = load_state(tmp.path()).unwrap();
+        assert!(state
+            .drift
+            .iter()
+            .any(|d| d.kind == DriftKind::PrListedOpenButMerged));
+    }
+
+    #[test]
+    fn detects_open_pr_listed_as_merged_from_repo_scoped_fixture() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/projects/verity.md"),
+            "Repo: lfglabs-dev/verity\nTracker: PR #103 open\n",
+        );
+        write(
+            &tmp.path()
+                .join(".paloma/fixtures/pr-lfglabs-dev__verity-103.json"),
             r#"{
               "state":"closed",
               "draft":false,
