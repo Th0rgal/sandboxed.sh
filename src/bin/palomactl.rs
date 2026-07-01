@@ -489,12 +489,12 @@ fn pr_gates(root: &Path, owner_repo: &str, number: u64) -> Result<PrGates> {
                     .unwrap_or(false)
         });
     let closed = gates.state.eq_ignore_ascii_case("closed");
-    gates.recommendation = if gates.draft {
+    gates.recommendation = if gates.merged {
+        Some("already_merged".to_string())
+    } else if gates.draft {
         Some("wait_for_ready_for_review".to_string())
     } else if gates.conflicting {
         Some("needs_conflict_resolution".to_string())
-    } else if gates.merged {
-        Some("already_merged".to_string())
     } else if closed {
         Some("closed_without_merge".to_string())
     } else if checks_green {
@@ -919,6 +919,24 @@ mod tests {
             gates.recommendation.as_deref(),
             Some("needs_conflict_resolution")
         );
+    }
+
+    #[test]
+    fn merged_pr_recommends_already_merged_even_when_conflicting() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/fixtures/pr-106.json"),
+            r#"{
+              "state":"closed",
+              "draft":false,
+              "merged":true,
+              "mergeable":false,
+              "merge_state_status":"dirty",
+              "checks":[{"name":"ci","status":"completed","conclusion":"success"}]
+            }"#,
+        );
+        let gates = pr_gates(tmp.path(), "lfglabs-dev/verity", 106).unwrap();
+        assert_eq!(gates.recommendation.as_deref(), Some("already_merged"));
     }
 
     #[test]
