@@ -327,7 +327,7 @@ fn detect_drift(root: &Path, docs: &[ProjectDoc], missions: &[MissionRef]) -> Re
         for mission in missions {
             if text.contains(&mission.id) {
                 let status_re = Regex::new(&format!(
-                    r"(?i){}\b.*\bstatus[:= ]+([a-z_]+)",
+                    r"(?is){}\b(?:(?!\bmission(?:[_ -]?id)?[:# ]+[0-9a-f][0-9a-f-]{{5,36}}\b).){{0,500}}?\bstatus[:= ]+([a-z_]+)",
                     regex::escape(&mission.id)
                 ))?;
                 if let Some(found) = status_re
@@ -936,6 +936,25 @@ mod tests {
             .drift
             .iter()
             .any(|d| d.kind == DriftKind::StaleMissionRef));
+    }
+
+    #[test]
+    fn detects_live_mismatch_when_status_is_on_next_line() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/fixtures/missions.json"),
+            r#"[{"id":"11111111-1111-4111-8111-111111111111","status":"active"}]"#,
+        );
+        write(
+            &tmp.path().join(".paloma/projects/verity.md"),
+            "mission: 11111111-1111-4111-8111-111111111111\nstatus: blocked\n",
+        );
+
+        let state = load_state(tmp.path()).unwrap();
+        assert!(state
+            .drift
+            .iter()
+            .any(|d| d.kind == DriftKind::LiveMismatch));
     }
 
     #[test]
