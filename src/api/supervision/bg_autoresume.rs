@@ -175,9 +175,29 @@ async fn reconcile_waiting_background(
         if missions_with_live_jobs.contains(&mission_id) {
             continue;
         }
-        if let Some(next) = reconcile_parked_status(MissionStatus::WaitingBackground, false) {
-            apply_reconciled_status(mission_store, events_tx, mission_id, next).await;
-        }
+        demote_parked_if_jobs_gone(mission_store, events_tx, mission_id).await;
+    }
+}
+
+/// Demote a single mission from `WaitingBackground` back to `AwaitingUser` now
+/// that its jobs are gone — but only after re-reading its current status.
+///
+/// The id came from a `get_waiting_background_mission_ids` snapshot; between that
+/// snapshot and this call auto-resume may have flipped the mission to `Active`.
+/// Re-reading and routing through [`reconcile_parked_status`] (which returns
+/// `None` for `Active`) ensures a running turn is never clobbered back to
+/// `AwaitingUser`, matching how the promotion loop re-reads each mission.
+async fn demote_parked_if_jobs_gone(
+    mission_store: &Arc<dyn MissionStore>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    mission_id: Uuid,
+) {
+    let current = match mission_store.get_mission(mission_id).await {
+        Ok(Some(m)) => m.status,
+        _ => return,
+    };
+    if let Some(next) = reconcile_parked_status(current, false) {
+        apply_reconciled_status(mission_store, events_tx, mission_id, next).await;
     }
 }
 
@@ -781,11 +801,14 @@ fn truncate_for_pgrep(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bg_decide_finished, parse_probe_line, pgrep_pattern_for_task, reconcile_parked_status,
-        shell_single_quote, truncate_for_pgrep, BackgroundTask, BgProbe, BgWatch, MissionStatus,
-        BG_IDLE_STABLE_SECS, BG_START_GRACE_SECS,
+        bg_decide_finished, demote_parked_if_jobs_gone, parse_probe_line, pgrep_pattern_for_task,
+        reconcile_parked_status, shell_single_quote, truncate_for_pgrep, BackgroundTask, BgProbe,
+        BgWatch, MissionStatus, BG_IDLE_STABLE_SECS, BG_START_GRACE_SECS,
     };
+    use crate::api::mission_store::{InMemoryMissionStore, MissionStore};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use tokio::sync::broadcast;
 
     fn sample_task(id: &str, output_path: &str, command: &str) -> BackgroundTask {
         BackgroundTask {
@@ -1022,5 +1045,61 @@ mod tests {
             assert_eq!(reconcile_parked_status(status, true), None);
             assert_eq!(reconcile_parked_status(status, false), None);
         }
+    }
+
+    #[tokio::test]
+    async fn demote_leaves_reactivated_mission_active() {
+        // Regression: the demotion loop must re-read status. A mission id can be
+        // listed as WaitingBackground, then flip to Active (auto-resume started a
+        // turn) before this runs. Demoting it unconditionally would clobber the
+        // running turn back to AwaitingUser and re-open the ack race.
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let (events_tx, _events_rx) = broadcast::channel(8);
+        let mission = store
+            .create_mission(Some("bg resume race"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("set active");
+
+        demote_parked_if_jobs_gone(&store, &events_tx, mission.id).await;
+
+        let after = store
+            .get_mission(mission.id)
+            .await
+            .expect("get mission")
+            .expect("mission exists");
+        assert_eq!(
+            after.status,
+            MissionStatus::Active,
+            "a reactivated mission must not be demoted to AwaitingUser"
+        );
+    }
+
+    #[tokio::test]
+    async fn demote_settles_waiting_background_mission() {
+        // The normal path: a still-WaitingBackground mission whose jobs drained
+        // settles back to AwaitingUser so the ack flow can archive it.
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let (events_tx, _events_rx) = broadcast::channel(8);
+        let mission = store
+            .create_mission(Some("bg drained"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::WaitingBackground)
+            .await
+            .expect("set waiting_background");
+
+        demote_parked_if_jobs_gone(&store, &events_tx, mission.id).await;
+
+        let after = store
+            .get_mission(mission.id)
+            .await
+            .expect("get mission")
+            .expect("mission exists");
+        assert_eq!(after.status, MissionStatus::AwaitingUser);
     }
 }
