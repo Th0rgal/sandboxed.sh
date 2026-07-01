@@ -238,21 +238,20 @@ fn scan_project_docs(root: &Path) -> Result<Vec<ProjectDoc>> {
             collect_md(&dir, &mut paths)?;
         }
     }
-    if paths.is_empty() {
-        let docs = root.join("docs");
-        if docs.exists() {
-            for entry in fs::read_dir(docs)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("md")
-                    && path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.starts_with("PALOMA_"))
-                        .unwrap_or(false)
-                {
-                    paths.push(path);
-                }
+    let docs = root.join("docs");
+    if docs.exists() {
+        for entry in fs::read_dir(docs)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md")
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("PALOMA_"))
+                    .unwrap_or(false)
+                && !paths.iter().any(|existing| existing == &path)
+            {
+                paths.push(path);
             }
         }
     }
@@ -474,12 +473,15 @@ fn pr_gates(root: &Path, owner_repo: &str, number: u64) -> Result<PrGates> {
         .ok_or_else(|| anyhow!("could not read PR gates from fixture or gh"))?;
     gates.owner_repo = owner_repo.to_string();
     gates.number = number;
+    let merge_state_status = gates
+        .merge_state_status
+        .as_deref()
+        .map(str::to_ascii_lowercase);
+    let blocked = merge_state_status.as_deref() == Some("blocked");
+    let behind = merge_state_status.as_deref() == Some("behind");
     gates.conflicting = gates.conflicting
-        || matches!(
-            gates.merge_state_status.as_deref(),
-            Some("dirty" | "blocked" | "behind")
-        )
-        || gates.mergeable == Some(false);
+        || merge_state_status.as_deref() == Some("dirty")
+        || (gates.mergeable == Some(false) && !blocked && !behind);
     let checks_green = !gates.checks.is_empty()
         && gates.checks.iter().all(|c| {
             c.status.eq_ignore_ascii_case("completed")
@@ -493,6 +495,10 @@ fn pr_gates(root: &Path, owner_repo: &str, number: u64) -> Result<PrGates> {
         Some("already_merged".to_string())
     } else if gates.draft {
         Some("wait_for_ready_for_review".to_string())
+    } else if blocked {
+        Some("blocked_by_policy".to_string())
+    } else if behind {
+        Some("needs_update_with_base".to_string())
     } else if gates.conflicting {
         Some("needs_conflict_resolution".to_string())
     } else if closed {
@@ -520,6 +526,62 @@ fn load_pr_fixture(root: &Path, owner_repo: &str, number: u64) -> Option<PrGates
     })
 }
 
+fn status_context_status(state: &str) -> &'static str {
+    match state.to_ascii_lowercase().as_str() {
+        "success" | "failure" | "error" => "completed",
+        _ => "in_progress",
+    }
+}
+
+fn status_context_conclusion(state: &str) -> String {
+    match state.to_ascii_lowercase().as_str() {
+        "success" => "success",
+        "failure" => "failure",
+        "error" => "failure",
+        _ => "",
+    }
+    .to_string()
+}
+
+fn parse_status_check_rollup(value: &Value) -> Vec<CheckRun> {
+    value
+        .get("statusCheckRollup")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| CheckRun {
+                    name: item
+                        .get("name")
+                        .or_else(|| item.get("context"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    status: item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            item.get("state")
+                                .and_then(Value::as_str)
+                                .map(status_context_status)
+                        })
+                        .unwrap_or_default()
+                        .to_ascii_lowercase(),
+                    conclusion: item
+                        .get("conclusion")
+                        .and_then(Value::as_str)
+                        .map(str::to_ascii_lowercase)
+                        .or_else(|| {
+                            item.get("state")
+                                .and_then(Value::as_str)
+                                .map(status_context_conclusion)
+                        }),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn gh_pr_gates(owner_repo: &str, number: u64) -> Option<PrGates> {
     let output = Command::new("gh")
         .args([
@@ -537,31 +599,7 @@ fn gh_pr_gates(owner_repo: &str, number: u64) -> Option<PrGates> {
         return None;
     }
     let value: Value = serde_json::from_slice(&output.stdout).ok()?;
-    let checks = value
-        .get("statusCheckRollup")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| CheckRun {
-                    name: item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    status: item
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_ascii_lowercase(),
-                    conclusion: item
-                        .get("conclusion")
-                        .and_then(Value::as_str)
-                        .map(|s| s.to_ascii_lowercase()),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let checks = parse_status_check_rollup(&value);
     let bugbot_accessible = value
         .get("comments")
         .and_then(Value::as_array)
@@ -901,6 +939,25 @@ mod tests {
     }
 
     #[test]
+    fn scans_paloma_docs_even_when_project_docs_exist() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/projects/verity.md"),
+            "mission: 11111111-1111-4111-8111-111111111111\n",
+        );
+        write(
+            &tmp.path().join("docs/PALOMA_EXTRA.md"),
+            "mission: 22222222-2222-4222-8222-222222222222\n",
+        );
+
+        let docs = scan_project_docs(tmp.path()).unwrap();
+        assert!(docs
+            .iter()
+            .any(|doc| doc.path == ".paloma/projects/verity.md"));
+        assert!(docs.iter().any(|doc| doc.path == "docs/PALOMA_EXTRA.md"));
+    }
+
+    #[test]
     fn pr_103_green_but_conflicting_recommends_conflict_resolution() {
         let tmp = tempdir().unwrap();
         write(
@@ -918,6 +975,41 @@ mod tests {
         assert_eq!(
             gates.recommendation.as_deref(),
             Some("needs_conflict_resolution")
+        );
+    }
+
+    #[test]
+    fn blocked_and_behind_prs_do_not_recommend_conflict_resolution() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/fixtures/pr-107.json"),
+            r#"{
+              "state":"open",
+              "draft":false,
+              "merged":false,
+              "mergeable":false,
+              "merge_state_status":"blocked",
+              "checks":[{"name":"ci","status":"completed","conclusion":"success"}]
+            }"#,
+        );
+        write(
+            &tmp.path().join(".paloma/fixtures/pr-108.json"),
+            r#"{
+              "state":"open",
+              "draft":false,
+              "merged":false,
+              "mergeable":false,
+              "merge_state_status":"behind",
+              "checks":[{"name":"ci","status":"completed","conclusion":"success"}]
+            }"#,
+        );
+
+        let blocked = pr_gates(tmp.path(), "lfglabs-dev/verity", 107).unwrap();
+        let behind = pr_gates(tmp.path(), "lfglabs-dev/verity", 108).unwrap();
+        assert_eq!(blocked.recommendation.as_deref(), Some("blocked_by_policy"));
+        assert_eq!(
+            behind.recommendation.as_deref(),
+            Some("needs_update_with_base")
         );
     }
 
@@ -977,6 +1069,20 @@ mod tests {
             gates.recommendation.as_deref(),
             Some("ready_for_review_or_merge")
         );
+    }
+
+    #[test]
+    fn status_context_rollup_entries_map_to_green_checks() {
+        let value = json!({
+            "statusCheckRollup": [
+                {"context": "legacy-ci", "state": "SUCCESS"}
+            ]
+        });
+        let checks = parse_status_check_rollup(&value);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "legacy-ci");
+        assert_eq!(checks[0].status, "completed");
+        assert_eq!(checks[0].conclusion.as_deref(), Some("success"));
     }
 
     #[test]
