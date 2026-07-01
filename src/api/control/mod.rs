@@ -85,6 +85,29 @@ pub(crate) const ACK_GRACE_SECONDS: u64 = 3600;
 pub(crate) const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
 
+/// Whether an incoming user message (a real one, or the background-task
+/// auto-resume synthetic message) should re-activate `status` to `Active`.
+///
+/// Kept as one predicate so every message-dequeue site agrees. It deliberately
+/// includes `WaitingBackground`: a resume delivered while background jobs were
+/// still live must flip the mission to `Active` — which clears `first_viewed_at`
+/// (see `MissionStore::update_mission_status`) — otherwise the stale timestamp
+/// survives the later demotion back to `AwaitingUser` and the ack-promotion
+/// sweep can archive a mission whose next turn just started.
+pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
+    matches!(
+        status,
+        MissionStatus::Pending
+            | MissionStatus::Interrupted
+            | MissionStatus::Blocked
+            | MissionStatus::Completed
+            | MissionStatus::Failed
+            | MissionStatus::AwaitingUser
+            | MissionStatus::WaitingBackground
+            | MissionStatus::Acknowledged
+    )
+}
+
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
 pub(crate) fn safe_truncate_index(s: &str, max: usize) -> usize {
     if s.len() <= max {
@@ -10416,16 +10439,7 @@ async fn control_actor_loop(
                                                 continue;
                                             }
                                             // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
-                                            if matches!(
-                                                mission.status,
-                                                MissionStatus::Pending
-                                                    | MissionStatus::Interrupted
-                                                    | MissionStatus::Blocked
-                                                    | MissionStatus::Completed
-                                                    | MissionStatus::Failed
-                                                    | MissionStatus::AwaitingUser
-                                                    | MissionStatus::Acknowledged
-                                            ) {
+                                            if message_activates_mission(mission.status) {
                                                 tracing::info!(
                                                     "Activating parallel mission {} (was {})",
                                                     tid, mission.status
@@ -10551,16 +10565,7 @@ async fn control_actor_loop(
                                             );
                                         }
                                         // Activate mission if it was pending/interrupted/blocked/completed
-                                        if matches!(
-                                            mission.status,
-                                            MissionStatus::Pending
-                                                | MissionStatus::Interrupted
-                                                | MissionStatus::Blocked
-                                                | MissionStatus::Completed
-                                                | MissionStatus::Failed
-                                                | MissionStatus::AwaitingUser
-                                                | MissionStatus::Acknowledged
-                                        ) {
+                                        if message_activates_mission(mission.status) {
                                             tracing::info!(
                                                 "Activating main mission {} (was {})",
                                                 tid, mission.status
@@ -10599,16 +10604,7 @@ async fn control_actor_loop(
                                                 history.push((entry.role.clone(), entry.content.clone()));
                                             }
                                             // Activate mission if it was pending/interrupted/blocked/completed
-                                            if matches!(
-                                                mission.status,
-                                                MissionStatus::Pending
-                                                    | MissionStatus::Interrupted
-                                                    | MissionStatus::Blocked
-                                                    | MissionStatus::Completed
-                                                    | MissionStatus::Failed
-                                                    | MissionStatus::AwaitingUser
-                                                    | MissionStatus::Acknowledged
-                                            ) {
+                                            if message_activates_mission(mission.status) {
                                                 tracing::info!(
                                                     "Activating switched mission {} (was {})",
                                                     tid, mission.status
@@ -10642,16 +10638,7 @@ async fn control_actor_loop(
                                                 );
                                             }
                                             // Activate mission if it was pending/interrupted/blocked/completed (same mission, reloading)
-                                            if matches!(
-                                                mission.status,
-                                                MissionStatus::Pending
-                                                    | MissionStatus::Interrupted
-                                                    | MissionStatus::Blocked
-                                                    | MissionStatus::Completed
-                                                    | MissionStatus::Failed
-                                                    | MissionStatus::AwaitingUser
-                                                    | MissionStatus::Acknowledged
-                                            ) {
+                                            if message_activates_mission(mission.status) {
                                                 tracing::info!(
                                                     "Activating reloaded mission {} (was {})",
                                                     tid, mission.status
@@ -10768,16 +10755,7 @@ async fn control_actor_loop(
                                     match mission_store.get_mission(mid).await {
                                         Ok(Some(mission)) => {
                                             // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
-                                            if matches!(
-                                                mission.status,
-                                                MissionStatus::Pending
-                                                    | MissionStatus::Interrupted
-                                                    | MissionStatus::Blocked
-                                                    | MissionStatus::Completed
-                                                    | MissionStatus::Failed
-                                                    | MissionStatus::AwaitingUser
-                                                    | MissionStatus::Acknowledged
-                                            ) {
+                                            if message_activates_mission(mission.status) {
                                                 tracing::info!(
                                                     "Activating mission {} (was {})",
                                                     mid, mission.status
@@ -20397,6 +20375,84 @@ Investigate <service/> failures.
         assert_eq!(
             mission_status_for_terminal_reason(TerminalReason::Completed, true),
             Some((MissionStatus::Completed, "completed"))
+        );
+    }
+
+    #[test]
+    fn message_activates_mission_includes_waiting_background() {
+        // A resume delivered while background jobs are still live lands on a
+        // WaitingBackground mission; it must be activation-eligible so the flip
+        // to Active clears first_viewed_at and closes the ack race.
+        assert!(message_activates_mission(MissionStatus::WaitingBackground));
+        for status in [
+            MissionStatus::Pending,
+            MissionStatus::Interrupted,
+            MissionStatus::Blocked,
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::AwaitingUser,
+            MissionStatus::Acknowledged,
+        ] {
+            assert!(
+                message_activates_mission(status),
+                "{status} should activate"
+            );
+        }
+        // Already-running and explicitly-paused missions are handled elsewhere
+        // (a running mission needs no activation; a paused one must stay parked
+        // until the user resumes it), so they are not activation-eligible here.
+        assert!(!message_activates_mission(MissionStatus::Active));
+        assert!(!message_activates_mission(MissionStatus::Paused));
+    }
+
+    #[tokio::test]
+    async fn activating_waiting_background_clears_first_viewed_at_and_blocks_ack() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("bg resume race"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        // The mission parked awaiting the user, was opened (first_viewed_at set),
+        // then a background job promoted it to WaitingBackground.
+        let long_ago = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        store
+            .set_mission_first_viewed_at_if_unset(mission.id, &long_ago)
+            .await
+            .expect("set first_viewed_at");
+        store
+            .update_mission_status(mission.id, MissionStatus::WaitingBackground)
+            .await
+            .expect("set waiting_background");
+
+        // The auto-resume dequeue path activates the mission to Active.
+        assert!(message_activates_mission(MissionStatus::WaitingBackground));
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("activate to Active");
+
+        // Activation cleared the stale first_viewed_at, so once the resumed turn
+        // re-parks in AwaitingUser the ack-promotion sweep must not archive it.
+        store
+            .update_mission_status(mission.id, MissionStatus::AwaitingUser)
+            .await
+            .expect("re-park in awaiting_user");
+        let after = store
+            .get_mission(mission.id)
+            .await
+            .expect("get mission")
+            .expect("mission exists");
+        assert_eq!(
+            after.first_viewed_at, None,
+            "activation must clear first_viewed_at"
+        );
+        let promoted = store
+            .acknowledge_stale_awaiting_user_missions(0)
+            .await
+            .expect("run ack sweep");
+        assert!(
+            !promoted.contains(&mission.id),
+            "a freshly-resumed mission must not be ack-promoted after demotion"
         );
     }
 
