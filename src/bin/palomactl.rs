@@ -104,6 +104,22 @@ fn modes_dir(root: &Path) -> PathBuf {
     control_dir(root).join("modes")
 }
 
+fn validate_project_slug(project: &str) -> Result<()> {
+    if project.is_empty()
+        || project == "."
+        || project == ".."
+        || project.contains("..")
+        || project.contains('/')
+        || project.contains('\\')
+        || !project
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        bail!("project slug must be non-empty and contain only ASCII letters, numbers, '-' or '_'");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct MissionSnapshot {
     #[serde(default)]
@@ -327,7 +343,7 @@ fn detect_drift(root: &Path, docs: &[ProjectDoc], missions: &[MissionRef]) -> Re
 
         for pr in &doc.pr_refs {
             if line_mentions_open_pr(&text, *pr) {
-                if let Ok(gates) = pr_gates(root, "fixture/repo", *pr) {
+                if let Some(gates) = load_pr_fixture(root, "fixture/repo", *pr) {
                     if gates.merged {
                         drift.push(Drift {
                             kind: DriftKind::PrListedOpenButMerged,
@@ -352,13 +368,11 @@ fn is_uuid_like(value: &str) -> bool {
 }
 
 fn line_mentions_open_pr(text: &str, number: u64) -> bool {
-    text.lines().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        (lower.contains(&format!("pr #{number}"))
-            || lower.contains(&format!("pr {number}"))
-            || lower.contains(&format!("#{number}")))
-            && lower.contains("open")
-    })
+    let pr_re = Regex::new(&format!(r"(?i)(?:\bpr\s*#?\s*{}\b|#{}\b)", number, number))
+        .expect("valid PR mention regex");
+    let open_re = Regex::new(r"(?i)\bopen\b").expect("valid open status regex");
+    text.lines()
+        .any(|line| pr_re.is_match(line) && open_re.is_match(line))
 }
 
 fn render_status_text(state: &ProjectState) -> String {
@@ -598,7 +612,7 @@ impl RiskMode {
 
     fn exploration_limit(&self) -> usize {
         match self {
-            Self::Conservative => 1,
+            Self::Conservative => 0,
             Self::Normal => 1,
             Self::Aggressive => 3,
             Self::VeryAggressive => 5,
@@ -615,8 +629,29 @@ struct ModePolicy {
     exploration_lane_max_workers: usize,
 }
 
+fn normal_mode_policy(project: &str) -> ModePolicy {
+    ModePolicy {
+        project: project.to_string(),
+        mode: RiskMode::Normal,
+        until: "unset".to_string(),
+        safe_lane_max_workers: 1,
+        exploration_lane_max_workers: RiskMode::Normal.exploration_limit(),
+    }
+}
+
+fn parse_unexpired_until(until: &str) -> Result<DateTime<Utc>> {
+    let until = DateTime::parse_from_rfc3339(until)
+        .context("--until must be RFC3339/ISO timestamp")?
+        .with_timezone(&Utc);
+    if until <= Utc::now() {
+        bail!("--until must be in the future");
+    }
+    Ok(until)
+}
+
 fn set_mode(root: &Path, project: &str, mode: &str, until: &str) -> Result<ModePolicy> {
-    DateTime::parse_from_rfc3339(until).context("--until must be RFC3339/ISO timestamp")?;
+    validate_project_slug(project)?;
+    parse_unexpired_until(until)?;
     let mode = RiskMode::parse(mode)?;
     let policy = ModePolicy {
         project: project.to_string(),
@@ -634,17 +669,25 @@ fn set_mode(root: &Path, project: &str, mode: &str, until: &str) -> Result<ModeP
 }
 
 fn load_mode(root: &Path, project: &str) -> Result<ModePolicy> {
+    validate_project_slug(project)?;
     let path = modes_dir(root).join(format!("{project}.json"));
     if path.exists() {
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
+        let Some(policy) = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ModePolicy>(&bytes).ok())
+        else {
+            return Ok(normal_mode_policy(project));
+        };
+        if DateTime::parse_from_rfc3339(&policy.until)
+            .map(|until| until.with_timezone(&Utc) > Utc::now())
+            .unwrap_or(false)
+        {
+            Ok(policy)
+        } else {
+            Ok(normal_mode_policy(project))
+        }
     } else {
-        Ok(ModePolicy {
-            project: project.to_string(),
-            mode: RiskMode::Normal,
-            until: "unset".to_string(),
-            safe_lane_max_workers: 1,
-            exploration_lane_max_workers: 1,
-        })
+        Ok(normal_mode_policy(project))
     }
 }
 
@@ -833,7 +876,7 @@ mod tests {
             tmp.path(),
             "verity-core",
             "aggressive",
-            "2026-07-02T00:00:00Z",
+            "2999-07-02T00:00:00Z",
         )
         .unwrap();
         write(
@@ -859,6 +902,119 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn set_mode_rejects_past_until() {
+        let tmp = tempdir().unwrap();
+        let err = set_mode(
+            tmp.path(),
+            "verity-core",
+            "aggressive",
+            "2000-01-01T00:00:00Z",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--until must be in the future"));
+        assert!(!tmp.path().join(".paloma/modes/verity-core.json").exists());
+    }
+
+    #[test]
+    fn expired_mode_reverts_to_normal_exploration_limit() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/modes/verity-core.json"),
+            r#"{
+              "project":"verity-core",
+              "mode":"very_aggressive",
+              "until":"2000-01-01T00:00:00Z",
+              "safe_lane_max_workers":1,
+              "exploration_lane_max_workers":5
+            }"#,
+        );
+        write(
+            &tmp.path().join(".paloma/fixtures/tasks.json"),
+            r#"[
+              {"project":"verity-core","id":"proof-a","status":"ready","lane":"exploration"},
+              {"project":"verity-core","id":"proof-b","status":"ready","lane":"exploration"}
+            ]"#,
+        );
+
+        let plan = dispatch_plan(tmp.path(), "verity-core").unwrap();
+        assert_eq!(plan.mode, RiskMode::Normal);
+        assert_eq!(plan.exploration_lane_max_workers, 1);
+        assert_eq!(
+            plan.dispatch
+                .iter()
+                .filter(|d| d["lane"] == "exploration")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unparsable_mode_reverts_to_normal_exploration_limit() {
+        let tmp = tempdir().unwrap();
+        write(&tmp.path().join(".paloma/modes/verity-core.json"), "{ nope");
+        write(
+            &tmp.path().join(".paloma/fixtures/tasks.json"),
+            r#"[
+              {"project":"verity-core","id":"proof-a","status":"ready","lane":"exploration"},
+              {"project":"verity-core","id":"proof-b","status":"ready","lane":"exploration"}
+            ]"#,
+        );
+
+        let plan = dispatch_plan(tmp.path(), "verity-core").unwrap();
+        assert_eq!(plan.mode, RiskMode::Normal);
+        assert_eq!(plan.exploration_lane_max_workers, 1);
+    }
+
+    #[test]
+    fn invalid_project_slug_cannot_escape_modes_dir() {
+        let tmp = tempdir().unwrap();
+        let err = set_mode(
+            tmp.path(),
+            "../status",
+            "aggressive",
+            "2999-07-02T00:00:00Z",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("project slug"));
+        assert!(!tmp.path().join(".paloma/status.json").exists());
+        assert!(!tmp.path().join(".paloma/modes/../status.json").exists());
+    }
+
+    #[test]
+    fn detects_open_pr_listed_as_merged_from_fixture_without_live_repo() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/projects/verity.md"),
+            "Tracker: PR #103 open\n",
+        );
+        write(
+            &tmp.path().join(".paloma/fixtures/pr-103.json"),
+            r#"{
+              "state":"closed",
+              "draft":false,
+              "merged":true,
+              "checks":[{"name":"ci","status":"completed","conclusion":"success"}]
+            }"#,
+        );
+
+        let state = load_state(tmp.path()).unwrap();
+        assert!(state
+            .drift
+            .iter()
+            .any(|d| d.kind == DriftKind::PrListedOpenButMerged));
+    }
+
+    #[test]
+    fn open_pr_matching_rejects_substrings_and_partial_numbers() {
+        assert!(line_mentions_open_pr("PR #12 open", 12));
+        assert!(line_mentions_open_pr("open pull request mentions #12", 12));
+        assert!(!line_mentions_open_pr("PR #12 reopened", 12));
+        assert!(!line_mentions_open_pr("PR #12 opening soon", 12));
+        assert!(!line_mentions_open_pr("PR #123 open", 12));
+        assert!(!line_mentions_open_pr("PR #12 open", 123));
     }
 
     #[test]
