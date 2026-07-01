@@ -792,10 +792,15 @@ fn dispatch_plan(root: &Path, project: &str) -> Result<DispatchPlan> {
         dispatch.push(json!({
             "task_id": task.id,
             "lane": "exploration",
-            "max_workers": mode.exploration_lane_max_workers,
+            "max_workers": 1,
             "isolated_branch": true
         }));
     }
+    let reason = if dispatch.is_empty() {
+        Some("no_schedulable_tasks".to_string())
+    } else {
+        None
+    };
 
     Ok(DispatchPlan {
         project: project.to_string(),
@@ -803,7 +808,7 @@ fn dispatch_plan(root: &Path, project: &str) -> Result<DispatchPlan> {
         safe_lane_max_workers: 1,
         exploration_lane_max_workers: mode.exploration_lane_max_workers,
         dispatch,
-        reason: None,
+        reason,
     })
 }
 
@@ -1020,6 +1025,12 @@ mod tests {
                 .count(),
             3
         );
+        assert!(plan
+            .dispatch
+            .iter()
+            .filter(|d| d["lane"] == "exploration")
+            .all(|d| d["max_workers"] == 1));
+        assert_eq!(plan.reason, None);
     }
 
     #[test]
@@ -1034,6 +1045,28 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("--until must be in the future"));
         assert!(!tmp.path().join(".paloma/modes/verity-core.json").exists());
+    }
+
+    #[test]
+    fn empty_dispatch_with_ready_but_unschedulable_tasks_has_reason() {
+        let tmp = tempdir().unwrap();
+        set_mode(
+            tmp.path(),
+            "verity-core",
+            "conservative",
+            "2999-07-02T00:00:00Z",
+        )
+        .unwrap();
+        write(
+            &tmp.path().join(".paloma/fixtures/tasks.json"),
+            r#"[
+              {"project":"verity-core","id":"proof-a","status":"ready","lane":"exploration"}
+            ]"#,
+        );
+
+        let plan = dispatch_plan(tmp.path(), "verity-core").unwrap();
+        assert!(plan.dispatch.is_empty());
+        assert_eq!(plan.reason.as_deref(), Some("no_schedulable_tasks"));
     }
 
     #[test]
