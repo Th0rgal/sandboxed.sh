@@ -325,25 +325,16 @@ fn detect_drift(root: &Path, docs: &[ProjectDoc], missions: &[MissionRef]) -> Re
         }
 
         for mission in missions {
-            if text.contains(&mission.id) {
-                let status_re = Regex::new(&format!(
-                    r"(?is){}\b(?:(?!\bmission(?:[_ -]?id)?[:# ]+[0-9a-f][0-9a-f-]{{5,36}}\b).){{0,500}}?\bstatus[:= ]+([a-z_]+)",
-                    regex::escape(&mission.id)
-                ))?;
-                if let Some(found) = status_re
-                    .captures(&text)
-                    .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
-                {
-                    if !mission.status.is_empty() && found != mission.status {
-                        drift.push(Drift {
-                            kind: DriftKind::LiveMismatch,
-                            source: doc.path.clone(),
-                            detail: format!(
-                                "mission `{}` tracker status `{}` differs from live `{}`",
-                                mission.id, found, mission.status
-                            ),
-                        });
-                    }
+            if let Some(found) = tracker_status_for_mission(&text, &mission.id) {
+                if !mission.status.is_empty() && found != mission.status {
+                    drift.push(Drift {
+                        kind: DriftKind::LiveMismatch,
+                        source: doc.path.clone(),
+                        detail: format!(
+                            "mission `{}` tracker status `{}` differs from live `{}`",
+                            mission.id, found, mission.status
+                        ),
+                    });
                 }
             }
         }
@@ -363,6 +354,22 @@ fn detect_drift(root: &Path, docs: &[ProjectDoc], missions: &[MissionRef]) -> Re
         }
     }
     Ok(drift)
+}
+
+fn tracker_status_for_mission(text: &str, mission_id: &str) -> Option<String> {
+    let start = text.find(mission_id)?;
+    let after_id = &text[start + mission_id.len()..];
+    let next_mission_re =
+        Regex::new(r"(?i)\bmission(?:[_ -]?id)?[:# ]+[0-9a-f][0-9a-f-]{5,36}\b").ok()?;
+    let end = next_mission_re
+        .find(after_id)
+        .map(|m| m.start())
+        .unwrap_or(after_id.len())
+        .min(500);
+    let status_re = Regex::new(r"(?i)\bstatus[:= ]+([a-z_]+)").ok()?;
+    status_re
+        .captures(&after_id[..end])
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
 }
 
 fn load_doc_pr_fixture(root: &Path, doc: &ProjectDoc, number: u64) -> Option<PrGates> {
