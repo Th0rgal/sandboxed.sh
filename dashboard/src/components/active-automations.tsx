@@ -30,6 +30,7 @@ const LIVE_STATUSES: ReadonlySet<MissionStatus> = new Set<MissionStatus>([
   'active',
   'awaiting_user',
   'blocked',
+  'waiting_background',
 ]);
 
 /**

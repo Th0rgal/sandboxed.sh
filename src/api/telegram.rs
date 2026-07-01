@@ -401,7 +401,7 @@ fn mission_rank(mission: &Mission, interest: TelegramMissionInterestLevel) -> i3
     score += match mission.status {
         MissionStatus::Blocked | MissionStatus::Failed => 60,
         MissionStatus::AwaitingUser => 50,
-        MissionStatus::Active => 40,
+        MissionStatus::Active | MissionStatus::WaitingBackground => 40,
         MissionStatus::Pending => 25,
         MissionStatus::Interrupted => 20,
         MissionStatus::Paused => 10,

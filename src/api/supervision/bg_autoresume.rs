@@ -128,6 +128,109 @@ fn bg_decide_finished(
     )
 }
 
+/// Pure reconciliation between a mission's persisted status and whether it has
+/// live background jobs. Returns `Some(new_status)` when a transition is needed.
+///
+/// Only the two "parked" statuses participate: a mission actively running a turn
+/// (`Active`), pending, or terminal is left untouched even if the registry still
+/// lists a job for it (that job is drained by the terminal/timeout paths).
+fn reconcile_parked_status(current: MissionStatus, has_live_jobs: bool) -> Option<MissionStatus> {
+    match (current, has_live_jobs) {
+        (MissionStatus::AwaitingUser, true) => Some(MissionStatus::WaitingBackground),
+        (MissionStatus::WaitingBackground, false) => Some(MissionStatus::AwaitingUser),
+        _ => None,
+    }
+}
+
+/// Apply [`reconcile_parked_status`] across the missions that currently have
+/// live jobs (promote `AwaitingUser` -> `WaitingBackground`) and the missions
+/// persisted as `WaitingBackground` (demote back to `AwaitingUser` once their
+/// jobs are gone). Broadcasts `MissionStatusChanged` for every transition so
+/// dashboard/Paloma clients update without a refresh.
+async fn reconcile_waiting_background(
+    mission_store: &Arc<dyn MissionStore>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    missions_with_live_jobs: &HashSet<Uuid>,
+) {
+    // Promote missions that just gained (or still have) live jobs.
+    for &mission_id in missions_with_live_jobs {
+        let current = match mission_store.get_mission(mission_id).await {
+            Ok(Some(m)) => m.status,
+            _ => continue,
+        };
+        if let Some(next) = reconcile_parked_status(current, true) {
+            apply_reconciled_status(mission_store, events_tx, mission_id, next).await;
+        }
+    }
+
+    // Demote missions still marked WaitingBackground whose jobs are gone.
+    let waiting = match mission_store.get_waiting_background_mission_ids().await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::debug!("bg-autoresume: list waiting_background failed: {}", e);
+            return;
+        }
+    };
+    for mission_id in waiting {
+        if missions_with_live_jobs.contains(&mission_id) {
+            continue;
+        }
+        if let Some(next) = reconcile_parked_status(MissionStatus::WaitingBackground, false) {
+            apply_reconciled_status(mission_store, events_tx, mission_id, next).await;
+        }
+    }
+}
+
+async fn apply_reconciled_status(
+    mission_store: &Arc<dyn MissionStore>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    mission_id: Uuid,
+    next: MissionStatus,
+) {
+    let reason = match next {
+        MissionStatus::WaitingBackground => Some("background_jobs_running"),
+        _ => None,
+    };
+    if let Err(e) = mission_store
+        .update_mission_status_with_reason(mission_id, next, reason)
+        .await
+    {
+        tracing::warn!(
+            mission_id = %mission_id,
+            ?next,
+            "bg-autoresume: failed to reconcile background status: {}",
+            e
+        );
+        return;
+    }
+    tracing::info!(
+        mission_id = %mission_id,
+        status = %next,
+        "bg-autoresume: reconciled mission background status"
+    );
+    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+        mission_id,
+        status: next,
+        summary: None,
+    });
+}
+
+/// Boot-time settle for stranded `WaitingBackground` missions.
+///
+/// The background-task registry is in-memory, so a restart loses the record of
+/// which jobs were live. Any mission persisted as `WaitingBackground` therefore
+/// has no known live jobs at boot and must be settled back to `AwaitingUser` so
+/// the normal ack flow can archive it — otherwise it is stranded outside every
+/// terminal path. Runs unconditionally (independent of whether the auto-resume
+/// watcher is enabled), since only the watcher would otherwise heal it.
+pub(crate) async fn reset_waiting_background_on_boot(
+    mission_store: Arc<dyn MissionStore>,
+    events_tx: broadcast::Sender<AgentEvent>,
+) {
+    let no_live_jobs = HashSet::new();
+    reconcile_waiting_background(&mission_store, &events_tx, &no_live_jobs).await;
+}
+
 /// Watcher that auto-resumes missions whose background shell tasks have finished.
 ///
 /// Uses an in-memory [`BackgroundTaskRegistry`] shared with the control actor.
@@ -162,6 +265,18 @@ pub(crate) async fn background_task_autoresume_loop(
                 .collect()
         };
 
+        // Keep the persisted mission status in sync with the live registry so a
+        // mission with running background work is never presented as "done":
+        //   - AwaitingUser + live jobs  -> WaitingBackground (visible as ongoing,
+        //     and NOT eligible for ack-promotion, which only touches AwaitingUser)
+        //   - WaitingBackground + no live jobs -> AwaitingUser (settle back so the
+        //     normal ack flow can archive it; also un-strands a mission whose
+        //     in-memory registry was lost across a restart).
+        // Runs every tick, including when the registry is empty, precisely so the
+        // "no live jobs" settle-back path can fire.
+        let missions_with_live_jobs: HashSet<Uuid> = snapshot.iter().map(|(m, _)| *m).collect();
+        reconcile_waiting_background(&mission_store, &events_tx, &missions_with_live_jobs).await;
+
         if snapshot.is_empty() {
             watches.clear();
             continue;
@@ -194,7 +309,10 @@ pub(crate) async fn background_task_autoresume_loop(
                     continue;
                 }
             };
-            if mission.status != MissionStatus::AwaitingUser {
+            if !matches!(
+                mission.status,
+                MissionStatus::AwaitingUser | MissionStatus::WaitingBackground
+            ) {
                 let terminal = matches!(
                     mission.status,
                     MissionStatus::Completed | MissionStatus::Failed | MissionStatus::NotFeasible
@@ -663,9 +781,9 @@ fn truncate_for_pgrep(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bg_decide_finished, parse_probe_line, pgrep_pattern_for_task, shell_single_quote,
-        truncate_for_pgrep, BackgroundTask, BgProbe, BgWatch, BG_IDLE_STABLE_SECS,
-        BG_START_GRACE_SECS,
+        bg_decide_finished, parse_probe_line, pgrep_pattern_for_task, reconcile_parked_status,
+        shell_single_quote, truncate_for_pgrep, BackgroundTask, BgProbe, BgWatch, MissionStatus,
+        BG_IDLE_STABLE_SECS, BG_START_GRACE_SECS,
     };
     use std::time::{Duration, Instant};
 
@@ -849,5 +967,60 @@ mod tests {
         let t = truncate_for_pgrep(&long);
         assert!(t.len() <= 120);
         assert!(long.starts_with(&t));
+    }
+
+    #[test]
+    fn reconcile_promotes_awaiting_user_with_live_jobs() {
+        // A mission that ended its turn but left background jobs running must be
+        // moved off AwaitingUser so it is never presented as done / ack-promoted.
+        assert_eq!(
+            reconcile_parked_status(MissionStatus::AwaitingUser, true),
+            Some(MissionStatus::WaitingBackground)
+        );
+    }
+
+    #[test]
+    fn reconcile_demotes_waiting_background_when_jobs_gone() {
+        // Once the background work drains, settle back to AwaitingUser so the
+        // normal ack flow can archive the mission (and un-strand it after a
+        // restart lost the in-memory registry).
+        assert_eq!(
+            reconcile_parked_status(MissionStatus::WaitingBackground, false),
+            Some(MissionStatus::AwaitingUser)
+        );
+    }
+
+    #[test]
+    fn reconcile_is_noop_when_already_consistent() {
+        // No transition when the persisted status already matches reality.
+        assert_eq!(
+            reconcile_parked_status(MissionStatus::AwaitingUser, false),
+            None
+        );
+        assert_eq!(
+            reconcile_parked_status(MissionStatus::WaitingBackground, true),
+            None
+        );
+    }
+
+    #[test]
+    fn reconcile_never_touches_active_or_terminal_statuses() {
+        // A mission actively running a turn, or already terminal, must never be
+        // flipped by the reconciler even if the registry still lists a job for
+        // it (that job is drained by the terminal/timeout paths instead).
+        for status in [
+            MissionStatus::Active,
+            MissionStatus::Pending,
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::NotFeasible,
+            MissionStatus::Acknowledged,
+            MissionStatus::Blocked,
+            MissionStatus::Interrupted,
+            MissionStatus::Paused,
+        ] {
+            assert_eq!(reconcile_parked_status(status, true), None);
+            assert_eq!(reconcile_parked_status(status, false), None);
+        }
     }
 }

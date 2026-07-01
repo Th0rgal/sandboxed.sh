@@ -68,6 +68,11 @@ export function missionStatusLabel(
       return { label: "Pending", className: "bg-zinc-500/20 text-zinc-400" };
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
+    case "waiting_background":
+      return {
+        label: "Working (Background)",
+        className: "bg-indigo-500/20 text-indigo-400",
+      };
     case "awaiting_user":
       // Distinguish "agent asked a question" (decision) from "agent finished,
       // waiting to be acked/merged" (ack). The old single "Needs You" label

@@ -72,6 +72,13 @@ export function categorizeMission(
     return 'running';
   }
 
+  // The agent's turn ended but background shell jobs it spawned are still
+  // live. Work is genuinely in progress, so surface it in Running rather than
+  // letting it fall through to Other (where it would look idle/dropped).
+  if (status === 'waiting_background') {
+    return 'running';
+  }
+
   if (needsAttentionStatus(status)) {
     return 'needs-you';
   }
@@ -126,6 +133,7 @@ export const STATUS_DOT_COLORS: Record<MissionStatus, string> = {
   interrupted: 'bg-red-400',
   blocked: 'bg-red-400',
   not_feasible: 'bg-red-400',
+  waiting_background: 'bg-indigo-400',
 };
 
 export const STATUS_TEXT_COLORS: Record<MissionStatus, string> = {
@@ -138,6 +146,7 @@ export const STATUS_TEXT_COLORS: Record<MissionStatus, string> = {
   interrupted: 'text-red-400',
   blocked: 'text-red-400',
   not_feasible: 'text-red-400',
+  waiting_background: 'text-indigo-400',
 };
 
 export const STATUS_LABELS: Record<MissionStatus, string> = {
@@ -150,6 +159,7 @@ export const STATUS_LABELS: Record<MissionStatus, string> = {
   interrupted: 'Interrupted',
   blocked: 'Blocked',
   not_feasible: 'Not Feasible',
+  waiting_background: 'Working (Background)',
 };
 
 /**

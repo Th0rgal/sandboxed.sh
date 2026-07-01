@@ -17,7 +17,8 @@ export type MissionStatus =
   | "failed"
   | "interrupted"
   | "blocked"
-  | "not_feasible";
+  | "not_feasible"
+  | "waiting_background";
 
 export type ModelEffort = "low" | "medium" | "high" | "xhigh" | "max";
 

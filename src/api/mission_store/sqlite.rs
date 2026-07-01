@@ -2437,6 +2437,7 @@ fn parse_status(s: &str) -> MissionStatus {
         "active" => MissionStatus::Active,
         "awaiting_user" => MissionStatus::AwaitingUser,
         "acknowledged" => MissionStatus::Acknowledged,
+        "waiting_background" => MissionStatus::WaitingBackground,
         "completed" => MissionStatus::Completed,
         "failed" => MissionStatus::Failed,
         "interrupted" => MissionStatus::Interrupted,
@@ -2453,6 +2454,7 @@ fn status_to_string(status: MissionStatus) -> &'static str {
         MissionStatus::Active => "active",
         MissionStatus::AwaitingUser => "awaiting_user",
         MissionStatus::Acknowledged => "acknowledged",
+        MissionStatus::WaitingBackground => "waiting_background",
         MissionStatus::Completed => "completed",
         MissionStatus::Failed => "failed",
         MissionStatus::Interrupted => "interrupted",
@@ -2999,6 +3001,7 @@ impl MissionStore for SqliteMissionStore {
                 | MissionStatus::Failed
                 | MissionStatus::AwaitingUser
                 | MissionStatus::Acknowledged
+                | MissionStatus::WaitingBackground
         );
         let terminal_reason = terminal_reason.map(|s| s.to_string());
         // Transitioning back to Active means the user just sent a new message —
@@ -3158,6 +3161,27 @@ impl MissionStore for SqliteMissionStore {
                 .map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())?;
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_waiting_background_mission_ids(&self) -> Result<Vec<Uuid>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT id FROM missions WHERE status = 'waiting_background'")
+                .map_err(|e| e.to_string())?;
+            let ids = stmt
+                .query_map([], |row| {
+                    let id_str: String = row.get(0)?;
+                    Ok(parse_uuid_or_nil(&id_str))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
             Ok(ids)
         })
         .await

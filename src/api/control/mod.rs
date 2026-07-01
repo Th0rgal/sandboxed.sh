@@ -42,7 +42,8 @@ use uuid::Uuid;
 #[allow(unused_imports)]
 use super::supervision::{
     ack_promotion_loop, background_task_autoresume_loop, cleanup_stale_active_missions_once,
-    recover_server_shutdown_missions, stale_mission_cleanup_loop, stuck_mission_watchdog_loop,
+    recover_server_shutdown_missions, reset_waiting_background_on_boot, stale_mission_cleanup_loop,
+    stuck_mission_watchdog_loop,
 };
 use crate::agents::{AgentContext, AgentRef, TerminalReason};
 use crate::config::Config;
@@ -7855,6 +7856,18 @@ fn spawn_control_session(
     // completion inside the workspace, and resumes the agent with the output.
     // Uses an in-memory registry (no persistent store required). Gated by
     // `BACKGROUND_TASK_AUTORESUME` (default enabled).
+    // Settle any mission left in `WaitingBackground` by a previous process:
+    // the in-memory background-task registry is empty at boot, so those jobs are
+    // no longer tracked and the mission would be stranded outside every terminal
+    // path. Runs regardless of whether the watcher below is enabled.
+    if state.mission_store.is_persistent() {
+        let store = Arc::clone(&state.mission_store);
+        let tx = events_tx.clone();
+        tokio::spawn(async move {
+            reset_waiting_background_on_boot(store, tx).await;
+        });
+    }
+
     if super::mission_runner::background_task_autoresume_enabled() {
         tokio::spawn(background_task_autoresume_loop(
             Arc::clone(&state.mission_store),

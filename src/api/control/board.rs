@@ -397,6 +397,10 @@ pub async fn scheduler_pass(
                     // Runner may exist in another control session or be mid-start;
                     // leave it alone.
                 }
+                MissionStatus::WaitingBackground => {
+                    // Worker parked on live background jobs; the auto-resume
+                    // watcher will wake it when they finish. Not settled — leave it.
+                }
                 MissionStatus::Paused => {
                     // Operator-paused worker: leave it alone, the dispatcher will
                     // resume it when unpaused.
