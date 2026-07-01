@@ -184,6 +184,7 @@ impl MissionStore for InMemoryMissionStore {
                 | MissionStatus::Failed
                 | MissionStatus::AwaitingUser
                 | MissionStatus::Acknowledged
+                | MissionStatus::WaitingBackground
         );
         mission.interrupted_at =
             if matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked) {
@@ -701,6 +702,51 @@ impl MissionStore for InMemoryMissionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn waiting_background_is_never_ack_promoted() {
+        // A mission parked in WaitingBackground has live background work; the
+        // stale-ack sweep must skip it even after its view-grace elapses,
+        // otherwise it would be archived while work is still running.
+        let store = InMemoryMissionStore::new();
+        let mission = store
+            .create_mission(Some("bg mission"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+        store
+            .update_mission_status(mission.id, MissionStatus::WaitingBackground)
+            .await
+            .expect("set waiting_background");
+        // Mark it viewed well in the past so the grace window is definitely
+        // exceeded — the only thing that should save it is the status guard.
+        let long_ago = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        store
+            .set_mission_first_viewed_at_if_unset(mission.id, &long_ago)
+            .await
+            .expect("set first viewed");
+
+        let promoted = store
+            .acknowledge_stale_awaiting_user_missions(0)
+            .await
+            .expect("run ack sweep");
+        assert!(
+            !promoted.contains(&mission.id),
+            "waiting_background must not be ack-promoted"
+        );
+
+        let after = store
+            .get_mission(mission.id)
+            .await
+            .expect("get mission")
+            .expect("mission exists");
+        assert_eq!(after.status, MissionStatus::WaitingBackground);
+
+        let waiting = store
+            .get_waiting_background_mission_ids()
+            .await
+            .expect("list waiting_background");
+        assert!(waiting.contains(&mission.id));
+    }
 
     #[tokio::test]
     async fn update_mission_metadata_is_noop_when_fields_missing() {

@@ -140,6 +140,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
         fill: '',
       };
     case 'active':
+    case 'waiting_background':
       return {
         ...base,
         indicator: <Dot color="bg-indigo-400" pulse />,

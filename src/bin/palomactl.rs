@@ -474,12 +474,7 @@ struct PrGates {
     recommendation: Option<String>,
 }
 
-fn pr_gates(root: &Path, owner_repo: &str, number: u64) -> Result<PrGates> {
-    let mut gates = load_pr_fixture(root, owner_repo, number)
-        .or_else(|| gh_pr_gates(owner_repo, number))
-        .ok_or_else(|| anyhow!("could not read PR gates from fixture or gh"))?;
-    gates.owner_repo = owner_repo.to_string();
-    gates.number = number;
+fn apply_pr_gate_recommendation(gates: &mut PrGates) {
     let merge_state_status = gates
         .merge_state_status
         .as_deref()
@@ -515,6 +510,15 @@ fn pr_gates(root: &Path, owner_repo: &str, number: u64) -> Result<PrGates> {
     } else {
         Some("needs_checks_or_review".to_string())
     };
+}
+
+fn pr_gates(root: &Path, owner_repo: &str, number: u64) -> Result<PrGates> {
+    let mut gates = load_pr_fixture(root, owner_repo, number)
+        .or_else(|| gh_pr_gates(owner_repo, number))
+        .ok_or_else(|| anyhow!("could not read PR gates from fixture or gh"))?;
+    gates.owner_repo = owner_repo.to_string();
+    gates.number = number;
+    apply_pr_gate_recommendation(&mut gates);
     Ok(gates)
 }
 
@@ -589,24 +593,8 @@ fn parse_status_check_rollup(value: &Value) -> Vec<CheckRun> {
         .unwrap_or_default()
 }
 
-fn gh_pr_gates(owner_repo: &str, number: u64) -> Option<PrGates> {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &number.to_string(),
-            "--repo",
-            owner_repo,
-            "--json",
-            "state,isDraft,mergeable,mergeStateStatus,merged,statusCheckRollup,comments",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
-    let checks = parse_status_check_rollup(&value);
+fn parse_gh_pr_gates(owner_repo: &str, number: u64, value: &Value) -> PrGates {
+    let checks = parse_status_check_rollup(value);
     let bugbot_accessible = value
         .get("comments")
         .and_then(Value::as_array)
@@ -621,14 +609,21 @@ fn gh_pr_gates(owner_repo: &str, number: u64) -> Option<PrGates> {
             })
         })
         .unwrap_or(false);
-    Some(PrGates {
+    let state = value
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let merged_at = value
+        .get("mergedAt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    PrGates {
         owner_repo: owner_repo.to_string(),
         number,
-        state: value
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase(),
+        state: state.clone(),
         draft: value
             .get("isDraft")
             .and_then(Value::as_bool)
@@ -636,7 +631,9 @@ fn gh_pr_gates(owner_repo: &str, number: u64) -> Option<PrGates> {
         merged: value
             .get("merged")
             .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .unwrap_or(false)
+            || merged_at
+            || state.eq_ignore_ascii_case("merged"),
         mergeable: value
             .get("mergeable")
             .and_then(Value::as_str)
@@ -653,7 +650,27 @@ fn gh_pr_gates(owner_repo: &str, number: u64) -> Option<PrGates> {
         checks,
         bugbot_accessible,
         recommendation: None,
-    })
+    }
+}
+
+fn gh_pr_gates(owner_repo: &str, number: u64) -> Option<PrGates> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &number.to_string(),
+            "--repo",
+            owner_repo,
+            "--json",
+            "state,isDraft,mergeable,mergeStateStatus,mergedAt,statusCheckRollup,comments",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(parse_gh_pr_gates(owner_repo, number, &value))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1054,6 +1071,26 @@ mod tests {
             }"#,
         );
         let gates = pr_gates(tmp.path(), "lfglabs-dev/verity", 106).unwrap();
+        assert_eq!(gates.recommendation.as_deref(), Some("already_merged"));
+    }
+
+    #[test]
+    fn gh_merged_at_without_merged_field_recommends_already_merged() {
+        let value = json!({
+            "state": "MERGED",
+            "isDraft": false,
+            "mergeable": "UNKNOWN",
+            "mergeStateStatus": "UNKNOWN",
+            "mergedAt": "2026-07-01T11:22:33Z",
+            "statusCheckRollup": [
+                {"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ],
+            "comments": []
+        });
+        let mut gates = parse_gh_pr_gates("Th0rgal/sandboxed.sh", 575, &value);
+        apply_pr_gate_recommendation(&mut gates);
+
+        assert!(gates.merged);
         assert_eq!(gates.recommendation.as_deref(), Some("already_merged"));
     }
 

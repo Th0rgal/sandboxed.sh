@@ -233,6 +233,7 @@ impl MissionStore for FileMissionStore {
                 | MissionStatus::Failed
                 | MissionStatus::AwaitingUser
                 | MissionStatus::Acknowledged
+                | MissionStatus::WaitingBackground
         );
         mission.interrupted_at =
             if matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked) {

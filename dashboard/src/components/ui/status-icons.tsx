@@ -24,6 +24,7 @@ export const STATUS_ICONS: Record<string, StatusIcon> = {
   pending: Clock,
   active: CircleNotch,
   running: CircleNotch,
+  waiting_background: CircleNotch,
   awaiting_user: Bell,
   acknowledged: CheckCircle,
   completed: CheckCircle,

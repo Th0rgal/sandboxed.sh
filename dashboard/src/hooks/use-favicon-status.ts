@@ -19,6 +19,7 @@ const STATUS_COLORS: Record<MissionStatus, string> = {
   interrupted: "#f87171", // red-400
   blocked: "#f87171", // red-400
   not_feasible: "#f87171", // red-400
+  waiting_background: "#818cf8", // indigo-400, work still running in background
 };
 
 /** Status dot radius & position (bottom-right, on a 64×64 canvas). */

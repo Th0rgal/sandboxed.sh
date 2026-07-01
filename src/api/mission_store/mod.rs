@@ -1685,6 +1685,24 @@ pub trait MissionStore: Send + Sync {
         grace_seconds: u64,
     ) -> Result<Vec<Uuid>, String>;
 
+    /// IDs of missions currently parked in `WaitingBackground` — the agent's
+    /// turn ended but tracked background shell jobs are (or were) still live.
+    ///
+    /// Used by the background-task auto-resume watcher to reconcile the
+    /// persisted status against the in-memory registry: a `WaitingBackground`
+    /// mission with no live jobs left must be flipped back to `AwaitingUser` so
+    /// the normal ack flow can settle it, instead of being stranded forever
+    /// (e.g. after a restart drops the in-memory registry). Default impl scans
+    /// via `list_missions`; the sqlite store overrides it with a targeted query.
+    async fn get_waiting_background_mission_ids(&self) -> Result<Vec<Uuid>, String> {
+        let missions = self.list_missions(1000, 0).await?;
+        Ok(missions
+            .into_iter()
+            .filter(|m| m.status == MissionStatus::WaitingBackground)
+            .map(|m| m.id)
+            .collect())
+    }
+
     /// Get recently interrupted missions that were stopped by server shutdown.
     async fn get_recent_server_shutdown_mission_ids(
         &self,

@@ -11,14 +11,14 @@ describe("createClientMessageId", () => {
     expect(
       createClientMessageId({
         randomUUID: () => "11111111-2222-4333-8444-555555555555",
-        getRandomValues: (array) => array,
+        getRandomValues: (array: Uint8Array) => array,
       }),
     ).toBe("11111111-2222-4333-8444-555555555555");
   });
 
   it("falls back to a v4 UUID when randomUUID is unavailable", () => {
     const id = createClientMessageId({
-      getRandomValues: (array) => {
+      getRandomValues: (array: Uint8Array) => {
         array.set([
           0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
           0xbb, 0xcc, 0xdd, 0xee, 0xff,

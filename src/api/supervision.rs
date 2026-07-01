@@ -32,7 +32,7 @@ use super::mission_store::MissionStore;
 
 mod bg_autoresume;
 
-pub(crate) use bg_autoresume::background_task_autoresume_loop;
+pub(crate) use bg_autoresume::{background_task_autoresume_loop, reset_waiting_background_on_boot};
 
 pub(crate) async fn recover_server_shutdown_missions(
     mission_store: Arc<dyn MissionStore>,
