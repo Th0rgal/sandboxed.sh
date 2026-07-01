@@ -642,6 +642,13 @@ fn normal_mode_policy(project: &str) -> ModePolicy {
     }
 }
 
+fn normalize_mode_policy(mut policy: ModePolicy, project: &str) -> ModePolicy {
+    policy.project = project.to_string();
+    policy.safe_lane_max_workers = 1;
+    policy.exploration_lane_max_workers = policy.mode.exploration_limit();
+    policy
+}
+
 fn parse_unexpired_until(until: &str) -> Result<DateTime<Utc>> {
     let until = DateTime::parse_from_rfc3339(until)
         .context("--until must be RFC3339/ISO timestamp")?
@@ -685,7 +692,7 @@ fn load_mode(root: &Path, project: &str) -> Result<ModePolicy> {
             .map(|until| until.with_timezone(&Utc) > Utc::now())
             .unwrap_or(false)
         {
-            Ok(policy)
+            Ok(normalize_mode_policy(policy, project))
         } else {
             Ok(normal_mode_policy(project))
         }
@@ -1022,6 +1029,41 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn mode_file_worker_limits_are_recomputed_from_mode() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/modes/verity-core.json"),
+            r#"{
+              "project":"verity-core",
+              "mode":"normal",
+              "until":"2999-07-02T00:00:00Z",
+              "safe_lane_max_workers":9,
+              "exploration_lane_max_workers":99
+            }"#,
+        );
+        write(
+            &tmp.path().join(".paloma/fixtures/tasks.json"),
+            r#"[
+              {"project":"verity-core","id":"proof-a","status":"ready","lane":"exploration"},
+              {"project":"verity-core","id":"proof-b","status":"ready","lane":"exploration"}
+            ]"#,
+        );
+
+        let plan = dispatch_plan(tmp.path(), "verity-core").unwrap();
+        assert_eq!(plan.mode, RiskMode::Normal);
+        assert_eq!(plan.safe_lane_max_workers, 1);
+        assert_eq!(plan.exploration_lane_max_workers, 1);
+        assert_eq!(
+            plan.dispatch
+                .iter()
+                .filter(|d| d["lane"] == "exploration")
+                .count(),
+            1
+        );
+        assert_eq!(plan.dispatch[0]["max_workers"], 1);
     }
 
     #[test]
