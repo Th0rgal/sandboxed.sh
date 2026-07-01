@@ -470,14 +470,17 @@ fn pr_gates(root: &Path, owner_repo: &str, number: u64) -> Result<PrGates> {
             .checks
             .iter()
             .all(|c| c.status == "completed" && c.conclusion.as_deref() == Some("success"));
+    let closed = gates.state.eq_ignore_ascii_case("closed");
     gates.recommendation = if gates.draft {
         Some("wait_for_ready_for_review".to_string())
     } else if gates.conflicting {
         Some("needs_conflict_resolution".to_string())
-    } else if checks_green && !gates.merged {
-        Some("ready_for_review_or_merge".to_string())
     } else if gates.merged {
         Some("already_merged".to_string())
+    } else if closed {
+        Some("closed_without_merge".to_string())
+    } else if checks_green {
+        Some("ready_for_review_or_merge".to_string())
     } else {
         Some("needs_checks_or_review".to_string())
     };
@@ -784,8 +787,27 @@ fn is_exploration_task(task: &TaskFixture) -> bool {
         || task
             .intent
             .as_deref()
-            .map(|i| i.contains("explor") || i.contains("proof"))
+            .map(intent_requests_exploration)
             .unwrap_or(false)
+}
+
+fn intent_requests_exploration(intent: &str) -> bool {
+    intent
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            matches!(
+                token.to_ascii_lowercase().as_str(),
+                "proof"
+                    | "prove"
+                    | "explore"
+                    | "explores"
+                    | "explored"
+                    | "exploring"
+                    | "exploration"
+                    | "exploratory"
+            )
+        })
 }
 
 fn load_tasks(root: &Path) -> Result<Vec<TaskFixture>> {
@@ -867,6 +889,57 @@ mod tests {
             gates.recommendation.as_deref(),
             Some("needs_conflict_resolution")
         );
+    }
+
+    #[test]
+    fn closed_unmerged_pr_with_green_checks_is_not_recommended_for_merge() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/fixtures/pr-104.json"),
+            r#"{
+              "state":"closed",
+              "draft":false,
+              "merged":false,
+              "mergeable":true,
+              "checks":[{"name":"ci","status":"completed","conclusion":"success"}]
+            }"#,
+        );
+        let gates = pr_gates(tmp.path(), "lfglabs-dev/verity", 104).unwrap();
+        assert_eq!(
+            gates.recommendation.as_deref(),
+            Some("closed_without_merge")
+        );
+    }
+
+    #[test]
+    fn intent_routing_matches_exploration_tokens_not_substrings() {
+        let safe_intents = ["proofread docs", "waterproof deployment notes"];
+        for intent in safe_intents {
+            let task = TaskFixture {
+                lane: "safe".to_string(),
+                intent: Some(intent.to_string()),
+                ..Default::default()
+            };
+            assert!(!is_exploration_task(&task), "{intent} should stay safe");
+        }
+
+        let exploration_intents = [
+            "proof of concept",
+            "prove this approach",
+            "explore options",
+            "exploration spike",
+        ];
+        for intent in exploration_intents {
+            let task = TaskFixture {
+                lane: "safe".to_string(),
+                intent: Some(intent.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                is_exploration_task(&task),
+                "{intent} should route exploration"
+            );
+        }
     }
 
     #[test]
