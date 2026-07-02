@@ -7605,6 +7605,12 @@ async fn paloma_webhook_forwarder_loop(
                         "sequence": seq,
                         "mission_id": mission_id,
                         "status": status,
+                        // Event-type mirror of `status` so consumers with
+                        // route-level event filters (e.g. the Hermes webhook
+                        // platform reads `payload.type`) can drop unwanted
+                        // transitions like `acknowledged` before spawning an
+                        // agent run.
+                        "type": status,
                         "title": title,
                         "short_description": mission
                             .as_ref()
