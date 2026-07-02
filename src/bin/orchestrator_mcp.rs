@@ -617,7 +617,7 @@ impl OrchestratorMcp {
                                     "prompt": { "type": "string", "description": "Full worker prompt: exact scope, absolute paths, success condition, verification command" },
                                     "backend": { "type": "string", "description": "codex | opencode | grok (never claudecode)" },
                                     "model_override": { "type": "string" },
-                                    "model_effort": { "type": "string", "description": "low | medium | high (codex)" },
+                                    "model_effort": { "type": "string", "description": "low | medium | high | xhigh (codex)" },
                                     "working_directory": { "type": "string", "description": "Worker cwd; superseded by worktree.path if a worktree is given" },
                                     "depends_on": { "type": "array", "items": { "type": "string" }, "description": "task_keys that must settle successfully or be accepted first" },
                                     "worktree": {
