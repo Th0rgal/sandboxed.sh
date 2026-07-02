@@ -7540,6 +7540,7 @@ async fn paloma_webhook_forwarder_loop(
     mission_store: Arc<dyn MissionStore>,
     workspaces: workspace::SharedWorkspaceStore,
     url: String,
+    secret: Option<String>,
     http: reqwest::Client,
 ) {
     tracing::info!(webhook_url = %url, "Paloma mission-status webhook forwarder started");
@@ -7576,6 +7577,7 @@ async fn paloma_webhook_forwarder_loop(
                 // webhook can stall the broadcast receiver and lag-drop events.
                 let http = http.clone();
                 let url = url.clone();
+                let secret = secret.clone();
                 let mission_store = Arc::clone(&mission_store);
                 let workspaces = workspaces.clone();
                 let sem = Arc::clone(&sem);
@@ -7635,12 +7637,45 @@ async fn paloma_webhook_forwarder_loop(
                             .map(|k| k.as_str()),
                     });
 
+                    // Serialize once so the signature is computed over the
+                    // exact bytes sent (consumers verify HMAC over the raw
+                    // body, e.g. the Hermes webhook platform's GitHub-style
+                    // `X-Hub-Signature-256` check).
+                    let payload = match serde_json::to_vec(&body) {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                "Failed to serialize Paloma webhook payload: {}",
+                                err
+                            );
+                            return;
+                        }
+                    };
+                    let signature = secret.as_ref().and_then(|secret| {
+                        use hmac::{Hmac, Mac};
+                        let mut mac =
+                            Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+                        mac.update(&payload);
+                        Some(format!(
+                            "sha256={}",
+                            hex::encode(mac.finalize().into_bytes())
+                        ))
+                    });
+
                     // At-least-once: retry transient failures with the SAME
                     // event_id so the consumer can dedupe. Bounded so a dead
                     // endpoint can't pile up tasks.
                     const MAX_ATTEMPTS: u32 = 3;
                     for attempt in 1..=MAX_ATTEMPTS {
-                        match http.post(&url).json(&body).send().await {
+                        let mut request = http
+                            .post(&url)
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .body(payload.clone());
+                        if let Some(signature) = signature.as_deref() {
+                            request = request.header("X-Hub-Signature-256", signature);
+                        }
+                        match request.send().await {
                             Ok(resp) if resp.status().is_success() => break,
                             Ok(resp) => {
                                 tracing::warn!(
@@ -7787,6 +7822,7 @@ fn spawn_control_session(
             Arc::clone(&state.mission_store),
             workspaces.clone(),
             url.clone(),
+            config.paloma_webhook_secret.clone(),
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(10))
