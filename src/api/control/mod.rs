@@ -2643,7 +2643,10 @@ pub struct ControlMessageRequest {
     pub agent: Option<String>,
     /// Target mission ID. If provided and differs from the currently running mission,
     /// the backend will automatically start this mission in parallel (if capacity allows).
-    #[serde(default)]
+    /// `target_mission_id` is accepted as an alias — unknown fields are otherwise
+    /// silently ignored, and a mistyped targeting field would silently reroute the
+    /// message to the session's current mission.
+    #[serde(default, alias = "target_mission_id")]
     pub mission_id: Option<Uuid>,
 }
 
@@ -10448,20 +10451,59 @@ async fn control_actor_loop(
                                 let max_parallel = crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
 
                                 if total_running >= max_parallel {
-                                    tracing::warn!(
-                                        "Cannot start parallel mission {}: max {} reached. \
-                                         Dropping targeted message to avoid sending to wrong mission.",
-                                        tid, max_parallel
-                                    );
-                                    let _ = events_tx.send(AgentEvent::Error {
-                                        message: format!(
-                                            "Cannot start mission {}: max parallel missions ({}) reached",
-                                            tid, max_parallel
-                                        ),
-                                        mission_id: Some(tid),
-                                        resumable: true,
-                                    });
-                                    let _ = respond.send(UserMessageAck::Dropped);
+                                    // At capacity, dropping the message would orphan the
+                                    // mission: it stays Pending with no deferred_goal, so
+                                    // the FLEET-001 scheduler never dispatches it and the
+                                    // HTTP response (`queued: false`) is indistinguishable
+                                    // from a successful delivery. Stash the content as the
+                                    // deferred goal instead — the scheduler pass re-injects
+                                    // it as a normal targeted message once a slot frees.
+                                    let combined = match mission_store
+                                        .get_deferred_goal(tid)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                    {
+                                        Some(prev) if !prev.is_empty() => {
+                                            format!("{prev}\n{content}")
+                                        }
+                                        _ => content.clone(),
+                                    };
+                                    match mission_store.set_deferred_goal(tid, Some(combined)).await
+                                    {
+                                        Ok(()) => {
+                                            tracing::info!(
+                                                mission_id = %tid,
+                                                max_parallel,
+                                                "At capacity: deferring targeted message as scheduled goal"
+                                            );
+                                            let _ = events_tx.send(AgentEvent::UserMessage {
+                                                id,
+                                                content: content.clone(),
+                                                queued: true,
+                                                mission_id: Some(tid),
+                                                source: source.clone(),
+                                            });
+                                            let _ = respond.send(UserMessageAck::Queued);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                mission_id = %tid,
+                                                "Cannot start parallel mission (max {} reached) and \
+                                                 failed to stash deferred goal: {e}",
+                                                max_parallel
+                                            );
+                                            let _ = events_tx.send(AgentEvent::Error {
+                                                message: format!(
+                                                    "Cannot start mission {}: max parallel missions ({}) reached",
+                                                    tid, max_parallel
+                                                ),
+                                                mission_id: Some(tid),
+                                                resumable: true,
+                                            });
+                                            let _ = respond.send(UserMessageAck::Dropped);
+                                        }
+                                    }
                                     continue;
                                 } else {
                                     // Load mission and start in parallel
