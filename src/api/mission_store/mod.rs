@@ -362,6 +362,16 @@ pub struct StoredEvent {
     pub metadata: serde_json::Value,
 }
 
+/// Lightweight mission decoration for cross-mission feeds (alerts feed):
+/// enough to label a row without loading the full `Mission`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MissionSummary {
+    pub title: Option<String>,
+    pub status: String,
+    pub workspace_name: Option<String>,
+    pub awaiting_kind: Option<String>,
+}
+
 /// Persisted summary for one tool call across all of its stored events.
 #[derive(Debug, Clone, Default)]
 pub struct ToolCallSummary {
@@ -1594,6 +1604,16 @@ pub trait MissionStore: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
+    /// Lightweight summaries (title/status/workspace) for a set of missions,
+    /// keyed by id. Used to decorate cross-mission feeds. Empty by default.
+    async fn get_mission_summaries(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, MissionSummary>, String> {
+        let _ = ids;
+        Ok(std::collections::HashMap::new())
+    }
+
     /// Set (or clear) the `awaiting_kind` classification for a mission. Only
     /// meaningful while the mission is in `AwaitingUser`. Default no-op for
     /// stores that do not persist it.
@@ -1799,6 +1819,19 @@ pub trait MissionStore: Send + Sync {
         limit: Option<usize>,
     ) -> Result<Vec<StoredEvent>, String> {
         let _ = (mission_id, before_seq, event_types, limit);
+        Ok(vec![])
+    }
+
+    /// Cross-mission feed of `mission_status_changed` events, newest first.
+    /// Paginated by `timestamp < before_ts` (event sequences are per-mission,
+    /// so a global feed cannot cursor on them; ISO-8601 timestamps sort
+    /// lexically). Empty by default for stores without an event log.
+    async fn get_status_events_global(
+        &self,
+        before_ts: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let _ = (before_ts, limit);
         Ok(vec![])
     }
 
@@ -2308,6 +2341,16 @@ pub trait MissionStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<TelegramAlert>, String> {
         let _ = (telegram_user_id, limit);
+        Ok(vec![])
+    }
+
+    /// List Telegram alerts (any status) for a set of missions. Used to
+    /// decorate the alerts feed with delivery state. Empty by default.
+    async fn list_telegram_alerts_for_missions(
+        &self,
+        mission_ids: &[Uuid],
+    ) -> Result<Vec<TelegramAlert>, String> {
+        let _ = mission_ids;
         Ok(vec![])
     }
 

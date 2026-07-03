@@ -743,6 +743,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/:id/events",
             get(control::get_mission_events),
         )
+        .route("/api/control/alerts", get(control::get_alerts_feed))
+        .route(
+            "/api/assistant/hermes/*path",
+            axum::routing::any(system_api::hermes_chat_proxy),
+        )
         .route(
             "/api/control/missions/:id/tool-calls/:tool_call_id",
             get(control::get_mission_tool_call_events),

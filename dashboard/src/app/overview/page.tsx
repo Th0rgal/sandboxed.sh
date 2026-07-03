@@ -1,0 +1,730 @@
+'use client';
+
+import { memo, Suspense, useCallback, useMemo, useRef, useState } from 'react';
+import Link from 'next/link';
+import { useRouter, useSearchParams } from 'next/navigation';
+import useSWR from 'swr';
+import { toast } from '@/components/toast';
+import { StatsCard } from '@/components/stats-card';
+import { LastDaySummary } from '@/components/last-day-summary';
+import { ActiveAutomations } from '@/components/active-automations';
+import { ShimmerStat } from '@/components/ui/shimmer';
+import { RelativeTime } from '@/components/ui/relative-time';
+import {
+  createMission,
+  getStats,
+  getUsageSummary,
+  listWorkspaces,
+  listMissions,
+  getRunningMissions,
+  listActiveAutomations,
+  cancelMission,
+  deleteMission,
+  resumeMission,
+  type ModelEffort,
+  type Mission,
+  type UsageSummary,
+} from '@/lib/api';
+import {
+  Activity,
+  CheckCircle,
+  DollarSign,
+  Zap,
+  Loader,
+  Clock,
+  Play,
+  Trash2,
+  Hand,
+  XCircle,
+  Ban,
+  ChevronDown,
+  ChevronRight,
+} from 'lucide-react';
+import { cn, formatCentsCompact } from '@/lib/utils';
+import { NewMissionDialog } from '@/components/new-mission-dialog';
+import { stableJsonCompare } from '@/lib/swr-config';
+import {
+  categorizeMissions,
+  getMissionTextColor,
+  getMissionTitle,
+  isFinishedStatus,
+  type MissionCategory,
+} from '@/lib/mission-status';
+import { inferMissionRole } from '@/lib/mission-role';
+
+interface Column {
+  id: MissionCategory;
+  label: string;
+  icon: typeof Clock;
+}
+
+const columns: Column[] = [
+  { id: 'running', label: 'Running', icon: Loader },
+  { id: 'needs-you', label: 'Needs You', icon: Hand },
+  { id: 'finished', label: 'Finished', icon: CheckCircle },
+];
+
+const CompactStatusIcon = memo(function CompactStatusIcon({
+  status,
+  isRunning,
+  className,
+}: {
+  status: Mission['status'];
+  isRunning: boolean;
+  className?: string;
+}) {
+  if (isRunning || status === 'active') return <Loader className={className} />;
+  if (status === 'awaiting_user') return <Hand className={className} />;
+  if (status === 'completed' || status === 'acknowledged') return <CheckCircle className={className} />;
+  if (status === 'failed' || status === 'not_feasible') return <XCircle className={className} />;
+  if (status === 'interrupted' || status === 'blocked') return <Ban className={className} />;
+  return <Clock className={className} />;
+});
+
+const CompactMissionCard = memo(function CompactMissionCard({
+  mission,
+  isBoss,
+  workers,
+  workersExpanded,
+  isRunningForDisplay,
+  isActuallyRunning,
+  runningMissionIds,
+  automationMissionIds,
+  onCancel,
+  onResume,
+  onDelete,
+  onToggleWorkers,
+}: {
+  mission: Mission;
+  isBoss: boolean;
+  workers?: Mission[];
+  workersExpanded?: boolean;
+  isRunningForDisplay: boolean;
+  isActuallyRunning: boolean;
+  runningMissionIds: Set<string>;
+  automationMissionIds: Set<string>;
+  onCancel: (id: string) => void;
+  onResume: (id: string) => void;
+  onDelete: (id: string) => void;
+  onToggleWorkers?: (id: string) => void;
+}) {
+  const color = getMissionTextColor(mission.status, isRunningForDisplay);
+  const title = getMissionTitle(mission);
+  const groupedWorkers = workers ?? [];
+  const hasWorkers = groupedWorkers.length > 0;
+  const isResumable = !isRunningForDisplay && mission.resumable &&
+    (mission.status === 'interrupted' || mission.status === 'blocked' || mission.status === 'failed' ||
+      mission.status === 'awaiting_user' || mission.status === 'acknowledged');
+  // Subtle "user has opened this since it last needed attention" indicator
+  // for missions parked in the Finished column.
+  const showOpenedDot = !isRunningForDisplay && isFinishedStatus(mission.status) && !!mission.first_viewed_at;
+
+  return (
+    <div className="group rounded-md bg-white/[0.02] border border-white/[0.06] hover:border-white/[0.12] px-2.5 py-2 transition-colors">
+      <div className="flex items-center gap-2 mb-1.5">
+        <CompactStatusIcon
+          status={mission.status}
+          isRunning={isRunningForDisplay}
+          className={cn('h-3.5 w-3.5 shrink-0', color, isRunningForDisplay && 'animate-spin')}
+        />
+        <Link href={`/control?mission=${mission.id}`} className="flex-1 min-w-0">
+          <p className="text-xs text-white/80 leading-snug truncate hover:text-white transition-colors">
+            {title}
+          </p>
+        </Link>
+        {showOpenedDot && (
+          <span
+            className="shrink-0 h-1.5 w-1.5 rounded-full bg-[rgb(var(--foreground-tertiary)/0.7)] ring-1 ring-[rgb(var(--background-elevated))]"
+            aria-label="Opened"
+            title="You've opened this mission"
+          />
+        )}
+        {isBoss && (
+          <span className="shrink-0 rounded bg-violet-500/10 border border-violet-500/20 px-1 py-0.5 text-[8px] font-medium text-violet-400">
+            B
+          </span>
+        )}
+        {hasWorkers && (
+          <button
+            type="button"
+            onClick={() => onToggleWorkers?.(mission.id)}
+            aria-label={workersExpanded ? 'Collapse workers' : 'Expand workers'}
+            aria-expanded={workersExpanded}
+            className="shrink-0 rounded p-0.5 text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white/70"
+            title={`${groupedWorkers.length} worker${groupedWorkers.length === 1 ? '' : 's'}`}
+          >
+            {workersExpanded ? (
+              <ChevronDown className="h-3 w-3" />
+            ) : (
+              <ChevronRight className="h-3 w-3" />
+            )}
+          </button>
+        )}
+        {mission.parent_mission_id && (
+          <span className="shrink-0 rounded bg-cyan-500/10 border border-cyan-500/20 px-1 py-0.5 text-[8px] font-medium text-cyan-400">
+            W
+          </span>
+        )}
+      </div>
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          {mission.workspace_name && (
+            <span className="inline-flex items-center rounded bg-white/[0.04] px-1 py-0.5 text-[9px] text-white/40 truncate max-w-[60px]">
+              {mission.workspace_name}
+            </span>
+          )}
+          <RelativeTime date={mission.updated_at} className="text-[9px] text-white/30" />
+        </div>
+        <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+          {isResumable && (
+            <button
+              onClick={() => onResume(mission.id)}
+              className="p-0.5 rounded hover:bg-white/[0.08] text-white/40 hover:text-emerald-400 transition-colors"
+              title="Resume mission"
+              aria-label="Resume mission"
+            >
+              <Play className="h-3 w-3" />
+            </button>
+          )}
+          {isActuallyRunning && (
+            <button
+              onClick={() => onCancel(mission.id)}
+              className="p-0.5 rounded hover:bg-white/[0.08] text-white/40 hover:text-red-400 transition-colors"
+              title="Cancel mission"
+              aria-label="Cancel mission"
+            >
+              <XCircle className="h-3 w-3" />
+            </button>
+          )}
+          {!isActuallyRunning && (
+            <button
+              onClick={() => onDelete(mission.id)}
+              className="p-0.5 rounded hover:bg-white/[0.08] text-white/40 hover:text-red-400 transition-colors"
+              title="Delete mission"
+              aria-label="Delete mission"
+            >
+              <Trash2 className="h-3 w-3" />
+            </button>
+          )}
+        </div>
+      </div>
+      {hasWorkers && (
+        <div className="mt-2 border-t border-white/[0.04] pt-1.5">
+          <button
+            type="button"
+            onClick={() => onToggleWorkers?.(mission.id)}
+            className="flex w-full items-center justify-between rounded px-1 py-0.5 text-[9px] text-white/35 transition-colors hover:bg-white/[0.03] hover:text-white/55"
+          >
+            <span className="tabular-nums">
+              {groupedWorkers.length} worker{groupedWorkers.length === 1 ? '' : 's'}
+            </span>
+            <span className="flex items-center gap-1">
+              {groupedWorkers.slice(0, 6).map((worker) => {
+                const workerRunning =
+                  runningMissionIds.has(worker.id) || automationMissionIds.has(worker.id);
+                return (
+                  <CompactStatusIcon
+                    key={worker.id}
+                    status={worker.status}
+                    isRunning={workerRunning}
+                    className={cn(
+                      'h-2.5 w-2.5',
+                      getMissionTextColor(worker.status, workerRunning),
+                      workerRunning && 'animate-spin'
+                    )}
+                  />
+                );
+              })}
+              {groupedWorkers.length > 6 && (
+                <span className="tabular-nums">+{groupedWorkers.length - 6}</span>
+              )}
+            </span>
+          </button>
+          {workersExpanded && (
+            <div className="mt-1 space-y-1">
+              {groupedWorkers.map((worker) => {
+                const workerRunning =
+                  runningMissionIds.has(worker.id) || automationMissionIds.has(worker.id);
+                return (
+                  <Link
+                    key={worker.id}
+                    href={`/control?mission=${worker.id}`}
+                    className="flex items-center gap-1.5 rounded px-1.5 py-1 text-[10px] text-white/50 transition-colors hover:bg-white/[0.04] hover:text-white/75"
+                    title={getMissionTitle(worker)}
+                  >
+                    <CompactStatusIcon
+                      status={worker.status}
+                      isRunning={workerRunning}
+                      className={cn(
+                        'h-3 w-3 shrink-0',
+                        getMissionTextColor(worker.status, workerRunning),
+                        workerRunning && 'animate-spin'
+                      )}
+                    />
+                    <span className="min-w-0 flex-1 truncate">{getMissionTitle(worker)}</span>
+                    <span className="rounded bg-cyan-500/10 border border-cyan-500/20 px-1 py-0.5 text-[8px] font-medium text-cyan-400">
+                      W
+                    </span>
+                  </Link>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+});
+
+function OverviewPageContent() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const [creatingMission, setCreatingMission] = useState(false);
+  const [expandedBossIds, setExpandedBossIds] = useState<Set<string>>(() => new Set());
+  const hasShownErrorRef = useRef(false);
+
+  // Check if we should auto-open the new mission dialog (e.g., from workspaces page)
+  const initialWorkspaceId = searchParams.get('workspace');
+  const shouldAutoOpen = Boolean(initialWorkspaceId);
+
+  // Clear URL params when dialog closes
+  const handleDialogClose = useCallback(() => {
+    if (initialWorkspaceId) {
+      router.replace('/overview', { scroll: false });
+    }
+  }, [initialWorkspaceId, router]);
+
+  // SWR: poll stats every 3 seconds. `compare` keeps the same array/object
+  // reference when a refresh returns identical content; without it every
+  // poll tick re-allocates the data and cascades into `useMemo`s downstream.
+  const { data: stats, isLoading: statsLoading } = useSWR(
+    'stats',
+    getStats,
+    {
+      refreshInterval: 3000,
+      revalidateOnFocus: false,
+      compare: stableJsonCompare,
+      onSuccess: () => {
+        hasShownErrorRef.current = false;
+      },
+      onError: () => {
+        if (!hasShownErrorRef.current) {
+          toast.error('Failed to connect to agent server');
+          hasShownErrorRef.current = true;
+        }
+      },
+    }
+  );
+
+  // SWR: lifetime AI spend. Mission stats `total_cost_cents` is unpopulated
+  // (per-mission cost is never recorded), so the footer reads the same
+  // source as the Providers page: aggregated AI usage records.
+  const { data: usageAll, isLoading: usageLoading } = useSWR<UsageSummary>(
+    ['usage-summary', 'all'],
+    () => getUsageSummary('all'),
+    {
+      refreshInterval: 30_000,
+      revalidateOnFocus: false,
+      compare: stableJsonCompare,
+    }
+  );
+
+  // SWR: fetch workspaces (shared key with workspaces page)
+  const { data: workspaces = [] } = useSWR('workspaces', listWorkspaces, {
+    revalidateOnFocus: false,
+    compare: stableJsonCompare,
+  });
+
+  // SWR: fetch missions for kanban
+  const { data: missions = [], mutate: mutateMissions } = useSWR(
+    'missions',
+    listMissions,
+    {
+      refreshInterval: 5000,
+      revalidateOnFocus: false,
+      compare: stableJsonCompare,
+    }
+  );
+
+  const { data: runningMissions = [] } = useSWR(
+    'running-missions',
+    getRunningMissions,
+    {
+      refreshInterval: 3000,
+      revalidateOnFocus: false,
+      compare: stableJsonCompare,
+    }
+  );
+
+  const { data: activeAutomations = [] } = useSWR(
+    'active-automations',
+    listActiveAutomations,
+    {
+      refreshInterval: 5000,
+      revalidateOnFocus: false,
+      compare: stableJsonCompare,
+    }
+  );
+
+  // Missions parked on a frontend tool (e.g. AskUserQuestion). The backend
+  // reports them in the running list with run state `waiting_for_tool`, but
+  // they are blocked on the user, so they belong in "Needs You" — not
+  // "Running". Track them separately and keep them out of the running set.
+  const waitingForToolMissionIds = useMemo(() => {
+    return new Set(
+      runningMissions
+        .filter((rm) => rm.state === 'waiting_for_tool')
+        .map((rm) => rm.mission_id)
+    );
+  }, [runningMissions]);
+
+  // Build a set of actually-executing mission IDs from the runtime state
+  // (excluding those merely waiting on a frontend tool).
+  const runningMissionIds = useMemo(() => {
+    return new Set(
+      runningMissions
+        .filter((rm) => rm.state !== 'waiting_for_tool')
+        .map((rm) => rm.mission_id)
+    );
+  }, [runningMissions]);
+
+  // Build a set of missions with active automations
+  const automationMissionIds = useMemo(() => {
+    return new Set(activeAutomations.map((automation) => automation.mission_id));
+  }, [activeAutomations]);
+
+  // Union: runtime running + active automations
+  const runningLikeMissionIds = useMemo(() => {
+    const combined = new Set(runningMissionIds);
+    for (const missionId of automationMissionIds) {
+      combined.add(missionId);
+    }
+    return combined;
+  }, [runningMissionIds, automationMissionIds]);
+
+  // Categorize missions using shared utility
+  const categorized = useMemo(
+    () => categorizeMissions(missions, runningLikeMissionIds, waitingForToolMissionIds),
+    [missions, runningLikeMissionIds, waitingForToolMissionIds]
+  );
+
+  // Set of mission IDs that have at least one child (boss missions)
+  const bossMissionIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const m of missions) {
+      if (m.parent_mission_id) ids.add(m.parent_mission_id);
+      if (inferMissionRole(m) === 'boss') ids.add(m.id);
+    }
+    return ids;
+  }, [missions]);
+
+  const missionIds = useMemo(() => new Set(missions.map((mission) => mission.id)), [missions]);
+
+  const workersByBossId = useMemo(() => {
+    const map = new Map<string, Mission[]>();
+    for (const mission of missions) {
+      if (!mission.parent_mission_id) continue;
+      if (!missionIds.has(mission.parent_mission_id)) continue;
+      const workers = map.get(mission.parent_mission_id) ?? [];
+      workers.push(mission);
+      map.set(mission.parent_mission_id, workers);
+    }
+    for (const workers of map.values()) {
+      workers.sort(
+        (a, b) =>
+          new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+      );
+    }
+    return map;
+  }, [missions, missionIds]);
+
+  const visibleCategorized = useMemo(() => {
+    const result: Record<MissionCategory, Mission[]> = {
+      running: [],
+      'needs-you': [],
+      finished: [],
+      other: [],
+    };
+
+    for (const category of Object.keys(result) as MissionCategory[]) {
+      result[category] = categorized[category].filter(
+        (mission) => !mission.parent_mission_id || !missionIds.has(mission.parent_mission_id)
+      );
+    }
+
+    return result;
+  }, [categorized, missionIds]);
+
+  // Build column data for display
+  const columnData = useMemo(() => {
+    return columns.map((col) => {
+      const colMissions = visibleCategorized[col.id]
+        .sort(
+          (a, b) =>
+            new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+        )
+        .slice(0, col.id === 'finished' ? 8 : 10);
+      return { ...col, missions: colMissions };
+    });
+  }, [visibleCategorized]);
+
+  const isActive = (stats?.active_tasks ?? 0) > 0;
+
+  const handleCancel = useCallback(
+    async (id: string) => {
+      try {
+        await cancelMission(id);
+        toast.success('Mission cancelled');
+        mutateMissions();
+      } catch {
+        toast.error('Failed to cancel mission');
+      }
+    },
+    [mutateMissions]
+  );
+
+  const handleResume = useCallback(
+    async (id: string) => {
+      try {
+        await resumeMission(id);
+        toast.success('Mission resumed');
+        router.push(`/control?mission=${id}`);
+      } catch {
+        toast.error('Failed to resume mission');
+      }
+    },
+    [router]
+  );
+
+  const handleDelete = useCallback(
+    async (id: string) => {
+      try {
+        const result = await deleteMission(id);
+        const deletedIds = new Set(result.deleted_ids ?? [id]);
+        mutateMissions(
+          (current) => (current ? current.filter((m) => !deletedIds.has(m.id)) : current),
+          false
+        );
+        toast.success(
+          result.deleted_count && result.deleted_count > 1
+            ? `Mission and ${result.deleted_count - 1} workers deleted`
+            : 'Mission deleted'
+        );
+      } catch {
+        toast.error('Failed to delete mission');
+      }
+    },
+    [mutateMissions]
+  );
+
+  const handleToggleWorkers = useCallback((bossId: string) => {
+    setExpandedBossIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(bossId)) {
+        next.delete(bossId);
+      } else {
+        next.add(bossId);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleNewMission = useCallback(
+    async (options?: { workspaceId?: string; agent?: string; modelOverride?: string; modelEffort?: ModelEffort; configProfile?: string | null; backend?: string; openInNewTab?: boolean }) => {
+      try {
+        setCreatingMission(true);
+        const mission = await createMission({
+          workspaceId: options?.workspaceId,
+          agent: options?.agent,
+          modelOverride: options?.modelOverride,
+          modelEffort: options?.modelEffort,
+          configProfile: options?.configProfile ?? undefined,
+          backend: options?.backend,
+        });
+        toast.success('New mission created');
+        return { id: mission.id };
+      } catch (err) {
+        console.error('Failed to create mission:', err);
+        toast.error(err instanceof Error ? err.message : 'Failed to create new mission');
+        throw err; // Re-throw so dialog knows creation failed
+      } finally {
+        setCreatingMission(false);
+      }
+    },
+    []
+  );
+
+  return (
+    <div className="flex flex-col lg:flex-row lg:h-screen lg:overflow-hidden">
+      {/* Main content */}
+      <div className="flex-1 flex flex-col p-6 min-h-0">
+        {/* Header */}
+        <div className="flex-shrink-0 mb-4 flex items-start justify-between">
+          <div>
+            <div className="flex items-center gap-3">
+              <h1 className="text-xl font-semibold text-white">
+                Global Monitor
+              </h1>
+              {isActive && (
+                <span className="flex items-center gap-1.5 rounded-md bg-emerald-500/10 border border-emerald-500/20 px-2 py-1 text-[10px] font-medium text-emerald-400">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  LIVE
+                </span>
+              )}
+            </div>
+            <p className="mt-1 text-sm text-white/50">
+              Real-time agent activity
+            </p>
+          </div>
+          
+          {/* Quick Actions */}
+          <NewMissionDialog
+            workspaces={workspaces}
+            disabled={creatingMission}
+            onCreate={handleNewMission}
+            autoOpen={shouldAutoOpen}
+            initialValues={initialWorkspaceId ? { workspaceId: initialWorkspaceId } : undefined}
+            onClose={handleDialogClose}
+          />
+        </div>
+
+        {/* Compact Kanban Board - 3 columns on desktop; stacks on mobile.
+            Below lg the grid contributes no height, so the column's clip +
+            inner scroll are gated behind lg: as well — otherwise the
+            flex-1/overflow-hidden body collapses toward zero and clips cards.
+            On mobile columns grow to fit their cards and the page scrolls. */}
+        <div className="grid grid-cols-1 gap-4 mb-4 lg:flex-1 lg:min-h-0 lg:grid-cols-3">
+          {columnData.map((col) => {
+            const ColIcon = col.icon;
+            return (
+              <div
+                key={col.id}
+                className="flex flex-col rounded-xl bg-white/[0.01] border border-white/[0.04] lg:min-h-0 lg:overflow-hidden"
+              >
+                <div className="flex items-center justify-between px-3 py-2.5 border-b border-white/[0.04]">
+                  <div className="flex items-center gap-2">
+                    <ColIcon className={cn('h-3.5 w-3.5', col.id === 'running' && 'animate-spin', col.id === 'running' ? 'text-indigo-400' : col.id === 'needs-you' ? 'text-amber-400' : 'text-white/40')} />
+                    <span className="text-xs font-medium text-white/70">{col.label}</span>
+                  </div>
+                  {col.missions.length > 0 && (
+                    <span className="text-[10px] text-white/30 tabular-nums">
+                      {col.missions.length}
+                    </span>
+                  )}
+                </div>
+                <div className="p-2 space-y-2 lg:flex-1 lg:overflow-y-auto">
+                  {col.missions.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-10 text-center">
+                      <p className="text-[10px] text-white/20">
+                        {col.id === 'running' ? 'No active missions' : col.id === 'needs-you' ? 'All good!' : 'No recent missions'}
+                      </p>
+                    </div>
+                  ) : (
+                    col.missions.map((mission) => (
+                      <CompactMissionCard
+                        key={mission.id}
+                        mission={mission}
+                        isBoss={bossMissionIds.has(mission.id)}
+                        workers={workersByBossId.get(mission.id)}
+                        workersExpanded={expandedBossIds.has(mission.id)}
+                        isRunningForDisplay={
+                          runningMissionIds.has(mission.id) ||
+                          automationMissionIds.has(mission.id)
+                        }
+                        isActuallyRunning={
+                          // Offer Cancel (not Delete) whenever the harness is
+                          // still alive — including a mission parked on a
+                          // frontend tool (waiting_for_tool). It shows as
+                          // "Needs You", but its process is live and should be
+                          // cancellable, not deleted outright.
+                          runningMissionIds.has(mission.id) ||
+                          waitingForToolMissionIds.has(mission.id)
+                        }
+                        runningMissionIds={runningMissionIds}
+                        automationMissionIds={automationMissionIds}
+                        onCancel={handleCancel}
+                        onResume={handleResume}
+                        onDelete={handleDelete}
+                        onToggleWorkers={handleToggleWorkers}
+                      />
+                    ))
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Stats grid - fixed at bottom. 2x2 below xl: the center column is
+            squeezed between the kanban and the sidebar, and four cards across
+            truncate their values well before the page's md/lg breakpoints. */}
+        <div className="grid flex-shrink-0 grid-cols-2 gap-3 xl:grid-cols-4 xl:gap-4">
+          {statsLoading ? (
+            <>
+              <ShimmerStat />
+              <ShimmerStat />
+              <ShimmerStat />
+              <ShimmerStat />
+            </>
+          ) : (
+            <>
+              <StatsCard
+                title="Total Tasks"
+                value={stats?.total_tasks ?? 0}
+                icon={Activity}
+              />
+              <StatsCard
+                title="Active"
+                value={stats?.active_tasks ?? 0}
+                subtitle="running"
+                icon={Zap}
+                color={stats?.active_tasks ? 'accent' : 'default'}
+              />
+              <StatsCard
+                title="Success Rate"
+                value={`${((stats?.success_rate ?? 1) * 100).toFixed(0)}%`}
+                icon={CheckCircle}
+                color="success"
+              />
+              <StatsCard
+                title="Total Cost"
+                value={
+                  usageLoading
+                    ? '…'
+                    : formatCentsCompact(usageAll?.totals.cost_cents ?? 0)
+                }
+                subtitle="lifetime"
+                icon={DollarSign}
+              />
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Right sidebar - no glass panel wrapper, just border. Flex column so
+          the automations panel stretches into the remaining vertical space. */}
+      <div className="flex w-full flex-col gap-4 overflow-y-auto border-t border-white/[0.06] p-4 lg:h-screen lg:w-72 lg:border-t-0 lg:border-l">
+        <div className="flex-shrink-0">
+          <LastDaySummary
+            missions={missions}
+            runningMissionIds={runningLikeMissionIds}
+          />
+        </div>
+        <div className="min-h-0 flex-1">
+          <ActiveAutomations
+            missions={missions}
+            runningMissionIds={runningMissionIds}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function OverviewPage() {
+  return (
+    <Suspense fallback={<div className="flex h-screen items-center justify-center"><Loader className="h-6 w-6 animate-spin text-white/50" /></div>}>
+      <OverviewPageContent />
+    </Suspense>
+  );
+}

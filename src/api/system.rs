@@ -1671,6 +1671,111 @@ pub async fn hermes_remote_proxy(
     }
 }
 
+pub const HERMES_CHAT_PROXY_PATH: &str = "/api/assistant/hermes";
+
+/// Dashboard-authenticated proxy for the Hermes session/chat API
+/// (`/api/assistant/hermes/*` → `http://127.0.0.1:<api-server-port>`).
+///
+/// Unlike `hermes_remote_proxy`, this route sits behind the dashboard JWT
+/// (protected_routes) and the browser never sees the Hermes `API_SERVER_KEY`:
+/// the key is read from the gateway env here and injected server-side. Only
+/// the session surface is exposed — no `/v1/*` model endpoints.
+pub async fn hermes_chat_proxy(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let suffix = path_and_query
+        .strip_prefix(HERMES_CHAT_PROXY_PATH)
+        .unwrap_or("");
+    let allowed = suffix == "/api/sessions"
+        || suffix.starts_with("/api/sessions?")
+        || suffix.starts_with("/api/sessions/");
+    if !allowed {
+        return (StatusCode::FORBIDDEN, "Path not allowed").into_response();
+    }
+
+    let runtime_name = assistant_runtime_name(&state.config);
+    let [env_path, _] = hermes_env_paths(runtime_name);
+    let key = tokio::fs::read_to_string(&env_path)
+        .await
+        .ok()
+        .and_then(|c| parse_env_value(&c, "API_SERVER_KEY").filter(|v| !v.trim().is_empty()));
+    let Some(key) = key else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Hermes API server key not provisioned",
+        )
+            .into_response();
+    };
+
+    let port = hermes_api_server_port(&state.config);
+    let target = format!("http://127.0.0.1:{port}{suffix}");
+
+    let method = req.method().clone();
+    let mut headers = req.headers().clone();
+    for hop in [
+        axum::http::header::HOST,
+        axum::http::header::CONTENT_LENGTH,
+        axum::http::header::CONNECTION,
+        axum::http::header::TRANSFER_ENCODING,
+    ] {
+        headers.remove(hop);
+    }
+    // Swap the dashboard JWT for the Hermes bearer.
+    match axum::http::HeaderValue::from_str(&format!("Bearer {key}")) {
+        Ok(value) => {
+            headers.insert(axum::http::header::AUTHORIZATION, value);
+        }
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid Hermes key").into_response();
+        }
+    }
+
+    let body = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large").into_response(),
+    };
+
+    match state
+        .http_client
+        .request(method, &target)
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(upstream) => {
+            let status = upstream.status();
+            let mut response_headers = upstream.headers().clone();
+            for hop in [
+                axum::http::header::CONTENT_LENGTH,
+                axum::http::header::CONNECTION,
+                axum::http::header::TRANSFER_ENCODING,
+            ] {
+                response_headers.remove(hop);
+            }
+            (
+                status,
+                response_headers,
+                axum::body::Body::from_stream(upstream.bytes_stream()),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("Hermes API server unreachable: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Get the proxy API key for the Hermes gateway, reusing the key already
 /// wired into the gateway env when it is still registered; otherwise mint a
 /// fresh one. Either way, revoke any other "Hermes Assistant" keys so
