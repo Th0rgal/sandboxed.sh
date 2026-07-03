@@ -60,12 +60,19 @@ export function HermesThread({ className }: { className?: string }) {
   const streamAssistantIdRef = useRef<string | null>(null);
   const streamThinkingIdRef = useRef<string | null>(null);
 
-  // Auto-grow composer, capped.
+  // Auto-grow composer, capped. The wrapper height is frozen across the
+  // height:auto measurement so the transcript scroller never sees the
+  // momentary collapse (browser would clamp its scrollTop — see
+  // enhanced-input.tsx).
   useEffect(() => {
     const ta = textareaRef.current;
     if (!ta) return;
+    const wrapper = ta.parentElement;
+    const prevWrapperHeight = wrapper ? wrapper.style.height : "";
+    if (wrapper) wrapper.style.height = `${wrapper.offsetHeight}px`;
     ta.style.height = "auto";
     ta.style.height = `${Math.min(ta.scrollHeight, 160)}px`;
+    if (wrapper) wrapper.style.height = prevWrapperHeight;
   }, [input]);
 
   // Pin to bottom as content streams in.

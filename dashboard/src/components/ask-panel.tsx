@@ -91,11 +91,18 @@ export function AskPanel({
 
   // Auto-grow the composer with input, capped (lighter than the main composer's
   // 10-line cap). Runs on every input change, including seed prefill and reset.
+  // The wrapper height is frozen across the height:auto measurement so the
+  // messages scroller above never sees the momentary collapse (which would
+  // make the browser clamp its scrollTop — see enhanced-input.tsx).
   useEffect(() => {
     const ta = textareaRef.current;
     if (!ta) return;
+    const wrapper = ta.parentElement;
+    const prevWrapperHeight = wrapper ? wrapper.style.height : "";
+    if (wrapper) wrapper.style.height = `${wrapper.offsetHeight}px`;
     ta.style.height = "auto";
     ta.style.height = `${Math.min(ta.scrollHeight, 120)}px`;
+    if (wrapper) wrapper.style.height = prevWrapperHeight;
   }, [input]);
 
   const refreshThreads = useCallback(async () => {
