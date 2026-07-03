@@ -33,7 +33,7 @@ export function MissionChip({ missionId }: { missionId: string }) {
 
   const dot = mission
     ? getMissionDotColor(mission.status, false)
-    : "bg-white/30";
+    : "bg-[rgb(var(--foreground)/0.3)]";
 
   return (
     <span className="group/chip relative inline-block align-baseline">
@@ -41,7 +41,7 @@ export function MissionChip({ missionId }: { missionId: string }) {
         href={`/control?mission=${missionId}`}
         onMouseEnter={prefetch}
         onFocus={prefetch}
-        className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.1] bg-white/[0.05] px-2 py-0.5 align-baseline text-xs text-white/80 no-underline transition-colors hover:border-indigo-400/40 hover:bg-indigo-500/10"
+        className="inline-flex items-center gap-1.5 rounded-full border border-[rgb(var(--foreground)/0.14)] bg-[rgb(var(--foreground)/0.06)] px-2 py-0.5 align-baseline text-xs font-medium !text-[rgb(var(--foreground)/0.85)] !no-underline transition-colors hover:border-indigo-400/40 hover:bg-indigo-500/10 hover:!text-indigo-300"
       >
         <span className={cn("h-1.5 w-1.5 rounded-full", dot)} />
         {mission
@@ -51,7 +51,7 @@ export function MissionChip({ missionId }: { missionId: string }) {
 
       {/* Hover card */}
       <span className="pointer-events-none absolute bottom-full left-0 z-30 mb-1.5 hidden w-64 rounded-xl border border-white/[0.1] bg-[rgb(var(--background-elevated))] p-3 shadow-xl group-hover/chip:block">
-        {fetchState === "loading" && (
+        {(fetchState === "loading" || fetchState === "idle") && (
           <span className="flex items-center gap-2 text-xs text-white/50">
             <Loader className="h-3 w-3 animate-spin" /> Loading mission…
           </span>

@@ -78,9 +78,11 @@ export default function HermesPage() {
         )}
       </div>
 
-      {/* Alerts rail */}
-      <div className="flex w-full flex-col gap-4 overflow-y-auto border-t border-white/[0.06] p-4 lg:h-screen lg:w-80 lg:border-l lg:border-t-0">
-        <AlertsFeed />
+      {/* Alerts rail — mirrors the Overview right rail (width, border, padding) */}
+      <div className="flex w-full flex-col gap-4 border-t border-white/[0.06] p-4 lg:h-screen lg:w-72 lg:border-l lg:border-t-0">
+        <div className="min-h-0 flex-1">
+          <AlertsFeed />
+        </div>
       </div>
     </div>
   );

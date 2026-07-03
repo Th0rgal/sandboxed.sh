@@ -86,22 +86,23 @@ export function AlertsFeed() {
   }, [cursor, filter, loadingMore]);
 
   return (
-    <div className="flex min-h-0 flex-col">
-      <div className="mb-2 flex items-center justify-between">
-        <h2 className="flex items-center gap-1.5 text-sm font-medium text-white/80">
-          <Bell className="h-3.5 w-3.5 text-white/40" /> Updates
-        </h2>
-        <div className="flex gap-1">
+    <div className="flex h-full min-h-0 flex-col rounded-xl border border-border bg-[rgb(var(--foreground)/0.025)] p-3">
+      <div className="mb-2 flex h-6 flex-shrink-0 items-center justify-between">
+        <div className="flex items-center gap-2 text-xs font-medium text-[rgb(var(--foreground)/0.75)]">
+          <Bell className="h-3.5 w-3.5 text-primary" />
+          Updates
+        </div>
+        <div className="flex gap-0.5">
           {(Object.keys(FILTER_LABELS) as FeedFilter[]).map((f) => (
             <button
               key={f}
               type="button"
               onClick={() => changeFilter(f)}
               className={cn(
-                "rounded-md px-2 py-0.5 text-[11px] transition-colors",
+                "rounded-md px-1.5 py-0.5 text-[10px] font-medium transition-colors",
                 filter === f
-                  ? "bg-white/[0.08] text-white/85"
-                  : "text-white/40 hover:text-white/70",
+                  ? "bg-[rgb(var(--foreground)/0.08)] text-[rgb(var(--foreground)/0.85)]"
+                  : "text-[rgb(var(--foreground)/0.4)] hover:text-[rgb(var(--foreground)/0.7)]",
               )}
             >
               {FILTER_LABELS[f]}
@@ -110,34 +111,34 @@ export function AlertsFeed() {
         </div>
       </div>
 
-      {isLoading && entries.length === 0 && (
-        <div className="flex items-center gap-2 py-4 text-xs text-white/40">
-          <Loader className="h-3.5 w-3.5 animate-spin" /> Loading updates…
-        </div>
-      )}
-      {!isLoading && entries.length === 0 && (
-        <p className="py-4 text-xs text-white/35">
-          No status updates yet. Mission completions, failures and questions
-          will land here.
-        </p>
-      )}
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {isLoading && entries.length === 0 && (
+          <div className="flex items-center gap-2 py-4 text-xs text-white/40">
+            <Loader className="h-3.5 w-3.5 animate-spin" /> Loading updates…
+          </div>
+        )}
+        {!isLoading && entries.length === 0 && (
+          <p className="py-4 text-xs text-white/35">
+            No status updates yet. Mission completions, failures and questions
+            will land here.
+          </p>
+        )}
 
-      <div>
         {entries.map((a) => (
           <AlertRow key={`${a.mission_id}:${a.timestamp}`} alert={a} />
         ))}
-      </div>
 
-      {cursor && (
-        <button
-          type="button"
-          onClick={() => void loadMore()}
-          disabled={loadingMore}
-          className="mt-2 rounded-lg border border-white/[0.06] py-1.5 text-[11px] text-white/45 transition-colors hover:bg-white/[0.04] hover:text-white/70 disabled:opacity-50"
-        >
-          {loadingMore ? "Loading…" : "Load older"}
-        </button>
-      )}
+        {cursor && (
+          <button
+            type="button"
+            onClick={() => void loadMore()}
+            disabled={loadingMore}
+            className="mt-2 w-full rounded-lg border border-white/[0.06] py-1.5 text-[11px] text-white/45 transition-colors hover:bg-white/[0.04] hover:text-white/70 disabled:opacity-50"
+          >
+            {loadingMore ? "Loading…" : "Load older"}
+          </button>
+        )}
+      </div>
     </div>
   );
 }

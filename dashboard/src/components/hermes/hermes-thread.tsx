@@ -324,31 +324,31 @@ export function HermesThread({ className }: { className?: string }) {
 
   return (
     <div className={cn("flex min-h-0 flex-col", className)}>
-      {/* Session bar */}
-      <div className="relative flex items-center gap-2 border-b border-white/[0.06] px-4 py-2">
+      {/* Session bar — left edge aligned with the page header (px-6) */}
+      <div className="relative flex h-11 shrink-0 items-center gap-2 border-b border-white/[0.06] px-6">
         <button
           type="button"
           onClick={() => setShowSessions((v) => !v)}
-          className="flex min-w-0 items-center gap-1.5 rounded-lg px-2 py-1 text-sm text-white/70 transition-colors hover:bg-white/[0.05] hover:text-white/90"
+          className="-ml-2 flex min-w-0 items-center gap-1.5 rounded-lg px-2 py-1 text-sm text-[rgb(var(--foreground)/0.7)] transition-colors hover:bg-[rgb(var(--foreground)/0.05)] hover:text-[rgb(var(--foreground)/0.9)]"
         >
           <span className="truncate">
             {activeSession?.title?.trim() ||
               (sessionId ? sessionId : "New conversation")}
           </span>
-          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-white/40" />
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[rgb(var(--foreground)/0.4)]" />
         </button>
         <div className="flex-1" />
         <button
           type="button"
           onClick={newSession}
           title="New conversation"
-          className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-white/50 transition-colors hover:bg-white/[0.06] hover:text-white/80"
+          className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-[rgb(var(--foreground)/0.5)] transition-colors hover:bg-[rgb(var(--foreground)/0.06)] hover:text-[rgb(var(--foreground)/0.8)]"
         >
           <Plus className="h-4 w-4" />
         </button>
 
         {showSessions && (
-          <div className="absolute left-3 top-full z-20 mt-1 max-h-80 w-80 overflow-y-auto rounded-xl border border-white/[0.08] bg-[rgb(var(--background-elevated))] p-1 shadow-xl">
+          <div className="absolute left-6 top-full z-20 mt-1 max-h-80 w-80 overflow-y-auto rounded-xl border border-white/[0.08] bg-[rgb(var(--background-elevated))] p-1 shadow-xl">
             {sessions.length === 0 && (
               <p className="px-3 py-2 text-xs text-white/40">
                 No conversations yet.
@@ -394,7 +394,7 @@ export function HermesThread({ className }: { className?: string }) {
       </div>
 
       {/* Transcript */}
-      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
+      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-6 py-4">
         {historyLoading && (
           <div className="flex items-center gap-2 text-xs text-white/40">
             <Loader className="h-3.5 w-3.5 animate-spin" /> Loading conversation…
@@ -425,9 +425,9 @@ export function HermesThread({ className }: { className?: string }) {
         )}
       </div>
 
-      {/* Composer */}
-      <div className="border-t border-white/[0.06] p-3">
-        <div className="flex items-end gap-2 rounded-xl border border-white/[0.08] bg-white/[0.03] px-3.5 py-2 transition-[border-color] duration-150 ease-out focus-within:border-indigo-400/50">
+      {/* Composer — same row grammar as the Ask panel composer */}
+      <div className="border-t border-white/[0.06] px-6 py-3">
+        <div className="flex items-center gap-2 rounded-xl border border-[rgb(var(--foreground)/0.08)] bg-[rgb(var(--foreground)/0.03)] px-3.5 py-2 transition-[border-color] duration-150 ease-out focus-within:border-indigo-400/50">
           <textarea
             ref={textareaRef}
             value={input}
@@ -440,7 +440,7 @@ export function HermesThread({ className }: { className?: string }) {
             }}
             rows={1}
             placeholder="Message Hermes…"
-            className="min-h-[20px] flex-1 resize-none overflow-y-auto bg-transparent text-sm leading-5 text-white/90 placeholder:text-white/40 focus:outline-none"
+            className="min-h-[20px] flex-1 resize-none overflow-y-auto bg-transparent text-sm leading-5 text-[rgb(var(--foreground)/0.9)] placeholder:text-[rgb(var(--foreground)/0.4)] focus:outline-none"
           />
           {loading ? (
             <button
@@ -486,13 +486,13 @@ function HermesRow({ item }: { item: ChatItem }) {
   if (item.role === "user") {
     return (
       <div className="flex justify-end gap-2">
-        <div className="max-w-[85%] rounded-2xl rounded-tr-md bg-white/[0.07] px-3 py-2">
-          <p className="whitespace-pre-wrap break-words text-sm text-white/90">
+        <div className="max-w-[85%] rounded-2xl rounded-tr-md bg-[rgb(var(--foreground)/0.07)] px-3 py-2">
+          <p className="whitespace-pre-wrap break-words text-sm text-[rgb(var(--foreground)/0.9)]">
             {item.content}
           </p>
         </div>
-        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white/[0.07]">
-          <User className="h-3.5 w-3.5 text-white/50" />
+        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[rgb(var(--foreground)/0.07)]">
+          <User className="h-3.5 w-3.5 text-[rgb(var(--foreground)/0.5)]" />
         </div>
       </div>
     );
@@ -504,22 +504,31 @@ function HermesRow({ item }: { item: ChatItem }) {
 
   if (item.role === "tool") {
     return (
-      <div className="ml-8 flex items-start gap-1.5 text-[11px] text-white/45">
+      <div className="ml-8 flex items-start gap-1.5 text-[11px] text-[rgb(var(--foreground)/0.45)]">
         {item.toolStatus === "running" ? (
-          <Loader className="mt-0.5 h-3 w-3 shrink-0 animate-spin text-white/35" />
+          <Loader className="mt-0.5 h-3 w-3 shrink-0 animate-spin text-[rgb(var(--foreground)/0.35)]" />
         ) : (
           <Terminal
             className={cn(
               "mt-0.5 h-3 w-3 shrink-0",
-              item.toolStatus === "failed" ? "text-red-400/70" : "text-white/35",
+              item.toolStatus === "failed"
+                ? "text-red-400/70"
+                : "text-[rgb(var(--foreground)/0.35)]",
             )}
           />
         )}
         <div className="min-w-0 flex-1">
-          <span className="text-white/35">{item.toolName ?? "tool"}</span>{" "}
-          <span className="break-words font-mono">
-            {truncate(item.content, 240)}
+          <span className="text-[rgb(var(--foreground)/0.35)]">
+            {item.toolName ?? "tool"}
           </span>
+          {item.content && item.content !== item.toolName && (
+            <>
+              {" "}
+              <span className="break-words font-mono">
+                {truncate(item.content, 240)}
+              </span>
+            </>
+          )}
         </div>
       </div>
     );
@@ -531,7 +540,7 @@ function HermesRow({ item }: { item: ChatItem }) {
       <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-500/15 ring-1 ring-inset ring-indigo-400/25">
         <Brain className="h-3.5 w-3.5 text-indigo-300" />
       </div>
-      <div className="max-w-[85%] rounded-2xl rounded-tl-md border border-white/[0.08] bg-white/[0.03] px-3 py-2">
+      <div className="max-w-[85%] rounded-2xl rounded-tl-md border border-[rgb(var(--foreground)/0.08)] bg-[rgb(var(--foreground)/0.03)] px-3 py-2">
         <LazyMarkdownContent
           content={item.content}
           className="text-sm"
@@ -550,7 +559,7 @@ function ThinkingRow({ content }: { content: string }) {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1 text-[11px] text-white/35 transition-colors hover:text-white/60"
+        className="flex items-center gap-1 text-[11px] text-[rgb(var(--foreground)/0.35)] transition-colors hover:text-[rgb(var(--foreground)/0.6)]"
       >
         {open ? (
           <ChevronDown className="h-3 w-3" />
@@ -560,7 +569,7 @@ function ThinkingRow({ content }: { content: string }) {
         <Brain className="h-3 w-3" /> thinking
       </button>
       {open && (
-        <p className="mt-1 whitespace-pre-wrap break-words border-l border-white/[0.08] pl-3 text-[11px] leading-relaxed text-white/40">
+        <p className="mt-1 whitespace-pre-wrap break-words border-l border-[rgb(var(--foreground)/0.08)] pl-3 text-[11px] leading-relaxed text-[rgb(var(--foreground)/0.4)]">
           {content}
         </p>
       )}
