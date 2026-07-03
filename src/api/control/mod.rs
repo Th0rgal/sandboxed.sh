@@ -2648,12 +2648,21 @@ pub struct ControlMessageRequest {
     /// message to the session's current mission.
     #[serde(default, alias = "target_mission_id")]
     pub mission_id: Option<Uuid>,
+    /// Catch-all for unrecognized request fields — surfaced as `warnings` in
+    /// the response instead of being silently dropped (a mistyped targeting
+    /// field once silently rerouted a message to the wrong mission).
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ControlMessageResponse {
     pub id: Uuid,
     pub queued: bool,
+    /// Non-fatal request problems (e.g. unrecognized fields that were
+    /// ignored). Empty on clean requests; omitted from the JSON then.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
 }
 
 /// A message waiting in the queue
@@ -3385,6 +3394,18 @@ pub async fn post_message(
     let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
+    // Fail loud on unrecognized fields (see ControlMessageRequest::extra).
+    let mut warnings: Vec<String> = Vec::new();
+    if !req.extra.is_empty() {
+        let ignored: Vec<&str> = req.extra.keys().map(String::as_str).collect();
+        let joined = ignored.join(",");
+        tracing::warn!(
+            user_id = %user.id,
+            ignored_fields = %joined,
+            "control message request carried unrecognized fields (ignored)"
+        );
+        warnings.push(format!("unrecognized fields ignored: {joined}"));
+    }
     // A real user message means the operator is steering this mission — reset
     // its stall-guard budget so future genuine stalls get the full allowance.
     if let Some(mid) = target_mission_id {
@@ -3424,7 +3445,11 @@ pub async fn post_message(
             status.state != ControlRunState::Idle
         }
     };
-    Ok(Json(ControlMessageResponse { id, queued }))
+    Ok(Json(ControlMessageResponse {
+        id,
+        queued,
+        warnings,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -4572,6 +4597,181 @@ pub async fn get_mission(
     }
 }
 
+/// Compact, orchestrator-friendly view of a mission: status, last exchange,
+/// and PR links — without the full transcript. Recap/orchestration sessions
+/// previously pulled entire mission histories (multi-KB each) just to answer
+/// "where is this mission at?"; this answers the same question in ~2 KB.
+pub async fn get_mission_digest(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let Some(mut mission) = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err((StatusCode::NOT_FOUND, format!("Mission {} not found", id)));
+    };
+    if mission.workspace_name.is_none() {
+        mission.workspace_name = state
+            .workspaces
+            .get(mission.workspace_id)
+            .await
+            .map(|ws| ws.name);
+    }
+
+    fn truncate_chars(s: &str, max: usize) -> String {
+        let total = s.chars().count();
+        if total <= max {
+            s.to_string()
+        } else {
+            let cut: String = s.chars().take(max).collect();
+            format!("{cut}… [+{} chars truncated]", total - max)
+        }
+    }
+
+    let last_assistant = mission
+        .history
+        .iter()
+        .rev()
+        .find(|e| e.role == "assistant" && !e.content.trim().is_empty())
+        .map(|e| truncate_chars(&e.content, 2000));
+    let last_user = mission
+        .history
+        .iter()
+        .rev()
+        .find(|e| e.role == "user")
+        .map(|e| truncate_chars(&e.content, 500));
+
+    // GitHub PR links mentioned near the end of the transcript (most recent
+    // first, deduped) — the fact orchestrators most often dig transcripts for.
+    let mut github_prs: Vec<String> = Vec::new();
+    for entry in mission.history.iter().rev().take(10) {
+        for word in entry.content.split_whitespace() {
+            let word = word.trim_matches(|c: char| {
+                !c.is_ascii_alphanumeric() && c != '/' && c != ':' && c != '.'
+            });
+            if word.starts_with("https://github.com/") && word.contains("/pull/") {
+                let url = word.trim_end_matches(|c: char| !c.is_ascii_digit());
+                if !url.is_empty() && !github_prs.iter().any(|u| u == url) {
+                    github_prs.push(url.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "id": mission.id,
+        "title": mission.title,
+        "status": mission.status,
+        "awaiting_kind": mission.awaiting_kind.map(|k| k.as_str()),
+        "terminal_reason": mission.terminal_reason,
+        "short_description": mission.short_description,
+        "backend": mission.backend,
+        "model_override": mission.model_override,
+        "model_effort": mission.model_effort,
+        "workspace_id": mission.workspace_id,
+        "workspace_name": mission.workspace_name,
+        "project": mission.project,
+        "created_at": mission.created_at,
+        "updated_at": mission.updated_at,
+        "history_len": mission.history.len(),
+        "last_user_message": last_user,
+        "last_assistant_message": last_assistant,
+        "github_prs": github_prs,
+    })))
+}
+
+/// Fleet integrity report: mission-store anomalies that otherwise fail
+/// silently — pending missions nothing will ever dispatch, active missions
+/// with no recent progress, and long-idle awaiting_user rows. Read-only;
+/// intended for a daily sweep or an on-demand health check (178 orphaned
+/// pending missions once accumulated unnoticed before this existed).
+pub async fn missions_integrity(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let missions = control
+        .mission_store
+        .list_missions(5000, 0)
+        .await
+        .map_err(internal_error)?;
+    let now = chrono::Utc::now();
+    let age_minutes = |ts: &str| -> i64 {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_minutes())
+            .unwrap_or(0)
+    };
+    let brief = |m: &Mission| {
+        serde_json::json!({
+            "id": m.id,
+            "title": m.title,
+            "status": m.status,
+            "updated_age_minutes": age_minutes(&m.updated_at),
+        })
+    };
+
+    // Pending missions: split into scheduler-visible (deferred goal set,
+    // waiting on capacity/not_before) vs orphaned (nothing will dispatch them).
+    let mut orphaned_pending: Vec<serde_json::Value> = Vec::new();
+    let mut scheduled_waiting: Vec<serde_json::Value> = Vec::new();
+    for m in missions
+        .iter()
+        .filter(|m| m.status == MissionStatus::Pending)
+    {
+        if age_minutes(&m.created_at) < 15 {
+            continue; // freshly created; give the caller time to deliver a goal
+        }
+        let has_goal = control
+            .mission_store
+            .get_deferred_goal(m.id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if has_goal {
+            scheduled_waiting.push(brief(m));
+        } else {
+            orphaned_pending.push(brief(m));
+        }
+    }
+
+    let stale_active: Vec<serde_json::Value> = missions
+        .iter()
+        .filter(|m| m.status == MissionStatus::Active && age_minutes(&m.updated_at) > 24 * 60)
+        .map(brief)
+        .collect();
+    let stale_awaiting: Vec<serde_json::Value> = missions
+        .iter()
+        .filter(|m| m.status == MissionStatus::AwaitingUser && age_minutes(&m.updated_at) > 72 * 60)
+        .map(brief)
+        .collect();
+
+    let truncate = |mut v: Vec<serde_json::Value>| -> (usize, Vec<serde_json::Value>) {
+        let count = v.len();
+        v.truncate(20);
+        (count, v)
+    };
+    let (orphaned_count, orphaned_pending) = truncate(orphaned_pending);
+    let (scheduled_count, scheduled_waiting) = truncate(scheduled_waiting);
+    let (stale_active_count, stale_active) = truncate(stale_active);
+    let (stale_awaiting_count, stale_awaiting) = truncate(stale_awaiting);
+
+    Ok(Json(serde_json::json!({
+        "generated_at": now.to_rfc3339(),
+        "scanned": missions.len(),
+        "healthy": orphaned_count == 0 && stale_active_count == 0,
+        "orphaned_pending": { "count": orphaned_count, "missions": orphaned_pending },
+        "scheduled_waiting": { "count": scheduled_count, "missions": scheduled_waiting },
+        "stale_active": { "count": stale_active_count, "missions": stale_active },
+        "stale_awaiting_user": { "count": stale_awaiting_count, "missions": stale_awaiting },
+    })))
+}
+
 /// Create a new mission and switch to it.
 /// Request body for creating a mission
 #[derive(Debug, Deserialize)]
@@ -4617,6 +4817,20 @@ pub struct CreateMissionRequest {
     pub desired_state: Option<String>,
     /// When the track should next be checked (RFC3339).
     pub next_check_at: Option<String>,
+    /// Initial prompt for the mission. Stored as the mission's deferred goal:
+    /// the FLEET-001 scheduler dispatches it as the first user message as soon
+    /// as parallel capacity allows (immediately when a slot is free, honoring
+    /// `not_before` when set). This makes create+start atomic — callers no
+    /// longer need a follow-up `POST /api/control/message`, whose delivery
+    /// used to be droppable at capacity, orphaning the mission.
+    pub prompt: Option<String>,
+    /// Catch-all for unrecognized request fields. Serde ignores unknown fields
+    /// by default, which has repeatedly hidden client bugs (a `prompt` sent
+    /// before the field existed, a mistyped `target_mission_id`). Captured
+    /// here so the handler can surface them via the `X-Ignored-Fields`
+    /// response header and a warning log instead of dropping them silently.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 fn deserialize_string_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
@@ -4704,7 +4918,7 @@ pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     body: Option<Json<CreateMissionRequest>>,
-) -> Result<Json<Mission>, (StatusCode, String)> {
+) -> Result<(axum::http::HeaderMap, Json<Mission>), (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
     let req = body.map(|b| b.0).unwrap_or(CreateMissionRequest {
@@ -4727,7 +4941,26 @@ pub async fn create_mission(
         tags: None,
         desired_state: None,
         next_check_at: None,
+        prompt: None,
+        extra: Default::default(),
     });
+
+    // Fail loud on unrecognized fields: log + surface in a response header so
+    // a client bug (typo, field sent to the wrong endpoint) is observable
+    // instead of silently changing behavior.
+    let mut headers = axum::http::HeaderMap::new();
+    if !req.extra.is_empty() {
+        let ignored: Vec<&str> = req.extra.keys().map(String::as_str).collect();
+        let joined = ignored.join(",");
+        tracing::warn!(
+            user_id = %user.id,
+            ignored_fields = %joined,
+            "create_mission request carried unrecognized fields (ignored)"
+        );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&joined) {
+            headers.insert("x-ignored-fields", value);
+        }
+    }
 
     let title = req.title.clone();
     let workspace_id = req.workspace_id;
@@ -4925,7 +5158,28 @@ pub async fn create_mission(
         }
     }
 
-    Ok(Json(mission))
+    // Atomic create+start: stash the initial prompt as the deferred goal. The
+    // FLEET-001 scheduler pass (every ~5s) dispatches pending missions with a
+    // deferred goal as soon as parallel capacity allows, honoring `not_before`
+    // when set. Unlike the old create-then-message pattern, this cannot be
+    // dropped at capacity.
+    if let Some(prompt) = nonblank(&req.prompt) {
+        control
+            .mission_store
+            .set_deferred_goal(mission.id, Some(prompt.clone()))
+            .await
+            .map_err(internal_error)?;
+        // Surface the queued goal so UIs show it as pending until dispatch.
+        let _ = control.events_tx.send(AgentEvent::UserMessage {
+            id: Uuid::new_v4(),
+            content: prompt,
+            queued: true,
+            mission_id: Some(mission.id),
+            source: Some(format!("api:{}", user.id)),
+        });
+    }
+
+    Ok((headers, Json(mission)))
 }
 
 /// Request body for `POST /api/control/missions/:id/project`. Tri-state per
@@ -6373,9 +6627,11 @@ pub async fn clone_mission(
         },
         desired_state: source.project.desired_state.clone(),
         next_check_at: source.project.next_check_at.clone(),
+        prompt: None,
+        extra: Default::default(),
     };
 
-    let cloned = create_mission(State(state), Extension(user), Some(Json(req))).await?;
+    let (_headers, cloned) = create_mission(State(state), Extension(user), Some(Json(req))).await?;
     let clone_id = cloned.0.id;
 
     // Optionally seed the clone with the source's conversation history

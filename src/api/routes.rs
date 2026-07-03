@@ -699,6 +699,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/control/missions", get(control::list_missions))
         .route("/api/control/missions", post(control::create_mission))
         .route(
+            "/api/control/missions/integrity",
+            get(control::missions_integrity),
+        )
+        .route(
+            "/api/control/missions/:id/digest",
+            get(control::get_mission_digest),
+        )
+        .route(
             "/api/control/missions/search",
             get(control::search_missions),
         )

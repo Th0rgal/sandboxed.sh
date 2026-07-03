@@ -477,7 +477,16 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_mission".to_string(),
-                description: "Get one mission by UUID.".to_string(),
+                description: "Get one mission by UUID (full record incl. history — heavy; prefer get_mission_digest for status checks).".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id"],
+                    "properties": {"mission_id": {"type": "string"}}
+                }),
+            },
+            ToolDefinition {
+                name: "get_mission_digest".to_string(),
+                description: "Compact ~2KB mission status: state, awaiting_kind, last user/assistant messages (truncated), GitHub PR links, project metadata. Use this instead of get_mission/get_mission_events for recaps and 'where is it?' checks — it avoids pulling whole transcripts into context.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -731,6 +740,20 @@ impl AssistantMcp {
             .map_err(|error| format!("Failed to parse mission: {error}"))
     }
 
+    async fn get_mission_digest(&self, params: MissionIdParams) -> Result<Value, String> {
+        let id = parse_uuid(&params.mission_id)?;
+        let response = self
+            .api_get(&format!("/api/control/missions/{id}/digest"))
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!("Mission not found: {}", response.status()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| format!("Failed to parse mission digest: {error}"))
+    }
+
     async fn get_mission_events(&self, params: MissionEventsParams) -> Result<Value, String> {
         let id = parse_uuid(&params.mission_id)?;
         let limit = params.limit.clamp(1, 200);
@@ -850,6 +873,11 @@ impl AssistantMcp {
             "model_effort": params.model_effort,
             "config_profile": params.config_profile,
             "agent": params.agent,
+            // Atomic create+start: the API stores the prompt as the mission's
+            // deferred goal and the scheduler dispatches it as soon as
+            // capacity allows. The old create-then-send_message pattern could
+            // be dropped at capacity, leaving zombie Pending missions.
+            "prompt": params.prompt,
             // Project tagging at creation so the mission isn't born with null
             // metadata (Paloma watchdogs then route by these, not titles).
             "project": params.project,
@@ -869,14 +897,9 @@ impl AssistantMcp {
             .json()
             .await
             .map_err(|error| format!("Failed to parse created mission: {error}"))?;
-        let Some(mission_id) = mission["id"].as_str() else {
+        if mission["id"].as_str().is_none() {
             return Err("Created mission response did not include an id".to_string());
-        };
-        self.send_message(SendMessageParams {
-            mission_id: mission_id.to_string(),
-            content: params.prompt,
-        })
-        .await?;
+        }
         Ok(json!({ "mission": mission }))
     }
 
@@ -1325,6 +1348,11 @@ impl AssistantMcp {
                 let params: MissionIdParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
                 self.get_mission(params).await
+            }
+            "get_mission_digest" => {
+                let params: MissionIdParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.get_mission_digest(params).await
             }
             "get_mission_events" => {
                 let params: MissionEventsParams = serde_json::from_value(arguments)
