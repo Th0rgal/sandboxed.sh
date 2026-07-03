@@ -2083,6 +2083,31 @@ async fn adopt_hermes_assistant(
     }))
 }
 
+/// Extract a display label ("provider/model") from a Hermes config.yaml
+/// `model:` block. Mirrors the runtime's resolution order: this is what the
+/// gateway actually runs with, unlike the adopt-flow env default.
+fn hermes_config_model_label(config_yaml: &str) -> Option<String> {
+    let value: serde_yaml::Value = serde_yaml::from_str(config_yaml).ok()?;
+    let model = value.get("model")?;
+    let name = model
+        .get("default")
+        .or_else(|| model.get("name"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let provider = model
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "auto");
+    match (provider, name) {
+        (Some(p), Some(n)) => Some(format!("{p}/{n}")),
+        (None, Some(n)) => Some(n.to_string()),
+        (Some(p), None) => Some(p.to_string()),
+        (None, None) => None,
+    }
+}
+
 async fn get_hermes_assistant_status(
     State(state): State<Arc<AppState>>,
 ) -> Json<HermesAssistantStatusResponse> {
@@ -2108,10 +2133,20 @@ async fn get_hermes_assistant_status(
         .and_then(|contents| parse_env_value(contents, "TELEGRAM_BOT_TOKEN"))
         .filter(|value| !value.trim().is_empty());
     let token_present = token.is_some();
-    let model = env_contents
+    // The env HERMES_ASSISTANT_MODEL is only the adopt-flow default; the
+    // Hermes runtime resolves the persisted config.yaml model FIRST (its
+    // runtime_provider treats the env as a stale override). Prefer the live
+    // config for display so switching Hermes to a native provider (e.g.
+    // openai-codex/gpt-5.5) doesn't keep showing the routing fallback.
+    let env_model = env_contents
         .as_deref()
         .and_then(|contents| parse_env_value(contents, "HERMES_ASSISTANT_MODEL"))
         .filter(|value| !value.trim().is_empty());
+    let config_model = tokio::fs::read_to_string(&config_path)
+        .await
+        .ok()
+        .and_then(|contents| hermes_config_model_label(&contents));
+    let model = config_model.or(env_model);
 
     let mut telegram_ok = None;
     let mut telegram_bot_username = None;
@@ -4070,10 +4105,28 @@ fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::conve
 #[cfg(test)]
 mod tests {
     use super::{
-        evaluate_debounce, evaluate_deploy_request, extract_version_token, is_safe_repo_path,
-        normalize_repo_path, select_repo_path, systemd_service_component_from_states,
-        ComponentStatus, DebounceDecision, DeployRefusal, DEPLOY_DEBOUNCE_SECS,
+        evaluate_debounce, evaluate_deploy_request, extract_version_token,
+        hermes_config_model_label, is_safe_repo_path, normalize_repo_path, select_repo_path,
+        systemd_service_component_from_states, ComponentStatus, DebounceDecision, DeployRefusal,
+        DEPLOY_DEBOUNCE_SECS,
     };
+
+    #[test]
+    fn hermes_config_model_label_prefers_provider_and_default() {
+        let yaml = "model:\n  base_url: https://chatgpt.com/backend-api/codex\n  default: gpt-5.5\n  provider: openai-codex\nproviders: {}\n";
+        assert_eq!(
+            hermes_config_model_label(yaml).as_deref(),
+            Some("openai-codex/gpt-5.5")
+        );
+        // `auto` provider is not a meaningful label component.
+        let auto = "model:\n  provider: auto\n  default: builtin/assistant\n";
+        assert_eq!(
+            hermes_config_model_label(auto).as_deref(),
+            Some("builtin/assistant")
+        );
+        assert_eq!(hermes_config_model_label("providers: {}\n"), None);
+        assert_eq!(hermes_config_model_label("model: {}\n"), None);
+    }
 
     // ─── Deploy safety rails ────────────────────────────────────────────────
 
