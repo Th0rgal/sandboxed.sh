@@ -391,7 +391,7 @@ async fn cancel_deferred_request(
     .into_response()
 }
 
-/// Parse a direct `provider/model` id (e.g. `xai/grok-4.3`) into a single
+/// Parse a direct `provider/model` id (e.g. `xai/grok-4.5`) into a single
 /// synthetic chain entry, when the prefix is a known provider type. Returns
 /// `None` for ids that aren't `provider/model` with a real provider prefix, so
 /// the caller can reject them (chain-ish ids like `builtin/smart` are matched
@@ -579,7 +579,7 @@ pub(crate) async fn chat_completions_inner(
     //    (a) A known chain id — exact, or "builtin/{model}" (the
     //        @ai-sdk/openai-compatible adapter strips the provider prefix, so
     //        "builtin/smart" can arrive as "smart").
-    //    (b) Otherwise a direct "provider/model" id (e.g. "xai/grok-4.3"):
+    //    (b) Otherwise a direct "provider/model" id (e.g. "xai/grok-4.5"):
     //        passthrough to that provider's first healthy configured account,
     //        no stored chain required. This lets clients reach ANY supported
     //        model, not just the predefined fallback chains.
@@ -5035,9 +5035,9 @@ mod tests {
 
     #[test]
     fn parse_direct_model_entry_accepts_known_provider_prefix() {
-        let e = parse_direct_model_entry("xai/grok-4.3").expect("known provider");
+        let e = parse_direct_model_entry("xai/grok-4.5").expect("known provider");
         assert_eq!(e.provider_id, "xai");
-        assert_eq!(e.model_id, "grok-4.3");
+        assert_eq!(e.model_id, "grok-4.5");
         // Model ids may themselves contain slashes (kept after the first split).
         let e2 = parse_direct_model_entry("openai/codex-mini/latest").expect("known provider");
         assert_eq!(e2.provider_id, "openai");
@@ -5049,10 +5049,10 @@ mod tests {
         // Unknown prefix (chain-ish / typo) → not a direct passthrough.
         assert!(parse_direct_model_entry("builtin/smart").is_none());
         // Bare model id with no provider prefix.
-        assert!(parse_direct_model_entry("grok-4.3").is_none());
+        assert!(parse_direct_model_entry("grok-4.5").is_none());
         // Empty halves.
         assert!(parse_direct_model_entry("xai/").is_none());
-        assert!(parse_direct_model_entry("/grok-4.3").is_none());
+        assert!(parse_direct_model_entry("/grok-4.5").is_none());
     }
 
     #[test]

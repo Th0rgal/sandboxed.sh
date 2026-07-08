@@ -214,12 +214,12 @@ pub struct BackendModelOptionsResponse {
 }
 
 /// One model in the full supported-model catalog, ready to drop into a
-/// model-routing chain (`value` is the provider-prefixed id, e.g. `xai/grok-4.3`).
+/// model-routing chain (`value` is the provider-prefixed id, e.g. `xai/grok-4.5`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogModelOption {
     pub provider_id: String,
     pub provider_name: String,
-    /// Bare model id (e.g. `grok-4.3`).
+    /// Bare model id (e.g. `grok-4.5`).
     pub id: String,
     /// Chain-ready value (`provider_id/model_id`).
     pub value: String,
@@ -833,9 +833,14 @@ fn default_providers_config() -> ProvidersConfig {
                         ),
                     },
                     ProviderModel {
+                        id: "grok-4.5".to_string(),
+                        name: "Grok 4.5".to_string(),
+                        description: Some("Latest flagship Grok model".to_string()),
+                    },
+                    ProviderModel {
                         id: "grok-4.3".to_string(),
                         name: "Grok 4.3".to_string(),
-                        description: Some("Current flagship Grok model".to_string()),
+                        description: Some("Previous flagship Grok model".to_string()),
                     },
                     ProviderModel {
                         id: "grok-4.20-0309-reasoning".to_string(),
@@ -2237,7 +2242,7 @@ pub async fn validate_model_override(
                 Ok(())
             } else {
                 Err(format!(
-                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.3' or 'grok-build-0.1'), got '{}'",
+                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.5' or 'grok-build-0.1'), got '{}'",
                     model_override
                 ))
             }
@@ -2372,11 +2377,13 @@ mod tests {
         // current CLIs). `composer-2.5` is intentionally NOT here: it's a
         // product name, not a valid xAI API id, and the API rejects it.
         assert!(xai.models.iter().any(|model| model.id == "grok-build-0.1"));
+        assert!(xai.models.iter().any(|model| model.id == "grok-4.5"));
         assert!(!xai.models.iter().any(|model| model.id == "composer-2.5"));
     }
 
     #[test]
     fn grok_custom_model_prefixes_reject_composer() {
+        assert!(is_custom_grok_model_id("grok-4.5"));
         assert!(is_custom_grok_model_id("grok-4.3"));
         assert!(is_custom_grok_model_id("grok-build-0.1"));
         // `composer-*` is a product name the xAI API rejects ("Model not found").
@@ -2400,6 +2407,7 @@ mod tests {
             .collect();
 
         assert!(option_ids.contains(&"grok-build-0.1"));
+        assert!(option_ids.contains(&"grok-4.5"));
         assert!(!option_ids.contains(&"composer-2.5"));
     }
 

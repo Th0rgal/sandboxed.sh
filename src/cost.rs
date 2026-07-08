@@ -232,6 +232,11 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         pricing: pricing(75, 300, None, None),
     },
     PricingEntry {
+        canonical: "grok-4.5",
+        aliases: &["grok-4.5"],
+        pricing: pricing(2_000, 6_000, None, Some(500)),
+    },
+    PricingEntry {
         canonical: "grok-4-fast",
         aliases: &["grok-4-fast", "grok-inference"],
         pricing: pricing(1_250, 2_500, None, Some(200)),
@@ -534,6 +539,7 @@ mod tests {
         assert_eq!(normalize_model("gemini-3-pro-preview"), "gemini-3-pro");
         assert_eq!(normalize_model("grok-4-fast-reasoning"), "grok-4-fast");
         assert_eq!(normalize_model("xAI/Grok Inference"), "grok-4-fast");
+        assert_eq!(normalize_model("xai/grok-4.5"), "grok-4.5");
         assert_eq!(normalize_model("grok-build"), "grok-build");
         assert_eq!(normalize_model("zai/glm-5"), "glm-5");
         assert_eq!(normalize_model("zai/glm-5.2"), "glm-5.2");
@@ -566,6 +572,7 @@ mod tests {
         assert!(pricing_for_model("gemini-3-flash-preview").is_some());
         assert!(pricing_for_model("grok-4-fast").is_some());
         assert!(pricing_for_model("xAI/Grok Inference").is_some());
+        assert!(pricing_for_model("xai/grok-4.5").is_some());
         assert!(pricing_for_model("grok-build").is_some());
         assert!(pricing_for_model("glm-5").is_some());
         assert!(pricing_for_model("zai/glm-5.2").is_some());
@@ -593,6 +600,11 @@ mod tests {
         assert_eq!(grok_fast.input_nano_per_token, 1_250);
         assert_eq!(grok_fast.output_nano_per_token, 2_500);
         assert_eq!(grok_fast.cache_read_nano_per_token, Some(200));
+
+        let grok_45 = pricing_for_model("xai/grok-4.5").expect("grok 4.5 pricing");
+        assert_eq!(grok_45.input_nano_per_token, 2_000);
+        assert_eq!(grok_45.output_nano_per_token, 6_000);
+        assert_eq!(grok_45.cache_read_nano_per_token, Some(500));
 
         let glm = pricing_for_model("zai/glm-5.1").expect("glm-5.1 pricing");
         assert_eq!(glm.input_nano_per_token, 1_400);
