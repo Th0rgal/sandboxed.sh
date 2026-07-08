@@ -48,6 +48,7 @@ pub mod opencode;
 pub mod opencode_config;
 pub mod pkg_manager;
 pub mod provider_health;
+pub mod remote_node;
 pub mod secrets;
 pub mod settings;
 pub mod skills_registry;

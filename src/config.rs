@@ -250,6 +250,10 @@ pub struct Config {
     pub spark_arbiter_token: Option<String>,
     /// SSH target for rsync of the workspace, e.g. `th0rgal@100.77.4.93`.
     pub spark_ssh_target: Option<String>,
+
+    /// Remote runner node configuration. Disabled unless
+    /// `SANDBOXED_REMOTE_NODES_ENABLED=true`.
+    pub remote_nodes: crate::remote_node::RemoteNodeSettings,
 }
 
 /// API auth configuration.
@@ -633,6 +637,9 @@ impl Config {
         let spark_arbiter_url = env_opt("SPARK_ARBITER_URL");
         let spark_arbiter_token = env_opt("SPARK_ARBITER_TOKEN");
         let spark_ssh_target = env_opt("SPARK_SSH_TARGET");
+        let remote_nodes = crate::remote_node::RemoteNodeSettings::from_env().map_err(|e| {
+            ConfigError::InvalidValue("SANDBOXED_REMOTE_NODES".to_string(), e.to_string())
+        })?;
 
         Ok(Self {
             default_model,
@@ -656,6 +663,7 @@ impl Config {
             spark_arbiter_url,
             spark_arbiter_token,
             spark_ssh_target,
+            remote_nodes,
         })
     }
 
@@ -684,6 +692,7 @@ impl Config {
             spark_arbiter_url: None,
             spark_arbiter_token: None,
             spark_ssh_target: None,
+            remote_nodes: crate::remote_node::RemoteNodeSettings::default(),
         }
     }
 }

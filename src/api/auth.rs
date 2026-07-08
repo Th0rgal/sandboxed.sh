@@ -574,6 +574,7 @@ mod tests {
             spark_arbiter_url: None,
             spark_arbiter_token: None,
             spark_ssh_target: None,
+            remote_nodes: crate::remote_node::RemoteNodeSettings::default(),
         }
     }
 

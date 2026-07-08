@@ -4191,6 +4191,11 @@ pub struct CreateMissionRequest {
     pub not_before: Option<chrono::DateTime<chrono::Utc>>,
     /// FLEET-001 scheduling hint: soft deadline for observability/enforcement.
     pub deadline: Option<chrono::DateTime<chrono::Utc>>,
+    /// Remote runner node id. When set, core creates the mission locally and
+    /// dispatches `remote_command` to that node behind the remote-node flag.
+    pub remote_node_id: Option<String>,
+    /// MVP remote execution payload. Full AI mission streaming remains local.
+    pub remote_command: Option<String>,
 }
 
 fn deserialize_string_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
@@ -4292,6 +4297,8 @@ pub async fn create_mission(
         priority: None,
         not_before: None,
         deadline: None,
+        remote_node_id: None,
+        remote_command: None,
     });
 
     let title = req.title.clone();
@@ -4432,10 +4439,148 @@ pub async fn create_mission(
         .await
         .map_err(session_unavailable)?;
 
-    rx.await
-        .map_err(recv_failed)?
-        .map(Json)
-        .map_err(internal_error)
+    let mission = rx.await.map_err(recv_failed)?.map_err(internal_error)?;
+    if let Some(remote_node_id) = req
+        .remote_node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let remote_command = req
+            .remote_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "remote_command is required when remote_node_id is set".to_string(),
+                )
+            })?;
+        let control = control_for_user(&state, &user).await;
+        match dispatch_remote_mission_mvp(
+            &state,
+            &control,
+            &mission,
+            remote_node_id,
+            remote_command,
+        )
+        .await
+        {
+            Ok(updated) => return Ok(Json(updated)),
+            Err(message) => {
+                let _ = control
+                    .mission_store
+                    .update_mission_status_with_reason(
+                        mission.id,
+                        MissionStatus::Failed,
+                        Some("remote_dispatch_failed"),
+                    )
+                    .await;
+                let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                    mission_id: mission.id,
+                    status: MissionStatus::Failed,
+                    summary: Some(message.clone()),
+                });
+                return Err((StatusCode::BAD_GATEWAY, message));
+            }
+        }
+    }
+    Ok(Json(mission))
+}
+
+async fn dispatch_remote_mission_mvp(
+    state: &Arc<AppState>,
+    control: &ControlState,
+    mission: &Mission,
+    remote_node_id: &str,
+    remote_command: &str,
+) -> Result<Mission, String> {
+    let node = crate::remote_node::placement_for_selected_node(
+        &state.config.remote_nodes,
+        Some(remote_node_id),
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "remote node placement unexpectedly returned local".to_string())?;
+    let shared_token = std::env::var(&node.token_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "remote node '{}' has no token in {}",
+                node.id, node.token_env
+            )
+        })?;
+    let claims = crate::remote_node::LeaseClaims {
+        mission_id: mission.id,
+        node_id: node.id.clone(),
+        scope: "mission:execute".to_string(),
+        expires_at: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp(),
+    };
+    let lease_token = crate::remote_node::create_lease_token(&claims, &shared_token)
+        .map_err(|e| e.to_string())?;
+    let request = crate::remote_node::LeaseRequest {
+        mission_id: mission.id,
+        node_id: node.id.clone(),
+        lease_token,
+        command: remote_command.to_string(),
+    };
+
+    control
+        .mission_store
+        .update_mission_status(mission.id, MissionStatus::Active)
+        .await?;
+    let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        mission_id: mission.id,
+        status: MissionStatus::Active,
+        summary: Some(format!("Dispatching to remote node '{}'", node.id)),
+    });
+
+    let client = crate::remote_node::RemoteNodeClient::default();
+    let response = client
+        .execute(node, &shared_token, &request)
+        .await
+        .map_err(|e| e.to_string())?;
+    let success = response.exit_code == Some(0);
+    let content = format!(
+        "Remote node '{}' exited with {:?}\n\nstdout:\n{}\n\nstderr:\n{}",
+        node.id, response.exit_code, response.stdout, response.stderr
+    );
+    let event = AgentEvent::AssistantMessage {
+        id: Uuid::new_v4(),
+        content,
+        success,
+        cost_cents: 0,
+        cost_source: crate::agents::CostSource::Unknown,
+        usage: None,
+        model: None,
+        model_normalized: None,
+        mission_id: Some(mission.id),
+        shared_files: None,
+        resumable: !success,
+        completion_evidence: None,
+    };
+    let _ = control.mission_store.log_event(mission.id, &event).await;
+    let _ = control.events_tx.send(event);
+    let status = if success {
+        MissionStatus::Completed
+    } else {
+        MissionStatus::Failed
+    };
+    control
+        .mission_store
+        .update_mission_status_with_reason(mission.id, status, Some("remote_node_mvp"))
+        .await?;
+    let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        mission_id: mission.id,
+        status,
+        summary: Some(format!("Remote node '{}' finished", node.id)),
+    });
+    control
+        .mission_store
+        .get_mission(mission.id)
+        .await?
+        .ok_or_else(|| format!("Mission {} disappeared after remote dispatch", mission.id))
 }
 
 /// Update mission run settings for future turns.
@@ -5740,6 +5885,8 @@ pub async fn clone_mission(
         priority: None,
         not_before: None,
         deadline: None,
+        remote_node_id: None,
+        remote_command: None,
     };
 
     create_mission(State(state), Extension(user), Some(Json(req))).await
