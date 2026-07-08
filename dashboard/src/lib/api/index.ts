@@ -248,6 +248,12 @@ export {
   type AlertMissionSummary,
   type AlertFeedEntry,
   type AlertsFeedResponse,
+  type HermesMissionControl,
+  type HermesMissionCard,
+  type HermesRuntimeSummary,
+  type HermesSessionRollup,
+  type HermesFailureRollup,
+  type HermesRemoteNodeOverview,
   listHermesSessions,
   createHermesSession,
   getHermesSessionMessages,
@@ -255,4 +261,5 @@ export {
   deleteHermesSession,
   hermesChatStream,
   listAlerts,
+  getHermesMissionControl,
 } from "./hermes";

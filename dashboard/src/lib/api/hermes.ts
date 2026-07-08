@@ -257,3 +257,75 @@ export async function listAlerts(opts?: {
     "Failed to load alerts feed",
   );
 }
+
+// ---------------------------------------------------------------------------
+// Mission-control console
+// ---------------------------------------------------------------------------
+
+export interface HermesRuntimeSummary {
+  service_name: string;
+  service_active: boolean;
+  model: string | null;
+  base_url: string | null;
+  expected_base_url: string;
+  uses_sandboxed_proxy: boolean;
+  env_present: boolean;
+  config_present: boolean;
+  token_present: boolean;
+  notes: string[];
+}
+
+export interface HermesSessionRollup {
+  since: string;
+  total: number;
+  by_source: Record<string, number>;
+  messages: number;
+  tool_calls: number;
+  open: number;
+}
+
+export interface HermesMissionCard {
+  id: string;
+  title: string | null;
+  status: string;
+  workspace_name: string | null;
+  backend: string;
+  model_override: string | null;
+  model_effort: string | null;
+  terminal_reason: string | null;
+  updated_at: string;
+  last_agent_event_at: string | null;
+  last_activity_at: string | null;
+  attention: string | null;
+}
+
+export interface HermesFailureRollup {
+  class: string;
+  count: number;
+}
+
+export interface HermesRemoteNodeOverview {
+  enabled: boolean;
+  configured_nodes: number;
+  status: string;
+  notes: string[];
+}
+
+export interface HermesMissionControl {
+  generated_at: string;
+  runtime: HermesRuntimeSummary;
+  sessions: HermesSessionRollup;
+  active: HermesMissionCard[];
+  needs_attention: HermesMissionCard[];
+  handled_recently: HermesMissionCard[];
+  failures: HermesFailureRollup[];
+  mission_status_counts: Record<string, number>;
+  remote_nodes: HermesRemoteNodeOverview;
+}
+
+export async function getHermesMissionControl(): Promise<HermesMissionControl> {
+  return apiGet<HermesMissionControl>(
+    "/api/system/hermes-assistant/mission-control",
+    "Failed to load Hermes mission control",
+  );
+}
