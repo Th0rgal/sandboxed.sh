@@ -3,6 +3,7 @@
 //! Provides endpoints to query and update system components like OpenCode
 //! and related CLI components.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -23,6 +24,8 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use super::auth::AuthUser;
+use super::control::{self, MissionStatus};
+use super::mission_store::Mission;
 use super::routes::AppState;
 use crate::util::home_dir;
 use crate::workspace::{Workspace, WorkspaceStatus, WorkspaceType};
@@ -311,6 +314,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/components/by-workspace", get(get_components_by_workspace))
         .route("/hermes-assistant/adopt", post(adopt_hermes_assistant))
         .route("/hermes-assistant/status", get(get_hermes_assistant_status))
+        .route(
+            "/hermes-assistant/mission-control",
+            get(get_hermes_mission_control),
+        )
         .route(
             "/hermes-assistant/skills",
             get(list_hermes_assistant_skills),
@@ -861,6 +868,65 @@ pub struct HermesAssistantStatusResponse {
     pub telegram_pending_update_count: Option<i64>,
     pub telegram_last_error: Option<String>,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HermesRuntimeSummary {
+    pub service_name: String,
+    pub service_active: bool,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub expected_base_url: String,
+    pub uses_sandboxed_proxy: bool,
+    pub env_present: bool,
+    pub config_present: bool,
+    pub token_present: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HermesSessionRollup {
+    pub since: String,
+    pub total: u64,
+    pub by_source: HashMap<String, u64>,
+    pub messages: u64,
+    pub tool_calls: u64,
+    pub open: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HermesMissionCard {
+    pub id: Uuid,
+    pub title: Option<String>,
+    pub status: String,
+    pub workspace_name: Option<String>,
+    pub backend: String,
+    pub model_override: Option<String>,
+    pub model_effort: Option<String>,
+    pub terminal_reason: Option<String>,
+    pub updated_at: String,
+    pub last_agent_event_at: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub attention: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HermesFailureRollup {
+    pub class: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HermesMissionControlResponse {
+    pub generated_at: String,
+    pub runtime: HermesRuntimeSummary,
+    pub sessions: HermesSessionRollup,
+    pub active: Vec<HermesMissionCard>,
+    pub needs_attention: Vec<HermesMissionCard>,
+    pub handled_recently: Vec<HermesMissionCard>,
+    pub failures: Vec<HermesFailureRollup>,
+    pub mission_status_counts: HashMap<String, u64>,
+    pub remote_nodes: crate::remote_node::RemoteNodeOverview,
 }
 
 #[derive(Debug, Serialize)]
@@ -4097,6 +4163,393 @@ fn stream_package_uninstall(
     }
 }
 
+fn hermes_config_base_url(config_yaml: &str) -> Option<String> {
+    let value: serde_yaml::Value = serde_yaml::from_str(config_yaml).ok()?;
+    value
+        .get("model")?
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+}
+
+fn expand_hermes_env_refs(raw: String, env_contents: Option<&str>) -> String {
+    let Some(env_contents) = env_contents else {
+        return raw;
+    };
+
+    let mut output = String::with_capacity(raw.len());
+    let mut iter = raw.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
+        if ch != '$' {
+            output.push(ch);
+            continue;
+        }
+
+        if matches!(iter.peek(), Some((_, '{'))) {
+            let _ = iter.next();
+            let name_start = idx + 2;
+            let mut name_end = name_start;
+            let mut closed = false;
+            while let Some((next_idx, next_ch)) = iter.next() {
+                if next_ch == '}' {
+                    closed = true;
+                    break;
+                }
+                name_end = next_idx + next_ch.len_utf8();
+            }
+            let name = &raw[name_start..name_end];
+            if closed && is_env_name(name) {
+                if let Some(value) = parse_env_value(env_contents, name) {
+                    output.push_str(&value);
+                } else {
+                    output.push_str(&raw[idx..name_end + 1]);
+                }
+            } else {
+                output.push_str(&raw[idx..name_end]);
+                if closed {
+                    output.push('}');
+                }
+            }
+            continue;
+        }
+
+        let name_start = idx + 1;
+        let mut name_end = name_start;
+        while let Some((next_idx, next_ch)) = iter.peek().copied() {
+            if !is_env_name_char(next_ch) {
+                break;
+            }
+            let _ = iter.next();
+            name_end = next_idx + next_ch.len_utf8();
+        }
+        let name = &raw[name_start..name_end];
+        if !name.is_empty() && is_env_name(name) {
+            if let Some(value) = parse_env_value(env_contents, name) {
+                output.push_str(&value);
+            } else {
+                output.push_str(&raw[idx..name_end]);
+            }
+        } else {
+            output.push('$');
+        }
+    }
+
+    output
+}
+
+fn is_env_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(is_env_name_char)
+}
+
+fn is_env_name_char(ch: char) -> bool {
+    ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'
+}
+
+fn runtime_name_for_config(config: &crate::config::Config) -> &'static str {
+    assistant_runtime_name(config)
+}
+
+async fn build_hermes_runtime_summary(state: &AppState) -> HermesRuntimeSummary {
+    let runtime_name = runtime_name_for_config(&state.config);
+    let service_name = format!("{runtime_name}.service");
+    let env_path = format!("/etc/sandboxed-sh/{runtime_name}.env");
+    let config_path = format!("/var/lib/{runtime_name}/config.yaml");
+    let expected_base_url = format!("{}/v1", local_api_url(&state.config));
+    let service_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", &service_name])
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false);
+
+    let env_contents = tokio::fs::read_to_string(&env_path).await.ok();
+    let config_contents = tokio::fs::read_to_string(&config_path).await.ok();
+    let env_model = env_contents
+        .as_deref()
+        .and_then(|contents| parse_env_value(contents, "HERMES_ASSISTANT_MODEL"))
+        .filter(|value| !value.trim().is_empty());
+    let env_base_url = env_contents
+        .as_deref()
+        .and_then(|contents| parse_env_value(contents, "OPENAI_BASE_URL"))
+        .filter(|value| !value.trim().is_empty());
+    let env_text = env_contents.as_deref();
+    let config_model = config_contents
+        .as_deref()
+        .and_then(hermes_config_model_label)
+        .map(|value| expand_hermes_env_refs(value, env_text));
+    let config_base_url = config_contents
+        .as_deref()
+        .and_then(hermes_config_base_url)
+        .map(|value| expand_hermes_env_refs(value, env_text));
+    let model = config_model.or(env_model);
+    let base_url = config_base_url.or(env_base_url);
+    let token_present = env_contents
+        .as_deref()
+        .and_then(|contents| parse_env_value(contents, "TELEGRAM_BOT_TOKEN"))
+        .is_some_and(|value| !value.trim().is_empty());
+    let uses_sandboxed_proxy = base_url
+        .as_deref()
+        .is_some_and(|url| url.trim_end_matches('/') == expected_base_url.trim_end_matches('/'));
+
+    let mut notes = Vec::new();
+    if !service_active {
+        notes.push("Hermes service is not active.".to_string());
+    }
+    if !uses_sandboxed_proxy {
+        notes.push(format!(
+            "Hermes model traffic is not routed through the sandboxed.sh proxy ({expected_base_url})."
+        ));
+    }
+    if model
+        .as_deref()
+        .is_some_and(|m| m.contains("openai-codex") || m.contains("gpt-5.5"))
+    {
+        notes.push(
+            "Hermes is configured for a direct Codex/OpenAI model; revoked OAuth will break assistant turns.".to_string(),
+        );
+    }
+    if !token_present {
+        notes.push("TELEGRAM_BOT_TOKEN is not present in the Hermes env file.".to_string());
+    }
+
+    HermesRuntimeSummary {
+        service_name,
+        service_active,
+        model,
+        base_url,
+        expected_base_url,
+        uses_sandboxed_proxy,
+        env_present: env_contents.is_some(),
+        config_present: config_contents.is_some(),
+        token_present,
+        notes,
+    }
+}
+
+fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+fn mission_attention(now: chrono::DateTime<chrono::Utc>, mission: &Mission) -> Option<String> {
+    if mission.status == MissionStatus::Failed {
+        return Some(
+            mission
+                .terminal_reason
+                .clone()
+                .unwrap_or_else(|| "failed".to_string()),
+        );
+    }
+    if matches!(
+        mission.status,
+        MissionStatus::Interrupted | MissionStatus::Blocked | MissionStatus::NotFeasible
+    ) {
+        return Some(mission.status.to_string());
+    }
+    if matches!(
+        mission.status,
+        MissionStatus::Active | MissionStatus::WaitingBackground
+    ) {
+        let anchor = mission
+            .activity
+            .last_activity_at
+            .as_deref()
+            .or(Some(&mission.updated_at))
+            .and_then(parse_rfc3339_utc);
+        if let Some(anchor) = anchor {
+            let age = now.signed_duration_since(anchor).num_minutes();
+            if age >= 30 {
+                return Some(format!("no activity for {age}m"));
+            }
+        }
+    }
+    None
+}
+
+fn mission_card(now: chrono::DateTime<chrono::Utc>, mission: &Mission) -> HermesMissionCard {
+    HermesMissionCard {
+        id: mission.id,
+        title: mission.title.clone(),
+        status: mission.status.to_string(),
+        workspace_name: mission.workspace_name.clone(),
+        backend: mission.backend.clone(),
+        model_override: mission.model_override.clone(),
+        model_effort: mission.model_effort.clone(),
+        terminal_reason: mission.terminal_reason.clone(),
+        updated_at: mission.updated_at.clone(),
+        last_agent_event_at: mission.activity.last_agent_event_at.clone(),
+        last_activity_at: mission.activity.last_activity_at.clone(),
+        attention: mission_attention(now, mission),
+    }
+}
+
+fn enrich_mission_activity(
+    mut missions: Vec<Mission>,
+    activity: &HashMap<Uuid, (Option<String>, Option<String>)>,
+) -> Vec<Mission> {
+    for mission in &mut missions {
+        if let Some((last_event, last_output)) = activity.get(&mission.id) {
+            mission.activity.last_agent_event_at = last_event.clone();
+            mission.activity.last_output_at = last_output.clone();
+        }
+        mission.activity.last_activity_at = [
+            Some(mission.updated_at.clone()),
+            mission.activity.last_agent_event_at.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+    }
+    missions
+}
+
+fn failure_class(mission: &Mission) -> String {
+    mission
+        .terminal_reason
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| mission.status.to_string())
+}
+
+async fn read_hermes_session_rollup(runtime_name: &str) -> HermesSessionRollup {
+    let since = (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+    let db_path = std::path::PathBuf::from(format!("/var/lib/{runtime_name}/state.db"));
+    tokio::task::spawn_blocking(move || {
+        let since_epoch = (chrono::Utc::now() - chrono::Duration::days(3)).timestamp() as f64;
+        let mut rollup = HermesSessionRollup {
+            since,
+            total: 0,
+            by_source: HashMap::new(),
+            messages: 0,
+            tool_calls: 0,
+            open: 0,
+        };
+        if !db_path.exists() {
+            return rollup;
+        }
+        let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            return rollup;
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT COALESCE(source, 'unknown'), COUNT(*), COALESCE(SUM(message_count), 0), \
+                    COALESCE(SUM(tool_call_count), 0), \
+                    COALESCE(SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END), 0) \
+             FROM sessions WHERE started_at >= ?1 GROUP BY COALESCE(source, 'unknown')",
+        ) else {
+            return rollup;
+        };
+        let rows = match stmt.query_map([since_epoch], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return rollup,
+        };
+        for row in rows.flatten() {
+            let (source, count, messages, tools, open) = row;
+            let count = count.max(0) as u64;
+            rollup.total += count;
+            rollup.messages += messages.max(0) as u64;
+            rollup.tool_calls += tools.max(0) as u64;
+            rollup.open += open.max(0) as u64;
+            rollup.by_source.insert(source, count);
+        }
+        rollup
+    })
+    .await
+    .unwrap_or_else(|_| HermesSessionRollup {
+        since: (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339(),
+        total: 0,
+        by_source: HashMap::new(),
+        messages: 0,
+        tool_calls: 0,
+        open: 0,
+    })
+}
+
+async fn get_hermes_mission_control(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<HermesMissionControlResponse>, (StatusCode, String)> {
+    let now = chrono::Utc::now();
+    let control = control::control_for_user(&state, &user).await;
+    let mut missions = control
+        .mission_store
+        .list_missions(300, 0)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let ids: Vec<Uuid> = missions.iter().map(|m| m.id).collect();
+    let activity = control
+        .mission_store
+        .get_mission_activity(&ids)
+        .await
+        .unwrap_or_default();
+    missions = enrich_mission_activity(missions, &activity);
+
+    let mut status_counts: HashMap<String, u64> = HashMap::new();
+    let mut failure_counts: HashMap<String, u64> = HashMap::new();
+    let mut active = Vec::new();
+    let mut needs_attention = Vec::new();
+    let mut handled_recently = Vec::new();
+
+    for mission in &missions {
+        *status_counts.entry(mission.status.to_string()).or_default() += 1;
+        if mission.status == MissionStatus::Failed {
+            *failure_counts.entry(failure_class(mission)).or_default() += 1;
+        }
+        let card = mission_card(now, mission);
+        if matches!(
+            mission.status,
+            MissionStatus::Active | MissionStatus::Pending | MissionStatus::WaitingBackground
+        ) && active.len() < 12
+        {
+            active.push(card.clone());
+        }
+        if card.attention.is_some() && needs_attention.len() < 20 {
+            needs_attention.push(card.clone());
+        }
+        if matches!(
+            mission.status,
+            MissionStatus::Acknowledged | MissionStatus::Completed
+        ) && handled_recently.len() < 16
+        {
+            handled_recently.push(card);
+        }
+    }
+
+    let mut failures: Vec<_> = failure_counts
+        .into_iter()
+        .map(|(class, count)| HermesFailureRollup { class, count })
+        .collect();
+    failures.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.class.cmp(&b.class)));
+
+    let runtime = build_hermes_runtime_summary(&state).await;
+    let sessions = read_hermes_session_rollup(runtime_name_for_config(&state.config)).await;
+
+    Ok(Json(HermesMissionControlResponse {
+        generated_at: now.to_rfc3339(),
+        runtime,
+        sessions,
+        active,
+        needs_attention,
+        handled_recently,
+        failures,
+        mission_status_counts: status_counts,
+        remote_nodes: crate::remote_node::RemoteNodeOverview::from_env(),
+    }))
+}
+
 /// Stream the Claude Code uninstall process.
 fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     stream_package_uninstall("@anthropic-ai/claude-code", ".claude", "Claude Code")
@@ -4105,10 +4558,10 @@ fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::conve
 #[cfg(test)]
 mod tests {
     use super::{
-        evaluate_debounce, evaluate_deploy_request, extract_version_token,
-        hermes_config_model_label, is_safe_repo_path, normalize_repo_path, select_repo_path,
-        systemd_service_component_from_states, ComponentStatus, DebounceDecision, DeployRefusal,
-        DEPLOY_DEBOUNCE_SECS,
+        evaluate_debounce, evaluate_deploy_request, expand_hermes_env_refs, extract_version_token,
+        hermes_config_base_url, hermes_config_model_label, is_safe_repo_path, normalize_repo_path,
+        select_repo_path, systemd_service_component_from_states, ComponentStatus, DebounceDecision,
+        DeployRefusal, DEPLOY_DEBOUNCE_SECS,
     };
 
     #[test]
@@ -4126,6 +4579,24 @@ mod tests {
         );
         assert_eq!(hermes_config_model_label("providers: {}\n"), None);
         assert_eq!(hermes_config_model_label("model: {}\n"), None);
+    }
+
+    #[test]
+    fn hermes_config_values_expand_env_placeholders() {
+        let env = "HERMES_ASSISTANT_MODEL=gpt-5.1\nOPENAI_BASE_URL=http://127.0.0.1:3002/v1\n";
+        let yaml = "model:\n  base_url: ${OPENAI_BASE_URL}\n  default: ${HERMES_ASSISTANT_MODEL}\n  provider: custom\n";
+
+        let model =
+            hermes_config_model_label(yaml).map(|value| expand_hermes_env_refs(value, Some(env)));
+        let base_url =
+            hermes_config_base_url(yaml).map(|value| expand_hermes_env_refs(value, Some(env)));
+
+        assert_eq!(model.as_deref(), Some("custom/gpt-5.1"));
+        assert_eq!(base_url.as_deref(), Some("http://127.0.0.1:3002/v1"));
+        assert_eq!(
+            expand_hermes_env_refs("custom/${HERMES_ASSISTANT_MODEL}".to_string(), Some(env)),
+            "custom/gpt-5.1"
+        );
     }
 
     // ─── Deploy safety rails ────────────────────────────────────────────────

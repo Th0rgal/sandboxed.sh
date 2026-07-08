@@ -176,7 +176,7 @@ pub async fn ask_send(
     if req.sandbox && sandbox_dir.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Sandbox mode requires a git workspace (no isolated worktree could be created)"
+            "sandbox_unavailable: could not create an isolated git worktree or temp-copy sandbox"
                 .to_string(),
         ));
     }
@@ -302,7 +302,7 @@ pub async fn ask_send_stream(
     if req.sandbox && sandbox_dir.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Sandbox mode requires a git workspace (no isolated worktree could be created)"
+            "sandbox_unavailable: could not create an isolated git worktree or temp-copy sandbox"
                 .to_string(),
         ));
     }

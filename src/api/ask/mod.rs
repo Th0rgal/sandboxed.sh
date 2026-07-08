@@ -1421,6 +1421,43 @@ pub async fn prepare_sandbox(exec: &WorkspaceExec, base_work_dir: &Path) -> Opti
     let sandbox = PathBuf::from(format!("/tmp/ask-sandbox-{}", Uuid::new_v4()));
     let base_str = base_work_dir.to_string_lossy().to_string();
     let sandbox_str = sandbox.to_string_lossy().to_string();
+    let is_git_cmd = format!(
+        "git -C {b} rev-parse --git-dir >/dev/null 2>&1",
+        b = single_quote(&base_str)
+    );
+    let args = vec!["-lc".to_string(), is_git_cmd];
+    let is_git = exec
+        .output(base_work_dir, "/bin/bash", &args, HashMap::new())
+        .await
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+
+    if !is_git {
+        let copy_cmd = format!(
+            "set -e; test -d {b}; rm -rf {s}; mkdir -p {s}; \
+             if command -v rsync >/dev/null 2>&1; then \
+               rsync -a --exclude .git --exclude node_modules --exclude target --exclude .next -- {b}/ {s}/; \
+             else \
+               (cd {b} && tar --exclude .git --exclude node_modules --exclude target --exclude .next -cf - .) | (cd {s} && tar -xf -); \
+             fi; echo SANDBOX_OK",
+            b = single_quote(&base_str),
+            s = single_quote(&sandbox_str)
+        );
+        let args = vec!["-lc".to_string(), copy_cmd];
+        return match exec
+            .output(base_work_dir, "/bin/bash", &args, HashMap::new())
+            .await
+        {
+            Ok(out)
+                if out.status.success()
+                    && String::from_utf8_lossy(&out.stdout).contains("SANDBOX_OK") =>
+            {
+                Some(sandbox)
+            }
+            _ => None,
+        };
+    }
+
     let cmd = format!(
         "git -C {b} rev-parse --git-dir >/dev/null 2>&1 && \
          git -C {b} worktree add --detach {s} HEAD >/dev/null 2>&1 && \
