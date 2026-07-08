@@ -5084,6 +5084,31 @@ pub async fn create_mission(
         }
     }
 
+    // Validate the remote-node payload before persisting the mission so a
+    // bad request cannot leave an orphaned pending mission behind.
+    let remote_node_id = req
+        .remote_node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let remote_command = req
+        .remote_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(str::to_string);
+    if let Some(node_id) = remote_node_id.as_deref() {
+        if remote_command.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "remote_command is required when remote_node_id is set".to_string(),
+            ));
+        }
+        crate::remote_node::placement_for_selected_node(&state.config.remote_nodes, Some(node_id))
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
+
     let control = control_for_user(&state, &user).await;
     control
         .cmd_tx
@@ -5186,23 +5211,9 @@ pub async fn create_mission(
         });
     }
 
-    if let Some(remote_node_id) = req
-        .remote_node_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
+    if let (Some(remote_node_id), Some(remote_command)) =
+        (remote_node_id.as_deref(), remote_command.as_deref())
     {
-        let remote_command = req
-            .remote_command
-            .as_deref()
-            .map(str::trim)
-            .filter(|command| !command.is_empty())
-            .ok_or_else(|| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "remote_command is required when remote_node_id is set".to_string(),
-                )
-            })?;
         match dispatch_remote_mission_mvp(
             &state,
             &control,

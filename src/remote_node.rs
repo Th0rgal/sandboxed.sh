@@ -106,9 +106,15 @@ pub struct RemoteNodeSettings {
 
 impl RemoteNodeSettings {
     pub fn from_env() -> Result<Self, RemoteNodeError> {
-        let enabled = parse_bool_env("SANDBOXED_REMOTE_NODES_ENABLED").unwrap_or(false);
-        let raw = match std::env::var("SANDBOXED_REMOTE_NODES") {
-            Ok(raw) if !raw.trim().is_empty() => raw,
+        Self::from_raw(
+            parse_bool_env("SANDBOXED_REMOTE_NODES_ENABLED").unwrap_or(false),
+            std::env::var("SANDBOXED_REMOTE_NODES").ok(),
+        )
+    }
+
+    fn from_raw(enabled: bool, raw: Option<String>) -> Result<Self, RemoteNodeError> {
+        let raw = match raw {
+            Some(raw) if !raw.trim().is_empty() => raw,
             _ => {
                 return Ok(Self {
                     enabled,
@@ -116,7 +122,17 @@ impl RemoteNodeSettings {
                 })
             }
         };
-        parse_node_list(&raw).map(|nodes| Self { enabled, nodes })
+        match parse_node_list(&raw) {
+            Ok(nodes) => Ok(Self { enabled, nodes }),
+            // A stale or legacy SANDBOXED_REMOTE_NODES value (e.g. the old
+            // URL-only format) must not prevent core startup while the
+            // feature is disabled.
+            Err(_) if !enabled => Ok(Self {
+                enabled,
+                nodes: vec![],
+            }),
+            Err(err) => Err(err),
+        }
     }
 
     pub fn node(&self, id: &str) -> Option<&RemoteNodeConfig> {
@@ -235,6 +251,10 @@ pub struct ExecuteResponse {
     pub stderr: String,
 }
 
+/// Total request timeout for `/execute`, which blocks until the remote
+/// command completes.
+const EXECUTE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 #[derive(Clone)]
 pub struct RemoteNodeClient {
     http: reqwest::Client,
@@ -288,6 +308,10 @@ impl RemoteNodeClient {
         let response = self
             .http
             .post(url)
+            // Override the client-wide 30s timeout: remote commands
+            // (builds, tests) routinely run for minutes and the response
+            // only arrives once the command finishes.
+            .timeout(EXECUTE_TIMEOUT)
             .bearer_auth(shared_token)
             .json(request)
             .send()
@@ -391,12 +415,17 @@ pub async fn run_lease_command(
     work_root: PathBuf,
     request: LeaseRequest,
 ) -> Result<ExecuteResponse, RemoteNodeError> {
-    validate_lease_token(
+    let claims = validate_lease_token(
         &request.lease_token,
         token_secret,
         node_id,
         chrono::Utc::now(),
     )?;
+    if claims.mission_id != request.mission_id {
+        return Err(RemoteNodeError::InvalidLease(
+            "lease is scoped to a different mission".to_string(),
+        ));
+    }
     let mission_dir = work_root.join(request.mission_id.to_string());
     tokio::fs::create_dir_all(&mission_dir)
         .await
@@ -431,6 +460,48 @@ mod tests {
         assert_eq!(nodes[0].id, "babylon");
         assert_eq!(nodes[0].token_env, "SANDBOXED_REMOTE_NODE_BABYLON_TOKEN");
         assert_eq!(nodes[1].token_env, "NIPPUR_TOKEN");
+    }
+
+    #[test]
+    fn disabled_settings_tolerate_legacy_node_list_format() {
+        let settings =
+            RemoteNodeSettings::from_raw(false, Some("http://n1:9100,http://n2:9100".to_string()))
+                .unwrap();
+        assert!(!settings.enabled);
+        assert!(settings.nodes.is_empty());
+
+        assert!(RemoteNodeSettings::from_raw(
+            true,
+            Some("http://n1:9100,http://n2:9100".to_string())
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn run_lease_command_rejects_mismatched_mission_id() {
+        let claims = LeaseClaims {
+            mission_id: Uuid::new_v4(),
+            node_id: "babylon".to_string(),
+            scope: "mission:execute".to_string(),
+            expires_at: chrono::Utc::now().timestamp() + 60,
+        };
+        let token = create_lease_token(&claims, "node-secret").unwrap();
+        let work_root = tempfile::tempdir().unwrap();
+        let request = LeaseRequest {
+            mission_id: Uuid::new_v4(),
+            node_id: "babylon".to_string(),
+            lease_token: token,
+            command: "true".to_string(),
+        };
+        let err = run_lease_command(
+            "babylon",
+            "node-secret",
+            work_root.path().to_path_buf(),
+            request,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RemoteNodeError::InvalidLease(_)));
     }
 
     #[test]
