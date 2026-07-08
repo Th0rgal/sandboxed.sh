@@ -666,6 +666,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     let protected_routes = Router::new()
         .route("/api/stats", get(get_stats))
+        .route("/api/remote-nodes", get(list_remote_nodes))
         .route("/api/ai/usage/summary", get(get_ai_usage_summary))
         .route("/api/task", post(create_task))
         .route("/api/task/:id", get(get_task))
@@ -1385,6 +1386,49 @@ async fn health(State(state): State<Arc<AppState>>) -> (HeaderMap, Json<HealthRe
             github_enabled: state.config.auth.github_enabled(),
         }),
     )
+}
+
+/// List configured remote runner nodes with live heartbeat status.
+async fn list_remote_nodes(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<crate::remote_node::NodeStatus>> {
+    let client = crate::remote_node::RemoteNodeClient::default();
+    let mut statuses = Vec::new();
+    for node in &state.config.remote_nodes.nodes {
+        let mut status = crate::remote_node::NodeStatus {
+            id: node.id.clone(),
+            base_url: node.base_url.clone(),
+            token_env: node.token_env.clone(),
+            online: false,
+            capacity_total: None,
+            capacity_available: None,
+            active_leases: None,
+            version: None,
+            error: None,
+        };
+        match std::env::var(&node.token_env)
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+        {
+            Some(token) => match client.heartbeat(node, &token).await {
+                Ok(heartbeat) => {
+                    status.online = heartbeat.online;
+                    status.capacity_total = Some(heartbeat.capacity_total);
+                    status.capacity_available = Some(heartbeat.capacity_available);
+                    status.active_leases = Some(heartbeat.active_leases);
+                    status.version = Some(heartbeat.version);
+                }
+                Err(err) => {
+                    status.error = Some(err.to_string());
+                }
+            },
+            None => {
+                status.error = Some(format!("missing token env {}", node.token_env));
+            }
+        }
+        statuses.push(status);
+    }
+    Json(statuses)
 }
 
 /// Optional query parameters for the stats endpoint.

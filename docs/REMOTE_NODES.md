@@ -1,36 +1,163 @@
-# Remote Mission Nodes
+# Remote Runner Nodes MVP
 
-Sandboxed.sh still runs missions locally by default. The remote-node work in
-this branch is a protocol skeleton for moving heavy missions to another machine
-without changing the normal local/container execution path.
+Remote nodes are an MVP execution path for selected missions. Core remains the
+source of truth for dashboard auth, mission records, events, and UI state. A
+node receives only a per-mission lease token signed from its own node secret.
+It never receives a dashboard JWT or broad API token.
 
-## Target Shape
+## Current Scope
 
-- **Core** stays responsible for auth, mission records, workspace metadata,
-  Library sync, event persistence, and the UI.
-- **Remote node** is a small Rust service installed on a compute host. It exposes
-  a narrow API to accept leases from core, start/stop mission processes, stream
-  harness events back, and report capacity.
-- **Leases** are short-lived capability tokens scoped to one mission. A node
-  never receives broad dashboard credentials.
-- **Heartbeats** report online/degraded/offline status, labels, CPU/RAM/disk/GPU
-  capacity, and current mission counts.
+Supported now:
 
-## Rollout Phases
+- core lists configured nodes and reports live heartbeat/capacity status
+- `sandboxed-node` exposes authenticated `/heartbeat` and `/execute`
+- selected missions can run one `remote_command` on a selected node
+- the command runs under `SANDBOXED_NODE_WORK_DIR/<mission-id>`
+- dispatch failures fail closed: the mission is marked failed and the API
+  returns an error
+- future `not_before` scheduling with `remote_node_id` is rejected for now so
+  remote commands are never started before their requested dispatch window
 
-1. Report configured remote-node state in Hermes mission control. Scheduling is
-   intentionally local-only.
-2. Add a `sandboxed-node` daemon with `/heartbeat`, `/leases`, `/events`, and
-   `/artifacts` endpoints.
-3. Let core choose a node for eligible missions using workspace requirements,
-   labels, and capacity.
-4. Add UI controls for node health, drain mode, resource usage, and per-mission
-   placement.
+Not supported yet:
 
-## Current Environment Flags
+- full AI backend execution on remote nodes
+- live token/tool streaming from remote back to core
+- workspace/container sync between core and node
+- node-side access to dashboard auth, mission DB, or broad core APIs
+- scheduled remote dispatch after a future `not_before`
 
-- `SANDBOXED_REMOTE_NODES_ENABLED=1` enables the reporting path.
-- `SANDBOXED_REMOTE_NODES=http://node-a:9100,http://node-b:9100` records the
-  configured endpoint count.
+## Build
 
-These flags do not change scheduling yet.
+On core and each node:
+
+```bash
+cargo build --bin sandboxed-sh --bin sandboxed-node
+```
+
+Install the node binary on each runner:
+
+```bash
+sudo install -m 0755 target/debug/sandboxed-node /usr/local/bin/sandboxed-node
+```
+
+## Node Configuration
+
+Use one distinct secret per node. Do not paste the secret into logs or docs.
+
+Babylon:
+
+```bash
+export SANDBOXED_NODE_ID=babylon
+export SANDBOXED_NODE_BIND=0.0.0.0:3088
+export SANDBOXED_NODE_WORK_DIR=/var/lib/sandboxed-node/work
+export SANDBOXED_NODE_CAPACITY=1
+export SANDBOXED_NODE_TOKEN="$SANDBOXED_REMOTE_NODE_BABYLON_TOKEN"
+/usr/local/bin/sandboxed-node
+```
+
+Nippur:
+
+```bash
+export SANDBOXED_NODE_ID=nippur
+export SANDBOXED_NODE_BIND=0.0.0.0:3088
+export SANDBOXED_NODE_WORK_DIR=/var/lib/sandboxed-node/work
+export SANDBOXED_NODE_CAPACITY=1
+export SANDBOXED_NODE_TOKEN="$SANDBOXED_REMOTE_NODE_NIPPUR_TOKEN"
+/usr/local/bin/sandboxed-node
+```
+
+Ashur:
+
+```bash
+export SANDBOXED_NODE_ID=ashur
+export SANDBOXED_NODE_BIND=0.0.0.0:3088
+export SANDBOXED_NODE_WORK_DIR=/var/lib/sandboxed-node/work
+export SANDBOXED_NODE_CAPACITY=1
+export SANDBOXED_NODE_TOKEN="$SANDBOXED_REMOTE_NODE_ASHUR_TOKEN"
+/usr/local/bin/sandboxed-node
+```
+
+Minimal systemd unit:
+
+```ini
+[Unit]
+Description=sandboxed.sh remote runner node
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/sandboxed-node.env
+ExecStart=/usr/local/bin/sandboxed-node
+Restart=always
+RestartSec=5
+User=root
+WorkingDirectory=/var/lib/sandboxed-node
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/etc/sandboxed-node.env` contains only env-var assignments such as
+`SANDBOXED_NODE_ID`, `SANDBOXED_NODE_BIND`, `SANDBOXED_NODE_WORK_DIR`,
+`SANDBOXED_NODE_CAPACITY`, and `SANDBOXED_NODE_TOKEN`.
+
+## Core Configuration
+
+Configure the three Thomas/Paloma servers on the core backend:
+
+```bash
+export SANDBOXED_REMOTE_NODES_ENABLED=true
+export SANDBOXED_REMOTE_NODES='babylon=http://54.36.175.109:3088,nippur=http://37.187.92.183:3088,ashur=http://188.40.69.160:3088'
+export SANDBOXED_REMOTE_NODE_BABYLON_TOKEN='<set in environment only>'
+export SANDBOXED_REMOTE_NODE_NIPPUR_TOKEN='<set in environment only>'
+export SANDBOXED_REMOTE_NODE_ASHUR_TOKEN='<set in environment only>'
+```
+
+The token env names are also the default names inferred from the node ids. To
+override a token env name, use `id=url|TOKEN_ENV_NAME` in
+`SANDBOXED_REMOTE_NODES`.
+
+## Smoke Tests
+
+Check live node status from core:
+
+```bash
+curl -H "Authorization: Bearer $DASHBOARD_JWT" \
+  "$SANDBOXED_CORE_URL/api/remote-nodes"
+```
+
+Run a selected remote MVP mission:
+
+```bash
+curl -sS -X POST "$SANDBOXED_CORE_URL/api/control/missions" \
+  -H "Authorization: Bearer $DASHBOARD_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "remote smoke on babylon",
+    "backend": "codex",
+    "remote_node_id": "babylon",
+    "remote_command": "hostname && docker --version && pwd && echo sandboxed-node-ok"
+  }'
+```
+
+Repeat with `"nippur"` and `"ashur"` for those nodes. The mission is stored in
+core. Its final assistant event contains the remote command stdout/stderr and
+the status becomes `completed` only when the remote command exits with code 0.
+
+## Failure Behavior
+
+- Unknown selected node: request fails with a clear error.
+- Remote nodes disabled: request fails with a clear error.
+- Missing node token env: mission is marked `failed`; the error names only the
+  missing env var.
+- Node offline or rejects lease: mission is marked `failed`; no local success is
+  reported.
+- Non-zero command exit: mission is stored and marked `failed` with the remote
+  stdout/stderr event preserved.
+
+## Production Readiness Gaps
+
+Before production deploy, this needs remote workspace synchronization, remote
+AI backend process supervision, streamed event forwarding, durable node lease
+tracking, capacity-aware queueing, TLS or private-network enforcement, and
+operator UI for selecting nodes.

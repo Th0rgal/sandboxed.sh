@@ -118,6 +118,10 @@ path = "src/bin/fido_agent_proxy.rs"
 name = "palomactl"
 path = "src/bin/palomactl.rs"
 
+[[bin]]
+name = "sandboxed-node"
+path = "src/bin/sandboxed_node.rs"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
