@@ -258,16 +258,7 @@ fn select_container_resolv_conf() -> Option<PathBuf> {
         .map(str::to_string);
     let include_tailnet = content.contains(".ts.net") || content.contains("tailscale");
 
-    let mut resolved = String::new();
-    if let Some(line) = search_line {
-        resolved.push_str(&line);
-        resolved.push('\n');
-    }
-    if include_tailnet {
-        resolved.push_str("nameserver 100.100.100.100\n");
-    }
-    resolved.push_str("nameserver 1.1.1.1\n");
-    resolved.push_str("nameserver 8.8.8.8\n");
+    let resolved = synthesized_container_resolv_conf(search_line.as_deref(), include_tailnet);
 
     let custom_path = PathBuf::from("/var/lib/opencode/.sandboxed-sh/resolv.conf");
     if let Some(parent) = custom_path.parent() {
@@ -282,23 +273,72 @@ fn select_container_resolv_conf() -> Option<PathBuf> {
     Some(custom_path)
 }
 
+fn synthesized_container_resolv_conf(search_line: Option<&str>, include_tailnet: bool) -> String {
+    let mut resolved = String::new();
+    if let Some(line) = search_line {
+        resolved.push_str(line);
+        resolved.push('\n');
+    }
+    resolved.push_str("nameserver 1.1.1.1\n");
+    resolved.push_str("nameserver 8.8.8.8\n");
+    if include_tailnet {
+        resolved.push_str("nameserver 100.100.100.100\n");
+    }
+    resolved
+}
+
 fn bind_resolv_conf(cmd: &mut Command) {
     if let Some(path) = select_container_resolv_conf() {
-        if path == Path::new("/etc/resolv.conf") {
-            cmd.arg("--bind-ro=/etc/resolv.conf");
-        } else {
-            cmd.arg(format!(
-                "--bind-ro={}:{}",
-                path.display(),
-                "/etc/resolv.conf"
-            ));
-        }
+        push_resolv_conf_bind_args(cmd, &path);
     }
+}
+
+fn push_resolv_conf_bind_args(cmd: &mut Command, path: &Path) {
+    for arg in resolv_conf_bind_args(path) {
+        cmd.arg(arg);
+    }
+}
+
+fn resolv_conf_bind_args(path: &Path) -> Vec<String> {
+    let bind_arg = if path == Path::new("/etc/resolv.conf") {
+        "--bind-ro=/etc/resolv.conf".to_string()
+    } else {
+        format!("--bind-ro={}:{}", path.display(), "/etc/resolv.conf")
+    };
+    vec!["--resolv-conf=off".to_string(), bind_arg]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{environ_has_keepalive_marker, normalize_container_path};
+    use super::{
+        environ_has_keepalive_marker, normalize_container_path, resolv_conf_bind_args,
+        synthesized_container_resolv_conf,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn synthesized_resolv_conf_uses_public_dns_before_magic_dns() {
+        let resolv = synthesized_container_resolv_conf(Some("search gazella-vector.ts.net"), true);
+
+        assert_eq!(
+            resolv,
+            "search gazella-vector.ts.net\n\
+             nameserver 1.1.1.1\n\
+             nameserver 8.8.8.8\n\
+             nameserver 100.100.100.100\n"
+        );
+    }
+
+    #[test]
+    fn resolv_conf_bind_disables_nspawn_resolver_initialization() {
+        assert_eq!(
+            resolv_conf_bind_args(Path::new("/tmp/sandboxed-resolv.conf")),
+            vec![
+                "--resolv-conf=off",
+                "--bind-ro=/tmp/sandboxed-resolv.conf:/etc/resolv.conf",
+            ]
+        );
+    }
 
     #[test]
     fn container_path_adds_system_dirs_when_missing() {
