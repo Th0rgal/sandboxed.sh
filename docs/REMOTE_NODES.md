@@ -15,6 +15,8 @@ Supported now:
 - the command runs under `SANDBOXED_NODE_WORK_DIR/<mission-id>`
 - dispatch failures fail closed: the mission is marked failed and the API
   returns an error
+- future `not_before` scheduling with `remote_node_id` is rejected for now so
+  remote commands are never started before their requested dispatch window
 
 Not supported yet:
 
@@ -22,6 +24,7 @@ Not supported yet:
 - live token/tool streaming from remote back to core
 - workspace/container sync between core and node
 - node-side access to dashboard auth, mission DB, or broad core APIs
+- scheduled remote dispatch after a future `not_before`
 
 ## Build
 

@@ -5105,6 +5105,16 @@ pub async fn create_mission(
                 "remote_command is required when remote_node_id is set".to_string(),
             ));
         }
+        if remote_dispatch_is_scheduled_for_future(
+            Some(node_id),
+            req.not_before,
+            chrono::Utc::now(),
+        ) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "remote-node MVP does not support future not_before scheduling yet; create the remote mission after the dispatch window opens".to_string(),
+            ));
+        }
         crate::remote_node::placement_for_selected_node(&state.config.remote_nodes, Some(node_id))
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     }
@@ -5244,6 +5254,17 @@ pub async fn create_mission(
     }
 
     Ok((headers, Json(mission)))
+}
+
+fn remote_dispatch_is_scheduled_for_future(
+    remote_node_id: Option<&str>,
+    not_before: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    remote_node_id
+        .map(str::trim)
+        .is_some_and(|id| !id.is_empty())
+        && not_before.is_some_and(|t| t > now)
 }
 
 async fn dispatch_remote_mission_mvp(
@@ -21038,6 +21059,27 @@ Investigate <service/> failures.
         // until the user resumes it), so they are not activation-eligible here.
         assert!(!message_activates_mission(MissionStatus::Active));
         assert!(!message_activates_mission(MissionStatus::Paused));
+    }
+
+    #[test]
+    fn remote_dispatch_future_not_before_is_not_immediate() {
+        let now = chrono::Utc::now();
+
+        assert!(remote_dispatch_is_scheduled_for_future(
+            Some("babylon"),
+            Some(now + chrono::Duration::minutes(5)),
+            now
+        ));
+        assert!(!remote_dispatch_is_scheduled_for_future(
+            Some("babylon"),
+            Some(now - chrono::Duration::minutes(5)),
+            now
+        ));
+        assert!(!remote_dispatch_is_scheduled_for_future(
+            None,
+            Some(now + chrono::Duration::minutes(5)),
+            now
+        ));
     }
 
     #[tokio::test]
