@@ -238,3 +238,21 @@ export {
   rotateHermesRemoteKey,
   applyHermesRemote,
 } from "./assistant";
+
+export {
+  type HermesSession,
+  type HermesMessage,
+  type HermesChatHandlers,
+  type HermesToolEvent,
+  type AlertDelivery,
+  type AlertMissionSummary,
+  type AlertFeedEntry,
+  type AlertsFeedResponse,
+  listHermesSessions,
+  createHermesSession,
+  getHermesSessionMessages,
+  renameHermesSession,
+  deleteHermesSession,
+  hermesChatStream,
+  listAlerts,
+} from "./hermes";

@@ -6072,6 +6072,139 @@ pub async fn get_mission_events(
     Ok(response)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AlertsFeedQuery {
+    /// Comma-separated mission statuses to keep (e.g. `awaiting_user,failed`).
+    pub statuses: Option<String>,
+    /// Timestamp cursor: return alerts strictly older than this.
+    pub before: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlertFeedDelivery {
+    pub channel: &'static str,
+    pub status: String,
+    pub sent_at: Option<String>,
+    pub acknowledged_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlertFeedEntry {
+    pub mission_id: Uuid,
+    pub status: String,
+    pub summary: String,
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission: Option<mission_store::MissionSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<AlertFeedDelivery>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlertsFeedResponse {
+    pub alerts: Vec<AlertFeedEntry>,
+    pub next_cursor: Option<String>,
+}
+
+/// Cross-mission feed of status-change alerts, newest first. Source of truth
+/// is `mission_events` (`mission_status_changed`), decorated best-effort with
+/// mission summaries and Telegram delivery state.
+pub async fn get_alerts_feed(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    axum::extract::Query(query): axum::extract::Query<AlertsFeedQuery>,
+) -> Result<Json<AlertsFeedResponse>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+
+    let events = control
+        .mission_store
+        .get_status_events_global(query.before.as_deref(), limit)
+        .await
+        .map_err(internal_error)?;
+
+    // Cursor comes from the raw (unfiltered) page so pagination never stalls
+    // even when a status filter empties a page.
+    let next_cursor = if events.len() == limit {
+        events.last().map(|e| e.timestamp.clone())
+    } else {
+        None
+    };
+
+    let wanted: Option<Vec<String>> = query.statuses.as_deref().map(|s| {
+        s.split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    });
+
+    let mut entries: Vec<AlertFeedEntry> = events
+        .into_iter()
+        .filter_map(|e| {
+            let status = e.metadata.get("status")?.as_str()?.to_string();
+            if let Some(wanted) = &wanted {
+                if !wanted.contains(&status) {
+                    return None;
+                }
+            }
+            Some(AlertFeedEntry {
+                mission_id: e.mission_id,
+                status,
+                summary: e.content,
+                timestamp: e.timestamp,
+                mission: None,
+                delivery: None,
+            })
+        })
+        .collect();
+
+    let mission_ids: Vec<Uuid> = {
+        let mut ids: Vec<Uuid> = entries.iter().map(|e| e.mission_id).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    };
+
+    let summaries = control
+        .mission_store
+        .get_mission_summaries(&mission_ids)
+        .await
+        .map_err(internal_error)?;
+    let telegram_alerts = control
+        .mission_store
+        .list_telegram_alerts_for_missions(&mission_ids)
+        .await
+        .unwrap_or_default();
+
+    for entry in &mut entries {
+        entry.mission = summaries.get(&entry.mission_id).cloned();
+        // Loose join: telegram_alerts has no FK to the event row; match the
+        // alert class (`mission_<status>` before any `:` suffix). The list is
+        // ordered created_at DESC, so the first match is the most recent.
+        let class = format!("mission_{}", entry.status);
+        entry.delivery = telegram_alerts
+            .iter()
+            .find(|a| {
+                a.mission_id == Some(entry.mission_id)
+                    && a.event_kind.split(':').next().unwrap_or(&a.event_kind) == class
+            })
+            .map(|a| AlertFeedDelivery {
+                channel: "telegram",
+                status: a.status.clone(),
+                sent_at: a.sent_at.clone(),
+                acknowledged_at: a.acknowledged_at.clone(),
+                last_error: a.last_error.clone(),
+            });
+    }
+
+    Ok(Json(AlertsFeedResponse {
+        alerts: entries,
+        next_cursor,
+    }))
+}
+
 pub async fn get_mission_tool_call_events(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,

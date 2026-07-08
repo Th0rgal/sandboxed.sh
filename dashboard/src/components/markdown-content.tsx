@@ -10,6 +10,8 @@ import { cn } from "@/lib/utils";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import { transformRichTags } from "@/lib/rich-tags";
+import { remarkMissionLinks } from "@/lib/remark-mission-links";
+import { MissionChip } from "@/components/hermes/mission-chip";
 import {
   FILE_EXTENSIONS,
   isMarkdownFile,
@@ -25,6 +27,8 @@ interface MarkdownContentProps {
   basePath?: string;
   workspaceId?: string;
   missionId?: string;
+  /** Opt-in (Hermes chat): render bare mission UUIDs as clickable chips. */
+  missionLinks?: boolean;
 }
 
 // Global, refcounted cache of fetched image blob URLs.
@@ -1102,6 +1106,7 @@ export const MarkdownContent = memo(function MarkdownContent({
   basePath,
   workspaceId,
   missionId,
+  missionLinks,
 }: MarkdownContentProps) {
   const [forceMarkdown, setForceMarkdown] = useState(false);
   const oversize = content.length > MARKDOWN_SIZE_CAP_BYTES;
@@ -1135,6 +1140,9 @@ export const MarkdownContent = memo(function MarkdownContent({
       return <img src={srcStr} alt={alt} {...props} className="max-w-full rounded" />;
     },
     a({ href, children, className, ...props }) {
+      if (href?.startsWith("mission://")) {
+        return <MissionChip missionId={href.replace("mission://", "")} />;
+      }
       if (href && isRichFileLinkHref(href)) {
         const path = href.startsWith("sandboxed-file://")
           ? decodeURIComponent(href.replace("sandboxed-file://", ""))
@@ -1242,13 +1250,20 @@ export const MarkdownContent = memo(function MarkdownContent({
   }), [basePath, workspaceId, missionId]);
 
   // Memoize remarkPlugins array to prevent recreation
-  const plugins = useMemo(() => [remarkGfm], []);
+  const plugins = useMemo(
+    () => (missionLinks ? [remarkGfm, remarkMissionLinks] : [remarkGfm]),
+    [missionLinks],
+  );
   const rehypePlugins = useMemo(() => [rehypeMarkStandaloneLinks], []);
 
   // Allow our placeholder protocols through react-markdown's URL sanitizer.
   // Everything else should continue to use the default sanitizer behavior.
   const urlTransform = useCallback((url: string) => {
-    if (url.startsWith("sandboxed-image://") || url.startsWith("sandboxed-file://")) {
+    if (
+      url.startsWith("sandboxed-image://") ||
+      url.startsWith("sandboxed-file://") ||
+      url.startsWith("mission://")
+    ) {
       return url;
     }
     return defaultUrlTransform(url);

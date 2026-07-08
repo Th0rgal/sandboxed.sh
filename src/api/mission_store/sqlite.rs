@@ -5,9 +5,9 @@ use super::{
     BoardTaskOutcome, BoardTaskStatus, CommandSource, DailyUsageStats, ExecutionStatus,
     FreshSession, HourlyUsageStats, Mission, MissionActivity, MissionHistoryEntry, MissionMode,
     MissionProject, MissionProjectPatch, MissionScheduling, MissionStatus, MissionStatusCounts,
-    MissionStore, ModelUsageStats, NewBoardTask, PalomaCooldownState, PalomaDecision,
-    PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig, StopPolicy,
-    StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
+    MissionStore, MissionSummary, ModelUsageStats, NewBoardTask, PalomaCooldownState,
+    PalomaDecision, PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig,
+    StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
     TelegramActionExecutionStatus, TelegramAlert, TelegramAlertPreference, TelegramChannel,
     TelegramChatMission, TelegramConversation, TelegramConversationMessage,
     TelegramConversationMessageDirection, TelegramMissionInterestLevel,
@@ -3516,6 +3516,50 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn get_mission_summaries(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, MissionSummary>, String> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.conn.clone();
+        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let placeholders = vec!["?"; id_strings.len()].join(",");
+            let sql = format!(
+                "SELECT id, title, status, workspace_name, awaiting_kind \
+                 FROM missions WHERE id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(id_strings.iter()), |row| {
+                    let mid: String = row.get(0)?;
+                    Ok((
+                        mid,
+                        MissionSummary {
+                            title: row.get(1)?,
+                            status: row.get(2)?,
+                            workspace_name: row.get(3)?,
+                            awaiting_kind: row.get(4)?,
+                        },
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            let mut out = std::collections::HashMap::new();
+            for row in rows {
+                let (mid, summary) = row.map_err(|e| e.to_string())?;
+                if let Ok(uuid) = Uuid::parse_str(&mid) {
+                    out.insert(uuid, summary);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn set_mission_awaiting_kind(
         &self,
         id: Uuid,
@@ -4817,6 +4861,77 @@ impl MissionStore for SqliteMissionStore {
                     result.push(row.map_err(|e| e.to_string())?);
                 }
                 result
+            };
+
+            Ok(events)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_status_events_global(
+        &self,
+        before_ts: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let conn = self.conn.clone();
+        let before_ts = before_ts.map(|s| s.to_string());
+        let limit = limit.min(500) as i64;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+
+            // Newest first across all missions. Backed by
+            // idx_events_event_type; timestamps are ISO-8601 so lexical
+            // ordering is chronological.
+            let query = if before_ts.is_some() {
+                "SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                 FROM mission_events
+                 WHERE event_type = 'mission_status_changed' AND timestamp < ?1
+                 ORDER BY timestamp DESC
+                 LIMIT ?2"
+            } else {
+                "SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                 FROM mission_events
+                 WHERE event_type = 'mission_status_changed'
+                 ORDER BY timestamp DESC
+                 LIMIT ?1"
+            };
+
+            fn parse_row(row: &rusqlite::Row<'_>) -> Result<StoredEvent, rusqlite::Error> {
+                let content: Option<String> = row.get(8)?;
+                let content_file: Option<String> = row.get(9)?;
+                let full_content =
+                    SqliteMissionStore::load_content(content.as_deref(), content_file.as_deref());
+                let metadata_str: String =
+                    row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "{}".to_string());
+                let mid_str: String = row.get(1)?;
+
+                Ok(StoredEvent {
+                    id: row.get(0)?,
+                    mission_id: parse_uuid_or_nil(&mid_str),
+                    sequence: row.get(2)?,
+                    event_type: row.get(3)?,
+                    timestamp: row.get(4)?,
+                    event_id: row.get(5)?,
+                    tool_call_id: row.get(6)?,
+                    tool_name: row.get(7)?,
+                    content: full_content,
+                    metadata: serde_json::from_str(&metadata_str).unwrap_or(serde_json::json!({})),
+                })
+            }
+
+            let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+            let events: Vec<StoredEvent> = if let Some(before) = before_ts {
+                let rows = stmt
+                    .query_map(params![&before, limit], parse_row)
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            } else {
+                let rows = stmt
+                    .query_map(params![limit], parse_row)
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
             };
 
             Ok(events)
@@ -7022,6 +7137,40 @@ impl MissionStore for SqliteMissionStore {
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map(params![telegram_user_id, limit as i64], row_to_telegram_alert)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_alerts_for_missions(
+        &self,
+        mission_ids: &[Uuid],
+    ) -> Result<Vec<TelegramAlert>, String> {
+        if mission_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let conn = self.conn.clone();
+        let id_strings: Vec<String> = mission_ids.iter().map(|id| id.to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let placeholders = vec!["?"; id_strings.len()].join(",");
+            let sql = format!(
+                "SELECT id, telegram_user_id, mission_id, event_kind, importance, title, body,
+                        status, telegram_message_id, last_error, created_at, sent_at, acknowledged_at
+                 FROM telegram_alerts
+                 WHERE mission_id IN ({placeholders})
+                 ORDER BY created_at DESC"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params_from_iter(id_strings.iter()),
+                    row_to_telegram_alert,
+                )
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
@@ -10582,6 +10731,90 @@ mod tests {
     use rusqlite::params;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn status_events_global_feed_paginates_by_timestamp() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+
+        // Three missions, one status change each, backdated to distinct
+        // timestamps (force_backdate_for_test stamps all of a mission's
+        // events at once, hence one mission per instant).
+        let cases = [
+            ("Alpha", MissionStatus::Completed, "2026-06-01T10:00:00Z"),
+            ("Bravo", MissionStatus::Failed, "2026-06-02T10:00:00Z"),
+            (
+                "Charlie",
+                MissionStatus::AwaitingUser,
+                "2026-06-03T10:00:00Z",
+            ),
+        ];
+        let mut ids = Vec::new();
+        for (title, status, ts) in &cases {
+            let mission = store
+                .create_mission(Some(title), None, None, None, None, None, None)
+                .await
+                .expect("mission");
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::MissionStatusChanged {
+                        mission_id: mission.id,
+                        status: status.clone(),
+                        summary: Some(format!("{title} status change")),
+                    },
+                )
+                .await
+                .expect("log status event");
+            // Noise: a different event type that must not appear in the feed.
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::MissionTitleChanged {
+                        mission_id: mission.id,
+                        title: title.to_string(),
+                    },
+                )
+                .await
+                .expect("log noise event");
+            store
+                .force_backdate_for_test(mission.id, ts)
+                .await
+                .expect("backdate");
+            ids.push(mission.id);
+        }
+
+        // Full feed: newest first, status events only.
+        let all = store
+            .get_status_events_global(None, 10)
+            .await
+            .expect("global feed");
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|e| e.event_type == "mission_status_changed"));
+        assert_eq!(all[0].timestamp, "2026-06-03T10:00:00Z");
+        assert_eq!(all[0].metadata["status"], "awaiting_user");
+        assert_eq!(all[2].timestamp, "2026-06-01T10:00:00Z");
+
+        // Cursor pagination: page of 2, then everything strictly older.
+        let page = store
+            .get_status_events_global(None, 2)
+            .await
+            .expect("first page");
+        assert_eq!(page.len(), 2);
+        let older = store
+            .get_status_events_global(Some(&page[1].timestamp), 10)
+            .await
+            .expect("second page");
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].timestamp, "2026-06-01T10:00:00Z");
+
+        // Summaries decorate the feed.
+        let summaries = store.get_mission_summaries(&ids).await.expect("summaries");
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(summaries[&ids[0]].title.as_deref(), Some("Alpha"));
+    }
 
     fn test_memory_entry(
         channel_id: Uuid,
