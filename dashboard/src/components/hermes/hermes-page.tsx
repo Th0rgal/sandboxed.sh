@@ -271,14 +271,30 @@ function RuntimePanel({
   usesProxy: boolean;
   notes: string[];
 }) {
+  const nativeCodex = isNativeCodexRuntime(model, baseUrl);
+  const routingOk = usesProxy || nativeCodex;
+  const routingText = usesProxy
+    ? "sandboxed.sh proxy"
+    : nativeCodex
+      ? "native OpenAI Codex"
+      : "direct or unknown";
+
   return (
-    <Panel title="Provider Health" icon={Bot}>
+    <Panel title="Runtime Routing" icon={Bot}>
       <div className="space-y-2 text-xs">
         <StatusLine label="Runtime" ok={serviceActive} text={serviceActive ? "service active" : "service offline"} />
-        <StatusLine label="Routing" ok={usesProxy} text={usesProxy ? "through sandboxed.sh /v1" : "direct or unknown"} />
-        <div className="truncate text-white/45">Model: <span className="font-mono text-white/65">{model ?? "unknown"}</span></div>
-        <div className="truncate text-white/35" title={baseUrl ?? expectedBaseUrl ?? undefined}>
-          Base URL: {baseUrl ?? "unknown"}
+        <StatusLine label="Routing" ok={routingOk} text={routingText} />
+        <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2 text-white/45">
+          <span>Model</span>
+          <span className="truncate font-mono text-white/70" title={model ?? "unknown"}>
+            {model ?? "unknown"}
+          </span>
+        </div>
+        <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2 text-white/35">
+          <span>Base URL</span>
+          <span className="truncate font-mono" title={baseUrl ?? expectedBaseUrl ?? undefined}>
+            {baseUrl ?? "unknown"}
+          </span>
         </div>
         {notes.slice(0, 3).map((note) => (
           <div key={note} className="rounded-md bg-amber-500/10 px-2 py-1 text-amber-200/80">
@@ -290,12 +306,23 @@ function RuntimePanel({
   );
 }
 
+function isNativeCodexRuntime(model: string | null, baseUrl: string | null) {
+  const normalizedModel = model?.toLowerCase() ?? "";
+  const normalizedBaseUrl = baseUrl?.toLowerCase() ?? "";
+
+  return (
+    normalizedModel.includes("openai-codex") ||
+    normalizedModel.includes("gpt-5.5") ||
+    normalizedBaseUrl.includes("chatgpt.com/backend-api/codex")
+  );
+}
+
 function StatusLine({ label, ok, text }: { label: string; ok: boolean; text: string }) {
   return (
     <div className="flex items-center justify-between gap-3">
       <span className="text-white/45">{label}</span>
-      <span className={cn("flex items-center gap-1.5", ok ? "text-emerald-300/80" : "text-amber-300/80")}>
-        <span className={cn("h-1.5 w-1.5 rounded-full", ok ? "bg-emerald-400" : "bg-amber-300")} />
+      <span className={cn("flex min-w-0 items-center gap-1.5 text-right", ok ? "text-emerald-300/80" : "text-amber-300/80")}>
+        <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", ok ? "bg-emerald-400" : "bg-amber-300")} />
         {text}
       </span>
     </div>

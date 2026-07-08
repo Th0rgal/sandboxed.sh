@@ -4247,6 +4247,18 @@ fn is_env_name_char(ch: char) -> bool {
     ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'
 }
 
+fn hermes_uses_native_codex(model: Option<&str>, base_url: Option<&str>) -> bool {
+    let model_is_codex = model.is_some_and(|m| {
+        let value = m.to_ascii_lowercase();
+        value.contains("openai-codex") || value.contains("gpt-5.5")
+    });
+    let base_url_is_codex = base_url.is_some_and(|url| {
+        url.to_ascii_lowercase()
+            .contains("chatgpt.com/backend-api/codex")
+    });
+    model_is_codex || base_url_is_codex
+}
+
 fn runtime_name_for_config(config: &crate::config::Config) -> &'static str {
     assistant_runtime_name(config)
 }
@@ -4292,23 +4304,16 @@ async fn build_hermes_runtime_summary(state: &AppState) -> HermesRuntimeSummary 
     let uses_sandboxed_proxy = base_url
         .as_deref()
         .is_some_and(|url| url.trim_end_matches('/') == expected_base_url.trim_end_matches('/'));
+    let uses_native_codex = hermes_uses_native_codex(model.as_deref(), base_url.as_deref());
 
     let mut notes = Vec::new();
     if !service_active {
         notes.push("Hermes service is not active.".to_string());
     }
-    if !uses_sandboxed_proxy {
+    if !uses_sandboxed_proxy && !uses_native_codex {
         notes.push(format!(
             "Hermes model traffic is not routed through the sandboxed.sh proxy ({expected_base_url})."
         ));
-    }
-    if model
-        .as_deref()
-        .is_some_and(|m| m.contains("openai-codex") || m.contains("gpt-5.5"))
-    {
-        notes.push(
-            "Hermes is configured for a direct Codex/OpenAI model; revoked OAuth will break assistant turns.".to_string(),
-        );
     }
     if !token_present {
         notes.push("TELEGRAM_BOT_TOKEN is not present in the Hermes env file.".to_string());
@@ -4559,9 +4564,10 @@ fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::conve
 mod tests {
     use super::{
         evaluate_debounce, evaluate_deploy_request, expand_hermes_env_refs, extract_version_token,
-        hermes_config_base_url, hermes_config_model_label, is_safe_repo_path, normalize_repo_path,
-        select_repo_path, systemd_service_component_from_states, ComponentStatus, DebounceDecision,
-        DeployRefusal, DEPLOY_DEBOUNCE_SECS,
+        hermes_config_base_url, hermes_config_model_label, hermes_uses_native_codex,
+        is_safe_repo_path, normalize_repo_path, select_repo_path,
+        systemd_service_component_from_states, ComponentStatus, DebounceDecision, DeployRefusal,
+        DEPLOY_DEBOUNCE_SECS,
     };
 
     #[test]
@@ -4579,6 +4585,19 @@ mod tests {
         );
         assert_eq!(hermes_config_model_label("providers: {}\n"), None);
         assert_eq!(hermes_config_model_label("model: {}\n"), None);
+    }
+
+    #[test]
+    fn hermes_native_codex_detection_accepts_model_and_backend_url() {
+        assert!(hermes_uses_native_codex(Some("openai-codex/gpt-5.5"), None));
+        assert!(hermes_uses_native_codex(
+            None,
+            Some("https://chatgpt.com/backend-api/codex")
+        ));
+        assert!(!hermes_uses_native_codex(
+            Some("openai/gpt-5"),
+            Some("http://127.0.0.1:3000/v1")
+        ));
     }
 
     #[test]
