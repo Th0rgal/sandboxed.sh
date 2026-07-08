@@ -10762,7 +10762,7 @@ mod tests {
                     mission.id,
                     &AgentEvent::MissionStatusChanged {
                         mission_id: mission.id,
-                        status: status.clone(),
+                        status: *status,
                         summary: Some(format!("{title} status change")),
                     },
                 )

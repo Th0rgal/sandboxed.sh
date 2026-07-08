@@ -4192,7 +4192,7 @@ fn expand_hermes_env_refs(raw: String, env_contents: Option<&str>) -> String {
             let name_start = idx + 2;
             let mut name_end = name_start;
             let mut closed = false;
-            while let Some((next_idx, next_ch)) = iter.next() {
+            for (next_idx, next_ch) in iter.by_ref() {
                 if next_ch == '}' {
                     closed = true;
                     break;
