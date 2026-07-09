@@ -617,7 +617,7 @@ impl OrchestratorMcp {
                                     "prompt": { "type": "string", "description": "Full worker prompt: exact scope, absolute paths, success condition, verification command" },
                                     "backend": { "type": "string", "description": "codex | opencode | grok (never claudecode)" },
                                     "model_override": { "type": "string" },
-                                    "model_effort": { "type": "string", "description": "low | medium | high (codex)" },
+                                    "model_effort": { "type": "string", "description": "low | medium | high | xhigh (codex)" },
                                     "working_directory": { "type": "string", "description": "Worker cwd; superseded by worktree.path if a worktree is given" },
                                     "depends_on": { "type": "array", "items": { "type": "string" }, "description": "task_keys that must settle successfully or be accepted first" },
                                     "worktree": {
@@ -1148,6 +1148,12 @@ impl OrchestratorMcp {
             "parent_mission_id": self.mission_id.to_string(),
             "working_directory": params.working_directory,
             "workspace_id": workspace_id,
+            // Atomic create+start: the API stores the prompt as the mission's
+            // deferred goal and the scheduler dispatches it once capacity
+            // allows. The old create-then-message pattern could be dropped at
+            // capacity, leaving a zombie Pending worker the boss believed was
+            // running.
+            "prompt": params.prompt,
         });
 
         let response = self.api_post("/api/control/missions", body).await?;
@@ -1160,21 +1166,6 @@ impl OrchestratorMcp {
             .json()
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        let worker_id = mission["id"].as_str().unwrap_or("");
-
-        // If a prompt was provided, send it as the first message
-        if let Some(prompt) = params.prompt {
-            if !prompt.trim().is_empty() && !worker_id.is_empty() {
-                let msg_body = json!({
-                    "content": prompt,
-                    "mission_id": worker_id,
-                });
-                if let Err(e) = self.api_post("/api/control/message", msg_body).await {
-                    eprintln!("[orchestrator-mcp] Warning: created mission but failed to send initial prompt: {}", e);
-                }
-            }
-        }
 
         Ok(mission)
     }

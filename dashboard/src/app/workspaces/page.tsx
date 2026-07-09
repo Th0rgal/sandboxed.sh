@@ -1130,7 +1130,7 @@ export default function WorkspacesPage() {
                 {selectedWorkspace.status === 'ready' && (
                   <button
                     onClick={() => {
-                      router.push(`/?workspace=${selectedWorkspace.id}`);
+                      router.push(`/overview?workspace=${selectedWorkspace.id}`);
                     }}
                     className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg transition-colors"
                   >

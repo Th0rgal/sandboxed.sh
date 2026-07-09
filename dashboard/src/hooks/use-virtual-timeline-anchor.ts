@@ -47,6 +47,16 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
           align: "end",
           behavior,
         });
+        // Authoritative re-target in the same frame: scrollToIndex computes
+        // its offset from the virtualizer's cached scroll-rect, which can
+        // lag the real clientHeight (e.g. the composer just grew and shrank
+        // the container) — landing above the bottom by exactly that delta.
+        // Since the second rAF below is routinely cancelled by changeKey
+        // churn during streaming, that short jump would otherwise stick.
+        {
+          const el = scrollElementRef.current;
+          if (el) el.scrollTo({ top: el.scrollHeight, behavior });
+        }
         rafRef.current = requestAnimationFrame(() => {
           rafRef.current = null;
           virtualizer.scrollToIndex(targetIndex, {
@@ -124,7 +134,27 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
     if (!el) return;
     updateAnchorFromScroll();
     el.addEventListener("scroll", updateAnchorFromScroll, { passive: true });
-    return () => el.removeEventListener("scroll", updateAnchorFromScroll);
+    // The scroll element itself resizes when the composer below it grows or
+    // shrinks with the draft (auto-growing textarea). The browser keeps
+    // scrollTop on resize, so a user pinned at the bottom silently drifts
+    // off it by the composer delta — and the next stream correction then
+    // "jumps". Re-pin on resize while at bottom; otherwise just refresh the
+    // anchor state.
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(() => {
+        if (isAtBottomRef.current) {
+          el.scrollTop = el.scrollHeight;
+        } else {
+          updateAnchorFromScroll();
+        }
+      });
+      resizeObserver.observe(el);
+    }
+    return () => {
+      el.removeEventListener("scroll", updateAnchorFromScroll);
+      resizeObserver?.disconnect();
+    };
   }, [scrollElementRef, updateAnchorFromScroll]);
 
   useEffect(() => {

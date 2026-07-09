@@ -20,6 +20,7 @@
 //! - `DEFAULT_BACKEND` - Optional. Default backend to use.
 //!   If not set, defaults to the first available backend with priority: claudecode → opencode → grok → gemini → codex.
 //! - `PALOMA_WEBHOOK_FORWARD_URL` - Optional. External webhook to receive mission status changes.
+//! - `PALOMA_WEBHOOK_SECRET` - Optional. HMAC-SHA256 secret; adds `X-Hub-Signature-256` to forwarded webhooks.
 //!
 //! Note: The agent has **full system access**. It can read/write any file, execute any command,
 //! and search anywhere on the machine. The `WORKING_DIR` is just the default for relative paths.
@@ -241,6 +242,12 @@ pub struct Config {
     /// Optional external webhook that receives Paloma mission status-change events.
     pub paloma_webhook_forward_url: Option<String>,
 
+    /// Optional shared secret for the Paloma webhook. When set, each forwarded
+    /// request carries a GitHub-style `X-Hub-Signature-256: sha256=<hex>`
+    /// header (HMAC-SHA256 of the raw body) so consumers that require signed
+    /// webhooks (e.g. the Hermes gateway webhook platform) accept it.
+    pub paloma_webhook_secret: Option<String>,
+
     /// DGX Spark build-offload config (all optional; offload is disabled unless
     /// all three are set). The host holds these credentials so workspaces never
     /// need Spark access. See `src/api/spark.rs`.
@@ -250,6 +257,10 @@ pub struct Config {
     pub spark_arbiter_token: Option<String>,
     /// SSH target for rsync of the workspace, e.g. `th0rgal@100.77.4.93`.
     pub spark_ssh_target: Option<String>,
+
+    /// Remote runner node configuration. Disabled unless
+    /// `SANDBOXED_REMOTE_NODES_ENABLED=true`.
+    pub remote_nodes: crate::remote_node::RemoteNodeSettings,
 }
 
 /// API auth configuration.
@@ -624,6 +635,11 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let paloma_webhook_secret = std::env::var("PALOMA_WEBHOOK_SECRET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let env_opt = |k: &str| {
             std::env::var(k)
                 .ok()
@@ -633,6 +649,9 @@ impl Config {
         let spark_arbiter_url = env_opt("SPARK_ARBITER_URL");
         let spark_arbiter_token = env_opt("SPARK_ARBITER_TOKEN");
         let spark_ssh_target = env_opt("SPARK_SSH_TARGET");
+        let remote_nodes = crate::remote_node::RemoteNodeSettings::from_env().map_err(|e| {
+            ConfigError::InvalidValue("SANDBOXED_REMOTE_NODES".to_string(), e.to_string())
+        })?;
 
         Ok(Self {
             default_model,
@@ -653,9 +672,11 @@ impl Config {
             default_backend,
             automations_enabled,
             paloma_webhook_forward_url,
+            paloma_webhook_secret,
             spark_arbiter_url,
             spark_arbiter_token,
             spark_ssh_target,
+            remote_nodes,
         })
     }
 
@@ -681,9 +702,11 @@ impl Config {
             default_backend: None,
             automations_enabled: true,
             paloma_webhook_forward_url: None,
+            paloma_webhook_secret: None,
             spark_arbiter_url: None,
             spark_arbiter_token: None,
             spark_ssh_target: None,
+            remote_nodes: crate::remote_node::RemoteNodeSettings::default(),
         }
     }
 }

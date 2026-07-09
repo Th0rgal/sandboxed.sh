@@ -1353,13 +1353,14 @@ async fn run_grok_acp_turn(
     // `grok -p` path defaulted to grok-build (a reasoning model), so missions
     // without an explicit model keep that behavior — and a populated thoughts
     // panel — here too. Override via backend setting `default_model`.
-    let effective_model = model
-        .filter(|m| !m.trim().is_empty())
-        .map(str::to_string)
+    let requested_model = model.filter(|m| !m.trim().is_empty()).map(str::to_string);
+    let model_was_explicit = requested_model.is_some();
+    let effective_model = requested_model
+        .clone()
         .or_else(|| get_backend_string_setting("grok", "default_model"))
         .or_else(|| Some("grok-build-0.1".to_string()));
+    let mut selected_model: Option<String> = None;
     if let Some(model) = effective_model.as_deref() {
-        // Best-effort: an unknown model shouldn't kill the turn.
         send(
             &mut stdin,
             serde_json::json!({
@@ -1370,8 +1371,26 @@ async fn run_grok_acp_turn(
             }),
         )
         .await?;
-        if let Err(err) = await_response(&mut lines, GROK_ACP_SET_MODEL_ID, 30).await {
-            tracing::warn!(mission_id = %mission_id, model, error = %err, "Grok ACP set_model failed; using session default");
+        match await_response(&mut lines, GROK_ACP_SET_MODEL_ID, 30).await {
+            Ok(_) => {
+                selected_model = Some(model.to_string());
+            }
+            Err(err) if model_was_explicit => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Ok(AgentResult::failure(
+                    format!(
+                        "Grok Build rejected model override '{}': {}. Run `grok models` on the server to see models available for this account.",
+                        model, err
+                    ),
+                    0,
+                )
+                .with_terminal_reason(TerminalReason::LlmError)
+                .with_model(model.to_string()));
+            }
+            Err(err) => {
+                tracing::warn!(mission_id = %mission_id, model, error = %err, "Grok ACP set_model failed; using session default");
+            }
         }
     }
 
@@ -1406,7 +1425,7 @@ async fn run_grok_acp_turn(
     let mut thinking_done_emitted = false;
     let mut text_buffer = String::new();
     let mut tool_calls: HashMap<String, GrokAcpToolCall> = HashMap::new();
-    let mut model_used: Option<String> = effective_model.clone();
+    let mut model_used: Option<String> = selected_model;
     let mut usage = crate::cost::TokenUsage::default();
     let mut stop_reason: Option<String> = None;
     let mut transport_error: Option<String> = None;

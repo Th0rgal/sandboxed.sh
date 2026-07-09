@@ -188,12 +188,22 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const autocompleteRef = useRef<HTMLDivElement>(null);
   const resizeTextarea = useCallback((textarea: HTMLTextAreaElement) => {
-    textarea.style.height = "auto";
     const lineHeight = 20;
     const maxLines = 10;
     const maxHeight = lineHeight * maxLines;
+    // Measuring with height:auto momentarily collapses the textarea to its
+    // rows=1 height; reading scrollHeight then forces a synchronous layout
+    // in that collapsed state, which grows the chat scroller above and makes
+    // the browser clamp its scrollTop down — the transcript visibly jumps by
+    // the draft height. Freeze the wrapper's height across the measurement
+    // so the surrounding layout never sees the collapse.
+    const wrapper = textarea.parentElement;
+    const prevWrapperHeight = wrapper ? wrapper.style.height : "";
+    if (wrapper) wrapper.style.height = `${wrapper.offsetHeight}px`;
+    textarea.style.height = "auto";
     const newHeight = Math.min(textarea.scrollHeight, maxHeight);
     textarea.style.height = `${newHeight}px`;
+    if (wrapper) wrapper.style.height = prevWrapperHeight;
   }, []);
 
   // Load commands and agents on mount or when backend changes

@@ -5,7 +5,7 @@
 //! the chain until one succeeds. Pre-stream 429/529 errors trigger instant
 //! failover to the next entry in the chain.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -313,20 +313,89 @@ async fn list_models(
         return resp;
     }
     let chains = state.chain_store.list().await;
-    let data = chains
-        .into_iter()
-        .map(|c| ModelObject {
+    let mut seen = HashSet::new();
+    let mut data = Vec::new();
+    for c in chains {
+        if !seen.insert(c.id.clone()) {
+            continue;
+        }
+        data.push(ModelObject {
             id: c.id,
             object: "model",
             created: c.created_at.timestamp(),
             owned_by: "sandboxed",
-        })
-        .collect();
+        });
+    }
+
+    let direct_models =
+        crate::api::providers::catalog_model_options_for_state(&state, true, true).await;
+    let direct_models = routable_direct_catalog_models(&state, direct_models).await;
+    append_direct_models_to_proxy_models(
+        &mut data,
+        &mut seen,
+        direct_models,
+        chrono::Utc::now().timestamp(),
+    );
+    data.sort_by(|a, b| a.id.cmp(&b.id));
     Json(ModelsResponse {
         object: "list",
         data,
     })
     .into_response()
+}
+
+async fn routable_direct_catalog_models(
+    state: &Arc<super::routes::AppState>,
+    models: Vec<crate::api::providers::CatalogModelOption>,
+) -> Vec<crate::api::providers::CatalogModelOption> {
+    let standard_accounts =
+        crate::api::ai_providers::read_standard_accounts(&state.config.working_dir);
+    let mut routable = Vec::new();
+    for model in models {
+        if !model.configured {
+            continue;
+        }
+        let entry = crate::provider_health::ChainEntry {
+            provider_id: model.provider_id.clone(),
+            model_id: model.id.clone(),
+        };
+        let entries = state
+            .chain_store
+            .resolve_entries(
+                &[entry],
+                &state.ai_providers,
+                &standard_accounts,
+                &state.health_tracker,
+            )
+            .await;
+        if entries.iter().any(|entry| {
+            let provider_type =
+                ProviderType::from_id(&entry.provider_id).unwrap_or(ProviderType::Custom);
+            has_routable_proxy_credentials(provider_type, entry.api_key.is_some(), entry.has_oauth)
+        }) {
+            routable.push(model);
+        }
+    }
+    routable
+}
+
+fn append_direct_models_to_proxy_models(
+    data: &mut Vec<ModelObject>,
+    seen: &mut HashSet<String>,
+    models: Vec<crate::api::providers::CatalogModelOption>,
+    created: i64,
+) {
+    for model in models {
+        if !model.configured || !seen.insert(model.value.clone()) {
+            continue;
+        }
+        data.push(ModelObject {
+            id: model.value,
+            object: "model",
+            created,
+            owned_by: "sandboxed",
+        });
+    }
 }
 
 async fn get_deferred_request(
@@ -391,7 +460,7 @@ async fn cancel_deferred_request(
     .into_response()
 }
 
-/// Parse a direct `provider/model` id (e.g. `xai/grok-4.3`) into a single
+/// Parse a direct `provider/model` id (e.g. `xai/grok-4.5`) into a single
 /// synthetic chain entry, when the prefix is a known provider type. Returns
 /// `None` for ids that aren't `provider/model` with a real provider prefix, so
 /// the caller can reject them (chain-ish ids like `builtin/smart` are matched
@@ -579,7 +648,7 @@ pub(crate) async fn chat_completions_inner(
     //    (a) A known chain id — exact, or "builtin/{model}" (the
     //        @ai-sdk/openai-compatible adapter strips the provider prefix, so
     //        "builtin/smart" can arrive as "smart").
-    //    (b) Otherwise a direct "provider/model" id (e.g. "xai/grok-4.3"):
+    //    (b) Otherwise a direct "provider/model" id (e.g. "xai/grok-4.5"):
     //        passthrough to that provider's first healthy configured account,
     //        no stored chain required. This lets clients reach ANY supported
     //        model, not just the predefined fallback chains.
@@ -5035,9 +5104,9 @@ mod tests {
 
     #[test]
     fn parse_direct_model_entry_accepts_known_provider_prefix() {
-        let e = parse_direct_model_entry("xai/grok-4.3").expect("known provider");
+        let e = parse_direct_model_entry("xai/grok-4.5").expect("known provider");
         assert_eq!(e.provider_id, "xai");
-        assert_eq!(e.model_id, "grok-4.3");
+        assert_eq!(e.model_id, "grok-4.5");
         // Model ids may themselves contain slashes (kept after the first split).
         let e2 = parse_direct_model_entry("openai/codex-mini/latest").expect("known provider");
         assert_eq!(e2.provider_id, "openai");
@@ -5049,10 +5118,64 @@ mod tests {
         // Unknown prefix (chain-ish / typo) → not a direct passthrough.
         assert!(parse_direct_model_entry("builtin/smart").is_none());
         // Bare model id with no provider prefix.
-        assert!(parse_direct_model_entry("grok-4.3").is_none());
+        assert!(parse_direct_model_entry("grok-4.5").is_none());
         // Empty halves.
         assert!(parse_direct_model_entry("xai/").is_none());
-        assert!(parse_direct_model_entry("/grok-4.3").is_none());
+        assert!(parse_direct_model_entry("/grok-4.5").is_none());
+    }
+
+    #[test]
+    fn proxy_model_list_appends_configured_direct_provider_models() {
+        let mut seen = HashSet::new();
+        seen.insert("xai/grok-4.5".to_string());
+        let mut data = vec![ModelObject {
+            id: "xai/grok-4.5".to_string(),
+            object: "model",
+            created: 1,
+            owned_by: "sandboxed",
+        }];
+
+        append_direct_models_to_proxy_models(
+            &mut data,
+            &mut seen,
+            vec![
+                crate::api::providers::CatalogModelOption {
+                    provider_id: "xai".to_string(),
+                    provider_name: "xAI".to_string(),
+                    id: "grok-4.5".to_string(),
+                    value: "xai/grok-4.5".to_string(),
+                    name: "Grok 4.5".to_string(),
+                    description: None,
+                    configured: true,
+                },
+                crate::api::providers::CatalogModelOption {
+                    provider_id: "openai".to_string(),
+                    provider_name: "OpenAI".to_string(),
+                    id: "gpt-5.6-sol".to_string(),
+                    value: "openai/gpt-5.6-sol".to_string(),
+                    name: "GPT-5.6 Sol".to_string(),
+                    description: None,
+                    configured: true,
+                },
+                crate::api::providers::CatalogModelOption {
+                    provider_id: "anthropic".to_string(),
+                    provider_name: "Anthropic".to_string(),
+                    id: "claude-sonnet-4-5".to_string(),
+                    value: "anthropic/claude-sonnet-4-5".to_string(),
+                    name: "Claude Sonnet 4.5".to_string(),
+                    description: None,
+                    configured: false,
+                },
+            ],
+            2,
+        );
+
+        let ids = data
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["xai/grok-4.5", "openai/gpt-5.6-sol"]);
+        assert_eq!(data[1].created, 2);
     }
 
     #[test]

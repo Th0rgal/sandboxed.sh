@@ -2643,14 +2643,26 @@ pub struct ControlMessageRequest {
     pub agent: Option<String>,
     /// Target mission ID. If provided and differs from the currently running mission,
     /// the backend will automatically start this mission in parallel (if capacity allows).
-    #[serde(default)]
+    /// `target_mission_id` is accepted as an alias — unknown fields are otherwise
+    /// silently ignored, and a mistyped targeting field would silently reroute the
+    /// message to the session's current mission.
+    #[serde(default, alias = "target_mission_id")]
     pub mission_id: Option<Uuid>,
+    /// Catch-all for unrecognized request fields — surfaced as `warnings` in
+    /// the response instead of being silently dropped (a mistyped targeting
+    /// field once silently rerouted a message to the wrong mission).
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ControlMessageResponse {
     pub id: Uuid,
     pub queued: bool,
+    /// Non-fatal request problems (e.g. unrecognized fields that were
+    /// ignored). Empty on clean requests; omitted from the JSON then.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
 }
 
 /// A message waiting in the queue
@@ -3382,6 +3394,18 @@ pub async fn post_message(
     let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
+    // Fail loud on unrecognized fields (see ControlMessageRequest::extra).
+    let mut warnings: Vec<String> = Vec::new();
+    if !req.extra.is_empty() {
+        let ignored: Vec<&str> = req.extra.keys().map(String::as_str).collect();
+        let joined = ignored.join(",");
+        tracing::warn!(
+            user_id = %user.id,
+            ignored_fields = %joined,
+            "control message request carried unrecognized fields (ignored)"
+        );
+        warnings.push(format!("unrecognized fields ignored: {joined}"));
+    }
     // A real user message means the operator is steering this mission — reset
     // its stall-guard budget so future genuine stalls get the full allowance.
     if let Some(mid) = target_mission_id {
@@ -3421,7 +3445,11 @@ pub async fn post_message(
             status.state != ControlRunState::Idle
         }
     };
-    Ok(Json(ControlMessageResponse { id, queued }))
+    Ok(Json(ControlMessageResponse {
+        id,
+        queued,
+        warnings,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -4569,6 +4597,181 @@ pub async fn get_mission(
     }
 }
 
+/// Compact, orchestrator-friendly view of a mission: status, last exchange,
+/// and PR links — without the full transcript. Recap/orchestration sessions
+/// previously pulled entire mission histories (multi-KB each) just to answer
+/// "where is this mission at?"; this answers the same question in ~2 KB.
+pub async fn get_mission_digest(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let Some(mut mission) = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err((StatusCode::NOT_FOUND, format!("Mission {} not found", id)));
+    };
+    if mission.workspace_name.is_none() {
+        mission.workspace_name = state
+            .workspaces
+            .get(mission.workspace_id)
+            .await
+            .map(|ws| ws.name);
+    }
+
+    fn truncate_chars(s: &str, max: usize) -> String {
+        let total = s.chars().count();
+        if total <= max {
+            s.to_string()
+        } else {
+            let cut: String = s.chars().take(max).collect();
+            format!("{cut}… [+{} chars truncated]", total - max)
+        }
+    }
+
+    let last_assistant = mission
+        .history
+        .iter()
+        .rev()
+        .find(|e| e.role == "assistant" && !e.content.trim().is_empty())
+        .map(|e| truncate_chars(&e.content, 2000));
+    let last_user = mission
+        .history
+        .iter()
+        .rev()
+        .find(|e| e.role == "user")
+        .map(|e| truncate_chars(&e.content, 500));
+
+    // GitHub PR links mentioned near the end of the transcript (most recent
+    // first, deduped) — the fact orchestrators most often dig transcripts for.
+    let mut github_prs: Vec<String> = Vec::new();
+    for entry in mission.history.iter().rev().take(10) {
+        for word in entry.content.split_whitespace() {
+            let word = word.trim_matches(|c: char| {
+                !c.is_ascii_alphanumeric() && c != '/' && c != ':' && c != '.'
+            });
+            if word.starts_with("https://github.com/") && word.contains("/pull/") {
+                let url = word.trim_end_matches(|c: char| !c.is_ascii_digit());
+                if !url.is_empty() && !github_prs.iter().any(|u| u == url) {
+                    github_prs.push(url.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "id": mission.id,
+        "title": mission.title,
+        "status": mission.status,
+        "awaiting_kind": mission.awaiting_kind.map(|k| k.as_str()),
+        "terminal_reason": mission.terminal_reason,
+        "short_description": mission.short_description,
+        "backend": mission.backend,
+        "model_override": mission.model_override,
+        "model_effort": mission.model_effort,
+        "workspace_id": mission.workspace_id,
+        "workspace_name": mission.workspace_name,
+        "project": mission.project,
+        "created_at": mission.created_at,
+        "updated_at": mission.updated_at,
+        "history_len": mission.history.len(),
+        "last_user_message": last_user,
+        "last_assistant_message": last_assistant,
+        "github_prs": github_prs,
+    })))
+}
+
+/// Fleet integrity report: mission-store anomalies that otherwise fail
+/// silently — pending missions nothing will ever dispatch, active missions
+/// with no recent progress, and long-idle awaiting_user rows. Read-only;
+/// intended for a daily sweep or an on-demand health check (178 orphaned
+/// pending missions once accumulated unnoticed before this existed).
+pub async fn missions_integrity(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let missions = control
+        .mission_store
+        .list_missions(5000, 0)
+        .await
+        .map_err(internal_error)?;
+    let now = chrono::Utc::now();
+    let age_minutes = |ts: &str| -> i64 {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_minutes())
+            .unwrap_or(0)
+    };
+    let brief = |m: &Mission| {
+        serde_json::json!({
+            "id": m.id,
+            "title": m.title,
+            "status": m.status,
+            "updated_age_minutes": age_minutes(&m.updated_at),
+        })
+    };
+
+    // Pending missions: split into scheduler-visible (deferred goal set,
+    // waiting on capacity/not_before) vs orphaned (nothing will dispatch them).
+    let mut orphaned_pending: Vec<serde_json::Value> = Vec::new();
+    let mut scheduled_waiting: Vec<serde_json::Value> = Vec::new();
+    for m in missions
+        .iter()
+        .filter(|m| m.status == MissionStatus::Pending)
+    {
+        if age_minutes(&m.created_at) < 15 {
+            continue; // freshly created; give the caller time to deliver a goal
+        }
+        let has_goal = control
+            .mission_store
+            .get_deferred_goal(m.id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if has_goal {
+            scheduled_waiting.push(brief(m));
+        } else {
+            orphaned_pending.push(brief(m));
+        }
+    }
+
+    let stale_active: Vec<serde_json::Value> = missions
+        .iter()
+        .filter(|m| m.status == MissionStatus::Active && age_minutes(&m.updated_at) > 24 * 60)
+        .map(brief)
+        .collect();
+    let stale_awaiting: Vec<serde_json::Value> = missions
+        .iter()
+        .filter(|m| m.status == MissionStatus::AwaitingUser && age_minutes(&m.updated_at) > 72 * 60)
+        .map(brief)
+        .collect();
+
+    let truncate = |mut v: Vec<serde_json::Value>| -> (usize, Vec<serde_json::Value>) {
+        let count = v.len();
+        v.truncate(20);
+        (count, v)
+    };
+    let (orphaned_count, orphaned_pending) = truncate(orphaned_pending);
+    let (scheduled_count, scheduled_waiting) = truncate(scheduled_waiting);
+    let (stale_active_count, stale_active) = truncate(stale_active);
+    let (stale_awaiting_count, stale_awaiting) = truncate(stale_awaiting);
+
+    Ok(Json(serde_json::json!({
+        "generated_at": now.to_rfc3339(),
+        "scanned": missions.len(),
+        "healthy": orphaned_count == 0 && stale_active_count == 0,
+        "orphaned_pending": { "count": orphaned_count, "missions": orphaned_pending },
+        "scheduled_waiting": { "count": scheduled_count, "missions": scheduled_waiting },
+        "stale_active": { "count": stale_active_count, "missions": stale_active },
+        "stale_awaiting_user": { "count": stale_awaiting_count, "missions": stale_awaiting },
+    })))
+}
+
 /// Create a new mission and switch to it.
 /// Request body for creating a mission
 #[derive(Debug, Deserialize)]
@@ -4614,6 +4817,25 @@ pub struct CreateMissionRequest {
     pub desired_state: Option<String>,
     /// When the track should next be checked (RFC3339).
     pub next_check_at: Option<String>,
+    /// Initial prompt for the mission. Stored as the mission's deferred goal:
+    /// the FLEET-001 scheduler dispatches it as the first user message as soon
+    /// as parallel capacity allows (immediately when a slot is free, honoring
+    /// `not_before` when set). This makes create+start atomic — callers no
+    /// longer need a follow-up `POST /api/control/message`, whose delivery
+    /// used to be droppable at capacity, orphaning the mission.
+    pub prompt: Option<String>,
+    /// Remote runner node id. When set, core creates the mission locally and
+    /// dispatches `remote_command` to that node behind the remote-node flag.
+    pub remote_node_id: Option<String>,
+    /// MVP remote execution payload. Full AI mission streaming remains local.
+    pub remote_command: Option<String>,
+    /// Catch-all for unrecognized request fields. Serde ignores unknown fields
+    /// by default, which has repeatedly hidden client bugs (a `prompt` sent
+    /// before the field existed, a mistyped `target_mission_id`). Captured
+    /// here so the handler can surface them via the `X-Ignored-Fields`
+    /// response header and a warning log instead of dropping them silently.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 fn deserialize_string_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
@@ -4656,7 +4878,9 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
     let normalized = normalize_model_effort(raw)?;
     match (backend, normalized.as_str()) {
         (Some("claudecode"), "low" | "medium" | "high" | "xhigh" | "max") => Some(normalized),
-        (Some("codex"), "low" | "medium" | "high") => Some(normalized),
+        // Codex CLI accepts `model_reasoning_effort=xhigh` (verified on
+        // codex-cli 0.137); the config value is passed through verbatim.
+        (Some("codex"), "low" | "medium" | "high" | "xhigh") => Some(normalized),
         _ => None,
     }
 }
@@ -4664,7 +4888,7 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
 fn supported_model_efforts_for_backend(backend: Option<&str>) -> &'static str {
     match backend {
         Some("claudecode") => "low, medium, high, xhigh, max",
-        Some("codex") => "low, medium, high",
+        Some("codex") => "low, medium, high, xhigh",
         _ => "none",
     }
 }
@@ -4699,7 +4923,7 @@ pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     body: Option<Json<CreateMissionRequest>>,
-) -> Result<Json<Mission>, (StatusCode, String)> {
+) -> Result<(axum::http::HeaderMap, Json<Mission>), (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
     let req = body.map(|b| b.0).unwrap_or(CreateMissionRequest {
@@ -4722,7 +4946,28 @@ pub async fn create_mission(
         tags: None,
         desired_state: None,
         next_check_at: None,
+        prompt: None,
+        remote_node_id: None,
+        remote_command: None,
+        extra: Default::default(),
     });
+
+    // Fail loud on unrecognized fields: log + surface in a response header so
+    // a client bug (typo, field sent to the wrong endpoint) is observable
+    // instead of silently changing behavior.
+    let mut headers = axum::http::HeaderMap::new();
+    if !req.extra.is_empty() {
+        let ignored: Vec<&str> = req.extra.keys().map(String::as_str).collect();
+        let joined = ignored.join(",");
+        tracing::warn!(
+            user_id = %user.id,
+            ignored_fields = %joined,
+            "create_mission request carried unrecognized fields (ignored)"
+        );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&joined) {
+            headers.insert("x-ignored-fields", value);
+        }
+    }
 
     let title = req.title.clone();
     let workspace_id = req.workspace_id;
@@ -4839,6 +5084,41 @@ pub async fn create_mission(
         }
     }
 
+    // Validate the remote-node payload before persisting the mission so a
+    // bad request cannot leave an orphaned pending mission behind.
+    let remote_node_id = req
+        .remote_node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let remote_command = req
+        .remote_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(str::to_string);
+    if let Some(node_id) = remote_node_id.as_deref() {
+        if remote_command.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "remote_command is required when remote_node_id is set".to_string(),
+            ));
+        }
+        if remote_dispatch_is_scheduled_for_future(
+            Some(node_id),
+            req.not_before,
+            chrono::Utc::now(),
+        ) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "remote-node MVP does not support future not_before scheduling yet; create the remote mission after the dispatch window opens".to_string(),
+            ));
+        }
+        crate::remote_node::placement_for_selected_node(&state.config.remote_nodes, Some(node_id))
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
+
     let control = control_for_user(&state, &user).await;
     control
         .cmd_tx
@@ -4920,7 +5200,165 @@ pub async fn create_mission(
         }
     }
 
-    Ok(Json(mission))
+    // Atomic create+start: stash the initial prompt as the deferred goal. The
+    // FLEET-001 scheduler pass (every ~5s) dispatches pending missions with a
+    // deferred goal as soon as parallel capacity allows, honoring `not_before`
+    // when set. Unlike the old create-then-message pattern, this cannot be
+    // dropped at capacity.
+    if let Some(prompt) = nonblank(&req.prompt) {
+        control
+            .mission_store
+            .set_deferred_goal(mission.id, Some(prompt.clone()))
+            .await
+            .map_err(internal_error)?;
+        // Surface the queued goal so UIs show it as pending until dispatch.
+        let _ = control.events_tx.send(AgentEvent::UserMessage {
+            id: Uuid::new_v4(),
+            content: prompt,
+            queued: true,
+            mission_id: Some(mission.id),
+            source: Some(format!("api:{}", user.id)),
+        });
+    }
+
+    if let (Some(remote_node_id), Some(remote_command)) =
+        (remote_node_id.as_deref(), remote_command.as_deref())
+    {
+        match dispatch_remote_mission_mvp(
+            &state,
+            &control,
+            &mission,
+            remote_node_id,
+            remote_command,
+        )
+        .await
+        {
+            Ok(updated) => return Ok((headers, Json(updated))),
+            Err(message) => {
+                let _ = control
+                    .mission_store
+                    .update_mission_status_with_reason(
+                        mission.id,
+                        MissionStatus::Failed,
+                        Some("remote_dispatch_failed"),
+                    )
+                    .await;
+                let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                    mission_id: mission.id,
+                    status: MissionStatus::Failed,
+                    summary: Some(message.clone()),
+                });
+                return Err((StatusCode::BAD_GATEWAY, message));
+            }
+        }
+    }
+
+    Ok((headers, Json(mission)))
+}
+
+fn remote_dispatch_is_scheduled_for_future(
+    remote_node_id: Option<&str>,
+    not_before: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    remote_node_id
+        .map(str::trim)
+        .is_some_and(|id| !id.is_empty())
+        && not_before.is_some_and(|t| t > now)
+}
+
+async fn dispatch_remote_mission_mvp(
+    state: &Arc<AppState>,
+    control: &ControlState,
+    mission: &Mission,
+    remote_node_id: &str,
+    remote_command: &str,
+) -> Result<Mission, String> {
+    let node = crate::remote_node::placement_for_selected_node(
+        &state.config.remote_nodes,
+        Some(remote_node_id),
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "remote node placement unexpectedly returned local".to_string())?;
+    let shared_token = std::env::var(&node.token_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "remote node '{}' has no token in {}",
+                node.id, node.token_env
+            )
+        })?;
+    let claims = crate::remote_node::LeaseClaims {
+        mission_id: mission.id,
+        node_id: node.id.clone(),
+        scope: "mission:execute".to_string(),
+        expires_at: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp(),
+    };
+    let lease_token = crate::remote_node::create_lease_token(&claims, &shared_token)
+        .map_err(|e| e.to_string())?;
+    let request = crate::remote_node::LeaseRequest {
+        mission_id: mission.id,
+        node_id: node.id.clone(),
+        lease_token,
+        command: remote_command.to_string(),
+    };
+
+    control
+        .mission_store
+        .update_mission_status(mission.id, MissionStatus::Active)
+        .await?;
+    let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        mission_id: mission.id,
+        status: MissionStatus::Active,
+        summary: Some(format!("Dispatching to remote node '{}'", node.id)),
+    });
+
+    let client = crate::remote_node::RemoteNodeClient::default();
+    let response = client
+        .execute(node, &shared_token, &request)
+        .await
+        .map_err(|e| e.to_string())?;
+    let success = response.exit_code == Some(0);
+    let content = format!(
+        "Remote node '{}' exited with {:?}\n\nstdout:\n{}\n\nstderr:\n{}",
+        node.id, response.exit_code, response.stdout, response.stderr
+    );
+    let event = AgentEvent::AssistantMessage {
+        id: Uuid::new_v4(),
+        content,
+        success,
+        cost_cents: 0,
+        cost_source: crate::agents::CostSource::Unknown,
+        usage: None,
+        model: None,
+        model_normalized: None,
+        mission_id: Some(mission.id),
+        shared_files: None,
+        resumable: !success,
+        completion_evidence: None,
+    };
+    let _ = control.mission_store.log_event(mission.id, &event).await;
+    let _ = control.events_tx.send(event);
+    let status = if success {
+        MissionStatus::Completed
+    } else {
+        MissionStatus::Failed
+    };
+    control
+        .mission_store
+        .update_mission_status_with_reason(mission.id, status, Some("remote_node_mvp"))
+        .await?;
+    let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        mission_id: mission.id,
+        status,
+        summary: Some(format!("Remote node '{}' finished", node.id)),
+    });
+    control
+        .mission_store
+        .get_mission(mission.id)
+        .await?
+        .ok_or_else(|| format!("Mission {} disappeared after remote dispatch", mission.id))
 }
 
 /// Request body for `POST /api/control/missions/:id/project`. Tri-state per
@@ -5813,6 +6251,139 @@ pub async fn get_mission_events(
     Ok(response)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AlertsFeedQuery {
+    /// Comma-separated mission statuses to keep (e.g. `awaiting_user,failed`).
+    pub statuses: Option<String>,
+    /// Timestamp cursor: return alerts strictly older than this.
+    pub before: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlertFeedDelivery {
+    pub channel: &'static str,
+    pub status: String,
+    pub sent_at: Option<String>,
+    pub acknowledged_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlertFeedEntry {
+    pub mission_id: Uuid,
+    pub status: String,
+    pub summary: String,
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission: Option<mission_store::MissionSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<AlertFeedDelivery>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlertsFeedResponse {
+    pub alerts: Vec<AlertFeedEntry>,
+    pub next_cursor: Option<String>,
+}
+
+/// Cross-mission feed of status-change alerts, newest first. Source of truth
+/// is `mission_events` (`mission_status_changed`), decorated best-effort with
+/// mission summaries and Telegram delivery state.
+pub async fn get_alerts_feed(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    axum::extract::Query(query): axum::extract::Query<AlertsFeedQuery>,
+) -> Result<Json<AlertsFeedResponse>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+
+    let events = control
+        .mission_store
+        .get_status_events_global(query.before.as_deref(), limit)
+        .await
+        .map_err(internal_error)?;
+
+    // Cursor comes from the raw (unfiltered) page so pagination never stalls
+    // even when a status filter empties a page.
+    let next_cursor = if events.len() == limit {
+        events.last().map(|e| e.timestamp.clone())
+    } else {
+        None
+    };
+
+    let wanted: Option<Vec<String>> = query.statuses.as_deref().map(|s| {
+        s.split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    });
+
+    let mut entries: Vec<AlertFeedEntry> = events
+        .into_iter()
+        .filter_map(|e| {
+            let status = e.metadata.get("status")?.as_str()?.to_string();
+            if let Some(wanted) = &wanted {
+                if !wanted.contains(&status) {
+                    return None;
+                }
+            }
+            Some(AlertFeedEntry {
+                mission_id: e.mission_id,
+                status,
+                summary: e.content,
+                timestamp: e.timestamp,
+                mission: None,
+                delivery: None,
+            })
+        })
+        .collect();
+
+    let mission_ids: Vec<Uuid> = {
+        let mut ids: Vec<Uuid> = entries.iter().map(|e| e.mission_id).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    };
+
+    let summaries = control
+        .mission_store
+        .get_mission_summaries(&mission_ids)
+        .await
+        .map_err(internal_error)?;
+    let telegram_alerts = control
+        .mission_store
+        .list_telegram_alerts_for_missions(&mission_ids)
+        .await
+        .unwrap_or_default();
+
+    for entry in &mut entries {
+        entry.mission = summaries.get(&entry.mission_id).cloned();
+        // Loose join: telegram_alerts has no FK to the event row; match the
+        // alert class (`mission_<status>` before any `:` suffix). The list is
+        // ordered created_at DESC, so the first match is the most recent.
+        let class = format!("mission_{}", entry.status);
+        entry.delivery = telegram_alerts
+            .iter()
+            .find(|a| {
+                a.mission_id == Some(entry.mission_id)
+                    && a.event_kind.split(':').next().unwrap_or(&a.event_kind) == class
+            })
+            .map(|a| AlertFeedDelivery {
+                channel: "telegram",
+                status: a.status.clone(),
+                sent_at: a.sent_at.clone(),
+                acknowledged_at: a.acknowledged_at.clone(),
+                last_error: a.last_error.clone(),
+            });
+    }
+
+    Ok(Json(AlertsFeedResponse {
+        alerts: entries,
+        next_cursor,
+    }))
+}
+
 pub async fn get_mission_tool_call_events(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -6368,9 +6939,13 @@ pub async fn clone_mission(
         },
         desired_state: source.project.desired_state.clone(),
         next_check_at: source.project.next_check_at.clone(),
+        prompt: None,
+        remote_node_id: None,
+        remote_command: None,
+        extra: Default::default(),
     };
 
-    let cloned = create_mission(State(state), Extension(user), Some(Json(req))).await?;
+    let (_headers, cloned) = create_mission(State(state), Extension(user), Some(Json(req))).await?;
     let clone_id = cloned.0.id;
 
     // Optionally seed the clone with the source's conversation history
@@ -7540,6 +8115,7 @@ async fn paloma_webhook_forwarder_loop(
     mission_store: Arc<dyn MissionStore>,
     workspaces: workspace::SharedWorkspaceStore,
     url: String,
+    secret: Option<String>,
     http: reqwest::Client,
 ) {
     tracing::info!(webhook_url = %url, "Paloma mission-status webhook forwarder started");
@@ -7576,6 +8152,7 @@ async fn paloma_webhook_forwarder_loop(
                 // webhook can stall the broadcast receiver and lag-drop events.
                 let http = http.clone();
                 let url = url.clone();
+                let secret = secret.clone();
                 let mission_store = Arc::clone(&mission_store);
                 let workspaces = workspaces.clone();
                 let sem = Arc::clone(&sem);
@@ -7603,6 +8180,12 @@ async fn paloma_webhook_forwarder_loop(
                         "sequence": seq,
                         "mission_id": mission_id,
                         "status": status,
+                        // Event-type mirror of `status` so consumers with
+                        // route-level event filters (e.g. the Hermes webhook
+                        // platform reads `payload.type`) can drop unwanted
+                        // transitions like `acknowledged` before spawning an
+                        // agent run.
+                        "type": status,
                         "title": title,
                         "short_description": mission
                             .as_ref()
@@ -7635,12 +8218,45 @@ async fn paloma_webhook_forwarder_loop(
                             .map(|k| k.as_str()),
                     });
 
+                    // Serialize once so the signature is computed over the
+                    // exact bytes sent (consumers verify HMAC over the raw
+                    // body, e.g. the Hermes webhook platform's GitHub-style
+                    // `X-Hub-Signature-256` check).
+                    let payload = match serde_json::to_vec(&body) {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                "Failed to serialize Paloma webhook payload: {}",
+                                err
+                            );
+                            return;
+                        }
+                    };
+                    let signature = secret.as_ref().and_then(|secret| {
+                        use hmac::{Hmac, Mac};
+                        let mut mac =
+                            Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+                        mac.update(&payload);
+                        Some(format!(
+                            "sha256={}",
+                            hex::encode(mac.finalize().into_bytes())
+                        ))
+                    });
+
                     // At-least-once: retry transient failures with the SAME
                     // event_id so the consumer can dedupe. Bounded so a dead
                     // endpoint can't pile up tasks.
                     const MAX_ATTEMPTS: u32 = 3;
                     for attempt in 1..=MAX_ATTEMPTS {
-                        match http.post(&url).json(&body).send().await {
+                        let mut request = http
+                            .post(&url)
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .body(payload.clone());
+                        if let Some(signature) = signature.as_deref() {
+                            request = request.header("X-Hub-Signature-256", signature);
+                        }
+                        match request.send().await {
                             Ok(resp) if resp.status().is_success() => break,
                             Ok(resp) => {
                                 tracing::warn!(
@@ -7787,6 +8403,7 @@ fn spawn_control_session(
             Arc::clone(&state.mission_store),
             workspaces.clone(),
             url.clone(),
+            config.paloma_webhook_secret.clone(),
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(10))
@@ -10404,20 +11021,59 @@ async fn control_actor_loop(
                                 let max_parallel = crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
 
                                 if total_running >= max_parallel {
-                                    tracing::warn!(
-                                        "Cannot start parallel mission {}: max {} reached. \
-                                         Dropping targeted message to avoid sending to wrong mission.",
-                                        tid, max_parallel
-                                    );
-                                    let _ = events_tx.send(AgentEvent::Error {
-                                        message: format!(
-                                            "Cannot start mission {}: max parallel missions ({}) reached",
-                                            tid, max_parallel
-                                        ),
-                                        mission_id: Some(tid),
-                                        resumable: true,
-                                    });
-                                    let _ = respond.send(UserMessageAck::Dropped);
+                                    // At capacity, dropping the message would orphan the
+                                    // mission: it stays Pending with no deferred_goal, so
+                                    // the FLEET-001 scheduler never dispatches it and the
+                                    // HTTP response (`queued: false`) is indistinguishable
+                                    // from a successful delivery. Stash the content as the
+                                    // deferred goal instead — the scheduler pass re-injects
+                                    // it as a normal targeted message once a slot frees.
+                                    let combined = match mission_store
+                                        .get_deferred_goal(tid)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                    {
+                                        Some(prev) if !prev.is_empty() => {
+                                            format!("{prev}\n{content}")
+                                        }
+                                        _ => content.clone(),
+                                    };
+                                    match mission_store.set_deferred_goal(tid, Some(combined)).await
+                                    {
+                                        Ok(()) => {
+                                            tracing::info!(
+                                                mission_id = %tid,
+                                                max_parallel,
+                                                "At capacity: deferring targeted message as scheduled goal"
+                                            );
+                                            let _ = events_tx.send(AgentEvent::UserMessage {
+                                                id,
+                                                content: content.clone(),
+                                                queued: true,
+                                                mission_id: Some(tid),
+                                                source: source.clone(),
+                                            });
+                                            let _ = respond.send(UserMessageAck::Queued);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                mission_id = %tid,
+                                                "Cannot start parallel mission (max {} reached) and \
+                                                 failed to stash deferred goal: {e}",
+                                                max_parallel
+                                            );
+                                            let _ = events_tx.send(AgentEvent::Error {
+                                                message: format!(
+                                                    "Cannot start mission {}: max parallel missions ({}) reached",
+                                                    tid, max_parallel
+                                                ),
+                                                mission_id: Some(tid),
+                                                resumable: true,
+                                            });
+                                            let _ = respond.send(UserMessageAck::Dropped);
+                                        }
+                                    }
                                     continue;
                                 } else {
                                     // Load mission and start in parallel
@@ -20403,6 +21059,27 @@ Investigate <service/> failures.
         // until the user resumes it), so they are not activation-eligible here.
         assert!(!message_activates_mission(MissionStatus::Active));
         assert!(!message_activates_mission(MissionStatus::Paused));
+    }
+
+    #[test]
+    fn remote_dispatch_future_not_before_is_not_immediate() {
+        let now = chrono::Utc::now();
+
+        assert!(remote_dispatch_is_scheduled_for_future(
+            Some("babylon"),
+            Some(now + chrono::Duration::minutes(5)),
+            now
+        ));
+        assert!(!remote_dispatch_is_scheduled_for_future(
+            Some("babylon"),
+            Some(now - chrono::Duration::minutes(5)),
+            now
+        ));
+        assert!(!remote_dispatch_is_scheduled_for_future(
+            None,
+            Some(now + chrono::Duration::minutes(5)),
+            now
+        ));
     }
 
     #[tokio::test]

@@ -349,7 +349,7 @@ Gemini CLI login flow. Gemini missions use raw model ids such as
 
 Configure xAI credentials in **Settings → Providers**, set `XAI_API_KEY` or
 `GROK_CODE_XAI_API_KEY`, or run the Grok CLI login flow. Grok missions use raw
-model ids such as `grok-4.3`.
+model ids such as `grok-4.5`.
 
 ---
 
