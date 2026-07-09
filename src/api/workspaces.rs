@@ -879,13 +879,7 @@ fn normalize_distro_value(value: &str) -> Result<String, (StatusCode, String)> {
 }
 
 fn normalize_init_script(value: Option<String>) -> Option<String> {
-    value.and_then(|script| {
-        if script.trim().is_empty() {
-            None
-        } else {
-            Some(script)
-        }
-    })
+    value.filter(|script| !script.trim().is_empty())
 }
 
 fn sanitize_env_vars(env_vars: HashMap<String, String>) -> HashMap<String, String> {

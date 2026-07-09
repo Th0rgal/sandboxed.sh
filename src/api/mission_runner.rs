@@ -1767,17 +1767,15 @@ fn handle_part_update(
         if !delta.is_empty() || full_text.is_none() {
             buffer.push_str(delta);
             buffer.clone()
-        } else if let Some(full) = full_text {
+        } else {
+            let full = full_text?;
             *buffer = full.to_string();
             buffer.clone()
-        } else {
-            return None;
         }
-    } else if let Some(full) = full_text {
+    } else {
+        let full = full_text?;
         *buffer = full.to_string();
         buffer.clone()
-    } else {
-        return None;
     };
 
     let mut content = content;
