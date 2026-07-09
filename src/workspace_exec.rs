@@ -244,6 +244,30 @@ fn resolve_resource_var(workspace_env: &HashMap<String, String>, key: &str) -> O
         .filter(|v| !v.is_empty())
 }
 
+fn build_container_resolv_conf(content: &str) -> String {
+    let search_line = content
+        .lines()
+        .find(|line| line.starts_with("search ") || line.starts_with("domain "))
+        .map(str::to_string);
+    let include_tailnet = content.contains(".ts.net") || content.contains("tailscale");
+
+    let mut resolved = String::new();
+    // Public resolvers must come first. Tailscale MagicDNS can be unavailable
+    // during workspace/provider preflight while tailscaled is still bootstrapping;
+    // if 100.100.100.100 is first, provider DNS (api.anthropic.com, api.openai.com)
+    // can fail before the mission prompt ever starts.
+    resolved.push_str("nameserver 1.1.1.1\n");
+    resolved.push_str("nameserver 8.8.8.8\n");
+    if let Some(line) = search_line {
+        resolved.push_str(&line);
+        resolved.push('\n');
+    }
+    if include_tailnet {
+        resolved.push_str("nameserver 100.100.100.100\n");
+    }
+    resolved
+}
+
 fn select_container_resolv_conf() -> Option<PathBuf> {
     let default_path = PathBuf::from("/etc/resolv.conf");
     let content = fs::read_to_string(&default_path).ok()?;
@@ -252,22 +276,7 @@ fn select_container_resolv_conf() -> Option<PathBuf> {
         return Some(default_path);
     }
 
-    let search_line = content
-        .lines()
-        .find(|line| line.starts_with("search ") || line.starts_with("domain "))
-        .map(str::to_string);
-    let include_tailnet = content.contains(".ts.net") || content.contains("tailscale");
-
-    let mut resolved = String::new();
-    if let Some(line) = search_line {
-        resolved.push_str(&line);
-        resolved.push('\n');
-    }
-    if include_tailnet {
-        resolved.push_str("nameserver 100.100.100.100\n");
-    }
-    resolved.push_str("nameserver 1.1.1.1\n");
-    resolved.push_str("nameserver 8.8.8.8\n");
+    let resolved = build_container_resolv_conf(&content);
 
     let custom_path = PathBuf::from("/var/lib/opencode/.sandboxed-sh/resolv.conf");
     if let Some(parent) = custom_path.parent() {
@@ -282,23 +291,58 @@ fn select_container_resolv_conf() -> Option<PathBuf> {
     Some(custom_path)
 }
 
+/// Returns the `systemd-nspawn --bind-ro=…` argument for `/etc/resolv.conf`,
+/// substituting the reordered resolver (public DNS before MagicDNS) when the
+/// host resolver is a local stub. Shared by exec and the API preflight path so
+/// both avoid binding a MagicDNS-first resolver into containers.
+pub(crate) fn resolv_conf_bind_arg() -> Option<String> {
+    let path = select_container_resolv_conf()?;
+    if path == Path::new("/etc/resolv.conf") {
+        Some("--bind-ro=/etc/resolv.conf".to_string())
+    } else {
+        Some(format!("--bind-ro={}:/etc/resolv.conf", path.display()))
+    }
+}
+
 fn bind_resolv_conf(cmd: &mut Command) {
-    if let Some(path) = select_container_resolv_conf() {
-        if path == Path::new("/etc/resolv.conf") {
-            cmd.arg("--bind-ro=/etc/resolv.conf");
-        } else {
-            cmd.arg(format!(
-                "--bind-ro={}:{}",
-                path.display(),
-                "/etc/resolv.conf"
-            ));
-        }
+    if let Some(arg) = resolv_conf_bind_arg() {
+        cmd.arg(arg);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{environ_has_keepalive_marker, normalize_container_path};
+    use super::{
+        build_container_resolv_conf, environ_has_keepalive_marker, normalize_container_path,
+    };
+
+    #[test]
+    fn generated_resolv_conf_prefers_public_dns_before_magicdns() {
+        let resolv =
+            build_container_resolv_conf("nameserver 127.0.0.53\nsearch gazella-vector.ts.net\n");
+        let lines: Vec<_> = resolv.lines().collect();
+
+        assert_eq!(lines[0], "nameserver 1.1.1.1");
+        assert_eq!(lines[1], "nameserver 8.8.8.8");
+        assert!(lines.contains(&"search gazella-vector.ts.net"));
+        assert!(lines.contains(&"nameserver 100.100.100.100"));
+        assert!(
+            lines
+                .iter()
+                .position(|line| *line == "nameserver 100.100.100.100")
+                .unwrap()
+                > 1
+        );
+    }
+
+    #[test]
+    fn generated_resolv_conf_omits_magicdns_without_tailnet_search_domain() {
+        let resolv = build_container_resolv_conf("nameserver 127.0.0.53\nsearch example.com\n");
+
+        assert!(resolv.starts_with("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"));
+        assert!(resolv.contains("search example.com\n"));
+        assert!(!resolv.contains("100.100.100.100"));
+    }
 
     #[test]
     fn container_path_adds_system_dirs_when_missing() {

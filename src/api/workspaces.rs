@@ -955,7 +955,9 @@ pub fn build_nspawn_command(
             let tailscale_requested = crate::nspawn::tailscale_enabled(&workspace.env_vars);
 
             let tailscale_enabled = if use_shared_network {
-                nspawn_args.push("--bind-ro=/etc/resolv.conf".to_string());
+                if let Some(arg) = crate::workspace_exec::resolv_conf_bind_arg() {
+                    nspawn_args.push(arg);
+                }
                 false
             } else if tailscale_requested {
                 nspawn_args.push("--network-veth".to_string());
@@ -965,7 +967,9 @@ pub fn build_nspawn_command(
                 }
                 true
             } else {
-                nspawn_args.push("--bind-ro=/etc/resolv.conf".to_string());
+                if let Some(arg) = crate::workspace_exec::resolv_conf_bind_arg() {
+                    nspawn_args.push(arg);
+                }
                 false
             };
 
