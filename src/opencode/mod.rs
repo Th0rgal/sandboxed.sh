@@ -923,17 +923,15 @@ fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option
         if !delta.is_empty() || full_text.is_none() {
             fold_stream_delta(buffer, delta);
             buffer.clone()
-        } else if let Some(full) = full_text {
+        } else {
+            let full = full_text?;
             *buffer = full.to_string();
             buffer.clone()
-        } else {
-            return None;
         }
-    } else if let Some(full) = full_text {
+    } else {
+        let full = full_text?;
         *buffer = full.to_string();
         buffer.clone()
-    } else {
-        return None;
     };
 
     if role.is_none()

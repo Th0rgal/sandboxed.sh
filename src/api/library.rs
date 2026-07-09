@@ -895,15 +895,13 @@ fn find_zip_prefix(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -> Opt
     for i in 0..archive.len() {
         if let Ok(file) = archive.by_index(i) {
             let name = file.name();
-            if let Some(slash_pos) = name.find('/') {
-                let dir = &name[..=slash_pos];
-                match &first_dir {
-                    None => first_dir = Some(dir.to_string()),
-                    Some(d) if d != dir => return None, // Multiple root dirs
-                    _ => {}
-                }
-            } else {
-                return None; // File at root level
+            // A file at root level (no '/') means no common prefix
+            let slash_pos = name.find('/')?;
+            let dir = &name[..=slash_pos];
+            match &first_dir {
+                None => first_dir = Some(dir.to_string()),
+                Some(d) if d != dir => return None, // Multiple root dirs
+                _ => {}
             }
         }
     }

@@ -308,6 +308,16 @@ fn resolv_conf_bind_args(path: &Path) -> Vec<String> {
     vec!["--resolv-conf=off".to_string(), bind_arg]
 }
 
+/// Nspawn arguments binding the container `/etc/resolv.conf`, preferring the
+/// synthesized resolver (public DNS before MagicDNS) when the host resolver is
+/// a local stub. Shared with the API preflight path so both avoid binding a
+/// MagicDNS-first resolver into containers.
+pub(crate) fn resolv_conf_nspawn_args() -> Vec<String> {
+    select_container_resolv_conf()
+        .map(|path| resolv_conf_bind_args(&path))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
