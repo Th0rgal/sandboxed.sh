@@ -4980,6 +4980,8 @@ pub(crate) fn ensure_opencode_provider_for_model(
             let base_url = std::env::var("ZAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.z.ai/api/coding/paas/v4".to_string());
             Some(serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Z.AI",
                 "models": {
                     model_id: model_entry.clone()
                 },
@@ -5079,6 +5081,20 @@ pub(crate) fn ensure_opencode_provider_for_model(
             Some(o) => o,
             None => return,
         };
+        // Backfill adapter fields missing from blocks persisted by older
+        // builds — without `npm` the AI-SDK loads a broken transport
+        // ("fn3 is not a function").
+        let mut repaired = false;
+        if let Some(def) = provider_def.as_object() {
+            for key in ["npm", "name", "options"] {
+                if !obj.contains_key(key) {
+                    if let Some(value) = def.get(key) {
+                        obj.insert(key.to_string(), value.clone());
+                        repaired = true;
+                    }
+                }
+            }
+        }
         let models = obj
             .entry("models".to_string())
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
@@ -5096,7 +5112,7 @@ pub(crate) fn ensure_opencode_provider_for_model(
                         }
                     }
                 }
-            } else {
+            } else if !repaired {
                 return; // already present, nothing to do
             }
         } else {
@@ -9350,6 +9366,99 @@ mod tests {
             opencode_json["provider"]["spark"]["options"]["baseURL"],
             "https://spark-de79.gazella-vector.ts.net/v1"
         );
+    }
+
+    #[test]
+    fn ensure_provider_for_model_injects_zai_openai_compatible_adapter() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_dir = temp_dir.path().join("app");
+        let config_dir = temp_dir.path().join("opencode");
+        fs::create_dir_all(&app_dir).expect("app dir");
+        fs::create_dir_all(&config_dir).expect("config dir");
+
+        ensure_opencode_provider_for_model(&config_dir, &app_dir, "zai/glm-5.2", "127.0.0.1", None);
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        let provider = &opencode_json["provider"]["zai"];
+        assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(provider["name"], "Z.AI");
+        assert_eq!(
+            provider["options"]["baseURL"],
+            "https://api.z.ai/api/coding/paas/v4"
+        );
+        assert_eq!(provider["models"]["glm-5.2"]["name"], "glm-5.2");
+        assert_eq!(
+            provider["models"]["glm-5.2"]["capabilities"]["interleaved"]["field"],
+            "reasoning_content"
+        );
+    }
+
+    #[test]
+    fn ensure_provider_for_model_repairs_existing_partial_zai_block() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_dir = temp_dir.path().join("app");
+        let config_dir = temp_dir.path().join("opencode");
+        fs::create_dir_all(&app_dir).expect("app dir");
+        fs::create_dir_all(&config_dir).expect("config dir");
+
+        // Simulate a config persisted by an older build that omitted the
+        // adapter fields (`npm`/`name`), which crashed OpenCode's transport.
+        fs::write(
+            config_dir.join("opencode.json"),
+            serde_json::json!({
+                "provider": {
+                    "zai": {
+                        "models": { "glm-5.2": { "name": "glm-5.2" } },
+                        "options": { "baseURL": "https://custom.example/v4" }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write opencode.json");
+
+        ensure_opencode_provider_for_model(&config_dir, &app_dir, "zai/glm-5.2", "127.0.0.1", None);
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        let provider = &opencode_json["provider"]["zai"];
+        assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(provider["name"], "Z.AI");
+        // Existing options must not be clobbered.
+        assert_eq!(provider["options"]["baseURL"], "https://custom.example/v4");
+        assert_eq!(provider["models"]["glm-5.2"]["name"], "glm-5.2");
+    }
+
+    #[test]
+    fn ensure_provider_for_model_injects_minimax_openai_compatible_adapter() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_dir = temp_dir.path().join("app");
+        let config_dir = temp_dir.path().join("opencode");
+        fs::create_dir_all(&app_dir).expect("app dir");
+        fs::create_dir_all(&config_dir).expect("config dir");
+
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "minimax/MiniMax-M3",
+            "127.0.0.1",
+            None,
+        );
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        let provider = &opencode_json["provider"]["minimax"];
+        assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(provider["name"], "Minimax");
+        assert_eq!(provider["options"]["baseURL"], "https://api.minimax.io/v1");
+        assert_eq!(provider["models"]["MiniMax-M3"]["name"], "MiniMax-M3");
     }
 
     #[test]
