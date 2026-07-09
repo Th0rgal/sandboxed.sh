@@ -2548,7 +2548,7 @@ pub(crate) async fn resolve_claudecode_default_model(
 pub(crate) fn resolve_codex_default_model() -> String {
     // Keep aligned with Codex upstream:
     // https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json
-    "gpt-5.5".to_string()
+    "gpt-5.6".to_string()
 }
 
 /// Return the default model for Gemini CLI when no override is specified.

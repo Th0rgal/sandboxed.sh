@@ -312,6 +312,7 @@ function isNativeCodexRuntime(model: string | null, baseUrl: string | null) {
 
   return (
     normalizedModel.includes("openai-codex") ||
+    normalizedModel.includes("gpt-5.6") ||
     normalizedModel.includes("gpt-5.5") ||
     normalizedBaseUrl.includes("chatgpt.com/backend-api/codex")
   );

@@ -778,7 +778,7 @@ mod tests {
                         title: "first".into(),
                         prompt: "do x".into(),
                         backend: "codex".into(),
-                        model_override: Some("gpt-5.5".into()),
+                        model_override: Some("gpt-5.6".into()),
                         model_effort: None,
                         working_directory: None,
                         depends_on: vec![],
