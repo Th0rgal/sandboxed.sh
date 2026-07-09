@@ -950,11 +950,6 @@ fn default_providers_config() -> ProvidersConfig {
                         ),
                     },
                     ProviderModel {
-                        id: "grok-4.5".to_string(),
-                        name: "Grok 4.5".to_string(),
-                        description: Some("Latest flagship Grok model".to_string()),
-                    },
-                    ProviderModel {
                         id: "grok-4.3".to_string(),
                         name: "Grok 4.3".to_string(),
                         description: Some("Previous flagship Grok model".to_string()),
@@ -2321,13 +2316,11 @@ pub async fn validate_model_override(
         "grok" => {
             let xai = providers.iter().find(|p| p.id == "xai");
             if let Some(provider) = xai {
-                if provider.models.iter().any(|m| m.id == model_override)
-                    || is_custom_grok_model_id(model_override)
-                {
+                if provider.models.iter().any(|m| m.id == model_override) {
                     Ok(())
                 } else {
                     Err(format!(
-                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use the 'grok-*' id format (note: 'composer-*' / 'composer-2.5' is a product name, not a valid xAI API id)",
+                        "Model '{}' not found in xAI/Grok CLI catalog. Available models: {}. Run `grok models` on the server to verify account-level availability; 'composer-*' / 'composer-2.5' is a product name, not a valid xAI API id.",
                         model_override,
                         provider
                             .models
@@ -2338,11 +2331,9 @@ pub async fn validate_model_override(
                             .join(", ")
                     ))
                 }
-            } else if is_custom_grok_model_id(model_override) {
-                Ok(())
             } else {
                 Err(format!(
-                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.5' or 'grok-build-0.1'), got '{}'",
+                    "xAI provider not configured. Expected a cataloged Grok model ID (e.g., 'grok-build-0.1'), got '{}'",
                     model_override
                 ))
             }
@@ -2512,8 +2503,11 @@ mod tests {
         // The CLI-valid coding model id (bare `grok-build` is rejected by
         // current CLIs). `composer-2.5` is intentionally NOT here: it's a
         // product name, not a valid xAI API id, and the API rejects it.
+        // `grok-4.5` is intentionally not seeded unless live account catalog
+        // discovery returns it; Grok CLI 0.2.93 rejects it with "unknown model id"
+        // for the current production OAuth/API token.
         assert!(xai.models.iter().any(|model| model.id == "grok-build-0.1"));
-        assert!(xai.models.iter().any(|model| model.id == "grok-4.5"));
+        assert!(!xai.models.iter().any(|model| model.id == "grok-4.5"));
         assert!(!xai.models.iter().any(|model| model.id == "composer-2.5"));
     }
 
@@ -2543,7 +2537,7 @@ mod tests {
             .collect();
 
         assert!(option_ids.contains(&"grok-build-0.1"));
-        assert!(option_ids.contains(&"grok-4.5"));
+        assert!(!option_ids.contains(&"grok-4.5"));
         assert!(!option_ids.contains(&"composer-2.5"));
     }
 
