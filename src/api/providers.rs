@@ -67,6 +67,19 @@ const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
     "meta-llama/llama-3.3-70b-instruct:free",
 ];
 
+/// Text/code model IDs accepted by the native Grok CLI backend for the current
+/// OAuth-based Grok Build path. This is intentionally narrower than xAI's
+/// OpenAI-compatible `/v1/models` catalog: API-routable models such as
+/// `grok-4.5` can still appear as `xai/grok-4.5` for the custom router, but the
+/// `grok` backend must only offer IDs that `grok --model ...` accepts.
+const GROK_CLI_TEXT_MODEL_IDS: &[&str] = &[
+    "grok-build-0.1",
+    "grok-4.3",
+    "grok-4.20-0309-reasoning",
+    "grok-4.20-0309-non-reasoning",
+    "grok-4.20-multi-agent-0309",
+];
+
 /// Maximum length (in `char`s) of a model description surfaced from a
 /// `/v1/models` entry. OpenRouter descriptions can run several paragraphs; the
 /// picker only needs a short blurb.
@@ -958,6 +971,16 @@ fn default_providers_config() -> ProvidersConfig {
                         id: "grok-4.20-0309-reasoning".to_string(),
                         name: "Grok 4.20 (Reasoning)".to_string(),
                         description: Some("Grok 4.20 reasoning model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "grok-4.20-0309-non-reasoning".to_string(),
+                        name: "Grok 4.20 (Non-Reasoning)".to_string(),
+                        description: Some("Grok 4.20 non-reasoning model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "grok-4.20-multi-agent-0309".to_string(),
+                        name: "Grok 4.20 Multi-Agent".to_string(),
+                        description: Some("Grok 4.20 multi-agent model".to_string()),
                     },
                 ],
             },
@@ -2316,17 +2339,20 @@ pub async fn validate_model_override(
         "grok" => {
             let xai = providers.iter().find(|p| p.id == "xai");
             if let Some(provider) = xai {
-                if provider.models.iter().any(|m| m.id == model_override) {
+                let cli_models: Vec<&ProviderModel> = provider
+                    .models
+                    .iter()
+                    .filter(|model| is_grok_backend_model_id(&model.id))
+                    .collect();
+                if cli_models.iter().any(|m| m.id == model_override) {
                     Ok(())
                 } else {
                     Err(format!(
                         "Model '{}' not found in xAI/Grok CLI catalog. Available models: {}. Run `grok models` on the server to verify account-level availability; 'composer-*' / 'composer-2.5' is a product name, not a valid xAI API id.",
                         model_override,
-                        provider
-                            .models
+                        cli_models
                             .iter()
-                            .map(|m| &m.id)
-                            .cloned()
+                            .map(|m| m.id.as_str())
                             .collect::<Vec<_>>()
                             .join(", ")
                     ))
@@ -2345,15 +2371,8 @@ pub async fn validate_model_override(
     }
 }
 
-fn is_custom_grok_model_id(model_id: &str) -> bool {
-    // Only `grok-*` ids are accepted by the xAI API. `composer-*` is a product
-    // name (Cursor / Grok Build "Composer 2.5") that the API rejects with
-    // "Model not found", so we don't treat it as a valid custom Grok id.
-    model_id.starts_with("grok-")
-}
-
 fn is_grok_backend_model_id(model_id: &str) -> bool {
-    is_custom_grok_model_id(model_id)
+    GROK_CLI_TEXT_MODEL_IDS.contains(&model_id)
 }
 
 #[cfg(test)]
@@ -2512,13 +2531,19 @@ mod tests {
     }
 
     #[test]
-    fn grok_custom_model_prefixes_reject_composer() {
-        assert!(is_custom_grok_model_id("grok-4.5"));
-        assert!(is_custom_grok_model_id("grok-4.3"));
-        assert!(is_custom_grok_model_id("grok-build-0.1"));
-        // `composer-*` is a product name the xAI API rejects ("Model not found").
-        assert!(!is_custom_grok_model_id("composer-2.5"));
-        assert!(!is_custom_grok_model_id("claude-opus-4-7"));
+    fn grok_backend_model_ids_are_cli_text_allowlist() {
+        assert!(is_grok_backend_model_id("grok-build-0.1"));
+        assert!(is_grok_backend_model_id("grok-4.20-0309-reasoning"));
+        assert!(is_grok_backend_model_id("grok-4.20-0309-non-reasoning"));
+        assert!(is_grok_backend_model_id("grok-4.20-multi-agent-0309"));
+        // xAI API/catalog IDs are not automatically valid for the native
+        // Grok CLI backend. Prod Grok CLI 0.2.93 currently rejects this one
+        // with "unknown model id".
+        assert!(!is_grok_backend_model_id("grok-4.5"));
+        assert!(!is_grok_backend_model_id("grok-imagine-image"));
+        // `composer-*` is a product name, not a Grok CLI model id.
+        assert!(!is_grok_backend_model_id("composer-2.5"));
+        assert!(!is_grok_backend_model_id("claude-opus-4-7"));
     }
 
     #[test]
