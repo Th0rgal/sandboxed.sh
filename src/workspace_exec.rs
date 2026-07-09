@@ -85,6 +85,10 @@ fn normalize_container_path(existing: Option<&str>) -> String {
 /// `/etc/ssl/certs/...`) are left untouched, and any workspace-configured value
 /// is re-`export`ed *after* this prelude, so intentional overrides survive.
 ///
+/// `SSL_CERT_DIR` may be a colon-separated directory list (OpenSSL 3+), so it
+/// is only unset when *none* of its components exist in the container; the
+/// other vars are single file paths.
+///
 /// The variable names are compile-time constants (never user input), so the
 /// generated `eval`/`unset` is not an injection vector.
 fn ca_env_scrub_prelude() -> String {
@@ -92,8 +96,17 @@ fn ca_env_scrub_prelude() -> String {
     format!(
         "for __oa_ca in {names}; do \
          eval \"__oa_ca_val=\\${{$__oa_ca:-}}\"; \
-         if [ -n \"$__oa_ca_val\" ] && [ ! -e \"$__oa_ca_val\" ]; then unset \"$__oa_ca\"; fi; \
-         done; unset __oa_ca __oa_ca_val; "
+         [ -n \"$__oa_ca_val\" ] || continue; \
+         if [ \"$__oa_ca\" = SSL_CERT_DIR ]; then \
+         __oa_ca_keep=; __oa_ca_rest=$__oa_ca_val; \
+         while [ -n \"$__oa_ca_rest\" ]; do \
+         __oa_ca_dir=${{__oa_ca_rest%%:*}}; \
+         case $__oa_ca_rest in *:*) __oa_ca_rest=${{__oa_ca_rest#*:}};; *) __oa_ca_rest=;; esac; \
+         if [ -n \"$__oa_ca_dir\" ] && [ -e \"$__oa_ca_dir\" ]; then __oa_ca_keep=1; fi; \
+         done; \
+         if [ -z \"$__oa_ca_keep\" ]; then unset SSL_CERT_DIR; fi; \
+         elif [ ! -e \"$__oa_ca_val\" ]; then unset \"$__oa_ca\"; fi; \
+         done; unset __oa_ca __oa_ca_val __oa_ca_keep __oa_ca_rest __oa_ca_dir; "
     )
 }
 
@@ -422,6 +435,49 @@ mod tests {
         // Only unsets when the referenced path is absent inside the container.
         assert!(prelude.contains("[ ! -e "));
         assert!(prelude.contains("unset "));
+    }
+
+    /// Runs the generated prelude in a real POSIX shell to verify scrub
+    /// semantics, including colon-separated `SSL_CERT_DIR` lists (OpenSSL 3+):
+    /// the var must survive if any component exists in the container.
+    #[test]
+    fn ca_scrub_prelude_shell_semantics() {
+        let run = |env: &[(&str, &str)]| -> String {
+            let script = format!(
+                "{} echo \"${{SSL_CERT_FILE:-UNSET}}|${{SSL_CERT_DIR:-UNSET}}\"",
+                ca_env_scrub_prelude()
+            );
+            let mut cmd = std::process::Command::new("/bin/sh");
+            // The test runner's own environment may carry CA vars (the very
+            // leak this prelude fixes), so start from a clean slate.
+            cmd.env_clear();
+            cmd.arg("-c").arg(&script);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().expect("run /bin/sh");
+            assert!(out.status.success(), "prelude script failed: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Broken single-path var is scrubbed; existing one is kept.
+        assert_eq!(
+            run(&[
+                ("SSL_CERT_FILE", "/nonexistent/cacert.pem"),
+                ("SSL_CERT_DIR", "/etc"),
+            ]),
+            "UNSET|/etc"
+        );
+        // Colon-separated SSL_CERT_DIR survives when any component exists.
+        assert_eq!(
+            run(&[("SSL_CERT_DIR", "/nonexistent-dir:/etc")]),
+            "UNSET|/nonexistent-dir:/etc"
+        );
+        // ...and is scrubbed only when no component exists.
+        assert_eq!(
+            run(&[("SSL_CERT_DIR", "/nonexistent-a:/nonexistent-b")]),
+            "UNSET|UNSET"
+        );
     }
 
     #[test]
