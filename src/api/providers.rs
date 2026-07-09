@@ -1366,10 +1366,14 @@ pub fn get_api_key_for_provider(
                     return Some(key.clone());
                 }
             }
-            // OAuth access tokens can also be used as bearer tokens for some APIs
-            if let Some(ref oauth) = provider.oauth {
-                if !oauth.access_token.is_empty() {
-                    return Some(oauth.access_token.clone());
+            // OAuth access tokens can also be used as bearer tokens for some APIs.
+            // Grok Build OAuth is CLI-only here; it is not a replacement for
+            // XAI_API_KEY on xAI's OpenAI-compatible API.
+            if provider_type != ProviderType::Xai {
+                if let Some(ref oauth) = provider.oauth {
+                    if !oauth.access_token.is_empty() {
+                        return Some(oauth.access_token.clone());
+                    }
                 }
             }
         }

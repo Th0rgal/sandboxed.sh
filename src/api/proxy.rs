@@ -329,6 +329,7 @@ async fn list_models(
 
     let direct_models =
         crate::api::providers::catalog_model_options_for_state(&state, true, true).await;
+    let direct_models = routable_direct_catalog_models(&state, direct_models).await;
     append_direct_models_to_proxy_models(
         &mut data,
         &mut seen,
@@ -341,6 +342,41 @@ async fn list_models(
         data,
     })
     .into_response()
+}
+
+async fn routable_direct_catalog_models(
+    state: &Arc<super::routes::AppState>,
+    models: Vec<crate::api::providers::CatalogModelOption>,
+) -> Vec<crate::api::providers::CatalogModelOption> {
+    let standard_accounts =
+        crate::api::ai_providers::read_standard_accounts(&state.config.working_dir);
+    let mut routable = Vec::new();
+    for model in models {
+        if !model.configured {
+            continue;
+        }
+        let entry = crate::provider_health::ChainEntry {
+            provider_id: model.provider_id.clone(),
+            model_id: model.id.clone(),
+        };
+        let entries = state
+            .chain_store
+            .resolve_entries(
+                &[entry],
+                &state.ai_providers,
+                &standard_accounts,
+                &state.health_tracker,
+            )
+            .await;
+        if entries.iter().any(|entry| {
+            let provider_type =
+                ProviderType::from_id(&entry.provider_id).unwrap_or(ProviderType::Custom);
+            has_routable_proxy_credentials(provider_type, entry.api_key.is_some(), entry.has_oauth)
+        }) {
+            routable.push(model);
+        }
+    }
+    routable
 }
 
 fn append_direct_models_to_proxy_models(
