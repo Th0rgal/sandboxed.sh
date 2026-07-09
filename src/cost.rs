@@ -40,7 +40,7 @@ const fn pricing(
 // Prices are nanodollars per token. Provider rates are published per 1M tokens,
 // so "$1.25 / 1M tokens" becomes 1_250 nanodollars per token.
 //
-// Sources checked May 26, 2026:
+// Sources checked July 9, 2026:
 // - OpenAI API pricing and model pages: https://developers.openai.com/api/docs/pricing
 // - xAI model pricing: https://docs.x.ai/developers/pricing
 // - Z.AI pricing: https://docs.z.ai/guides/overview/pricing
@@ -157,9 +157,34 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         pricing: pricing(250, 2_000, None, Some(25)),
     },
     PricingEntry {
+        canonical: "gpt-5.6-sol",
+        aliases: &["gpt-5.6-sol", "gpt-5-6-sol"],
+        pricing: pricing(5_000, 30_000, Some(6_250), Some(500)),
+    },
+    PricingEntry {
+        canonical: "gpt-5.6-terra",
+        aliases: &["gpt-5.6-terra", "gpt-5-6-terra"],
+        pricing: pricing(2_500, 15_000, Some(3_125), Some(250)),
+    },
+    PricingEntry {
+        canonical: "gpt-5.6-luna",
+        aliases: &["gpt-5.6-luna", "gpt-5-6-luna"],
+        pricing: pricing(1_000, 6_000, Some(1_250), Some(100)),
+    },
+    PricingEntry {
+        canonical: "gpt-5.5-pro",
+        aliases: &["gpt-5.5-pro", "gpt-5-5-pro"],
+        pricing: pricing(30_000, 180_000, None, None),
+    },
+    PricingEntry {
         canonical: "gpt-5.5",
         aliases: &["gpt-5.5", "gpt-5-5"],
         pricing: pricing(5_000, 30_000, None, Some(500)),
+    },
+    PricingEntry {
+        canonical: "gpt-5.4-pro",
+        aliases: &["gpt-5.4-pro", "gpt-5-4-pro"],
+        pricing: pricing(30_000, 180_000, None, None),
     },
     PricingEntry {
         canonical: "gpt-5.4",
@@ -530,6 +555,11 @@ mod tests {
         );
         assert_eq!(normalize_model("gpt-4o-2024-08-06"), "gpt-4o");
         assert_eq!(normalize_model("gpt-5.3-codex"), "gpt-5.3");
+        assert_eq!(normalize_model("openai/gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(normalize_model("openai/gpt-5.6-terra"), "gpt-5.6-terra");
+        assert_eq!(normalize_model("openai/gpt-5.6-luna"), "gpt-5.6-luna");
+        assert_eq!(normalize_model("gpt-5.5-pro"), "gpt-5.5-pro");
+        assert_eq!(normalize_model("gpt-5.4-pro"), "gpt-5.4-pro");
         assert_eq!(normalize_model("OpenAI/GPT-5"), "gpt-5");
         assert_eq!(normalize_model("openai/gpt-5.1-codex"), "gpt-5");
         assert_eq!(normalize_model("gpt-5-mini"), "gpt-5-mini");
@@ -563,6 +593,11 @@ mod tests {
         assert!(pricing_for_model("claude-haiku-4-5").is_some());
         assert!(pricing_for_model("gpt-4o").is_some());
         assert!(pricing_for_model("gpt-5.3-codex").is_some());
+        assert!(pricing_for_model("openai/gpt-5.6-sol").is_some());
+        assert!(pricing_for_model("openai/gpt-5.6-terra").is_some());
+        assert!(pricing_for_model("openai/gpt-5.6-luna").is_some());
+        assert!(pricing_for_model("gpt-5.5-pro").is_some());
+        assert!(pricing_for_model("gpt-5.4-pro").is_some());
         assert!(pricing_for_model("OpenAI/GPT-5").is_some());
         assert!(pricing_for_model("openai/gpt-5.1-codex").is_some());
         assert!(pricing_for_model("gpt-5-mini").is_some());
