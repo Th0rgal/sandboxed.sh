@@ -14,10 +14,10 @@ import { toast } from '@/components/toast';
 const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok'] as const;
 
 // Kept in sync with src/api/control.rs `normalize_model_effort_for_backend`.
-// Codex only accepts the three baseline levels; claudecode also accepts
-// xhigh/max. Other backends ignore effort entirely.
+// Codex and Claude Code both accept the GPT reasoning-effort ladder. Other
+// backends ignore effort entirely.
 const SUPPORTED_EFFORTS_BY_BACKEND: Record<string, readonly ModelEffort[]> = {
-  codex: ['low', 'medium', 'high'],
+  codex: ['low', 'medium', 'high', 'xhigh', 'max'],
   claudecode: ['low', 'medium', 'high', 'xhigh', 'max'],
 };
 
@@ -536,8 +536,7 @@ export function NewMissionDialog({
 
   useEffect(() => {
     // Clear effort if the current selection isn't valid for the selected
-    // backend. Codex only supports low/medium/high — leaving "xhigh"/"max"
-    // in state when switching from claudecode would silently render as
+    // backend. Leaving an unsupported value selected would silently render as
     // "Default effort" in the dropdown (no matching <option>) while POSTing
     // the stale invalid value.
     if (modelEffort && !isEffortSupportedByBackend(modelEffort, selectedBackend)) {
@@ -894,8 +893,12 @@ export function NewMissionDialog({
                   <option value="low">Low</option>
                   <option value="medium">Medium</option>
                   <option value="high">High</option>
-                  {selectedBackend === 'claudecode' && <option value="xhigh">XHigh</option>}
-                  {selectedBackend === 'claudecode' && <option value="max">Max</option>}
+                  {(selectedBackend === 'claudecode' || selectedBackend === 'codex') && (
+                    <option value="xhigh">XHigh</option>
+                  )}
+                  {(selectedBackend === 'claudecode' || selectedBackend === 'codex') && (
+                    <option value="max">Max</option>
+                  )}
                 </select>
                 <p className="text-xs text-white/30 mt-1.5">
                   {selectedBackend === 'codex' ? 'Passed to Codex as reasoning effort.' : 'Controls Claude Code adaptive reasoning depth (via CLAUDE_CODE_EFFORT_LEVEL).'}

@@ -4878,9 +4878,9 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
     let normalized = normalize_model_effort(raw)?;
     match (backend, normalized.as_str()) {
         (Some("claudecode"), "low" | "medium" | "high" | "xhigh" | "max") => Some(normalized),
-        // Codex CLI accepts `model_reasoning_effort=xhigh` (verified on
-        // codex-cli 0.137); the config value is passed through verbatim.
-        (Some("codex"), "low" | "medium" | "high" | "xhigh") => Some(normalized),
+        // Codex app-server accepts the GPT reasoning-effort values and passes
+        // them through as `reasoningEffort`.
+        (Some("codex"), "low" | "medium" | "high" | "xhigh" | "max") => Some(normalized),
         _ => None,
     }
 }
@@ -4888,7 +4888,7 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
 fn supported_model_efforts_for_backend(backend: Option<&str>) -> &'static str {
     match backend {
         Some("claudecode") => "low, medium, high, xhigh, max",
-        Some("codex") => "low, medium, high, xhigh",
+        Some("codex") => "low, medium, high, xhigh, max",
         _ => "none",
     }
 }
@@ -20313,14 +20313,14 @@ And the report:
     }
 
     #[test]
-    fn test_normalize_model_effort_for_backend_rejects_codex_max() {
+    fn test_normalize_model_effort_for_backend_accepts_codex_max() {
         assert_eq!(
             normalize_model_effort_for_backend(Some("codex"), "high"),
             Some("high".to_string())
         );
         assert_eq!(
             normalize_model_effort_for_backend(Some("codex"), "max"),
-            None
+            Some("max".to_string())
         );
         assert_eq!(
             normalize_model_effort_for_backend(Some("claudecode"), "max"),

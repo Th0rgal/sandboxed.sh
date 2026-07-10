@@ -636,7 +636,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "update_mission_settings".to_string(),
-                description: "Change a mission's run settings for its NEXT turn: switch backend (claudecode/codex/opencode/gemini/grok), model, reasoning effort, or agent. Applies between turns — the mission must be idle (awaiting_user/acknowledged/interrupted), not actively running. If it is running, cancel_mission first (or wait), then update, then send_message_to_mission or resume_mission to kick the next turn. Note: model_effort only applies to claudecode (low/medium/high/xhigh/max) and codex (low/medium/high/xhigh).".to_string(),
+                description: "Change a mission's run settings for its NEXT turn: switch backend (claudecode/codex/opencode/gemini/grok), model, reasoning effort, or agent. Applies between turns — the mission must be idle (awaiting_user/acknowledged/interrupted), not actively running. If it is running, cancel_mission first (or wait), then update, then send_message_to_mission or resume_mission to kick the next turn. Note: model_effort only applies to claudecode and codex (low/medium/high/xhigh/max).".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
