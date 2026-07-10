@@ -63,6 +63,8 @@ const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
     "anthropic/claude-opus-4.8",
     "anthropic/claude-sonnet-4.6",
     "google/gemini-3.1-pro-preview",
+    "openai/gpt-5.6",
+    "openai/gpt-5.6-sol",
     "openai/gpt-5.5",
     "meta-llama/llama-3.3-70b-instruct:free",
 ];
@@ -802,11 +804,18 @@ fn default_providers_config() -> ProvidersConfig {
                     // using Codex with a ChatGPT account"), and everything older
                     // than it is dead too. Newest first.
                     ProviderModel {
+                        id: "gpt-5.6".to_string(),
+                        name: "GPT-5.6".to_string(),
+                        description: Some(
+                            "Alias for GPT-5.6 Sol, OpenAI's flagship reasoning and coding model"
+                                .to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "gpt-5.6-sol".to_string(),
                         name: "GPT-5.6 Sol".to_string(),
                         description: Some(
-                            "Preview flagship GPT-5.6 model for approved OpenAI API/Codex access"
-                                .to_string(),
+                            "Flagship GPT-5.6 model for complex reasoning and coding".to_string(),
                         ),
                     },
                     ProviderModel {
@@ -896,8 +905,8 @@ fn default_providers_config() -> ProvidersConfig {
                         description: Some("Google Gemini via OpenRouter".to_string()),
                     },
                     ProviderModel {
-                        id: "openai/gpt-5.5".to_string(),
-                        name: "GPT-5.5".to_string(),
+                        id: "openai/gpt-5.6".to_string(),
+                        name: "GPT-5.6".to_string(),
                         description: Some("OpenAI GPT via OpenRouter".to_string()),
                     },
                     ProviderModel {
@@ -2103,6 +2112,7 @@ pub async fn list_backend_model_options(
             || matches!(
                 id,
                 "gpt-5.5"
+                    | "gpt-5.6"
                     | "gpt-5.6-sol"
                     | "gpt-5.6-terra"
                     | "gpt-5.6-luna"
@@ -2422,6 +2432,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for id in [
+            "gpt-5.6",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
@@ -2435,7 +2446,7 @@ mod tests {
             assert!(ids.contains(&id), "missing OpenAI model {id}");
         }
 
-        for invalid_id in ["gpt-5.6", "sol", "terra", "luna"] {
+        for invalid_id in ["sol", "terra", "luna"] {
             assert!(
                 !ids.contains(&invalid_id),
                 "bare/non-API slug should not be exposed: {invalid_id}"
@@ -2481,6 +2492,7 @@ mod tests {
             .map(|i| make(&format!("vendor/model-{i:03}")))
             .collect();
         entries.push(make("anthropic/claude-opus-4.8"));
+        entries.push(make("openai/gpt-5.6"));
         entries.push(make("openai/gpt-5.5"));
 
         let capped = cap_catalog_entries(
@@ -2490,6 +2502,7 @@ mod tests {
         );
         assert_eq!(capped.len(), MAX_CATALOG_MODELS_PER_PROVIDER);
         assert_eq!(capped[0].id, "anthropic/claude-opus-4.8");
+        assert!(capped.iter().any(|entry| entry.id == "openai/gpt-5.6"));
         assert!(capped.iter().any(|entry| entry.id == "openai/gpt-5.5"));
     }
 

@@ -158,7 +158,7 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
     },
     PricingEntry {
         canonical: "gpt-5.6-sol",
-        aliases: &["gpt-5.6-sol", "gpt-5-6-sol"],
+        aliases: &["gpt-5.6", "gpt-5-6", "gpt-5.6-sol", "gpt-5-6-sol"],
         pricing: pricing(5_000, 30_000, Some(6_250), Some(500)),
     },
     PricingEntry {
@@ -413,13 +413,39 @@ fn normalize_model(model: &str) -> &str {
         if entry
             .aliases
             .iter()
-            .any(|alias| normalized_for_match.contains(alias))
+            .any(|alias| model_alias_matches(&normalized_for_match, alias))
         {
             return entry.canonical;
         }
     }
 
     trimmed
+}
+
+fn model_alias_matches(model: &str, alias: &str) -> bool {
+    for (idx, _) in model.match_indices(alias) {
+        let after = &model[idx + alias.len()..];
+        if after.is_empty() {
+            return true;
+        }
+        if alias.as_bytes().last().is_some_and(|b| b.is_ascii_digit()) {
+            // Numeric family aliases may have date/version suffixes, but should
+            // not swallow named variants such as gpt-5.6-terra.
+            if let Some(suffix) = after.strip_prefix('-') {
+                if suffix
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|b| b.is_ascii_digit())
+                    || suffix.starts_with("codex")
+                {
+                    return true;
+                }
+            }
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 /// Normalize model names to the canonical pricing key.
@@ -555,6 +581,8 @@ mod tests {
         );
         assert_eq!(normalize_model("gpt-4o-2024-08-06"), "gpt-4o");
         assert_eq!(normalize_model("gpt-5.3-codex"), "gpt-5.3");
+        assert_eq!(normalize_model("openai/gpt-5.6"), "gpt-5.6-sol");
+        assert_eq!(normalize_model("gpt-5.6-2026-07-09"), "gpt-5.6-sol");
         assert_eq!(normalize_model("openai/gpt-5.6-sol"), "gpt-5.6-sol");
         assert_eq!(normalize_model("openai/gpt-5.6-terra"), "gpt-5.6-terra");
         assert_eq!(normalize_model("openai/gpt-5.6-luna"), "gpt-5.6-luna");
@@ -593,6 +621,7 @@ mod tests {
         assert!(pricing_for_model("claude-haiku-4-5").is_some());
         assert!(pricing_for_model("gpt-4o").is_some());
         assert!(pricing_for_model("gpt-5.3-codex").is_some());
+        assert!(pricing_for_model("openai/gpt-5.6").is_some());
         assert!(pricing_for_model("openai/gpt-5.6-sol").is_some());
         assert!(pricing_for_model("openai/gpt-5.6-terra").is_some());
         assert!(pricing_for_model("openai/gpt-5.6-luna").is_some());
