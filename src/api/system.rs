@@ -2203,7 +2203,7 @@ async fn get_hermes_assistant_status(
     // Hermes runtime resolves the persisted config.yaml model FIRST (its
     // runtime_provider treats the env as a stale override). Prefer the live
     // config for display so switching Hermes to a native provider (e.g.
-    // openai-codex/gpt-5.6) doesn't keep showing the routing fallback.
+    // openai-codex/gpt-5.6-sol) doesn't keep showing the routing fallback.
     let env_model = env_contents
         .as_deref()
         .and_then(|contents| parse_env_value(contents, "HERMES_ASSISTANT_MODEL"))
@@ -4572,10 +4572,10 @@ mod tests {
 
     #[test]
     fn hermes_config_model_label_prefers_provider_and_default() {
-        let yaml = "model:\n  base_url: https://chatgpt.com/backend-api/codex\n  default: gpt-5.6\n  provider: openai-codex\nproviders: {}\n";
+        let yaml = "model:\n  base_url: https://chatgpt.com/backend-api/codex\n  default: gpt-5.6-sol\n  provider: openai-codex\nproviders: {}\n";
         assert_eq!(
             hermes_config_model_label(yaml).as_deref(),
-            Some("openai-codex/gpt-5.6")
+            Some("openai-codex/gpt-5.6-sol")
         );
         // `auto` provider is not a meaningful label component.
         let auto = "model:\n  provider: auto\n  default: builtin/assistant\n";
@@ -4589,6 +4589,10 @@ mod tests {
 
     #[test]
     fn hermes_native_codex_detection_accepts_model_and_backend_url() {
+        assert!(hermes_uses_native_codex(
+            Some("openai-codex/gpt-5.6-sol"),
+            None
+        ));
         assert!(hermes_uses_native_codex(Some("openai-codex/gpt-5.6"), None));
         assert!(hermes_uses_native_codex(Some("openai-codex/gpt-5.5"), None));
         assert!(hermes_uses_native_codex(

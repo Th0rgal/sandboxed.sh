@@ -344,7 +344,7 @@ struct MergeBranchParams {
     /// Backend for the auto-registered conflict-resolver task (default codex)
     #[serde(default)]
     resolver_backend: Option<String>,
-    /// Model for the resolver task (default gpt-5.6)
+    /// Model for the resolver task (default gpt-5.6-sol)
     #[serde(default)]
     resolver_model: Option<String>,
 }
@@ -690,7 +690,7 @@ impl OrchestratorMcp {
                         "push": { "type": "boolean", "description": "Push target to origin after a clean merge" },
                         "delete_source": { "type": "boolean", "description": "Delete the source branch after a clean merge" },
                         "resolver_backend": { "type": "string", "description": "Backend for the auto conflict-resolver task (default codex)" },
-                        "resolver_model": { "type": "string", "description": "Model for the resolver task (default gpt-5.6)" }
+                        "resolver_model": { "type": "string", "description": "Model for the resolver task (default gpt-5.6-sol)" }
                     }
                 }),
             },
@@ -712,7 +712,7 @@ impl OrchestratorMcp {
                         },
                         "model_override": {
                             "type": "string",
-                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.6') for codex, Gemini models for gemini, Grok models for grok, 'provider/model' format for opencode."
+                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.6-sol') for codex, Gemini models for gemini, Grok models for grok, 'provider/model' format for opencode."
                         },
                         "model_effort": {
                             "type": "string",
@@ -1115,7 +1115,7 @@ impl OrchestratorMcp {
         }
         if claude_worker && !claude_allowed {
             return Err(
-                "Refused: Claude models/backends are not allowed for worker missions                  (operator policy). Use opencode+builtin/smart, opencode+genius,                  codex+gpt-5.6, or grok instead. If the operator explicitly approved a                  Claude worker, set SANDBOXED_SH_ALLOW_CLAUDE_WORKERS=1."
+                "Refused: Claude models/backends are not allowed for worker missions                  (operator policy). Use opencode+builtin/smart, opencode+genius,                  codex+gpt-5.6-sol, or grok instead. If the operator explicitly approved a                  Claude worker, set SANDBOXED_SH_ALLOW_CLAUDE_WORKERS=1."
                     .to_string(),
             );
         }
@@ -2028,7 +2028,7 @@ impl OrchestratorMcp {
                     model_override: Some(
                         params
                             .resolver_model
-                            .unwrap_or_else(|| "gpt-5.6".to_string()),
+                            .unwrap_or_else(|| "gpt-5.6-sol".to_string()),
                     ),
                     model_effort: Some("high".to_string()),
                     working_directory: Some(repo_dir.clone()),

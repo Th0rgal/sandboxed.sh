@@ -1905,7 +1905,7 @@ mod tests {
             "status": "active",
             "mission_mode": "default",
             "backend": "codex",
-            "model_override": "gpt-5.6",
+            "model_override": "gpt-5.6-sol",
             "workspace_id": "workspace-1",
             "workspace_name": "assistant",
             "short_description": "Build fix",
