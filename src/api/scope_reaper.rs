@@ -67,6 +67,21 @@ fn reaper_interval() -> Duration {
     Duration::from_secs(minutes * 60)
 }
 
+/// Grace between a stopping status event and the actual scope stop. Must be
+/// comfortably LONGER than the background watcher's 10s reconciliation poll
+/// (`bg_autoresume::BG_POLL_INTERVAL`): a mission that parks AwaitingUser
+/// right after launching a background job is only promoted to
+/// WaitingBackground on the watcher's next tick, and the pre-stop status
+/// recheck must observe that promotion.
+fn teardown_grace() -> Duration {
+    let secs = std::env::var("SCOPE_TEARDOWN_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s >= 1)
+        .unwrap_or(30);
+    Duration::from_secs(secs)
+}
+
 fn zombie_max_age() -> Duration {
     let hours = std::env::var("SCOPE_ZOMBIE_MAX_AGE_HOURS")
         .ok()
@@ -184,10 +199,12 @@ pub fn spawn_status_listener(
                         let store = Arc::clone(&mission_store);
                         tokio::spawn(async move {
                             let reason = format!("mission status {status:?}");
-                            // Small grace: let the harness's own shutdown
-                            // path run first so we usually stop an
-                            // already-empty scope instead of racing it.
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            // Grace: let the harness's own shutdown path run
+                            // first, and — critically — outlast the
+                            // background watcher's 10s poll so an
+                            // AwaitingUser→WaitingBackground promotion is
+                            // visible to the recheck below.
+                            tokio::time::sleep(teardown_grace()).await;
                             // Re-check the CURRENT status: within the grace
                             // window the mission may have been promoted
                             // (AwaitingUser → WaitingBackground by the
