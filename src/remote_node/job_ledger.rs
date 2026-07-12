@@ -32,39 +32,45 @@ fn lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-pub async fn load(working_dir: &Path) -> Vec<JobHandle> {
+async fn load_result(working_dir: &Path) -> anyhow::Result<Vec<JobHandle>> {
     let path = ledger_path(working_dir);
     match tokio::fs::read(&path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
-            tracing::warn!(path = %path.display(), ?err, "remote job ledger unreadable; ignoring");
-            Vec::new()
-        }),
-        Err(_) => Vec::new(),
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|err| anyhow::anyhow!("parse {}: {err}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(anyhow::anyhow!("read {}: {err}", path.display())),
     }
 }
 
-async fn store(working_dir: &Path, handles: &[JobHandle]) {
+pub async fn load(working_dir: &Path) -> Vec<JobHandle> {
+    load_result(working_dir).await.unwrap_or_else(|err| {
+        tracing::warn!(
+            ?err,
+            "remote job ledger unreadable; keeping missions unchanged"
+        );
+        Vec::new()
+    })
+}
+
+async fn store(working_dir: &Path, handles: &[JobHandle]) -> anyhow::Result<()> {
     let path = ledger_path(working_dir);
-    let Ok(bytes) = serde_json::to_vec_pretty(handles) else {
-        return;
-    };
+    let bytes = serde_json::to_vec_pretty(handles)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let tmp = path.with_extension("json.tmp");
-    if let Err(err) = tokio::fs::write(&tmp, &bytes).await {
-        tracing::warn!(path = %tmp.display(), ?err, "remote job ledger write failed");
-        return;
-    }
-    if let Err(err) = tokio::fs::rename(&tmp, &path).await {
-        tracing::warn!(path = %path.display(), ?err, "remote job ledger rename failed");
-    }
+    tokio::fs::write(&tmp, &bytes).await?;
+    tokio::fs::rename(&tmp, &path).await?;
+    Ok(())
 }
 
 /// Record a job handle (idempotent on job_id).
-pub async fn record(working_dir: &Path, handle: JobHandle) {
+pub async fn record(working_dir: &Path, handle: JobHandle) -> anyhow::Result<()> {
     let _guard = lock().lock().await;
-    let mut handles = load(working_dir).await;
+    let mut handles = load_result(working_dir).await?;
     handles.retain(|h| h.job_id != handle.job_id);
     handles.push(handle);
-    store(working_dir, &handles).await;
+    store(working_dir, &handles).await
 }
 
 /// Remove a job handle once its mission is finalized.
@@ -74,6 +80,50 @@ pub async fn remove(working_dir: &Path, job_id: Uuid) {
     let before = handles.len();
     handles.retain(|h| h.job_id != job_id);
     if handles.len() != before {
-        store(working_dir, &handles).await;
+        if let Err(err) = store(working_dir, &handles).await {
+            tracing::warn!(?err, "remote job ledger removal failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn record_is_durable_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+        let handle = JobHandle {
+            mission_id: Uuid::new_v4(),
+            node_id: "node-a".to_string(),
+            job_id,
+            started_at: chrono::Utc::now(),
+        };
+
+        record(dir.path(), handle.clone()).await.unwrap();
+        record(dir.path(), handle).await.unwrap();
+        let handles = load_result(dir.path()).await.unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].job_id, job_id);
+    }
+
+    #[tokio::test]
+    async fn record_surfaces_an_unwritable_ledger_path() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join(".sandboxed-sh"), b"not a directory")
+            .await
+            .unwrap();
+        let result = record(
+            dir.path(),
+            JobHandle {
+                mission_id: Uuid::new_v4(),
+                node_id: "node-a".to_string(),
+                job_id: Uuid::new_v4(),
+                started_at: chrono::Utc::now(),
+            },
+        )
+        .await;
+        assert!(result.is_err());
     }
 }

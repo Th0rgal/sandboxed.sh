@@ -1,7 +1,7 @@
 //! Declarative `lean_build` job execution for the `sandboxed-node` runner.
 //!
 //! A lean-build job carries only a git source (repo + pinned commit), a
-//! constrained argv (`lake`/`lean`/`elan`), and artifact patterns. The node
+//! constrained argv (`lake build`/`lean`), and artifact patterns. The node
 //! materializes a content-addressed checkout, restores shared elan/lake
 //! caches, runs the build, syncs the lake cache back on success, and records
 //! artifact digests. No workspace sync with core, no shell interpretation of
@@ -11,10 +11,8 @@
 //! - `checkouts/<sha256(repo)[..16]>/<commit>/` — immutable-ish checkouts
 //! - `caches/elan/` (`ELAN_HOME`), `caches/xdg/` (`XDG_CACHE_HOME`),
 //!   `caches/home/` (`HOME`) — shared toolchain caches
-//! - `caches/lake/<cache_key>/` — lake build cache slots, hardlink-copied
-//!   (`cp -al`) into `<build cwd>/.lake` before a build and refreshed after a
-//!   successful one. Accepted caveat: hardlink copies preserve inode mtimes,
-//!   so mtime drift can cause partial rebuilds — never wrong artifacts.
+//! - `caches/lake/<cache_key>/` — lake build cache slots, copied into
+//!   `<build cwd>/.lake` before a build and refreshed after a successful one.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,7 +31,7 @@ use crate::remote_node::{ArtifactEntry, JobPayload, JobSource};
 pub const DEFAULT_ENV_ALLOWLIST: &str = "LEAN_NUM_THREADS,LAKE_JOBS";
 
 /// Binaries a lean-build argv may start with (basename of argv[0]).
-pub const ALLOWED_COMMANDS: [&str; 3] = ["lake", "lean", "elan"];
+pub const ALLOWED_COMMANDS: [&str; 2] = ["lake", "lean"];
 
 /// Default node GC threshold: keep at least this many GiB free on the
 /// filesystem backing the work dir (`SANDBOXED_NODE_MIN_FREE_GB` overrides).
@@ -166,6 +164,13 @@ pub fn validate_lean_build(
             "command '{argv0}' is not allowed; argv[0] must be one of {}",
             ALLOWED_COMMANDS.join("/")
         ));
+    }
+    // `lake env` and `elan run` are direct arbitrary-command escape hatches.
+    // Lake is therefore limited to its build operation. Repository builds are
+    // still untrusted code and must run under the dedicated, non-root node
+    // service account documented in REMOTE_NODES.md.
+    if argv0 == "lake" && command.get(1).map(String::as_str) != Some("build") {
+        return Err("lake command must use the 'build' subcommand".to_string());
     }
     for key in env.keys() {
         if !allowlist.iter().any(|allowed| allowed == key) {
@@ -523,17 +528,19 @@ async fn ensure_checkout(
     }
 }
 
-/// Hardlink-copy `src` to `dest` (`cp -al`). `dest` must not exist.
-async fn hardlink_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
+/// Copy `src` to `dest` without hardlinks. Builds mutate `.lake` in place, so
+/// hardlinks would let one checkout corrupt the shared slot or another build.
+/// `dest` must not exist.
+async fn isolated_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
     let output = tokio::process::Command::new("cp")
-        .arg("-al")
+        .arg("-a")
         .arg(src)
         .arg(dest)
         .output()
         .await?;
     if !output.status.success() {
         anyhow::bail!(
-            "cp -al {} -> {} failed: {}",
+            "cp -a {} -> {} failed: {}",
             src.display(),
             dest.display(),
             String::from_utf8_lossy(&output.stderr)
@@ -590,7 +597,7 @@ pub async fn execute_lean_build(
         anyhow::bail!("cwd_rel '{rel_clean}' does not exist in the checkout");
     }
 
-    // Lake cache restore: hardlink-copy the slot into `<cwd>/.lake` when the
+    // Lake cache restore: isolate the slot into `<cwd>/.lake` when the
     // checkout has no .lake yet. Slot mutation is guarded by a per-key flock
     // (shared across commits with the same toolchain+manifest).
     let effective_cache_key = cache_key
@@ -602,7 +609,7 @@ pub async fn execute_lean_build(
         let lake_dir = build_cwd.join(".lake");
         if !lake_dir.exists() && slot.is_dir() {
             let _cache_lock = FileLock::acquire(slot.with_extension("lock")).await?;
-            if let Err(err) = hardlink_copy(&slot, &lake_dir).await {
+            if let Err(err) = isolated_copy(&slot, &lake_dir).await {
                 tracing::warn!("lake cache restore failed (continuing cold): {err}");
                 let _ = tokio::fs::remove_dir_all(&lake_dir).await;
             }
@@ -610,9 +617,11 @@ pub async fn execute_lean_build(
     }
 
     // Run the build argv directly (no shell) with shared-cache env plus the
-    // allowlisted job env.
+    // allowlisted job env. Clear the node service environment first: bearer
+    // tokens, signing secrets and operator credentials must never reach code
+    // executed from a repository.
     let mut cmd = tokio::process::Command::new(&command[0]);
-    cmd.args(&command[1..]).current_dir(&build_cwd);
+    cmd.env_clear().args(&command[1..]).current_dir(&build_cwd);
     for (key, value) in cache_env(work_root) {
         cmd.env(key, value);
     }
@@ -625,7 +634,7 @@ pub async fn execute_lean_build(
 
     let mut result_artifacts = Vec::new();
     if success {
-        // Sync the lake cache back: hardlink-copy into a tmp slot, then swap
+        // Sync the lake cache back: copy into a tmp slot, then swap
         // it in under the per-key flock so readers never see a partial slot.
         if let Some(key) = effective_cache_key.as_deref() {
             if let Err(err) = sync_lake_cache_back(work_root, key, &build_cwd.join(".lake")).await {
@@ -661,7 +670,7 @@ async fn sync_lake_cache_back(work_root: &Path, key: &str, lake_dir: &Path) -> a
     tokio::fs::create_dir_all(parent).await?;
     let _cache_lock = FileLock::acquire(slot.with_extension("lock")).await?;
     let tmp = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
-    hardlink_copy(lake_dir, &tmp).await?;
+    isolated_copy(lake_dir, &tmp).await?;
     let old = parent.join(format!(".old-{}", uuid::Uuid::new_v4()));
     let had_old = tokio::fs::rename(&slot, &old).await.is_ok();
     if let Err(err) = tokio::fs::rename(&tmp, &slot).await {
@@ -955,6 +964,25 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_command_execution_subcommands() {
+        for command in [
+            vec!["lake", "env", "bash"],
+            vec!["lake", "exe", "tool"],
+            vec!["elan", "run", "stable", "bash"],
+        ] {
+            let command: Vec<String> = command.into_iter().map(str::to_string).collect();
+            assert!(validate_lean_build(
+                &source(&"a".repeat(40)),
+                None,
+                &command,
+                &HashMap::new(),
+                &allowlist(),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn validation_rejects_env_keys_outside_allowlist() {
         let env: HashMap<String, String> = [("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string())]
             .into_iter()
@@ -1126,6 +1154,27 @@ mod tests {
         assert_eq!(
             artifacts[0].sha256,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_copy_is_isolated_from_build_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        let restored = dir.path().join("restored");
+        tokio::fs::create_dir_all(&slot).await.unwrap();
+        tokio::fs::write(slot.join("cache.bin"), b"shared")
+            .await
+            .unwrap();
+
+        isolated_copy(&slot, &restored).await.unwrap();
+        tokio::fs::write(restored.join("cache.bin"), b"mutated")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read(slot.join("cache.bin")).await.unwrap(),
+            b"shared"
         );
     }
 

@@ -4,7 +4,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use sandboxed_sh::node::{read_log_tail, JobRecord, JobRunner, JobStore, DEFAULT_MAX_JOB_SECS};
+use sandboxed_sh::node::{
+    read_log_tail, JobRecord, JobRunner, JobStore, NodeQueueFull, DEFAULT_MAX_JOB_SECS,
+};
 use sandboxed_sh::remote_node::{
     bearer_token, node_token_matches, parse_labels, run_lease_command, validate_lease_token,
     CancelJobResponse, ExecuteResponse, LeaseClaims, LeaseRequest, NodeHeartbeat, NodeJobStatus,
@@ -42,6 +44,19 @@ async fn main() -> anyhow::Result<()> {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    #[cfg(unix)]
+    {
+        let running_as_root = unsafe { libc::geteuid() == 0 };
+        let allow_root = std::env::var("SANDBOXED_NODE_ALLOW_ROOT")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if running_as_root && !allow_root {
+            anyhow::bail!(
+                "sandboxed-node refuses to run as root; use the dedicated sandboxed-node service account (SANDBOXED_NODE_ALLOW_ROOT=1 is an emergency-only override)"
+            );
+        }
+    }
 
     let node_id = std::env::var("SANDBOXED_NODE_ID").unwrap_or_else(|_| "local-node".to_string());
     let shared_token = std::env::var("SANDBOXED_NODE_TOKEN")
@@ -322,7 +337,13 @@ async fn submit_job(
         .runner
         .submit(request.job_id, request.mission_id, request.payload)
         .await
-        .map_err(internal_error)?;
+        .map_err(|err| {
+            if err.downcast_ref::<NodeQueueFull>().is_some() {
+                (StatusCode::TOO_MANY_REQUESTS, err.to_string())
+            } else {
+                internal_error(err)
+            }
+        })?;
     Ok((
         StatusCode::ACCEPTED,
         Json(SubmitJobResponse {

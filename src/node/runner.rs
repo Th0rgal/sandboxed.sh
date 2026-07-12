@@ -41,7 +41,7 @@ pub struct JobRunner {
     store: JobStore,
     work_root: PathBuf,
     max_job_secs: u64,
-    tx: mpsc::UnboundedSender<QueuedJob>,
+    tx: mpsc::Sender<QueuedJob>,
     cancels: Mutex<HashMap<Uuid, CancellationToken>>,
     queued: AtomicU32,
     active: AtomicU32,
@@ -55,7 +55,12 @@ impl JobRunner {
         capacity: u32,
         max_job_secs: u64,
     ) -> Arc<Self> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<QueuedJob>();
+        let max_queued = std::env::var("SANDBOXED_NODE_MAX_QUEUED")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| (capacity.max(1) as usize).saturating_mul(4));
+        let (tx, mut rx) = mpsc::channel::<QueuedJob>(max_queued);
         let runner = Arc::new(Self {
             store,
             work_root,
@@ -106,6 +111,12 @@ impl JobRunner {
         mission_id: Uuid,
         payload: JobPayload,
     ) -> anyhow::Result<()> {
+        // Reserve bounded queue capacity before persisting the queued row. The
+        // permit prevents concurrent submitters from all passing an advisory
+        // heartbeat check and growing memory/jobs.db without limit.
+        let permit = self.tx.try_reserve().map_err(|_| NodeQueueFull {
+            max_queued: self.tx.max_capacity(),
+        })?;
         let payload_json = serde_json::to_string(&payload)?;
         let log_path = self.log_path(job_id);
         self.store
@@ -121,13 +132,11 @@ impl JobRunner {
             .unwrap_or_else(|e| e.into_inner())
             .insert(job_id, CancellationToken::new());
         self.queued.fetch_add(1, Ordering::AcqRel);
-        self.tx
-            .send(QueuedJob {
-                id: job_id,
-                mission_id,
-                payload,
-            })
-            .map_err(|_| anyhow::anyhow!("job runner is shut down"))?;
+        permit.send(QueuedJob {
+            id: job_id,
+            mission_id,
+            payload,
+        });
         Ok(())
     }
 
@@ -233,6 +242,12 @@ impl JobRunner {
             }
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("node job queue is full (maximum {max_queued} queued jobs)")]
+pub struct NodeQueueFull {
+    pub max_queued: usize,
 }
 
 /// Clamp a client-requested timeout to the node ceiling (min 1s).

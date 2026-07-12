@@ -258,8 +258,21 @@ pub(crate) async fn build_mission_index(state: &Arc<AppState>) -> MissionIndex {
         .working_dir
         .join(".sandboxed-sh")
         .join("missions");
-    if let Ok(mut rd) = tokio::fs::read_dir(&missions_dir).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
+    match tokio::fs::read_dir(&missions_dir).await {
+        Ok(mut rd) => loop {
+            let entry = match rd.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        dir = %missions_dir.display(),
+                        ?err,
+                        "mission index: directory iteration failed; index marked incomplete"
+                    );
+                    complete = false;
+                    break;
+                }
+            };
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(stem) = name.strip_prefix("missions-") else {
                 continue;
@@ -307,6 +320,15 @@ pub(crate) async fn build_mission_index(state: &Arc<AppState>) -> MissionIndex {
                     complete = false;
                 }
             }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(
+                dir = %missions_dir.display(),
+                ?err,
+                "mission index: persisted-store directory unreadable; index marked incomplete"
+            );
+            complete = false;
         }
     }
 

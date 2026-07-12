@@ -5542,7 +5542,7 @@ async fn dispatch_remote_job(
     // Persist the job handle BEFORE marking the mission Active: if the API
     // restarts from here on, the startup reconciler can re-attach a poll
     // loop instead of leaving an Active mission orphaned.
-    crate::remote_node::job_ledger::record(
+    if let Err(err) = crate::remote_node::job_ledger::record(
         &state.config.working_dir,
         crate::remote_node::job_ledger::JobHandle {
             mission_id: mission.id,
@@ -5551,7 +5551,16 @@ async fn dispatch_remote_job(
             started_at: chrono::Utc::now(),
         },
     )
-    .await;
+    .await
+    {
+        // Never expose an Active mission without a durable recovery handle.
+        // Best-effort cancellation prevents an accepted node job from running
+        // after the caller receives the persistence failure.
+        let _ = client.cancel_job(&node, &shared_token, job_id).await;
+        return Err(format!(
+            "remote job accepted but recovery handle could not be persisted: {err}"
+        ));
+    }
 
     control
         .mission_store

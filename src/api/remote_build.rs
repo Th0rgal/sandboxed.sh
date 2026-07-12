@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -55,14 +55,38 @@ fn remote_build_secret() -> Option<String> {
         })
 }
 
-/// Domain-separated HMAC over the mission id (pure; unit-tested).
-fn sign_remote_build_token(secret: &str, mission_id: Uuid) -> Option<String> {
+#[derive(Debug, Serialize, Deserialize)]
+struct RemoteBuildCapability {
+    mission_id: Uuid,
+    expires_at: i64,
+}
+
+fn remote_build_token_ttl_secs() -> i64 {
+    std::env::var("REMOTE_BUILD_TOKEN_TTL_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|seconds| *seconds >= 300)
+        .unwrap_or(6 * 60 * 60)
+}
+
+/// Domain-separated, expiring HMAC capability (pure; unit-tested).
+fn sign_remote_build_token(secret: &str, mission_id: Uuid, expires_at: i64) -> Option<String> {
+    use base64::Engine;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
+    let claims = RemoteBuildCapability {
+        mission_id,
+        expires_at,
+    };
+    let payload =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).ok()?);
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(b"remote-build:");
-    mac.update(mission_id.as_bytes());
-    Some(hex::encode(mac.finalize().into_bytes()))
+    mac.update(payload.as_bytes());
+    Some(format!(
+        "{payload}.{}",
+        hex::encode(mac.finalize().into_bytes())
+    ))
 }
 
 /// Mint a per-mission, scope-bound capability token for remote builds. The
@@ -70,14 +94,67 @@ fn sign_remote_build_token(secret: &str, mission_id: Uuid) -> Option<String> {
 /// signed with the same secret, so neither can be replayed as the other.
 /// Returns `None` when no signing secret is configured.
 pub fn build_remote_build_token(mission_id: Uuid) -> Option<String> {
-    sign_remote_build_token(&remote_build_secret()?, mission_id)
+    sign_remote_build_token(
+        &remote_build_secret()?,
+        mission_id,
+        chrono::Utc::now().timestamp() + remote_build_token_ttl_secs(),
+    )
+}
+
+fn verify_remote_build_token_with_secret(
+    secret: &str,
+    mission_id: Uuid,
+    token: &str,
+    now: i64,
+) -> bool {
+    use base64::Engine;
+    let Some((payload, signature)) = token.trim().split_once('.') else {
+        return false;
+    };
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    let Ok(claims) = serde_json::from_slice::<RemoteBuildCapability>(&bytes) else {
+        return false;
+    };
+    if claims.mission_id != mission_id || claims.expires_at < now {
+        return false;
+    }
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(b"remote-build:");
+    mac.update(payload.as_bytes());
+    let expected = hex::encode(mac.finalize().into_bytes());
+    super::auth::constant_time_eq(&expected, signature)
 }
 
 fn verify_remote_build_token(mission_id: Uuid, token: &str) -> bool {
-    let Some(expected) = build_remote_build_token(mission_id) else {
+    let Some(secret) = remote_build_secret() else {
         return false;
     };
-    super::auth::constant_time_eq(&expected, token.trim())
+    verify_remote_build_token_with_secret(
+        &secret,
+        mission_id,
+        token,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+async fn mission_accepts_remote_build(state: &AppState, mission_id: Uuid) -> bool {
+    for session in state.control.all_sessions().await {
+        if let Ok(Some(mission)) = session.mission_store.get_mission(mission_id).await {
+            return matches!(
+                mission.status,
+                super::control::MissionStatus::Active
+                    | super::control::MissionStatus::Pending
+                    | super::control::MissionStatus::WaitingBackground
+            );
+        }
+    }
+    false
 }
 
 fn default_requirements() -> Vec<String> {
@@ -195,6 +272,13 @@ async fn submit_remote_build(
     // for this one mission. Same trust model as the spark offload endpoint.
     if !verify_remote_build_token(req.mission_id, &req.token) {
         return (StatusCode::UNAUTHORIZED, "invalid remote build token").into_response();
+    }
+    if !mission_accepts_remote_build(&state, req.mission_id).await {
+        return (
+            StatusCode::FORBIDDEN,
+            "remote builds require a live mission",
+        )
+            .into_response();
     }
     if req.command.is_empty() {
         return (StatusCode::BAD_REQUEST, "command argv required").into_response();
@@ -336,21 +420,26 @@ async fn submit_remote_build(
 #[derive(Debug, Deserialize)]
 pub struct RemoteBuildStatusQuery {
     pub mission_id: Uuid,
-    pub token: String,
     #[serde(default = "default_node_id")]
     pub node_id: String,
 }
 
-/// `GET /api/remote-build/:job_id?mission_id=...&token=...&node_id=...` —
+/// `GET /api/remote-build/:job_id?mission_id=...&node_id=...` —
 /// job status for a build submitted with `wait: false`. Authenticated with
-/// the same per-mission capability token (query params, since the wrapper's
-/// GET has no body).
+/// the same per-mission capability token in `Authorization: Bearer ...` so
+/// credentials never enter request URLs or access logs.
 async fn get_remote_build(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<Uuid>,
     Query(query): Query<RemoteBuildStatusQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<NodeJobStatus>, (StatusCode, String)> {
-    if !verify_remote_build_token(query.mission_id, &query.token) {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !verify_remote_build_token(query.mission_id, token) {
         return Err((
             StatusCode::UNAUTHORIZED,
             "invalid remote build token".to_string(),
@@ -391,15 +480,14 @@ mod tests {
     fn token_round_trips_and_is_mission_and_domain_scoped() {
         let mission = Uuid::new_v4();
         let other = Uuid::new_v4();
-        let token = sign_remote_build_token("secret", mission).unwrap();
-        assert_eq!(
-            sign_remote_build_token("secret", mission).unwrap(),
-            token,
-            "token must be deterministic for (secret, mission)"
-        );
-        assert_ne!(sign_remote_build_token("secret", other).unwrap(), token);
+        let expires_at = chrono::Utc::now().timestamp() + 600;
+        let token = sign_remote_build_token("secret", mission, expires_at).unwrap();
         assert_ne!(
-            sign_remote_build_token("other-secret", mission).unwrap(),
+            sign_remote_build_token("secret", other, expires_at).unwrap(),
+            token
+        );
+        assert_ne!(
+            sign_remote_build_token("other-secret", mission, expires_at).unwrap(),
             token
         );
         // Domain separation from the spark-offload token (same secret,
@@ -414,6 +502,29 @@ mod tests {
             let spark_token = hex::encode(mac.finalize().into_bytes());
             assert_ne!(spark_token, token);
         }
+    }
+
+    #[test]
+    fn token_expiry_is_enforced() {
+        let mission = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp();
+        let token = sign_remote_build_token("secret", mission, now + 60).unwrap();
+        let expired = sign_remote_build_token("secret", mission, now - 1).unwrap();
+        assert!(verify_remote_build_token_with_secret(
+            "secret", mission, &token, now
+        ));
+        assert!(!verify_remote_build_token_with_secret(
+            "secret", mission, &expired, now
+        ));
+        assert!(!verify_remote_build_token_with_secret(
+            "secret",
+            Uuid::new_v4(),
+            &token,
+            now
+        ));
+        assert!(!verify_remote_build_token_with_secret(
+            "wrong", mission, &token, now
+        ));
     }
 
     #[test]

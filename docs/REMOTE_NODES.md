@@ -137,18 +137,36 @@ EnvironmentFile=/etc/sandboxed-node.env
 ExecStart=/usr/local/bin/sandboxed-node
 Restart=always
 RestartSec=5
-User=root
+User=sandboxed-node
+Group=sandboxed-node
 WorkingDirectory=/var/lib/sandboxed-node
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sandboxed-node
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+Create the service account and writable state directory before starting the
+unit (`useradd --system --home /var/lib/sandboxed-node sandboxed-node` and
+`install -d -o sandboxed-node -g sandboxed-node /var/lib/sandboxed-node`).
+Lean/Lake builds execute repository-controlled code, so running this service as
+root is unsupported; the argv allowlist is defense in depth, not a sandbox.
+The binary refuses UID 0 by default; `SANDBOXED_NODE_ALLOW_ROOT=1` is available
+only as an explicit emergency migration override.
+
 `/etc/sandboxed-node.env` contains only env-var assignments such as
 `SANDBOXED_NODE_ID`, `SANDBOXED_NODE_BIND`, `SANDBOXED_NODE_WORK_DIR`,
 `SANDBOXED_NODE_CAPACITY`, `SANDBOXED_NODE_TOKEN`,
 `SANDBOXED_NODE_TOKEN_PREVIOUS` (rotation only), `SANDBOXED_NODE_LABELS`,
-and `SANDBOXED_NODE_MAX_JOB_SECS`.
+`SANDBOXED_NODE_MAX_JOB_SECS`, and `SANDBOXED_NODE_MAX_QUEUED` (jobs waiting
+behind capacity; defaults to four times `SANDBOXED_NODE_CAPACITY`).
 
 Node env vars for lean-build jobs:
 
@@ -228,8 +246,9 @@ Validation (node-side, before anything runs):
 - `source.commit` must be a full 40-char lowercase hex SHA (no branches).
 - `cwd_rel` uses the same strict path allowlist as the Spark offload
   (`[A-Za-z0-9._-]` components, no `..`, no `-`-leading component).
-- `command` is executed directly (never via a shell) and its argv[0]
-  basename must be `lake`, `lean`, or `elan`.
+- `command` is executed directly (never via a shell); accepted entry points are
+  `lake build ...` and `lean ...`. The service environment is cleared before
+  execution so node bearer/signing secrets are not inherited by build code.
 - `env` keys must be within `SANDBOXED_NODE_ENV_ALLOWLIST`.
 - `timeout_secs` is clamped to `SANDBOXED_NODE_MAX_JOB_SECS`.
 
@@ -313,8 +332,11 @@ Request body:
 `true`. With `wait: true` the call polls the node every 3s (client-side cap
 2h) and returns `{exit_code, state, duration_secs, log_tail, node_id,
 job_id, artifacts}`. With `wait: false` it returns `202 {job_id, node_id}`;
-poll `GET /api/remote-build/:job_id?mission_id=...&token=...&node_id=...`
-for the job status. Placement failures and unconfigured/unavailable fleets
+poll `GET /api/remote-build/:job_id?mission_id=...&node_id=...` with the
+capability in `Authorization: Bearer $REMOTE_BUILD_TOKEN` for the job status.
+Capabilities expire after six hours by default (`REMOTE_BUILD_TOKEN_TTL_SECS`)
+and new submissions require a live mission. Placement failures and
+unconfigured/unavailable fleets
 answer `503` with the reason, so callers can fall back to a local build.
 
 ## remote-lean-build wrapper
