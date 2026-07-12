@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -9439,6 +9440,7 @@ fn spawn_control_session(
             workspaces.clone(),
             state.events_tx.clone(),
             telegram_bridge.clone(),
+            config.working_dir.clone(),
         ));
     } else if state.mission_store.is_persistent() {
         tracing::info!("Automation scheduler disabled by config");
@@ -9508,6 +9510,7 @@ async fn automation_scheduler_loop(
     workspaces: workspace::SharedWorkspaceStore,
     events_tx: broadcast::Sender<AgentEvent>,
     telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
+    working_dir: PathBuf,
 ) {
     use super::automation_variables::{substitute_variables, SubstitutionContext};
     use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus, TriggerType};
@@ -9593,6 +9596,7 @@ async fn automation_scheduler_loop(
                     expression: String,
                     timezone: String,
                 },
+                DurableJobTerminal(Uuid),
             }
             let schedule = match &automation.trigger {
                 TriggerType::Interval { seconds } => ScheduleKind::Interval(*seconds),
@@ -9606,6 +9610,9 @@ async fn automation_scheduler_loop(
                 TriggerType::Webhook { .. } => continue,
                 TriggerType::AgentFinished => continue,
                 TriggerType::Telegram { .. } => continue,
+                TriggerType::DurableJobTerminal { job_id } => {
+                    ScheduleKind::DurableJobTerminal(*job_id)
+                }
             };
 
             let mission = match mission_store.get_mission(automation.mission_id).await {
@@ -9742,6 +9749,27 @@ async fn automation_scheduler_loop(
                         }
                     }
                 }
+                ScheduleKind::DurableJobTerminal(job_id) => {
+                    match super::durable_jobs::terminal_for_mission(
+                        &working_dir,
+                        *job_id,
+                        mission.id,
+                    )
+                    .await
+                    {
+                        Ok(terminal) => terminal,
+                        Err(error) => {
+                            tracing::debug!(
+                                automation_id = %automation.id,
+                                mission_id = %mission.id,
+                                durable_job_id = %job_id,
+                                %error,
+                                "Durable-job automation is not ready"
+                            );
+                            false
+                        }
+                    }
+                }
             };
 
             if !should_trigger {
@@ -9861,7 +9889,12 @@ async fn automation_scheduler_loop(
                 automation_id: automation.id,
                 mission_id: mission.id,
                 triggered_at: mission_store::now_string(),
-                trigger_source: "interval".to_string(),
+                trigger_source: match &schedule {
+                    ScheduleKind::Interval(_) => "interval",
+                    ScheduleKind::Cron { .. } => "cron",
+                    ScheduleKind::DurableJobTerminal(_) => "durable_job_terminal",
+                }
+                .to_string(),
                 status: ExecutionStatus::Pending,
                 webhook_payload: None,
                 variables_used: automation.variables.clone(),
@@ -15598,6 +15631,12 @@ pub async fn create_automation(
         }
     }
 
+    if let mission_store::TriggerType::DurableJobTerminal { job_id } = &trigger {
+        super::durable_jobs::terminal_for_mission(&state.config.working_dir, *job_id, mission_id)
+            .await
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    }
+
     let start_immediately = req.start_immediately;
 
     // For interval/cron triggers, if start_immediately is false, set last_triggered_at
@@ -15649,11 +15688,7 @@ pub async fn create_automation(
         driver: mission_store::AutomationDriver::Scheduler,
     };
 
-    let is_builtin_wakeup = automation
-        .variables
-        .get("__wakeup_source")
-        .map(String::as_str)
-        == Some("claude-builtin");
+    let is_one_shot_wakeup = automation.variables.contains_key("__wakeup_source");
 
     tracing::info!(
         mission_id = %mission_id,
@@ -15661,7 +15696,7 @@ pub async fn create_automation(
         command_source = ?automation.command_source,
         trigger = ?automation.trigger,
         fresh_session = ?automation.fresh_session,
-        is_builtin_wakeup,
+        is_one_shot_wakeup,
         "Creating mission automation"
     );
 
@@ -15671,7 +15706,7 @@ pub async fn create_automation(
         .await
         .map_err(internal_error)?;
 
-    // One pending built-in wakeup per mission: a new ScheduleWakeup
+    // One pending wakeup per mission: a new ScheduleWakeup
     // supersedes any earlier un-fired one. Without this, a turn that starts
     // before the previous wakeup fires (user message, other automation)
     // schedules a second wakeup, and the leftovers pile up into overlapping
@@ -15685,7 +15720,7 @@ pub async fn create_automation(
     // overlapping creates converge on exactly the newest wakeup instead of
     // deactivating each other.
     let mut wakeup_iteration: u32 = 1;
-    if is_builtin_wakeup {
+    if is_one_shot_wakeup {
         if let Ok(existing) = control
             .mission_store
             .get_mission_automations(mission_id)
@@ -15694,11 +15729,7 @@ pub async fn create_automation(
             let new_key = (automation.created_at.clone(), automation.id.to_string());
             let priors: Vec<_> = existing
                 .into_iter()
-                .filter(|a| {
-                    a.id != automation.id
-                        && a.variables.get("__wakeup_source").map(String::as_str)
-                            == Some("claude-builtin")
-                })
+                .filter(|a| a.id != automation.id && a.variables.contains_key("__wakeup_source"))
                 .collect();
             wakeup_iteration = (priors.len() as u32).saturating_add(1);
             for prior in priors
@@ -15723,7 +15754,7 @@ pub async fn create_automation(
     // Persist a goal-iteration marker for self-paced loops so the dashboard
     // and assistant can see loop progress after a reload — previously this
     // state lived only in the (transient) wakeup automations.
-    if is_builtin_wakeup {
+    if is_one_shot_wakeup {
         let _ = control.events_tx.send(AgentEvent::GoalIteration {
             iteration: wakeup_iteration,
             objective: automation
@@ -15892,6 +15923,24 @@ pub async fn update_automation(
 
     if let Some(active) = req.active {
         automation.active = active;
+    }
+
+    if let mission_store::TriggerType::Cron { expression, .. } = &automation.trigger {
+        if croner::Cron::new(expression).parse().is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid cron expression: {expression}"),
+            ));
+        }
+    }
+    if let mission_store::TriggerType::DurableJobTerminal { job_id } = &automation.trigger {
+        super::durable_jobs::terminal_for_mission(
+            &state.config.working_dir,
+            *job_id,
+            automation.mission_id,
+        )
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     }
 
     if automation.fresh_session == mission_store::FreshSession::Switch {

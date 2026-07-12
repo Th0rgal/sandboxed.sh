@@ -780,6 +780,19 @@ impl SqliteMissionStore {
                 TriggerType::Webhook { config }
             }
             "agent_finished" => TriggerType::AgentFinished,
+            "durable_job_terminal" => {
+                let data: serde_json::Value = serde_json::from_str(&trigger_data)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                let job_id = data["job_id"]
+                    .as_str()
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .ok_or_else(|| {
+                        rusqlite::Error::ToSqlConversionFailure(
+                            "Invalid durable_job_terminal job_id".into(),
+                        )
+                    })?;
+                TriggerType::DurableJobTerminal { job_id }
+            }
             "telegram" => {
                 let config: super::TelegramTriggerConfig = serde_json::from_str(&trigger_data)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -5949,6 +5962,10 @@ impl MissionStore for SqliteMissionStore {
                 serde_json::to_string(config).map_err(|e| e.to_string())?,
             ),
             TriggerType::AgentFinished => ("agent_finished", "{}".to_string()),
+            TriggerType::DurableJobTerminal { job_id } => (
+                "durable_job_terminal",
+                serde_json::json!({ "job_id": job_id }).to_string(),
+            ),
             TriggerType::Telegram { config } => (
                 "telegram",
                 serde_json::to_string(config).map_err(|e| e.to_string())?,
@@ -6189,6 +6206,10 @@ impl MissionStore for SqliteMissionStore {
                 serde_json::to_string(config).map_err(|e| e.to_string())?,
             ),
             TriggerType::AgentFinished => ("agent_finished", "{}".to_string()),
+            TriggerType::DurableJobTerminal { job_id } => (
+                "durable_job_terminal",
+                serde_json::json!({ "job_id": job_id }).to_string(),
+            ),
             TriggerType::Telegram { config } => (
                 "telegram",
                 serde_json::to_string(config).map_err(|e| e.to_string())?,
@@ -9827,6 +9848,10 @@ impl MissionStore for SqliteMissionStore {
                         serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string()),
                     ),
                     TriggerType::AgentFinished => ("agent_finished", "{}".to_string()),
+                    TriggerType::DurableJobTerminal { job_id } => (
+                        "durable_job_terminal",
+                        serde_json::json!({ "job_id": job_id }).to_string(),
+                    ),
                     TriggerType::Telegram { config } => (
                         "telegram",
                         serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string()),
@@ -14462,6 +14487,57 @@ mod tests {
             ids.contains(&preserved_active_id),
             "active harness_loop row represents an in-progress loop and must survive"
         );
+    }
+
+    #[tokio::test]
+    async fn durable_job_terminal_automation_roundtrips() {
+        use std::collections::HashMap;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(
+                Some("durable owner"),
+                None,
+                None,
+                None,
+                None,
+                Some("codex"),
+                None,
+            )
+            .await
+            .expect("mission");
+        let job_id = Uuid::new_v4();
+        let automation = Automation {
+            id: Uuid::new_v4(),
+            mission_id: mission.id,
+            command_source: CommandSource::Inline {
+                content: "inspect terminal job".into(),
+            },
+            trigger: TriggerType::DurableJobTerminal { job_id },
+            variables: HashMap::new(),
+            active: true,
+            created_at: now_string(),
+            last_triggered_at: None,
+            retry_config: RetryConfig::default(),
+            stop_policy: StopPolicy::AfterFirstFire,
+            fresh_session: FreshSession::Keep,
+            consecutive_failures: 0,
+            driver: AutomationDriver::Scheduler,
+        };
+
+        store
+            .create_automation(automation.clone())
+            .await
+            .expect("create automation");
+        let loaded = store
+            .get_automation(automation.id)
+            .await
+            .expect("load automation")
+            .expect("automation exists");
+        assert_eq!(loaded.trigger, TriggerType::DurableJobTerminal { job_id });
     }
 
     #[tokio::test]

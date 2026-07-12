@@ -199,6 +199,14 @@ struct ScheduleWakeupParams {
     reason: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ScheduleJobWakeupParams {
+    #[serde(rename = "jobId", alias = "job_id")]
+    job_id: String,
+    prompt: String,
+    reason: String,
+}
+
 const WAKEUP_MIN_SECONDS: u64 = 60;
 const WAKEUP_MAX_SECONDS: u64 = 3600;
 
@@ -246,7 +254,7 @@ impl AutomationManagerMcp {
                     "  \"trigger\": { \"type\": \"cron\", \"expression\": \"0 8 * * *\", \"timezone\": \"Europe/Paris\" },\n",
                     "  \"fresh_session\": \"always\"\n",
                     "}\n",
-                    "Trigger types: cron (expression + timezone), interval (seconds).\n",
+                    "Trigger types: cron (expression + timezone), interval (seconds), durable_job_terminal (job_id).\n",
                     "Command source types: inline (content), library (name), local_file (path).\n",
                     "Cron examples: '0 8 * * *' daily 8am, '0 9 * * 1' Mon 9am, '*/30 * * * *' every 30min."
                 ).to_string(),
@@ -269,10 +277,11 @@ impl AutomationManagerMcp {
                             "type": "object",
                             "description": "When to trigger. Use {\"type\": \"cron\", \"expression\": \"0 8 * * *\", \"timezone\": \"Europe/Paris\"} for cron schedules.",
                             "properties": {
-                                "type": {"type": "string", "description": "One of: cron, interval, agent_finished, webhook"},
+                                "type": {"type": "string", "description": "One of: cron, interval, durable_job_terminal, agent_finished, webhook"},
                                 "expression": {"type": "string", "description": "Cron expression: minute hour day-of-month month day-of-week (when type=cron)"},
                                 "timezone": {"type": "string", "description": "IANA timezone like Europe/Paris (when type=cron, defaults to UTC)"},
-                                "seconds": {"type": "number", "description": "Interval in seconds (when type=interval)"}
+                                "seconds": {"type": "number", "description": "Interval in seconds (when type=interval)"},
+                                "job_id": {"type": "string", "description": "Durable job UUID owned by this mission (when type=durable_job_terminal)"}
                             },
                             "required": ["type"]
                         },
@@ -350,8 +359,8 @@ impl AutomationManagerMcp {
                 description: concat!(
                     "Schedule a one-shot wake-up that delivers `prompt` back into this ",
                     "mission after `delaySeconds`. Use this when you need to pause and ",
-                    "resume work later (polling a build, checking back after a wait, ",
-                    "self-paced iteration). The wake-up fires exactly once and then ",
+                    "resume work at a wall-clock time. For builds and other durable ",
+                    "jobs, use schedule_job_wakeup instead. The wake-up fires exactly once and then ",
                     "auto-disables — call schedule_wakeup again from the resumed turn ",
                     "to keep looping. delaySeconds is clamped to [60, 3600]."
                 ).to_string(),
@@ -372,6 +381,35 @@ impl AutomationManagerMcp {
                         "reason": {
                             "type": "string",
                             "description": "One short sentence explaining the chosen delay (for telemetry / UI)."
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_job_wakeup".to_string(),
+                description: concat!(
+                    "Wake this mission exactly once when one of its durable jobs becomes ",
+                    "terminal. Prefer this over repeated schedule_wakeup polling for builds, ",
+                    "benchmark runs, test suites, and other long compute. The wakeup survives ",
+                    "API restarts and fires for completed, failed, cancelled, unknown, or ",
+                    "otherwise dead jobs."
+                )
+                .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["jobId", "prompt", "reason"],
+                    "properties": {
+                        "jobId": {
+                            "type": "string",
+                            "description": "Durable job UUID returned by the durable job launcher."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Message delivered after the job becomes terminal."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Short telemetry/UI explanation."
                         }
                     }
                 }),
@@ -564,6 +602,10 @@ impl AutomationManagerMcp {
 
         let mut variables = HashMap::new();
         variables.insert("__wakeup_reason".to_string(), params.reason.clone());
+        variables.insert(
+            "__wakeup_source".to_string(),
+            "automation-manager".to_string(),
+        );
 
         let body = json!({
             "command_source": { "type": "inline", "content": params.prompt },
@@ -602,6 +644,52 @@ impl AutomationManagerMcp {
         }))
     }
 
+    async fn schedule_job_wakeup(&self, params: ScheduleJobWakeupParams) -> Result<Value, String> {
+        let job_id = Uuid::parse_str(&params.job_id)
+            .map_err(|_| "Invalid durable job ID format".to_string())?;
+        let client = reqwest::Client::new();
+        let url = format!(
+            "{}/api/control/missions/{}/automations",
+            self.api_url, self.mission_id
+        );
+        let mut variables = HashMap::new();
+        variables.insert("__wakeup_reason".to_string(), params.reason.clone());
+        variables.insert(
+            "__wakeup_source".to_string(),
+            "durable-job-terminal".to_string(),
+        );
+        let body = json!({
+            "command_source": { "type": "inline", "content": params.prompt },
+            "trigger": { "type": "durable_job_terminal", "job_id": job_id },
+            "stop_policy": { "type": "after_first_fire" },
+            "fresh_session": "keep",
+            "variables": variables,
+            "start_immediately": false,
+        });
+        let mut request = client.post(&url).json(&body);
+        if let Some(ref token) = self.api_token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {e}"))?;
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(format!("API returned error: {error_text}"));
+        }
+        let automation: Automation = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        Ok(json!({
+            "automation_id": automation.id,
+            "job_id": job_id,
+            "reason": params.reason,
+            "fires_once": true,
+        }))
+    }
+
     async fn handle_call(&self, method: &str, params: Value) -> Result<Value, String> {
         match method {
             "list_automations" => {
@@ -633,6 +721,11 @@ impl AutomationManagerMcp {
                 let params: ScheduleWakeupParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.schedule_wakeup(params).await
+            }
+            "schedule_job_wakeup" => {
+                let params: ScheduleJobWakeupParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {e}"))?;
+                self.schedule_job_wakeup(params).await
             }
             _ => Err(format!("Unknown method: {}", method)),
         }

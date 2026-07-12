@@ -28,7 +28,10 @@ export type AutomationDriver = "scheduler" | "harness_loop";
 
 export type TriggerType =
   | { type: "interval"; seconds: number }
+  | { type: "cron"; expression: string; timezone: string }
   | { type: "agent_finished" }
+  | { type: "durable_job_terminal"; job_id: string }
+  | { type: "telegram"; config: { channel_id: string } }
   | {
       type: "webhook";
       config: {

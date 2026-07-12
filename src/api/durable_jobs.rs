@@ -126,6 +126,55 @@ fn jobs_root(state: &AppState) -> PathBuf {
     state.config.working_dir.join(".sandboxed-sh/durable-jobs")
 }
 
+/// Observe whether a durable job owned by `mission_id` is terminal without
+/// requiring an agent turn to call the durable-job API. The automation
+/// scheduler uses this to provide event-like completion wakeups while keeping
+/// the file-backed registry authoritative across API restarts.
+pub(crate) async fn terminal_for_mission(
+    working_dir: &Path,
+    id: Uuid,
+    mission_id: Uuid,
+) -> Result<bool, String> {
+    let path = working_dir
+        .join(".sandboxed-sh/durable-jobs")
+        .join(id.to_string())
+        .join("job.json");
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| format!("durable job not found: {id}"))?;
+    let job: DurableJob =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid durable job entry: {e}"))?;
+
+    if job.started_by_mission_id != Some(mission_id) {
+        return Err(format!(
+            "durable job {id} is not owned by mission {mission_id}"
+        ));
+    }
+
+    if matches!(
+        job.status,
+        DurableJobStatus::Completed
+            | DurableJobStatus::Failed
+            | DurableJobStatus::Cancelled
+            | DurableJobStatus::Unknown
+    ) {
+        return Ok(true);
+    }
+
+    // The child watcher is process-local, so an API restart can leave job.json
+    // at `running`. The wrapper's atomic exit record is the restart-safe source
+    // of truth and should wake the owner even before a GET refreshes job.json.
+    if let Ok(bytes) = tokio::fs::read(&job.status_file).await {
+        if serde_json::from_slice::<ExitRecord>(&bytes).is_ok() {
+            return Ok(true);
+        }
+    }
+
+    // If neither watcher nor wrapper could persist a terminal record, a dead
+    // supervisor still requires owner attention rather than infinite polling.
+    Ok(job.pid.is_some_and(|pid| !process_alive(pid)))
+}
+
 fn job_dir(state: &AppState, id: Uuid) -> PathBuf {
     jobs_root(state).join(id.to_string())
 }
@@ -768,6 +817,67 @@ mod tests {
         let merged = merge_job_for_write(Some(current), next);
 
         assert_eq!(merged.status, DurableJobStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn terminal_observer_uses_restart_safe_exit_record_and_enforces_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let mut job = test_job(DurableJobStatus::Running);
+        job.started_by_mission_id = Some(mission_id);
+        job.pid = None;
+        job.status_file = dir.path().join("exit.json").to_string_lossy().to_string();
+        let registry_dir = dir
+            .path()
+            .join(".sandboxed-sh/durable-jobs")
+            .join(job.id.to_string());
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("job.json"),
+            serde_json::to_vec(&job).unwrap(),
+        )
+        .unwrap();
+
+        assert!(!terminal_for_mission(dir.path(), job.id, mission_id)
+            .await
+            .unwrap());
+        assert!(terminal_for_mission(dir.path(), job.id, Uuid::new_v4())
+            .await
+            .unwrap_err()
+            .contains("not owned"));
+
+        let exit = ExitRecord {
+            exit_code: Some(0),
+            signal: None,
+            finished_at: Utc::now(),
+        };
+        std::fs::write(&job.status_file, serde_json::to_vec(&exit).unwrap()).unwrap();
+        assert!(terminal_for_mission(dir.path(), job.id, mission_id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn terminal_observer_accepts_persisted_terminal_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let mut job = test_job(DurableJobStatus::Failed);
+        job.started_by_mission_id = Some(mission_id);
+        job.pid = None;
+        let registry_dir = dir
+            .path()
+            .join(".sandboxed-sh/durable-jobs")
+            .join(job.id.to_string());
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("job.json"),
+            serde_json::to_vec(&job).unwrap(),
+        )
+        .unwrap();
+
+        assert!(terminal_for_mission(dir.path(), job.id, mission_id)
+            .await
+            .unwrap());
     }
 
     #[test]
