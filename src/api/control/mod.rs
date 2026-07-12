@@ -5817,36 +5817,25 @@ async fn reconcile_pending_handles(
                 }
                 continue;
             }
-            // Positive-evidence rule: only drop a handle when a live session
-            // PROVES the mission no longer needs it (found and not Active).
-            // A user whose session hasn't booted yet must not lose the only
-            // copy of their job handle — keep it for a later pass instead.
-            let mut owning: Option<ControlState> = None;
-            let mut proven_inactive = false;
+            // A user whose session has not booted yet must not lose the only
+            // recovery handle. Once found, reattach even when the mission is
+            // inactive: the poll loop will request cancellation and retain
+            // the handle until the node confirms a terminal state.
+            let mut owning: Option<(ControlState, MissionStatus)> = None;
             for session in state.control.all_sessions().await {
                 if let Ok(Some(mission)) =
                     session.mission_store.get_mission(handle.mission_id).await
                 {
-                    if mission.status == MissionStatus::Active {
-                        owning = Some(session);
-                    } else {
-                        proven_inactive = true;
-                    }
+                    owning = Some((session, mission.status));
                     break;
                 }
             }
-            let Some(session) = owning else {
-                if proven_inactive {
-                    // Finalized elsewhere: the handle is no longer needed.
-                    crate::remote_node::job_ledger::remove(working_dir, handle.job_id).await;
-                    settled.insert(handle.job_id);
-                } else {
-                    tracing::info!(
-                        mission_id = %handle.mission_id,
-                        job_id = %handle.job_id,
-                        "remote job handle kept: owning session not booted yet; will retry"
-                    );
-                }
+            let Some((session, mission_status)) = owning else {
+                tracing::info!(
+                    mission_id = %handle.mission_id,
+                    job_id = %handle.job_id,
+                    "remote job handle kept: owning session not booted yet; will retry"
+                );
                 continue;
             };
             let node = state.config.remote_nodes.node(&handle.node_id).cloned();
@@ -5881,6 +5870,16 @@ async fn reconcile_pending_handles(
                     });
                 }
                 _ => {
+                    if mission_status != MissionStatus::Active {
+                        tracing::warn!(
+                            mission_id = %handle.mission_id,
+                            job_id = %handle.job_id,
+                            node = %handle.node_id,
+                            %mission_status,
+                            "inactive remote job handle retained: cancellation node unavailable"
+                        );
+                        continue;
+                    }
                     tracing::warn!(
                         mission_id = %handle.mission_id,
                         node = %handle.node_id,

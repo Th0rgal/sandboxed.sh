@@ -211,13 +211,7 @@ impl JobRunner {
 
                 self.store.mark_running(job.id).await?;
 
-                let mut cmd = tokio::process::Command::new("bash");
-                cmd.arg("-lc").arg(command).current_dir(&mission_dir);
-                if let Some(env) = env {
-                    for (key, value) in env {
-                        cmd.env(key, value);
-                    }
-                }
+                let cmd = crate::remote_node::raw_command(command, &mission_dir, env.as_ref());
                 let limit_secs = clamp_timeout(*timeout_secs, self.max_job_secs);
                 let outcome = run_logged_command(cmd, &log_path, limit_secs, token).await?;
                 let (state, exit_code, error) = outcome.into_job_result();

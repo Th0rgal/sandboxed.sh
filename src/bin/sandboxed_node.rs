@@ -321,6 +321,8 @@ async fn submit_job(
             "lease is scoped to a different job".to_string(),
         ));
     }
+    validate_job_payload(&request.payload)
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
     if state
         .jobs
         .get(request.job_id)
@@ -351,6 +353,26 @@ async fn submit_job(
             state: "queued".to_string(),
         }),
     ))
+}
+
+fn validate_job_payload(payload: &sandboxed_sh::remote_node::JobPayload) -> Result<(), String> {
+    if let sandboxed_sh::remote_node::JobPayload::LeanBuild {
+        source,
+        cwd_rel,
+        command,
+        env,
+        ..
+    } = payload
+    {
+        sandboxed_sh::node::lean::validate_lean_build(
+            source,
+            cwd_rel.as_deref(),
+            command,
+            env,
+            &sandboxed_sh::node::lean::env_allowlist_from_env(),
+        )?;
+    }
+    Ok(())
 }
 
 /// `GET /jobs/:id` — full job status including up to 64 KiB of log tail.
@@ -558,6 +580,31 @@ mod tests {
             scope: SCOPE_JOB_SUBMIT.to_string(),
             ..wrong_scope
         };
+        let invalid = submit_job(
+            State(state.clone()),
+            headers.clone(),
+            Json(SubmitJobRequest {
+                job_id,
+                mission_id,
+                lease_token: create_lease_token(&claims, &state.shared_token).expect("lease token"),
+                payload: sandboxed_sh::remote_node::JobPayload::LeanBuild {
+                    source: sandboxed_sh::remote_node::JobSource {
+                        repo: "/node/local/repo".to_string(),
+                        commit: "a".repeat(40),
+                    },
+                    cwd_rel: None,
+                    command: vec!["lake".to_string(), "build".to_string()],
+                    timeout_secs: None,
+                    cache_key: None,
+                    artifacts: vec![],
+                    env: Default::default(),
+                },
+            }),
+        )
+        .await;
+        assert_eq!(invalid.unwrap_err().0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(state.jobs.get(job_id).await.unwrap().is_none());
+
         let (status, accepted) = submit_job(
             State(state.clone()),
             headers.clone(),

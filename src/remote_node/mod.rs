@@ -270,10 +270,7 @@ pub async fn run_lease_command(
     tokio::fs::create_dir_all(&mission_dir)
         .await
         .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
-    let output = Command::new("bash")
-        .arg("-lc")
-        .arg(&request.command)
-        .current_dir(&mission_dir)
+    let output = raw_command(&request.command, &mission_dir, None)
         .output()
         .await
         .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
@@ -285,10 +282,56 @@ pub async fn run_lease_command(
     })
 }
 
+/// Construct a raw command without inheriting the node service environment.
+/// The service bearer/signing tokens must never be visible to repository or
+/// mission code. Explicit payload env is added back after a minimal runtime
+/// baseline.
+pub(crate) fn raw_command(
+    command: &str,
+    cwd: &std::path::Path,
+    env: Option<&std::collections::HashMap<String, String>>,
+) -> Command {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .env_clear()
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string()),
+        )
+        .env("HOME", cwd)
+        .env("LANG", "C.UTF-8");
+    if let Some(env) = env {
+        cmd.envs(env);
+    }
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn raw_command_does_not_inherit_node_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_name = "SANDBOXED_NODE_TEST_ONLY_SECRET_44EDEB08";
+        std::env::set_var(secret_name, "must-not-leak");
+
+        let output = raw_command(
+            &format!("test -z \"${secret_name:-}\" && printf safe"),
+            dir.path(),
+            None,
+        )
+        .output()
+        .await
+        .unwrap();
+        std::env::remove_var(secret_name);
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "safe");
+    }
 
     #[test]
     fn parses_env_node_list_with_default_token_env() {
