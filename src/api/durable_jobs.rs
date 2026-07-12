@@ -88,6 +88,12 @@ fn default_tail_bytes() -> usize {
     16 * 1024
 }
 
+fn require_workspace_scope(workspace_id: Option<Uuid>) -> Result<Uuid, String> {
+    workspace_id.ok_or_else(|| {
+        "workspace_id is required; unscoped durable jobs cannot run on the API host".to_string()
+    })
+}
+
 #[derive(Debug, Serialize)]
 pub struct JobLogsResponse {
     pub job_id: Uuid,
@@ -384,22 +390,15 @@ pub async fn start_job(
     if command.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "command is required"));
     }
-    if req.started_by_mission_id.is_some() && req.workspace_id.is_none() {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "mission-owned durable jobs require workspace_id",
-        ));
-    }
+    let workspace_id = require_workspace_scope(req.workspace_id)
+        .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
 
-    let workspace =
-        match req.workspace_id {
-            Some(id) => {
-                Some(state.workspaces.get(id).await.ok_or_else(|| {
-                    err(StatusCode::NOT_FOUND, format!("workspace not found: {id}"))
-                })?)
-            }
-            None => None,
-        };
+    let workspace = Some(state.workspaces.get(workspace_id).await.ok_or_else(|| {
+        err(
+            StatusCode::NOT_FOUND,
+            format!("workspace not found: {workspace_id}"),
+        )
+    })?);
     let cwd = match workspace.as_ref() {
         Some(workspace) => resolve_workspace_cwd(
             &workspace.path,
@@ -706,6 +705,15 @@ mod tests {
     fn resolve_cwd_defaults_to_base() {
         let base = std::env::current_dir().unwrap();
         assert_eq!(resolve_cwd(&base, None).unwrap(), base);
+    }
+
+    #[test]
+    fn durable_jobs_require_a_workspace_scope() {
+        let id = Uuid::new_v4();
+        assert_eq!(require_workspace_scope(Some(id)).unwrap(), id);
+        assert!(require_workspace_scope(None)
+            .unwrap_err()
+            .contains("cannot run on the API host"));
     }
 
     #[test]
