@@ -3567,6 +3567,35 @@ fn stream_deploy(
         }
         yield sse("log", format!("Backups: {}, {}, {}", bkp_main, bkp_mcp, bkp_assistant_mcp), Some(88));
 
+        // Prune old backups now that every install succeeded. The rollback
+        // paths above consume this deploy's backups via rename, so pruning
+        // must stay on the success path only. Each deploy adds one ~440MB
+        // copy per binary; unbounded, this filled the prod disk.
+        let keep = deploy_backup_keep();
+        let mut pruned_total = 0usize;
+        let mut freed_total = 0u64;
+        for dest in [
+            &install_dest_main,
+            &install_dest_mcp,
+            &install_dest_assistant_mcp,
+        ] {
+            let (pruned, freed) = prune_deploy_backups(dest, keep).await;
+            pruned_total += pruned.len();
+            freed_total = freed_total.saturating_add(freed);
+        }
+        if pruned_total > 0 {
+            yield sse(
+                "log",
+                format!(
+                    "Pruned {} old pre-deploy backups ({} MB freed, keeping {} per binary)",
+                    pruned_total,
+                    freed_total / (1024 * 1024),
+                    keep
+                ),
+                Some(89),
+            );
+        }
+
         // Schedule the restart in a fully detached process so this SSE
         // response can flush its final event before systemd SIGTERMs us.
         // `setsid` + `nohup` + `&` puts the restart in a new session that
@@ -3603,6 +3632,65 @@ fn stream_deploy(
         // restart tears down our TCP connection.
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
+}
+
+/// How many `.pre-deploy-<sha>` backups to keep per deployed binary.
+/// Env `DEPLOY_BACKUP_KEEP`, default 2, clamped to at least 1 so the
+/// most recent rollback point always survives.
+fn deploy_backup_keep() -> usize {
+    std::env::var("DEPLOY_BACKUP_KEEP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.max(1))
+        .unwrap_or(2)
+}
+
+/// Remove all but the `keep` newest `.pre-deploy-*` backups of `dest`.
+/// Returns (pruned file names, bytes freed). Matches on the exact
+/// `<basename>.pre-deploy-` prefix — the dot anchors the name, so pruning
+/// `sandboxed-sh` never touches `sandboxed-sh-prod` backups. Failures are
+/// swallowed: pruning must never fail a deploy that already succeeded.
+async fn prune_deploy_backups(dest: &str, keep: usize) -> (Vec<String>, u64) {
+    let dest_path = std::path::Path::new(dest);
+    let (Some(dir), Some(name)) = (dest_path.parent(), dest_path.file_name()) else {
+        return (Vec::new(), 0);
+    };
+    let prefix = format!("{}.pre-deploy-", name.to_string_lossy());
+    let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+        return (Vec::new(), 0);
+    };
+    let mut backups: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if !fname.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        backups.push((entry.path(), mtime, meta.len()));
+    }
+    backups.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut pruned = Vec::new();
+    let mut freed = 0u64;
+    for (path, _, size) in backups.into_iter().skip(keep) {
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                freed = freed.saturating_add(size);
+                if let Some(n) = path.file_name() {
+                    pruned.push(n.to_string_lossy().into_owned());
+                }
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), ?err, "failed to prune deploy backup");
+            }
+        }
+    }
+    (pruned, freed)
 }
 
 /// Install a new binary into a versioned dir and flip a symlink at
@@ -4565,10 +4653,40 @@ mod tests {
     use super::{
         evaluate_debounce, evaluate_deploy_request, expand_hermes_env_refs, extract_version_token,
         hermes_config_base_url, hermes_config_model_label, hermes_uses_native_codex,
-        is_safe_repo_path, normalize_repo_path, select_repo_path,
+        is_safe_repo_path, normalize_repo_path, prune_deploy_backups, select_repo_path,
         systemd_service_component_from_states, ComponentStatus, DebounceDecision, DeployRefusal,
         DEPLOY_DEBOUNCE_SECS,
     };
+
+    #[tokio::test]
+    async fn prune_deploy_backups_keeps_newest_and_anchors_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("sandboxed-sh");
+        let mk = |name: &str, age_secs: u64| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_modified(t).unwrap();
+            p
+        };
+        // Four backups of `sandboxed-sh`, oldest last.
+        mk("sandboxed-sh.pre-deploy-aaaa", 10);
+        mk("sandboxed-sh.pre-deploy-bbbb", 20);
+        let old1 = mk("sandboxed-sh.pre-deploy-cccc", 30);
+        let old2 = mk("sandboxed-sh.pre-deploy-dddd", 40);
+        // A different binary sharing the prefix chars must NOT be touched.
+        let other = mk("sandboxed-sh-prod.pre-deploy-eeee", 99);
+
+        let (pruned, freed) = prune_deploy_backups(dest.to_string_lossy().as_ref(), 2).await;
+        assert_eq!(pruned.len(), 2);
+        assert!(freed >= 2);
+        assert!(!old1.exists());
+        assert!(!old2.exists());
+        assert!(other.exists(), "prefix must be dot-anchored per basename");
+        assert!(dir.path().join("sandboxed-sh.pre-deploy-aaaa").exists());
+        assert!(dir.path().join("sandboxed-sh.pre-deploy-bbbb").exists());
+    }
 
     #[test]
     fn hermes_config_model_label_prefers_provider_and_default() {
