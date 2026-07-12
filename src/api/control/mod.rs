@@ -5630,20 +5630,35 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
             "reconciling async remote jobs from previous process"
         );
         for handle in handles {
+            // Positive-evidence rule: only drop a handle when a live session
+            // PROVES the mission no longer needs it (found and not Active).
+            // A user whose session hasn't booted yet must not lose the only
+            // copy of their job handle — keep it for a later pass instead.
             let mut owning: Option<ControlState> = None;
+            let mut proven_inactive = false;
             for session in state.control.all_sessions().await {
                 if let Ok(Some(mission)) =
                     session.mission_store.get_mission(handle.mission_id).await
                 {
                     if mission.status == MissionStatus::Active {
                         owning = Some(session);
+                    } else {
+                        proven_inactive = true;
                     }
                     break;
                 }
             }
             let Some(session) = owning else {
-                // Mission gone or no longer Active: nothing to resume.
-                crate::remote_node::job_ledger::remove(&working_dir, handle.job_id).await;
+                if proven_inactive {
+                    // Finalized elsewhere: the handle is no longer needed.
+                    crate::remote_node::job_ledger::remove(&working_dir, handle.job_id).await;
+                } else {
+                    tracing::info!(
+                        mission_id = %handle.mission_id,
+                        job_id = %handle.job_id,
+                        "remote job handle kept: owning session not booted yet"
+                    );
+                }
                 continue;
             };
             let node = state.config.remote_nodes.node(&handle.node_id).cloned();
