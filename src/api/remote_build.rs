@@ -322,6 +322,46 @@ fn node_shared_token(node: &RemoteNodeConfig) -> Result<String, (StatusCode, Str
         ))
 }
 
+fn spawn_remote_build_observer(
+    state: Arc<AppState>,
+    node: RemoteNodeConfig,
+    shared_token: String,
+    mission_id: Uuid,
+    job_id: Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+            match RemoteNodeClient::default()
+                .get_job(&node, &shared_token, job_id)
+                .await
+            {
+                Ok(status)
+                    if matches!(
+                        status.state.as_str(),
+                        "succeeded" | "failed" | "cancelled" | "lost"
+                    ) =>
+                {
+                    state.fleet.record_outcome(DispatchOutcome {
+                        mission_id,
+                        node_id: node.id.clone(),
+                        job_id: Some(job_id),
+                        state: status.state,
+                        exit_code: status.exit_code,
+                        error: status.error,
+                        started_at,
+                        finished_at: Some(chrono::Utc::now()),
+                    });
+                    crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
+                    return;
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+    });
+}
+
 async fn submit_remote_build(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RemoteBuildRequest>,
@@ -421,20 +461,9 @@ async fn submit_remote_build(
         "remote build dispatched"
     );
 
-    if !req.wait {
-        return (
-            StatusCode::ACCEPTED,
-            Json(RemoteBuildAcceptedResponse {
-                job_id,
-                node_id: node.id.clone(),
-            }),
-        )
-            .into_response();
-    }
-
-    // Persist before entering the request-local poll loop. If the handler is
-    // aborted or the API restarts, startup recovery can still observe the
-    // accepted node job through to a terminal state instead of orphaning it.
+    // Persist every accepted build before either returning 202 or entering a
+    // request-local wait. Startup recovery can therefore observe it through
+    // terminal state even if the caller or API disappears.
     if let Err(err) = crate::remote_node::job_ledger::record(
         &state.config.working_dir,
         crate::remote_node::job_ledger::JobHandle {
@@ -451,6 +480,25 @@ async fn submit_remote_build(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("remote build accepted but recovery handle could not be persisted: {err}"),
+        )
+            .into_response();
+    }
+
+    if !req.wait {
+        spawn_remote_build_observer(
+            Arc::clone(&state),
+            node.clone(),
+            shared_token.clone(),
+            req.mission_id,
+            job_id,
+            started_at,
+        );
+        return (
+            StatusCode::ACCEPTED,
+            Json(RemoteBuildAcceptedResponse {
+                job_id,
+                node_id: node.id.clone(),
+            }),
         )
             .into_response();
     }
@@ -493,43 +541,14 @@ async fn submit_remote_build(
         Some("client-side wait cap (2h) exceeded".to_string()),
         true,
     ));
-    let observer_state = Arc::clone(&state);
-    let observer_node = node.clone();
-    let observer_token = shared_token.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(WAIT_POLL_INTERVAL).await;
-            match RemoteNodeClient::default()
-                .get_job(&observer_node, &observer_token, job_id)
-                .await
-            {
-                Ok(status)
-                    if matches!(
-                        status.state.as_str(),
-                        "succeeded" | "failed" | "cancelled" | "lost"
-                    ) =>
-                {
-                    observer_state.fleet.record_outcome(DispatchOutcome {
-                        mission_id: req.mission_id,
-                        node_id: observer_node.id.clone(),
-                        job_id: Some(job_id),
-                        state: status.state,
-                        exit_code: status.exit_code,
-                        error: status.error,
-                        started_at,
-                        finished_at: Some(chrono::Utc::now()),
-                    });
-                    crate::remote_node::job_ledger::remove(
-                        &observer_state.config.working_dir,
-                        job_id,
-                    )
-                    .await;
-                    return;
-                }
-                Ok(_) | Err(_) => {}
-            }
-        }
-    });
+    spawn_remote_build_observer(
+        Arc::clone(&state),
+        node.clone(),
+        shared_token.clone(),
+        req.mission_id,
+        job_id,
+        started_at,
+    );
     (
         StatusCode::GATEWAY_TIMEOUT,
         format!("remote build {job_id} on '{}' did not finish within the 2h wait cap; poll GET /api/remote-build/{job_id}?node_id={}", node.id, node.id),
