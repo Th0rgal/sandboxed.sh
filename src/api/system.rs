@@ -3674,7 +3674,7 @@ async fn prune_deploy_backups(dest: &str, keep: usize) -> (Vec<String>, u64) {
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         backups.push((entry.path(), mtime, meta.len()));
     }
-    backups.sort_by(|a, b| b.1.cmp(&a.1));
+    backups.sort_by_key(|(_, mtime, _)| std::cmp::Reverse(*mtime));
     let mut pruned = Vec::new();
     let mut freed = 0u64;
     for (path, _, size) in backups.into_iter().skip(keep) {
