@@ -108,6 +108,16 @@ pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
     )
 }
 
+fn remote_node_needs_on_demand_probe(
+    status: Option<&crate::remote_node::RemoteNodeStatus>,
+) -> bool {
+    status.is_none_or(|status| *status == crate::remote_node::RemoteNodeStatus::Unknown)
+}
+
+fn should_finalize_remote_job(inactive_status: Option<MissionStatus>) -> bool {
+    inactive_status.is_none()
+}
+
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
 pub(crate) fn safe_truncate_index(s: &str, max: usize) -> usize {
     if s.len() <= max {
@@ -5193,10 +5203,42 @@ pub async fn create_mission(
             // Raw remote commands default to no label requirements; the
             // lean_build path (`POST /api/remote-build`) defaults to ["lean"].
             let requirements = req.remote_requirements.clone().unwrap_or_default();
-            let resolved = state
-                .fleet
-                .place_auto(&state.config.remote_nodes, &requirements)
-                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+            let resolved =
+                match state
+                    .fleet
+                    .place_auto(&state.config.remote_nodes, &requirements)
+                {
+                    Ok(resolved) => resolved,
+                    Err(initial_err) => {
+                        // The periodic monitor may be disabled, or this request
+                        // may race its first heartbeat. Match `/api/remote-build`:
+                        // probe only cold nodes, then retry placement once.
+                        let cold: Vec<_> = state
+                            .config
+                            .remote_nodes
+                            .nodes
+                            .iter()
+                            .filter(|node| {
+                                let cached = state.fleet.get(&node.id);
+                                remote_node_needs_on_demand_probe(
+                                    cached.as_ref().map(|cached| &cached.status),
+                                )
+                            })
+                            .collect();
+                        if cold.is_empty() {
+                            return Err((StatusCode::SERVICE_UNAVAILABLE, initial_err.to_string()));
+                        }
+                        let client = crate::remote_node::RemoteNodeClient::default();
+                        futures::future::join_all(cold.into_iter().map(|node| {
+                            crate::remote_node::probe_node(&state.fleet, &client, node)
+                        }))
+                        .await;
+                        state
+                            .fleet
+                            .place_auto(&state.config.remote_nodes, &requirements)
+                            .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?
+                    }
+                };
             tracing::info!(node_id = %resolved, "auto placement selected remote node");
             remote_node_id = Some(resolved);
         } else {
@@ -5896,15 +5938,25 @@ async fn poll_remote_job(
                             .unwrap_or_default(),
                         status.log_tail.as_deref().unwrap_or("(empty)"),
                     );
-                    let _ = finalize_remote_mission(
-                        &control,
-                        mission_id,
-                        &node.id,
-                        success,
-                        content,
-                        "remote_node_job",
-                    )
-                    .await;
+                    if should_finalize_remote_job(inactive_status) {
+                        let _ = finalize_remote_mission(
+                            &control,
+                            mission_id,
+                            &node.id,
+                            success,
+                            content,
+                            "remote_node_job",
+                        )
+                        .await;
+                    } else {
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            job_id = %job_id,
+                            node = %node.id,
+                            state = %status.state,
+                            "remote job reached a terminal state after operator interruption; preserving mission status"
+                        );
+                    }
                     fleet.record_outcome(outcome(
                         &status.state,
                         status.exit_code,
@@ -21675,6 +21727,40 @@ Investigate <service/> failures.
         // until the user resumes it), so they are not activation-eligible here.
         assert!(!message_activates_mission(MissionStatus::Active));
         assert!(!message_activates_mission(MissionStatus::Paused));
+    }
+
+    #[test]
+    fn raw_remote_auto_placement_probes_only_cold_nodes() {
+        use crate::remote_node::RemoteNodeStatus;
+
+        assert!(remote_node_needs_on_demand_probe(None));
+        assert!(remote_node_needs_on_demand_probe(Some(
+            &RemoteNodeStatus::Unknown
+        )));
+        for status in [
+            RemoteNodeStatus::Online,
+            RemoteNodeStatus::Degraded,
+            RemoteNodeStatus::Offline,
+            RemoteNodeStatus::Disabled,
+        ] {
+            assert!(!remote_node_needs_on_demand_probe(Some(&status)));
+        }
+    }
+
+    #[test]
+    fn remote_terminal_result_preserves_operator_selected_status() {
+        assert!(should_finalize_remote_job(None));
+        for status in [
+            MissionStatus::Interrupted,
+            MissionStatus::Paused,
+            MissionStatus::Blocked,
+            MissionStatus::Failed,
+        ] {
+            assert!(
+                !should_finalize_remote_job(Some(status)),
+                "terminal node result must not overwrite {status}"
+            );
+        }
     }
 
     #[test]
