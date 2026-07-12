@@ -5403,12 +5403,13 @@ pub async fn create_mission(
     if let (Some(remote_node_id), Some(remote_command)) =
         (remote_node_id.as_deref(), remote_command.as_deref())
     {
-        let dispatch = if req.remote_async.unwrap_or(false) {
-            dispatch_remote_job(&state, &control, &mission, remote_node_id, remote_command).await
-        } else {
-            dispatch_remote_mission_mvp(&state, &control, &mission, remote_node_id, remote_command)
-                .await
-        };
+        // All remote commands use the durable node job API. The legacy
+        // synchronous `/execute` path has no cancellation handle if its HTTP
+        // wait expires, so routing `remote_async=false` through it could orphan
+        // a process on the node. The response contract here is unchanged: the
+        // mission is returned Active while its durable poller owns completion.
+        let dispatch =
+            dispatch_remote_job(&state, &control, &mission, remote_node_id, remote_command).await;
         match dispatch {
             Ok(updated) => return Ok((headers, Json(updated))),
             Err(message) => {
@@ -5444,6 +5445,7 @@ fn remote_dispatch_is_scheduled_for_future(
         && not_before.is_some_and(|t| t > now)
 }
 
+#[allow(dead_code)]
 async fn dispatch_remote_mission_mvp(
     state: &Arc<AppState>,
     control: &ControlState,
@@ -6070,7 +6072,12 @@ async fn poll_remote_job(
                     )
                     .await;
                     fleet.record_outcome(outcome("lost", None, Some(err.to_string()), true));
-                    return;
+                    // Finalization moves the mission out of Active. Keep the
+                    // durable handle and continue: the next iteration enters
+                    // the cancellation-aware path, and wrappers only remove
+                    // the ledger entry after a terminal node response.
+                    failures = 0;
+                    continue;
                 }
             }
             Ok(status) => {

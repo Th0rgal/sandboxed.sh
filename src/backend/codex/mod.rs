@@ -496,6 +496,21 @@ async fn send_message_streaming_app_server(
                             }
                         }
                         if outcome.terminal {
+                            let interrupted = reconcile_pending_before_terminal(
+                                &mut translator,
+                                &mut pending_tool_reconciliation,
+                            );
+                            if !interrupted.is_empty() {
+                                let _ = tx
+                                    .send(ExecutionEvent::Error {
+                                        message: "codex app-server resumed with pending tool calls but emitted a terminal turn before replaying their completion; synthetic infra_transport_interrupted results were emitted"
+                                            .to_string(),
+                                    })
+                                    .await;
+                                for event in interrupted {
+                                    let _ = tx.send(event).await;
+                                }
+                            }
                             terminal = true;
                         }
                     }
@@ -727,6 +742,16 @@ struct AppServerEventTranslator {
 struct TranslateOutcome {
     events: Vec<ExecutionEvent>,
     terminal: bool,
+}
+
+fn reconcile_pending_before_terminal(
+    translator: &mut AppServerEventTranslator,
+    pending: &mut Option<(tokio::time::Instant, std::collections::HashSet<String>)>,
+) -> Vec<ExecutionEvent> {
+    let Some((_, interrupted_ids)) = pending.take() else {
+        return Vec::new();
+    };
+    translator.reconcile_interrupted_tools(&interrupted_ids)
 }
 
 fn usage_tokens(usage: &serde_json::Value, keys: &[&str]) -> u64 {
@@ -1452,6 +1477,35 @@ mod tests {
         assert!(translator
             .reconcile_interrupted_tools(&interrupted)
             .is_empty());
+    }
+
+    #[test]
+    fn terminal_resume_reconciles_pending_tool_before_exit() {
+        let mut translator = AppServerEventTranslator::default();
+        translator.handle_notification(
+            "item/started",
+            &json!({
+                "item": {
+                    "id": "tool-terminal",
+                    "type": "toolCall",
+                    "name": "bash",
+                    "arguments": {"command": "lake build"}
+                }
+            }),
+            false,
+        );
+        let ids = translator.pending_tool_ids();
+        let mut pending = Some((tokio::time::Instant::now(), ids));
+
+        let events = reconcile_pending_before_terminal(&mut translator, &mut pending);
+
+        assert!(pending.is_none());
+        assert!(translator.pending_tool_ids().is_empty());
+        assert!(matches!(
+            events.as_slice(),
+            [ExecutionEvent::ToolResult { id, name, .. }]
+                if id == "tool-terminal" && name == "bash"
+        ));
     }
 
     #[test]
