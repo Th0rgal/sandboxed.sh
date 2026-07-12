@@ -259,8 +259,15 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
         return report;
     }
     let index = build_mission_index(state).await;
-    // Workspaces with any scope-keeping mission, keyed by machine token, for
-    // the legacy-naming policy (no mission id in the unit name).
+    // Two token sets over this instance's workspaces (machine-name tokens,
+    // cf. `WorkspaceExec::mission_scope_match_token`):
+    // - `known_workspace_tokens`: OWNERSHIP filter. systemd units are
+    //   host-global; when prod and dev instances share a host, each must
+    //   only ever act on scopes of its own workspaces — a unit whose token
+    //   we can't attribute to one of our workspaces is not ours to stop.
+    // - `live_workspace_tokens`: workspaces with a scope-keeping mission,
+    //   for the legacy-naming policy (no mission id in the unit name).
+    let mut known_workspace_tokens: HashSet<String> = HashSet::new();
     let mut live_workspace_tokens: HashSet<String> = HashSet::new();
     let workspaces = state.workspaces.list().await;
     let live_workspace_ids: HashSet<Uuid> = index
@@ -269,18 +276,25 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
         .map(|e| e.workspace_id)
         .collect();
     for ws in &workspaces {
-        // Same token every scope of this workspace embeds (the machine
-        // name), cf. `WorkspaceExec::mission_scope_match_token`.
         if let Some(token) = machine_name_for_path(&ws.path) {
             if live_workspace_ids.contains(&ws.id) {
-                live_workspace_tokens.insert(token);
+                live_workspace_tokens.insert(token.clone());
             }
+            known_workspace_tokens.insert(token);
         }
     }
     let max_age = zombie_max_age();
 
     for unit in units {
         report.scanned += 1;
+        let ours = known_workspace_tokens
+            .iter()
+            .any(|token| unit.contains(token.as_str()));
+        if !ours {
+            tracing::debug!(unit, "reaper: kept (scope not owned by this instance)");
+            report.kept += 1;
+            continue;
+        }
         match mission_short_id_from_exec_unit(&unit) {
             Some(short) => match index.get(&short) {
                 Some(entry) if status_keeps_scopes(&entry.status) => {
