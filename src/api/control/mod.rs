@@ -3301,6 +3301,13 @@ impl ControlHub {
         self.sessions.read().await.values().cloned().collect()
     }
 
+    /// User ids of all live control sessions. Used by GC/reaper to decide
+    /// whether the cross-store mission index is complete (a persisted store
+    /// with no live session means missions exist that the index can't see).
+    pub async fn session_user_ids(&self) -> Vec<String> {
+        self.sessions.read().await.keys().cloned().collect()
+    }
+
     /// Get a mission store for desktop management.
     /// Uses the default user's store if available, or creates a temporary one.
     pub async fn get_mission_store(&self) -> Arc<dyn MissionStore> {
@@ -8753,7 +8760,10 @@ fn spawn_control_session(
     // Event-driven scope teardown: stop a mission's exec scopes as soon as
     // its status stops needing a live harness. The periodic scope reaper
     // (scope_reaper::spawn) backstops events missed across restarts.
-    super::scope_reaper::spawn_status_listener(events_tx.subscribe());
+    super::scope_reaper::spawn_status_listener(
+        events_tx.subscribe(),
+        Arc::clone(&state.mission_store),
+    );
 
     // Shared registry of in-flight Claude Code background shell tasks. Written
     // by the control actor's ToolResult arm; read by the auto-resume watcher.

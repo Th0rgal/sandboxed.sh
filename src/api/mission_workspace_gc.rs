@@ -127,15 +127,71 @@ fn protection_rank(status: &MissionStatus) -> u8 {
     }
 }
 
-/// Index every mission across all live sessions' stores by the first 8 hex
+/// Cross-store mission index keyed by 8-hex short id.
+///
+/// `complete` is the load-bearing bit: "no index hit" is only usable as
+/// evidence that a dir/scope is orphaned when every persisted store on disk
+/// was actually indexed. Stores belonging to users with no live session are
+/// read offline (read-only SQLite); if any store can't be read, `complete`
+/// is false and callers must skip their unknown-entry deletion branches.
+pub(crate) struct MissionIndex {
+    pub by_short: std::collections::HashMap<String, MissionIndexEntry>,
+    pub complete: bool,
+}
+
+/// Read one persisted SQLite mission store without booting a session.
+fn index_store_file_blocking(
+    path: &std::path::Path,
+) -> Result<Vec<(String, MissionIndexEntry)>, String> {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, status, updated_at, workspace_id FROM missions")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, status, updated_at, workspace_id) = row.map_err(|e| e.to_string())?;
+        if id.len() < 8 {
+            continue;
+        }
+        // Unknown status strings deserialize to the most protective value.
+        let status: MissionStatus = serde_json::from_value(serde_json::Value::String(status))
+            .unwrap_or(MissionStatus::Active);
+        let updated_at = DateTime::parse_from_rfc3339(&updated_at)
+            .map(|ts| ts.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let workspace_id = uuid::Uuid::parse_str(&workspace_id).unwrap_or(uuid::Uuid::nil());
+        out.push((
+            id[..8].to_ascii_lowercase(),
+            MissionIndexEntry {
+                status,
+                updated_at,
+                workspace_id,
+            },
+        ));
+    }
+    Ok(out)
+}
+
+/// Index every mission across all persisted stores by the first 8 hex
 /// chars of its id — the same prefix embedded in workspace dir names
 /// (`mission-<8hex>`) and exec scope units (`-m<8hex>-`). Shared by the
 /// orphan-dir sweep and the scope reaper.
-pub(crate) async fn build_mission_index(
-    state: &Arc<AppState>,
-) -> std::collections::HashMap<String, MissionIndexEntry> {
+pub(crate) async fn build_mission_index(state: &Arc<AppState>) -> MissionIndex {
     let mut index: std::collections::HashMap<String, MissionIndexEntry> =
         std::collections::HashMap::new();
+    let mut complete = true;
     let sessions = state.control.all_sessions().await;
     for session in sessions {
         let store = session.mission_store.clone();
@@ -182,7 +238,78 @@ pub(crate) async fn build_mission_index(
             offset += page_len;
         }
     }
-    index
+
+    // Offline pass: persisted stores whose user has no live session (e.g.
+    // OAuth users who haven't connected since restart). Their missions must
+    // still protect their dirs/scopes.
+    let live_users: std::collections::HashSet<String> = state
+        .control
+        .session_user_ids()
+        .await
+        .iter()
+        .map(|u| super::mission_store::sanitize_filename(u))
+        .collect();
+    let missions_dir = state
+        .config
+        .working_dir
+        .join(".sandboxed-sh")
+        .join("missions");
+    if let Ok(mut rd) = tokio::fs::read_dir(&missions_dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_prefix("missions-") else {
+                continue;
+            };
+            if let Some(user) = stem.strip_suffix(".db") {
+                if live_users.contains(user) {
+                    continue;
+                }
+                let path = entry.path();
+                let rows = tokio::task::spawn_blocking({
+                    let path = path.clone();
+                    move || index_store_file_blocking(&path)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+                match rows {
+                    Ok(rows) => {
+                        for (short, entry) in rows {
+                            match index.get(&short) {
+                                Some(existing)
+                                    if (protection_rank(&existing.status), existing.updated_at)
+                                        >= (protection_rank(&entry.status), entry.updated_at) => {}
+                                _ => {
+                                    index.insert(short, entry);
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            store = %path.display(),
+                            err,
+                            "mission index: offline store read failed; index marked incomplete"
+                        );
+                        complete = false;
+                    }
+                }
+            } else if stem.ends_with(".json") {
+                // File-store format: not offline-indexed; play safe.
+                if !live_users.contains(stem.trim_end_matches(".json")) {
+                    tracing::warn!(
+                        store = name,
+                        "mission index: uncovered file-store; index marked incomplete"
+                    );
+                    complete = false;
+                }
+            }
+        }
+    }
+
+    MissionIndex {
+        by_short: index,
+        complete,
+    }
 }
 
 #[derive(Default)]
@@ -302,7 +429,8 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
 /// its reason; deletion requires positive evidence of collectability, and a
 /// live exec scope always wins.
 async fn orphan_sweep(state: &Arc<AppState>, params: &SweepParams, report: &mut SweepReport) {
-    let index = build_mission_index(state).await;
+    let index_full = build_mission_index(state).await;
+    let index = &index_full.by_short;
     // Any dir whose short id is referenced by a live exec scope is kept
     // unconditionally: a process may hold cwd/fds there.
     let scope_protected: std::collections::HashSet<String> =
@@ -360,6 +488,8 @@ async fn orphan_sweep(state: &Arc<AppState>, params: &SweepParams, report: &mut 
                 None => {
                     if !params.orphans_enabled {
                         Verdict::Keep("orphan collection disabled")
+                    } else if !index_full.complete {
+                        Verdict::Keep("mission index incomplete; not trusting orphan verdicts")
                     } else {
                         // No mission anywhere claims this dir. Use the dir
                         // mtime as the age signal, with the normal retention

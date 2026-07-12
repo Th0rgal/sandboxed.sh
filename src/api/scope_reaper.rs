@@ -27,6 +27,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use super::control::{AgentEvent, MissionStatus};
+use super::mission_store::MissionStore;
 use super::mission_workspace_gc::build_mission_index;
 use super::routes::AppState;
 use crate::workspace_exec::{machine_name_for_path, mission_short_id_from_exec_unit};
@@ -167,7 +168,10 @@ pub async fn stop_mission_exec_scopes(mission_id: Uuid, reason: &str) -> usize {
 /// Event-driven teardown: stop a mission's scopes as soon as its status
 /// stops needing them. Spawned once per control session next to the other
 /// event listeners (telegram alerts, paloma forwarder).
-pub fn spawn_status_listener(mut events: broadcast::Receiver<AgentEvent>) {
+pub fn spawn_status_listener(
+    mut events: broadcast::Receiver<AgentEvent>,
+    mission_store: Arc<dyn MissionStore>,
+) {
     tokio::spawn(async move {
         loop {
             match events.recv().await {
@@ -177,12 +181,29 @@ pub fn spawn_status_listener(mut events: broadcast::Receiver<AgentEvent>) {
                     if status_triggers_teardown(&status) {
                         // Detached so the grace sleep never stalls this
                         // receiver into broadcast lag.
+                        let store = Arc::clone(&mission_store);
                         tokio::spawn(async move {
                             let reason = format!("mission status {status:?}");
                             // Small grace: let the harness's own shutdown
                             // path run first so we usually stop an
                             // already-empty scope instead of racing it.
                             tokio::time::sleep(Duration::from_secs(5)).await;
+                            // Re-check the CURRENT status: within the grace
+                            // window the mission may have been promoted
+                            // (AwaitingUser → WaitingBackground by the
+                            // background watcher, or resumed to Active) —
+                            // stopping then would kill live work.
+                            match store.get_mission(mission_id).await {
+                                Ok(Some(m)) if status_keeps_scopes(&m.status) => {
+                                    tracing::debug!(
+                                        %mission_id,
+                                        status = ?m.status,
+                                        "scope teardown skipped: status changed during grace"
+                                    );
+                                    return;
+                                }
+                                _ => {}
+                            }
                             stop_mission_exec_scopes(mission_id, &reason).await;
                         });
                     }
@@ -258,7 +279,8 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
     if units.is_empty() {
         return report;
     }
-    let index = build_mission_index(state).await;
+    let index_full = build_mission_index(state).await;
+    let index = &index_full.by_short;
     // Two token sets over this instance's workspaces (machine-name tokens,
     // cf. `WorkspaceExec::mission_scope_match_token`):
     // - `known_workspace_tokens`: OWNERSHIP filter. systemd units are
@@ -309,7 +331,13 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
                     }
                 }
                 None => {
-                    if stop_unit(&unit, "reaper: mission unknown to any store").await {
+                    if !index_full.complete {
+                        tracing::debug!(
+                            unit,
+                            "reaper: kept (mission unknown but index incomplete)"
+                        );
+                        report.kept += 1;
+                    } else if stop_unit(&unit, "reaper: mission unknown to any store").await {
                         report.stopped += 1;
                     } else {
                         report.errors += 1;
