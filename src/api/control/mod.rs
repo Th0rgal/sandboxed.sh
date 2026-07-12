@@ -5639,6 +5639,7 @@ async fn dispatch_remote_job(
             node_id: node.id.clone(),
             job_id,
             started_at: chrono::Utc::now(),
+            kind: crate::remote_node::job_ledger::JobHandleKind::Mission,
         },
     )
     .await
@@ -5779,6 +5780,43 @@ async fn reconcile_pending_handles(
 ) {
     {
         for handle in handles {
+            if handle.kind == crate::remote_node::job_ledger::JobHandleKind::RemoteBuild {
+                let node = state.config.remote_nodes.node(&handle.node_id).cloned();
+                let shared_token = node
+                    .as_ref()
+                    .and_then(|node| std::env::var(&node.token_env).ok())
+                    .filter(|value| !value.trim().is_empty());
+                match (node, shared_token) {
+                    (Some(node), Some(shared_token)) => {
+                        settled.insert(handle.job_id);
+                        let ledger_dir = working_dir.to_path_buf();
+                        let fleet = Arc::clone(&state.fleet);
+                        tokio::spawn(async move {
+                            poll_recovered_remote_build(
+                                fleet,
+                                crate::remote_node::RemoteNodeClient::default(),
+                                node,
+                                shared_token,
+                                handle.mission_id,
+                                handle.job_id,
+                                handle.started_at,
+                            )
+                            .await;
+                            crate::remote_node::job_ledger::remove(&ledger_dir, handle.job_id)
+                                .await;
+                        });
+                    }
+                    _ => {
+                        tracing::warn!(
+                            mission_id = %handle.mission_id,
+                            job_id = %handle.job_id,
+                            node = %handle.node_id,
+                            "waited remote build retained: node config/token unavailable"
+                        );
+                    }
+                }
+                continue;
+            }
             // Positive-evidence rule: only drop a handle when a live session
             // PROVES the mission no longer needs it (found and not Active).
             // A user whose session hasn't booted yet must not lose the only
@@ -5863,6 +5901,44 @@ async fn reconcile_pending_handles(
                     settled.insert(handle.job_id);
                 }
             }
+        }
+    }
+}
+
+/// Observe a waited remote-build job after API restart. This deliberately has
+/// no mission-status side effects: the build was a tool call within a mission,
+/// not the mission's own remote execution backend.
+async fn poll_recovered_remote_build(
+    fleet: Arc<crate::remote_node::FleetMonitor>,
+    client: crate::remote_node::RemoteNodeClient,
+    node: crate::remote_node::RemoteNodeConfig,
+    shared_token: String,
+    mission_id: Uuid,
+    job_id: Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        match client.get_job(&node, &shared_token, job_id).await {
+            Ok(status)
+                if matches!(
+                    status.state.as_str(),
+                    "succeeded" | "failed" | "cancelled" | "lost"
+                ) =>
+            {
+                fleet.record_outcome(crate::remote_node::DispatchOutcome {
+                    mission_id,
+                    node_id: node.id.clone(),
+                    job_id: Some(job_id),
+                    state: status.state,
+                    exit_code: status.exit_code,
+                    error: status.error,
+                    started_at,
+                    finished_at: Some(chrono::Utc::now()),
+                });
+                return;
+            }
+            Ok(_) | Err(_) => {}
         }
     }
 }

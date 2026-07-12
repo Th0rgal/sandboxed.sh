@@ -13,12 +13,25 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobHandleKind {
+    /// A raw remote mission whose terminal result finalizes the mission.
+    #[default]
+    Mission,
+    /// A waited `/api/remote-build` request. Recovery only observes the node
+    /// job and cleans up its handle; it must not finalize the agent mission.
+    RemoteBuild,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobHandle {
     pub mission_id: Uuid,
     pub node_id: String,
     pub job_id: Uuid,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub kind: JobHandleKind,
 }
 
 fn ledger_path(working_dir: &Path) -> PathBuf {
@@ -99,6 +112,7 @@ mod tests {
             node_id: "node-a".to_string(),
             job_id,
             started_at: chrono::Utc::now(),
+            kind: JobHandleKind::Mission,
         };
 
         record(dir.path(), handle.clone()).await.unwrap();
@@ -121,9 +135,24 @@ mod tests {
                 node_id: "node-a".to_string(),
                 job_id: Uuid::new_v4(),
                 started_at: chrono::Utc::now(),
+                kind: JobHandleKind::Mission,
             },
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn legacy_handles_default_to_mission_kind() {
+        let raw = serde_json::json!({
+            "mission_id": Uuid::new_v4(),
+            "node_id": "node-a",
+            "job_id": Uuid::new_v4(),
+            "started_at": chrono::Utc::now(),
+        });
+
+        let handle: JobHandle = serde_json::from_value(raw).unwrap();
+
+        assert_eq!(handle.kind, JobHandleKind::Mission);
     }
 }

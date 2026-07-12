@@ -432,6 +432,29 @@ async fn submit_remote_build(
             .into_response();
     }
 
+    // Persist before entering the request-local poll loop. If the handler is
+    // aborted or the API restarts, startup recovery can still observe the
+    // accepted node job through to a terminal state instead of orphaning it.
+    if let Err(err) = crate::remote_node::job_ledger::record(
+        &state.config.working_dir,
+        crate::remote_node::job_ledger::JobHandle {
+            mission_id: req.mission_id,
+            node_id: node.id.clone(),
+            job_id,
+            started_at,
+            kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
+        },
+    )
+    .await
+    {
+        let _ = client.cancel_job(&node, &shared_token, job_id).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("remote build accepted but recovery handle could not be persisted: {err}"),
+        )
+            .into_response();
+    }
+
     // Poll to completion (3s interval, capped at 2h client-side; the node
     // enforces its own SANDBOXED_NODE_MAX_JOB_SECS on the job itself).
     for _ in 0..WAIT_MAX_POLLS {
@@ -450,6 +473,7 @@ async fn submit_remote_build(
                 status.error.clone(),
                 true,
             ));
+            crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
             let duration_secs = (chrono::Utc::now() - started_at).num_seconds().max(0) as u64;
             return Json(RemoteBuildWaitResponse {
                 exit_code: status.exit_code,

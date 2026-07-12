@@ -255,6 +255,31 @@ pub fn derive_cache_key(build_cwd: &Path) -> Option<String> {
     Some(hex::encode(hasher.finalize()))
 }
 
+/// Namespace a dependency cache key by the project and requested build. A
+/// toolchain/manifest digest alone is shared by unrelated repositories and
+/// can therefore restore stale `.lake` outputs that the current job never
+/// produced.
+fn project_cache_key(
+    dependency_key: &str,
+    source: &JobSource,
+    cwd_rel: &str,
+    command: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lake-cache-v2\0dependency\0");
+    hasher.update(dependency_key.as_bytes());
+    hasher.update(b"\0repo\0");
+    hasher.update(source.repo.trim().as_bytes());
+    hasher.update(b"\0cwd\0");
+    hasher.update(cwd_rel.as_bytes());
+    hasher.update(b"\0command\0");
+    for arg in command {
+        hasher.update((arg.len() as u64).to_be_bytes());
+        hasher.update(arg.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// Toolchain directory names under the shared elan cache, for heartbeat
 /// `cached_toolchains` (empty when the cache does not exist yet).
 pub fn cached_toolchains(work_root: &Path) -> Vec<String> {
@@ -616,7 +641,8 @@ pub async fn execute_lean_build(
     let effective_cache_key = cache_key
         .clone()
         .filter(|key| !key.trim().is_empty())
-        .or_else(|| derive_cache_key(&build_cwd));
+        .or_else(|| derive_cache_key(&build_cwd))
+        .map(|key| project_cache_key(&key, source, rel_clean, command));
     if let Some(key) = effective_cache_key.as_deref() {
         let slot = lake_cache_slot(work_root, key);
         let lake_dir = build_cwd.join(".lake");
@@ -1104,6 +1130,44 @@ mod tests {
         )
         .unwrap();
         assert_ne!(derive_cache_key(dir2.path()).unwrap(), with_manifest);
+    }
+
+    #[test]
+    fn lake_cache_key_is_partitioned_by_project_and_target() {
+        let dependency_key = "same-toolchain-and-manifest";
+        let source_a = JobSource {
+            repo: "https://example.com/a.git".to_string(),
+            commit: "a".repeat(40),
+        };
+        let source_a_next_commit = JobSource {
+            repo: source_a.repo.clone(),
+            commit: "b".repeat(40),
+        };
+        let source_b = JobSource {
+            repo: "https://example.com/b.git".to_string(),
+            commit: "a".repeat(40),
+        };
+        let build = vec!["lake".to_string(), "build".to_string(), "A".to_string()];
+        let build_b = vec!["lake".to_string(), "build".to_string(), "B".to_string()];
+
+        let key = project_cache_key(dependency_key, &source_a, "pkg", &build);
+        assert_eq!(
+            key,
+            project_cache_key(dependency_key, &source_a_next_commit, "pkg", &build),
+            "commits in the same project intentionally reuse incremental dependencies"
+        );
+        assert_ne!(
+            key,
+            project_cache_key(dependency_key, &source_b, "pkg", &build)
+        );
+        assert_ne!(
+            key,
+            project_cache_key(dependency_key, &source_a, "other", &build)
+        );
+        assert_ne!(
+            key,
+            project_cache_key(dependency_key, &source_a, "pkg", &build_b)
+        );
     }
 
     #[test]
