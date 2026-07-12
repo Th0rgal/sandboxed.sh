@@ -9,8 +9,15 @@ It never receives a dashboard JWT or broad API token.
 
 Supported now:
 
-- core lists configured nodes and reports live heartbeat/capacity status
+- core lists configured nodes and reports cached fleet status (heartbeat v2:
+  capacity, labels, CPU/memory/disk figures, job counts)
+- a background fleet monitor polls every node's `/heartbeat` on an interval
+  (`REMOTE_NODE_MONITOR_SECS`, default 15s, `0` disables) and derives per-node
+  statuses: `online` (fresh heartbeat), `degraded` (1-2 consecutive misses),
+  `offline` (3+ consecutive misses)
 - `sandboxed-node` exposes authenticated `/heartbeat` and `/execute`
+- node bearer-token rotation: the node accepts the current token and, during a
+  rotation window, the previous one (`SANDBOXED_NODE_TOKEN_PREVIOUS`)
 - selected missions can run one `remote_command` on a selected node
 - the command runs under `SANDBOXED_NODE_WORK_DIR/<mission-id>`
 - dispatch failures fail closed: the mission is marked failed and the API
@@ -44,38 +51,56 @@ sudo install -m 0755 target/debug/sandboxed-node /usr/local/bin/sandboxed-node
 
 Use one distinct secret per node. Do not paste the secret into logs or docs.
 
-Babylon:
+The node binds to `127.0.0.1:3088` by default so it is never reachable over a
+network by accident. To let core reach it, set `SANDBOXED_NODE_BIND` to a
+private interface — preferably the node's tailscale IP (e.g.
+`SANDBOXED_NODE_BIND=100.77.4.93:3088`), or `0.0.0.0:3088` only when the host
+firewall restricts the port to core.
+
+Example (Babylon):
 
 ```bash
 export SANDBOXED_NODE_ID=babylon
-export SANDBOXED_NODE_BIND=0.0.0.0:3088
+# Bind a private/tailscale interface; default is 127.0.0.1:3088.
+export SANDBOXED_NODE_BIND=<tailscale-ip>:3088
 export SANDBOXED_NODE_WORK_DIR=/var/lib/sandboxed-node/work
 export SANDBOXED_NODE_CAPACITY=1
 export SANDBOXED_NODE_TOKEN="$SANDBOXED_REMOTE_NODE_BABYLON_TOKEN"
+# Optional: comma-separated capability labels reported in heartbeats.
+export SANDBOXED_NODE_LABELS=lean,docker
 /usr/local/bin/sandboxed-node
 ```
 
-Nippur:
+Nippur and Ashur are configured identically with their own
+`SANDBOXED_NODE_ID` and token.
 
-```bash
-export SANDBOXED_NODE_ID=nippur
-export SANDBOXED_NODE_BIND=0.0.0.0:3088
-export SANDBOXED_NODE_WORK_DIR=/var/lib/sandboxed-node/work
-export SANDBOXED_NODE_CAPACITY=1
-export SANDBOXED_NODE_TOKEN="$SANDBOXED_REMOTE_NODE_NIPPUR_TOKEN"
-/usr/local/bin/sandboxed-node
-```
+### Token rotation
 
-Ashur:
+To rotate a node token with zero downtime:
 
-```bash
-export SANDBOXED_NODE_ID=ashur
-export SANDBOXED_NODE_BIND=0.0.0.0:3088
-export SANDBOXED_NODE_WORK_DIR=/var/lib/sandboxed-node/work
-export SANDBOXED_NODE_CAPACITY=1
-export SANDBOXED_NODE_TOKEN="$SANDBOXED_REMOTE_NODE_ASHUR_TOKEN"
-/usr/local/bin/sandboxed-node
-```
+1. On the node, set `SANDBOXED_NODE_TOKEN` to the new secret and
+   `SANDBOXED_NODE_TOKEN_PREVIOUS` to the old one, then restart the node. It
+   now accepts both (constant-time comparison for each).
+2. Update the core env (`SANDBOXED_REMOTE_NODE_<ID>_TOKEN`) to the new secret
+   and restart/redeploy core.
+3. Remove `SANDBOXED_NODE_TOKEN_PREVIOUS` on the node and restart it.
+
+### Heartbeat v2
+
+`GET /heartbeat` returns the v1 fields (`node_id`, `online`, `capacity_total`,
+`capacity_available`, `active_leases`, `version`) plus:
+
+- `protocol_version` (currently `2`; core treats a missing field as `1`)
+- `labels` (from `SANDBOXED_NODE_LABELS`)
+- `cpu_total` (logical cores)
+- `mem_total_bytes` / `mem_available_bytes`
+- `disk_total_bytes` / `disk_available_bytes` (filesystem backing the work
+  dir, falling back to root)
+- `active_jobs` / `queued_jobs` (async job API)
+- `cached_toolchains` (empty until toolchain prewarming ships)
+
+All new fields are serde-default-tolerant in both directions, so mixed-version
+core/node fleets keep working during upgrades.
 
 Minimal systemd unit:
 
@@ -99,7 +124,9 @@ WantedBy=multi-user.target
 
 `/etc/sandboxed-node.env` contains only env-var assignments such as
 `SANDBOXED_NODE_ID`, `SANDBOXED_NODE_BIND`, `SANDBOXED_NODE_WORK_DIR`,
-`SANDBOXED_NODE_CAPACITY`, and `SANDBOXED_NODE_TOKEN`.
+`SANDBOXED_NODE_CAPACITY`, `SANDBOXED_NODE_TOKEN`,
+`SANDBOXED_NODE_TOKEN_PREVIOUS` (rotation only), and
+`SANDBOXED_NODE_LABELS`.
 
 ## Core Configuration
 
@@ -117,14 +144,24 @@ The token env names are also the default names inferred from the node ids. To
 override a token env name, use `id=url|TOKEN_ENV_NAME` in
 `SANDBOXED_REMOTE_NODES`.
 
+Optional: `REMOTE_NODE_MONITOR_SECS` sets the fleet-monitor poll interval
+(default 15; `0` disables the loop, in which case `/api/remote-nodes` probes
+uncached nodes on demand).
+
 ## Smoke Tests
 
-Check live node status from core:
+Check fleet status from core:
 
 ```bash
 curl -H "Authorization: Bearer $DASHBOARD_JWT" \
   "$SANDBOXED_CORE_URL/api/remote-nodes"
 ```
+
+The response is `{ "enabled": bool, "nodes": [...], "recent_jobs": [...] }`.
+Each node entry carries the cached `status`
+(`online`/`degraded`/`offline`/`unknown`), labels, capacity, job counts,
+memory/disk availability, `cached_toolchains`, and `last_seen`; `recent_jobs`
+lists the last dispatch outcomes across the fleet.
 
 Run a selected remote MVP mission:
 
