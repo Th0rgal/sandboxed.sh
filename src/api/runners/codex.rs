@@ -36,25 +36,6 @@ fn copy_file_if_exists(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn copy_dir_recursive_if_exists(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if !src.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_recursive_if_exists(&src_path, &dst_path)?;
-        } else if ty.is_file() {
-            copy_file_if_exists(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
-}
-
 fn prepare_codex_per_mission_home(
     workspace: &Workspace,
     workspace_exec: &WorkspaceExec,
@@ -85,10 +66,10 @@ fn prepare_codex_per_mission_home(
         }
     }
 
-    // Only copy user/auth material from the shared Codex home. The generated
-    // `config.toml` contains mission-scoped MCP env and is written separately
-    // into the mission workspace; copying a stale shared config can point
-    // automation-manager/orchestrator at another mission.
+    // Only copy user/auth material from the shared Codex home. Generated
+    // config.toml and native skills are written directly into this mission's
+    // .codex directory during workspace preparation; copying shared versions
+    // could point orchestrator/automation-manager at another mission.
     for file_name in ["auth.json"] {
         if let Err(e) = copy_file_if_exists(
             &source_codex_dir.join(file_name),
@@ -103,19 +84,6 @@ fn prepare_codex_per_mission_home(
             );
         }
     }
-    if let Err(e) = copy_dir_recursive_if_exists(
-        &source_codex_dir.join("skills"),
-        &mission_codex_dir.join("skills"),
-    ) {
-        tracing::warn!(
-            mission_id = %mission_id,
-            source = %source_codex_dir.join("skills").display(),
-            dest = %mission_codex_dir.join("skills").display(),
-            error = %e,
-            "Failed to copy Codex skills into per-mission home"
-        );
-    }
-
     let mut env = HashMap::new();
     env.insert(
         "HOME".to_string(),
