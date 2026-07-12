@@ -68,6 +68,9 @@ pub struct JobRecord {
     pub finished_at: Option<String>,
     pub log_path: Option<String>,
     pub error: Option<String>,
+    /// JSON-encoded `Vec<ArtifactEntry>` recorded after a successful build
+    /// job; `None` for raw commands and unfinished/failed jobs.
+    pub artifacts_json: Option<String>,
 }
 
 fn now_rfc3339() -> String {
@@ -98,9 +101,13 @@ impl JobStore {
                     started_at TEXT,
                     finished_at TEXT,
                     log_path TEXT,
-                    error TEXT
+                    error TEXT,
+                    artifacts_json TEXT
                 );",
             )?;
+            // Migration for jobs.db files created before artifacts shipped.
+            // "duplicate column name" on already-migrated DBs is expected.
+            let _ = conn.execute("ALTER TABLE jobs ADD COLUMN artifacts_json TEXT", []);
             Ok(Self {
                 conn: Arc::new(Mutex::new(conn)),
             })
@@ -181,16 +188,32 @@ impl JobStore {
         exit_code: Option<i32>,
         error: Option<String>,
     ) -> anyhow::Result<()> {
+        self.finish_with_artifacts(id, state, exit_code, error, None)
+            .await
+    }
+
+    /// Record a terminal state plus (for successful build jobs) the resolved
+    /// artifact manifest as JSON.
+    pub async fn finish_with_artifacts(
+        &self,
+        id: Uuid,
+        state: JobState,
+        exit_code: Option<i32>,
+        error: Option<String>,
+        artifacts_json: Option<String>,
+    ) -> anyhow::Result<()> {
         self.with_conn(move |conn| {
             conn.execute(
-                "UPDATE jobs SET state = ?2, exit_code = ?3, error = ?4, finished_at = ?5
+                "UPDATE jobs SET state = ?2, exit_code = ?3, error = ?4, finished_at = ?5,
+                        artifacts_json = ?6
                  WHERE id = ?1",
                 params![
                     id.to_string(),
                     state.as_str(),
                     exit_code,
                     error,
-                    now_rfc3339()
+                    now_rfc3339(),
+                    artifacts_json,
                 ],
             )
             .map(|_| ())
@@ -202,7 +225,7 @@ impl JobStore {
         self.with_conn(move |conn| {
             conn.query_row(
                 "SELECT id, mission_id, payload_json, state, exit_code, created_at,
-                        started_at, finished_at, log_path, error
+                        started_at, finished_at, log_path, error, artifacts_json
                  FROM jobs WHERE id = ?1",
                 params![id.to_string()],
                 row_to_record,
@@ -217,7 +240,7 @@ impl JobStore {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, mission_id, payload_json, state, exit_code, created_at,
-                        started_at, finished_at, log_path, error
+                        started_at, finished_at, log_path, error, artifacts_json
                  FROM jobs ORDER BY created_at DESC, id DESC LIMIT ?1",
             )?;
             let rows = stmt.query_map(params![limit as i64], row_to_record)?;
@@ -246,6 +269,7 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
         finished_at: row.get(7)?,
         log_path: row.get(8)?,
         error: row.get(9)?,
+        artifacts_json: row.get(10)?,
     })
 }
 

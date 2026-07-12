@@ -4,7 +4,9 @@
 //! store and the job runner are unit-testable with `cargo test --lib`.
 
 pub mod job_store;
+pub mod lean;
 pub mod runner;
 
 pub use job_store::{JobRecord, JobState, JobStore};
+pub use lean::{cached_toolchains, spawn_cache_gc};
 pub use runner::{read_log_tail, JobRunner, DEFAULT_MAX_JOB_SECS, LOG_TAIL_MAX_BYTES};

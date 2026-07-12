@@ -87,6 +87,10 @@ async fn main() -> anyhow::Result<()> {
         max_job_secs,
     );
 
+    // Periodic disk GC for lean-build checkouts and lake cache slots
+    // (SANDBOXED_NODE_MIN_FREE_GB, default 10).
+    sandboxed_sh::node::spawn_cache_gc(work_root.clone());
+
     let state = Arc::new(NodeState {
         node_id,
         shared_token,
@@ -195,7 +199,7 @@ async fn heartbeat(
         disk_available_bytes: resources.disk_available_bytes,
         active_jobs: state.runner.active_count(),
         queued_jobs: state.runner.queued_count(),
-        cached_toolchains: vec![],
+        cached_toolchains: sandboxed_sh::node::cached_toolchains(&state.work_root),
     }))
 }
 
@@ -271,6 +275,11 @@ fn job_status_from_record(record: &JobRecord, log_tail: Option<String>) -> NodeJ
         finished_at: record.finished_at.clone(),
         error: record.error.clone(),
         log_tail,
+        artifacts: record
+            .artifacts_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default(),
     }
 }
 

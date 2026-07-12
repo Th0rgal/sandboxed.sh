@@ -112,8 +112,27 @@ pub struct ExecuteResponse {
     pub stderr: String,
 }
 
-/// Async job payload. Tagged so future kinds (e.g. `lean_build`) can be added
-/// without breaking the wire format.
+/// Git source of a declarative build job: the node fetches exactly this
+/// commit itself, so no workspace sync between core and node is needed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobSource {
+    /// Clone/fetch URL (https or ssh).
+    pub repo: String,
+    /// Full 40-char lowercase hex commit SHA. Branch names are rejected so a
+    /// job always builds a pinned, reproducible tree.
+    pub commit: String,
+}
+
+/// One artifact produced by a build job, relative to the checkout root.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactEntry {
+    pub path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+/// Async job payload. Tagged so future kinds can be added without breaking
+/// the wire format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobPayload {
@@ -127,6 +146,36 @@ pub enum JobPayload {
         timeout_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env: Option<std::collections::HashMap<String, String>>,
+    },
+    /// Declarative Lean build: the node checks out `source` into a
+    /// content-addressed checkout, restores shared elan/lake caches, runs a
+    /// constrained `lake`/`lean`/`elan` argv, and reports artifact digests.
+    /// See `src/node/lean.rs` for validation and execution.
+    LeanBuild {
+        source: JobSource,
+        /// Build cwd relative to the checkout root (validated: no traversal,
+        /// no shell metacharacters). `None`/empty = checkout root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd_rel: Option<String>,
+        /// Argv executed directly (no shell). argv[0] must be one of
+        /// `lake`/`lean`/`elan` on the node.
+        command: Vec<String>,
+        /// Client-requested timeout; clamped to the node's
+        /// `SANDBOXED_NODE_MAX_JOB_SECS`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+        /// Lake cache slot key. Defaults to a digest of the checkout's
+        /// `lean-toolchain` + `lake-manifest.json` contents.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_key: Option<String>,
+        /// Artifact patterns relative to the checkout root (exact paths or a
+        /// single-segment `*` glob), resolved after a successful build.
+        #[serde(default)]
+        artifacts: Vec<String>,
+        /// Extra env for the build command; keys must be allowlisted on the
+        /// node (`SANDBOXED_NODE_ENV_ALLOWLIST`).
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
     },
 }
 
@@ -162,6 +211,10 @@ pub struct NodeJobStatus {
     /// only; omitted from list responses).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_tail: Option<String>,
+    /// Artifact digests recorded after a successful build job (empty for raw
+    /// commands and for pre-artifact nodes).
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactEntry>,
 }
 
 /// Body of `POST /jobs/:id/cancel`.
@@ -395,10 +448,84 @@ mod tests {
 
         // Unknown kinds are rejected, leaving room for future variants.
         assert!(serde_json::from_value::<JobPayload>(serde_json::json!({
-            "kind": "lean_build",
+            "kind": "gpu_render",
             "command": "true",
         }))
         .is_err());
+    }
+
+    #[test]
+    fn lean_build_payload_round_trips_with_defaults() {
+        let payload = JobPayload::LeanBuild {
+            source: JobSource {
+                repo: "https://github.com/example/verity.git".to_string(),
+                commit: "a".repeat(40),
+            },
+            cwd_rel: Some("morpho-verity".to_string()),
+            command: vec!["lake".to_string(), "build".to_string()],
+            timeout_secs: Some(3600),
+            cache_key: Some("abc123".to_string()),
+            artifacts: vec![".lake/build/lib/*".to_string()],
+            env: [("LEAN_NUM_THREADS".to_string(), "4".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["kind"], "lean_build");
+        assert_eq!(json["source"]["commit"], "a".repeat(40));
+        let parsed: JobPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, payload);
+
+        // Minimal payload: only source + command; the rest defaults.
+        let minimal: JobPayload = serde_json::from_value(serde_json::json!({
+            "kind": "lean_build",
+            "source": {"repo": "https://x.git", "commit": "b".repeat(40)},
+            "command": ["lake", "build"],
+        }))
+        .unwrap();
+        match minimal {
+            JobPayload::LeanBuild {
+                cwd_rel,
+                timeout_secs,
+                cache_key,
+                artifacts,
+                env,
+                ..
+            } => {
+                assert_eq!(cwd_rel, None);
+                assert_eq!(timeout_secs, None);
+                assert_eq!(cache_key, None);
+                assert!(artifacts.is_empty());
+                assert!(env.is_empty());
+            }
+            other => panic!("expected lean_build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn job_status_artifacts_default_for_old_nodes() {
+        // A pre-artifact node omits the field entirely.
+        let raw = serde_json::json!({
+            "job_id": Uuid::new_v4(),
+            "mission_id": Uuid::new_v4(),
+            "state": "succeeded",
+            "exit_code": 0,
+            "created_at": "2026-07-12T00:00:00Z",
+            "started_at": null,
+            "finished_at": null,
+            "error": null,
+        });
+        let status: NodeJobStatus = serde_json::from_value(raw).unwrap();
+        assert!(status.artifacts.is_empty());
+
+        let entry = ArtifactEntry {
+            path: ".lake/build/lib/Verity.olean".to_string(),
+            sha256: "0".repeat(64),
+            size_bytes: 42,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        let parsed: ArtifactEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, entry);
     }
 
     #[test]

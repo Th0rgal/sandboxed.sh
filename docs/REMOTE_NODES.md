@@ -32,6 +32,9 @@ Supported now:
   mission goes Active immediately and a background poll loop (3s) finalizes
   it when the job completes; 5 consecutive unreachable polls fail the mission
   with reason `remote_node_lost`
+- declarative `lean_build` jobs: the node fetches a pinned commit itself,
+  runs a constrained `lake`/`lean`/`elan` argv with shared elan/lake caches,
+  and reports artifact digests (see "Lean build jobs" below)
 - dispatch failures fail closed: the mission is marked failed and the API
   returns an error
 - future `not_before` scheduling with `remote_node_id` is rejected for now so
@@ -109,7 +112,8 @@ To rotate a node token with zero downtime:
 - `disk_total_bytes` / `disk_available_bytes` (filesystem backing the work
   dir, falling back to root)
 - `active_jobs` / `queued_jobs` (async job API)
-- `cached_toolchains` (empty until toolchain prewarming ships)
+- `cached_toolchains` (Lean toolchain dirs under the node's shared elan
+  cache; empty until the first `lean_build` job warms it)
 
 All new fields are serde-default-tolerant in both directions, so mixed-version
 core/node fleets keep working during upgrades.
@@ -140,6 +144,19 @@ WantedBy=multi-user.target
 `SANDBOXED_NODE_TOKEN_PREVIOUS` (rotation only), `SANDBOXED_NODE_LABELS`,
 and `SANDBOXED_NODE_MAX_JOB_SECS`.
 
+Node env vars for lean-build jobs:
+
+- `SANDBOXED_NODE_ENV_ALLOWLIST` — comma-separated env keys a `lean_build`
+  payload may set (default `LEAN_NUM_THREADS,LAKE_JOBS`); anything else is
+  rejected before the build starts.
+- `SANDBOXED_NODE_MIN_FREE_GB` — free-space floor (default 10 GiB) for the
+  node's cache GC: every 30 minutes, when the work-dir filesystem drops below
+  it, checkout dirs then lake cache slots are LRU-deleted (by dir mtime)
+  until the threshold is met.
+- `SANDBOXED_NODE_GIT_SSH_KEY` — path to an SSH key used for git fetches
+  (`GIT_SSH_COMMAND="ssh -i <key> -o IdentitiesOnly=yes -o
+  StrictHostKeyChecking=accept-new"`); unset = default git auth.
+
 ## Async Job API
 
 The node exposes a durable job API next to the blocking `/execute` path. All
@@ -149,11 +166,12 @@ leases are rejected, and vice versa).
 
 - `POST /jobs` with `{job_id, mission_id, lease_token, payload}` where
   `payload` is `{"kind": "raw_command", "command": "...", "timeout_secs"?:
-  N, "env"?: {..}}`. Returns `202 {job_id, state: "queued"}`; duplicate
-  `job_id` returns `409`.
+  N, "env"?: {..}}` or a `lean_build` payload (below). Returns `202 {job_id,
+  state: "queued"}`; duplicate `job_id` returns `409`.
 - `GET /jobs/:id` — full status (`queued|running|succeeded|failed|cancelled|
   lost`, exit code, timestamps, error) plus up to the last 64 KiB of the
-  combined log as `log_tail`.
+  combined log as `log_tail` and, for successful builds, `artifacts`
+  (`[{path, sha256, size_bytes}]`).
 - `POST /jobs/:id/cancel` — SIGTERMs the job's process group (SIGKILL after
   10s); returns the current state and whether a live job got the request.
 - `GET /jobs?limit=N` — recent jobs, newest first (default 20, no log tails).
@@ -180,6 +198,58 @@ indirectly: when the mission leaves the Active state for any reason, the poll
 loop cancels the node job on its next tick. There is no dedicated
 mission-cancel -> job-cancel plumbing yet; wiring an explicit cancel hook is a
 follow-up.
+
+## Lean Build Jobs
+
+`lean_build` is a declarative job payload: no workspace sync, no shell. The
+node checks out the pinned commit itself and runs a constrained argv:
+
+```json
+{
+  "kind": "lean_build",
+  "source": {"repo": "https://github.com/org/repo.git", "commit": "<40-hex sha>"},
+  "cwd_rel": "morpho-verity",
+  "command": ["lake", "build"],
+  "timeout_secs": 3600,
+  "cache_key": null,
+  "artifacts": [".lake/build/lib/*"],
+  "env": {"LEAN_NUM_THREADS": "8"}
+}
+```
+
+Validation (node-side, before anything runs):
+
+- `source.commit` must be a full 40-char lowercase hex SHA (no branches).
+- `cwd_rel` uses the same strict path allowlist as the Spark offload
+  (`[A-Za-z0-9._-]` components, no `..`, no `-`-leading component).
+- `command` is executed directly (never via a shell) and its argv[0]
+  basename must be `lake`, `lean`, or `elan`.
+- `env` keys must be within `SANDBOXED_NODE_ENV_ALLOWLIST`.
+- `timeout_secs` is clamped to `SANDBOXED_NODE_MAX_JOB_SECS`.
+
+Execution model:
+
+- Checkouts are content-addressed at
+  `<workdir>/checkouts/<sha256(repo)[..16]>/<commit>/` and reused across
+  jobs; materialization is `git init` + `git fetch --depth 1 <repo>
+  <commit>` + detached checkout (+ best-effort shallow submodules) into a
+  temp dir, then an atomic rename. Builds of the same commit are serialized
+  by a file lock.
+- Builds run with shared caches: `ELAN_HOME=<workdir>/caches/elan`,
+  `XDG_CACHE_HOME=<workdir>/caches/xdg`, `HOME=<workdir>/caches/home`, and
+  `<workdir>/caches/elan/bin` prepended to `PATH`.
+- Lake cache: `cache_key` defaults to a digest of the build cwd's
+  `lean-toolchain` + `lake-manifest.json`. Before a cold build the slot
+  `<workdir>/caches/lake/<key>/` is hardlink-copied (`cp -al`) into
+  `<cwd>/.lake`; after a successful build the slot is refreshed the same way
+  (tmp dir + atomic rename, under a per-key flock). Accepted caveat: mtime
+  drift may cause partial rebuilds, never wrong artifacts.
+- `artifacts` patterns are resolved relative to the checkout root after a
+  successful build: exact relative paths, or `*` within a single path
+  segment (never across `/`); `..` and absolute paths are rejected. Each
+  match is recorded with its sha256 and size.
+- The heartbeat's `cached_toolchains` lists the directory names under
+  `<workdir>/caches/elan/toolchains/`.
 
 ## Core Configuration
 

@@ -162,19 +162,24 @@ impl JobRunner {
 
     async fn run_one(&self, job: QueuedJob) {
         let token = self.take_cancel_token(job.id);
-        let (state, exit_code, error) = if token.is_cancelled() {
+        let (state, exit_code, error, artifacts_json) = if token.is_cancelled() {
             (
                 JobState::Cancelled,
                 None,
                 Some("cancelled before start".to_string()),
+                None,
             )
         } else {
             match self.execute(&job, &token).await {
                 Ok(outcome) => outcome,
-                Err(err) => (JobState::Failed, None, Some(err.to_string())),
+                Err(err) => (JobState::Failed, None, Some(err.to_string()), None),
             }
         };
-        if let Err(err) = self.store.finish(job.id, state, exit_code, error).await {
+        if let Err(err) = self
+            .store
+            .finish_with_artifacts(job.id, state, exit_code, error, artifacts_json)
+            .await
+        {
             tracing::warn!(job_id = %job.id, "failed to persist job outcome: {err}");
         }
         self.drop_cancel_token(job.id);
@@ -184,79 +189,136 @@ impl JobRunner {
         &self,
         job: &QueuedJob,
         token: &CancellationToken,
-    ) -> anyhow::Result<(JobState, Option<i32>, Option<String>)> {
-        let JobPayload::RawCommand {
-            command,
-            timeout_secs,
-            env,
-        } = &job.payload;
-
-        let mission_dir = self.work_root.join(job.mission_id.to_string());
-        tokio::fs::create_dir_all(&mission_dir).await?;
+    ) -> anyhow::Result<(JobState, Option<i32>, Option<String>, Option<String>)> {
         let log_path = self.log_path(job.id);
-        if let Some(parent) = log_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let stdout_file = std::fs::File::create(&log_path)?;
-        let stderr_file = stdout_file.try_clone()?;
+        match &job.payload {
+            JobPayload::RawCommand {
+                command,
+                timeout_secs,
+                env,
+            } => {
+                let mission_dir = self.work_root.join(job.mission_id.to_string());
+                tokio::fs::create_dir_all(&mission_dir).await?;
 
-        self.store.mark_running(job.id).await?;
+                self.store.mark_running(job.id).await?;
 
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.arg("-lc")
-            .arg(command)
-            .current_dir(&mission_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file))
-            // New process group so cancel/timeout can kill the whole tree.
-            .process_group(0);
-        if let Some(env) = env {
-            for (key, value) in env {
-                cmd.env(key, value);
-            }
-        }
-        let mut child = cmd.spawn()?;
-        let pid = child.id();
-
-        let limit_secs = timeout_secs
-            .map(|requested| requested.min(self.max_job_secs))
-            .unwrap_or(self.max_job_secs)
-            .max(1);
-
-        let outcome = tokio::select! {
-            _ = token.cancelled() => {
-                kill_process_group(pid, &mut child).await;
-                (JobState::Cancelled, None, Some("cancelled".to_string()))
-            }
-            waited = tokio::time::timeout(Duration::from_secs(limit_secs), child.wait()) => {
-                match waited {
-                    Ok(Ok(status)) => {
-                        let code = status.code();
-                        if status.success() {
-                            (JobState::Succeeded, code, None)
-                        } else {
-                            (
-                                JobState::Failed,
-                                code,
-                                Some(format!("command exited with {code:?}")),
-                            )
-                        }
-                    }
-                    Ok(Err(err)) => (JobState::Failed, None, Some(err.to_string())),
-                    Err(_) => {
-                        kill_process_group(pid, &mut child).await;
-                        (
-                            JobState::Failed,
-                            None,
-                            Some(format!("timed out after {limit_secs}s")),
-                        )
+                let mut cmd = tokio::process::Command::new("bash");
+                cmd.arg("-lc").arg(command).current_dir(&mission_dir);
+                if let Some(env) = env {
+                    for (key, value) in env {
+                        cmd.env(key, value);
                     }
                 }
+                let limit_secs = clamp_timeout(*timeout_secs, self.max_job_secs);
+                let outcome = run_logged_command(cmd, &log_path, limit_secs, token).await?;
+                let (state, exit_code, error) = outcome.into_job_result();
+                Ok((state, exit_code, error, None))
             }
-        };
-        Ok(outcome)
+            JobPayload::LeanBuild { .. } => {
+                self.store.mark_running(job.id).await?;
+                let result = super::lean::execute_lean_build(
+                    &self.work_root,
+                    &log_path,
+                    &job.payload,
+                    self.max_job_secs,
+                    token,
+                )
+                .await?;
+                let artifacts_json = if result.artifacts.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&result.artifacts)?)
+                };
+                Ok((result.state, result.exit_code, result.error, artifacts_json))
+            }
+        }
     }
+}
+
+/// Clamp a client-requested timeout to the node ceiling (min 1s).
+pub(crate) fn clamp_timeout(requested: Option<u64>, max_job_secs: u64) -> u64 {
+    requested
+        .map(|requested| requested.min(max_job_secs))
+        .unwrap_or(max_job_secs)
+        .max(1)
+}
+
+/// Outcome of one supervised child process run (see [`run_logged_command`]).
+pub(crate) enum RunOutcome {
+    Exited(Option<i32>),
+    Cancelled,
+    TimedOut { limit_secs: u64 },
+}
+
+impl RunOutcome {
+    /// Whether the process ran to completion with exit code 0.
+    pub(crate) fn success(&self) -> bool {
+        matches!(self, RunOutcome::Exited(Some(0)))
+    }
+
+    /// Map a run outcome to the `(state, exit_code, error)` triple persisted
+    /// on the job record.
+    pub(crate) fn into_job_result(self) -> (JobState, Option<i32>, Option<String>) {
+        match self {
+            RunOutcome::Exited(Some(0)) => (JobState::Succeeded, Some(0), None),
+            RunOutcome::Exited(code) => (
+                JobState::Failed,
+                code,
+                Some(format!("command exited with {code:?}")),
+            ),
+            RunOutcome::Cancelled => (JobState::Cancelled, None, Some("cancelled".to_string())),
+            RunOutcome::TimedOut { limit_secs } => (
+                JobState::Failed,
+                None,
+                Some(format!("timed out after {limit_secs}s")),
+            ),
+        }
+    }
+}
+
+/// Spawn `cmd` in its own process group with combined stdout+stderr appended
+/// to `log_path`, honoring cancellation and a hard timeout. The whole process
+/// group is killed (SIGTERM, then SIGKILL after a grace period) on
+/// cancel/timeout. Shared by raw-command jobs and the lean-build steps.
+pub(crate) async fn run_logged_command(
+    mut cmd: tokio::process::Command,
+    log_path: &Path,
+    limit_secs: u64,
+    token: &CancellationToken,
+) -> anyhow::Result<RunOutcome> {
+    if let Some(parent) = log_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let stdout_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let stderr_file = stdout_file.try_clone()?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        // New process group so cancel/timeout can kill the whole tree.
+        .process_group(0);
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+
+    let outcome = tokio::select! {
+        _ = token.cancelled() => {
+            kill_process_group(pid, &mut child).await;
+            RunOutcome::Cancelled
+        }
+        waited = tokio::time::timeout(Duration::from_secs(limit_secs.max(1)), child.wait()) => {
+            match waited {
+                Ok(Ok(status)) => RunOutcome::Exited(status.code()),
+                Ok(Err(err)) => return Err(err.into()),
+                Err(_) => {
+                    kill_process_group(pid, &mut child).await;
+                    RunOutcome::TimedOut { limit_secs }
+                }
+            }
+        }
+    };
+    Ok(outcome)
 }
 
 /// SIGTERM the job's process group, escalating to SIGKILL after a grace
