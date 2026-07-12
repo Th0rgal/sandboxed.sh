@@ -12,6 +12,7 @@
 //! `crate::remote_node::*` unchanged.
 
 pub mod client;
+pub mod job_ledger;
 pub mod monitor;
 pub mod protocol;
 

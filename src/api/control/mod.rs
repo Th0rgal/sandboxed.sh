@@ -5539,6 +5539,20 @@ async fn dispatch_remote_job(
         .await
         .map_err(|e| e.to_string())?;
 
+    // Persist the job handle BEFORE marking the mission Active: if the API
+    // restarts from here on, the startup reconciler can re-attach a poll
+    // loop instead of leaving an Active mission orphaned.
+    crate::remote_node::job_ledger::record(
+        &state.config.working_dir,
+        crate::remote_node::job_ledger::JobHandle {
+            mission_id: mission.id,
+            node_id: node.id.clone(),
+            job_id,
+            started_at: chrono::Utc::now(),
+        },
+    )
+    .await;
+
     control
         .mission_store
         .update_mission_status(mission.id, MissionStatus::Active)
@@ -5575,6 +5589,7 @@ async fn dispatch_remote_job(
     let poll_control = control.clone();
     let fleet = Arc::clone(&state.fleet);
     let mission_id = mission.id;
+    let ledger_dir = state.config.working_dir.clone();
     tokio::spawn(async move {
         poll_remote_job(
             poll_control,
@@ -5587,9 +5602,102 @@ async fn dispatch_remote_job(
             started_at,
         )
         .await;
+        // The poll loop only returns once the mission is finalized (or the
+        // job was cancelled/lost); the handle is no longer needed.
+        crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
     });
 
     Ok(updated)
+}
+
+/// Startup reconciliation for async remote jobs that were in flight when the
+/// previous process exited. For each persisted handle: if its mission is
+/// still Active in some live session's store, re-attach a poll loop (the
+/// node job is durable — jobs.db — so its result is recoverable); otherwise
+/// drop the stale handle. Handles whose node is no longer configured fail
+/// their mission explicitly rather than leaving it Active forever.
+pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        // Let control sessions boot before touching their stores.
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let working_dir = state.config.working_dir.clone();
+        let handles = crate::remote_node::job_ledger::load(&working_dir).await;
+        if handles.is_empty() {
+            return;
+        }
+        tracing::info!(
+            count = handles.len(),
+            "reconciling async remote jobs from previous process"
+        );
+        for handle in handles {
+            let mut owning: Option<ControlState> = None;
+            for session in state.control.all_sessions().await {
+                if let Ok(Some(mission)) =
+                    session.mission_store.get_mission(handle.mission_id).await
+                {
+                    if mission.status == MissionStatus::Active {
+                        owning = Some(session);
+                    }
+                    break;
+                }
+            }
+            let Some(session) = owning else {
+                // Mission gone or no longer Active: nothing to resume.
+                crate::remote_node::job_ledger::remove(&working_dir, handle.job_id).await;
+                continue;
+            };
+            let node = state.config.remote_nodes.node(&handle.node_id).cloned();
+            let shared_token = node
+                .as_ref()
+                .and_then(|n| std::env::var(&n.token_env).ok())
+                .filter(|v| !v.trim().is_empty());
+            match (node, shared_token) {
+                (Some(node), Some(shared_token)) => {
+                    tracing::info!(
+                        mission_id = %handle.mission_id,
+                        job_id = %handle.job_id,
+                        node = %node.id,
+                        "re-attaching poll loop to in-flight remote job"
+                    );
+                    let fleet = Arc::clone(&state.fleet);
+                    let ledger_dir = working_dir.clone();
+                    tokio::spawn(async move {
+                        poll_remote_job(
+                            session,
+                            fleet,
+                            crate::remote_node::RemoteNodeClient::default(),
+                            node,
+                            shared_token,
+                            handle.mission_id,
+                            handle.job_id,
+                            handle.started_at,
+                        )
+                        .await;
+                        crate::remote_node::job_ledger::remove(&ledger_dir, handle.job_id).await;
+                    });
+                }
+                _ => {
+                    tracing::warn!(
+                        mission_id = %handle.mission_id,
+                        node = %handle.node_id,
+                        "remote job's node no longer configured; failing mission"
+                    );
+                    let _ = session
+                        .mission_store
+                        .update_mission_status(handle.mission_id, MissionStatus::Failed)
+                        .await;
+                    let _ = session.events_tx.send(AgentEvent::MissionStatusChanged {
+                        mission_id: handle.mission_id,
+                        status: MissionStatus::Failed,
+                        summary: Some(
+                            "remote_node_lost: node unconfigured after restart".to_string(),
+                        ),
+                    });
+                    crate::remote_node::job_ledger::remove(&working_dir, handle.job_id).await;
+                }
+            }
+        }
+    });
 }
 
 /// Background poll loop for one async remote job. Emits sparse progress

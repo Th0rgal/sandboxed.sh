@@ -588,6 +588,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // mission no longer needs a live harness (see scope_reaper docs).
     super::scope_reaper::spawn(Arc::clone(&state));
 
+    // Re-attach poll loops for async remote jobs that were in flight when
+    // the previous process exited (durable handles in remote-jobs.json).
+    super::control::spawn_remote_job_reconciler(Arc::clone(&state));
+
     // Start background OAuth token refresher task
     {
         let ai_providers = Arc::clone(&state.ai_providers);
