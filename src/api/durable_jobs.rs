@@ -23,6 +23,8 @@ use tokio::process::{Child, Command};
 use uuid::Uuid;
 
 use super::routes::AppState;
+use crate::workspace::WorkspaceType;
+use crate::workspace_exec::WorkspaceExec;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +48,8 @@ pub struct DurableJob {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub started_by_mission_id: Option<Uuid>,
+    #[serde(default)]
+    pub workspace_id: Option<Uuid>,
     pub stdout_log: String,
     pub stderr_log: String,
     pub status_file: String,
@@ -58,6 +62,11 @@ pub struct StartDurableJobRequest {
     pub cwd: Option<String>,
     #[serde(default)]
     pub started_by_mission_id: Option<Uuid>,
+    /// Run through this workspace's execution layer. Container workspaces
+    /// therefore use their persistent nspawn namespace and mission cgroup
+    /// caps instead of leaking heavy work into the API service cgroup.
+    #[serde(default)]
+    pub workspace_id: Option<Uuid>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
 }
@@ -139,6 +148,48 @@ fn resolve_cwd(base: &Path, raw: Option<&str>) -> Result<PathBuf, String> {
     }
 
     Ok(cwd)
+}
+
+fn resolve_workspace_cwd(
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    raw: Option<&str>,
+) -> Result<PathBuf, String> {
+    let cwd = match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => workspace_root.to_path_buf(),
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() && path.starts_with(workspace_root) {
+                path
+            } else if path.is_absolute() && workspace_type == WorkspaceType::Container {
+                workspace_root.join(path.strip_prefix("/").unwrap_or(&path))
+            } else if path.is_absolute() {
+                return Err(format!(
+                    "cwd must stay within workspace root {}",
+                    workspace_root.display()
+                ));
+            } else {
+                workspace_root.join(path)
+            }
+        }
+    };
+
+    if !cwd.is_dir() {
+        return Err(format!("cwd does not exist: {}", cwd.display()));
+    }
+    let canonical_root = workspace_root
+        .canonicalize()
+        .map_err(|e| format!("failed to resolve workspace root: {e}"))?;
+    let canonical_cwd = cwd
+        .canonicalize()
+        .map_err(|e| format!("failed to resolve cwd: {e}"))?;
+    if !canonical_cwd.starts_with(&canonical_root) {
+        return Err(format!(
+            "cwd escapes workspace root {}",
+            workspace_root.display()
+        ));
+    }
+    Ok(canonical_cwd)
 }
 
 fn merge_job_for_write(current: Option<DurableJob>, mut next: DurableJob) -> DurableJob {
@@ -314,18 +365,52 @@ pub async fn start_job(
     if command.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "command is required"));
     }
+    if req.started_by_mission_id.is_some() && req.workspace_id.is_none() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "mission-owned durable jobs require workspace_id",
+        ));
+    }
 
-    let cwd = resolve_cwd(&state.config.working_dir, req.cwd.as_deref())
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let workspace =
+        match req.workspace_id {
+            Some(id) => {
+                Some(state.workspaces.get(id).await.ok_or_else(|| {
+                    err(StatusCode::NOT_FOUND, format!("workspace not found: {id}"))
+                })?)
+            }
+            None => None,
+        };
+    let cwd = match workspace.as_ref() {
+        Some(workspace) => resolve_workspace_cwd(
+            &workspace.path,
+            workspace.workspace_type,
+            req.cwd.as_deref(),
+        ),
+        None => resolve_cwd(&state.config.working_dir, req.cwd.as_deref()),
+    }
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
     let id = Uuid::new_v4();
     let dir = job_dir(&state, id);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let stdout_log = dir.join("stdout.log");
-    let stderr_log = dir.join("stderr.log");
-    let status_file = dir.join("exit.json");
+    let runtime_dir = workspace
+        .as_ref()
+        .map(|workspace| {
+            workspace
+                .path
+                .join(".sandboxed-sh/durable-jobs")
+                .join(id.to_string())
+        })
+        .unwrap_or_else(|| dir.clone());
+    tokio::fs::create_dir_all(&runtime_dir)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let stdout_log = runtime_dir.join("stdout.log");
+    let stderr_log = runtime_dir.join("stderr.log");
+    let status_file = runtime_dir.join("exit.json");
 
     let stdout = std::fs::OpenOptions::new()
         .create(true)
@@ -339,30 +424,9 @@ pub async fn start_job(
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let wrapper = format!(
-        "cd \"$SANDBOXED_SH_DURABLE_CWD\" && {{ {}; }}\ncode=$?\nprintf '{{\"exit_code\":%s,\"signal\":null,\"finished_at\":\"%s\"}}\\n' \"$code\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$SANDBOXED_SH_DURABLE_STATUS\"\nexit \"$code\"\n",
+        "{{ {}; }}\ncode=$?\nprintf '{{\"exit_code\":%s,\"signal\":null,\"finished_at\":\"%s\"}}\\n' \"$code\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$SANDBOXED_SH_DURABLE_STATUS\"\nexit \"$code\"\n",
         command
     );
-
-    let mut child = Command::new("/bin/sh");
-    child
-        .arg("-lc")
-        .arg(wrapper)
-        .current_dir(&cwd)
-        .envs(req.env)
-        .env("SANDBOXED_SH_DURABLE_CWD", &cwd)
-        .env("SANDBOXED_SH_DURABLE_STATUS", &status_file)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    #[cfg(unix)]
-    unsafe {
-        child.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
 
     let now = Utc::now();
     let mut job = DurableJob {
@@ -376,6 +440,7 @@ pub async fn start_job(
         created_at: now,
         updated_at: now,
         started_by_mission_id: req.started_by_mission_id,
+        workspace_id: req.workspace_id,
         stdout_log: stdout_log.to_string_lossy().to_string(),
         stderr_log: stderr_log.to_string_lossy().to_string(),
         status_file: status_file.to_string_lossy().to_string(),
@@ -384,7 +449,54 @@ pub async fn start_job(
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let child = match child.spawn() {
+    let mut job_env = req.env;
+    let status_path_for_child = workspace
+        .as_ref()
+        .map(|workspace| {
+            WorkspaceExec::new(workspace.clone()).translate_path_for_container(&status_file)
+        })
+        .unwrap_or_else(|| status_file.to_string_lossy().to_string());
+    job_env.insert(
+        "SANDBOXED_SH_DURABLE_STATUS".to_string(),
+        status_path_for_child,
+    );
+    let shell_args = vec!["-lc".to_string(), wrapper];
+    let child_result = match workspace {
+        Some(workspace) => {
+            WorkspaceExec::new(workspace)
+                .spawn_with_stdio(
+                    &cwd,
+                    "/bin/sh",
+                    &shell_args,
+                    job_env,
+                    Stdio::null(),
+                    Stdio::from(stdout),
+                    Stdio::from(stderr),
+                )
+                .await
+        }
+        None => {
+            let mut child = Command::new("/bin/sh");
+            child
+                .args(&shell_args)
+                .current_dir(&cwd)
+                .envs(job_env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr));
+            #[cfg(unix)]
+            unsafe {
+                child.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            child.spawn().map_err(anyhow::Error::from)
+        }
+    };
+    let child = match child_result {
         Ok(child) => child,
         Err(e) => {
             job.status = DurableJobStatus::Failed;
@@ -539,6 +651,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             started_by_mission_id: None,
+            workspace_id: None,
             stdout_log: "/tmp/stdout.log".to_string(),
             stderr_log: "/tmp/stderr.log".to_string(),
             status_file: "/tmp/exit.json".to_string(),
@@ -556,6 +669,29 @@ mod tests {
         let base = std::env::current_dir().unwrap();
         let result = resolve_cwd(&base, Some("__definitely_missing_durable_job_cwd__"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn workspace_cwd_maps_container_absolute_path_inside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission = dir.path().join("workspaces/mission-deadbeef");
+        std::fs::create_dir_all(&mission).unwrap();
+
+        let resolved = resolve_workspace_cwd(
+            dir.path(),
+            WorkspaceType::Container,
+            Some("/workspaces/mission-deadbeef"),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, mission.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn workspace_cwd_rejects_host_absolute_path_and_relative_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_workspace_cwd(dir.path(), WorkspaceType::Host, Some("/tmp")).is_err());
+        assert!(resolve_workspace_cwd(dir.path(), WorkspaceType::Container, Some("../")).is_err());
     }
 
     #[test]

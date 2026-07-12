@@ -51,6 +51,7 @@ use crate::mcp::McpRegistry;
 use crate::secrets::SecretsStore;
 use crate::util::{build_history_context, internal_error};
 use crate::workspace;
+use crate::workspace_exec::WorkspaceExec;
 
 use super::auth::AuthUser;
 use super::desktop;
@@ -63,6 +64,52 @@ use super::routes::AppState;
 
 pub(crate) const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
 const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
+
+fn parse_durable_job_result(result: &serde_json::Value) -> Option<serde_json::Value> {
+    fn visit(value: &serde_json::Value, depth: u8) -> Option<serde_json::Value> {
+        if depth > 4 {
+            return None;
+        }
+        if value.get("id").and_then(|id| id.as_str()).is_some()
+            && value
+                .get("stdout_log")
+                .and_then(|path| path.as_str())
+                .is_some()
+        {
+            return Some(value.clone());
+        }
+        if let Some(inner) = value.get("result") {
+            if let Some(job) = visit(inner, depth + 1) {
+                return Some(job);
+            }
+        }
+        if let Some(content) = value.get("content") {
+            if let Some(job) = visit(content, depth + 1) {
+                return Some(job);
+            }
+        }
+        if let Some(items) = value.as_array() {
+            for item in items {
+                if let Some(job) = visit(item, depth + 1) {
+                    return Some(job);
+                }
+                if let Some(text) = item.get("text") {
+                    if let Some(job) = visit(text, depth + 1) {
+                        return Some(job);
+                    }
+                }
+            }
+        }
+        if let Some(raw) = value.as_str() {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+                return visit(&parsed, depth + 1);
+            }
+        }
+        None
+    }
+
+    visit(result, 0)
+}
 
 /// One entry in the main control queue: (message id, content, optional per-message
 /// agent override, target mission id, source). Aliased to keep signatures under
@@ -111,7 +158,7 @@ pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
 fn remote_node_needs_on_demand_probe(
     status: Option<&crate::remote_node::RemoteNodeStatus>,
 ) -> bool {
-    status.is_none_or(|status| *status == crate::remote_node::RemoteNodeStatus::Unknown)
+    status.is_none_or(|status| *status != crate::remote_node::RemoteNodeStatus::Online)
 }
 
 fn should_finalize_remote_job(inactive_status: Option<MissionStatus>) -> bool {
@@ -5212,8 +5259,9 @@ pub async fn create_mission(
                     Err(initial_err) => {
                         // The periodic monitor may be disabled, or this request
                         // may race its first heartbeat. Match `/api/remote-build`:
-                        // probe only cold nodes, then retry placement once.
-                        let cold: Vec<_> = state
+                        // re-probe missing and non-online nodes, then retry
+                        // placement once.
+                        let retry_nodes: Vec<_> = state
                             .config
                             .remote_nodes
                             .nodes
@@ -5225,11 +5273,11 @@ pub async fn create_mission(
                                 )
                             })
                             .collect();
-                        if cold.is_empty() {
+                        if retry_nodes.is_empty() {
                             return Err((StatusCode::SERVICE_UNAVAILABLE, initial_err.to_string()));
                         }
                         let client = crate::remote_node::RemoteNodeClient::default();
-                        futures::future::join_all(cold.into_iter().map(|node| {
+                        futures::future::join_all(retry_nodes.into_iter().map(|node| {
                             crate::remote_node::probe_node(&state.fleet, &client, node)
                         }))
                         .await;
@@ -14661,6 +14709,58 @@ async fn control_actor_loop(
                                             .insert(task_id, task);
                                     }
                                 }
+                            } else if name.ends_with("durable_job_start") {
+                                if let (Some(mid), Some(job)) =
+                                    (mission_id, parse_durable_job_result(result))
+                                {
+                                    let Some(job_id) =
+                                        job.get("id").and_then(|value| value.as_str())
+                                    else {
+                                        continue;
+                                    };
+                                    let command = job
+                                        .get("command")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let mut output_path = job
+                                        .get("stdout_log")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    if let Ok(Some(mission)) = mission_store.get_mission(*mid).await {
+                                        if let Some(workspace) =
+                                            workspaces.get(mission.workspace_id).await
+                                        {
+                                            output_path = WorkspaceExec::new(workspace)
+                                                .translate_path_for_container(
+                                                    std::path::Path::new(&output_path),
+                                                );
+                                        }
+                                    }
+                                    let task = super::mission_runner::BackgroundTask {
+                                        id: format!("durable:{job_id}"),
+                                        output_path,
+                                        command,
+                                        started_at: std::time::Instant::now(),
+                                    };
+                                    tracing::info!(
+                                        mission_id = %mid,
+                                        durable_job_id = %job_id,
+                                        "Captured durable background job; scheduling auto-resume on completion"
+                                    );
+                                    if let Some(runner) = parallel_runners.get_mut(mid) {
+                                        runner
+                                            .background_tasks
+                                            .insert(task.id.clone(), task.clone());
+                                    }
+                                    background_tasks
+                                        .write()
+                                        .await
+                                        .entry(*mid)
+                                        .or_default()
+                                        .insert(task.id.clone(), task);
+                                }
                             }
                         }
                     }
@@ -18146,6 +18246,28 @@ mod tests {
             content: content.to_string(),
             metadata: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn durable_job_result_parser_accepts_direct_and_mcp_content_shapes() {
+        let job = serde_json::json!({
+            "id": "11111111-1111-1111-1111-111111111111",
+            "stdout_log": "/workspace/.sandboxed-sh/durable-jobs/job/stdout.log",
+            "command": "lake build"
+        });
+        assert_eq!(parse_durable_job_result(&job), Some(job.clone()));
+
+        let wrapped = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string(&job).unwrap()
+            }]
+        });
+        assert_eq!(parse_durable_job_result(&wrapped), Some(job));
+        assert!(parse_durable_job_result(&serde_json::json!({
+            "content": "not a job"
+        }))
+        .is_none());
     }
 
     #[test]
@@ -21730,7 +21852,7 @@ Investigate <service/> failures.
     }
 
     #[test]
-    fn raw_remote_auto_placement_probes_only_cold_nodes() {
+    fn raw_remote_auto_placement_reprobes_every_non_online_node() {
         use crate::remote_node::RemoteNodeStatus;
 
         assert!(remote_node_needs_on_demand_probe(None));
@@ -21738,13 +21860,15 @@ Investigate <service/> failures.
             &RemoteNodeStatus::Unknown
         )));
         for status in [
-            RemoteNodeStatus::Online,
             RemoteNodeStatus::Degraded,
             RemoteNodeStatus::Offline,
             RemoteNodeStatus::Disabled,
         ] {
-            assert!(!remote_node_needs_on_demand_probe(Some(&status)));
+            assert!(remote_node_needs_on_demand_probe(Some(&status)));
         }
+        assert!(!remote_node_needs_on_demand_probe(Some(
+            &RemoteNodeStatus::Online
+        )));
     }
 
     #[test]

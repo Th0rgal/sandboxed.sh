@@ -1663,6 +1663,43 @@ impl WorkspaceExec {
         Ok(child)
     }
 
+    /// Spawn a workspace-aware command with caller-provided stdio.
+    ///
+    /// Durable jobs use file-backed stdout/stderr rather than pipes so they
+    /// can outlive the agent turn that launched them without blocking on an
+    /// abandoned pipe reader.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_with_stdio(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+        env: HashMap<String, String>,
+        stdin: Stdio,
+        stdout: Stdio,
+        stderr: Stdio,
+    ) -> anyhow::Result<Child> {
+        let env = self.build_env(env);
+        let mut cmd = self
+            .build_command(cwd, program, args, env, stdin, stdout, stderr)
+            .await
+            .context("Failed to build workspace command")?;
+        // Durable-job cancellation targets the spawned process group. Give
+        // every workspace-aware launch its own session so cancelling a job
+        // cannot signal the API service's process group. Descendants of a
+        // systemd-run/nsenter wrapper inherit this group as well.
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd.spawn().context("Failed to spawn workspace command")
+    }
+
     pub async fn spawn_streaming_pty(
         &self,
         cwd: &Path,
