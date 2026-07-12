@@ -257,6 +257,7 @@ pub async fn run_lease_command(
         &request.lease_token,
         token_secret,
         node_id,
+        SCOPE_MISSION_EXECUTE,
         chrono::Utc::now(),
     )?;
     if claims.mission_id != request.mission_id {
@@ -321,6 +322,7 @@ mod tests {
             node_id: "babylon".to_string(),
             scope: SCOPE_MISSION_EXECUTE.to_string(),
             expires_at: chrono::Utc::now().timestamp() + 60,
+            job_id: None,
         };
         let token = create_lease_token(&claims, "node-secret").unwrap();
         let work_root = tempfile::tempdir().unwrap();

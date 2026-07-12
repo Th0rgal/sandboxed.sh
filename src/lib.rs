@@ -43,6 +43,7 @@ pub mod cost;
 pub mod github_connection;
 pub mod library;
 pub mod mcp;
+pub mod node;
 pub mod nspawn;
 pub mod opencode;
 pub mod opencode_config;

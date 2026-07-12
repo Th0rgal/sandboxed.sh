@@ -4868,6 +4868,11 @@ pub struct CreateMissionRequest {
     pub remote_node_id: Option<String>,
     /// MVP remote execution payload. Full AI mission streaming remains local.
     pub remote_command: Option<String>,
+    /// When true (with `remote_node_id` + `remote_command`), dispatch through
+    /// the node's async job API: the mission goes Active immediately and a
+    /// background poll loop finalizes it when the job completes. Default
+    /// false keeps the synchronous blocking `/execute` path unchanged.
+    pub remote_async: Option<bool>,
     /// Catch-all for unrecognized request fields. Serde ignores unknown fields
     /// by default, which has repeatedly hidden client bugs (a `prompt` sent
     /// before the field existed, a mistyped `target_mission_id`). Captured
@@ -4994,6 +4999,7 @@ pub async fn create_mission(
         prompt: None,
         remote_node_id: None,
         remote_command: None,
+        remote_async: None,
         extra: Default::default(),
     });
 
@@ -5269,15 +5275,13 @@ pub async fn create_mission(
     if let (Some(remote_node_id), Some(remote_command)) =
         (remote_node_id.as_deref(), remote_command.as_deref())
     {
-        match dispatch_remote_mission_mvp(
-            &state,
-            &control,
-            &mission,
-            remote_node_id,
-            remote_command,
-        )
-        .await
-        {
+        let dispatch = if req.remote_async.unwrap_or(false) {
+            dispatch_remote_job(&state, &control, &mission, remote_node_id, remote_command).await
+        } else {
+            dispatch_remote_mission_mvp(&state, &control, &mission, remote_node_id, remote_command)
+                .await
+        };
+        match dispatch {
             Ok(updated) => return Ok((headers, Json(updated))),
             Err(message) => {
                 let _ = control
@@ -5337,8 +5341,9 @@ async fn dispatch_remote_mission_mvp(
     let claims = crate::remote_node::LeaseClaims {
         mission_id: mission.id,
         node_id: node.id.clone(),
-        scope: "mission:execute".to_string(),
+        scope: crate::remote_node::SCOPE_MISSION_EXECUTE.to_string(),
         expires_at: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp(),
+        job_id: None,
     };
     let lease_token = crate::remote_node::create_lease_token(&claims, &shared_token)
         .map_err(|e| e.to_string())?;
@@ -5359,6 +5364,7 @@ async fn dispatch_remote_mission_mvp(
         summary: Some(format!("Dispatching to remote node '{}'", node.id)),
     });
 
+    let started_at = chrono::Utc::now();
     let client = crate::remote_node::RemoteNodeClient::default();
     let response = client
         .execute(node, &shared_token, &request)
@@ -5369,6 +5375,45 @@ async fn dispatch_remote_mission_mvp(
         "Remote node '{}' exited with {:?}\n\nstdout:\n{}\n\nstderr:\n{}",
         node.id, response.exit_code, response.stdout, response.stderr
     );
+    finalize_remote_mission(
+        control,
+        mission.id,
+        &node.id,
+        success,
+        content,
+        "remote_node_mvp",
+    )
+    .await?;
+    state
+        .fleet
+        .record_outcome(crate::remote_node::DispatchOutcome {
+            mission_id: mission.id,
+            node_id: node.id.clone(),
+            job_id: None,
+            state: if success { "succeeded" } else { "failed" }.to_string(),
+            exit_code: response.exit_code,
+            error: None,
+            started_at,
+            finished_at: Some(chrono::Utc::now()),
+        });
+    control
+        .mission_store
+        .get_mission(mission.id)
+        .await?
+        .ok_or_else(|| format!("Mission {} disappeared after remote dispatch", mission.id))
+}
+
+/// Terminal bookkeeping shared by the sync (`/execute`) and async (job) remote
+/// paths: log the final assistant message, flip the mission to
+/// completed/failed with `status_reason`, and broadcast the status change.
+async fn finalize_remote_mission(
+    control: &ControlState,
+    mission_id: Uuid,
+    node_id: &str,
+    success: bool,
+    content: String,
+    status_reason: &str,
+) -> Result<(), String> {
     let event = AgentEvent::AssistantMessage {
         id: Uuid::new_v4(),
         content,
@@ -5378,12 +5423,12 @@ async fn dispatch_remote_mission_mvp(
         usage: None,
         model: None,
         model_normalized: None,
-        mission_id: Some(mission.id),
+        mission_id: Some(mission_id),
         shared_files: None,
         resumable: !success,
         completion_evidence: None,
     };
-    let _ = control.mission_store.log_event(mission.id, &event).await;
+    let _ = control.mission_store.log_event(mission_id, &event).await;
     let _ = control.events_tx.send(event);
     let status = if success {
         MissionStatus::Completed
@@ -5392,18 +5437,265 @@ async fn dispatch_remote_mission_mvp(
     };
     control
         .mission_store
-        .update_mission_status_with_reason(mission.id, status, Some("remote_node_mvp"))
+        .update_mission_status_with_reason(mission_id, status, Some(status_reason))
+        .await?;
+    let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        mission_id,
+        status,
+        summary: Some(format!("Remote node '{node_id}' finished")),
+    });
+    Ok(())
+}
+
+/// Async remote dispatch: mint a `job:submit` lease, queue the command on the
+/// node's job API, mark the mission Active immediately, and finalize it from
+/// a background poll loop. Unlike [`dispatch_remote_mission_mvp`], the create
+/// request does not block for the command's duration.
+async fn dispatch_remote_job(
+    state: &Arc<AppState>,
+    control: &ControlState,
+    mission: &Mission,
+    remote_node_id: &str,
+    remote_command: &str,
+) -> Result<Mission, String> {
+    let node = crate::remote_node::placement_for_selected_node(
+        &state.config.remote_nodes,
+        Some(remote_node_id),
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "remote node placement unexpectedly returned local".to_string())?
+    .clone();
+    let shared_token = std::env::var(&node.token_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "remote node '{}' has no token in {}",
+                node.id, node.token_env
+            )
+        })?;
+    let job_id = Uuid::new_v4();
+    let claims = crate::remote_node::LeaseClaims {
+        mission_id: mission.id,
+        node_id: node.id.clone(),
+        scope: crate::remote_node::SCOPE_JOB_SUBMIT.to_string(),
+        expires_at: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp(),
+        job_id: Some(job_id),
+    };
+    let lease_token = crate::remote_node::create_lease_token(&claims, &shared_token)
+        .map_err(|e| e.to_string())?;
+    let request = crate::remote_node::SubmitJobRequest {
+        job_id,
+        mission_id: mission.id,
+        lease_token,
+        payload: crate::remote_node::JobPayload::RawCommand {
+            command: remote_command.to_string(),
+            timeout_secs: None,
+            env: None,
+        },
+    };
+
+    let client = crate::remote_node::RemoteNodeClient::default();
+    let accepted = client
+        .submit_job(&node, &shared_token, &request)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    control
+        .mission_store
+        .update_mission_status(mission.id, MissionStatus::Active)
         .await?;
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
         mission_id: mission.id,
-        status,
-        summary: Some(format!("Remote node '{}' finished", node.id)),
+        status: MissionStatus::Active,
+        summary: Some(format!(
+            "Dispatched job {} to remote node '{}'",
+            job_id, node.id
+        )),
     });
-    control
+
+    let started_at = chrono::Utc::now();
+    state
+        .fleet
+        .record_outcome(crate::remote_node::DispatchOutcome {
+            mission_id: mission.id,
+            node_id: node.id.clone(),
+            job_id: Some(job_id),
+            state: accepted.state.clone(),
+            exit_code: None,
+            error: None,
+            started_at,
+            finished_at: None,
+        });
+
+    let updated = control
         .mission_store
         .get_mission(mission.id)
         .await?
-        .ok_or_else(|| format!("Mission {} disappeared after remote dispatch", mission.id))
+        .ok_or_else(|| format!("Mission {} disappeared after remote dispatch", mission.id))?;
+
+    let poll_control = control.clone();
+    let fleet = Arc::clone(&state.fleet);
+    let mission_id = mission.id;
+    tokio::spawn(async move {
+        poll_remote_job(
+            poll_control,
+            fleet,
+            client,
+            node,
+            shared_token,
+            mission_id,
+            job_id,
+            started_at,
+        )
+        .await;
+    });
+
+    Ok(updated)
+}
+
+/// Background poll loop for one async remote job. Emits sparse progress
+/// events (job state changes only), fails the mission after 5 consecutive
+/// unreachable polls (`remote_node_lost`), honors external mission
+/// cancellation by cancelling the node job, and finalizes the mission through
+/// the same path as the synchronous dispatch.
+#[allow(clippy::too_many_arguments)]
+async fn poll_remote_job(
+    control: ControlState,
+    fleet: Arc<crate::remote_node::FleetMonitor>,
+    client: crate::remote_node::RemoteNodeClient,
+    node: crate::remote_node::RemoteNodeConfig,
+    shared_token: String,
+    mission_id: Uuid,
+    job_id: Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
+) {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+    const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+    let outcome = |state: &str, exit_code: Option<i32>, error: Option<String>, terminal: bool| {
+        crate::remote_node::DispatchOutcome {
+            mission_id,
+            node_id: node.id.clone(),
+            job_id: Some(job_id),
+            state: state.to_string(),
+            exit_code,
+            error,
+            started_at,
+            finished_at: terminal.then(chrono::Utc::now),
+        }
+    };
+    let mut last_state = "queued".to_string();
+    let mut failures = 0u32;
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        // Honor external mission cancellation when trivially observable: if
+        // an operator moved the mission out of Active (cancel/interrupt/
+        // pause), stop polling and cancel the job on the node.
+        if let Ok(Some(current)) = control.mission_store.get_mission(mission_id).await {
+            if current.status != MissionStatus::Active {
+                let _ = client.cancel_job(&node, &shared_token, job_id).await;
+                fleet.record_outcome(outcome(
+                    "cancelled",
+                    None,
+                    Some(format!(
+                        "mission left active state ({}); job cancelled on node",
+                        current.status
+                    )),
+                    true,
+                ));
+                return;
+            }
+        }
+
+        match client.get_job(&node, &shared_token, job_id).await {
+            Err(err) => {
+                failures += 1;
+                if failures >= MAX_CONSECUTIVE_FAILURES {
+                    let content = format!(
+                        "Remote node '{}' became unreachable while running job {} \
+                         ({failures} consecutive poll failures; last error: {err}). \
+                         Marking the mission failed.",
+                        node.id, job_id
+                    );
+                    let _ = finalize_remote_mission(
+                        &control,
+                        mission_id,
+                        &node.id,
+                        false,
+                        content,
+                        "remote_node_lost",
+                    )
+                    .await;
+                    fleet.record_outcome(outcome("lost", None, Some(err.to_string()), true));
+                    return;
+                }
+            }
+            Ok(status) => {
+                failures = 0;
+                let terminal = matches!(
+                    status.state.as_str(),
+                    "succeeded" | "failed" | "cancelled" | "lost"
+                );
+                if terminal {
+                    let success = status.state == "succeeded";
+                    let content = format!(
+                        "Remote node '{}' job {} finished with state '{}' (exit {:?}){}\n\nlog tail:\n{}",
+                        node.id,
+                        job_id,
+                        status.state,
+                        status.exit_code,
+                        status
+                            .error
+                            .as_deref()
+                            .map(|e| format!("\nerror: {e}"))
+                            .unwrap_or_default(),
+                        status.log_tail.as_deref().unwrap_or("(empty)"),
+                    );
+                    let _ = finalize_remote_mission(
+                        &control,
+                        mission_id,
+                        &node.id,
+                        success,
+                        content,
+                        "remote_node_job",
+                    )
+                    .await;
+                    fleet.record_outcome(outcome(
+                        &status.state,
+                        status.exit_code,
+                        status.error.clone(),
+                        true,
+                    ));
+                    return;
+                }
+                if status.state != last_state {
+                    // Sparse progress note: only on job state changes.
+                    let event = AgentEvent::AssistantMessage {
+                        id: Uuid::new_v4(),
+                        content: format!(
+                            "Remote job {} on node '{}' is now {}",
+                            job_id, node.id, status.state
+                        ),
+                        success: true,
+                        cost_cents: 0,
+                        cost_source: crate::agents::CostSource::Unknown,
+                        usage: None,
+                        model: None,
+                        model_normalized: None,
+                        mission_id: Some(mission_id),
+                        shared_files: None,
+                        resumable: false,
+                        completion_evidence: None,
+                    };
+                    let _ = control.mission_store.log_event(mission_id, &event).await;
+                    let _ = control.events_tx.send(event);
+                    fleet.record_outcome(outcome(&status.state, None, None, false));
+                    last_state = status.state.clone();
+                }
+            }
+        }
+    }
 }
 
 /// Request body for `POST /api/control/missions/:id/project`. Tri-state per
@@ -6987,6 +7279,7 @@ pub async fn clone_mission(
         prompt: None,
         remote_node_id: None,
         remote_command: None,
+        remote_async: None,
         extra: Default::default(),
     };
 

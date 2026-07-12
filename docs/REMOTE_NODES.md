@@ -20,6 +20,18 @@ Supported now:
   rotation window, the previous one (`SANDBOXED_NODE_TOKEN_PREVIOUS`)
 - selected missions can run one `remote_command` on a selected node
 - the command runs under `SANDBOXED_NODE_WORK_DIR/<mission-id>`
+- async job API on the node (`POST /jobs`, `GET /jobs/:id`,
+  `POST /jobs/:id/cancel`, `GET /jobs`): jobs are persisted to
+  `<workdir>/jobs.db`, run under a capacity semaphore
+  (`SANDBOXED_NODE_CAPACITY`), capture combined stdout+stderr to
+  `<workdir>/logs/<job-id>.log`, and are killed by process group on
+  cancel/timeout (`SANDBOXED_NODE_MAX_JOB_SECS`, default 14400s). Jobs left
+  in flight across a node restart are marked `lost`
+- non-blocking core dispatch: pass `"remote_async": true` alongside
+  `remote_node_id`/`remote_command` in `POST /api/control/missions` — the
+  mission goes Active immediately and a background poll loop (3s) finalizes
+  it when the job completes; 5 consecutive unreachable polls fail the mission
+  with reason `remote_node_lost`
 - dispatch failures fail closed: the mission is marked failed and the API
   returns an error
 - future `not_before` scheduling with `remote_node_id` is rejected for now so
@@ -125,8 +137,49 @@ WantedBy=multi-user.target
 `/etc/sandboxed-node.env` contains only env-var assignments such as
 `SANDBOXED_NODE_ID`, `SANDBOXED_NODE_BIND`, `SANDBOXED_NODE_WORK_DIR`,
 `SANDBOXED_NODE_CAPACITY`, `SANDBOXED_NODE_TOKEN`,
-`SANDBOXED_NODE_TOKEN_PREVIOUS` (rotation only), and
-`SANDBOXED_NODE_LABELS`.
+`SANDBOXED_NODE_TOKEN_PREVIOUS` (rotation only), `SANDBOXED_NODE_LABELS`,
+and `SANDBOXED_NODE_MAX_JOB_SECS`.
+
+## Async Job API
+
+The node exposes a durable job API next to the blocking `/execute` path. All
+endpoints require the shared bearer token; `POST /jobs` additionally requires
+a per-job HMAC lease scoped to `job:submit` (minted by core; `mission:execute`
+leases are rejected, and vice versa).
+
+- `POST /jobs` with `{job_id, mission_id, lease_token, payload}` where
+  `payload` is `{"kind": "raw_command", "command": "...", "timeout_secs"?:
+  N, "env"?: {..}}`. Returns `202 {job_id, state: "queued"}`; duplicate
+  `job_id` returns `409`.
+- `GET /jobs/:id` — full status (`queued|running|succeeded|failed|cancelled|
+  lost`, exit code, timestamps, error) plus up to the last 64 KiB of the
+  combined log as `log_tail`.
+- `POST /jobs/:id/cancel` — SIGTERMs the job's process group (SIGKILL after
+  10s); returns the current state and whether a live job got the request.
+- `GET /jobs?limit=N` — recent jobs, newest first (default 20, no log tails).
+
+Async mission dispatch from core:
+
+```bash
+curl -sS -X POST "$SANDBOXED_CORE_URL/api/control/missions" \
+  -H "Authorization: Bearer $DASHBOARD_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "async remote smoke on babylon",
+    "remote_node_id": "babylon",
+    "remote_command": "hostname && sleep 30 && echo done",
+    "remote_async": true
+  }'
+```
+
+The API returns immediately with the mission Active; core polls the job every
+3s, logs a progress note on job state changes, and finalizes the mission with
+reason `remote_node_job` (or `remote_node_lost` when the node stays
+unreachable for 5 consecutive polls). Cancelling from the dashboard works
+indirectly: when the mission leaves the Active state for any reason, the poll
+loop cancels the node job on its next tick. There is no dedicated
+mission-cancel -> job-cancel plumbing yet; wiring an explicit cancel hook is a
+follow-up.
 
 ## Core Configuration
 

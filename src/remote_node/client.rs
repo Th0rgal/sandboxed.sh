@@ -2,12 +2,23 @@
 
 use std::time::Duration;
 
-use super::protocol::{ExecuteResponse, LeaseRequest, NodeHeartbeat};
+use uuid::Uuid;
+
+use super::protocol::{
+    CancelJobResponse, ExecuteResponse, LeaseRequest, NodeHeartbeat, NodeJobStatus,
+    SubmitJobRequest, SubmitJobResponse,
+};
 use super::{RemoteNodeConfig, RemoteNodeError};
 
 /// Total request timeout for `/execute`, which blocks until the remote
 /// command completes.
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// `POST /jobs` returns as soon as the job is queued.
+const SUBMIT_JOB_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Job status/cancel calls are cheap lookups.
+const JOB_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct RemoteNodeClient {
@@ -78,6 +89,88 @@ impl RemoteNodeClient {
         }
         response
             .json::<ExecuteResponse>()
+            .await
+            .map_err(|e| RemoteNodeError::Request(e.to_string()))
+    }
+
+    /// Submit an async job (`POST /jobs`); returns once the node has queued it.
+    pub async fn submit_job(
+        &self,
+        node: &RemoteNodeConfig,
+        shared_token: &str,
+        request: &SubmitJobRequest,
+    ) -> Result<SubmitJobResponse, RemoteNodeError> {
+        let url = format!("{}/jobs", node.base_url);
+        let response = self
+            .http
+            .post(url)
+            .timeout(SUBMIT_JOB_TIMEOUT)
+            .bearer_auth(shared_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RemoteNodeError::Rejected(format!("{status}: {body}")));
+        }
+        response
+            .json::<SubmitJobResponse>()
+            .await
+            .map_err(|e| RemoteNodeError::Request(e.to_string()))
+    }
+
+    /// Fetch one job's status (`GET /jobs/:id`), including its log tail.
+    pub async fn get_job(
+        &self,
+        node: &RemoteNodeConfig,
+        shared_token: &str,
+        job_id: Uuid,
+    ) -> Result<NodeJobStatus, RemoteNodeError> {
+        let url = format!("{}/jobs/{}", node.base_url, job_id);
+        let response = self
+            .http
+            .get(url)
+            .timeout(JOB_STATUS_TIMEOUT)
+            .bearer_auth(shared_token)
+            .send()
+            .await
+            .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RemoteNodeError::Request(format!("{status}: {body}")));
+        }
+        response
+            .json::<NodeJobStatus>()
+            .await
+            .map_err(|e| RemoteNodeError::Request(e.to_string()))
+    }
+
+    /// Request cancellation of a job (`POST /jobs/:id/cancel`).
+    pub async fn cancel_job(
+        &self,
+        node: &RemoteNodeConfig,
+        shared_token: &str,
+        job_id: Uuid,
+    ) -> Result<CancelJobResponse, RemoteNodeError> {
+        let url = format!("{}/jobs/{}/cancel", node.base_url, job_id);
+        let response = self
+            .http
+            .post(url)
+            .timeout(JOB_STATUS_TIMEOUT)
+            .bearer_auth(shared_token)
+            .send()
+            .await
+            .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RemoteNodeError::Request(format!("{status}: {body}")));
+        }
+        response
+            .json::<CancelJobResponse>()
             .await
             .map_err(|e| RemoteNodeError::Request(e.to_string()))
     }

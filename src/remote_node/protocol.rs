@@ -20,6 +20,9 @@ pub const NODE_PROTOCOL_VERSION: u32 = 2;
 /// Lease scope for the synchronous `/execute` path.
 pub const SCOPE_MISSION_EXECUTE: &str = "mission:execute";
 
+/// Lease scope for submitting async jobs (`POST /jobs`).
+pub const SCOPE_JOB_SUBMIT: &str = "job:submit";
+
 fn default_protocol_version() -> u32 {
     // Nodes predating heartbeat v2 don't send the field at all.
     1
@@ -87,6 +90,10 @@ pub struct LeaseClaims {
     pub node_id: String,
     pub scope: String,
     pub expires_at: i64,
+    /// Job the lease is bound to (async job submissions only). Tolerated as
+    /// absent so pre-job leases keep validating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,6 +110,67 @@ pub struct ExecuteResponse {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Async job payload. Tagged so future kinds (e.g. `lean_build`) can be added
+/// without breaking the wire format.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JobPayload {
+    /// Run one shell command with `bash -lc` under the mission work dir —
+    /// same semantics as the synchronous `/execute` path.
+    RawCommand {
+        command: String,
+        /// Client-requested timeout; clamped to the node's
+        /// `SANDBOXED_NODE_MAX_JOB_SECS`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<std::collections::HashMap<String, String>>,
+    },
+}
+
+/// Body of `POST /jobs` on the node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubmitJobRequest {
+    pub job_id: Uuid,
+    pub mission_id: Uuid,
+    pub lease_token: String,
+    pub payload: JobPayload,
+}
+
+/// `202 Accepted` body of `POST /jobs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubmitJobResponse {
+    pub job_id: Uuid,
+    pub state: String,
+}
+
+/// Job status as returned by `GET /jobs/:id` and `GET /jobs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeJobStatus {
+    pub job_id: Uuid,
+    pub mission_id: Uuid,
+    /// queued | running | succeeded | failed | cancelled | lost
+    pub state: String,
+    pub exit_code: Option<i32>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+    /// Up to the last 64 KiB of combined stdout+stderr (single-job status
+    /// only; omitted from list responses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_tail: Option<String>,
+}
+
+/// Body of `POST /jobs/:id/cancel`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelJobResponse {
+    pub job_id: Uuid,
+    pub state: String,
+    /// Whether a cancellation was actually delivered to a live job.
+    pub cancel_requested: bool,
 }
 
 pub fn create_lease_token(claims: &LeaseClaims, secret: &str) -> Result<String, RemoteNodeError> {
@@ -125,6 +193,7 @@ pub fn validate_lease_token(
     token: &str,
     secret: &str,
     expected_node_id: &str,
+    expected_scope: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<LeaseClaims, RemoteNodeError> {
     let (payload, signature) = token
@@ -148,7 +217,7 @@ pub fn validate_lease_token(
     if claims.expires_at <= now.timestamp() {
         return Err(RemoteNodeError::InvalidLease("expired".to_string()));
     }
-    if claims.scope != SCOPE_MISSION_EXECUTE {
+    if claims.scope != expected_scope {
         return Err(RemoteNodeError::InvalidLease("wrong scope".to_string()));
     }
     Ok(claims)
@@ -194,15 +263,142 @@ mod tests {
             node_id: "babylon".to_string(),
             scope: SCOPE_MISSION_EXECUTE.to_string(),
             expires_at: chrono::Utc::now().timestamp() + 60,
+            job_id: None,
         };
         let token = create_lease_token(&claims, "node-secret").unwrap();
-        let parsed =
-            validate_lease_token(&token, "node-secret", "babylon", chrono::Utc::now()).unwrap();
+        let parsed = validate_lease_token(
+            &token,
+            "node-secret",
+            "babylon",
+            SCOPE_MISSION_EXECUTE,
+            chrono::Utc::now(),
+        )
+        .unwrap();
         assert_eq!(parsed.mission_id, mission_id);
-        assert!(
-            validate_lease_token(&token, "other-secret", "babylon", chrono::Utc::now()).is_err()
+        assert!(validate_lease_token(
+            &token,
+            "other-secret",
+            "babylon",
+            SCOPE_MISSION_EXECUTE,
+            chrono::Utc::now()
+        )
+        .is_err());
+        assert!(validate_lease_token(
+            &token,
+            "node-secret",
+            "nippur",
+            SCOPE_MISSION_EXECUTE,
+            chrono::Utc::now()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lease_scopes_are_not_interchangeable() {
+        let now = chrono::Utc::now();
+        let claims_for = |scope: &str, job_id: Option<Uuid>| LeaseClaims {
+            mission_id: Uuid::new_v4(),
+            node_id: "babylon".to_string(),
+            scope: scope.to_string(),
+            expires_at: now.timestamp() + 60,
+            job_id,
+        };
+
+        // A mission:execute lease must be rejected for job submission.
+        let execute_token =
+            create_lease_token(&claims_for(SCOPE_MISSION_EXECUTE, None), "node-secret").unwrap();
+        assert!(validate_lease_token(
+            &execute_token,
+            "node-secret",
+            "babylon",
+            SCOPE_MISSION_EXECUTE,
+            now
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_lease_token(
+                &execute_token,
+                "node-secret",
+                "babylon",
+                SCOPE_JOB_SUBMIT,
+                now
+            ),
+            Err(RemoteNodeError::InvalidLease(_))
+        ));
+
+        // ... and a job:submit lease must be rejected for /execute.
+        let job_token = create_lease_token(
+            &claims_for(SCOPE_JOB_SUBMIT, Some(Uuid::new_v4())),
+            "node-secret",
+        )
+        .unwrap();
+        let parsed =
+            validate_lease_token(&job_token, "node-secret", "babylon", SCOPE_JOB_SUBMIT, now)
+                .unwrap();
+        assert!(parsed.job_id.is_some());
+        assert!(matches!(
+            validate_lease_token(
+                &job_token,
+                "node-secret",
+                "babylon",
+                SCOPE_MISSION_EXECUTE,
+                now
+            ),
+            Err(RemoteNodeError::InvalidLease(_))
+        ));
+    }
+
+    #[test]
+    fn lease_claims_without_job_id_still_parse() {
+        // Tokens minted before the job API existed have no job_id claim.
+        let raw = serde_json::json!({
+            "mission_id": Uuid::new_v4(),
+            "node_id": "babylon",
+            "scope": SCOPE_MISSION_EXECUTE,
+            "expires_at": 1_900_000_000,
+        });
+        let claims: LeaseClaims = serde_json::from_value(raw).unwrap();
+        assert_eq!(claims.job_id, None);
+    }
+
+    #[test]
+    fn job_payload_round_trips_with_kind_tag() {
+        let payload = JobPayload::RawCommand {
+            command: "cargo test".to_string(),
+            timeout_secs: Some(600),
+            env: Some(
+                [("RUST_LOG".to_string(), "info".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["kind"], "raw_command");
+        assert_eq!(json["command"], "cargo test");
+        let parsed: JobPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, payload);
+
+        // Minimal payload: optional fields default.
+        let minimal: JobPayload = serde_json::from_value(serde_json::json!({
+            "kind": "raw_command",
+            "command": "true",
+        }))
+        .unwrap();
+        assert_eq!(
+            minimal,
+            JobPayload::RawCommand {
+                command: "true".to_string(),
+                timeout_secs: None,
+                env: None,
+            }
         );
-        assert!(validate_lease_token(&token, "node-secret", "nippur", chrono::Utc::now()).is_err());
+
+        // Unknown kinds are rejected, leaving room for future variants.
+        assert!(serde_json::from_value::<JobPayload>(serde_json::json!({
+            "kind": "lean_build",
+            "command": "true",
+        }))
+        .is_err());
     }
 
     #[test]
