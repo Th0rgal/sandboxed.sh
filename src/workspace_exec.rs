@@ -24,6 +24,7 @@ const CONTAINER_KEEPALIVE_ENV_KEY: &str = "SANDBOXED_SH_CONTAINER_KEEPALIVE";
 const CONTAINER_KEEPALIVE_ENV_VALUE: &str = "1";
 const ALLOW_TRANSIENT_CONTAINER_NSENTER_ENV: &str =
     "SANDBOXED_SH_ALLOW_TRANSIENT_CONTAINER_NSENTER";
+const NSENTER_USE_TARGET_ROOT_ENV: &str = "SANDBOXED_SH_NSENTER_USE_TARGET_ROOT";
 
 /// TLS CA-bundle env vars that point at a filesystem path. When the host
 /// process that launches a container mission (e.g. the sandboxed.sh daemon
@@ -118,6 +119,12 @@ fn environ_has_keepalive_marker(environ: &[u8]) -> bool {
     environ
         .split(|byte| *byte == 0)
         .any(|entry| entry == expected.as_bytes())
+}
+
+fn append_nsenter_target_root_arg(args: &mut Vec<String>, enabled: bool) {
+    if enabled {
+        args.push("--root".to_string());
+    }
 }
 
 /// Stable container identity for a workspace, derived from its path. Every
@@ -488,11 +495,11 @@ pub(crate) fn resolv_conf_nspawn_args() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ca_env_scrub_prelude, durable_scope_unit, environ_has_keepalive_marker, exec_scope_unit,
-        exec_scope_unit_for_mission, exec_unit_belongs_to_mission, machine_name_from_exec_unit,
-        mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
-        resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec,
-        CA_BUNDLE_ENV_VARS,
+        append_nsenter_target_root_arg, ca_env_scrub_prelude, durable_scope_unit,
+        environ_has_keepalive_marker, exec_scope_unit, exec_scope_unit_for_mission,
+        exec_unit_belongs_to_mission, machine_name_from_exec_unit, mission_short_id_from_exec_unit,
+        mission_tag_from_path, normalize_container_path, resolv_conf_bind_args,
+        synthesized_container_resolv_conf, WorkspaceExec, CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -777,6 +784,18 @@ mod tests {
         assert!(!environ_has_keepalive_marker(
             b"PATH=/usr/bin\0SANDBOXED_SH_CONTAINER_KEEPALIVE=0\0HOME=/root\0"
         ));
+    }
+
+    #[test]
+    fn pty_nsenter_target_root_guard_precedes_shell_payload() {
+        let mut args = vec!["--pid".to_string()];
+        append_nsenter_target_root_arg(&mut args, true);
+        args.extend(["/bin/sh".to_string(), "-lc".to_string()]);
+        assert_eq!(args, ["--pid", "--root", "/bin/sh", "-lc"]);
+
+        let mut disabled = vec!["--pid".to_string()];
+        append_nsenter_target_root_arg(&mut disabled, false);
+        assert_eq!(disabled, ["--pid"]);
     }
 }
 
@@ -1533,15 +1552,7 @@ impl WorkspaceExec {
         // existing deployment doesn't break on upgrade; once a host is
         // verified, set `SANDBOXED_SH_NSENTER_USE_TARGET_ROOT=1` in the env
         // file to flip the safe default on.
-        let use_target_root = std::env::var("SANDBOXED_SH_NSENTER_USE_TARGET_ROOT")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
+        let use_target_root = env_var_bool(NSENTER_USE_TARGET_ROOT_ENV, false);
         if use_target_root {
             // `--root` with no arg = use the *target* process's root, i.e.
             // the container rootfs. After this flag the new shell can only
@@ -2011,7 +2022,7 @@ impl WorkspaceExec {
             Self::build_shell_command_with_env(&rel_cwd, program, args, None)
         };
 
-        let nsenter_args = vec![
+        let mut nsenter_args = vec![
             "--target".to_string(),
             leader,
             "--mount".to_string(),
@@ -2019,10 +2030,15 @@ impl WorkspaceExec {
             "--ipc".to_string(),
             "--net".to_string(),
             "--pid".to_string(),
-            "/bin/sh".to_string(),
-            "-lc".to_string(),
-            shell_cmd,
         ];
+        // Keep PTY launches under the same target-root guard as non-PTY
+        // nsenter. Entering only the mount namespace still retains the host
+        // root directory, allowing absolute paths to escape the container.
+        append_nsenter_target_root_arg(
+            &mut nsenter_args,
+            env_var_bool(NSENTER_USE_TARGET_ROOT_ENV, false),
+        );
+        nsenter_args.extend(["/bin/sh".to_string(), "-lc".to_string(), shell_cmd]);
 
         // Same cgroup-escape hatch as build_nsenter_command, PTY edition:
         // this invocation is what launches harness CLIs (claude/codex/…) for
