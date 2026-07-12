@@ -814,17 +814,22 @@ mod tests {
             ),
             Ok(())
         );
-        // Absolute argv[0] is judged by basename.
-        assert_eq!(
-            validate_lean_build(
-                &source(&"a".repeat(40)),
-                None,
-                &["/usr/local/bin/elan".to_string(), "show".to_string()],
-                &HashMap::new(),
-                &allowlist(),
-            ),
-            Ok(())
-        );
+        // Path-form argv[0] is rejected even when the basename is allowed:
+        // `./lake` or an absolute path would execute an arbitrary file from
+        // the checkout / node fs instead of the PATH-resolved tool.
+        for path_argv in ["/usr/local/bin/elan", "./lake", "subdir/lake"] {
+            assert!(
+                validate_lean_build(
+                    &source(&"a".repeat(40)),
+                    None,
+                    &[path_argv.to_string(), "show".to_string()],
+                    &HashMap::new(),
+                    &allowlist(),
+                )
+                .is_err(),
+                "{path_argv} must be rejected"
+            );
+        }
     }
 
     #[test]
