@@ -207,6 +207,14 @@ pub fn exec_scope_unit(machine_name: &str, cwd: Option<&Path>) -> String {
     }
 }
 
+/// Unit name for a durable job scope. Durable scopes deliberately use a
+/// separate prefix and contain no mission tag: mission-end teardown only owns
+/// `sandboxed-exec-*`, while the durable-job registry owns and cancels these
+/// scopes explicitly.
+pub fn durable_scope_unit(machine_name: &str, job_id: uuid::Uuid) -> String {
+    format!("sandboxed-durable-{machine_name}-{}", job_id.simple())
+}
+
 /// Recover the 8-hex mission short id from an exec scope unit name produced
 /// by [`exec_scope_unit`]. Parses from the END (`…-m<8hex>-<rand8>.scope`) so
 /// machine-name segments can never false-positive. Returns `None` for
@@ -453,7 +461,7 @@ pub(crate) fn resolv_conf_nspawn_args() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ca_env_scrub_prelude, environ_has_keepalive_marker, exec_scope_unit,
+        ca_env_scrub_prelude, durable_scope_unit, environ_has_keepalive_marker, exec_scope_unit,
         machine_name_from_exec_unit, mission_short_id_from_exec_unit, mission_tag_from_path,
         normalize_container_path, resolv_conf_bind_args, synthesized_container_resolv_conf,
         WorkspaceExec, CA_BUNDLE_ENV_VARS,
@@ -553,6 +561,19 @@ mod tests {
             .as_deref(),
             Some("sandboxed-dumbcontracts-634e6d35")
         );
+    }
+
+    #[test]
+    fn durable_scope_is_not_owned_by_mission_reaper() {
+        let id = uuid::Uuid::parse_str("df71826d-2060-44bd-b674-0ab16083e3b3").unwrap();
+        let unit = durable_scope_unit("sandboxed-dumbcontracts-634e6d35", id);
+
+        assert_eq!(
+            unit,
+            "sandboxed-durable-sandboxed-dumbcontracts-634e6d35-df71826d206044bdb6740ab16083e3b3"
+        );
+        assert_eq!(mission_short_id_from_exec_unit(&unit), None);
+        assert!(!unit.starts_with("sandboxed-exec-"));
     }
 
     #[test]
@@ -1118,7 +1139,7 @@ impl WorkspaceExec {
         cmd
     }
 
-    fn machine_name(&self) -> Option<String> {
+    pub(crate) fn machine_name(&self) -> Option<String> {
         machine_name_for_path(&self.workspace.path)
     }
 
@@ -1360,6 +1381,7 @@ impl WorkspaceExec {
         stdin: Stdio,
         stdout: Stdio,
         stderr: Stdio,
+        scope_unit: Option<&str>,
     ) -> anyhow::Result<Command> {
         let nsenter = if Path::new("/usr/bin/nsenter").exists() {
             "/usr/bin/nsenter"
@@ -1400,10 +1422,12 @@ impl WorkspaceExec {
         // mission tag so mission-end teardown can stop exactly this
         // mission's scopes.
         let caps = self.mission_resource_caps();
-        let exec_unit = exec_scope_unit(
-            &self.machine_name().unwrap_or_else(|| "unknown".to_string()),
-            Some(cwd),
-        );
+        let exec_unit = scope_unit.map(str::to_owned).unwrap_or_else(|| {
+            exec_scope_unit(
+                &self.machine_name().unwrap_or_else(|| "unknown".to_string()),
+                Some(cwd),
+            )
+        });
         let mut cmd = if let Some(scope_args) = caps.scope_run_args(&exec_unit) {
             let mut c = Command::new("systemd-run");
             c.args(&scope_args);
@@ -1463,6 +1487,7 @@ impl WorkspaceExec {
         stdin: Stdio,
         stdout: Stdio,
         stderr: Stdio,
+        scope_unit: Option<&str>,
     ) -> anyhow::Result<Command> {
         match self.workspace.workspace_type {
             WorkspaceType::Host => {
@@ -1553,6 +1578,7 @@ impl WorkspaceExec {
                     stdin,
                     stdout,
                     stderr,
+                    scope_unit,
                 )
             }
         }
@@ -1587,6 +1613,7 @@ impl WorkspaceExec {
                     Stdio::null(),
                     Stdio::piped(),
                     Stdio::piped(),
+                    None,
                 )
                 .await
                 .context("Failed to build workspace command")?;
@@ -1655,6 +1682,7 @@ impl WorkspaceExec {
                 Stdio::piped(), // Pipe stdin for processes that read input (e.g., Claude Code --print)
                 Stdio::piped(),
                 Stdio::piped(),
+                None,
             )
             .await
             .context("Failed to build workspace command")?;
@@ -1678,10 +1706,23 @@ impl WorkspaceExec {
         stdin: Stdio,
         stdout: Stdio,
         stderr: Stdio,
+        durable_job_id: uuid::Uuid,
     ) -> anyhow::Result<Child> {
         let env = self.build_env(env);
+        let scope_unit = self
+            .machine_name()
+            .map(|machine| durable_scope_unit(&machine, durable_job_id));
         let mut cmd = self
-            .build_command(cwd, program, args, env, stdin, stdout, stderr)
+            .build_command(
+                cwd,
+                program,
+                args,
+                env,
+                stdin,
+                stdout,
+                stderr,
+                scope_unit.as_deref(),
+            )
             .await
             .context("Failed to build workspace command")?;
         // Durable-job cancellation targets the spawned process group. Give

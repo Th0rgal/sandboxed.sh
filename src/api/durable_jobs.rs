@@ -53,6 +53,11 @@ pub struct DurableJob {
     pub stdout_log: String,
     pub stderr_log: String,
     pub status_file: String,
+    /// Transient systemd scope owned by this durable job. It intentionally
+    /// does not carry the launching mission's tag, so mission teardown cannot
+    /// terminate it.
+    #[serde(default)]
+    pub scope_unit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,6 +324,20 @@ fn terminate_process_group(pid: u32) {
     }
 }
 
+async fn stop_scope(unit: &str) -> bool {
+    let unit = if unit.ends_with(".scope") {
+        unit.to_string()
+    } else {
+        format!("{unit}.scope")
+    };
+    Command::new("systemctl")
+        .args(["stop", unit.as_str()])
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 #[cfg(not(unix))]
 fn terminate_process_group(_pid: u32) {}
 
@@ -444,6 +463,11 @@ pub async fn start_job(
         stdout_log: stdout_log.to_string_lossy().to_string(),
         stderr_log: stderr_log.to_string_lossy().to_string(),
         status_file: status_file.to_string_lossy().to_string(),
+        scope_unit: workspace.as_ref().and_then(|workspace| {
+            WorkspaceExec::new(workspace.clone())
+                .machine_name()
+                .map(|machine| crate::workspace_exec::durable_scope_unit(&machine, id))
+        }),
     };
     job = write_job(&state, &job)
         .await
@@ -472,6 +496,7 @@ pub async fn start_job(
                     Stdio::null(),
                     Stdio::from(stdout),
                     Stdio::from(stderr),
+                    id,
                 )
                 .await
         }
@@ -510,8 +535,14 @@ pub async fn start_job(
     job = match write_job(&state, &job).await {
         Ok(job) => job,
         Err(e) => {
-            if let Some(pid) = job.pid {
-                terminate_process_group(pid);
+            let stopped_scope = match job.scope_unit.as_deref() {
+                Some(unit) => stop_scope(unit).await,
+                None => false,
+            };
+            if !stopped_scope {
+                if let Some(pid) = job.pid {
+                    terminate_process_group(pid);
+                }
             }
             job.status = DurableJobStatus::Failed;
             job.updated_at = Utc::now();
@@ -521,8 +552,14 @@ pub async fn start_job(
         }
     };
     if job.status == DurableJobStatus::Cancelled {
-        if let Some(pid) = job.pid {
-            terminate_process_group(pid);
+        let stopped_scope = match job.scope_unit.as_deref() {
+            Some(unit) => stop_scope(unit).await,
+            None => false,
+        };
+        if !stopped_scope {
+            if let Some(pid) = job.pid {
+                terminate_process_group(pid);
+            }
         }
     }
 
@@ -619,8 +656,14 @@ pub async fn cancel_job(
         job = write_job(&state, &job)
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        if let Some(pid) = job.pid {
-            terminate_process_group(pid);
+        let stopped_scope = match job.scope_unit.as_deref() {
+            Some(unit) => stop_scope(unit).await,
+            None => false,
+        };
+        if !stopped_scope {
+            if let Some(pid) = job.pid {
+                terminate_process_group(pid);
+            }
         }
     }
     Ok(Json(job))
@@ -655,6 +698,7 @@ mod tests {
             stdout_log: "/tmp/stdout.log".to_string(),
             stderr_log: "/tmp/stderr.log".to_string(),
             status_file: "/tmp/exit.json".to_string(),
+            scope_unit: None,
         }
     }
 
