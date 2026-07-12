@@ -1043,9 +1043,17 @@ impl WorkspaceExec {
         escaped
     }
 
+    fn valid_env_key(key: &str) -> bool {
+        !key.trim().is_empty()
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }
+
     /// Build a shell command with optional env var exports.
-    /// When `env` is provided, all env vars are exported before running the program.
-    /// This is needed for nsenter where env vars don't propagate into the container.
+    /// When `env` is provided, all env vars are exported before running the
+    /// program. nsenter callers intentionally pass `None` and use the child
+    /// process environment so credentials never appear in argv.
     fn build_shell_command_with_env(
         rel_cwd: &str,
         program: &str,
@@ -1068,7 +1076,7 @@ impl WorkspaceExec {
                 if k.trim().is_empty() {
                     continue;
                 }
-                if !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                if !Self::valid_env_key(k) {
                     tracing::warn!(key = %k, "Skipping env var with invalid key characters");
                     continue;
                 }
@@ -1444,8 +1452,21 @@ impl WorkspaceExec {
             "nsenter"
         };
         let rel_cwd = self.rel_path_in_container(cwd);
-        // Build shell command with env exports - nsenter doesn't pass env vars
-        // into the container namespace, so we need to export them in the shell.
+        // nsenter preserves its caller's environment. Pass workspace variables
+        // through the process environment instead of embedding them in the
+        // shell argument: transient scope descriptions and process listings
+        // expose argv, and workspace variables commonly contain credentials.
+        let env: HashMap<_, _> = env
+            .into_iter()
+            .filter(|(key, _)| {
+                let valid = Self::valid_env_key(key);
+                if !valid {
+                    tracing::warn!(key = %key, "Skipping env var with invalid key characters");
+                }
+                valid
+            })
+            .collect();
+        let empty_env = HashMap::new();
         let shell_cmd = if tailscale_bootstrap {
             tracing::info!(
                 workspace = %self.workspace.name,
@@ -1456,13 +1477,12 @@ impl WorkspaceExec {
                 &rel_cwd,
                 program,
                 args,
-                &env,
+                &empty_env,
                 true,
                 tailnet_only,
             )
         } else {
-            let env_ref = if env.is_empty() { None } else { Some(&env) };
-            Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
+            Self::build_shell_command_with_env(&rel_cwd, program, args, None)
         };
         // Per-mission isolation, nsenter edition. `nsenter` only enters the
         // container's *namespaces* — the spawned process stays in the
@@ -1530,8 +1550,7 @@ impl WorkspaceExec {
         }
         cmd.args(["/bin/sh", "-lc"]);
         cmd.arg(shell_cmd);
-        // Note: env vars are now exported in the shell command, not here.
-        // Setting them here with cmd.envs() doesn't propagate into the container.
+        cmd.env_clear().envs(env);
         cmd.stdin(stdin).stdout(stdout).stderr(stderr);
         Ok(cmd)
     }
@@ -1939,8 +1958,8 @@ impl WorkspaceExec {
     /// Build the (program, args) tuple for spawning a command inside an
     /// nspawn container via nsenter. Also mutates `env` to add container
     /// defaults (HOME, SSH_AUTH_SOCK). The returned args end with
-    /// `"/bin/sh", "-lc", <shell_cmd>` where `shell_cmd` re-exports env and
-    /// execs the target program.
+    /// `"/bin/sh", "-lc", <shell_cmd>`. nsenter inherits the environment
+    /// applied to the returned command by [`Self::spawn_unix_pty`].
     async fn build_container_nsenter_invocation(
         &self,
         cwd: &Path,
@@ -1978,18 +1997,18 @@ impl WorkspaceExec {
         }
         .to_string();
         let rel_cwd = self.rel_path_in_container(cwd);
+        let empty_env = HashMap::new();
         let shell_cmd = if needs_tailscale_bootstrap {
             Self::build_tailscale_bootstrap_command(
                 &rel_cwd,
                 program,
                 args,
-                env,
+                &empty_env,
                 true,
                 nsenter_tailnet_only,
             )
         } else {
-            let env_ref = if env.is_empty() { None } else { Some(&*env) };
-            Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
+            Self::build_shell_command_with_env(&rel_cwd, program, args, None)
         };
 
         let nsenter_args = vec![
@@ -2083,9 +2102,14 @@ impl WorkspaceExec {
         if !args.is_empty() {
             cmd.args(args);
         }
-        // Inherit parent env, then apply workspace/mission overrides.
+        // Container commands must not inherit API-service credentials. The
+        // complete workspace environment is applied here and inherited by
+        // nsenter without ever appearing in its argv.
+        if self.workspace.workspace_type == WorkspaceType::Container {
+            cmd.env_clear();
+        }
         for (k, v) in env {
-            if k.trim().is_empty() {
+            if !Self::valid_env_key(k) {
                 continue;
             }
             cmd.env(k, v);
