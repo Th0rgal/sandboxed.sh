@@ -171,11 +171,9 @@ async fn stop_unit(unit: &str, reason: &str) -> bool {
 /// number of scopes stopped. No-op when the host has no systemd scopes
 /// (caps disabled) — the unit list is simply empty.
 pub async fn stop_mission_exec_scopes(mission_id: Uuid, reason: &str) -> usize {
-    let short = mission_id.to_string()[..8].to_string();
     let mut stopped = 0;
     for unit in list_exec_scope_units().await {
-        if crate::workspace_exec::mission_short_id_from_exec_unit(&unit).as_deref()
-            == Some(short.as_str())
+        if crate::workspace_exec::exec_unit_belongs_to_mission(&unit, mission_id)
             && stop_unit(&unit, reason).await
         {
             stopped += 1;

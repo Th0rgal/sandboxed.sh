@@ -5653,10 +5653,43 @@ async fn dispatch_remote_job(
         ));
     }
 
-    control
+    if let Err(err) = control
         .mission_store
         .update_mission_status(mission.id, MissionStatus::Active)
-        .await?;
+        .await
+    {
+        // The node already accepted the job and its handle is durable. Ask
+        // for cancellation immediately, then keep polling until terminal so
+        // a failed mission activation cannot leak node capacity.
+        if let Err(cancel_err) = client.cancel_job(&node, &shared_token, job_id).await {
+            tracing::warn!(
+                mission_id = %mission.id,
+                job_id = %job_id,
+                ?cancel_err,
+                "remote job cancellation after activation failure will be retried by poller"
+            );
+        }
+        let poll_control = control.clone();
+        let fleet = Arc::clone(&state.fleet);
+        let ledger_dir = state.config.working_dir.clone();
+        let mission_id = mission.id;
+        let started_at = chrono::Utc::now();
+        tokio::spawn(async move {
+            poll_remote_job(
+                poll_control,
+                fleet,
+                client,
+                node,
+                shared_token,
+                mission_id,
+                job_id,
+                started_at,
+            )
+            .await;
+            crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+        });
+        return Err(err);
+    }
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
         mission_id: mission.id,
         status: MissionStatus::Active,

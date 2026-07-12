@@ -493,6 +493,43 @@ async fn submit_remote_build(
         Some("client-side wait cap (2h) exceeded".to_string()),
         true,
     ));
+    let observer_state = Arc::clone(&state);
+    let observer_node = node.clone();
+    let observer_token = shared_token.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+            match RemoteNodeClient::default()
+                .get_job(&observer_node, &observer_token, job_id)
+                .await
+            {
+                Ok(status)
+                    if matches!(
+                        status.state.as_str(),
+                        "succeeded" | "failed" | "cancelled" | "lost"
+                    ) =>
+                {
+                    observer_state.fleet.record_outcome(DispatchOutcome {
+                        mission_id: req.mission_id,
+                        node_id: observer_node.id.clone(),
+                        job_id: Some(job_id),
+                        state: status.state,
+                        exit_code: status.exit_code,
+                        error: status.error,
+                        started_at,
+                        finished_at: Some(chrono::Utc::now()),
+                    });
+                    crate::remote_node::job_ledger::remove(
+                        &observer_state.config.working_dir,
+                        job_id,
+                    )
+                    .await;
+                    return;
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+    });
     (
         StatusCode::GATEWAY_TIMEOUT,
         format!("remote build {job_id} on '{}' did not finish within the 2h wait cap; poll GET /api/remote-build/{job_id}?node_id={}", node.id, node.id),
@@ -551,6 +588,12 @@ async fn get_remote_build(
             StatusCode::FORBIDDEN,
             "job does not belong to this mission".to_string(),
         ));
+    }
+    if matches!(
+        status.state.as_str(),
+        "succeeded" | "failed" | "cancelled" | "lost"
+    ) {
+        crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
     }
     Ok(Json(status))
 }

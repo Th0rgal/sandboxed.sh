@@ -199,9 +199,20 @@ pub fn mission_tag_from_path(cwd: &Path) -> Option<String> {
 /// `list_workspace_scope_units` stays intact), the optional mission/task tag
 /// second (per-mission teardown), and a short random suffix for uniqueness.
 pub fn exec_scope_unit(machine_name: &str, cwd: Option<&Path>) -> String {
+    exec_scope_unit_for_mission(machine_name, cwd, None)
+}
+
+fn exec_scope_unit_for_mission(
+    machine_name: &str,
+    cwd: Option<&Path>,
+    mission_id: Option<uuid::Uuid>,
+) -> String {
     let rand = uuid::Uuid::new_v4().simple().to_string();
     let rand8 = &rand[..8];
-    match cwd.and_then(mission_tag_from_path) {
+    let tag = mission_id
+        .map(|id| format!("m{}", id.simple()))
+        .or_else(|| cwd.and_then(mission_tag_from_path));
+    match tag {
         Some(tag) => format!("sandboxed-exec-{machine_name}-{tag}-{rand8}"),
         None => format!("sandboxed-exec-{machine_name}-{rand8}"),
     }
@@ -225,11 +236,27 @@ pub fn mission_short_id_from_exec_unit(unit: &str) -> Option<String> {
     let _rand = segs.next()?;
     let tag = segs.next()?;
     let rest = tag.strip_prefix('m')?;
-    if rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(rest.to_string())
+    if matches!(rest.len(), 8 | 32) && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(rest[..8].to_string())
     } else {
         None
     }
+}
+
+/// Exact ownership check for newly generated exec scopes. Legacy 8-hex tags
+/// intentionally do not match: stopping them immediately would reintroduce
+/// the collision this check prevents; the ownership-aware periodic reaper
+/// handles those old scopes instead.
+pub fn exec_unit_belongs_to_mission(unit: &str, mission_id: uuid::Uuid) -> bool {
+    let name = unit.strip_suffix(".scope").unwrap_or(unit);
+    let mut segments = name.rsplit('-');
+    let _random = segments.next();
+    let Some(tag) = segments.next().and_then(|tag| tag.strip_prefix('m')) else {
+        return false;
+    };
+    tag.len() == 32
+        && tag.eq_ignore_ascii_case(&mission_id.simple().to_string())
+        && tag.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Recover the exact machine token from a per-exec scope name. Parsing from
@@ -462,9 +489,10 @@ pub(crate) fn resolv_conf_nspawn_args() -> Vec<String> {
 mod tests {
     use super::{
         ca_env_scrub_prelude, durable_scope_unit, environ_has_keepalive_marker, exec_scope_unit,
-        machine_name_from_exec_unit, mission_short_id_from_exec_unit, mission_tag_from_path,
-        normalize_container_path, resolv_conf_bind_args, synthesized_container_resolv_conf,
-        WorkspaceExec, CA_BUNDLE_ENV_VARS,
+        exec_scope_unit_for_mission, exec_unit_belongs_to_mission, machine_name_from_exec_unit,
+        mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
+        resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec,
+        CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -574,6 +602,29 @@ mod tests {
         );
         assert_eq!(mission_short_id_from_exec_unit(&unit), None);
         assert!(!unit.starts_with("sandboxed-exec-"));
+    }
+
+    #[test]
+    fn full_mission_scope_tag_prevents_short_id_collisions() {
+        let first = uuid::Uuid::parse_str("deadbeef-0000-4000-8000-000000000001").unwrap();
+        let collision = uuid::Uuid::parse_str("deadbeef-0000-4000-8000-000000000002").unwrap();
+        let unit = exec_scope_unit_for_mission(
+            "sandboxed-dumbcontracts-634e6d35",
+            Some(Path::new("/workspaces/mission-deadbeef")),
+            Some(first),
+        );
+
+        assert!(exec_unit_belongs_to_mission(&unit, first));
+        assert!(!exec_unit_belongs_to_mission(&unit, collision));
+        assert_eq!(
+            mission_short_id_from_exec_unit(&unit).as_deref(),
+            Some("deadbeef")
+        );
+        let legacy = exec_scope_unit(
+            "sandboxed-dumbcontracts-634e6d35",
+            Some(Path::new("/workspaces/mission-deadbeef")),
+        );
+        assert!(!exec_unit_belongs_to_mission(&legacy, first));
     }
 
     #[test]
@@ -1422,10 +1473,14 @@ impl WorkspaceExec {
         // mission tag so mission-end teardown can stop exactly this
         // mission's scopes.
         let caps = self.mission_resource_caps();
+        let mission_id = env
+            .get("MISSION_ID")
+            .and_then(|value| uuid::Uuid::parse_str(value).ok());
         let exec_unit = scope_unit.map(str::to_owned).unwrap_or_else(|| {
-            exec_scope_unit(
+            exec_scope_unit_for_mission(
                 &self.machine_name().unwrap_or_else(|| "unknown".to_string()),
                 Some(cwd),
+                mission_id,
             )
         });
         let mut cmd = if let Some(scope_args) = caps.scope_run_args(&exec_unit) {

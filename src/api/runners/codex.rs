@@ -85,6 +85,7 @@ fn prepare_codex_per_mission_home(
         }
     }
     let mut env = HashMap::new();
+    env.insert("MISSION_ID".to_string(), mission_id.to_string());
     env.insert(
         "HOME".to_string(),
         workspace_exec.translate_path_for_container(mission_work_dir),
