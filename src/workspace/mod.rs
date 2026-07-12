@@ -2203,6 +2203,21 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                         );
                     }
                 }
+                // Service MCPs mint short-lived JWTs from JWT_SECRET. Preserve
+                // the deployment's authoritative single-tenant identity so
+                // they address the same persisted mission store as the API;
+                // otherwise container env filtering makes them fall back to
+                // the unrelated `default` store after a restart.
+                if let Ok(user_id) = std::env::var("SANDBOXED_SINGLE_TENANT_USER_ID")
+                    .or_else(|_| std::env::var("SINGLE_TENANT_USER_ID"))
+                {
+                    if !user_id.trim().is_empty() {
+                        env.insert(
+                            "SANDBOXED_SINGLE_TENANT_USER_ID".to_string(),
+                            user_id.trim().to_string(),
+                        );
+                    }
+                }
                 // Use the server's own address so MCPs can reach the API.
                 // Private-network containers (Tailscale veth) cannot reach
                 // the host on 127.0.0.1 — use the veth gateway address there.
