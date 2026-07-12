@@ -80,6 +80,83 @@ async fn read_settings(state: &Arc<AppState>) -> (bool, u32) {
     (enabled, days)
 }
 
+/// One mission's GC/reaper-relevant metadata, keyed by 8-hex short id.
+#[derive(Debug, Clone)]
+pub struct MissionIndexEntry {
+    pub status: MissionStatus,
+    pub updated_at: DateTime<Utc>,
+    pub workspace_id: uuid::Uuid,
+}
+
+/// How protected a status is, for short-id collision resolution: running >
+/// parked > terminal. The more protective entry wins so a collision can
+/// never cause a live mission's dir/scope to be collected.
+fn protection_rank(status: &MissionStatus) -> u8 {
+    match status {
+        MissionStatus::Active | MissionStatus::Pending | MissionStatus::WaitingBackground => 2,
+        MissionStatus::AwaitingUser | MissionStatus::Paused => 1,
+        _ => 0,
+    }
+}
+
+/// Index every mission across all live sessions' stores by the first 8 hex
+/// chars of its id — the same prefix embedded in workspace dir names
+/// (`mission-<8hex>`) and exec scope units (`-m<8hex>-`). Shared by the
+/// orphan-dir sweep and the scope reaper.
+pub(crate) async fn build_mission_index(
+    state: &Arc<AppState>,
+) -> std::collections::HashMap<String, MissionIndexEntry> {
+    let mut index: std::collections::HashMap<String, MissionIndexEntry> =
+        std::collections::HashMap::new();
+    let sessions = state.control.all_sessions().await;
+    for session in sessions {
+        let store = session.mission_store.clone();
+        let mut offset = 0usize;
+        loop {
+            let page = match store.list_missions(LIST_PAGE_SIZE, offset).await {
+                Ok(page) => page,
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "mission index: list_missions failed; skipping session"
+                    );
+                    break;
+                }
+            };
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            for mission in page {
+                let short = mission.id.to_string()[..8].to_string();
+                let updated_at = DateTime::parse_from_rfc3339(&mission.updated_at)
+                    .map(|ts| ts.with_timezone(&Utc))
+                    // Unparseable timestamp → treat as "just now" so the
+                    // entry is maximally protective rather than collectable.
+                    .unwrap_or_else(|_| Utc::now());
+                let entry = MissionIndexEntry {
+                    status: mission.status,
+                    updated_at,
+                    workspace_id: mission.workspace_id,
+                };
+                match index.get(&short) {
+                    Some(existing)
+                        if (protection_rank(&existing.status), existing.updated_at)
+                            >= (protection_rank(&entry.status), entry.updated_at) => {}
+                    _ => {
+                        index.insert(short, entry);
+                    }
+                }
+            }
+            if page_len < LIST_PAGE_SIZE {
+                break;
+            }
+            offset += page_len;
+        }
+    }
+    index
+}
+
 #[derive(Default)]
 pub struct SweepReport {
     pub scanned: usize,

@@ -166,6 +166,59 @@ fn mission_scope_unit(machine_name: &str) -> String {
     format!("sandboxed-mission-{sanitized}.scope")
 }
 
+/// Mission/task tag derived from an exec working directory. Per-mission dirs
+/// are `.../workspaces/mission-<first-8-hex-of-uuid>/…` (see
+/// `workspace::mission_workspace_dir_for_root`), so the tag is recoverable
+/// from any cwd inside a mission workspace. It is embedded in exec scope
+/// unit names so mission-end teardown and the zombie reaper can select one
+/// mission's scopes without a process registry.
+pub fn mission_tag_from_path(cwd: &Path) -> Option<String> {
+    for comp in cwd.components() {
+        let Some(name) = comp.as_os_str().to_str() else {
+            continue;
+        };
+        for (prefix, tag) in [("mission-", 'm'), ("task-", 't')] {
+            if let Some(rest) = name.strip_prefix(prefix) {
+                if rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(format!("{tag}{}", rest.to_ascii_lowercase()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Unit name for a per-exec transient scope:
+/// `sandboxed-exec-<machine>[-m<8hex>|-t<8hex>]-<rand8>`.
+/// The machine token comes first (workspace-level substring discovery by
+/// `list_workspace_scope_units` stays intact), the optional mission/task tag
+/// second (per-mission teardown), and a short random suffix for uniqueness.
+pub fn exec_scope_unit(machine_name: &str, cwd: Option<&Path>) -> String {
+    let rand = uuid::Uuid::new_v4().simple().to_string();
+    let rand8 = &rand[..8];
+    match cwd.and_then(mission_tag_from_path) {
+        Some(tag) => format!("sandboxed-exec-{machine_name}-{tag}-{rand8}"),
+        None => format!("sandboxed-exec-{machine_name}-{rand8}"),
+    }
+}
+
+/// Recover the 8-hex mission short id from an exec scope unit name produced
+/// by [`exec_scope_unit`]. Parses from the END (`…-m<8hex>-<rand8>.scope`) so
+/// machine-name segments can never false-positive. Returns `None` for
+/// legacy-named units (pre-mission-tag) and task-tagged units.
+pub fn mission_short_id_from_exec_unit(unit: &str) -> Option<String> {
+    let name = unit.strip_suffix(".scope").unwrap_or(unit);
+    let mut segs = name.rsplit('-');
+    let _rand = segs.next()?;
+    let tag = segs.next()?;
+    let rest = tag.strip_prefix('m')?;
+    if rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(rest.to_string())
+    } else {
+        None
+    }
+}
+
 /// systemd slice that hosts every mission scope. Putting all mission scopes
 /// under one slice makes them cgroup *siblings* of the API service instead of
 /// children, and lets ops pin an **aggregate** memory cap on the slice so the
@@ -372,12 +425,74 @@ pub(crate) fn resolv_conf_nspawn_args() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ca_env_scrub_prelude, environ_has_keepalive_marker, normalize_container_path,
+        ca_env_scrub_prelude, environ_has_keepalive_marker, exec_scope_unit,
+        mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
         resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec,
         CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
     use std::path::Path;
+
+    #[test]
+    fn mission_tag_extracted_from_workspace_cwd() {
+        assert_eq!(
+            mission_tag_from_path(Path::new(
+                "/root/.sandboxed-sh/containers/dumbcontracts/workspaces/mission-4efda364/repo"
+            ))
+            .as_deref(),
+            Some("m4efda364")
+        );
+        assert_eq!(
+            mission_tag_from_path(Path::new("/workspaces/task-deadbeef")).as_deref(),
+            Some("tdeadbeef")
+        );
+        // Not 8 hex chars → no tag.
+        assert_eq!(
+            mission_tag_from_path(Path::new("/workspaces/mission-xyz")),
+            None
+        );
+        assert_eq!(
+            mission_tag_from_path(Path::new("/workspaces/mission-123456789")),
+            None
+        );
+        assert_eq!(mission_tag_from_path(Path::new("/srv/monorepo")), None);
+    }
+
+    #[test]
+    fn exec_scope_unit_roundtrips_mission_short_id() {
+        let unit = exec_scope_unit(
+            "sandboxed-dumbcontracts-634e6d35",
+            Some(Path::new("/workspaces/mission-4efda364")),
+        );
+        assert!(unit.starts_with("sandboxed-exec-sandboxed-dumbcontracts-634e6d35-m4efda364-"));
+        assert_eq!(
+            mission_short_id_from_exec_unit(&format!("{unit}.scope")).as_deref(),
+            Some("4efda364")
+        );
+        assert_eq!(
+            mission_short_id_from_exec_unit(&unit).as_deref(),
+            Some("4efda364")
+        );
+
+        // Legacy naming (32-char random suffix, no tag) must not parse — the
+        // machine hash segment is 8 hex but lacks the `m` prefix.
+        assert_eq!(
+            mission_short_id_from_exec_unit(
+                "sandboxed-exec-sandboxed-dumbcontracts-634e6d35-000b8543a2244e49875a6bf64594dbc5.scope"
+            ),
+            None
+        );
+        // Task tags are not mission ids.
+        let task_unit = exec_scope_unit(
+            "sandboxed-misc-deadbeef",
+            Some(Path::new("/workspaces/task-01234567")),
+        );
+        assert_eq!(mission_short_id_from_exec_unit(&task_unit), None);
+        // No cwd → no tag, still unique-suffixed.
+        let bare = exec_scope_unit("sandboxed-misc-deadbeef", None);
+        assert_eq!(mission_short_id_from_exec_unit(&bare), None);
+        assert!(bare.starts_with("sandboxed-exec-sandboxed-misc-deadbeef-"));
+    }
 
     #[test]
     fn synthesized_resolv_conf_uses_public_dns_before_magic_dns() {
@@ -1220,12 +1335,13 @@ impl WorkspaceExec {
         // container's own scope sat at 24G/2MB). Wrap each attach in its
         // own capped transient scope when `MISSION_MEMORY_MAX` is set.
         // The unit embeds the machine name so the API layer can find and
-        // retune every scope belonging to one workspace at runtime.
+        // retune every scope belonging to one workspace at runtime, plus the
+        // mission tag so mission-end teardown can stop exactly this
+        // mission's scopes.
         let caps = self.mission_resource_caps();
-        let exec_unit = format!(
-            "sandboxed-exec-{}-{}",
-            self.machine_name().unwrap_or_else(|| "unknown".to_string()),
-            uuid::Uuid::new_v4().simple()
+        let exec_unit = exec_scope_unit(
+            &self.machine_name().unwrap_or_else(|| "unknown".to_string()),
+            Some(cwd),
         );
         let mut cmd = if let Some(scope_args) = caps.scope_run_args(&exec_unit) {
             let mut c = Command::new("systemd-run");
@@ -1700,10 +1816,9 @@ impl WorkspaceExec {
         // --scope keeps the payload as its own foreground child, so PTY
         // semantics and group-kill teardown are preserved.
         let caps = self.mission_resource_caps();
-        let exec_unit = format!(
-            "sandboxed-exec-{}-{}",
-            self.machine_name().unwrap_or_else(|| "unknown".to_string()),
-            uuid::Uuid::new_v4().simple()
+        let exec_unit = exec_scope_unit(
+            &self.machine_name().unwrap_or_else(|| "unknown".to_string()),
+            Some(cwd),
         );
         if let Some(scope_args) = caps.scope_run_args(&exec_unit) {
             let mut args = scope_args;

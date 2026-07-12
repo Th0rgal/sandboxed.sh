@@ -8457,6 +8457,11 @@ fn spawn_control_session(
         ));
     }
 
+    // Event-driven scope teardown: stop a mission's exec scopes as soon as
+    // its status stops needing a live harness. The periodic scope reaper
+    // (scope_reaper::spawn) backstops events missed across restarts.
+    super::scope_reaper::spawn_status_listener(events_tx.subscribe());
+
     // Shared registry of in-flight Claude Code background shell tasks. Written
     // by the control actor's ToolResult arm; read by the auto-resume watcher.
     let background_tasks: super::mission_runner::BackgroundTaskRegistry =

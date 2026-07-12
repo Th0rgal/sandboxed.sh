@@ -54,6 +54,7 @@ mod proxy_keys;
 pub(crate) mod proxy_liveness;
 mod routes;
 pub(crate) mod runners;
+pub mod scope_reaper;
 pub mod secrets;
 pub mod settings;
 pub(crate) mod spark;

@@ -569,6 +569,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // crossings, recovery notice on the way back down.
     super::disk_watch::spawn(Arc::clone(&state));
 
+    // Zombie-scope reaper: stops leftover sandboxed-exec-*.scope units whose
+    // mission no longer needs a live harness (see scope_reaper docs).
+    super::scope_reaper::spawn(Arc::clone(&state));
+
     // Start background OAuth token refresher task
     {
         let ai_providers = Arc::clone(&state.ai_providers);
