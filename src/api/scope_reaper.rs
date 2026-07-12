@@ -30,7 +30,9 @@ use super::control::{AgentEvent, MissionStatus};
 use super::mission_store::MissionStore;
 use super::mission_workspace_gc::build_mission_index;
 use super::routes::AppState;
-use crate::workspace_exec::{machine_name_for_path, mission_short_id_from_exec_unit};
+use crate::workspace_exec::{
+    machine_name_for_path, machine_name_from_exec_unit, mission_short_id_from_exec_unit,
+};
 
 fn env_flag(var: &str, default: bool) -> bool {
     match std::env::var(var) {
@@ -328,9 +330,10 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
 
     for unit in units {
         report.scanned += 1;
-        let ours = known_workspace_tokens
-            .iter()
-            .any(|token| unit.contains(token.as_str()));
+        let unit_machine = machine_name_from_exec_unit(&unit);
+        let ours = unit_machine
+            .as_ref()
+            .is_some_and(|machine| known_workspace_tokens.contains(machine));
         if !ours {
             tracing::debug!(unit, "reaper: kept (scope not owned by this instance)");
             report.kept += 1;
@@ -374,9 +377,9 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
                     report.kept += 1;
                     continue;
                 }
-                let owned_by_live_ws = live_workspace_tokens
-                    .iter()
-                    .any(|token| unit.contains(token.as_str()));
+                let owned_by_live_ws = unit_machine
+                    .as_ref()
+                    .is_some_and(|machine| live_workspace_tokens.contains(machine));
                 if owned_by_live_ws {
                     report.kept += 1;
                     continue;

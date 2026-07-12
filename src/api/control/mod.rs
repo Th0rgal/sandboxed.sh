@@ -5813,21 +5813,30 @@ async fn poll_remote_job(
         tokio::time::sleep(POLL_INTERVAL).await;
 
         // Honor external mission cancellation when trivially observable: if
-        // an operator moved the mission out of Active (cancel/interrupt/
-        // pause), stop polling and cancel the job on the node.
-        if let Ok(Some(current)) = control.mission_store.get_mission(mission_id).await {
-            if current.status != MissionStatus::Active {
-                let _ = client.cancel_job(&node, &shared_token, job_id).await;
-                fleet.record_outcome(outcome(
-                    "cancelled",
-                    None,
-                    Some(format!(
-                        "mission left active state ({}); job cancelled on node",
-                        current.status
-                    )),
-                    true,
-                ));
-                return;
+        // an operator moved the mission out of Active (cancel/interrupt/pause),
+        // request cancellation but retain the durable handle and keep polling
+        // until the node confirms a terminal state. A transient cancel outage
+        // must not orphan a still-running remote job.
+        let inactive_status = match control.mission_store.get_mission(mission_id).await {
+            Ok(Some(current)) if current.status != MissionStatus::Active => Some(current.status),
+            _ => None,
+        };
+        if let Some(status) = inactive_status {
+            if let Err(err) = client.cancel_job(&node, &shared_token, job_id).await {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    job_id = %job_id,
+                    node = %node.id,
+                    ?err,
+                    "remote job cancellation failed; retaining handle and retrying"
+                );
+            } else {
+                tracing::debug!(
+                    mission_id = %mission_id,
+                    job_id = %job_id,
+                    %status,
+                    "remote job cancellation requested; awaiting terminal state"
+                );
             }
         }
 
@@ -5835,6 +5844,18 @@ async fn poll_remote_job(
             Err(err) => {
                 failures += 1;
                 if failures >= MAX_CONSECUTIVE_FAILURES {
+                    if inactive_status.is_some() {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            job_id = %job_id,
+                            node = %node.id,
+                            failures,
+                            ?err,
+                            "remote job still unreachable during cancellation; retaining handle"
+                        );
+                        failures = 0;
+                        continue;
+                    }
                     let content = format!(
                         "Remote node '{}' became unreachable while running job {} \
                          ({failures} consecutive poll failures; last error: {err}). \

@@ -827,7 +827,9 @@ fn gc_once(work_root: &Path) {
         }
         let _ = fs2::FileExt::unlock(&lock_file);
         drop(lock_file);
-        let _ = std::fs::remove_file(&lock_path);
+        // Keep the lock inode stable. Unlinking here can split the flock
+        // domain when a waiter already has this inode open while a later job
+        // recreates and locks a different inode at the same path.
         match fs2::available_space(work_root) {
             Ok(free) if free >= threshold => return,
             _ => {}

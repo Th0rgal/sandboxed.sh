@@ -219,6 +219,29 @@ pub fn mission_short_id_from_exec_unit(unit: &str) -> Option<String> {
     }
 }
 
+/// Recover the exact machine token from a per-exec scope name. Parsing from
+/// the right avoids ambiguous substring/prefix ownership matches when two
+/// user-controlled workspace names overlap.
+pub fn machine_name_from_exec_unit(unit: &str) -> Option<String> {
+    let name = unit
+        .strip_suffix(".scope")
+        .unwrap_or(unit)
+        .strip_prefix("sandboxed-exec-")?;
+    let (before_rand, rand) = name.rsplit_once('-')?;
+    if !matches!(rand.len(), 8 | 32) || !rand.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if let Some((machine, tag)) = before_rand.rsplit_once('-') {
+        let tagged = tag.len() == 9
+            && matches!(tag.as_bytes().first(), Some(b'm' | b't'))
+            && tag[1..].chars().all(|c| c.is_ascii_hexdigit());
+        if tagged {
+            return Some(machine.to_string());
+        }
+    }
+    Some(before_rand.to_string())
+}
+
 /// systemd slice that hosts every mission scope. Putting all mission scopes
 /// under one slice makes them cgroup *siblings* of the API service instead of
 /// children, and lets ops pin an **aggregate** memory cap on the slice so the
@@ -426,9 +449,9 @@ pub(crate) fn resolv_conf_nspawn_args() -> Vec<String> {
 mod tests {
     use super::{
         ca_env_scrub_prelude, environ_has_keepalive_marker, exec_scope_unit,
-        mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
-        resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec,
-        CA_BUNDLE_ENV_VARS,
+        machine_name_from_exec_unit, mission_short_id_from_exec_unit, mission_tag_from_path,
+        normalize_container_path, resolv_conf_bind_args, synthesized_container_resolv_conf,
+        WorkspaceExec, CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -492,6 +515,26 @@ mod tests {
         let bare = exec_scope_unit("sandboxed-misc-deadbeef", None);
         assert_eq!(mission_short_id_from_exec_unit(&bare), None);
         assert!(bare.starts_with("sandboxed-exec-sandboxed-misc-deadbeef-"));
+
+        assert_eq!(
+            machine_name_from_exec_unit(&format!("{unit}.scope")).as_deref(),
+            Some("sandboxed-dumbcontracts-634e6d35")
+        );
+        assert_eq!(
+            machine_name_from_exec_unit(&task_unit).as_deref(),
+            Some("sandboxed-misc-deadbeef")
+        );
+        assert_eq!(
+            machine_name_from_exec_unit(&bare).as_deref(),
+            Some("sandboxed-misc-deadbeef")
+        );
+        assert_eq!(
+            machine_name_from_exec_unit(
+                "sandboxed-exec-sandboxed-dumbcontracts-634e6d35-000b8543a2244e49875a6bf64594dbc5.scope"
+            )
+            .as_deref(),
+            Some("sandboxed-dumbcontracts-634e6d35")
+        );
     }
 
     #[test]

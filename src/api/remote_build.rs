@@ -29,7 +29,8 @@ use uuid::Uuid;
 use super::routes::AppState;
 use crate::remote_node::{
     ArtifactEntry, DispatchOutcome, JobPayload, JobSource, LeaseClaims, NodeJobStatus,
-    RemoteNodeClient, RemoteNodeConfig, SubmitJobRequest, SCOPE_JOB_SUBMIT,
+    RemoteNodeClient, RemoteNodeConfig, RemoteNodeError, RemoteNodeStatus, SubmitJobRequest,
+    SCOPE_JOB_SUBMIT,
 };
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -234,7 +235,7 @@ struct RemoteBuildAcceptedResponse {
 /// Resolve the target node: explicit id or capacity-aware auto placement.
 /// All misses map to `503` so the wrapper can fall back to a local build —
 /// except an explicitly named unknown node, which is a caller bug (`400`).
-fn resolve_node(
+async fn resolve_node(
     state: &AppState,
     node_id: &str,
     requirements: &[String],
@@ -247,10 +248,39 @@ fn resolve_node(
         ));
     }
     if node_id.eq_ignore_ascii_case("auto") {
-        let picked = state
-            .fleet
-            .place_auto(settings, requirements)
-            .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+        let first = state.fleet.place_auto(settings, requirements);
+        let picked = match first {
+            Ok(picked) => picked,
+            Err(initial_err) => {
+                // The monitor can be disabled, or the first request can race
+                // its initial tick. Probe only cold nodes, then retry placement
+                // once so on-demand mode remains usable without masking a real
+                // capacity/label rejection from fresh heartbeat data.
+                let cold: Vec<_> = settings
+                    .nodes
+                    .iter()
+                    .filter(|node| {
+                        state
+                            .fleet
+                            .get(&node.id)
+                            .is_none_or(|cached| cached.status == RemoteNodeStatus::Unknown)
+                    })
+                    .collect();
+                if cold.is_empty() {
+                    return Err((StatusCode::SERVICE_UNAVAILABLE, initial_err.to_string()));
+                }
+                let client = RemoteNodeClient::default();
+                futures::future::join_all(
+                    cold.into_iter()
+                        .map(|node| crate::remote_node::probe_node(&state.fleet, &client, node)),
+                )
+                .await;
+                state
+                    .fleet
+                    .place_auto(settings, requirements)
+                    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?
+            }
+        };
         return settings.node(&picked).cloned().ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
             format!("placed node '{picked}' vanished from configuration"),
@@ -260,6 +290,17 @@ fn resolve_node(
         StatusCode::BAD_REQUEST,
         format!("remote node '{node_id}' is not configured"),
     ))
+}
+
+fn submit_error_status(err: &RemoteNodeError) -> StatusCode {
+    match err {
+        RemoteNodeError::Rejected { status, .. }
+            if (400..500).contains(status) && !matches!(*status, 408 | 429) =>
+        {
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST)
+        }
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 fn node_shared_token(node: &RemoteNodeConfig) -> Result<String, (StatusCode, String)> {
@@ -296,7 +337,7 @@ async fn submit_remote_build(
         return (StatusCode::BAD_REQUEST, "command argv required").into_response();
     }
 
-    let node = match resolve_node(&state, &req.node_id, &req.requirements) {
+    let node = match resolve_node(&state, &req.node_id, &req.requirements).await {
         Ok(node) => node,
         Err((status, message)) => return (status, message).into_response(),
     };
@@ -340,12 +381,12 @@ async fn submit_remote_build(
     let accepted = match client.submit_job(&node, &shared_token, &submit).await {
         Ok(accepted) => accepted,
         Err(err) => {
-            // 503, not 502: a node that went down after placement is a
-            // transient fleet-capacity condition, and 503 is the documented
-            // signal the remote-lean-build wrapper maps to EX_TEMPFAIL
-            // (fall back to a local build).
+            // Transport outages and queue saturation remain 503 so the wrapper
+            // can fall back locally. Node-side caller validation stays 4xx and
+            // must not be disguised as a fleet outage.
+            let status = submit_error_status(&err);
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
+                status,
                 format!("remote node '{}' did not accept the build: {err}", node.id),
             )
                 .into_response();
@@ -578,5 +619,34 @@ mod tests {
         assert_eq!(req.cwd_rel.as_deref(), Some("verity"));
         assert_eq!(req.timeout_secs, Some(1200));
         assert_eq!(req.artifacts, vec![".lake/build/lib/*"]);
+    }
+
+    #[test]
+    fn submit_errors_preserve_caller_failures_only() {
+        assert_eq!(
+            submit_error_status(&RemoteNodeError::Rejected {
+                status: 400,
+                body: "invalid payload".to_string(),
+            }),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            submit_error_status(&RemoteNodeError::Rejected {
+                status: 422,
+                body: "invalid payload".to_string(),
+            }),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            submit_error_status(&RemoteNodeError::Rejected {
+                status: 429,
+                body: "queue full".to_string(),
+            }),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            submit_error_status(&RemoteNodeError::Request("offline".to_string())),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

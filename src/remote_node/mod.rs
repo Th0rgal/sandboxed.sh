@@ -103,8 +103,8 @@ pub enum RemoteNodeError {
     InvalidConfig(String),
     #[error("remote node request failed: {0}")]
     Request(String),
-    #[error("remote node rejected lease: {0}")]
-    Rejected(String),
+    #[error("remote node rejected request with HTTP {status}: {body}")]
+    Rejected { status: u16, body: String },
     #[error("invalid lease token: {0}")]
     InvalidLease(String),
 }
