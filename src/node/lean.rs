@@ -101,6 +101,26 @@ pub fn rel_path_is_safe(rel_clean: &str) -> bool {
         })
 }
 
+/// Only remote fetch sources: git happily fetches local paths and file://
+/// URLs, which would let a remote-build token holder exfiltrate node-local
+/// git data into a checkout.
+fn repo_url_is_remote(repo: &str) -> bool {
+    let repo = repo.trim();
+    if repo.starts_with("https://") || repo.starts_with("ssh://") {
+        return true;
+    }
+    // scp-like syntax: user@host:path (no scheme). Require the colon after
+    // the host part and forbid path-like prefixes.
+    if let Some((userhost, path)) = repo.split_once(':') {
+        return userhost.contains('@')
+            && !userhost.contains('/')
+            && !path.is_empty()
+            && !repo.starts_with('/')
+            && !repo.starts_with('.');
+    }
+    false
+}
+
 /// Validate a lean-build payload before touching the filesystem or network.
 pub fn validate_lean_build(
     source: &JobSource,
@@ -111,6 +131,13 @@ pub fn validate_lean_build(
 ) -> Result<(), String> {
     if source.repo.trim().is_empty() {
         return Err("source.repo is required".to_string());
+    }
+    if !repo_url_is_remote(&source.repo) {
+        return Err(format!(
+            "source.repo must be an https://, ssh:// or git@host: URL (got '{}'); \
+             local paths and file:// would expose node-local repositories",
+            source.repo
+        ));
     }
     if !commit_is_valid(&source.commit) {
         return Err(format!(
@@ -828,6 +855,53 @@ mod tests {
                 )
                 .is_err(),
                 "{path_argv} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_local_repo_sources() {
+        for bad in [
+            "/srv/git/private.git",
+            "file:///var/lib/sandboxed-node/checkouts",
+            "./repo",
+            "../repo",
+            "repo",
+            "C:/repos/x",
+        ] {
+            assert!(
+                validate_lean_build(
+                    &JobSource {
+                        repo: bad.to_string(),
+                        commit: "a".repeat(40),
+                    },
+                    None,
+                    &["lake".to_string(), "build".to_string()],
+                    &HashMap::new(),
+                    &allowlist(),
+                )
+                .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        for good in [
+            "https://github.com/lfglabs-dev/verity.git",
+            "ssh://git@github.com/lfglabs-dev/erc4337-verity.git",
+            "git@github.com:lfglabs-dev/erc4337-verity.git",
+        ] {
+            assert!(
+                validate_lean_build(
+                    &JobSource {
+                        repo: good.to_string(),
+                        commit: "a".repeat(40),
+                    },
+                    None,
+                    &["lake".to_string(), "build".to_string()],
+                    &HashMap::new(),
+                    &allowlist(),
+                )
+                .is_ok(),
+                "{good} must be accepted"
             );
         }
     }

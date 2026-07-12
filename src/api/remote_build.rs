@@ -244,11 +244,15 @@ async fn submit_remote_build(
     let accepted = match client.submit_job(&node, &shared_token, &submit).await {
         Ok(accepted) => accepted,
         Err(err) => {
+            // 503, not 502: a node that went down after placement is a
+            // transient fleet-capacity condition, and 503 is the documented
+            // signal the remote-lean-build wrapper maps to EX_TEMPFAIL
+            // (fall back to a local build).
             return (
-                StatusCode::BAD_GATEWAY,
-                format!("remote node '{}' rejected the build: {err}", node.id),
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("remote node '{}' did not accept the build: {err}", node.id),
             )
-                .into_response()
+                .into_response();
         }
     };
     let outcome = |state: &str, exit_code: Option<i32>, error: Option<String>, terminal: bool| {
