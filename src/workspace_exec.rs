@@ -173,17 +173,22 @@ fn mission_scope_unit(machine_name: &str) -> String {
 /// unit names so mission-end teardown and the zombie reaper can select one
 /// mission's scopes without a process registry.
 pub fn mission_tag_from_path(cwd: &Path) -> Option<String> {
+    let mut below_workspaces = false;
     for comp in cwd.components() {
         let Some(name) = comp.as_os_str().to_str() else {
+            below_workspaces = false;
             continue;
         };
-        for (prefix, tag) in [("mission-", 'm'), ("task-", 't')] {
-            if let Some(rest) = name.strip_prefix(prefix) {
-                if rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Some(format!("{tag}{}", rest.to_ascii_lowercase()));
+        if below_workspaces {
+            for (prefix, tag) in [("mission-", 'm'), ("task-", 't')] {
+                if let Some(rest) = name.strip_prefix(prefix) {
+                    if rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Some(format!("{tag}{}", rest.to_ascii_lowercase()));
+                    }
                 }
             }
         }
+        below_workspaces = name == "workspaces";
     }
     None
 }
@@ -476,6 +481,19 @@ mod tests {
         );
         assert_eq!(
             mission_tag_from_path(Path::new("/workspaces/mission-123456789")),
+            None
+        );
+        // User-controlled parent names must not override the actual mission
+        // directory immediately below `workspaces`.
+        assert_eq!(
+            mission_tag_from_path(Path::new(
+                "/srv/mission-deadbeef/containers/workspaces/mission-4EFDA364/repo"
+            ))
+            .as_deref(),
+            Some("m4efda364")
+        );
+        assert_eq!(
+            mission_tag_from_path(Path::new("/srv/mission-deadbeef/repo")),
             None
         );
         assert_eq!(mission_tag_from_path(Path::new("/srv/monorepo")), None);

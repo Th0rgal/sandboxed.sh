@@ -232,6 +232,10 @@ struct RemoteBuildAcceptedResponse {
     node_id: String,
 }
 
+fn should_reprobe_after_placement_failure(status: Option<&RemoteNodeStatus>) -> bool {
+    !matches!(status, Some(RemoteNodeStatus::Online))
+}
+
 /// Resolve the target node: explicit id or capacity-aware auto placement.
 /// All misses map to `503` so the wrapper can fall back to a local build —
 /// except an explicitly named unknown node, which is a caller bug (`400`).
@@ -252,26 +256,28 @@ async fn resolve_node(
         let picked = match first {
             Ok(picked) => picked,
             Err(initial_err) => {
-                // The monitor can be disabled, or the first request can race
-                // its initial tick. Probe only cold nodes, then retry placement
-                // once so on-demand mode remains usable without masking a real
-                // capacity/label rejection from fresh heartbeat data.
-                let cold: Vec<_> = settings
+                // The monitor can be disabled, its initial tick can race this
+                // request, or a node can have recovered since a cached miss.
+                // Re-probe missing and non-online nodes, then retry placement
+                // once without masking capacity/label rejection from nodes
+                // whose latest heartbeat still says they are online.
+                let retry_nodes: Vec<_> = settings
                     .nodes
                     .iter()
                     .filter(|node| {
-                        state
-                            .fleet
-                            .get(&node.id)
-                            .is_none_or(|cached| cached.status == RemoteNodeStatus::Unknown)
+                        let cached = state.fleet.get(&node.id);
+                        should_reprobe_after_placement_failure(
+                            cached.as_ref().map(|cached| &cached.status),
+                        )
                     })
                     .collect();
-                if cold.is_empty() {
+                if retry_nodes.is_empty() {
                     return Err((StatusCode::SERVICE_UNAVAILABLE, initial_err.to_string()));
                 }
                 let client = RemoteNodeClient::default();
                 futures::future::join_all(
-                    cold.into_iter()
+                    retry_nodes
+                        .into_iter()
                         .map(|node| crate::remote_node::probe_node(&state.fleet, &client, node)),
                 )
                 .await;
@@ -648,5 +654,21 @@ mod tests {
             submit_error_status(&RemoteNodeError::Request("offline".to_string())),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn failed_auto_placement_reprobes_every_non_online_cache_state() {
+        assert!(should_reprobe_after_placement_failure(None));
+        for status in [
+            RemoteNodeStatus::Unknown,
+            RemoteNodeStatus::Degraded,
+            RemoteNodeStatus::Offline,
+            RemoteNodeStatus::Disabled,
+        ] {
+            assert!(should_reprobe_after_placement_failure(Some(&status)));
+        }
+        assert!(!should_reprobe_after_placement_failure(Some(
+            &RemoteNodeStatus::Online
+        )));
     }
 }
