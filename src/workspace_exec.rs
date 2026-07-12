@@ -272,7 +272,7 @@ pub fn machine_name_from_exec_unit(unit: &str) -> Option<String> {
         return None;
     }
     if let Some((machine, tag)) = before_rand.rsplit_once('-') {
-        let tagged = tag.len() == 9
+        let tagged = matches!(tag.len(), 9 | 33)
             && matches!(tag.as_bytes().first(), Some(b'm' | b't'))
             && tag[1..].chars().all(|c| c.is_ascii_hexdigit());
         if tagged {
@@ -619,6 +619,10 @@ mod tests {
         assert_eq!(
             mission_short_id_from_exec_unit(&unit).as_deref(),
             Some("deadbeef")
+        );
+        assert_eq!(
+            machine_name_from_exec_unit(&format!("{unit}.scope")).as_deref(),
+            Some("sandboxed-dumbcontracts-634e6d35")
         );
         let legacy = exec_scope_unit(
             "sandboxed-dumbcontracts-634e6d35",
@@ -2010,9 +2014,13 @@ impl WorkspaceExec {
         // --scope keeps the payload as its own foreground child, so PTY
         // semantics and group-kill teardown are preserved.
         let caps = self.mission_resource_caps();
-        let exec_unit = exec_scope_unit(
+        let mission_id = env
+            .get("MISSION_ID")
+            .and_then(|value| uuid::Uuid::parse_str(value).ok());
+        let exec_unit = exec_scope_unit_for_mission(
             &self.machine_name().unwrap_or_else(|| "unknown".to_string()),
             Some(cwd),
+            mission_id,
         );
         if let Some(scope_args) = caps.scope_run_args(&exec_unit) {
             let mut args = scope_args;
