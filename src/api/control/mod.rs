@@ -4001,6 +4001,40 @@ pub struct FleetHealth {
     pub missions: crate::api::mission_store::MissionStatusCounts,
     pub webhook_forwarder_configured: bool,
     pub offload_configured: bool,
+    /// Root-filesystem usage so fleet controllers can preflight capacity
+    /// instead of discovering a full disk through worker failures.
+    pub disk_used: u64,
+    pub disk_total: u64,
+    pub disk_percent: f32,
+    pub disk_level: crate::api::monitoring::DiskHealthLevel,
+}
+
+/// Admission preflight: `Some(reason)` when new missions must be refused
+/// because the root filesystem is critically full. `DISK_ADMISSION_ENABLED=0`
+/// is the escape hatch. Warn level admits but logs.
+fn disk_admission_refusal() -> Option<String> {
+    let enabled = std::env::var("DISK_ADMISSION_ENABLED")
+        .map(|v| v.trim() != "0" && !v.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+    let (used, total, percent) = crate::api::monitoring::current_disk_usage();
+    match crate::api::monitoring::DiskHealthLevel::from_percent(percent) {
+        crate::api::monitoring::DiskHealthLevel::Critical => Some(format!(
+            "mission creation refused: disk critically full ({percent:.1}% used, {} GB free). \
+             Free space or raise DISK_CRITICAL_PCT, then retry.",
+            total.saturating_sub(used) / (1024 * 1024 * 1024)
+        )),
+        crate::api::monitoring::DiskHealthLevel::Warn => {
+            tracing::warn!(
+                disk_percent = percent,
+                "disk usage above warn threshold; admitting mission anyway"
+            );
+            None
+        }
+        crate::api::monitoring::DiskHealthLevel::Ok => None,
+    }
 }
 
 pub async fn fleet_health(
@@ -4031,6 +4065,7 @@ pub async fn fleet_health(
         .map_err(internal_error)?;
 
     let cfg = &state.config;
+    let (disk_used, disk_total, disk_percent) = crate::api::monitoring::current_disk_usage();
     Ok(Json(FleetHealth {
         status: if control_responsive { "ok" } else { "degraded" },
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -4040,6 +4075,10 @@ pub async fn fleet_health(
         missions,
         webhook_forwarder_configured: cfg.paloma_webhook_forward_url.is_some(),
         offload_configured: cfg.spark_arbiter_url.is_some() || cfg.spark_ssh_target.is_some(),
+        disk_used,
+        disk_total,
+        disk_percent,
+        disk_level: crate::api::monitoring::DiskHealthLevel::from_percent(disk_percent),
     }))
 }
 
@@ -11579,6 +11618,15 @@ async fn control_actor_loop(
                         }
                     }
                     ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, scheduling, respond } => {
+                        // Disk preflight: refuse new missions when the root
+                        // filesystem is critically full instead of letting
+                        // workers die mid-flight on ENOSPC. Actor-level so
+                        // the HTTP, Ask and Telegram entrypoints are all
+                        // covered by this single gate.
+                        if let Some(refusal) = disk_admission_refusal() {
+                            let _ = respond.send(Err(refusal));
+                            continue;
+                        }
                         // First persist current mission history
                         persist_mission_history(
                             &mission_store,

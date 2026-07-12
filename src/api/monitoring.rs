@@ -132,6 +132,59 @@ impl MemoryHealthLevel {
     }
 }
 
+/// Severity of host disk pressure, mirroring [`MemoryHealthLevel`].
+/// Warn at >= `DISK_WARN_PCT` (default 90), critical at >=
+/// `DISK_CRITICAL_PCT` (default 95). At critical, mission admission is
+/// refused (see the CreateMission preflight in control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskHealthLevel {
+    Ok,
+    Warn,
+    Critical,
+}
+
+fn disk_pct_threshold(var: &str, default: f32, slot: &'static std::sync::OnceLock<f32>) -> f32 {
+    *slot.get_or_init(|| {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| (1.0..=100.0).contains(v))
+            .unwrap_or(default)
+    })
+}
+
+pub fn disk_warn_pct() -> f32 {
+    static SLOT: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    disk_pct_threshold("DISK_WARN_PCT", 90.0, &SLOT)
+}
+
+pub fn disk_critical_pct() -> f32 {
+    static SLOT: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    disk_pct_threshold("DISK_CRITICAL_PCT", 95.0, &SLOT)
+}
+
+impl DiskHealthLevel {
+    pub fn from_percent(disk_percent: f32) -> Self {
+        if disk_percent >= disk_critical_pct() {
+            DiskHealthLevel::Critical
+        } else if disk_percent >= disk_warn_pct() {
+            DiskHealthLevel::Warn
+        } else {
+            DiskHealthLevel::Ok
+        }
+    }
+}
+
+/// Fresh snapshot of root-filesystem usage as `(used, total, percent)`.
+/// Standalone (its own sysinfo read) so admission checks, fleet health and
+/// the disk watcher can call it without the monitoring collector's state.
+pub fn current_disk_usage() -> (u64, u64, f32) {
+    let disks = Disks::new_with_refreshed_list();
+    let (used, total) = root_disk_usage(&disks);
+    (used, total, pct(used, total))
+}
+
 /// Percentage of `used` over `total` (0 when `total` is 0).
 fn pct(used: u64, total: u64) -> f32 {
     if total > 0 {

@@ -28,6 +28,7 @@ pub mod control_metrics;
 pub mod deferred_proxy;
 pub mod desktop;
 mod desktop_stream;
+pub mod disk_watch;
 pub mod durable_jobs;
 pub mod fido;
 mod fs;

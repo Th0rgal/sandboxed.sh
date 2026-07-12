@@ -565,6 +565,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // it's safe to always spawn.
     super::mission_workspace_gc::spawn(Arc::clone(&state));
 
+    // Disk-usage watcher: logs + Paloma-webhook alerts on Warn/Critical
+    // crossings, recovery notice on the way back down.
+    super::disk_watch::spawn(Arc::clone(&state));
+
     // Start background OAuth token refresher task
     {
         let ai_providers = Arc::clone(&state.ai_providers);
