@@ -184,6 +184,72 @@ fn index_store_file_blocking(
     Ok(out)
 }
 
+/// Resolve one exact mission from persisted stores without requiring its user
+/// session to have booted in this process. Remote-build admission uses this
+/// after restart so a still-running OAuth user's workspace is not rejected.
+pub(crate) async fn persisted_mission_status(
+    state: &AppState,
+    mission_id: uuid::Uuid,
+) -> Result<Option<MissionStatus>, String> {
+    let missions_dir = state
+        .config
+        .working_dir
+        .join(".sandboxed-sh")
+        .join("missions");
+    tokio::task::spawn_blocking(move || {
+        let entries = match std::fs::read_dir(&missions_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(format!("read {}: {err}", missions_dir.display())),
+        };
+        let id = mission_id.to_string();
+        for entry in entries {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let path = entry.path();
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("db") => {
+                    let conn = rusqlite::Connection::open_with_flags(
+                        &path,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .map_err(|err| format!("open {}: {err}", path.display()))?;
+                    let mut stmt = conn
+                        .prepare("SELECT status FROM missions WHERE id = ?1 LIMIT 1")
+                        .map_err(|err| format!("query {}: {err}", path.display()))?;
+                    let mut rows = stmt
+                        .query([id.as_str()])
+                        .map_err(|err| format!("query {}: {err}", path.display()))?;
+                    if let Some(row) = rows.next().map_err(|err| err.to_string())? {
+                        let raw: String = row.get(0).map_err(|err| err.to_string())?;
+                        let status = serde_json::from_value(serde_json::Value::String(raw))
+                            .map_err(|err| err.to_string())?;
+                        return Ok(Some(status));
+                    }
+                }
+                Some("json") => {
+                    let bytes = std::fs::read(&path)
+                        .map_err(|err| format!("read {}: {err}", path.display()))?;
+                    let snapshot: serde_json::Value = serde_json::from_slice(&bytes)
+                        .map_err(|err| format!("parse {}: {err}", path.display()))?;
+                    if let Some(raw) = snapshot
+                        .get("missions")
+                        .and_then(|missions| missions.get(&id))
+                        .and_then(|mission| mission.get("status"))
+                    {
+                        let status =
+                            serde_json::from_value(raw.clone()).map_err(|err| err.to_string())?;
+                        return Ok(Some(status));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
 /// Index every mission across all persisted stores by the first 8 hex
 /// chars of its id — the same prefix embedded in workspace dir names
 /// (`mission-<8hex>`) and exec scope units (`-m<8hex>-`). Shared by the

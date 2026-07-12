@@ -170,10 +170,12 @@ async fn stop_unit(unit: &str, reason: &str) -> bool {
 /// (caps disabled) — the unit list is simply empty.
 pub async fn stop_mission_exec_scopes(mission_id: Uuid, reason: &str) -> usize {
     let short = mission_id.to_string()[..8].to_string();
-    let needle = format!("-m{short}-");
     let mut stopped = 0;
     for unit in list_exec_scope_units().await {
-        if unit.contains(&needle) && stop_unit(&unit, reason).await {
+        if crate::workspace_exec::mission_short_id_from_exec_unit(&unit).as_deref()
+            == Some(short.as_str())
+            && stop_unit(&unit, reason).await
+        {
             stopped += 1;
         }
     }

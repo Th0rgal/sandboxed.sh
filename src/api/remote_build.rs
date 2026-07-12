@@ -154,7 +154,19 @@ async fn mission_accepts_remote_build(state: &AppState, mission_id: Uuid) -> boo
             );
         }
     }
-    false
+    match super::mission_workspace_gc::persisted_mission_status(state, mission_id).await {
+        Ok(Some(status)) => matches!(
+            status,
+            super::control::MissionStatus::Active
+                | super::control::MissionStatus::Pending
+                | super::control::MissionStatus::WaitingBackground
+        ),
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(mission_id = %mission_id, ?err, "remote-build persisted mission lookup failed");
+            false
+        }
+    }
 }
 
 fn default_requirements() -> Vec<String> {

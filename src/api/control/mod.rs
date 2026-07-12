@@ -5640,8 +5640,15 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
         let mut pass = 0u32;
         loop {
             pass += 1;
-            let pending: Vec<_> = crate::remote_node::job_ledger::load(&working_dir)
-                .await
+            let handles = match crate::remote_node::job_ledger::load(&working_dir).await {
+                Ok(handles) => handles,
+                Err(err) => {
+                    tracing::warn!(?err, "remote job ledger unreadable; reconciler will retry");
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+            };
+            let pending: Vec<_> = handles
                 .into_iter()
                 .filter(|h| !settled.contains(&h.job_id))
                 .collect();
@@ -5655,10 +5662,16 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
                 );
             }
             reconcile_pending_handles(&state, &working_dir, pending, &mut settled).await;
-            let unresolved = crate::remote_node::job_ledger::load(&working_dir)
-                .await
-                .into_iter()
-                .any(|h| !settled.contains(&h.job_id));
+            let unresolved = match crate::remote_node::job_ledger::load(&working_dir).await {
+                Ok(handles) => handles.into_iter().any(|h| !settled.contains(&h.job_id)),
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "remote job ledger unreadable after reconciliation; will retry"
+                    );
+                    true
+                }
+            };
             if !unresolved {
                 return;
             }

@@ -42,14 +42,8 @@ async fn load_result(working_dir: &Path) -> anyhow::Result<Vec<JobHandle>> {
     }
 }
 
-pub async fn load(working_dir: &Path) -> Vec<JobHandle> {
-    load_result(working_dir).await.unwrap_or_else(|err| {
-        tracing::warn!(
-            ?err,
-            "remote job ledger unreadable; keeping missions unchanged"
-        );
-        Vec::new()
-    })
+pub async fn load(working_dir: &Path) -> anyhow::Result<Vec<JobHandle>> {
+    load_result(working_dir).await
 }
 
 async fn store(working_dir: &Path, handles: &[JobHandle]) -> anyhow::Result<()> {
@@ -76,7 +70,13 @@ pub async fn record(working_dir: &Path, handle: JobHandle) -> anyhow::Result<()>
 /// Remove a job handle once its mission is finalized.
 pub async fn remove(working_dir: &Path, job_id: Uuid) {
     let _guard = lock().lock().await;
-    let mut handles = load(working_dir).await;
+    let mut handles = match load_result(working_dir).await {
+        Ok(handles) => handles,
+        Err(err) => {
+            tracing::warn!(?err, "remote job ledger removal deferred");
+            return;
+        }
+    };
     let before = handles.len();
     handles.retain(|h| h.job_id != job_id);
     if handles.len() != before {

@@ -587,6 +587,19 @@ pub async fn execute_lean_build(
     let checkout_lock = FileLock::acquire(checkout.with_extension("lock")).await?;
     let checkout = ensure_checkout(work_root, source, log_path, token).await?;
 
+    // The content-addressed checkout is reused, but build outputs are mutable.
+    // Reset it before every invocation so a cancelled/different-target build
+    // cannot leave `.lake` files or artifacts that a later job mistakes for
+    // its own output.
+    run_git_step(
+        &["reset", "--hard", source.commit.as_str()],
+        &checkout,
+        log_path,
+        token,
+    )
+    .await?;
+    run_git_step(&["clean", "-ffdx"], &checkout, log_path, token).await?;
+
     let rel_clean = cwd_rel.as_deref().unwrap_or("").trim_matches('/');
     let build_cwd = if rel_clean.is_empty() {
         checkout.clone()
@@ -670,7 +683,10 @@ async fn sync_lake_cache_back(work_root: &Path, key: &str, lake_dir: &Path) -> a
     tokio::fs::create_dir_all(parent).await?;
     let _cache_lock = FileLock::acquire(slot.with_extension("lock")).await?;
     let tmp = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
-    isolated_copy(lake_dir, &tmp).await?;
+    if let Err(err) = isolated_copy(lake_dir, &tmp).await {
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        return Err(err);
+    }
     let old = parent.join(format!(".old-{}", uuid::Uuid::new_v4()));
     let had_old = tokio::fs::rename(&slot, &old).await.is_ok();
     if let Err(err) = tokio::fs::rename(&tmp, &slot).await {
