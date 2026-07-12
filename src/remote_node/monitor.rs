@@ -232,7 +232,8 @@ impl std::error::Error for PlacementError {}
 /// A node is eligible when it is `Online` with a heartbeat, its labels cover
 /// every requirement, it has at least `min_disk_bytes` disk and
 /// `min_mem_bytes` memory available, and its in-flight load
-/// (`active_jobs + queued_jobs`) is below `2 * capacity_total`. Eligible
+/// (`active_jobs + queued_jobs + active_leases`) is below
+/// `2 * capacity_total`. Eligible
 /// nodes are ranked least-loaded first, breaking ties on the most available
 /// memory.
 pub fn select_node_auto(
@@ -290,12 +291,17 @@ pub fn select_node_auto(
             ));
             continue;
         }
-        let load = heartbeat.active_jobs.saturating_add(heartbeat.queued_jobs);
+        // Sync `/execute` dispatches surface as active_leases (not jobs) —
+        // count them too, or a node saturated by synchronous work looks idle.
+        let load = heartbeat
+            .active_jobs
+            .saturating_add(heartbeat.queued_jobs)
+            .saturating_add(heartbeat.active_leases);
         if load >= heartbeat.capacity_total.saturating_mul(2) {
             reasons.push((
                 node.id.clone(),
                 format!(
-                    "busy ({load} jobs in flight >= 2x capacity {})",
+                    "busy ({load} jobs/leases in flight >= 2x capacity {})",
                     heartbeat.capacity_total
                 ),
             ));

@@ -455,6 +455,12 @@ pub async fn run_opencode_turn(
     if let Some(spark_vars) = workspace.spark_offload_env(mission_id) {
         env.extend(spark_vars);
     }
+    // Remote lean-build dispatch — see Workspace::remote_build_env. Exported
+    // so the in-workspace `remote-lean-build` wrapper can reach the host
+    // /api/remote-build endpoint.
+    if let Some(remote_build_vars) = workspace.remote_build_env(mission_id) {
+        env.extend(remote_build_vars);
+    }
     if let Some(public_url) = public_api_base_url_from_env() {
         env.insert("API_URL".to_string(), public_url);
     } else if let Some(local_url) = workspace_api_base_url(workspace) {
