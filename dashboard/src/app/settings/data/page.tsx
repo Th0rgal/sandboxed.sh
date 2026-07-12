@@ -501,6 +501,18 @@ export default function DataSettingsPage() {
                 )}
               </div>
             </div>
+
+            <p className="mt-3 text-xs text-white/40">
+              Stopped missions (awaiting user / paused) are kept{' '}
+              {serverSettings?.auto_cleanup_stopped_days ?? 30} days; orphan
+              directories with no matching mission are{' '}
+              {(serverSettings?.auto_cleanup_orphans_enabled ??
+                serverSettings?.auto_cleanup_enabled)
+                ? 'collected'
+                : 'kept'}
+              . Tune via <code>auto_cleanup_stopped_days</code> /{' '}
+              <code>auto_cleanup_orphans_enabled</code> in the settings API.
+            </p>
           </div>
 
           {/* Backup & Restore */}

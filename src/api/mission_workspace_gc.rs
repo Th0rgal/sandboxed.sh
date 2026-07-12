@@ -32,6 +32,9 @@ const TICK_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
 /// Default retention when no value is configured in settings.
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
 
+/// Default long-stop retention for AwaitingUser/Paused mission dirs.
+pub const DEFAULT_STOPPED_RETENTION_DAYS: u32 = 30;
+
 /// Page size for `list_missions` pagination — keeps the scan bounded in
 /// memory even when a session has thousands of missions.
 const LIST_PAGE_SIZE: usize = 200;
@@ -51,33 +54,58 @@ async fn run_loop(state: Arc<AppState>) {
     loop {
         interval.tick().await;
         let started = std::time::Instant::now();
-        let (enabled, days) = read_settings(&state).await;
-        if !enabled {
+        let settings = read_settings(&state).await;
+        if !settings.enabled {
             tracing::trace!("mission workspace GC disabled");
             continue;
         }
-        let cutoff = Utc::now() - chrono::Duration::days(days as i64);
-        let report = run_once(&state, cutoff).await;
+        let now = Utc::now();
+        let params = SweepParams {
+            cutoff: now - chrono::Duration::days(settings.days as i64),
+            stopped_cutoff: now - chrono::Duration::days(settings.stopped_days as i64),
+            orphans_enabled: settings.orphans_enabled,
+        };
+        let report = run_once(&state, &params).await;
         tracing::info!(
             removed = report.removed,
+            orphans_removed = report.orphans_removed,
+            stopped_removed = report.stopped_removed,
             errors = report.errors,
             scanned = report.scanned,
             bytes_freed = report.bytes_freed,
             duration_ms = started.elapsed().as_millis() as u64,
-            retention_days = days,
+            retention_days = settings.days,
+            stopped_retention_days = settings.stopped_days,
             "mission workspace GC sweep finished",
         );
     }
 }
 
-async fn read_settings(state: &Arc<AppState>) -> (bool, u32) {
+struct GcSettings {
+    enabled: bool,
+    days: u32,
+    stopped_days: u32,
+    orphans_enabled: bool,
+}
+
+async fn read_settings(state: &Arc<AppState>) -> GcSettings {
     let snapshot = state.settings.get().await;
     let enabled = snapshot.auto_cleanup_enabled.unwrap_or(false);
     let days = snapshot
         .auto_cleanup_days
         .filter(|d| *d >= 1)
         .unwrap_or(DEFAULT_RETENTION_DAYS);
-    (enabled, days)
+    let stopped_days = snapshot
+        .auto_cleanup_stopped_days
+        .filter(|d| *d >= 1)
+        .unwrap_or(DEFAULT_STOPPED_RETENTION_DAYS);
+    let orphans_enabled = snapshot.auto_cleanup_orphans_enabled.unwrap_or(enabled);
+    GcSettings {
+        enabled,
+        days,
+        stopped_days,
+        orphans_enabled,
+    }
 }
 
 /// One mission's GC/reaper-relevant metadata, keyed by 8-hex short id.
@@ -161,12 +189,32 @@ pub(crate) async fn build_mission_index(
 pub struct SweepReport {
     pub scanned: usize,
     pub removed: usize,
+    /// Dirs matching no mission in any store (hard-deleted / legacy DBs).
+    pub orphans_removed: usize,
+    /// AwaitingUser/Paused dirs past the long-stop retention.
+    pub stopped_removed: usize,
     pub errors: usize,
     pub bytes_freed: u64,
 }
 
-/// One full pass: enumerate sessions → missions → eligible → delete.
-pub async fn run_once(state: &Arc<AppState>, cutoff: DateTime<Utc>) -> SweepReport {
+/// Cutoffs and toggles for one sweep.
+pub struct SweepParams {
+    /// Terminal missions older than this are collected.
+    pub cutoff: DateTime<Utc>,
+    /// AwaitingUser/Paused missions older than this are collected.
+    pub stopped_cutoff: DateTime<Utc>,
+    /// Whether unmatched `mission-*` dirs are collected.
+    pub orphans_enabled: bool,
+}
+
+/// One full pass. Phase 1 is DB-driven (mission → its recorded workspace →
+/// dir). Phase 2 is disk-driven (every `mission-*` dir under every known
+/// workspace root, reconciled against the mission index) — it catches what
+/// phase 1 structurally cannot: dirs of hard-deleted missions, dirs under a
+/// different-but-existing workspace than the mission's recorded one, and
+/// long-stopped AwaitingUser/Paused missions.
+pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepReport {
+    let cutoff = params.cutoff;
     let mut report = SweepReport::default();
     let sessions = state.control.all_sessions().await;
     for session in sessions {
@@ -199,7 +247,16 @@ pub async fn run_once(state: &Arc<AppState>, cutoff: DateTime<Utc>) -> SweepRepo
                 let workspace_id = mission.workspace_id;
                 let ws = match state.workspaces.get(workspace_id).await {
                     Some(ws) => ws,
-                    None => continue,
+                    None => {
+                        // The orphan sweep (phase 2) is what actually
+                        // reclaims these; the log is forensics.
+                        tracing::debug!(
+                            mission_id = %mission.id,
+                            workspace_id = %workspace_id,
+                            "mission GC: workspace no longer exists; dir left to orphan sweep",
+                        );
+                        continue;
+                    }
                 };
                 let dir = workspace::mission_workspace_dir_for_root(&ws.path, mission.id);
                 if !dir.exists() {
@@ -235,7 +292,131 @@ pub async fn run_once(state: &Arc<AppState>, cutoff: DateTime<Utc>) -> SweepRepo
             offset += page_len;
         }
     }
+
+    orphan_sweep(state, params, &mut report).await;
+
     report
+}
+
+/// Disk-driven reconciliation pass (phase 2). Every decision is logged with
+/// its reason; deletion requires positive evidence of collectability, and a
+/// live exec scope always wins.
+async fn orphan_sweep(state: &Arc<AppState>, params: &SweepParams, report: &mut SweepReport) {
+    let index = build_mission_index(state).await;
+    // Any dir whose short id is referenced by a live exec scope is kept
+    // unconditionally: a process may hold cwd/fds there.
+    let scope_protected: std::collections::HashSet<String> =
+        super::scope_reaper::list_exec_scope_units()
+            .await
+            .iter()
+            .filter_map(|u| crate::workspace_exec::mission_short_id_from_exec_unit(u))
+            .collect();
+
+    for ws in state.workspaces.list().await {
+        let root = workspace::workspaces_root_for(&ws.path);
+        let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(short) = name.strip_prefix("mission-") else {
+                continue;
+            };
+            if short.len() != 8 || !short.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            let dir = entry.path();
+            if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if scope_protected.contains(short) {
+                tracing::debug!(path = %dir.display(), "mission GC: kept (live exec scope)");
+                continue;
+            }
+            enum Verdict {
+                Keep(&'static str),
+                Delete(&'static str, bool /*orphan*/, bool /*stopped*/),
+            }
+            let verdict = match index.get(short) {
+                Some(e) => match e.status {
+                    MissionStatus::Active
+                    | MissionStatus::Pending
+                    | MissionStatus::WaitingBackground => Verdict::Keep("mission running"),
+                    MissionStatus::AwaitingUser | MissionStatus::Paused => {
+                        if e.updated_at < params.stopped_cutoff {
+                            Verdict::Delete("stopped mission past long-stop retention", false, true)
+                        } else {
+                            Verdict::Keep("awaiting user / paused within retention")
+                        }
+                    }
+                    _ => {
+                        if e.updated_at < params.cutoff {
+                            Verdict::Delete("terminal mission past retention", false, false)
+                        } else {
+                            Verdict::Keep("terminal mission within retention")
+                        }
+                    }
+                },
+                None => {
+                    if !params.orphans_enabled {
+                        Verdict::Keep("orphan collection disabled")
+                    } else {
+                        // No mission anywhere claims this dir. Use the dir
+                        // mtime as the age signal, with the normal retention
+                        // as a grace period for freshly-created dirs whose
+                        // mission row hasn't landed yet.
+                        let old_enough = match tokio::fs::metadata(&dir).await {
+                            Ok(meta) => match meta.modified() {
+                                Ok(mtime) => chrono::DateTime::<Utc>::from(mtime) < params.cutoff,
+                                Err(_) => false,
+                            },
+                            Err(_) => false,
+                        };
+                        if old_enough {
+                            Verdict::Delete("no mission in any store", true, false)
+                        } else {
+                            Verdict::Keep("unmatched but too recent")
+                        }
+                    }
+                }
+            };
+            match verdict {
+                Verdict::Keep(reason) => {
+                    tracing::debug!(path = %dir.display(), reason, "mission GC: kept");
+                }
+                Verdict::Delete(reason, orphan, stopped) => {
+                    let size = directory_size_bytes(&dir).await;
+                    match tokio::fs::remove_dir_all(&dir).await {
+                        Ok(()) => {
+                            report.removed += 1;
+                            if orphan {
+                                report.orphans_removed += 1;
+                            }
+                            if stopped {
+                                report.stopped_removed += 1;
+                            }
+                            report.bytes_freed = report.bytes_freed.saturating_add(size);
+                            tracing::info!(
+                                path = %dir.display(),
+                                workspace = %ws.name,
+                                bytes = size,
+                                reason,
+                                "mission GC: removed workspace directory (orphan sweep)",
+                            );
+                        }
+                        Err(err) => {
+                            report.errors += 1;
+                            tracing::warn!(
+                                path = %dir.display(),
+                                ?err,
+                                "mission GC: failed to remove directory (orphan sweep)",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Strict terminal-status filter — narrower than

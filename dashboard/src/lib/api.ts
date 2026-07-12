@@ -3149,6 +3149,8 @@ export interface SettingsResponse {
   max_concurrent_tasks: number | null;
   auto_cleanup_enabled: boolean | null;
   auto_cleanup_days: number | null;
+  auto_cleanup_stopped_days: number | null;
+  auto_cleanup_orphans_enabled: boolean | null;
   ask_assistant_model: string | null;
   metadata_model: string | null;
 }

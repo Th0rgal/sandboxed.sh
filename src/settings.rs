@@ -59,6 +59,16 @@ pub struct Settings {
     /// older than this becomes eligible for GC. When None, defaults to 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_cleanup_days: Option<u32>,
+    /// Long-stop retention (days) for AwaitingUser/Paused mission workspace
+    /// dirs. These are exempt from the normal window (the user may come
+    /// back) but not forever. When None, defaults to 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_cleanup_stopped_days: Option<u32>,
+    /// Whether the GC also removes `mission-*` dirs that match no mission in
+    /// any store (hard-deleted missions, legacy DBs). When None, follows
+    /// `auto_cleanup_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_cleanup_orphans_enabled: Option<bool>,
     /// Model for the Ask assistant (sidecar co-pilot). When None, falls back to
     /// the `ASK_ASSISTANT_MODEL` env var, then the built-in default
     /// (`gpt-oss-120b`).
@@ -139,6 +149,8 @@ impl SettingsStore {
             max_concurrent_tasks,
             auto_cleanup_enabled: None,
             auto_cleanup_days: None,
+            auto_cleanup_stopped_days: None,
+            auto_cleanup_orphans_enabled: None,
             ask_assistant_model: std::env::var("ASK_ASSISTANT_MODEL").ok(),
             metadata_model: None,
         }

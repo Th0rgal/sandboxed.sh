@@ -101,7 +101,7 @@ fn status_triggers_teardown(status: &MissionStatus) -> bool {
 }
 
 /// List all `sandboxed-exec-*.scope` unit names currently known to systemd.
-async fn list_exec_scope_units() -> Vec<String> {
+pub(crate) async fn list_exec_scope_units() -> Vec<String> {
     let output = Command::new("systemctl")
         .args([
             "list-units",
