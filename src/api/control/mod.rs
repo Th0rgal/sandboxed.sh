@@ -5621,14 +5621,51 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
         // Let control sessions boot before touching their stores.
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         let working_dir = state.config.working_dir.clone();
-        let handles = crate::remote_node::job_ledger::load(&working_dir).await;
-        if handles.is_empty() {
-            return;
+        // Job ids a poll loop was already re-attached for (or that were
+        // finalized), so retry passes never double-attach.
+        let mut settled: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        // Retry until every persisted handle is settled: a handle whose
+        // owning session has not booted yet is picked up on a later pass
+        // (sessions boot lazily on the user's first request). Early passes
+        // are frequent, later ones back off.
+        let mut pass = 0u32;
+        loop {
+            pass += 1;
+            let pending: Vec<_> = crate::remote_node::job_ledger::load(&working_dir)
+                .await
+                .into_iter()
+                .filter(|h| !settled.contains(&h.job_id))
+                .collect();
+            if pending.is_empty() {
+                return;
+            }
+            if pass == 1 {
+                tracing::info!(
+                    count = pending.len(),
+                    "reconciling async remote jobs from previous process"
+                );
+            }
+            reconcile_pending_handles(&state, &working_dir, pending, &mut settled).await;
+            let unresolved = crate::remote_node::job_ledger::load(&working_dir)
+                .await
+                .into_iter()
+                .any(|h| !settled.contains(&h.job_id));
+            if !unresolved {
+                return;
+            }
+            let backoff = if pass < 10 { 60 } else { 600 };
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         }
-        tracing::info!(
-            count = handles.len(),
-            "reconciling async remote jobs from previous process"
-        );
+    });
+}
+
+async fn reconcile_pending_handles(
+    state: &Arc<AppState>,
+    working_dir: &std::path::Path,
+    handles: Vec<crate::remote_node::job_ledger::JobHandle>,
+    settled: &mut std::collections::HashSet<Uuid>,
+) {
+    {
         for handle in handles {
             // Positive-evidence rule: only drop a handle when a live session
             // PROVES the mission no longer needs it (found and not Active).
@@ -5651,12 +5688,13 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
             let Some(session) = owning else {
                 if proven_inactive {
                     // Finalized elsewhere: the handle is no longer needed.
-                    crate::remote_node::job_ledger::remove(&working_dir, handle.job_id).await;
+                    crate::remote_node::job_ledger::remove(working_dir, handle.job_id).await;
+                    settled.insert(handle.job_id);
                 } else {
                     tracing::info!(
                         mission_id = %handle.mission_id,
                         job_id = %handle.job_id,
-                        "remote job handle kept: owning session not booted yet"
+                        "remote job handle kept: owning session not booted yet; will retry"
                     );
                 }
                 continue;
@@ -5674,8 +5712,9 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
                         node = %node.id,
                         "re-attaching poll loop to in-flight remote job"
                     );
+                    settled.insert(handle.job_id);
                     let fleet = Arc::clone(&state.fleet);
-                    let ledger_dir = working_dir.clone();
+                    let ledger_dir = working_dir.to_path_buf();
                     tokio::spawn(async move {
                         poll_remote_job(
                             session,
@@ -5708,11 +5747,12 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
                             "remote_node_lost: node unconfigured after restart".to_string(),
                         ),
                     });
-                    crate::remote_node::job_ledger::remove(&working_dir, handle.job_id).await;
+                    crate::remote_node::job_ledger::remove(working_dir, handle.job_id).await;
+                    settled.insert(handle.job_id);
                 }
             }
         }
-    });
+    }
 }
 
 /// Background poll loop for one async remote job. Emits sparse progress
