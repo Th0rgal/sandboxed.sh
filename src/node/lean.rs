@@ -125,10 +125,18 @@ pub fn validate_lean_build(
     let Some(argv0) = command.first().filter(|argv0| !argv0.trim().is_empty()) else {
         return Err("command must be a non-empty argv".to_string());
     };
-    let basename = argv0.rsplit('/').next().unwrap_or(argv0);
-    if !ALLOWED_COMMANDS.contains(&basename) {
+    // Bare tool names only: a path like `./lake` or `subdir/lake` would make
+    // Command::new execute an attacker-controlled file from the checkout
+    // instead of the PATH-resolved tool, bypassing the allowlist.
+    if argv0.contains('/') || argv0.contains('\\') {
         return Err(format!(
-            "command '{basename}' is not allowed; argv[0] must be one of {}",
+            "argv[0] must be a bare tool name (one of {}), not a path: '{argv0}'",
+            ALLOWED_COMMANDS.join("/")
+        ));
+    }
+    if !ALLOWED_COMMANDS.contains(&argv0.as_str()) {
+        return Err(format!(
+            "command '{argv0}' is not allowed; argv[0] must be one of {}",
             ALLOWED_COMMANDS.join("/")
         ));
     }
@@ -733,13 +741,41 @@ fn gc_once(work_root: &Path) {
         "node cache GC: below free-space threshold, evicting LRU caches"
     );
     for dir in gc_candidates(work_root) {
+        // Take the same `<dir>.lock` the build path holds (checkout builds
+        // and lake-slot syncs) — try-lock so an in-flight build makes the
+        // sweep skip its directories instead of deleting them mid-build.
+        let lock_path = dir.with_extension("lock");
+        let lock_file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!(
+                    "node cache GC: cannot open lock for {}: {err}",
+                    dir.display()
+                );
+                continue;
+            }
+        };
+        if fs2::FileExt::try_lock_exclusive(&lock_file).is_err() {
+            tracing::debug!(
+                "node cache GC: skipped {} (locked by active build)",
+                dir.display()
+            );
+            continue;
+        }
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => tracing::info!("node cache GC: deleted {}", dir.display()),
             Err(err) => {
                 tracing::warn!("node cache GC: failed to delete {}: {err}", dir.display())
             }
         }
-        let _ = std::fs::remove_file(dir.with_extension("lock"));
+        let _ = fs2::FileExt::unlock(&lock_file);
+        drop(lock_file);
+        let _ = std::fs::remove_file(&lock_path);
         match fs2::available_space(work_root) {
             Ok(free) if free >= threshold => return,
             _ => {}

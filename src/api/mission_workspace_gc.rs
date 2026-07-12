@@ -200,10 +200,14 @@ pub(crate) async fn build_mission_index(state: &Arc<AppState>) -> MissionIndex {
             let page = match store.list_missions(LIST_PAGE_SIZE, offset).await {
                 Ok(page) => page,
                 Err(err) => {
+                    // Fail closed: a store we couldn't fully page may hold
+                    // missions whose dirs/scopes must not be treated as
+                    // unknown by the deletion branches.
                     tracing::warn!(
                         ?err,
-                        "mission index: list_missions failed; skipping session"
+                        "mission index: list_missions failed; index marked incomplete"
                     );
+                    complete = false;
                     break;
                 }
             };
