@@ -978,6 +978,13 @@ pub async fn run_codex_turn(
         extra_env.extend(spark_env);
     }
 
+    // Remote lean-build dispatch — see Workspace::remote_build_env. Exported
+    // so the in-workspace `remote-lean-build` wrapper can reach the host
+    // /api/remote-build endpoint.
+    if let Some(remote_build_env) = workspace.remote_build_env(mission_id) {
+        extra_env.extend(remote_build_env);
+    }
+
     let codex_config = crate::backend::codex::client::CodexConfig {
         cli_path,
         model_effort: model_effort.map(|s| s.to_string()),

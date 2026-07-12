@@ -1,0 +1,455 @@
+//! Remote lean-build dispatch endpoint.
+//!
+//! A harness inside a mission workspace calls `POST /api/remote-build` (over
+//! the host veth link, like `POST /api/spark/offload`) to run a declarative
+//! `lean_build` job on a remote runner node. The HOST holds the node bearer
+//! tokens (`SANDBOXED_REMOTE_NODE_<ID>_TOKEN`), so workspaces never carry
+//! them — the wrapper only holds a per-mission HMAC capability token.
+//!
+//! Flow: resolve a node (capacity-aware `place_auto` by default), mint a
+//! `job:submit` lease, submit the `lean_build` job, and either poll it to
+//! completion (`wait: true`, default) or return `{job_id, node_id}`
+//! immediately. Responds `503` when remote nodes are unavailable or no node
+//! qualifies, so the in-workspace `remote-lean-build` wrapper can fall back
+//! to a local build (exit 75).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::routes::AppState;
+use crate::remote_node::{
+    ArtifactEntry, DispatchOutcome, JobPayload, JobSource, LeaseClaims, NodeJobStatus,
+    RemoteNodeClient, RemoteNodeConfig, SubmitJobRequest, SCOPE_JOB_SUBMIT,
+};
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/", post(submit_remote_build))
+        .route("/:job_id", get(get_remote_build))
+}
+
+/// Client-side cap on a waited build: poll every 3s for at most 2 hours.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const WAIT_MAX_POLLS: u32 = 2 * 60 * 60 / 3;
+
+/// Secret used to sign the per-mission remote-build capability token. Same
+/// source as the spark-offload token (`src/api/spark.rs`).
+fn remote_build_secret() -> Option<String> {
+    std::env::var("SANDBOXED_INTERNAL_ACTION_SECRET")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("JWT_SECRET")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+}
+
+/// Domain-separated HMAC over the mission id (pure; unit-tested).
+fn sign_remote_build_token(secret: &str, mission_id: Uuid) -> Option<String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(b"remote-build:");
+    mac.update(mission_id.as_bytes());
+    Some(hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Mint a per-mission, scope-bound capability token for remote builds. The
+/// domain prefix (`remote-build:`) separates it from the spark-offload token
+/// signed with the same secret, so neither can be replayed as the other.
+/// Returns `None` when no signing secret is configured.
+pub fn build_remote_build_token(mission_id: Uuid) -> Option<String> {
+    sign_remote_build_token(&remote_build_secret()?, mission_id)
+}
+
+fn verify_remote_build_token(mission_id: Uuid, token: &str) -> bool {
+    let Some(expected) = build_remote_build_token(mission_id) else {
+        return false;
+    };
+    super::auth::constant_time_eq(&expected, token.trim())
+}
+
+fn default_requirements() -> Vec<String> {
+    vec!["lean".to_string()]
+}
+
+fn default_node_id() -> String {
+    "auto".to_string()
+}
+
+fn default_wait() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteBuildRequest {
+    /// Mission this build belongs to; `token` must be the capability token
+    /// minted for exactly this mission.
+    pub mission_id: Uuid,
+    pub token: String,
+    /// Git clone/fetch URL; the node fetches it itself.
+    pub repo: String,
+    /// Full 40-char lowercase hex commit SHA.
+    pub commit: String,
+    /// Build cwd relative to the checkout root.
+    #[serde(default)]
+    pub cwd_rel: Option<String>,
+    /// Build argv (`["lake", "build"]` etc.); validated on the node.
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Node label requirements for auto placement.
+    #[serde(default = "default_requirements")]
+    pub requirements: Vec<String>,
+    /// Explicit node id, or `"auto"` (default) for capacity-aware placement.
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+    /// Wait for the build to finish (default). `false` returns
+    /// `{job_id, node_id}` immediately; poll `GET /api/remote-build/:job_id`.
+    #[serde(default = "default_wait")]
+    pub wait: bool,
+    /// Artifact patterns (relative to the checkout root) to digest after a
+    /// successful build.
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RemoteBuildWaitResponse {
+    exit_code: Option<i32>,
+    state: String,
+    duration_secs: u64,
+    log_tail: String,
+    node_id: String,
+    job_id: Uuid,
+    artifacts: Vec<ArtifactEntry>,
+}
+
+#[derive(Serialize)]
+struct RemoteBuildAcceptedResponse {
+    job_id: Uuid,
+    node_id: String,
+}
+
+/// Resolve the target node: explicit id or capacity-aware auto placement.
+/// All misses map to `503` so the wrapper can fall back to a local build —
+/// except an explicitly named unknown node, which is a caller bug (`400`).
+fn resolve_node(
+    state: &AppState,
+    node_id: &str,
+    requirements: &[String],
+) -> Result<RemoteNodeConfig, (StatusCode, String)> {
+    let settings = &state.config.remote_nodes;
+    if !settings.enabled || settings.nodes.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "remote build nodes are not configured".to_string(),
+        ));
+    }
+    if node_id.eq_ignore_ascii_case("auto") {
+        let picked = state
+            .fleet
+            .place_auto(settings, requirements)
+            .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+        return settings.node(&picked).cloned().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("placed node '{picked}' vanished from configuration"),
+        ));
+    }
+    settings.node(node_id).cloned().ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("remote node '{node_id}' is not configured"),
+    ))
+}
+
+fn node_shared_token(node: &RemoteNodeConfig) -> Result<String, (StatusCode, String)> {
+    std::env::var(&node.token_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "remote node '{}' has no token in {}",
+                node.id, node.token_env
+            ),
+        ))
+}
+
+async fn submit_remote_build(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RemoteBuildRequest>,
+) -> axum::response::Response {
+    // Auth: per-mission, scope-bound capability token (NOT the dashboard JWT
+    // and NOT a node bearer token) — a leak only authorizes remote builds
+    // for this one mission. Same trust model as the spark offload endpoint.
+    if !verify_remote_build_token(req.mission_id, &req.token) {
+        return (StatusCode::UNAUTHORIZED, "invalid remote build token").into_response();
+    }
+    if req.command.is_empty() {
+        return (StatusCode::BAD_REQUEST, "command argv required").into_response();
+    }
+
+    let node = match resolve_node(&state, &req.node_id, &req.requirements) {
+        Ok(node) => node,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+    let shared_token = match node_shared_token(&node) {
+        Ok(token) => token,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+
+    let job_id = Uuid::new_v4();
+    let claims = LeaseClaims {
+        mission_id: req.mission_id,
+        node_id: node.id.clone(),
+        scope: SCOPE_JOB_SUBMIT.to_string(),
+        expires_at: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp(),
+        job_id: Some(job_id),
+    };
+    let lease_token = match crate::remote_node::create_lease_token(&claims, &shared_token) {
+        Ok(token) => token,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    };
+    let submit = SubmitJobRequest {
+        job_id,
+        mission_id: req.mission_id,
+        lease_token,
+        payload: JobPayload::LeanBuild {
+            source: JobSource {
+                repo: req.repo.clone(),
+                commit: req.commit.clone(),
+            },
+            cwd_rel: req.cwd_rel.clone(),
+            command: req.command.clone(),
+            timeout_secs: req.timeout_secs,
+            cache_key: None,
+            artifacts: req.artifacts.clone(),
+            env: Default::default(),
+        },
+    };
+
+    let client = RemoteNodeClient::default();
+    let started_at = chrono::Utc::now();
+    let accepted = match client.submit_job(&node, &shared_token, &submit).await {
+        Ok(accepted) => accepted,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("remote node '{}' rejected the build: {err}", node.id),
+            )
+                .into_response()
+        }
+    };
+    let outcome = |state: &str, exit_code: Option<i32>, error: Option<String>, terminal: bool| {
+        DispatchOutcome {
+            mission_id: req.mission_id,
+            node_id: node.id.clone(),
+            job_id: Some(job_id),
+            state: state.to_string(),
+            exit_code,
+            error,
+            started_at,
+            finished_at: terminal.then(chrono::Utc::now),
+        }
+    };
+    state
+        .fleet
+        .record_outcome(outcome(&accepted.state, None, None, false));
+    tracing::info!(
+        mission_id = %req.mission_id,
+        node_id = %node.id,
+        job_id = %job_id,
+        wait = req.wait,
+        "remote build dispatched"
+    );
+
+    if !req.wait {
+        return (
+            StatusCode::ACCEPTED,
+            Json(RemoteBuildAcceptedResponse {
+                job_id,
+                node_id: node.id.clone(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Poll to completion (3s interval, capped at 2h client-side; the node
+    // enforces its own SANDBOXED_NODE_MAX_JOB_SECS on the job itself).
+    for _ in 0..WAIT_MAX_POLLS {
+        tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+        let status = match client.get_job(&node, &shared_token, job_id).await {
+            Ok(status) => status,
+            Err(_) => continue, // transient poll failure; the job keeps running
+        };
+        if matches!(
+            status.state.as_str(),
+            "succeeded" | "failed" | "cancelled" | "lost"
+        ) {
+            state.fleet.record_outcome(outcome(
+                &status.state,
+                status.exit_code,
+                status.error.clone(),
+                true,
+            ));
+            let duration_secs = (chrono::Utc::now() - started_at).num_seconds().max(0) as u64;
+            return Json(RemoteBuildWaitResponse {
+                exit_code: status.exit_code,
+                state: status.state,
+                duration_secs,
+                log_tail: status.log_tail.unwrap_or_default(),
+                node_id: node.id.clone(),
+                job_id,
+                artifacts: status.artifacts,
+            })
+            .into_response();
+        }
+    }
+    state.fleet.record_outcome(outcome(
+        "lost",
+        None,
+        Some("client-side wait cap (2h) exceeded".to_string()),
+        true,
+    ));
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        format!("remote build {job_id} on '{}' did not finish within the 2h wait cap; poll GET /api/remote-build/{job_id}?node_id={}", node.id, node.id),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteBuildStatusQuery {
+    pub mission_id: Uuid,
+    pub token: String,
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+}
+
+/// `GET /api/remote-build/:job_id?mission_id=...&token=...&node_id=...` —
+/// job status for a build submitted with `wait: false`. Authenticated with
+/// the same per-mission capability token (query params, since the wrapper's
+/// GET has no body).
+async fn get_remote_build(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<Uuid>,
+    Query(query): Query<RemoteBuildStatusQuery>,
+) -> Result<Json<NodeJobStatus>, (StatusCode, String)> {
+    if !verify_remote_build_token(query.mission_id, &query.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid remote build token".to_string(),
+        ));
+    }
+    if query.node_id.eq_ignore_ascii_case("auto") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "node_id is required to poll a build".to_string(),
+        ));
+    }
+    let settings = &state.config.remote_nodes;
+    let node = settings.node(&query.node_id).cloned().ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("remote node '{}' is not configured", query.node_id),
+    ))?;
+    let shared_token = node_shared_token(&node)?;
+    let status = RemoteNodeClient::default()
+        .get_job(&node, &shared_token, job_id)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    // The capability token is mission-scoped: never leak another mission's
+    // job status through it.
+    if status.mission_id != query.mission_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "job does not belong to this mission".to_string(),
+        ));
+    }
+    Ok(Json(status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_round_trips_and_is_mission_and_domain_scoped() {
+        let mission = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let token = sign_remote_build_token("secret", mission).unwrap();
+        assert_eq!(
+            sign_remote_build_token("secret", mission).unwrap(),
+            token,
+            "token must be deterministic for (secret, mission)"
+        );
+        assert_ne!(sign_remote_build_token("secret", other).unwrap(), token);
+        assert_ne!(
+            sign_remote_build_token("other-secret", mission).unwrap(),
+            token
+        );
+        // Domain separation from the spark-offload token (same secret,
+        // different prefix).
+        // Spark: HMAC("spark-offload:" || mission); ours must differ.
+        {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
+            mac.update(b"spark-offload:");
+            mac.update(mission.as_bytes());
+            let spark_token = hex::encode(mac.finalize().into_bytes());
+            assert_ne!(spark_token, token);
+        }
+    }
+
+    #[test]
+    fn request_deserialization_applies_defaults() {
+        let mission = Uuid::new_v4();
+        let req: RemoteBuildRequest = serde_json::from_value(serde_json::json!({
+            "mission_id": mission,
+            "token": "t",
+            "repo": "https://github.com/example/verity.git",
+            "commit": "a".repeat(40),
+            "command": ["lake", "build"],
+        }))
+        .unwrap();
+        assert_eq!(req.mission_id, mission);
+        assert_eq!(req.node_id, "auto");
+        assert!(req.wait);
+        assert_eq!(req.requirements, vec!["lean".to_string()]);
+        assert_eq!(req.cwd_rel, None);
+        assert_eq!(req.timeout_secs, None);
+        assert!(req.artifacts.is_empty());
+
+        let req: RemoteBuildRequest = serde_json::from_value(serde_json::json!({
+            "mission_id": mission,
+            "token": "t",
+            "repo": "https://x.git",
+            "commit": "b".repeat(40),
+            "command": ["lake", "build", "Verity"],
+            "cwd_rel": "verity",
+            "timeout_secs": 1200,
+            "requirements": ["lean", "bigmem"],
+            "node_id": "babylon",
+            "wait": false,
+            "artifacts": [".lake/build/lib/*"],
+        }))
+        .unwrap();
+        assert_eq!(req.node_id, "babylon");
+        assert!(!req.wait);
+        assert_eq!(req.requirements, vec!["lean", "bigmem"]);
+        assert_eq!(req.cwd_rel.as_deref(), Some("verity"));
+        assert_eq!(req.timeout_secs, Some(1200));
+        assert_eq!(req.artifacts, vec![".lake/build/lib/*"]);
+    }
+}

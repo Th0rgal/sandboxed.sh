@@ -4872,7 +4872,13 @@ pub struct CreateMissionRequest {
     pub prompt: Option<String>,
     /// Remote runner node id. When set, core creates the mission locally and
     /// dispatches `remote_command` to that node behind the remote-node flag.
+    /// The special value `"auto"` picks a node via capacity-aware placement
+    /// (`FleetMonitor::place_auto`) before the mission is persisted.
     pub remote_node_id: Option<String>,
+    /// Label requirements for `remote_node_id: "auto"` placement. Defaults to
+    /// no requirements for raw remote commands (`lean_build` dispatch via
+    /// `POST /api/remote-build` defaults to `["lean"]`).
+    pub remote_requirements: Option<Vec<String>>,
     /// MVP remote execution payload. Full AI mission streaming remains local.
     pub remote_command: Option<String>,
     /// When true (with `remote_node_id` + `remote_command`), dispatch through
@@ -5005,6 +5011,7 @@ pub async fn create_mission(
         next_check_at: None,
         prompt: None,
         remote_node_id: None,
+        remote_requirements: None,
         remote_command: None,
         remote_async: None,
         extra: Default::default(),
@@ -5144,7 +5151,7 @@ pub async fn create_mission(
 
     // Validate the remote-node payload before persisting the mission so a
     // bad request cannot leave an orphaned pending mission behind.
-    let remote_node_id = req
+    let mut remote_node_id = req
         .remote_node_id
         .as_deref()
         .map(str::trim)
@@ -5173,8 +5180,32 @@ pub async fn create_mission(
                 "remote-node MVP does not support future not_before scheduling yet; create the remote mission after the dispatch window opens".to_string(),
             ));
         }
-        crate::remote_node::placement_for_selected_node(&state.config.remote_nodes, Some(node_id))
+        if node_id.eq_ignore_ascii_case("auto") {
+            // Capacity-aware auto placement, resolved BEFORE the mission is
+            // persisted so placement failures surface as a clean API error
+            // instead of an orphaned failed mission.
+            if !state.config.remote_nodes.enabled {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    crate::remote_node::RemoteNodeError::Disabled.to_string(),
+                ));
+            }
+            // Raw remote commands default to no label requirements; the
+            // lean_build path (`POST /api/remote-build`) defaults to ["lean"].
+            let requirements = req.remote_requirements.clone().unwrap_or_default();
+            let resolved = state
+                .fleet
+                .place_auto(&state.config.remote_nodes, &requirements)
+                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+            tracing::info!(node_id = %resolved, "auto placement selected remote node");
+            remote_node_id = Some(resolved);
+        } else {
+            crate::remote_node::placement_for_selected_node(
+                &state.config.remote_nodes,
+                Some(node_id),
+            )
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        }
     }
 
     let control = control_for_user(&state, &user).await;
@@ -7285,6 +7316,7 @@ pub async fn clone_mission(
         next_check_at: source.project.next_check_at.clone(),
         prompt: None,
         remote_node_id: None,
+        remote_requirements: None,
         remote_command: None,
         remote_async: None,
         extra: Default::default(),

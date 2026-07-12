@@ -189,6 +189,149 @@ impl FleetMonitor {
     }
 }
 
+/// Placement thresholds (env-overridable defaults).
+const DEFAULT_MIN_DISK_GB: u64 = 20;
+const DEFAULT_MIN_MEM_GB: u64 = 8;
+
+fn env_gb_bytes(key: &str, default_gb: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(default_gb)
+        .saturating_mul(1 << 30)
+}
+
+/// Why auto placement found no eligible node. FAIL CLOSED: every configured
+/// node is listed with its own exclusion reason so the caller (and the
+/// wrapper's fallback logging) can see exactly what was ruled out and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlacementError {
+    /// `(node_id, reason)` per configured node.
+    pub reasons: Vec<(String, String)>,
+}
+
+impl std::fmt::Display for PlacementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.reasons.is_empty() {
+            return write!(f, "no remote nodes are configured");
+        }
+        let detail = self
+            .reasons
+            .iter()
+            .map(|(node, reason)| format!("{node}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(f, "no eligible remote node ({detail})")
+    }
+}
+
+impl std::error::Error for PlacementError {}
+
+/// Pure capacity-aware auto placement over cached node statuses.
+///
+/// A node is eligible when it is `Online` with a heartbeat, its labels cover
+/// every requirement, it has at least `min_disk_bytes` disk and
+/// `min_mem_bytes` memory available, and its in-flight load
+/// (`active_jobs + queued_jobs`) is below `2 * capacity_total`. Eligible
+/// nodes are ranked least-loaded first, breaking ties on the most available
+/// memory.
+pub fn select_node_auto(
+    nodes: &[RemoteNodeConfig],
+    statuses: &HashMap<String, CachedNodeStatus>,
+    requirements: &[String],
+    min_disk_bytes: u64,
+    min_mem_bytes: u64,
+) -> Result<String, PlacementError> {
+    let mut reasons: Vec<(String, String)> = Vec::new();
+    let mut eligible: Vec<(u32, u64, String)> = Vec::new(); // (load, mem_avail, id)
+    for node in nodes {
+        let cached = statuses.get(&node.id);
+        let status = cached
+            .map(|c| c.status.clone())
+            .unwrap_or(RemoteNodeStatus::Unknown);
+        if status != RemoteNodeStatus::Online {
+            reasons.push((node.id.clone(), format!("not online (status: {status:?})")));
+            continue;
+        }
+        let Some(heartbeat) = cached.and_then(|c| c.last_heartbeat.as_ref()) else {
+            reasons.push((node.id.clone(), "no heartbeat data".to_string()));
+            continue;
+        };
+        // Labels come from the heartbeat, falling back to static config for
+        // nodes that don't report any (mirrors RemoteNodeView).
+        let labels: &[String] = if heartbeat.labels.is_empty() {
+            node.labels.as_deref().unwrap_or(&[])
+        } else {
+            &heartbeat.labels
+        };
+        if let Some(missing) = requirements.iter().find(|req| !labels.contains(req)) {
+            reasons.push((node.id.clone(), format!("missing label '{missing}'")));
+            continue;
+        }
+        if heartbeat.disk_available_bytes < min_disk_bytes {
+            reasons.push((
+                node.id.clone(),
+                format!(
+                    "low disk ({} GiB available, {} GiB required)",
+                    heartbeat.disk_available_bytes / (1 << 30),
+                    min_disk_bytes / (1 << 30)
+                ),
+            ));
+            continue;
+        }
+        if heartbeat.mem_available_bytes < min_mem_bytes {
+            reasons.push((
+                node.id.clone(),
+                format!(
+                    "low memory ({} GiB available, {} GiB required)",
+                    heartbeat.mem_available_bytes / (1 << 30),
+                    min_mem_bytes / (1 << 30)
+                ),
+            ));
+            continue;
+        }
+        let load = heartbeat.active_jobs.saturating_add(heartbeat.queued_jobs);
+        if load >= heartbeat.capacity_total.saturating_mul(2) {
+            reasons.push((
+                node.id.clone(),
+                format!(
+                    "busy ({load} jobs in flight >= 2x capacity {})",
+                    heartbeat.capacity_total
+                ),
+            ));
+            continue;
+        }
+        eligible.push((load, heartbeat.mem_available_bytes, node.id.clone()));
+    }
+    eligible.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    eligible
+        .into_iter()
+        .next()
+        .map(|(_, _, id)| id)
+        .ok_or(PlacementError { reasons })
+}
+
+impl FleetMonitor {
+    /// Capacity-aware auto placement over the configured nodes, using cached
+    /// heartbeats and env thresholds (`REMOTE_NODE_MIN_DISK_GB`, default 20;
+    /// `REMOTE_NODE_MIN_MEM_GB`, default 8). Fails closed with a per-node
+    /// exclusion report when no node qualifies.
+    pub fn place_auto(
+        &self,
+        settings: &RemoteNodeSettings,
+        requirements: &[String],
+    ) -> Result<String, PlacementError> {
+        let statuses = self.statuses.read().unwrap_or_else(|e| e.into_inner());
+        select_node_auto(
+            &settings.nodes,
+            &statuses,
+            requirements,
+            env_gb_bytes("REMOTE_NODE_MIN_DISK_GB", DEFAULT_MIN_DISK_GB),
+            env_gb_bytes("REMOTE_NODE_MIN_MEM_GB", DEFAULT_MIN_MEM_GB),
+        )
+    }
+}
+
 static GLOBAL_FLEET: OnceLock<Arc<FleetMonitor>> = OnceLock::new();
 
 /// Register the process-wide fleet monitor so synchronous status readers
@@ -393,6 +536,176 @@ mod tests {
         let cached = fleet.get("babylon").unwrap();
         assert_eq!(cached.status, RemoteNodeStatus::Online);
         assert_eq!(cached.consecutive_misses, 0);
+    }
+
+    fn node_config(id: &str) -> RemoteNodeConfig {
+        RemoteNodeConfig {
+            id: id.to_string(),
+            base_url: format!("http://{id}:3088"),
+            token_env: "TOKEN".to_string(),
+            labels: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cached_online(
+        id: &str,
+        labels: &[&str],
+        disk_gb: u64,
+        mem_gb: u64,
+        capacity: u32,
+        active: u32,
+        queued: u32,
+    ) -> CachedNodeStatus {
+        let heartbeat: NodeHeartbeat = serde_json::from_value(serde_json::json!({
+            "node_id": id,
+            "online": true,
+            "capacity_total": capacity,
+            "capacity_available": capacity.saturating_sub(active),
+            "active_leases": 0,
+            "version": "test",
+            "protocol_version": 2,
+            "labels": labels,
+            "mem_available_bytes": mem_gb * (1u64 << 30),
+            "disk_available_bytes": disk_gb * (1u64 << 30),
+            "active_jobs": active,
+            "queued_jobs": queued,
+        }))
+        .unwrap();
+        CachedNodeStatus {
+            node_id: id.to_string(),
+            status: RemoteNodeStatus::Online,
+            consecutive_misses: 0,
+            last_heartbeat: Some(heartbeat),
+            last_seen: Some(Utc::now()),
+            last_error: None,
+        }
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn place_auto_filters_by_status_labels_disk_mem_and_load() {
+        let nodes = vec![
+            node_config("offline"),
+            node_config("unlabeled"),
+            node_config("lowdisk"),
+            node_config("lowmem"),
+            node_config("busy"),
+            node_config("good"),
+        ];
+        let mut statuses = HashMap::new();
+        let mut offline = cached_online("offline", &["lean"], 100, 32, 2, 0, 0);
+        offline.status = RemoteNodeStatus::Offline;
+        statuses.insert("offline".to_string(), offline);
+        statuses.insert(
+            "unlabeled".to_string(),
+            cached_online("unlabeled", &["docker"], 100, 32, 2, 0, 0),
+        );
+        statuses.insert(
+            "lowdisk".to_string(),
+            cached_online("lowdisk", &["lean"], 5, 32, 2, 0, 0),
+        );
+        statuses.insert(
+            "lowmem".to_string(),
+            cached_online("lowmem", &["lean"], 100, 2, 2, 0, 0),
+        );
+        // capacity 2 -> load ceiling is 4; 3 active + 1 queued = at ceiling.
+        statuses.insert(
+            "busy".to_string(),
+            cached_online("busy", &["lean"], 100, 32, 2, 3, 1),
+        );
+        statuses.insert(
+            "good".to_string(),
+            cached_online("good", &["lean", "docker"], 100, 32, 2, 1, 0),
+        );
+
+        let requirements = vec!["lean".to_string()];
+        let picked = select_node_auto(&nodes, &statuses, &requirements, 20 * GIB, 8 * GIB).unwrap();
+        assert_eq!(picked, "good");
+
+        // Remove the only good node: fail closed with one reason per node.
+        let nodes_without_good = &nodes[..5];
+        let err = select_node_auto(
+            nodes_without_good,
+            &statuses,
+            &requirements,
+            20 * GIB,
+            8 * GIB,
+        )
+        .unwrap_err();
+        assert_eq!(err.reasons.len(), 5);
+        let reason_for = |id: &str| {
+            err.reasons
+                .iter()
+                .find(|(node, _)| node == id)
+                .map(|(_, reason)| reason.clone())
+                .unwrap()
+        };
+        assert!(reason_for("offline").contains("not online"));
+        assert!(reason_for("unlabeled").contains("missing label 'lean'"));
+        assert!(reason_for("lowdisk").contains("low disk"));
+        assert!(reason_for("lowmem").contains("low memory"));
+        assert!(reason_for("busy").contains("busy"));
+        let message = err.to_string();
+        assert!(message.contains("no eligible remote node"));
+        assert!(message.contains("lowdisk"));
+    }
+
+    #[test]
+    fn place_auto_prefers_least_loaded_then_most_free_memory() {
+        let nodes = vec![node_config("a"), node_config("b"), node_config("c")];
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "a".to_string(),
+            cached_online("a", &["lean"], 100, 64, 4, 2, 1),
+        );
+        statuses.insert(
+            "b".to_string(),
+            cached_online("b", &["lean"], 100, 16, 4, 1, 0),
+        );
+        statuses.insert(
+            "c".to_string(),
+            cached_online("c", &["lean"], 100, 48, 4, 1, 0),
+        );
+        let requirements = vec!["lean".to_string()];
+        // b and c tie on load (1); c wins on more available memory.
+        let picked = select_node_auto(&nodes, &statuses, &requirements, 20 * GIB, 8 * GIB).unwrap();
+        assert_eq!(picked, "c");
+
+        // Never-probed nodes are excluded (status Unknown), not crashed on.
+        let unknown_nodes = vec![node_config("ghost")];
+        let err = select_node_auto(
+            &unknown_nodes,
+            &HashMap::new(),
+            &requirements,
+            20 * GIB,
+            8 * GIB,
+        )
+        .unwrap_err();
+        assert!(err.reasons[0].1.contains("not online"));
+
+        // Config labels back a heartbeat that reports none.
+        let mut labeled_config = node_config("d");
+        labeled_config.labels = Some(vec!["lean".to_string()]);
+        let mut statuses = HashMap::new();
+        statuses.insert("d".to_string(), cached_online("d", &[], 100, 32, 2, 0, 0));
+        let picked = select_node_auto(
+            &[labeled_config],
+            &statuses,
+            &requirements,
+            20 * GIB,
+            8 * GIB,
+        )
+        .unwrap();
+        assert_eq!(picked, "d");
+
+        // No requirements: any healthy node qualifies, even without labels.
+        let mut statuses = HashMap::new();
+        statuses.insert("e".to_string(), cached_online("e", &[], 100, 32, 2, 0, 0));
+        let picked =
+            select_node_auto(&[node_config("e")], &statuses, &[], 20 * GIB, 8 * GIB).unwrap();
+        assert_eq!(picked, "e");
     }
 
     #[test]

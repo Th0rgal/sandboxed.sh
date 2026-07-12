@@ -52,6 +52,7 @@ pub(crate) mod providers;
 pub(crate) mod proxy;
 mod proxy_keys;
 pub(crate) mod proxy_liveness;
+pub(crate) mod remote_build;
 mod routes;
 pub(crate) mod runners;
 pub mod scope_reaper;

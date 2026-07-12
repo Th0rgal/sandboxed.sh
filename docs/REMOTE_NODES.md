@@ -35,6 +35,12 @@ Supported now:
 - declarative `lean_build` jobs: the node fetches a pinned commit itself,
   runs a constrained `lake`/`lean`/`elan` argv with shared elan/lake caches,
   and reports artifact digests (see "Lean build jobs" below)
+- capacity-aware auto placement: `remote_node_id: "auto"` (plus optional
+  `remote_requirements` labels) picks the least-loaded eligible node from the
+  fleet cache and fails closed with a per-node exclusion report
+- `POST /api/remote-build`: an in-workspace, capability-token-authenticated
+  endpoint that dispatches a `lean_build` job (auto-placed by default) and
+  waits for the result — used by the `remote-lean-build` wrapper
 - dispatch failures fail closed: the mission is marked failed and the API
   returns an error
 - future `not_before` scheduling with `remote_node_id` is rejected for now so
@@ -250,6 +256,92 @@ Execution model:
   match is recorded with its sha256 and size.
 - The heartbeat's `cached_toolchains` lists the directory names under
   `<workdir>/caches/elan/toolchains/`.
+
+## Auto Placement
+
+`POST /api/control/missions` accepts `remote_node_id: "auto"` (optionally
+with `remote_requirements: ["lean", ...]`, default none for raw commands),
+and `POST /api/remote-build` defaults to it (requirements default
+`["lean"]`). Placement runs against the fleet monitor's cached heartbeats
+**before** the mission/job is persisted, so failures surface as a clean API
+error.
+
+A node is eligible when all of the following hold:
+
+- cached status is `online`
+- its labels (heartbeat, falling back to static config) cover every
+  requirement
+- `disk_available` ≥ `REMOTE_NODE_MIN_DISK_GB` (default 20)
+- `mem_available` ≥ `REMOTE_NODE_MIN_MEM_GB` (default 8)
+- `active_jobs + queued_jobs < 2 * capacity_total`
+
+Eligible nodes are ranked least-loaded first (ties broken by most available
+memory). When no node qualifies the request **fails closed** with every
+configured node listed alongside its exclusion reason (offline / missing
+label X / low disk / low memory / busy), e.g.
+`no eligible remote node (babylon: low disk (12 GiB available, 20 GiB
+required); nippur: missing label 'lean')`.
+
+## POST /api/remote-build
+
+Dispatches a `lean_build` job from inside a mission workspace. Auth is a
+per-mission HMAC capability token (same signing secret as the spark-offload
+token, domain-separated with a `remote-build:` prefix), injected into
+harness envs as `REMOTE_BUILD_URL` / `REMOTE_BUILD_TOKEN` /
+`REMOTE_BUILD_MISSION_ID` whenever remote nodes (or spark offload) are
+enabled. Node bearer tokens never enter the workspace.
+
+Request body:
+
+```json
+{
+  "mission_id": "<uuid>",
+  "token": "<REMOTE_BUILD_TOKEN>",
+  "repo": "https://github.com/org/repo.git",
+  "commit": "<40-hex sha>",
+  "cwd_rel": "verity",
+  "command": ["lake", "build"],
+  "timeout_secs": 3600,
+  "requirements": ["lean"],
+  "node_id": "auto",
+  "wait": true,
+  "artifacts": [".lake/build/lib/*"]
+}
+```
+
+`requirements` defaults to `["lean"]`, `node_id` to `"auto"`, `wait` to
+`true`. With `wait: true` the call polls the node every 3s (client-side cap
+2h) and returns `{exit_code, state, duration_secs, log_tail, node_id,
+job_id, artifacts}`. With `wait: false` it returns `202 {job_id, node_id}`;
+poll `GET /api/remote-build/:job_id?mission_id=...&token=...&node_id=...`
+for the job status. Placement failures and unconfigured/unavailable fleets
+answer `503` with the reason, so callers can fall back to a local build.
+
+## remote-lean-build wrapper
+
+`scripts/remote-lean-build` is the in-workspace client for the endpoint. Run
+it from anywhere inside a git checkout:
+
+```bash
+remote-lean-build                # lake build at your current repo position
+remote-lean-build lake build Verity
+```
+
+It derives `repo` (`git remote get-url origin`), `commit`
+(`git rev-parse HEAD`) and `cwd_rel` (`git rev-parse --show-prefix`),
+refuses a dirty tree (exit 2 — the node builds a pinned commit, so
+uncommitted changes would be silently ignored), POSTs to
+`$REMOTE_BUILD_URL` with `$REMOTE_BUILD_TOKEN`/`$REMOTE_BUILD_MISSION_ID`,
+prints the remote log tail, and exits with the remote build's exit code. On
+HTTP 503 (placement failure, fleet down, feature off) it prints the reason
+and exits 75 (`EX_TEMPFAIL`) so scripts can fall back to a local build:
+
+```bash
+remote-lean-build || { [ $? -eq 75 ] && lake build; }
+```
+
+Optional: `REMOTE_BUILD_TIMEOUT_SECS` forwards a job timeout (clamped by the
+node's `SANDBOXED_NODE_MAX_JOB_SECS`).
 
 ## Core Configuration
 
