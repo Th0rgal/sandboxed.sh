@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Extension, Path as AxumPath, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 
-use super::routes::AppState;
+use super::{auth::AuthUser, control::control_for_user, routes::AppState};
 use crate::workspace::WorkspaceType;
 use crate::workspace_exec::WorkspaceExec;
 
@@ -50,6 +50,10 @@ pub struct DurableJob {
     pub started_by_mission_id: Option<Uuid>,
     #[serde(default)]
     pub workspace_id: Option<Uuid>,
+    /// Authenticated API user that launched the job. Legacy entries fall back
+    /// to their owning mission for authorization.
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
     pub stdout_log: String,
     pub stderr_log: String,
     pub status_file: String,
@@ -120,6 +124,85 @@ fn err(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Erro
             error: message.into(),
         }),
     )
+}
+
+async fn authorize_start(
+    state: &Arc<AppState>,
+    user: &AuthUser,
+    workspace_id: Option<Uuid>,
+    mission_id: Option<Uuid>,
+) -> Result<(Uuid, Uuid), (StatusCode, Json<ErrorResponse>)> {
+    let workspace_id = require_workspace_scope(workspace_id)
+        .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
+    let mission_id = mission_id.ok_or_else(|| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "started_by_mission_id is required for durable jobs",
+        )
+    })?;
+    let control = control_for_user(state, user).await;
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| err(StatusCode::FORBIDDEN, "mission is not owned by the caller"))?;
+    if mission.workspace_id != workspace_id {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "workspace does not belong to the caller mission",
+        ));
+    }
+    Ok((workspace_id, mission_id))
+}
+
+fn explicit_owner_authorized(job: &DurableJob, user_id: &str) -> Option<bool> {
+    job.owner_user_id.as_deref().map(|owner| owner == user_id)
+}
+
+async fn authorize_job(
+    state: &Arc<AppState>,
+    user: &AuthUser,
+    job: &DurableJob,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if let Some(allowed) = explicit_owner_authorized(job, &user.id) {
+        return if allowed {
+            Ok(())
+        } else {
+            Err(err(
+                StatusCode::FORBIDDEN,
+                "durable job belongs to another user",
+            ))
+        };
+    }
+
+    // Backward compatibility for jobs created before owner_user_id existed.
+    let mission_id = job.started_by_mission_id.ok_or_else(|| {
+        err(
+            StatusCode::FORBIDDEN,
+            "legacy durable job has no caller ownership metadata",
+        )
+    })?;
+    let workspace_id = job.workspace_id.ok_or_else(|| {
+        err(
+            StatusCode::FORBIDDEN,
+            "legacy durable job has no workspace ownership metadata",
+        )
+    })?;
+    let control = control_for_user(state, user).await;
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| err(StatusCode::FORBIDDEN, "durable job belongs to another user"))?;
+    if mission.workspace_id != workspace_id {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "durable job belongs to another user",
+        ));
+    }
+    Ok(())
 }
 
 fn jobs_root(state: &AppState) -> PathBuf {
@@ -433,14 +516,15 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
 
 pub async fn start_job(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
     Json(req): Json<StartDurableJobRequest>,
 ) -> Result<Json<DurableJob>, (StatusCode, Json<ErrorResponse>)> {
     let command = req.command.trim();
     if command.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "command is required"));
     }
-    let workspace_id = require_workspace_scope(req.workspace_id)
-        .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
+    let (workspace_id, started_by_mission_id) =
+        authorize_start(&state, &user, req.workspace_id, req.started_by_mission_id).await?;
 
     let workspace = Some(state.workspaces.get(workspace_id).await.ok_or_else(|| {
         err(
@@ -506,8 +590,9 @@ pub async fn start_job(
         signal: None,
         created_at: now,
         updated_at: now,
-        started_by_mission_id: req.started_by_mission_id,
+        started_by_mission_id: Some(started_by_mission_id),
         workspace_id: req.workspace_id,
+        owner_user_id: Some(user.id.clone()),
         stdout_log: stdout_log.to_string_lossy().to_string(),
         stderr_log: stderr_log.to_string_lossy().to_string(),
         status_file: status_file.to_string_lossy().to_string(),
@@ -616,7 +701,10 @@ pub async fn start_job(
     Ok(Json(job))
 }
 
-pub async fn list_jobs(State(state): State<Arc<AppState>>) -> Json<Vec<DurableJob>> {
+pub async fn list_jobs(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Json<Vec<DurableJob>> {
     let mut jobs = Vec::new();
     let root = jobs_root(&state);
     if let Ok(mut entries) = tokio::fs::read_dir(root).await {
@@ -624,7 +712,9 @@ pub async fn list_jobs(State(state): State<Arc<AppState>>) -> Json<Vec<DurableJo
             let path = entry.path().join("job.json");
             if let Ok(bytes) = tokio::fs::read(path).await {
                 if let Ok(job) = serde_json::from_slice::<DurableJob>(&bytes) {
-                    jobs.push(refresh_job(&state, job).await);
+                    if authorize_job(&state, &user, &job).await.is_ok() {
+                        jobs.push(refresh_job(&state, job).await);
+                    }
                 }
             }
         }
@@ -635,11 +725,13 @@ pub async fn list_jobs(State(state): State<Arc<AppState>>) -> Json<Vec<DurableJo
 
 pub async fn get_job(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<DurableJob>, (StatusCode, Json<ErrorResponse>)> {
     let job = read_job(&state, id)
         .await
         .map_err(|e| err(StatusCode::NOT_FOUND, e))?;
+    authorize_job(&state, &user, &job).await?;
     Ok(Json(refresh_job(&state, job).await))
 }
 
@@ -665,12 +757,14 @@ async fn tail_file(path: &str, max_bytes: usize) -> String {
 
 pub async fn job_logs(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(id): AxumPath<Uuid>,
     axum::extract::Query(query): axum::extract::Query<JobLogsQuery>,
 ) -> Result<Json<JobLogsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let job = read_job(&state, id)
         .await
         .map_err(|e| err(StatusCode::NOT_FOUND, e))?;
+    authorize_job(&state, &user, &job).await?;
 
     let stdout = if query.stream.as_deref() == Some("stderr") {
         String::new()
@@ -692,11 +786,13 @@ pub async fn job_logs(
 
 pub async fn cancel_job(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<DurableJob>, (StatusCode, Json<ErrorResponse>)> {
     let mut job = read_job(&state, id)
         .await
         .map_err(|e| err(StatusCode::NOT_FOUND, e))?;
+    authorize_job(&state, &user, &job).await?;
     job = refresh_job(&state, job).await;
     if job.status == DurableJobStatus::Running {
         job.status = DurableJobStatus::Cancelled;
@@ -743,6 +839,7 @@ mod tests {
             updated_at: now,
             started_by_mission_id: None,
             workspace_id: None,
+            owner_user_id: None,
             stdout_log: "/tmp/stdout.log".to_string(),
             stderr_log: "/tmp/stderr.log".to_string(),
             status_file: "/tmp/exit.json".to_string(),
@@ -763,6 +860,15 @@ mod tests {
         assert!(require_workspace_scope(None)
             .unwrap_err()
             .contains("cannot run on the API host"));
+    }
+
+    #[test]
+    fn explicit_job_owner_is_isolated_between_users() {
+        let mut job = test_job(DurableJobStatus::Running);
+        assert_eq!(explicit_owner_authorized(&job, "alice"), None);
+        job.owner_user_id = Some("alice".to_string());
+        assert_eq!(explicit_owner_authorized(&job, "alice"), Some(true));
+        assert_eq!(explicit_owner_authorized(&job, "bob"), Some(false));
     }
 
     #[test]
