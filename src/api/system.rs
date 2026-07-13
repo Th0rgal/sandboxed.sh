@@ -1213,12 +1213,26 @@ mcp_servers:
         - list_active_missions
         - list_missions
         - get_mission
+        - get_mission_digest
         - get_mission_events
+        - get_mission_health
+        - get_mission_diagnostics
         - start_mission
         - send_message_to_mission
         - ask_mission
+        - update_mission_settings
+        - resume_mission
         - cancel_mission
         - list_workspaces
+        - get_workspace
+        - create_workspace
+        - update_workspace
+        - list_workspace_templates
+        - get_workspace_template
+        - save_workspace_template
+        - delete_workspace_template
+        - rebuild_workspace_from_template
+        - workspace_bash
       prompts: false
       resources: false
 
@@ -4662,7 +4676,7 @@ mod tests {
     };
 
     #[test]
-    fn generated_hermes_config_allows_long_ask_turns() {
+    fn generated_hermes_config_allows_long_ask_turns_and_workspace_management() {
         let yaml = hermes_config_yaml(
             "hermes-test",
             "model",
@@ -4678,6 +4692,22 @@ mod tests {
         assert!(yaml.contains("    timeout: 600\n"));
         assert!(!yaml.contains("    timeout: 120\n"));
         assert!(yaml.contains("        - ask_mission\n"));
+        for tool in [
+            "get_workspace",
+            "create_workspace",
+            "update_workspace",
+            "list_workspace_templates",
+            "get_workspace_template",
+            "save_workspace_template",
+            "delete_workspace_template",
+            "rebuild_workspace_from_template",
+            "workspace_bash",
+        ] {
+            assert!(
+                yaml.contains(&format!("        - {tool}\n")),
+                "generated Hermes config missing {tool}"
+            );
+        }
     }
 
     #[tokio::test]
