@@ -4988,7 +4988,8 @@ pub(crate) fn ensure_opencode_provider_for_model(
     };
 
     // Only inject definitions for providers that need it.
-    // OpenAI, Anthropic, Google are natively supported by OpenCode.
+    // OpenAI, Anthropic, Google are natively supported by OpenCode and their
+    // OAuth plugins are installed by the runner when credentials are present.
     let provider_def: Option<serde_json::Value> = match provider_id {
         "zai" => {
             let base_url = std::env::var("ZAI_BASE_URL")
@@ -5373,6 +5374,24 @@ fn write_json_file(path: &std::path::Path, value: &serde_json::Value) -> std::io
     std::fs::write(path, contents)
 }
 
+fn overlay_opencode_auth(current: &mut Option<serde_json::Value>, overlay: serde_json::Value) {
+    let mut merged = match current.take() {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    if let serde_json::Value::Object(entries) = overlay {
+        // The AI provider store is managed by Sandboxed.sh and refreshed by
+        // the runner before this function is called. It must win over stale
+        // host auth.json and legacy per-provider files.
+        merged.extend(entries);
+    }
+    *current = if merged.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(merged))
+    };
+}
+
 fn selected_opencode_auth_path(
     work_dir: &std::path::Path,
     shared_path: Option<std::path::PathBuf>,
@@ -5450,17 +5469,15 @@ pub(crate) fn sync_opencode_auth_to_workspace(
         }
     }
 
-    if auth_json.is_none() {
-        auth_json = build_opencode_auth_from_ai_providers(app_working_dir);
-        if let Some(ref value) = auth_json {
-            if let Some(dest_path) = auth_path.as_ref() {
-                if let Err(e) = write_json_file(dest_path, value) {
-                    tracing::warn!(
-                        "Failed to write OpenCode auth.json to workspace {}: {}",
-                        dest_path.display(),
-                        e
-                    );
-                }
+    if let Some(managed_auth) = build_opencode_auth_from_ai_providers(app_working_dir) {
+        overlay_opencode_auth(&mut auth_json, managed_auth);
+        if let (Some(value), Some(dest_path)) = (auth_json.as_ref(), auth_path.as_ref()) {
+            if let Err(e) = write_json_file(dest_path, value) {
+                tracing::warn!(
+                    "Failed to write managed OpenCode auth.json to workspace {}: {}",
+                    dest_path.display(),
+                    e
+                );
             }
         }
     }
@@ -8348,21 +8365,22 @@ mod tests {
         is_success_path_provider_payload_error, is_success_path_rate_limited_error,
         is_tool_call_only_output, opencode_goal_terminal_status,
         opencode_idle_timeout_result_message, opencode_output_needs_fallback,
-        opencode_session_exists_in_data_home, opencode_session_token_from_line, parse_cli_semver,
-        parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
-        parse_opencode_stderr_text_part, preferred_model_for_cost, preferred_opencode_bin_dir,
-        prepend_unique_path_entry, record_codex_error_message,
-        replace_filepath_artifact_with_tool_output, running_health, sanitized_opencode_stdout,
-        selected_opencode_auth_path, selected_opencode_provider_auth_dir,
-        set_codex_account_cooldown, should_sync_container_opencode, stall_severity,
-        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
-        summarize_codex_usage_caps, summarize_recent_opencode_stderr,
-        text_buffer_stream_looks_degenerate, thinking_overlaps_visible_answer, tls_error_hint,
-        truncate_garbled_output, use_thinking_only_fallback, utf8_safe_prefix,
-        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
-        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        opencode_session_exists_in_data_home, opencode_session_token_from_line,
+        overlay_opencode_auth, parse_cli_semver, parse_opencode_goal_objective,
+        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
+        preferred_model_for_cost, preferred_opencode_bin_dir, prepend_unique_path_entry,
+        record_codex_error_message, replace_filepath_artifact_with_tool_output, running_health,
+        sanitized_opencode_stdout, selected_opencode_auth_path,
+        selected_opencode_provider_auth_dir, set_codex_account_cooldown,
+        should_sync_container_opencode, stall_severity, strip_ansi_codes,
+        strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
+        summarize_recent_opencode_stderr, text_buffer_stream_looks_degenerate,
+        thinking_overlaps_visible_answer, tls_error_hint, truncate_garbled_output,
+        use_thinking_only_fallback, utf8_safe_prefix, ClaudeIncompleteTurnContext,
+        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
+        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState,
+        CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN, CODEX_RATE_LIMIT_COOLDOWN,
+        STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -8400,6 +8418,25 @@ mod tests {
             selected_opencode_provider_auth_dir(work_dir, Some(shared_providers.clone()), true),
             Some(shared_providers)
         );
+    }
+
+    #[test]
+    fn managed_opencode_auth_overrides_stale_host_credentials() {
+        let mut current = Some(json!({
+            "anthropic": {"type": "oauth", "access": "stale", "expires": 1},
+            "unmanaged": {"type": "api_key", "key": "preserved"}
+        }));
+        overlay_opencode_auth(
+            &mut current,
+            json!({
+                "anthropic": {"type": "oauth", "access": "fresh", "expires": 2}
+            }),
+        );
+
+        let merged = current.expect("merged auth");
+        assert_eq!(merged["anthropic"]["access"], "fresh");
+        assert_eq!(merged["anthropic"]["expires"], 2);
+        assert_eq!(merged["unmanaged"]["key"], "preserved");
     }
 
     #[test]
