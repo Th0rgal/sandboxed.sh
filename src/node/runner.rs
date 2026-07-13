@@ -396,12 +396,22 @@ pub(crate) async fn run_logged_command(
 fn contain_command(cmd: tokio::process::Command) -> (tokio::process::Command, Option<String>) {
     #[cfg(target_os = "linux")]
     {
-        if Path::new("/run/systemd/system").is_dir() {
+        if systemd_scopes_available() {
             let scope = format!("sandboxed-node-job-{}.scope", Uuid::new_v4().simple());
             return (systemd_scope_command(cmd, &scope), Some(scope));
         }
     }
     (cmd, None)
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_scopes_available() -> bool {
+    // The node service is installed as root. Merely seeing systemd's runtime
+    // directory is insufficient in containers and CI runners: an unprivileged
+    // process can see it but cannot create system scopes, which would make the
+    // wrapper fail before the actual job starts.
+    // SAFETY: geteuid() is a side-effect-free syscall with no preconditions.
+    (unsafe { libc::geteuid() == 0 }) && Path::new("/run/systemd/system").is_dir()
 }
 
 #[cfg(target_os = "linux")]
@@ -749,7 +759,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn systemd_scope_kills_setsid_descendants() {
-        if !Path::new("/run/systemd/system").is_dir() {
+        if !systemd_scopes_available() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
