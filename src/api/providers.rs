@@ -63,8 +63,23 @@ const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
     "anthropic/claude-opus-4.8",
     "anthropic/claude-sonnet-4.6",
     "google/gemini-3.1-pro-preview",
+    "openai/gpt-5.6",
+    "openai/gpt-5.6-sol",
     "openai/gpt-5.5",
     "meta-llama/llama-3.3-70b-instruct:free",
+];
+
+/// Text/code model IDs accepted by the native Grok CLI backend for the current
+/// OAuth-based Grok Build path. This is intentionally narrower than xAI's
+/// OpenAI-compatible `/v1/models` catalog: API-routable models such as
+/// `grok-4.5` can still appear as `xai/grok-4.5` for the custom router, but the
+/// `grok` backend must only offer IDs that `grok --model ...` accepts.
+const GROK_CLI_TEXT_MODEL_IDS: &[&str] = &[
+    "grok-build-0.1",
+    "grok-4.3",
+    "grok-4.20-0309-reasoning",
+    "grok-4.20-0309-non-reasoning",
+    "grok-4.20-multi-agent-0309",
 ];
 
 /// Maximum length (in `char`s) of a model description surfaced from a
@@ -228,6 +243,76 @@ pub struct CatalogModelOption {
     pub description: Option<String>,
     /// Whether this provider is currently configured/authenticated for this account.
     pub configured: bool,
+}
+
+pub(crate) async fn catalog_model_options_for_state(
+    state: &AppState,
+    include_unverified: bool,
+    configured_only: bool,
+) -> Vec<CatalogModelOption> {
+    let working_dir = state.config.working_dir.to_string_lossy().to_string();
+    let mut config = load_providers_config(&working_dir);
+
+    let cached = state.model_catalog.read().await;
+    merge_cached_provider_models(&mut config, &cached, include_unverified);
+
+    let mut configured = get_configured_provider_ids(state.config.working_dir.as_path());
+    let store_providers = state.ai_providers.list().await;
+    for provider in &store_providers {
+        if !provider.enabled || !provider.has_credentials() {
+            continue;
+        }
+        let id = if provider.provider_type == ProviderType::Custom {
+            sanitize_custom_provider_id(&provider.name)
+        } else {
+            provider.provider_type.id().to_string()
+        };
+        configured.insert(id);
+    }
+
+    let mut providers = if configured_only {
+        config
+            .providers
+            .into_iter()
+            .filter(|provider| configured.contains(&provider.id))
+            .collect()
+    } else {
+        config.providers
+    };
+    merge_store_provider_models(&mut providers, &store_providers, !configured_only);
+    apply_live_custom_provider_models(
+        &mut providers,
+        &store_providers,
+        &cached,
+        include_unverified,
+    );
+    drop(cached);
+
+    let mut models = Vec::new();
+    for provider in &providers {
+        let is_configured = configured.contains(&provider.id);
+        if configured_only && !is_configured {
+            continue;
+        }
+        for model in &provider.models {
+            models.push(CatalogModelOption {
+                provider_id: provider.id.clone(),
+                provider_name: provider.name.clone(),
+                id: model.id.clone(),
+                value: format!("{}/{}", provider.id, model.id),
+                name: model.name.clone(),
+                description: model.description.clone(),
+                configured: is_configured,
+            });
+        }
+    }
+
+    models.sort_by(|a, b| {
+        a.provider_id
+            .cmp(&b.provider_id)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    models
 }
 
 /// Response for the full model catalog endpoint.
@@ -719,11 +804,45 @@ fn default_providers_config() -> ProvidersConfig {
                     // using Codex with a ChatGPT account"), and everything older
                     // than it is dead too. Newest first.
                     ProviderModel {
+                        id: "gpt-5.6".to_string(),
+                        name: "GPT-5.6".to_string(),
+                        description: Some(
+                            "Alias for GPT-5.6 Sol, OpenAI's flagship reasoning and coding model"
+                                .to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "gpt-5.6-sol".to_string(),
+                        name: "GPT-5.6 Sol".to_string(),
+                        description: Some(
+                            "Flagship GPT-5.6 model for complex reasoning and coding".to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "gpt-5.6-terra".to_string(),
+                        name: "GPT-5.6 Terra".to_string(),
+                        description: Some(
+                            "Preview GPT-5.6 model with lower cost than Sol".to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "gpt-5.6-luna".to_string(),
+                        name: "GPT-5.6 Luna".to_string(),
+                        description: Some(
+                            "Preview GPT-5.6 model optimized for speed and cost".to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "gpt-5.5".to_string(),
                         name: "GPT-5.5".to_string(),
                         description: Some(
                             "Latest frontier coding model in Codex (Spud, 2026-04)".to_string(),
                         ),
+                    },
+                    ProviderModel {
+                        id: "gpt-5.5-pro".to_string(),
+                        name: "GPT-5.5 Pro".to_string(),
+                        description: Some("Highest-capability GPT-5.5 model".to_string()),
                     },
                     ProviderModel {
                         id: "gpt-5.5-codex".to_string(),
@@ -734,6 +853,26 @@ fn default_providers_config() -> ProvidersConfig {
                         id: "gpt-5.4".to_string(),
                         name: "GPT-5.4".to_string(),
                         description: Some("Previous frontier coding model in Codex".to_string()),
+                    },
+                    ProviderModel {
+                        id: "gpt-5.4-pro".to_string(),
+                        name: "GPT-5.4 Pro".to_string(),
+                        description: Some("Highest-capability GPT-5.4 model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "gpt-5.4-mini".to_string(),
+                        name: "GPT-5.4 Mini".to_string(),
+                        description: Some("Smaller, lower-latency GPT-5.4 model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "gpt-5.4-nano".to_string(),
+                        name: "GPT-5.4 Nano".to_string(),
+                        description: Some("Smallest, lowest-cost GPT-5.4 model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "gpt-5.3-codex".to_string(),
+                        name: "GPT-5.3 Codex".to_string(),
+                        description: Some("Codex-specialized model".to_string()),
                     },
                 ],
             },
@@ -766,8 +905,8 @@ fn default_providers_config() -> ProvidersConfig {
                         description: Some("Google Gemini via OpenRouter".to_string()),
                     },
                     ProviderModel {
-                        id: "openai/gpt-5.5".to_string(),
-                        name: "GPT-5.5".to_string(),
+                        id: "openai/gpt-5.6".to_string(),
+                        name: "GPT-5.6".to_string(),
                         description: Some("OpenAI GPT via OpenRouter".to_string()),
                     },
                     ProviderModel {
@@ -833,11 +972,6 @@ fn default_providers_config() -> ProvidersConfig {
                         ),
                     },
                     ProviderModel {
-                        id: "grok-4.5".to_string(),
-                        name: "Grok 4.5".to_string(),
-                        description: Some("Latest flagship Grok model".to_string()),
-                    },
-                    ProviderModel {
                         id: "grok-4.3".to_string(),
                         name: "Grok 4.3".to_string(),
                         description: Some("Previous flagship Grok model".to_string()),
@@ -846,6 +980,16 @@ fn default_providers_config() -> ProvidersConfig {
                         id: "grok-4.20-0309-reasoning".to_string(),
                         name: "Grok 4.20 (Reasoning)".to_string(),
                         description: Some("Grok 4.20 reasoning model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "grok-4.20-0309-non-reasoning".to_string(),
+                        name: "Grok 4.20 (Non-Reasoning)".to_string(),
+                        description: Some("Grok 4.20 non-reasoning model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "grok-4.20-multi-agent-0309".to_string(),
+                        name: "Grok 4.20 Multi-Agent".to_string(),
+                        description: Some("Grok 4.20 multi-agent model".to_string()),
                     },
                 ],
             },
@@ -1249,10 +1393,14 @@ pub fn get_api_key_for_provider(
                     return Some(key.clone());
                 }
             }
-            // OAuth access tokens can also be used as bearer tokens for some APIs
-            if let Some(ref oauth) = provider.oauth {
-                if !oauth.access_token.is_empty() {
-                    return Some(oauth.access_token.clone());
+            // OAuth access tokens can also be used as bearer tokens for some APIs.
+            // Grok Build OAuth is CLI-only here; it is not a replacement for
+            // XAI_API_KEY on xAI's OpenAI-compatible API.
+            if provider_type != ProviderType::Xai {
+                if let Some(ref oauth) = provider.oauth {
+                    if !oauth.access_token.is_empty() {
+                        return Some(oauth.access_token.clone());
+                    }
                 }
             }
         }
@@ -1869,43 +2017,9 @@ pub async fn list_providers(
 pub async fn list_full_model_catalog(
     State(state): State<Arc<AppState>>,
 ) -> Json<FullCatalogResponse> {
-    let working_dir = state.config.working_dir.to_string_lossy().to_string();
-    let mut config = load_providers_config(&working_dir);
-
     // "Everything supported" => always include public-catalog (unverified)
     // models and providers that aren't configured yet.
-    let cached = state.model_catalog.read().await;
-    merge_cached_provider_models(&mut config, &cached, true);
-
-    let configured = get_configured_provider_ids(state.config.working_dir.as_path());
-
-    let mut providers = config.providers;
-    let store_providers = state.ai_providers.list().await;
-    merge_store_provider_models(&mut providers, &store_providers, true);
-    apply_live_custom_provider_models(&mut providers, &store_providers, &cached, true);
-    drop(cached);
-
-    let mut models = Vec::new();
-    for provider in &providers {
-        let is_configured = configured.contains(&provider.id);
-        for model in &provider.models {
-            models.push(CatalogModelOption {
-                provider_id: provider.id.clone(),
-                provider_name: provider.name.clone(),
-                id: model.id.clone(),
-                value: format!("{}/{}", provider.id, model.id),
-                name: model.name.clone(),
-                description: model.description.clone(),
-                configured: is_configured,
-            });
-        }
-    }
-    // Stable order: provider, then model name.
-    models.sort_by(|a, b| {
-        a.provider_id
-            .cmp(&b.provider_id)
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    let models = catalog_model_options_for_state(&state, true, false).await;
 
     Json(FullCatalogResponse {
         count: models.len(),
@@ -1987,14 +2101,28 @@ pub async fn list_backend_model_options(
         };
 
     push_options("claudecode", Some(&["anthropic"]), false, None);
-    // Codex model catalog includes codex-* IDs plus the latest plain
-    // `gpt-5.X` flagship models (currently 5.5 and 5.4). The Codex CLI
+    // Codex model catalog includes codex-* IDs plus current GPT-5 family
+    // API slugs. The Codex CLI
     // passes `--model <slug>` straight through to OpenAI's backend, so
     // a new slug starts working as soon as the backend recognizes it
     // — there is no hard dependency on the CLI's embedded catalog
     // being up-to-date.
-    let codex_filter: &dyn Fn(&str) -> bool =
-        &|id: &str| id.contains("codex") || id == "gpt-5.5" || id == "gpt-5.4";
+    let codex_filter: &dyn Fn(&str) -> bool = &|id: &str| {
+        id.contains("codex")
+            || matches!(
+                id,
+                "gpt-5.5"
+                    | "gpt-5.6"
+                    | "gpt-5.6-sol"
+                    | "gpt-5.6-terra"
+                    | "gpt-5.6-luna"
+                    | "gpt-5.5-pro"
+                    | "gpt-5.4"
+                    | "gpt-5.4-pro"
+                    | "gpt-5.4-mini"
+                    | "gpt-5.4-nano"
+            )
+    };
     push_options("codex", Some(&["openai"]), false, Some(codex_filter));
     push_options("gemini", Some(&["google"]), false, None);
     push_options("opencode", None, true, None);
@@ -2221,28 +2349,27 @@ pub async fn validate_model_override(
         "grok" => {
             let xai = providers.iter().find(|p| p.id == "xai");
             if let Some(provider) = xai {
-                if provider.models.iter().any(|m| m.id == model_override)
-                    || is_custom_grok_model_id(model_override)
-                {
+                let cli_models: Vec<&ProviderModel> = provider
+                    .models
+                    .iter()
+                    .filter(|model| is_grok_backend_model_id(&model.id))
+                    .collect();
+                if cli_models.iter().any(|m| m.id == model_override) {
                     Ok(())
                 } else {
                     Err(format!(
-                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use the 'grok-*' id format (note: 'composer-*' / 'composer-2.5' is a product name, not a valid xAI API id)",
+                        "Model '{}' not found in xAI/Grok CLI catalog. Available models: {}. Run `grok models` on the server to verify account-level availability; 'composer-*' / 'composer-2.5' is a product name, not a valid xAI API id.",
                         model_override,
-                        provider
-                            .models
+                        cli_models
                             .iter()
-                            .map(|m| &m.id)
-                            .cloned()
+                            .map(|m| m.id.as_str())
                             .collect::<Vec<_>>()
                             .join(", ")
                     ))
                 }
-            } else if is_custom_grok_model_id(model_override) {
-                Ok(())
             } else {
                 Err(format!(
-                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.5' or 'grok-build-0.1'), got '{}'",
+                    "xAI provider not configured. Expected a cataloged Grok model ID (e.g., 'grok-build-0.1'), got '{}'",
                     model_override
                 ))
             }
@@ -2254,15 +2381,8 @@ pub async fn validate_model_override(
     }
 }
 
-fn is_custom_grok_model_id(model_id: &str) -> bool {
-    // Only `grok-*` ids are accepted by the xAI API. `composer-*` is a product
-    // name (Cursor / Grok Build "Composer 2.5") that the API rejects with
-    // "Model not found", so we don't treat it as a valid custom Grok id.
-    model_id.starts_with("grok-")
-}
-
 fn is_grok_backend_model_id(model_id: &str) -> bool {
-    is_custom_grok_model_id(model_id)
+    GROK_CLI_TEXT_MODEL_IDS.contains(&model_id)
 }
 
 #[cfg(test)]
@@ -2295,6 +2415,43 @@ mod tests {
             .models
             .iter()
             .any(|model| model.id == "claude-opus-4-7"));
+    }
+
+    #[test]
+    fn default_openai_catalog_includes_current_gpt_family() {
+        let defaults = default_providers_config();
+        let openai = defaults
+            .providers
+            .iter()
+            .find(|provider| provider.id == "openai")
+            .expect("openai provider");
+        let ids = openai
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+
+        for id in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5.4",
+            "gpt-5.4-pro",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+        ] {
+            assert!(ids.contains(&id), "missing OpenAI model {id}");
+        }
+
+        for invalid_id in ["sol", "terra", "luna"] {
+            assert!(
+                !ids.contains(&invalid_id),
+                "bare/non-API slug should not be exposed: {invalid_id}"
+            );
+        }
     }
 
     #[test]
@@ -2335,6 +2492,7 @@ mod tests {
             .map(|i| make(&format!("vendor/model-{i:03}")))
             .collect();
         entries.push(make("anthropic/claude-opus-4.8"));
+        entries.push(make("openai/gpt-5.6"));
         entries.push(make("openai/gpt-5.5"));
 
         let capped = cap_catalog_entries(
@@ -2344,6 +2502,7 @@ mod tests {
         );
         assert_eq!(capped.len(), MAX_CATALOG_MODELS_PER_PROVIDER);
         assert_eq!(capped[0].id, "anthropic/claude-opus-4.8");
+        assert!(capped.iter().any(|entry| entry.id == "openai/gpt-5.6"));
         assert!(capped.iter().any(|entry| entry.id == "openai/gpt-5.5"));
     }
 
@@ -2376,19 +2535,28 @@ mod tests {
         // The CLI-valid coding model id (bare `grok-build` is rejected by
         // current CLIs). `composer-2.5` is intentionally NOT here: it's a
         // product name, not a valid xAI API id, and the API rejects it.
+        // `grok-4.5` is intentionally not seeded unless live account catalog
+        // discovery returns it; Grok CLI 0.2.93 rejects it with "unknown model id"
+        // for the current production OAuth/API token.
         assert!(xai.models.iter().any(|model| model.id == "grok-build-0.1"));
-        assert!(xai.models.iter().any(|model| model.id == "grok-4.5"));
+        assert!(!xai.models.iter().any(|model| model.id == "grok-4.5"));
         assert!(!xai.models.iter().any(|model| model.id == "composer-2.5"));
     }
 
     #[test]
-    fn grok_custom_model_prefixes_reject_composer() {
-        assert!(is_custom_grok_model_id("grok-4.5"));
-        assert!(is_custom_grok_model_id("grok-4.3"));
-        assert!(is_custom_grok_model_id("grok-build-0.1"));
-        // `composer-*` is a product name the xAI API rejects ("Model not found").
-        assert!(!is_custom_grok_model_id("composer-2.5"));
-        assert!(!is_custom_grok_model_id("claude-opus-4-7"));
+    fn grok_backend_model_ids_are_cli_text_allowlist() {
+        assert!(is_grok_backend_model_id("grok-build-0.1"));
+        assert!(is_grok_backend_model_id("grok-4.20-0309-reasoning"));
+        assert!(is_grok_backend_model_id("grok-4.20-0309-non-reasoning"));
+        assert!(is_grok_backend_model_id("grok-4.20-multi-agent-0309"));
+        // xAI API/catalog IDs are not automatically valid for the native
+        // Grok CLI backend. Prod Grok CLI 0.2.93 currently rejects this one
+        // with "unknown model id".
+        assert!(!is_grok_backend_model_id("grok-4.5"));
+        assert!(!is_grok_backend_model_id("grok-imagine-image"));
+        // `composer-*` is a product name, not a Grok CLI model id.
+        assert!(!is_grok_backend_model_id("composer-2.5"));
+        assert!(!is_grok_backend_model_id("claude-opus-4-7"));
     }
 
     #[test]
@@ -2407,7 +2575,7 @@ mod tests {
             .collect();
 
         assert!(option_ids.contains(&"grok-build-0.1"));
-        assert!(option_ids.contains(&"grok-4.5"));
+        assert!(!option_ids.contains(&"grok-4.5"));
         assert!(!option_ids.contains(&"composer-2.5"));
     }
 

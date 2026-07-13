@@ -1300,14 +1300,15 @@ impl ModelChainStore {
                     .map(|oauth| oauth.expires_at > now_ms + 60_000)
                     .unwrap_or(false);
                 // Hoist the OAuth access token to `api_key` so the proxy can
-                // forward it as a Bearer credential. This works for providers
-                // whose chat endpoint accepts the OAuth access token directly:
+                // forward it as a Bearer credential. This only works for
+                // providers whose chat endpoint accepts the OAuth access token
+                // directly:
                 //   - Anthropic: `api.anthropic.com/v1/messages` (with the
                 //     `oauth-2025-04-20` beta header), and
-                //   - xAI/Grok: `api.x.ai/v1/chat/completions` accepts the
-                //     Grok-Build OAuth token as a Bearer (scope `api:access`).
                 //   - Kimi: `api.kimi.com/coding/v1/chat/completions` accepts the
                 //     Kimi Code subscription OAuth access token as a Bearer.
+                // xAI/Grok Build OAuth is for the Grok CLI, not a substitute
+                // for `XAI_API_KEY` at `api.x.ai/v1/chat/completions`.
                 // OpenAI (Codex) JWTs do NOT work at
                 // `api.openai.com/v1/chat/completions`; those accounts keep
                 // `api_key = None, has_oauth = true` and route through the
@@ -1316,7 +1317,6 @@ impl ModelChainStore {
                     if !matches!(
                         provider_type,
                         crate::ai_providers::ProviderType::Anthropic
-                            | crate::ai_providers::ProviderType::Xai
                             | crate::ai_providers::ProviderType::Kimi
                     ) {
                         return None;
@@ -1384,7 +1384,13 @@ impl ModelChainStore {
                 // attaching OAuth-only headers (Bearer + oauth beta) to an
                 // x-api-key request. Google still needs `has_oauth=true` to
                 // trigger its adapter regardless of store-token freshness.
-                let credential_is_oauth_token = account.api_key.is_none() && oauth_is_fresh;
+                let provider_oauth_is_proxy_routable = matches!(
+                    provider_type,
+                    crate::ai_providers::ProviderType::Anthropic
+                        | crate::ai_providers::ProviderType::Kimi
+                );
+                let credential_is_oauth_token =
+                    account.api_key.is_none() && oauth_is_fresh && provider_oauth_is_proxy_routable;
                 let entry_has_oauth = credential_is_oauth_token || google_oauth_routable;
                 let entry_has_api_key = routed_api_key.is_some();
                 resolved.push(ResolvedEntry {
@@ -1664,6 +1670,45 @@ mod tests {
             resolved
         );
         assert_eq!(resolved[0].account_id, standard[0].account_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_does_not_treat_xai_oauth_as_proxy_api_key() {
+        let mut xai = AIProvider::new(ProviderType::Xai, "xAI Grok OAuth".to_string());
+        xai.oauth = Some(OAuthCredentials {
+            access_token: "grok-oauth-token".to_string(),
+            refresh_token: "grok-refresh-token".to_string(),
+            expires_at: future_ms(6),
+        });
+        xai.status = ProviderStatus::Connected;
+
+        let store = store_with(vec![xai]).await;
+        let chains = store_with_chain(
+            "grok",
+            vec![ChainEntry {
+                provider_id: "xai".to_string(),
+                model_id: "grok-4.5".to_string(),
+            }],
+        )
+        .await;
+        let tracker = ProviderHealthTracker::new();
+
+        let resolved = chains.resolve_chain("grok", &store, &[], &tracker).await;
+
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0].api_key.is_none(),
+            "Grok Build OAuth must not be forwarded as XAI_API_KEY"
+        );
+        assert!(
+            !resolved[0].has_oauth,
+            "xAI OAuth is CLI-only for this router path"
+        );
+        assert!(!crate::api::proxy::has_routable_proxy_credentials(
+            ProviderType::Xai,
+            resolved[0].api_key.is_some(),
+            resolved[0].has_oauth
+        ));
     }
 
     #[tokio::test]

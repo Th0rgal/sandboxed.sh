@@ -879,13 +879,7 @@ fn normalize_distro_value(value: &str) -> Result<String, (StatusCode, String)> {
 }
 
 fn normalize_init_script(value: Option<String>) -> Option<String> {
-    value.and_then(|script| {
-        if script.trim().is_empty() {
-            None
-        } else {
-            Some(script)
-        }
-    })
+    value.filter(|script| !script.trim().is_empty())
 }
 
 fn sanitize_env_vars(env_vars: HashMap<String, String>) -> HashMap<String, String> {
@@ -955,7 +949,7 @@ pub fn build_nspawn_command(
             let tailscale_requested = crate::nspawn::tailscale_enabled(&workspace.env_vars);
 
             let tailscale_enabled = if use_shared_network {
-                nspawn_args.push("--bind-ro=/etc/resolv.conf".to_string());
+                nspawn_args.extend(crate::workspace_exec::resolv_conf_nspawn_args());
                 false
             } else if tailscale_requested {
                 nspawn_args.push("--network-veth".to_string());
@@ -965,7 +959,7 @@ pub fn build_nspawn_command(
                 }
                 true
             } else {
-                nspawn_args.push("--bind-ro=/etc/resolv.conf".to_string());
+                nspawn_args.extend(crate::workspace_exec::resolv_conf_nspawn_args());
                 false
             };
 

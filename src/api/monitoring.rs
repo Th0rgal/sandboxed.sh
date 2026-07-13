@@ -303,7 +303,7 @@ impl MonitoringState {
         networks.refresh();
 
         // Get initial network totals
-        for (_name, data) in networks.iter() {
+        for data in networks.values() {
             prev_rx_bytes += data.total_received();
             prev_tx_bytes += data.total_transmitted();
         }
@@ -339,7 +339,7 @@ impl MonitoringState {
 
             let mut current_rx_bytes: u64 = 0;
             let mut current_tx_bytes: u64 = 0;
-            for (_name, data) in networks.iter() {
+            for data in networks.values() {
                 current_rx_bytes += data.total_received();
                 current_tx_bytes += data.total_transmitted();
             }

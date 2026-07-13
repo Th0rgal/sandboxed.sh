@@ -1396,7 +1396,7 @@ pub async fn run_codex_turn(
     if lower_final.contains("does not exist or you do not have access")
         || lower_final.contains("model_not_found")
     {
-        final_message.push_str("\n\nTry model `gpt-5.5` or `gpt-5-codex` for Codex missions.");
+        final_message.push_str("\n\nTry model `gpt-5.6-sol` or `gpt-5-codex` for Codex missions.");
         if matches!(
             model,
             Some("gpt-5.3-codex" | "gpt-5.4-codex" | "gpt-5.5-codex")

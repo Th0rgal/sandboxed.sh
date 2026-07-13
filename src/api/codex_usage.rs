@@ -257,7 +257,7 @@ pub fn parse_cooldown_reset(body: &[u8], now_unix: i64) -> Option<i64> {
 /// Active probe: ask the Codex backend for this account's limits and parse the
 /// `x-codex-*` headers. `access_token` must be a fresh ChatGPT OAuth token.
 ///
-/// Sends a minimal `gpt-5.5` request — the only model class accepted on a
+/// Sends a minimal `gpt-5.6-sol` request — the current model class accepted on a
 /// ChatGPT account (codex-specific ids 400). When budget remains this consumes
 /// one message; when exhausted the backend 429s (free) but still returns the
 /// headers, which is exactly what we want.
@@ -267,7 +267,7 @@ pub async fn probe(
     account_id: &str,
 ) -> Result<CodexUsageSnapshot, String> {
     let body = serde_json::json!({
-        "model": "gpt-5.5",
+        "model": "gpt-5.6-sol",
         "instructions": "x",
         "input": [{
             "type": "message",

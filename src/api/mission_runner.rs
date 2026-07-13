@@ -1767,17 +1767,15 @@ fn handle_part_update(
         if !delta.is_empty() || full_text.is_none() {
             buffer.push_str(delta);
             buffer.clone()
-        } else if let Some(full) = full_text {
+        } else {
+            let full = full_text?;
             *buffer = full.to_string();
             buffer.clone()
-        } else {
-            return None;
         }
-    } else if let Some(full) = full_text {
+    } else {
+        let full = full_text?;
         *buffer = full.to_string();
         buffer.clone()
-    } else {
-        return None;
     };
 
     let mut content = content;
@@ -5081,17 +5079,14 @@ pub(crate) fn ensure_opencode_provider_for_model(
             Some(o) => o,
             None => return,
         };
-        // Blocks written before the provider adapters were added can already
-        // contain the requested model but lack the adapter factory fields.
-        // OpenCode then treats the provider block itself as a transport and
-        // crashes when it tries to call it ("fn3 is not a function").  Retain
-        // any user-configured values, while backfilling only required fields
-        // from the canonical definition for this provider.
+        // Backfill adapter fields missing from blocks persisted by older
+        // builds — without `npm` the AI-SDK loads a broken transport
+        // ("fn3 is not a function").
         let mut repaired = false;
-        if let Some(definition) = provider_def.as_object() {
+        if let Some(def) = provider_def.as_object() {
             for key in ["npm", "name", "options"] {
                 if !obj.contains_key(key) {
-                    if let Some(value) = definition.get(key) {
+                    if let Some(value) = def.get(key) {
                         obj.insert(key.to_string(), value.clone());
                         repaired = true;
                     }
@@ -5991,6 +5986,26 @@ fn format_exit_status(status: &std::process::ExitStatus) -> String {
     "code <unknown>".to_string()
 }
 
+/// Detect a TLS/CA failure in curl output.
+///
+/// A broken CA bundle (e.g. an inherited host `SSL_CERT_FILE` pointing at a
+/// path that does not exist inside the container) makes curl fail *before* any
+/// HTTP response, with messages like "error setting certificate", "SSL
+/// certificate problem", or "unable to get local issuer certificate". Without
+/// this, the basic-connectivity check reports such failures as a generic
+/// "network check failed", which misleads operators toward a DNS/routing hunt.
+fn tls_error_hint(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    lower.contains("ssl certificate problem")
+        || lower.contains("error setting certificate")
+        || lower.contains("unable to get local issuer certificate")
+        || lower.contains("self-signed certificate")
+        || lower.contains("self signed certificate")
+        || lower.contains("certificate verify failed")
+        || lower.contains("ca file")
+        || lower.contains("cafile")
+}
+
 fn curl_dependency_error(output: &str) -> Option<&'static str> {
     let lower = output.to_lowercase();
     if lower.contains("curl: not found")
@@ -6057,6 +6072,11 @@ async fn check_basic_internet_connectivity(
 
         let err = if let Some(message) = curl_dependency_error(&combined) {
             format!("Workspace dependency check failed: {}", message)
+        } else if tls_error_hint(&combined) {
+            "TLS/certificate error reaching the internet. \
+             A CA bundle env var (e.g. SSL_CERT_FILE) may point at a path that \
+             does not exist in the workspace, or a proxy is intercepting HTTPS."
+                .to_string()
         } else if combined.contains("Network is unreachable") {
             "No internet connectivity: Network is unreachable. \
              The workspace has no network access."
@@ -8160,7 +8180,7 @@ mod tests {
         replace_filepath_artifact_with_tool_output, running_health, sanitized_opencode_stdout,
         set_codex_account_cooldown, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
         strip_think_tags, summarize_codex_usage_caps, summarize_recent_opencode_stderr,
-        text_buffer_stream_looks_degenerate, thinking_overlaps_visible_answer,
+        text_buffer_stream_looks_degenerate, thinking_overlaps_visible_answer, tls_error_hint,
         truncate_garbled_output, use_thinking_only_fallback, utf8_safe_prefix,
         ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
         ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
@@ -8201,6 +8221,30 @@ mod tests {
     fn curl_dependency_error_ignores_network_failures() {
         assert!(curl_dependency_error("curl: (7) Failed to connect to 1.1.1.1").is_none());
         assert!(curl_dependency_error("Network is unreachable").is_none());
+    }
+
+    #[test]
+    fn tls_error_hint_detects_broken_ca_bundle() {
+        // curl (77): what a bogus SSL_CERT_FILE produces.
+        assert!(tls_error_hint(
+            "curl: (77) error setting certificate file: /venv/certifi/cacert.pem"
+        ));
+        assert!(tls_error_hint(
+            "curl: (60) SSL certificate problem: unable to get local issuer certificate"
+        ));
+        assert!(tls_error_hint(
+            "SSL certificate problem: self-signed certificate"
+        ));
+    }
+
+    #[test]
+    fn tls_error_hint_ignores_dns_and_routing_failures() {
+        assert!(!tls_error_hint(
+            "curl: (6) Could not resolve host: api.anthropic.com"
+        ));
+        assert!(!tls_error_hint("Network is unreachable"));
+        assert!(!tls_error_hint("Connection timed out"));
+        assert!(!tls_error_hint("200"));
     }
 
     #[test]
@@ -9407,8 +9451,8 @@ mod tests {
         fs::create_dir_all(&app_dir).expect("app dir");
         fs::create_dir_all(&config_dir).expect("config dir");
 
-        // This represents a one-time migration config: it declares the model
-        // but predates the OpenAI-compatible adapter fields.
+        // Simulate a config persisted by an older build that omitted the
+        // adapter fields (`npm`/`name`), which crashed OpenCode's transport.
         fs::write(
             config_dir.join("opencode.json"),
             serde_json::json!({
@@ -9432,7 +9476,7 @@ mod tests {
         let provider = &opencode_json["provider"]["zai"];
         assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
         assert_eq!(provider["name"], "Z.AI");
-        // A configured endpoint must remain intact; this is a repair, not a remap.
+        // Existing options must not be clobbered.
         assert_eq!(provider["options"]["baseURL"], "https://custom.example/v4");
         assert_eq!(provider["models"]["glm-5.2"]["name"], "glm-5.2");
     }

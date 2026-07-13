@@ -25,6 +25,22 @@ const CONTAINER_KEEPALIVE_ENV_VALUE: &str = "1";
 const ALLOW_TRANSIENT_CONTAINER_NSENTER_ENV: &str =
     "SANDBOXED_SH_ALLOW_TRANSIENT_CONTAINER_NSENTER";
 
+/// TLS CA-bundle env vars that point at a filesystem path. When the host
+/// process that launches a container mission (e.g. the sandboxed.sh daemon
+/// started from a Python venv) has one of these set, the value leaks into the
+/// container via process inheritance on the `nsenter` path — but the path
+/// (e.g. a Hermes venv `certifi/cacert.pem`) does not exist inside the
+/// container rootfs. OpenSSL/curl/Node then fail to load *any* CA store and
+/// every HTTPS request dies, which the provider preflight reports as a
+/// misleading DNS/connectivity failure. See `ca_env_scrub_prelude`.
+const CA_BUNDLE_ENV_VARS: &[&str] = &[
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+];
+
 const CONTAINER_DEFAULT_PATH_DIRS: &[&str] = &[
     "/root/.bun/bin",
     "/root/.cache/.bun/bin",
@@ -57,6 +73,41 @@ fn normalize_container_path(existing: Option<&str>) -> String {
     }
 
     dirs.join(":")
+}
+
+/// POSIX-sh snippet that scrubs inherited-but-broken TLS CA-bundle env vars.
+///
+/// This is prepended to the `/bin/sh -lc` command that `nsenter` runs *inside*
+/// the container namespace, so the `[ -e ]` checks see the container rootfs
+/// (not the host). For each var in [`CA_BUNDLE_ENV_VARS`], it unsets the var
+/// when it is set to a path that does not exist inside the container. Vars that
+/// point at a path present in the container (e.g. a shared
+/// `/etc/ssl/certs/...`) are left untouched, and any workspace-configured value
+/// is re-`export`ed *after* this prelude, so intentional overrides survive.
+///
+/// `SSL_CERT_DIR` may be a colon-separated directory list (OpenSSL 3+), so it
+/// is only unset when *none* of its components exist in the container; the
+/// other vars are single file paths.
+///
+/// The variable names are compile-time constants (never user input), so the
+/// generated `eval`/`unset` is not an injection vector.
+fn ca_env_scrub_prelude() -> String {
+    let names = CA_BUNDLE_ENV_VARS.join(" ");
+    format!(
+        "for __oa_ca in {names}; do \
+         eval \"__oa_ca_val=\\${{$__oa_ca:-}}\"; \
+         [ -n \"$__oa_ca_val\" ] || continue; \
+         if [ \"$__oa_ca\" = SSL_CERT_DIR ]; then \
+         __oa_ca_keep=; __oa_ca_rest=$__oa_ca_val; \
+         while [ -n \"$__oa_ca_rest\" ]; do \
+         __oa_ca_dir=${{__oa_ca_rest%%:*}}; \
+         case $__oa_ca_rest in *:*) __oa_ca_rest=${{__oa_ca_rest#*:}};; *) __oa_ca_rest=;; esac; \
+         if [ -n \"$__oa_ca_dir\" ] && [ -e \"$__oa_ca_dir\" ]; then __oa_ca_keep=1; fi; \
+         done; \
+         if [ -z \"$__oa_ca_keep\" ]; then unset SSL_CERT_DIR; fi; \
+         elif [ ! -e \"$__oa_ca_val\" ]; then unset \"$__oa_ca\"; fi; \
+         done; unset __oa_ca __oa_ca_val __oa_ca_keep __oa_ca_rest __oa_ca_dir; "
+    )
 }
 
 fn environ_has_keepalive_marker(environ: &[u8]) -> bool {
@@ -308,12 +359,24 @@ fn resolv_conf_bind_args(path: &Path) -> Vec<String> {
     vec!["--resolv-conf=off".to_string(), bind_arg]
 }
 
+/// Nspawn arguments binding the container `/etc/resolv.conf`, preferring the
+/// synthesized resolver (public DNS before MagicDNS) when the host resolver is
+/// a local stub. Shared with the API preflight path so both avoid binding a
+/// MagicDNS-first resolver into containers.
+pub(crate) fn resolv_conf_nspawn_args() -> Vec<String> {
+    select_container_resolv_conf()
+        .map(|path| resolv_conf_bind_args(&path))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        environ_has_keepalive_marker, normalize_container_path, resolv_conf_bind_args,
-        synthesized_container_resolv_conf,
+        ca_env_scrub_prelude, environ_has_keepalive_marker, normalize_container_path,
+        resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec,
+        CA_BUNDLE_ENV_VARS,
     };
+    use std::collections::HashMap;
     use std::path::Path;
 
     #[test]
@@ -358,6 +421,100 @@ mod tests {
         assert_eq!(dirs[0], "/tmp/wrapper");
         assert_eq!(dirs.iter().filter(|dir| **dir == "/usr/bin").count(), 1);
         assert_eq!(dirs.iter().filter(|dir| **dir == "/tmp/wrapper").count(), 1);
+    }
+
+    #[test]
+    fn ca_scrub_prelude_covers_all_ca_bundle_vars() {
+        let prelude = ca_env_scrub_prelude();
+        for name in CA_BUNDLE_ENV_VARS {
+            assert!(
+                prelude.contains(name),
+                "prelude should reference {name}: {prelude}"
+            );
+        }
+        // Only unsets when the referenced path is absent inside the container.
+        assert!(prelude.contains("[ ! -e "));
+        assert!(prelude.contains("unset "));
+    }
+
+    /// Runs the generated prelude in a real POSIX shell to verify scrub
+    /// semantics, including colon-separated `SSL_CERT_DIR` lists (OpenSSL 3+):
+    /// the var must survive if any component exists in the container.
+    #[test]
+    fn ca_scrub_prelude_shell_semantics() {
+        let run = |env: &[(&str, &str)]| -> String {
+            let script = format!(
+                "{} echo \"${{SSL_CERT_FILE:-UNSET}}|${{SSL_CERT_DIR:-UNSET}}\"",
+                ca_env_scrub_prelude()
+            );
+            let mut cmd = std::process::Command::new("/bin/sh");
+            // The test runner's own environment may carry CA vars (the very
+            // leak this prelude fixes), so start from a clean slate.
+            cmd.env_clear();
+            cmd.arg("-c").arg(&script);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().expect("run /bin/sh");
+            assert!(out.status.success(), "prelude script failed: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Broken single-path var is scrubbed; existing one is kept.
+        assert_eq!(
+            run(&[
+                ("SSL_CERT_FILE", "/nonexistent/cacert.pem"),
+                ("SSL_CERT_DIR", "/etc"),
+            ]),
+            "UNSET|/etc"
+        );
+        // Colon-separated SSL_CERT_DIR survives when any component exists.
+        assert_eq!(
+            run(&[("SSL_CERT_DIR", "/nonexistent-dir:/etc")]),
+            "UNSET|/nonexistent-dir:/etc"
+        );
+        // ...and is scrubbed only when no component exists.
+        assert_eq!(
+            run(&[("SSL_CERT_DIR", "/nonexistent-a:/nonexistent-b")]),
+            "UNSET|UNSET"
+        );
+    }
+
+    #[test]
+    fn shell_command_scrubs_ca_env_before_exporting_workspace_vars() {
+        let mut env = HashMap::new();
+        env.insert(
+            "SSL_CERT_FILE".to_string(),
+            "/root/workspace-ca.pem".to_string(),
+        );
+        let cmd = WorkspaceExec::build_shell_command_with_env(
+            "/w",
+            "/usr/local/bin/claude",
+            &[],
+            Some(&env),
+        );
+
+        let scrub_at = cmd.find("__oa_ca").expect("scrub prelude present");
+        let export_at = cmd
+            .find("export SSL_CERT_FILE=")
+            .expect("workspace SSL_CERT_FILE re-exported after scrub");
+        // Prelude runs first; the intentional workspace override is applied
+        // afterwards so it survives the scrub.
+        assert!(
+            scrub_at < export_at,
+            "scrub must precede workspace exports: {cmd}"
+        );
+        assert!(cmd.contains("exec '/usr/local/bin/claude'"));
+    }
+
+    #[test]
+    fn shell_command_without_env_still_scrubs_ca_vars() {
+        // Even with no workspace env (preflight uses an empty map), the nsenter
+        // shell must still drop inherited-but-broken CA vars.
+        let cmd = WorkspaceExec::build_shell_command_with_env("/w", "curl", &[], None);
+        assert!(cmd.contains("SSL_CERT_FILE"));
+        assert!(cmd.contains("NODE_EXTRA_CA_CERTS"));
+        assert!(cmd.trim_start().starts_with("for __oa_ca in"));
     }
 
     #[test]
@@ -645,6 +802,12 @@ impl WorkspaceExec {
     ) -> String {
         let mut cmd = String::new();
 
+        // Drop inherited-but-broken TLS CA env vars (e.g. a host venv
+        // SSL_CERT_FILE) before exporting workspace vars, so they can't break
+        // HTTPS inside the container. Runs first so workspace-configured CA
+        // vars re-exported below still win.
+        cmd.push_str(&ca_env_scrub_prelude());
+
         // Export env vars inside the shell command so they're available in the container.
         // Keys are validated to POSIX env var names (alphanumeric + underscore) to prevent
         // shell injection via crafted env var keys. Values are single-quote escaped.
@@ -698,6 +861,14 @@ impl WorkspaceExec {
         tailnet_only: bool,
     ) -> String {
         let mut cmd = String::new();
+
+        // Scrub inherited-but-broken TLS CA env vars before anything else so
+        // the Tailscale bootstrap's own HTTPS calls (and the exec'd program)
+        // fall back to the container's default CA store. Only meaningful on the
+        // nsenter path where env is inherited; harmless under nspawn.
+        if export_all_env {
+            cmd.push_str(&ca_env_scrub_prelude());
+        }
 
         // Export env vars so the bootstrap script and program can use them.
         for (k, v) in env {
