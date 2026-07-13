@@ -4987,9 +4987,20 @@ pub(crate) fn ensure_opencode_provider_for_model(
         serde_json::json!({ "name": model_id })
     };
 
-    // Only inject definitions for providers that need it.
-    // OpenAI, Anthropic, Google are natively supported by OpenCode.
+    // Only inject definitions for providers that need it. OpenCode 1.17 no
+    // longer materializes the Anthropic provider from OAuth credentials alone:
+    // the auth entry is present, but `opencode models anthropic` reports
+    // "Provider not found" until a provider definition exists in the workspace
+    // config. Keep the credentials in auth.json and declare the native adapter
+    // here so provider-prefixed model overrides remain valid.
     let provider_def: Option<serde_json::Value> = match provider_id {
+        "anthropic" => Some(serde_json::json!({
+            "npm": "@ai-sdk/anthropic",
+            "name": "Anthropic",
+            "models": {
+                model_id: model_entry.clone()
+            }
+        })),
         "zai" => {
             let base_url = std::env::var("ZAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.z.ai/api/coding/paas/v4".to_string());
@@ -9641,6 +9652,35 @@ mod tests {
         assert_eq!(
             provider["models"]["glm-5.2"]["capabilities"]["interleaved"]["field"],
             "reasoning_content"
+        );
+    }
+
+    #[test]
+    fn ensure_provider_for_model_injects_anthropic_native_adapter() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_dir = temp_dir.path().join("app");
+        let config_dir = temp_dir.path().join("opencode");
+        fs::create_dir_all(&app_dir).expect("app dir");
+        fs::create_dir_all(&config_dir).expect("config dir");
+
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "anthropic/claude-sonnet-4-5",
+            "127.0.0.1",
+            None,
+        );
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        let provider = &opencode_json["provider"]["anthropic"];
+        assert_eq!(provider["npm"], "@ai-sdk/anthropic");
+        assert_eq!(provider["name"], "Anthropic");
+        assert_eq!(
+            provider["models"]["claude-sonnet-4-5"]["name"],
+            "claude-sonnet-4-5"
         );
     }
 
