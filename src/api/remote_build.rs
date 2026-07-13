@@ -329,14 +329,24 @@ fn spawn_remote_build_observer(
     mission_id: Uuid,
     job_id: Uuid,
     started_at: chrono::DateTime<chrono::Utc>,
+    cancel_requested: bool,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(WAIT_POLL_INTERVAL).await;
-            match RemoteNodeClient::default()
-                .get_job(&node, &shared_token, job_id)
-                .await
-            {
+            let client = RemoteNodeClient::default();
+            if cancel_requested {
+                if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        node_id = %node.id,
+                        job_id = %job_id,
+                        ?error,
+                        "remote build cancellation failed; observer will retry"
+                    );
+                }
+            }
+            match client.get_job(&node, &shared_token, job_id).await {
                 Ok(status)
                     if matches!(
                         status.state.as_str(),
@@ -476,7 +486,19 @@ async fn submit_remote_build(
     )
     .await
     {
-        let _ = client.cancel_job(&node, &shared_token, job_id).await;
+        // No durable recovery handle exists, so retain the accepted ids in an
+        // in-process observer and retry cancellation until the node confirms a
+        // terminal state. A single best-effort cancel can fail during the same
+        // outage that prevented ledger persistence and leak node capacity.
+        spawn_remote_build_observer(
+            Arc::clone(&state),
+            node.clone(),
+            shared_token.clone(),
+            req.mission_id,
+            job_id,
+            started_at,
+            true,
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("remote build accepted but recovery handle could not be persisted: {err}"),
@@ -492,6 +514,7 @@ async fn submit_remote_build(
             req.mission_id,
             job_id,
             started_at,
+            false,
         );
         return (
             StatusCode::ACCEPTED,
@@ -548,6 +571,7 @@ async fn submit_remote_build(
         req.mission_id,
         job_id,
         started_at,
+        false,
     );
     (
         StatusCode::GATEWAY_TIMEOUT,

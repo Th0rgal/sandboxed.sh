@@ -5648,9 +5648,18 @@ async fn dispatch_remote_job(
     .await
     {
         // Never expose an Active mission without a durable recovery handle.
-        // Best-effort cancellation prevents an accepted node job from running
-        // after the caller receives the persistence failure.
-        let _ = client.cancel_job(&node, &shared_token, job_id).await;
+        // Retain the only copy of the accepted handle in an in-process
+        // cancellation observer. Ledger failures often coincide with broader
+        // outages, so one ignored cancel attempt is not sufficient.
+        spawn_untracked_remote_job_cancellation(
+            Arc::clone(&state.fleet),
+            client,
+            node,
+            shared_token,
+            mission.id,
+            job_id,
+            chrono::Utc::now(),
+        );
         return Err(format!(
             "remote job accepted but recovery handle could not be persisted: {err}"
         ));
@@ -5744,6 +5753,53 @@ async fn dispatch_remote_job(
     });
 
     Ok(updated)
+}
+
+/// Retry cancellation for an accepted remote job whose durable ledger entry
+/// could not be written. The observer intentionally owns the only remaining
+/// `(node, job)` handle until a terminal response arrives; without it a
+/// transient cancel failure leaks remote capacity until the node timeout.
+fn spawn_untracked_remote_job_cancellation(
+    fleet: Arc<crate::remote_node::FleetMonitor>,
+    client: crate::remote_node::RemoteNodeClient,
+    node: crate::remote_node::RemoteNodeConfig,
+    shared_token: String,
+    mission_id: Uuid,
+    job_id: Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
+) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    node_id = %node.id,
+                    job_id = %job_id,
+                    ?error,
+                    "untracked remote job cancellation failed; retrying"
+                );
+            }
+            if let Ok(status) = client.get_job(&node, &shared_token, job_id).await {
+                if matches!(
+                    status.state.as_str(),
+                    "succeeded" | "failed" | "cancelled" | "lost"
+                ) {
+                    fleet.record_outcome(crate::remote_node::DispatchOutcome {
+                        mission_id,
+                        node_id: node.id.clone(),
+                        job_id: Some(job_id),
+                        state: status.state,
+                        exit_code: status.exit_code,
+                        error: status.error,
+                        started_at,
+                        finished_at: Some(chrono::Utc::now()),
+                    });
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    });
 }
 
 /// Startup reconciliation for async remote jobs that were in flight when the

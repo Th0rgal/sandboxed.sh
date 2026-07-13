@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use super::control::{AgentEvent, MissionStatus};
 use super::mission_store::MissionStore;
-use super::mission_workspace_gc::build_mission_index;
+use super::mission_workspace_gc::{build_mission_index, entry_for_workspace};
 use super::routes::AppState;
 use crate::workspace_exec::{
     machine_name_for_path, machine_name_from_exec_unit, mission_short_id_from_exec_unit,
@@ -302,17 +302,20 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
     let index = &index_full.by_short;
     // Two token sets over this instance's workspaces (machine-name tokens,
     // cf. `WorkspaceExec::mission_scope_match_token`):
-    // - `known_workspace_tokens`: OWNERSHIP filter. systemd units are
+    // - `workspace_ids_by_token`: OWNERSHIP filter and collision-safe lookup.
+    //   systemd units are
     //   host-global; when prod and dev instances share a host, each must
     //   only ever act on scopes of its own workspaces — a unit whose token
     //   we can't attribute to one of our workspaces is not ours to stop.
     // - `live_workspace_tokens`: workspaces with a scope-keeping mission,
     //   for the legacy-naming policy (no mission id in the unit name).
-    let mut known_workspace_tokens: HashSet<String> = HashSet::new();
+    let mut workspace_ids_by_token: std::collections::HashMap<String, Uuid> =
+        std::collections::HashMap::new();
     let mut live_workspace_tokens: HashSet<String> = HashSet::new();
     let workspaces = state.workspaces.list().await;
     let live_workspace_ids: HashSet<Uuid> = index
         .values()
+        .flatten()
         .filter(|e| status_keeps_scopes(&e.status))
         .map(|e| e.workspace_id)
         .collect();
@@ -321,7 +324,7 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
             if live_workspace_ids.contains(&ws.id) {
                 live_workspace_tokens.insert(token.clone());
             }
-            known_workspace_tokens.insert(token);
+            workspace_ids_by_token.insert(token, ws.id);
         }
     }
     let max_age = zombie_max_age();
@@ -329,16 +332,20 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
     for unit in units {
         report.scanned += 1;
         let unit_machine = machine_name_from_exec_unit(&unit);
-        let ours = unit_machine
+        let unit_workspace_id = unit_machine
             .as_ref()
-            .is_some_and(|machine| known_workspace_tokens.contains(machine));
-        if !ours {
+            .and_then(|machine| workspace_ids_by_token.get(machine))
+            .copied();
+        let Some(unit_workspace_id) = unit_workspace_id else {
             tracing::debug!(unit, "reaper: kept (scope not owned by this instance)");
             report.kept += 1;
             continue;
-        }
+        };
         match mission_short_id_from_exec_unit(&unit) {
-            Some(short) => match index.get(&short) {
+            Some(short) => match index
+                .get(&short)
+                .and_then(|entries| entry_for_workspace(entries, unit_workspace_id))
+            {
                 Some(entry) if status_keeps_scopes(&entry.status) => {
                     report.kept += 1;
                 }

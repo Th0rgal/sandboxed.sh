@@ -135,8 +135,26 @@ fn protection_rank(status: &MissionStatus) -> u8 {
 /// read offline (read-only SQLite); if any store can't be read, `complete`
 /// is false and callers must skip their unknown-entry deletion branches.
 pub(crate) struct MissionIndex {
-    pub by_short: std::collections::HashMap<String, MissionIndexEntry>,
+    pub by_short: std::collections::HashMap<String, Vec<MissionIndexEntry>>,
     pub complete: bool,
+}
+
+/// Select the most protective mission that owns the directory/scope's actual
+/// workspace. Short ids are only eight hex characters, so entries from other
+/// workspaces must never influence collection on a collision.
+pub(crate) fn entry_for_workspace(
+    entries: &[MissionIndexEntry],
+    workspace_id: uuid::Uuid,
+) -> Option<&MissionIndexEntry> {
+    entries
+        .iter()
+        .filter(|entry| entry.workspace_id == workspace_id)
+        .max_by_key(|entry| {
+            (
+                protection_rank(&entry.status),
+                entry.updated_at.timestamp_micros(),
+            )
+        })
 }
 
 /// Read one persisted SQLite mission store without booting a session.
@@ -255,7 +273,7 @@ pub(crate) async fn persisted_mission_status(
 /// (`mission-<8hex>`) and exec scope units (`-m<8hex>-`). Shared by the
 /// orphan-dir sweep and the scope reaper.
 pub(crate) async fn build_mission_index(state: &Arc<AppState>) -> MissionIndex {
-    let mut index: std::collections::HashMap<String, MissionIndexEntry> =
+    let mut index: std::collections::HashMap<String, Vec<MissionIndexEntry>> =
         std::collections::HashMap::new();
     let mut complete = true;
     let sessions = state.control.all_sessions().await;
@@ -293,14 +311,7 @@ pub(crate) async fn build_mission_index(state: &Arc<AppState>) -> MissionIndex {
                     updated_at,
                     workspace_id: mission.workspace_id,
                 };
-                match index.get(&short) {
-                    Some(existing)
-                        if (protection_rank(&existing.status), existing.updated_at)
-                            >= (protection_rank(&entry.status), entry.updated_at) => {}
-                    _ => {
-                        index.insert(short, entry);
-                    }
-                }
+                index.entry(short).or_default().push(entry);
             }
             if page_len < LIST_PAGE_SIZE {
                 break;
@@ -357,14 +368,7 @@ pub(crate) async fn build_mission_index(state: &Arc<AppState>) -> MissionIndex {
                 match rows {
                     Ok(rows) => {
                         for (short, entry) in rows {
-                            match index.get(&short) {
-                                Some(existing)
-                                    if (protection_rank(&existing.status), existing.updated_at)
-                                        >= (protection_rank(&entry.status), entry.updated_at) => {}
-                                _ => {
-                                    index.insert(short, entry);
-                                }
-                            }
+                            index.entry(short).or_default().push(entry);
                         }
                     }
                     Err(err) => {
@@ -525,11 +529,16 @@ async fn orphan_sweep(state: &Arc<AppState>, params: &SweepParams, report: &mut 
     let index = &index_full.by_short;
     // Any dir whose short id is referenced by a live exec scope is kept
     // unconditionally: a process may hold cwd/fds there.
-    let scope_protected: std::collections::HashSet<String> =
+    let scope_protected: std::collections::HashSet<(String, String)> =
         super::scope_reaper::list_exec_scope_units()
             .await
             .iter()
-            .filter_map(|u| crate::workspace_exec::mission_short_id_from_exec_unit(u))
+            .filter_map(|unit| {
+                Some((
+                    crate::workspace_exec::machine_name_from_exec_unit(unit)?,
+                    crate::workspace_exec::mission_short_id_from_exec_unit(unit)?,
+                ))
+            })
             .collect();
 
     for ws in state.workspaces.list().await {
@@ -549,7 +558,11 @@ async fn orphan_sweep(state: &Arc<AppState>, params: &SweepParams, report: &mut 
             if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            if scope_protected.contains(short) {
+            let workspace_token = crate::workspace_exec::machine_name_for_path(&ws.path);
+            if workspace_token
+                .as_ref()
+                .is_some_and(|token| scope_protected.contains(&(token.clone(), short.to_string())))
+            {
                 tracing::debug!(path = %dir.display(), "mission GC: kept (live exec scope)");
                 continue;
             }
@@ -557,7 +570,10 @@ async fn orphan_sweep(state: &Arc<AppState>, params: &SweepParams, report: &mut 
                 Keep(&'static str),
                 Delete(&'static str, bool /*orphan*/, bool /*stopped*/),
             }
-            let verdict = match index.get(short) {
+            let indexed_entry = index
+                .get(short)
+                .and_then(|entries| entry_for_workspace(entries, ws.id));
+            let verdict = match indexed_entry {
                 Some(e) => match e.status {
                     MissionStatus::Active
                     | MissionStatus::Pending
@@ -683,4 +699,56 @@ async fn directory_size_bytes(path: &std::path::Path) -> u64 {
     })
     .await
     .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_id_collisions_are_resolved_within_the_actual_workspace() {
+        let workspace_a = uuid::Uuid::new_v4();
+        let workspace_b = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let entries = vec![
+            MissionIndexEntry {
+                status: MissionStatus::Paused,
+                updated_at: now - chrono::Duration::days(40),
+                workspace_id: workspace_a,
+            },
+            MissionIndexEntry {
+                status: MissionStatus::Completed,
+                updated_at: now,
+                workspace_id: workspace_b,
+            },
+        ];
+
+        let selected = entry_for_workspace(&entries, workspace_b).unwrap();
+        assert_eq!(selected.workspace_id, workspace_b);
+        assert_eq!(selected.status, MissionStatus::Completed);
+        assert!(entry_for_workspace(&entries, uuid::Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn same_workspace_collision_keeps_the_most_protective_entry() {
+        let workspace_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let entries = vec![
+            MissionIndexEntry {
+                status: MissionStatus::Completed,
+                updated_at: now,
+                workspace_id,
+            },
+            MissionIndexEntry {
+                status: MissionStatus::Active,
+                updated_at: now - chrono::Duration::days(1),
+                workspace_id,
+            },
+        ];
+
+        assert_eq!(
+            entry_for_workspace(&entries, workspace_id).unwrap().status,
+            MissionStatus::Active
+        );
+    }
 }
