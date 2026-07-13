@@ -332,6 +332,26 @@ fn segment_matches(name: &str, pattern: &str) -> bool {
     rest.len() >= parts[last].len() && rest.ends_with(parts[last])
 }
 
+/// Return metadata only when every component below `root` is present and is
+/// not a symlink. Artifact paths come from an untrusted build, so following a
+/// link at either an intermediate directory or the final file would escape the
+/// checkout confinement promised by this API.
+fn symlink_free_metadata(root: &Path, rel: &Path) -> Option<std::fs::Metadata> {
+    let mut current = root.to_path_buf();
+    let mut metadata = std::fs::symlink_metadata(&current).ok()?;
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
+    for component in rel.components() {
+        current.push(component);
+        metadata = std::fs::symlink_metadata(&current).ok()?;
+        if metadata.file_type().is_symlink() {
+            return None;
+        }
+    }
+    Some(metadata)
+}
+
 /// Resolve artifact patterns to existing files below `root`.
 ///
 /// Deliberately tiny glob: `*` is supported within a single path segment
@@ -350,6 +370,9 @@ pub fn resolve_artifact_paths(root: &Path, patterns: &[String]) -> Result<Vec<St
             let mut next = Vec::new();
             for rel in &current {
                 if segment.contains('*') {
+                    if !symlink_free_metadata(root, rel).is_some_and(|metadata| metadata.is_dir()) {
+                        continue;
+                    }
                     let Ok(entries) = std::fs::read_dir(root.join(rel)) else {
                         continue;
                     };
@@ -368,7 +391,7 @@ pub fn resolve_artifact_paths(root: &Path, patterns: &[String]) -> Result<Vec<St
             current = next;
         }
         for rel in current {
-            if root.join(&rel).is_file() {
+            if symlink_free_metadata(root, &rel).is_some_and(|metadata| metadata.is_file()) {
                 out.insert(rel.to_string_lossy().into_owned());
             }
         }
@@ -388,8 +411,23 @@ pub async fn collect_artifacts(
         rels.into_iter()
             .map(|rel| {
                 let full = root.join(&rel);
-                let mut file =
-                    std::fs::File::open(&full).map_err(|e| format!("open artifact {rel}: {e}"))?;
+                if !symlink_free_metadata(&root, Path::new(&rel))
+                    .is_some_and(|metadata| metadata.is_file())
+                {
+                    return Err(format!(
+                        "artifact path is not a symlink-free regular file: {rel}"
+                    ));
+                }
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW);
+                }
+                let mut file = options
+                    .open(&full)
+                    .map_err(|e| format!("open artifact {rel}: {e}"))?;
                 let mut hasher = Sha256::new();
                 let size_bytes = std::io::copy(&mut file, &mut hasher)
                     .map_err(|e| format!("hash artifact {rel}: {e}"))?;
@@ -1237,6 +1275,40 @@ mod tests {
             artifacts[0].sha256,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_collection_rejects_symlinked_files_and_directories() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.olean"), b"secret").unwrap();
+        symlink(
+            outside.path().join("secret.olean"),
+            dir.path().join("linked.olean"),
+        )
+        .unwrap();
+        symlink(outside.path(), dir.path().join("linked-dir")).unwrap();
+
+        let resolved = resolve_artifact_paths(
+            dir.path(),
+            &["*.olean".to_string(), "linked-dir/*.olean".to_string()],
+        )
+        .unwrap();
+        assert!(resolved.is_empty());
+
+        let artifacts = collect_artifacts(
+            dir.path(),
+            &[
+                "linked.olean".to_string(),
+                "linked-dir/secret.olean".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(artifacts.is_empty());
     }
 
     #[tokio::test]
