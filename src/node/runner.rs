@@ -3,15 +3,16 @@
 //! Jobs are submitted to an mpsc queue and executed under a capacity
 //! semaphore (`SANDBOXED_NODE_CAPACITY`). Each job runs `bash -lc <command>`
 //! in `<workdir>/<mission-id>/` with combined stdout+stderr captured to
-//! `<workdir>/logs/<job-id>.log`. Jobs are killed by process *group* on
-//! cancel or timeout (SIGTERM, then SIGKILL after 10s).
+//! `<workdir>/logs/<job-id>.log`. Every terminal path cleans up the process
+//! *group* (SIGTERM, then SIGKILL after 10s) so daemonized children cannot
+//! escape queue accounting.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -335,7 +336,8 @@ impl RunOutcome {
 /// Spawn `cmd` in its own process group with combined stdout+stderr appended
 /// to `log_path`, honoring cancellation and a hard timeout. The whole process
 /// group is killed (SIGTERM, then SIGKILL after a grace period) on
-/// cancel/timeout. Shared by raw-command jobs and the lean-build steps.
+/// cancel/timeout and after the leader exits normally. Shared by raw-command
+/// jobs and the lean-build steps.
 pub(crate) async fn run_logged_command(
     mut cmd: tokio::process::Command,
     log_path: &Path,
@@ -365,7 +367,13 @@ pub(crate) async fn run_logged_command(
         }
         waited = tokio::time::timeout(Duration::from_secs(limit_secs.max(1)), child.wait()) => {
             match waited {
-                Ok(Ok(status)) => RunOutcome::Exited(status.code()),
+                Ok(Ok(status)) => {
+                    // The process-group leader may exit after daemonizing a
+                    // child. A terminal job must not leave those descendants
+                    // consuming node resources outside queue accounting.
+                    kill_process_group(pid, &mut child).await;
+                    RunOutcome::Exited(status.code())
+                }
                 Ok(Err(err)) => return Err(err.into()),
                 Err(_) => {
                     kill_process_group(pid, &mut child).await;
@@ -384,17 +392,45 @@ async fn kill_process_group(pid: Option<u32>, child: &mut tokio::process::Child)
         unsafe {
             libc::kill(-(pid as i32), libc::SIGTERM);
         }
-        if tokio::time::timeout(KILL_GRACE, child.wait())
-            .await
-            .is_err()
-        {
+        if !wait_for_process_group_exit(pid, child, KILL_GRACE).await {
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGKILL);
             }
-            let _ = child.wait().await;
+            if !wait_for_process_group_exit(pid, child, Duration::from_secs(1)).await {
+                tracing::warn!(
+                    process_group = pid,
+                    "job process group still exists after SIGKILL"
+                );
+            }
         }
+        let _ = child.wait().await;
     } else {
         let _ = child.kill().await;
+    }
+}
+
+fn process_group_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(-(pid as i32), 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+async fn wait_for_process_group_exit(
+    pid: u32,
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Reap the leader promptly; an unreaped zombie keeps the process
+        // group observable even after every live process has exited.
+        let _ = child.try_wait();
+        if !process_group_exists(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -576,6 +612,27 @@ mod tests {
         let record = wait_for_terminal(&store, job_id).await;
         assert_eq!(record.state, JobState::Failed);
         assert!(record.error.as_deref().unwrap_or("").contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn normal_exit_kills_background_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("background-survived");
+        let log = dir.path().join("job.log");
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args(["-c", "(sleep 1; echo survived > \"$SURVIVOR_MARKER\") &"])
+            .env("SURVIVOR_MARKER", &marker);
+
+        let outcome = run_logged_command(cmd, &log, 30, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(outcome.success());
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+        assert!(
+            !marker.exists(),
+            "background descendant survived the terminal job"
+        );
     }
 
     async fn wait_for_terminal(store: &JobStore, job_id: Uuid) -> super::super::JobRecord {
