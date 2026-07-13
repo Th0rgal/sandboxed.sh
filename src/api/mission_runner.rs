@@ -7127,8 +7127,8 @@ fn copy_host_executable_into_container(
 
 fn parse_cli_semver(output: &str) -> Option<(u64, u64, u64)> {
     output.split_whitespace().find_map(|word| {
-        let candidate = word.trim_start_matches(|c: char| c == 'v' || c == 'V');
-        let mut parts = candidate.split(|c: char| c == '.' || c == '-' || c == '+');
+        let candidate = word.trim_start_matches(['v', 'V']);
+        let mut parts = candidate.split(['.', '-', '+']);
         let major = parts.next()?.parse().ok()?;
         let minor = parts.next()?.parse().ok()?;
         let patch = parts.next()?.parse().ok()?;
