@@ -525,6 +525,15 @@ export function MissionAutomationsDialog({
     if (automation.trigger?.type === 'agent_finished') {
       return 'After agent finishes';
     }
+    if (automation.trigger?.type === 'durable_job_terminal') {
+      return 'After durable job finishes';
+    }
+    if (automation.trigger?.type === 'cron') {
+      return `Cron ${automation.trigger.expression}`;
+    }
+    if (automation.trigger?.type === 'telegram') {
+      return 'Telegram';
+    }
     if (automation.trigger?.type === 'webhook') {
       return 'Webhook';
     }

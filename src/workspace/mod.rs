@@ -319,6 +319,49 @@ impl Workspace {
         Some(m)
     }
 
+    /// Whether remote runner nodes are configured for this deployment
+    /// (`SANDBOXED_REMOTE_NODES_ENABLED` + a non-empty node list).
+    fn remote_nodes_enabled() -> bool {
+        crate::remote_node::RemoteNodeSettings::from_env()
+            .map(|settings| settings.enabled && !settings.nodes.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Env vars that let the in-workspace `remote-lean-build` wrapper dispatch
+    /// a build for `mission_id` to a remote runner node via the host
+    /// `POST /api/remote-build` endpoint — or `None` when neither remote
+    /// nodes nor spark offload are enabled, or no signing secret is
+    /// available. Mirrors [`Self::spark_offload_env`]: the exposed token is a
+    /// per-mission, scope-bound capability token (domain-separated from the
+    /// spark token), never a node bearer token or the dashboard JWT.
+    pub fn remote_build_env(&self, mission_id: Uuid) -> Option<HashMap<String, String>> {
+        // Gate on either build-offload backend being available: the endpoint
+        // itself answers 503 when remote nodes are absent, letting the
+        // wrapper fall back to a local (or spark) build.
+        if !Self::remote_nodes_enabled() && !self.spark_offload_enabled() {
+            return None;
+        }
+        let token = crate::api::remote_build::build_remote_build_token(mission_id)?;
+        let port = std::env::var("PORT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        let mut m = HashMap::new();
+        m.insert(
+            "REMOTE_BUILD_URL".to_string(),
+            format!(
+                "http://{}:{}/api/remote-build",
+                self.host_ip_from_workspace(),
+                port
+            ),
+        );
+        m.insert("REMOTE_BUILD_TOKEN".to_string(), token);
+        m.insert(
+            "REMOTE_BUILD_MISSION_ID".to_string(),
+            mission_id.to_string(),
+        );
+        Some(m)
+    }
+
     /// Create the default host workspace.
     pub fn default_host(working_dir: PathBuf) -> Self {
         Self {
@@ -2157,6 +2200,21 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                             mcp = %cfg.name,
                             stale_mission_id = %previous,
                             "Overriding stale MCP MISSION_ID in generated workspace config"
+                        );
+                    }
+                }
+                // Service MCPs mint short-lived JWTs from JWT_SECRET. Preserve
+                // the deployment's authoritative single-tenant identity so
+                // they address the same persisted mission store as the API;
+                // otherwise container env filtering makes them fall back to
+                // the unrelated `default` store after a restart.
+                if let Ok(user_id) = std::env::var("SANDBOXED_SINGLE_TENANT_USER_ID")
+                    .or_else(|_| std::env::var("SINGLE_TENANT_USER_ID"))
+                {
+                    if !user_id.trim().is_empty() {
+                        env.insert(
+                            "SANDBOXED_SINGLE_TENANT_USER_ID".to_string(),
+                            user_id.trim().to_string(),
                         );
                     }
                 }

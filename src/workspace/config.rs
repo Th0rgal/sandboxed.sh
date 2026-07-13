@@ -988,12 +988,18 @@ pub(crate) struct CodexMcpEntry {
 }
 
 fn resolve_codex_dir(
-    _workspace_dir: &Path,
-    workspace_root: &Path,
-    workspace_type: WorkspaceType,
-    workspace_env: &HashMap<String, String>,
+    workspace_dir: &Path,
+    _workspace_root: &Path,
+    _workspace_type: WorkspaceType,
+    _workspace_env: &HashMap<String, String>,
 ) -> PathBuf {
-    super::resolve_workspace_home_root(workspace_root, workspace_type, workspace_env).join(".codex")
+    // Codex runs with a per-mission HOME rooted at `workspace_dir`. Writing
+    // generated MCP configuration into the shared workspace/container home
+    // leaves the live mission with only Codex's trust stanza and no MCP tools,
+    // while concurrent mission preparation can overwrite another mission's
+    // MISSION_ID. Keep config and native skills beside the mission HOME that
+    // the runner actually exports.
+    workspace_dir.join(".codex")
 }
 
 fn resolve_claudecode_dir(
@@ -1336,5 +1342,26 @@ pub async fn write_backend_config(
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_generated_state_is_mission_scoped() {
+        let workspace_root = Path::new("/srv/workspace-root");
+        let mission_dir = workspace_root.join("workspaces/mission-deadbeef");
+
+        assert_eq!(
+            resolve_codex_dir(
+                &mission_dir,
+                workspace_root,
+                WorkspaceType::Container,
+                &HashMap::new(),
+            ),
+            mission_dir.join(".codex")
+        );
     }
 }

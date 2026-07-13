@@ -1,15 +1,30 @@
+//! Remote runner nodes: core-side configuration, wire protocol, HTTP client
+//! and fleet monitoring for the `sandboxed-node` runner binary.
+//!
+//! Module layout:
+//! - [`protocol`]: shared wire types (heartbeat, leases, job payloads) used by
+//!   both core and the node binary.
+//! - [`client`]: core-side HTTP client for talking to nodes.
+//! - [`monitor`]: background fleet monitor caching per-node statuses and
+//!   recent dispatch outcomes.
+//!
+//! Everything public is re-exported here so call sites keep using
+//! `crate::remote_node::*` unchanged.
+
+pub mod client;
+pub mod job_ledger;
+pub mod monitor;
+pub mod protocol;
+
+pub use client::*;
+pub use monitor::*;
+pub use protocol::*;
+
 use axum::http::HeaderMap;
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::path::PathBuf;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::process::Command;
-use uuid::Uuid;
-
-type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -58,14 +73,19 @@ impl RemoteNodeOverview {
                 "Remote node MVP is enabled for explicit selected-node missions.".to_string(),
             );
         }
+        let status = if settings.enabled {
+            // Derive the live status from the fleet monitor cache when
+            // available instead of the old hardcoded `Unknown`.
+            monitor::global_fleet()
+                .and_then(|fleet| fleet.aggregate_status())
+                .unwrap_or(RemoteNodeStatus::Unknown)
+        } else {
+            RemoteNodeStatus::Disabled
+        };
         Self {
             enabled: settings.enabled,
             configured_nodes: settings.nodes.len(),
-            status: if settings.enabled {
-                RemoteNodeStatus::Unknown
-            } else {
-                RemoteNodeStatus::Disabled
-            },
+            status,
             notes,
         }
     }
@@ -83,10 +103,16 @@ pub enum RemoteNodeError {
     InvalidConfig(String),
     #[error("remote node request failed: {0}")]
     Request(String),
-    #[error("remote node rejected lease: {0}")]
-    Rejected(String),
+    #[error("remote node rejected request with HTTP {status}: {body}")]
+    Rejected { status: u16, body: String },
     #[error("invalid lease token: {0}")]
     InvalidLease(String),
+}
+
+impl RemoteNodeError {
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Rejected { status: 404, .. })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,187 +230,6 @@ pub fn parse_node_list(raw: &str) -> Result<Vec<RemoteNodeConfig>, RemoteNodeErr
         .collect()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NodeHeartbeat {
-    pub node_id: String,
-    pub online: bool,
-    pub capacity_total: u32,
-    pub capacity_available: u32,
-    pub active_leases: u32,
-    pub version: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NodeStatus {
-    pub id: String,
-    pub base_url: String,
-    pub token_env: String,
-    pub online: bool,
-    pub capacity_total: Option<u32>,
-    pub capacity_available: Option<u32>,
-    pub active_leases: Option<u32>,
-    pub version: Option<String>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LeaseClaims {
-    pub mission_id: Uuid,
-    pub node_id: String,
-    pub scope: String,
-    pub expires_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LeaseRequest {
-    pub mission_id: Uuid,
-    pub node_id: String,
-    pub lease_token: String,
-    pub command: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExecuteResponse {
-    pub accepted: bool,
-    pub exit_code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-/// Total request timeout for `/execute`, which blocks until the remote
-/// command completes.
-const EXECUTE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-
-#[derive(Clone)]
-pub struct RemoteNodeClient {
-    http: reqwest::Client,
-}
-
-impl Default for RemoteNodeClient {
-    fn default() -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .connect_timeout(Duration::from_secs(5))
-                .build()
-                .unwrap_or_default(),
-        }
-    }
-}
-
-impl RemoteNodeClient {
-    pub async fn heartbeat(
-        &self,
-        node: &RemoteNodeConfig,
-        token: &str,
-    ) -> Result<NodeHeartbeat, RemoteNodeError> {
-        let url = format!("{}/heartbeat", node.base_url);
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
-        if !response.status().is_success() {
-            return Err(RemoteNodeError::Request(format!(
-                "heartbeat returned {}",
-                response.status()
-            )));
-        }
-        response
-            .json::<NodeHeartbeat>()
-            .await
-            .map_err(|e| RemoteNodeError::Request(e.to_string()))
-    }
-
-    pub async fn execute(
-        &self,
-        node: &RemoteNodeConfig,
-        shared_token: &str,
-        request: &LeaseRequest,
-    ) -> Result<ExecuteResponse, RemoteNodeError> {
-        let url = format!("{}/execute", node.base_url);
-        let response = self
-            .http
-            .post(url)
-            // Override the client-wide 30s timeout: remote commands
-            // (builds, tests) routinely run for minutes and the response
-            // only arrives once the command finishes.
-            .timeout(EXECUTE_TIMEOUT)
-            .bearer_auth(shared_token)
-            .json(request)
-            .send()
-            .await
-            .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RemoteNodeError::Rejected(format!("{status}: {body}")));
-        }
-        response
-            .json::<ExecuteResponse>()
-            .await
-            .map_err(|e| RemoteNodeError::Request(e.to_string()))
-    }
-}
-
-pub fn create_lease_token(claims: &LeaseClaims, secret: &str) -> Result<String, RemoteNodeError> {
-    if secret.trim().is_empty() {
-        return Err(RemoteNodeError::InvalidLease(
-            "empty signing secret".to_string(),
-        ));
-    }
-    let json =
-        serde_json::to_vec(claims).map_err(|e| RemoteNodeError::InvalidLease(e.to_string()))?;
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|e| RemoteNodeError::InvalidLease(e.to_string()))?;
-    mac.update(payload.as_bytes());
-    let signature = hex::encode(mac.finalize().into_bytes());
-    Ok(format!("{payload}.{signature}"))
-}
-
-pub fn validate_lease_token(
-    token: &str,
-    secret: &str,
-    expected_node_id: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<LeaseClaims, RemoteNodeError> {
-    let (payload, signature) = token
-        .split_once('.')
-        .ok_or_else(|| RemoteNodeError::InvalidLease("missing signature".to_string()))?;
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|e| RemoteNodeError::InvalidLease(e.to_string()))?;
-    mac.update(payload.as_bytes());
-    let expected = hex::encode(mac.finalize().into_bytes());
-    if !constant_time_eq(signature.as_bytes(), expected.as_bytes()) {
-        return Err(RemoteNodeError::InvalidLease("bad signature".to_string()));
-    }
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|e| RemoteNodeError::InvalidLease(e.to_string()))?;
-    let claims: LeaseClaims =
-        serde_json::from_slice(&bytes).map_err(|e| RemoteNodeError::InvalidLease(e.to_string()))?;
-    if claims.node_id != expected_node_id {
-        return Err(RemoteNodeError::InvalidLease("wrong node".to_string()));
-    }
-    if claims.expires_at <= now.timestamp() {
-        return Err(RemoteNodeError::InvalidLease("expired".to_string()));
-    }
-    if claims.scope != "mission:execute" {
-        return Err(RemoteNodeError::InvalidLease("wrong scope".to_string()));
-    }
-    Ok(claims)
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 pub fn placement_for_selected_node<'a>(
     settings: &'a RemoteNodeSettings,
     selected_node_id: Option<&str>,
@@ -419,6 +264,7 @@ pub async fn run_lease_command(
         &request.lease_token,
         token_secret,
         node_id,
+        SCOPE_MISSION_EXECUTE,
         chrono::Utc::now(),
     )?;
     if claims.mission_id != request.mission_id {
@@ -430,10 +276,7 @@ pub async fn run_lease_command(
     tokio::fs::create_dir_all(&mission_dir)
         .await
         .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
-    let output = Command::new("bash")
-        .arg("-lc")
-        .arg(&request.command)
-        .current_dir(&mission_dir)
+    let output = raw_command(&request.command, &mission_dir, None)
         .output()
         .await
         .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
@@ -445,11 +288,56 @@ pub async fn run_lease_command(
     })
 }
 
+/// Construct a raw command without inheriting the node service environment.
+/// The service bearer/signing tokens must never be visible to repository or
+/// mission code. Explicit payload env is added back after a minimal runtime
+/// baseline.
+pub(crate) fn raw_command(
+    command: &str,
+    cwd: &std::path::Path,
+    env: Option<&std::collections::HashMap<String, String>>,
+) -> Command {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .env_clear()
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string()),
+        )
+        .env("HOME", cwd)
+        .env("LANG", "C.UTF-8");
+    if let Some(env) = env {
+        cmd.envs(env);
+    }
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{routing::get, Json, Router};
-    use tokio::net::TcpListener;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn raw_command_does_not_inherit_node_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_name = "SANDBOXED_NODE_TEST_ONLY_SECRET_44EDEB08";
+        std::env::set_var(secret_name, "must-not-leak");
+
+        let output = raw_command(
+            &format!("test -z \"${secret_name:-}\" && printf safe"),
+            dir.path(),
+            None,
+        )
+        .output()
+        .await
+        .unwrap();
+        std::env::remove_var(secret_name);
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "safe");
+    }
 
     #[test]
     fn parses_env_node_list_with_default_token_env() {
@@ -482,8 +370,9 @@ mod tests {
         let claims = LeaseClaims {
             mission_id: Uuid::new_v4(),
             node_id: "babylon".to_string(),
-            scope: "mission:execute".to_string(),
+            scope: SCOPE_MISSION_EXECUTE.to_string(),
             expires_at: chrono::Utc::now().timestamp() + 60,
+            job_id: None,
         };
         let token = create_lease_token(&claims, "node-secret").unwrap();
         let work_root = tempfile::tempdir().unwrap();
@@ -502,55 +391,6 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, RemoteNodeError::InvalidLease(_)));
-    }
-
-    #[test]
-    fn validates_scoped_lease_token() {
-        let mission_id = Uuid::new_v4();
-        let claims = LeaseClaims {
-            mission_id,
-            node_id: "babylon".to_string(),
-            scope: "mission:execute".to_string(),
-            expires_at: chrono::Utc::now().timestamp() + 60,
-        };
-        let token = create_lease_token(&claims, "node-secret").unwrap();
-        let parsed =
-            validate_lease_token(&token, "node-secret", "babylon", chrono::Utc::now()).unwrap();
-        assert_eq!(parsed.mission_id, mission_id);
-        assert!(
-            validate_lease_token(&token, "other-secret", "babylon", chrono::Utc::now()).is_err()
-        );
-        assert!(validate_lease_token(&token, "node-secret", "nippur", chrono::Utc::now()).is_err());
-    }
-
-    #[tokio::test]
-    async fn heartbeat_client_reads_node_status() {
-        async fn heartbeat() -> Json<NodeHeartbeat> {
-            Json(NodeHeartbeat {
-                node_id: "babylon".to_string(),
-                online: true,
-                capacity_total: 2,
-                capacity_available: 1,
-                active_leases: 1,
-                version: "test".to_string(),
-            })
-        }
-        let app = Router::new().route("/heartbeat", get(heartbeat));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let client = RemoteNodeClient::default();
-        let node = RemoteNodeConfig {
-            id: "babylon".to_string(),
-            base_url: format!("http://{addr}"),
-            token_env: "TOKEN".to_string(),
-            labels: None,
-        };
-        let heartbeat = client.heartbeat(&node, "unused").await.unwrap();
-        assert_eq!(heartbeat.capacity_available, 1);
     }
 
     #[test]

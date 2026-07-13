@@ -479,6 +479,10 @@ function triggerChip(a: Automation): string {
       return 'webhook';
     case 'cron':
       return 'cron';
+    case 'durable_job_terminal':
+      return 'on job finish';
+    case 'telegram':
+      return 'telegram';
     default:
       return trigger.type;
   }

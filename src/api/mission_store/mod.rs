@@ -481,6 +481,9 @@ pub enum TriggerType {
     Webhook { config: WebhookConfig },
     /// Trigger immediately after an agent turn finishes for the mission
     AgentFinished,
+    /// Trigger once the durable job started by this mission is no longer
+    /// running. This avoids spending repeated agent turns polling a build.
+    DurableJobTerminal { job_id: Uuid },
     /// Telegram bot trigger (messages are routed via the Telegram bridge)
     Telegram { config: TelegramTriggerConfig },
 }

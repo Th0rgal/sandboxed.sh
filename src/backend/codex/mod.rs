@@ -398,7 +398,12 @@ async fn send_message_streaming_app_server(
         // the common case (transient OOM kill, network blip) without
         // hiding a persistent failure.
         const MAX_RECONNECTS: u32 = 1;
+        const PENDING_TOOL_RECONCILE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
         let mut reconnect_attempts: u32 = 0;
+        let mut pending_tool_reconciliation: Option<(
+            tokio::time::Instant,
+            std::collections::HashSet<String>,
+        )> = None;
 
         'outer: loop {
             loop {
@@ -443,6 +448,41 @@ async fn send_message_streaming_app_server(
                         Some(m) => m,
                         None => break, // inner loop → check whether to reconnect
                     },
+                    _ = async {
+                        if let Some((deadline, _)) = pending_tool_reconciliation.as_ref() {
+                            tokio::time::sleep_until(*deadline).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        let (_, interrupted_ids) = pending_tool_reconciliation
+                            .take()
+                            .expect("reconciliation timer fired without pending state");
+                        let interrupted =
+                            translator.reconcile_interrupted_tools(&interrupted_ids);
+                        if interrupted.is_empty() {
+                            continue;
+                        }
+                        let names = interrupted
+                            .iter()
+                            .filter_map(|event| match event {
+                                ExecutionEvent::ToolResult { name, .. } => Some(name.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = tx
+                            .send(ExecutionEvent::Error {
+                                message: format!(
+                                    "codex app-server transport interrupted while pending tool calls ({names}) could not be reconciled after thread/resume; synthetic infra_transport_interrupted results were emitted and commands were not replayed"
+                                ),
+                            })
+                            .await;
+                        for event in interrupted {
+                            let _ = tx.send(event).await;
+                        }
+                        break 'outer;
+                    }
                 };
 
                 match msg {
@@ -456,6 +496,21 @@ async fn send_message_streaming_app_server(
                             }
                         }
                         if outcome.terminal {
+                            let interrupted = reconcile_pending_before_terminal(
+                                &mut translator,
+                                &mut pending_tool_reconciliation,
+                            );
+                            if !interrupted.is_empty() {
+                                let _ = tx
+                                    .send(ExecutionEvent::Error {
+                                        message: "codex app-server resumed with pending tool calls but emitted a terminal turn before replaying their completion; synthetic infra_transport_interrupted results were emitted"
+                                            .to_string(),
+                                    })
+                                    .await;
+                                for event in interrupted {
+                                    let _ = tx.send(event).await;
+                                }
+                            }
                             terminal = true;
                         }
                     }
@@ -581,10 +636,34 @@ async fn send_message_streaming_app_server(
             };
             session_arc = new_session;
             inbound = new_inbound;
+            let interrupted_ids = translator.pending_tool_ids();
+            if !interrupted_ids.is_empty() {
+                tracing::warn!(
+                    pending_tool_count = interrupted_ids.len(),
+                    grace_seconds = PENDING_TOOL_RECONCILE_GRACE.as_secs(),
+                    "codex app-server resumed with in-flight tool calls; waiting for completion replay before synthetic terminalization"
+                );
+                pending_tool_reconciliation = Some((
+                    tokio::time::Instant::now() + PENDING_TOOL_RECONCILE_GRACE,
+                    interrupted_ids,
+                ));
+            }
             tracing::info!("codex app-server reconnected via thread/resume");
         }
 
         if stream_closed_unexpectedly {
+            let interrupted_ids = translator.pending_tool_ids();
+            let interrupted = translator.reconcile_interrupted_tools(&interrupted_ids);
+            if !interrupted.is_empty() {
+                let _ = tx
+                    .send(ExecutionEvent::Error {
+                        message: "codex app-server stream closed while tool calls were pending; synthetic infra_transport_interrupted results were emitted and commands were not replayed".to_string(),
+                    })
+                    .await;
+                for event in interrupted {
+                    let _ = tx.send(event).await;
+                }
+            }
             let _ = tx
                 .send(ExecutionEvent::Error {
                     message: "codex app-server stream closed before mission terminated".to_string(),
@@ -652,11 +731,27 @@ struct AppServerEventTranslator {
     /// Set after a terminal goal update (`complete` / `budgetLimited`). The
     /// stream becomes terminal once the active turn completes.
     goal_terminal_seen: bool,
+    /// Tool calls emitted to consumers but not yet paired with a terminal
+    /// result. Persisted across an app-server reconnect within this driver so
+    /// a resumed stream can replay completion or be terminalized exactly once.
+    pending_tool_calls: std::collections::HashMap<String, String>,
+    emitted_tool_call_ids: std::collections::HashSet<String>,
+    emitted_tool_result_ids: std::collections::HashSet<String>,
 }
 
 struct TranslateOutcome {
     events: Vec<ExecutionEvent>,
     terminal: bool,
+}
+
+fn reconcile_pending_before_terminal(
+    translator: &mut AppServerEventTranslator,
+    pending: &mut Option<(tokio::time::Instant, std::collections::HashSet<String>)>,
+) -> Vec<ExecutionEvent> {
+    let Some((_, interrupted_ids)) = pending.take() else {
+        return Vec::new();
+    };
+    translator.reconcile_interrupted_tools(&interrupted_ids)
 }
 
 fn usage_tokens(usage: &serde_json::Value, keys: &[&str]) -> u64 {
@@ -698,6 +793,37 @@ fn codex_usage_from_turn_params(params: &serde_json::Value) -> Option<(u64, u64)
 }
 
 impl AppServerEventTranslator {
+    fn pending_tool_ids(&self) -> std::collections::HashSet<String> {
+        self.pending_tool_calls.keys().cloned().collect()
+    }
+
+    fn reconcile_interrupted_tools(
+        &mut self,
+        interrupted_ids: &std::collections::HashSet<String>,
+    ) -> Vec<ExecutionEvent> {
+        let mut ids: Vec<_> = interrupted_ids.iter().cloned().collect();
+        ids.sort();
+        let mut events = Vec::new();
+        for id in ids {
+            let Some(name) = self.pending_tool_calls.remove(&id) else {
+                continue;
+            };
+            if self.emitted_tool_result_ids.insert(id.clone()) {
+                events.push(ExecutionEvent::ToolResult {
+                    id,
+                    name,
+                    result: serde_json::json!({
+                        "status": "infra_transport_interrupted",
+                        "synthetic": true,
+                        "command_replayed": false,
+                        "message": "app-server stream closed before the tool result was observed",
+                    }),
+                });
+            }
+        }
+        events
+    }
+
     fn handle_notification(
         &mut self,
         method: &str,
@@ -782,14 +908,24 @@ impl AppServerEventTranslator {
                                     .or_else(|| item.get("input"))
                                     .cloned()
                                     .unwrap_or(serde_json::Value::Null);
-                                events.push(ExecutionEvent::ToolCall { id, name, args });
+                                if !self.emitted_tool_result_ids.contains(&id) {
+                                    self.pending_tool_calls.insert(id.clone(), name.clone());
+                                }
+                                if !self.emitted_tool_result_ids.contains(&id)
+                                    && self.emitted_tool_call_ids.insert(id.clone())
+                                {
+                                    events.push(ExecutionEvent::ToolCall { id, name, args });
+                                }
                             } else {
                                 let result = item
                                     .get("result")
                                     .or_else(|| item.get("output"))
                                     .cloned()
                                     .unwrap_or(serde_json::Value::Null);
-                                events.push(ExecutionEvent::ToolResult { id, name, result });
+                                self.pending_tool_calls.remove(&id);
+                                if self.emitted_tool_result_ids.insert(id.clone()) {
+                                    events.push(ExecutionEvent::ToolResult { id, name, result });
+                                }
                             }
                         }
                         "commandExecution" => {
@@ -801,22 +937,33 @@ impl AppServerEventTranslator {
                                 .cloned()
                                 .unwrap_or(serde_json::Value::Null);
                             if method == "item/started" {
-                                events.push(ExecutionEvent::ToolCall {
-                                    id,
-                                    name: "bash".to_string(),
-                                    args: serde_json::json!({ "command": command }),
-                                });
+                                if !self.emitted_tool_result_ids.contains(&id) {
+                                    self.pending_tool_calls
+                                        .insert(id.clone(), "bash".to_string());
+                                }
+                                if !self.emitted_tool_result_ids.contains(&id)
+                                    && self.emitted_tool_call_ids.insert(id.clone())
+                                {
+                                    events.push(ExecutionEvent::ToolCall {
+                                        id,
+                                        name: "bash".to_string(),
+                                        args: serde_json::json!({ "command": command }),
+                                    });
+                                }
                             } else {
                                 let result = item
                                     .get("aggregatedOutput")
                                     .or_else(|| item.get("output"))
                                     .cloned()
                                     .unwrap_or(serde_json::Value::Null);
-                                events.push(ExecutionEvent::ToolResult {
-                                    id,
-                                    name: "bash".to_string(),
-                                    result,
-                                });
+                                self.pending_tool_calls.remove(&id);
+                                if self.emitted_tool_result_ids.insert(id.clone()) {
+                                    events.push(ExecutionEvent::ToolResult {
+                                        id,
+                                        name: "bash".to_string(),
+                                        result,
+                                    });
+                                }
                             }
                         }
                         // Other item types (assistantMessage, userMessage, etc.)
@@ -1136,6 +1283,7 @@ mod tests {
             goal_objective: String::new(),
             goal_turn_active: false,
             goal_terminal_seen: false,
+            ..Default::default()
         };
 
         let notify = |item_id: &str, delta: &str| {
@@ -1220,6 +1368,7 @@ mod tests {
             goal_objective: String::new(),
             goal_turn_active: false,
             goal_terminal_seen: false,
+            ..Default::default()
         };
 
         let outcome = translator.handle_notification(
@@ -1290,6 +1439,146 @@ mod tests {
             true,
         );
         assert!(turn_completed.terminal);
+    }
+
+    #[test]
+    fn interrupted_tool_is_reconciled_exactly_once_without_replay() {
+        let mut translator = AppServerEventTranslator::default();
+        let started = translator.handle_notification(
+            "item/started",
+            &json!({
+                "item": {
+                    "id": "tool-1",
+                    "type": "toolCall",
+                    "name": "write_file",
+                    "arguments": {"path": "proof.lean"}
+                }
+            }),
+            false,
+        );
+        assert!(matches!(
+            started.events.as_slice(),
+            [ExecutionEvent::ToolCall { id, name, .. }]
+                if id == "tool-1" && name == "write_file"
+        ));
+
+        let interrupted = translator.pending_tool_ids();
+        let reconciled = translator.reconcile_interrupted_tools(&interrupted);
+        assert!(matches!(
+            reconciled.as_slice(),
+            [ExecutionEvent::ToolResult { id, name, result }]
+                if id == "tool-1"
+                    && name == "write_file"
+                    && result.get("status").and_then(|v| v.as_str())
+                        == Some("infra_transport_interrupted")
+                    && result.get("command_replayed").and_then(|v| v.as_bool()) == Some(false)
+        ));
+        assert!(translator.pending_tool_ids().is_empty());
+        assert!(translator
+            .reconcile_interrupted_tools(&interrupted)
+            .is_empty());
+    }
+
+    #[test]
+    fn terminal_resume_reconciles_pending_tool_before_exit() {
+        let mut translator = AppServerEventTranslator::default();
+        translator.handle_notification(
+            "item/started",
+            &json!({
+                "item": {
+                    "id": "tool-terminal",
+                    "type": "toolCall",
+                    "name": "bash",
+                    "arguments": {"command": "lake build"}
+                }
+            }),
+            false,
+        );
+        let ids = translator.pending_tool_ids();
+        let mut pending = Some((tokio::time::Instant::now(), ids));
+
+        let events = reconcile_pending_before_terminal(&mut translator, &mut pending);
+
+        assert!(pending.is_none());
+        assert!(translator.pending_tool_ids().is_empty());
+        assert!(matches!(
+            events.as_slice(),
+            [ExecutionEvent::ToolResult { id, name, .. }]
+                if id == "tool-terminal" && name == "bash"
+        ));
+    }
+
+    #[test]
+    fn resumed_real_completion_wins_over_synthetic_reconciliation() {
+        let mut translator = AppServerEventTranslator::default();
+        let params = json!({
+            "item": {
+                "id": "cmd-1",
+                "type": "commandExecution",
+                "command": "lake env lean proof.lean",
+                "aggregatedOutput": "ok"
+            }
+        });
+
+        assert_eq!(
+            translator
+                .handle_notification("item/started", &params, false)
+                .events
+                .len(),
+            1
+        );
+        let interrupted = translator.pending_tool_ids();
+        let completed = translator.handle_notification("item/completed", &params, false);
+        assert!(matches!(
+            completed.events.as_slice(),
+            [ExecutionEvent::ToolResult { id, name, result }]
+                if id == "cmd-1" && name == "bash" && result == "ok"
+        ));
+        assert!(translator
+            .reconcile_interrupted_tools(&interrupted)
+            .is_empty());
+    }
+
+    #[test]
+    fn replayed_tool_lifecycle_notifications_are_deduplicated() {
+        let mut translator = AppServerEventTranslator::default();
+        let params = json!({
+            "item": {
+                "id": "tool-2",
+                "type": "function_call",
+                "name": "read_file",
+                "input": {"path": "proof.lean"},
+                "output": "contents"
+            }
+        });
+
+        assert_eq!(
+            translator
+                .handle_notification("item/started", &params, false)
+                .events
+                .len(),
+            1
+        );
+        assert!(translator
+            .handle_notification("item/started", &params, false)
+            .events
+            .is_empty());
+        assert_eq!(
+            translator
+                .handle_notification("item/completed", &params, false)
+                .events
+                .len(),
+            1
+        );
+        assert!(translator
+            .handle_notification("item/completed", &params, false)
+            .events
+            .is_empty());
+        assert!(translator
+            .handle_notification("item/started", &params, false)
+            .events
+            .is_empty());
+        assert!(translator.pending_tool_ids().is_empty());
     }
 
     #[tokio::test]

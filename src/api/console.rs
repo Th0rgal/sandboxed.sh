@@ -751,10 +751,21 @@ async fn handle_new_workspace_shell(
                 .build_interactive_shell_invocation(&workspace.path, shell, &shell_args, extra_env)
                 .await
             {
-                Ok(Some((program, args))) => {
+                Ok(Some((program, args, env))) => {
                     let mut cmd = CommandBuilder::new(&program);
                     for arg in &args {
                         cmd.arg(arg);
+                    }
+                    // The nsenter invocation itself runs on the API host.
+                    // Start from the explicit workspace environment so API
+                    // credentials cannot leak and the container receives the
+                    // WORKSPACE_*, DISPLAY, HOME, PATH, and configured values
+                    // prepared by WorkspaceExec.
+                    cmd.env_clear();
+                    for (key, value) in env {
+                        if !key.trim().is_empty() {
+                            cmd.env(key, value);
+                        }
                     }
                     cmd
                 }

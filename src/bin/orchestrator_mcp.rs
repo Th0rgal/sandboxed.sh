@@ -552,13 +552,13 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "durable_job_start".to_string(),
-                description: "Start a long-running server-managed background command that survives ephemeral agent session cleanup. Use this for multi-hour builds, large test suites, image builds, and similar work.".to_string(),
+                description: "REQUIRED for any command that may outlive one tool call (long builds, benchmark arms, test suites, image builds). It runs inside the caller's workspace with its CPU/RAM scope, durable status, and file-backed logs. Never use shell `&`, nohup, or setsid for such work: those descendants remain owned by the ephemeral harness scope and are killed when the turn disconnects.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["command"],
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run."},
-                        "cwd": {"type": "string", "description": "Working directory. Relative paths resolve from the server working directory."},
+                        "cwd": {"type": "string", "description": "Working directory inside the caller's workspace. Relative paths resolve from the workspace root."},
                         "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment variables to add."}
                     }
                 }),
@@ -1567,11 +1567,16 @@ impl OrchestratorMcp {
                 .ok()
                 .or_else(|| std::env::var("SANDBOXED_SH_WORKSPACE").ok())
         });
+        let workspace_id = self
+            .boss_workspace_id()
+            .await
+            .ok_or_else(|| "Mission has no resolvable workspace_id; refusing to launch a host-leaking durable job".to_string())?;
         let body = json!({
             "command": params.command,
             "cwd": cwd,
             "env": params.env,
             "started_by_mission_id": self.mission_id,
+            "workspace_id": workspace_id,
         });
         let response = self.api_post("/api/durable-jobs", body).await?;
         if !response.status().is_success() {

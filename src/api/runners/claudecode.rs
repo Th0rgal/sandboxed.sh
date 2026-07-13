@@ -1251,6 +1251,12 @@ pub fn run_claudecode_turn<'a>(
         if let Some(spark_vars) = workspace.spark_offload_env(mission_id) {
             env.extend(spark_vars);
         }
+        // Remote lean-build dispatch — see Workspace::remote_build_env. Lets
+        // the in-workspace `remote-lean-build` wrapper ship builds to remote
+        // runner nodes; node credentials stay on the host.
+        if let Some(remote_build_vars) = workspace.remote_build_env(mission_id) {
+            env.extend(remote_build_vars);
+        }
 
         // Inject Telegram action environment variables when processing a Telegram message.
         // These are needed by the telegram-action CLI helper inside the container to schedule

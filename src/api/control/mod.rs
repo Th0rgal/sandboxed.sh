@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -51,6 +52,7 @@ use crate::mcp::McpRegistry;
 use crate::secrets::SecretsStore;
 use crate::util::{build_history_context, internal_error};
 use crate::workspace;
+use crate::workspace_exec::WorkspaceExec;
 
 use super::auth::AuthUser;
 use super::desktop;
@@ -63,6 +65,52 @@ use super::routes::AppState;
 
 pub(crate) const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
 const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
+
+fn parse_durable_job_result(result: &serde_json::Value) -> Option<serde_json::Value> {
+    fn visit(value: &serde_json::Value, depth: u8) -> Option<serde_json::Value> {
+        if depth > 4 {
+            return None;
+        }
+        if value.get("id").and_then(|id| id.as_str()).is_some()
+            && value
+                .get("stdout_log")
+                .and_then(|path| path.as_str())
+                .is_some()
+        {
+            return Some(value.clone());
+        }
+        if let Some(inner) = value.get("result") {
+            if let Some(job) = visit(inner, depth + 1) {
+                return Some(job);
+            }
+        }
+        if let Some(content) = value.get("content") {
+            if let Some(job) = visit(content, depth + 1) {
+                return Some(job);
+            }
+        }
+        if let Some(items) = value.as_array() {
+            for item in items {
+                if let Some(job) = visit(item, depth + 1) {
+                    return Some(job);
+                }
+                if let Some(text) = item.get("text") {
+                    if let Some(job) = visit(text, depth + 1) {
+                        return Some(job);
+                    }
+                }
+            }
+        }
+        if let Some(raw) = value.as_str() {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+                return visit(&parsed, depth + 1);
+            }
+        }
+        None
+    }
+
+    visit(result, 0)
+}
 
 /// One entry in the main control queue: (message id, content, optional per-message
 /// agent override, target mission id, source). Aliased to keep signatures under
@@ -105,6 +153,42 @@ pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
             | MissionStatus::AwaitingUser
             | MissionStatus::WaitingBackground
             | MissionStatus::Acknowledged
+    )
+}
+
+fn remote_node_needs_on_demand_probe(
+    _status: Option<&crate::remote_node::RemoteNodeStatus>,
+) -> bool {
+    // Auto-placement has already rejected the cached fleet. Even an Online
+    // heartbeat may carry stale load or resource figures, so refresh every
+    // configured node once before returning 503.
+    true
+}
+
+fn wakeup_supersession_key(
+    source: Option<&str>,
+    trigger: &mission_store::TriggerType,
+) -> Option<String> {
+    match source? {
+        // Wall-clock wakeups all represent the mission's next timer and may
+        // supersede one another regardless of which helper created them.
+        "claude-builtin" | "automation-manager" => Some("wall-clock".to_string()),
+        // Durable completions are independent. Only a replacement watcher for
+        // the same job may supersede an older one.
+        "durable-job-terminal" => match trigger {
+            mission_store::TriggerType::DurableJobTerminal { job_id } => {
+                Some(format!("durable-job:{job_id}"))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn should_finalize_remote_job(current_status: Option<MissionStatus>) -> bool {
+    matches!(
+        current_status,
+        None | Some(MissionStatus::Active | MissionStatus::Pending)
     )
 }
 
@@ -3301,6 +3385,13 @@ impl ControlHub {
         self.sessions.read().await.values().cloned().collect()
     }
 
+    /// User ids of all live control sessions. Used by GC/reaper to decide
+    /// whether the cross-store mission index is complete (a persisted store
+    /// with no live session means missions exist that the index can't see).
+    pub async fn session_user_ids(&self) -> Vec<String> {
+        self.sessions.read().await.keys().cloned().collect()
+    }
+
     /// Get a mission store for desktop management.
     /// Uses the default user's store if available, or creates a temporary one.
     pub async fn get_mission_store(&self) -> Arc<dyn MissionStore> {
@@ -4001,6 +4092,40 @@ pub struct FleetHealth {
     pub missions: crate::api::mission_store::MissionStatusCounts,
     pub webhook_forwarder_configured: bool,
     pub offload_configured: bool,
+    /// Root-filesystem usage so fleet controllers can preflight capacity
+    /// instead of discovering a full disk through worker failures.
+    pub disk_used: u64,
+    pub disk_total: u64,
+    pub disk_percent: f32,
+    pub disk_level: crate::api::monitoring::DiskHealthLevel,
+}
+
+/// Admission preflight: `Some(reason)` when new missions must be refused
+/// because the root filesystem is critically full. `DISK_ADMISSION_ENABLED=0`
+/// is the escape hatch. Warn level admits but logs.
+fn disk_admission_refusal() -> Option<String> {
+    let enabled = std::env::var("DISK_ADMISSION_ENABLED")
+        .map(|v| v.trim() != "0" && !v.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+    let (used, total, percent) = crate::api::monitoring::current_disk_usage();
+    match crate::api::monitoring::DiskHealthLevel::from_percent(percent) {
+        crate::api::monitoring::DiskHealthLevel::Critical => Some(format!(
+            "mission creation refused: disk critically full ({percent:.1}% used, {} GB free). \
+             Free space or raise DISK_CRITICAL_PCT, then retry.",
+            total.saturating_sub(used) / (1024 * 1024 * 1024)
+        )),
+        crate::api::monitoring::DiskHealthLevel::Warn => {
+            tracing::warn!(
+                disk_percent = percent,
+                "disk usage above warn threshold; admitting mission anyway"
+            );
+            None
+        }
+        crate::api::monitoring::DiskHealthLevel::Ok => None,
+    }
 }
 
 pub async fn fleet_health(
@@ -4031,6 +4156,7 @@ pub async fn fleet_health(
         .map_err(internal_error)?;
 
     let cfg = &state.config;
+    let (disk_used, disk_total, disk_percent) = crate::api::monitoring::current_disk_usage();
     Ok(Json(FleetHealth {
         status: if control_responsive { "ok" } else { "degraded" },
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -4040,6 +4166,10 @@ pub async fn fleet_health(
         missions,
         webhook_forwarder_configured: cfg.paloma_webhook_forward_url.is_some(),
         offload_configured: cfg.spark_arbiter_url.is_some() || cfg.spark_ssh_target.is_some(),
+        disk_used,
+        disk_total,
+        disk_percent,
+        disk_level: crate::api::monitoring::DiskHealthLevel::from_percent(disk_percent),
     }))
 }
 
@@ -4826,9 +4956,20 @@ pub struct CreateMissionRequest {
     pub prompt: Option<String>,
     /// Remote runner node id. When set, core creates the mission locally and
     /// dispatches `remote_command` to that node behind the remote-node flag.
+    /// The special value `"auto"` picks a node via capacity-aware placement
+    /// (`FleetMonitor::place_auto`) before the mission is persisted.
     pub remote_node_id: Option<String>,
+    /// Label requirements for `remote_node_id: "auto"` placement. Defaults to
+    /// no requirements for raw remote commands (`lean_build` dispatch via
+    /// `POST /api/remote-build` defaults to `["lean"]`).
+    pub remote_requirements: Option<Vec<String>>,
     /// MVP remote execution payload. Full AI mission streaming remains local.
     pub remote_command: Option<String>,
+    /// When true (with `remote_node_id` + `remote_command`), dispatch through
+    /// the node's async job API: the mission goes Active immediately and a
+    /// background poll loop finalizes it when the job completes. Default
+    /// false keeps the synchronous blocking `/execute` path unchanged.
+    pub remote_async: Option<bool>,
     /// Catch-all for unrecognized request fields. Serde ignores unknown fields
     /// by default, which has repeatedly hidden client bugs (a `prompt` sent
     /// before the field existed, a mistyped `target_mission_id`). Captured
@@ -4954,7 +5095,9 @@ pub async fn create_mission(
         next_check_at: None,
         prompt: None,
         remote_node_id: None,
+        remote_requirements: None,
         remote_command: None,
+        remote_async: None,
         extra: Default::default(),
     });
 
@@ -5092,7 +5235,7 @@ pub async fn create_mission(
 
     // Validate the remote-node payload before persisting the mission so a
     // bad request cannot leave an orphaned pending mission behind.
-    let remote_node_id = req
+    let mut remote_node_id = req
         .remote_node_id
         .as_deref()
         .map(str::trim)
@@ -5121,8 +5264,66 @@ pub async fn create_mission(
                 "remote-node MVP does not support future not_before scheduling yet; create the remote mission after the dispatch window opens".to_string(),
             ));
         }
-        crate::remote_node::placement_for_selected_node(&state.config.remote_nodes, Some(node_id))
+        if node_id.eq_ignore_ascii_case("auto") {
+            // Capacity-aware auto placement, resolved BEFORE the mission is
+            // persisted so placement failures surface as a clean API error
+            // instead of an orphaned failed mission.
+            if !state.config.remote_nodes.enabled {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    crate::remote_node::RemoteNodeError::Disabled.to_string(),
+                ));
+            }
+            // Raw remote commands default to no label requirements; the
+            // lean_build path (`POST /api/remote-build`) defaults to ["lean"].
+            let requirements = req.remote_requirements.clone().unwrap_or_default();
+            let resolved =
+                match state
+                    .fleet
+                    .place_auto(&state.config.remote_nodes, &requirements)
+                {
+                    Ok(resolved) => resolved,
+                    Err(initial_err) => {
+                        // The periodic monitor may be disabled, or this request
+                        // may race its first heartbeat. Match `/api/remote-build`:
+                        // re-probe every configured node (including Online
+                        // entries with potentially stale load), then retry
+                        // placement once.
+                        let retry_nodes: Vec<_> = state
+                            .config
+                            .remote_nodes
+                            .nodes
+                            .iter()
+                            .filter(|node| {
+                                let cached = state.fleet.get(&node.id);
+                                remote_node_needs_on_demand_probe(
+                                    cached.as_ref().map(|cached| &cached.status),
+                                )
+                            })
+                            .collect();
+                        if retry_nodes.is_empty() {
+                            return Err((StatusCode::SERVICE_UNAVAILABLE, initial_err.to_string()));
+                        }
+                        let client = crate::remote_node::RemoteNodeClient::default();
+                        futures::future::join_all(retry_nodes.into_iter().map(|node| {
+                            crate::remote_node::probe_node(&state.fleet, &client, node)
+                        }))
+                        .await;
+                        state
+                            .fleet
+                            .place_auto(&state.config.remote_nodes, &requirements)
+                            .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?
+                    }
+                };
+            tracing::info!(node_id = %resolved, "auto placement selected remote node");
+            remote_node_id = Some(resolved);
+        } else {
+            crate::remote_node::placement_for_selected_node(
+                &state.config.remote_nodes,
+                Some(node_id),
+            )
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        }
     }
 
     let control = control_for_user(&state, &user).await;
@@ -5230,15 +5431,14 @@ pub async fn create_mission(
     if let (Some(remote_node_id), Some(remote_command)) =
         (remote_node_id.as_deref(), remote_command.as_deref())
     {
-        match dispatch_remote_mission_mvp(
-            &state,
-            &control,
-            &mission,
-            remote_node_id,
-            remote_command,
-        )
-        .await
-        {
+        // All remote commands use the durable node job API. The legacy
+        // synchronous `/execute` path has no cancellation handle if its HTTP
+        // wait expires, so routing `remote_async=false` through it could orphan
+        // a process on the node. The response contract here is unchanged: the
+        // mission is returned Active while its durable poller owns completion.
+        let dispatch =
+            dispatch_remote_job(&state, &control, &mission, remote_node_id, remote_command).await;
+        match dispatch {
             Ok(updated) => return Ok((headers, Json(updated))),
             Err(message) => {
                 let _ = control
@@ -5273,6 +5473,7 @@ fn remote_dispatch_is_scheduled_for_future(
         && not_before.is_some_and(|t| t > now)
 }
 
+#[allow(dead_code)]
 async fn dispatch_remote_mission_mvp(
     state: &Arc<AppState>,
     control: &ControlState,
@@ -5298,8 +5499,9 @@ async fn dispatch_remote_mission_mvp(
     let claims = crate::remote_node::LeaseClaims {
         mission_id: mission.id,
         node_id: node.id.clone(),
-        scope: "mission:execute".to_string(),
+        scope: crate::remote_node::SCOPE_MISSION_EXECUTE.to_string(),
         expires_at: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp(),
+        job_id: None,
     };
     let lease_token = crate::remote_node::create_lease_token(&claims, &shared_token)
         .map_err(|e| e.to_string())?;
@@ -5320,6 +5522,7 @@ async fn dispatch_remote_mission_mvp(
         summary: Some(format!("Dispatching to remote node '{}'", node.id)),
     });
 
+    let started_at = chrono::Utc::now();
     let client = crate::remote_node::RemoteNodeClient::default();
     let response = client
         .execute(node, &shared_token, &request)
@@ -5330,6 +5533,74 @@ async fn dispatch_remote_mission_mvp(
         "Remote node '{}' exited with {:?}\n\nstdout:\n{}\n\nstderr:\n{}",
         node.id, response.exit_code, response.stdout, response.stderr
     );
+    let owner = RemoteMissionOwner::live(control);
+    finalize_remote_mission(
+        &owner,
+        mission.id,
+        &node.id,
+        success,
+        content,
+        "remote_node_mvp",
+    )
+    .await?;
+    state
+        .fleet
+        .record_outcome(crate::remote_node::DispatchOutcome {
+            mission_id: mission.id,
+            node_id: node.id.clone(),
+            job_id: None,
+            state: if success { "succeeded" } else { "failed" }.to_string(),
+            exit_code: response.exit_code,
+            error: None,
+            started_at,
+            finished_at: Some(chrono::Utc::now()),
+        });
+    control
+        .mission_store
+        .get_mission(mission.id)
+        .await?
+        .ok_or_else(|| format!("Mission {} disappeared after remote dispatch", mission.id))
+}
+
+/// Terminal bookkeeping shared by the sync (`/execute`) and async (job) remote
+/// paths: log the final assistant message, flip the mission to
+/// completed/failed with `status_reason`, and broadcast the status change.
+#[derive(Clone)]
+struct RemoteMissionOwner {
+    mission_store: Arc<dyn MissionStore>,
+    events_tx: Option<broadcast::Sender<AgentEvent>>,
+}
+
+impl RemoteMissionOwner {
+    fn live(control: &ControlState) -> Self {
+        Self {
+            mission_store: Arc::clone(&control.mission_store),
+            events_tx: Some(control.events_tx.clone()),
+        }
+    }
+
+    fn offline(mission_store: Arc<dyn MissionStore>) -> Self {
+        Self {
+            mission_store,
+            events_tx: None,
+        }
+    }
+
+    fn send(&self, event: AgentEvent) {
+        if let Some(events_tx) = &self.events_tx {
+            let _ = events_tx.send(event);
+        }
+    }
+}
+
+async fn finalize_remote_mission(
+    owner: &RemoteMissionOwner,
+    mission_id: Uuid,
+    node_id: &str,
+    success: bool,
+    content: String,
+    status_reason: &str,
+) -> Result<(), String> {
     let event = AgentEvent::AssistantMessage {
         id: Uuid::new_v4(),
         content,
@@ -5339,32 +5610,788 @@ async fn dispatch_remote_mission_mvp(
         usage: None,
         model: None,
         model_normalized: None,
-        mission_id: Some(mission.id),
+        mission_id: Some(mission_id),
         shared_files: None,
         resumable: !success,
         completion_evidence: None,
     };
-    let _ = control.mission_store.log_event(mission.id, &event).await;
-    let _ = control.events_tx.send(event);
+    let _ = owner.mission_store.log_event(mission_id, &event).await;
+    owner.send(event);
     let status = if success {
         MissionStatus::Completed
     } else {
         MissionStatus::Failed
     };
-    control
+    owner
         .mission_store
-        .update_mission_status_with_reason(mission.id, status, Some("remote_node_mvp"))
+        .update_mission_status_with_reason(mission_id, status, Some(status_reason))
         .await?;
+    owner.send(AgentEvent::MissionStatusChanged {
+        mission_id,
+        status,
+        summary: Some(format!("Remote node '{node_id}' finished")),
+    });
+    Ok(())
+}
+
+/// Async remote dispatch: mint a `job:submit` lease, queue the command on the
+/// node's job API, mark the mission Active immediately, and finalize it from
+/// a background poll loop. Unlike [`dispatch_remote_mission_mvp`], the create
+/// request does not block for the command's duration.
+async fn dispatch_remote_job(
+    state: &Arc<AppState>,
+    control: &ControlState,
+    mission: &Mission,
+    remote_node_id: &str,
+    remote_command: &str,
+) -> Result<Mission, String> {
+    let node = crate::remote_node::placement_for_selected_node(
+        &state.config.remote_nodes,
+        Some(remote_node_id),
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "remote node placement unexpectedly returned local".to_string())?
+    .clone();
+    let shared_token = std::env::var(&node.token_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "remote node '{}' has no token in {}",
+                node.id, node.token_env
+            )
+        })?;
+    let job_id = Uuid::new_v4();
+    let claims = crate::remote_node::LeaseClaims {
+        mission_id: mission.id,
+        node_id: node.id.clone(),
+        scope: crate::remote_node::SCOPE_JOB_SUBMIT.to_string(),
+        expires_at: (chrono::Utc::now() + chrono::Duration::minutes(15)).timestamp(),
+        job_id: Some(job_id),
+    };
+    let lease_token = crate::remote_node::create_lease_token(&claims, &shared_token)
+        .map_err(|e| e.to_string())?;
+    let request = crate::remote_node::SubmitJobRequest {
+        job_id,
+        mission_id: mission.id,
+        lease_token,
+        payload: crate::remote_node::JobPayload::RawCommand {
+            command: remote_command.to_string(),
+            timeout_secs: None,
+            env: None,
+        },
+    };
+
+    let client = crate::remote_node::RemoteNodeClient::default();
+    let submit_started_at = chrono::Utc::now();
+    let ledger_dir = state.config.working_dir.clone();
+    // Record the generated id before the POST. If the process dies after the
+    // node accepts but before the HTTP result is observed, restart recovery
+    // still has enough information to cancel the maybe-accepted job.
+    crate::remote_node::job_ledger::record(
+        &ledger_dir,
+        crate::remote_node::job_ledger::JobHandle {
+            mission_id: mission.id,
+            node_id: node.id.clone(),
+            job_id,
+            started_at: submit_started_at,
+            kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
+        },
+    )
+    .await
+    .map_err(|error| format!("remote job recovery handle could not be prepared: {error}"))?;
+    let accepted = match client.submit_job(&node, &shared_token, &request).await {
+        Ok(accepted) => accepted,
+        Err(crate::remote_node::RemoteNodeError::Request(message)) => {
+            // A transport/response failure is ambiguous: the node may have
+            // durably queued this exact job id before the response was lost.
+            // Keep the cancellation-only handle while returning failure so
+            // restart recovery cannot orphan the possible remote process.
+            spawn_untracked_remote_job_cancellation(
+                Arc::clone(&state.fleet),
+                node,
+                shared_token,
+                mission.id,
+                job_id,
+                submit_started_at,
+                ledger_dir,
+            );
+            return Err(format!(
+                "remote job submit outcome is ambiguous; cancellation is being reconciled: {message}"
+            ));
+        }
+        Err(error) => {
+            // A node HTTP rejection is definitive: the handler did not queue
+            // the job, so this pre-submit handle can be discarded.
+            crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+            return Err(error.to_string());
+        }
+    };
+
+    // Persist the job handle BEFORE marking the mission Active: if the API
+    // restarts from here on, the startup reconciler can re-attach a poll
+    // loop instead of leaving an Active mission orphaned.
+    if let Err(err) = crate::remote_node::job_ledger::record(
+        &state.config.working_dir,
+        crate::remote_node::job_ledger::JobHandle {
+            mission_id: mission.id,
+            node_id: node.id.clone(),
+            job_id,
+            started_at: submit_started_at,
+            kind: crate::remote_node::job_ledger::JobHandleKind::Mission,
+        },
+    )
+    .await
+    {
+        // Never expose an Active mission without a durable accepted handle.
+        // The pre-submit tentative entry remains the restart fallback; also
+        // start cancellation immediately rather than letting the job run.
+        spawn_untracked_remote_job_cancellation(
+            Arc::clone(&state.fleet),
+            node,
+            shared_token,
+            mission.id,
+            job_id,
+            submit_started_at,
+            state.config.working_dir.clone(),
+        );
+        return Err(format!(
+            "remote job accepted but recovery handle could not be persisted: {err}"
+        ));
+    }
+
+    if let Err(err) = control
+        .mission_store
+        .update_mission_status(mission.id, MissionStatus::Active)
+        .await
+    {
+        // The node already accepted the job and its handle is durable. Ask
+        // for cancellation immediately, then keep polling until terminal so
+        // a failed mission activation cannot leak node capacity.
+        if let Err(cancel_err) = client.cancel_job(&node, &shared_token, job_id).await {
+            tracing::warn!(
+                mission_id = %mission.id,
+                job_id = %job_id,
+                ?cancel_err,
+                "remote job cancellation after activation failure will be retried by poller"
+            );
+        }
+        let poll_owner = RemoteMissionOwner::live(control);
+        let fleet = Arc::clone(&state.fleet);
+        let ledger_dir = state.config.working_dir.clone();
+        let mission_id = mission.id;
+        let started_at = chrono::Utc::now();
+        tokio::spawn(async move {
+            poll_remote_job(
+                poll_owner,
+                fleet,
+                client,
+                node,
+                shared_token,
+                mission_id,
+                job_id,
+                started_at,
+            )
+            .await;
+            crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+        });
+        return Err(err);
+    }
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
         mission_id: mission.id,
-        status,
-        summary: Some(format!("Remote node '{}' finished", node.id)),
+        status: MissionStatus::Active,
+        summary: Some(format!(
+            "Dispatched job {} to remote node '{}'",
+            job_id, node.id
+        )),
     });
-    control
-        .mission_store
-        .get_mission(mission.id)
+
+    let started_at = chrono::Utc::now();
+    state
+        .fleet
+        .record_outcome(crate::remote_node::DispatchOutcome {
+            mission_id: mission.id,
+            node_id: node.id.clone(),
+            job_id: Some(job_id),
+            state: accepted.state.clone(),
+            exit_code: None,
+            error: None,
+            started_at,
+            finished_at: None,
+        });
+
+    let poll_owner = RemoteMissionOwner::live(control);
+    let fleet = Arc::clone(&state.fleet);
+    let mission_id = mission.id;
+    let ledger_dir = state.config.working_dir.clone();
+    let updated = read_dispatched_mission_after_observer_start(
+        &control.mission_store,
+        mission.id,
+        move || {
+            tokio::spawn(async move {
+                poll_remote_job(
+                    poll_owner,
+                    fleet,
+                    client,
+                    node,
+                    shared_token,
+                    mission_id,
+                    job_id,
+                    started_at,
+                )
+                .await;
+                // The poll loop only returns once the mission is finalized (or the
+                // job was cancelled/lost); the handle is no longer needed.
+                crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+            });
+        },
+    )
+    .await?;
+
+    Ok(updated)
+}
+
+/// Start ownership of an accepted remote job before any fallible final read.
+/// The observer must survive both a store error and a row that disappeared
+/// after dispatch, otherwise the durable node job remains unpolled until the
+/// API process restarts.
+async fn read_dispatched_mission_after_observer_start(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    start_observer: impl FnOnce(),
+) -> Result<Mission, String> {
+    start_observer();
+    mission_store
+        .get_mission(mission_id)
         .await?
-        .ok_or_else(|| format!("Mission {} disappeared after remote dispatch", mission.id))
+        .ok_or_else(|| format!("Mission {mission_id} disappeared after remote dispatch"))
+}
+
+/// Retry cancellation for a remote job that must not outlive its failed
+/// dispatch. The tentative ledger entry survives a process restart; this
+/// in-process observer removes it only after terminal state or authoritative
+/// 404, so a transient cancel failure cannot leak node capacity.
+fn spawn_untracked_remote_job_cancellation(
+    fleet: Arc<crate::remote_node::FleetMonitor>,
+    node: crate::remote_node::RemoteNodeConfig,
+    shared_token: String,
+    mission_id: Uuid,
+    job_id: Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
+    ledger_dir: std::path::PathBuf,
+) {
+    tokio::spawn(async move {
+        let client = crate::remote_node::RemoteNodeClient::default();
+        loop {
+            if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
+                if error.is_not_found() {
+                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+                    return;
+                }
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    node_id = %node.id,
+                    job_id = %job_id,
+                    ?error,
+                    "untracked remote job cancellation failed; retrying"
+                );
+            }
+            match client.get_job(&node, &shared_token, job_id).await {
+                Ok(status)
+                    if matches!(
+                        status.state.as_str(),
+                        "succeeded" | "failed" | "cancelled" | "lost"
+                    ) =>
+                {
+                    fleet.record_outcome(crate::remote_node::DispatchOutcome {
+                        mission_id,
+                        node_id: node.id.clone(),
+                        job_id: Some(job_id),
+                        state: status.state,
+                        exit_code: status.exit_code,
+                        error: status.error,
+                        started_at,
+                        finished_at: Some(chrono::Utc::now()),
+                    });
+                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+                    return;
+                }
+                Err(error) if error.is_not_found() => {
+                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+                    return;
+                }
+                Ok(_) | Err(_) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    });
+}
+
+/// Startup reconciliation for async remote jobs that were in flight when the
+/// previous process exited. For each persisted handle: if its mission is
+/// still Active in some live session's store, re-attach a poll loop (the
+/// node job is durable — jobs.db — so its result is recoverable); otherwise
+/// drop the stale handle. Handles whose node is no longer configured fail
+/// their mission explicitly rather than leaving it Active forever.
+pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        // Let control sessions boot before touching their stores.
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let working_dir = state.config.working_dir.clone();
+        // Job ids a poll loop was already re-attached for (or that were
+        // finalized), so retry passes never double-attach.
+        let mut settled: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        // Retry until every persisted handle is settled: a handle whose
+        // owning session has not booted yet is picked up on a later pass
+        // (sessions boot lazily on the user's first request). Early passes
+        // are frequent, later ones back off.
+        let mut pass = 0u32;
+        loop {
+            pass += 1;
+            let handles = match crate::remote_node::job_ledger::load(&working_dir).await {
+                Ok(handles) => handles,
+                Err(err) => {
+                    tracing::warn!(?err, "remote job ledger unreadable; reconciler will retry");
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+            };
+            let pending: Vec<_> = handles
+                .into_iter()
+                .filter(|h| !settled.contains(&h.job_id))
+                .collect();
+            if pending.is_empty() {
+                return;
+            }
+            if pass == 1 {
+                tracing::info!(
+                    count = pending.len(),
+                    "reconciling async remote jobs from previous process"
+                );
+            }
+            reconcile_pending_handles(&state, &working_dir, pending, &mut settled).await;
+            let unresolved = match crate::remote_node::job_ledger::load(&working_dir).await {
+                Ok(handles) => handles.into_iter().any(|h| !settled.contains(&h.job_id)),
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "remote job ledger unreadable after reconciliation; will retry"
+                    );
+                    true
+                }
+            };
+            if !unresolved {
+                return;
+            }
+            let backoff = if pass < 10 { 60 } else { 600 };
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        }
+    });
+}
+
+async fn reconcile_pending_handles(
+    state: &Arc<AppState>,
+    working_dir: &std::path::Path,
+    handles: Vec<crate::remote_node::job_ledger::JobHandle>,
+    settled: &mut std::collections::HashSet<Uuid>,
+) {
+    {
+        for handle in handles {
+            if handle.kind == crate::remote_node::job_ledger::JobHandleKind::Tentative {
+                let node = state.config.remote_nodes.node(&handle.node_id).cloned();
+                let shared_token = node
+                    .as_ref()
+                    .and_then(|node| std::env::var(&node.token_env).ok())
+                    .filter(|value| !value.trim().is_empty());
+                match (node, shared_token) {
+                    (Some(node), Some(shared_token)) => {
+                        settled.insert(handle.job_id);
+                        spawn_untracked_remote_job_cancellation(
+                            Arc::clone(&state.fleet),
+                            node,
+                            shared_token,
+                            handle.mission_id,
+                            handle.job_id,
+                            handle.started_at,
+                            working_dir.to_path_buf(),
+                        );
+                    }
+                    _ => {
+                        tracing::warn!(
+                            mission_id = %handle.mission_id,
+                            job_id = %handle.job_id,
+                            node = %handle.node_id,
+                            "tentative remote job retained: node config/token unavailable"
+                        );
+                    }
+                }
+                continue;
+            }
+            if handle.kind == crate::remote_node::job_ledger::JobHandleKind::RemoteBuild {
+                let node = state.config.remote_nodes.node(&handle.node_id).cloned();
+                let shared_token = node
+                    .as_ref()
+                    .and_then(|node| std::env::var(&node.token_env).ok())
+                    .filter(|value| !value.trim().is_empty());
+                match (node, shared_token) {
+                    (Some(node), Some(shared_token)) => {
+                        settled.insert(handle.job_id);
+                        let ledger_dir = working_dir.to_path_buf();
+                        let fleet = Arc::clone(&state.fleet);
+                        tokio::spawn(async move {
+                            poll_recovered_remote_build(
+                                fleet,
+                                crate::remote_node::RemoteNodeClient::default(),
+                                node,
+                                shared_token,
+                                handle.mission_id,
+                                handle.job_id,
+                                handle.started_at,
+                            )
+                            .await;
+                            crate::remote_node::job_ledger::remove(&ledger_dir, handle.job_id)
+                                .await;
+                        });
+                    }
+                    _ => {
+                        tracing::warn!(
+                            mission_id = %handle.mission_id,
+                            job_id = %handle.job_id,
+                            node = %handle.node_id,
+                            "waited remote build retained: node config/token unavailable"
+                        );
+                    }
+                }
+                continue;
+            }
+            // Reattach even when the owner has not booted a control session:
+            // durable node work must still be observed/cancelled while an
+            // OAuth user remains offline after restart.
+            let mut owning: Option<(RemoteMissionOwner, MissionStatus)> = None;
+            for session in state.control.all_sessions().await {
+                if let Ok(Some(mission)) =
+                    session.mission_store.get_mission(handle.mission_id).await
+                {
+                    owning = Some((RemoteMissionOwner::live(&session), mission.status));
+                    break;
+                }
+            }
+            if owning.is_none() {
+                match super::mission_workspace_gc::persisted_mission_store(
+                    state.as_ref(),
+                    handle.mission_id,
+                )
+                .await
+                {
+                    Ok(Some((store, status))) => {
+                        tracing::info!(
+                            mission_id = %handle.mission_id,
+                            job_id = %handle.job_id,
+                            "re-attaching remote job for offline persisted owner"
+                        );
+                        owning = Some((RemoteMissionOwner::offline(store), status));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            mission_id = %handle.mission_id,
+                            job_id = %handle.job_id,
+                            ?err,
+                            "remote job persisted owner lookup failed; will retry"
+                        );
+                    }
+                }
+            }
+            let Some((owner, mission_status)) = owning else {
+                tracing::info!(
+                    mission_id = %handle.mission_id,
+                    job_id = %handle.job_id,
+                    "remote job handle kept: owning persisted mission not found; will retry"
+                );
+                continue;
+            };
+            let node = state.config.remote_nodes.node(&handle.node_id).cloned();
+            let shared_token = node
+                .as_ref()
+                .and_then(|n| std::env::var(&n.token_env).ok())
+                .filter(|v| !v.trim().is_empty());
+            match (node, shared_token) {
+                (Some(node), Some(shared_token)) => {
+                    tracing::info!(
+                        mission_id = %handle.mission_id,
+                        job_id = %handle.job_id,
+                        node = %node.id,
+                        "re-attaching poll loop to in-flight remote job"
+                    );
+                    settled.insert(handle.job_id);
+                    let fleet = Arc::clone(&state.fleet);
+                    let ledger_dir = working_dir.to_path_buf();
+                    tokio::spawn(async move {
+                        poll_remote_job(
+                            owner,
+                            fleet,
+                            crate::remote_node::RemoteNodeClient::default(),
+                            node,
+                            shared_token,
+                            handle.mission_id,
+                            handle.job_id,
+                            handle.started_at,
+                        )
+                        .await;
+                        crate::remote_node::job_ledger::remove(&ledger_dir, handle.job_id).await;
+                    });
+                }
+                _ => {
+                    if !should_finalize_remote_job(Some(mission_status)) {
+                        tracing::warn!(
+                            mission_id = %handle.mission_id,
+                            job_id = %handle.job_id,
+                            node = %handle.node_id,
+                            %mission_status,
+                            "inactive remote job handle retained: cancellation node unavailable"
+                        );
+                        continue;
+                    }
+                    tracing::warn!(
+                        mission_id = %handle.mission_id,
+                        node = %handle.node_id,
+                        "remote job's node no longer configured; failing mission"
+                    );
+                    let _ = owner
+                        .mission_store
+                        .update_mission_status(handle.mission_id, MissionStatus::Failed)
+                        .await;
+                    owner.send(AgentEvent::MissionStatusChanged {
+                        mission_id: handle.mission_id,
+                        status: MissionStatus::Failed,
+                        summary: Some(
+                            "remote_node_lost: node unconfigured after restart".to_string(),
+                        ),
+                    });
+                    crate::remote_node::job_ledger::remove(working_dir, handle.job_id).await;
+                    settled.insert(handle.job_id);
+                }
+            }
+        }
+    }
+}
+
+/// Observe a waited remote-build job after API restart. This deliberately has
+/// no mission-status side effects: the build was a tool call within a mission,
+/// not the mission's own remote execution backend.
+async fn poll_recovered_remote_build(
+    fleet: Arc<crate::remote_node::FleetMonitor>,
+    client: crate::remote_node::RemoteNodeClient,
+    node: crate::remote_node::RemoteNodeConfig,
+    shared_token: String,
+    mission_id: Uuid,
+    job_id: Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        match client.get_job(&node, &shared_token, job_id).await {
+            Ok(status)
+                if matches!(
+                    status.state.as_str(),
+                    "succeeded" | "failed" | "cancelled" | "lost"
+                ) =>
+            {
+                fleet.record_outcome(crate::remote_node::DispatchOutcome {
+                    mission_id,
+                    node_id: node.id.clone(),
+                    job_id: Some(job_id),
+                    state: status.state,
+                    exit_code: status.exit_code,
+                    error: status.error,
+                    started_at,
+                    finished_at: Some(chrono::Utc::now()),
+                });
+                return;
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+}
+
+/// Background poll loop for one async remote job. Emits sparse progress
+/// events (job state changes only), fails the mission after 5 consecutive
+/// unreachable polls (`remote_node_lost`), honors external mission
+/// cancellation by cancelling the node job, and finalizes the mission through
+/// the same path as the synchronous dispatch.
+#[allow(clippy::too_many_arguments)]
+async fn poll_remote_job(
+    owner: RemoteMissionOwner,
+    fleet: Arc<crate::remote_node::FleetMonitor>,
+    client: crate::remote_node::RemoteNodeClient,
+    node: crate::remote_node::RemoteNodeConfig,
+    shared_token: String,
+    mission_id: Uuid,
+    job_id: Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
+) {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+    const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+    let outcome = |state: &str, exit_code: Option<i32>, error: Option<String>, terminal: bool| {
+        crate::remote_node::DispatchOutcome {
+            mission_id,
+            node_id: node.id.clone(),
+            job_id: Some(job_id),
+            state: state.to_string(),
+            exit_code,
+            error,
+            started_at,
+            finished_at: terminal.then(chrono::Utc::now),
+        }
+    };
+    let mut last_state = "queued".to_string();
+    let mut failures = 0u32;
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        // Honor external mission cancellation when trivially observable: if
+        // an operator moved the mission out of Active (cancel/interrupt/pause),
+        // request cancellation but retain the durable handle and keep polling
+        // until the node confirms a terminal state. A transient cancel outage
+        // must not orphan a still-running remote job.
+        let inactive_status = match owner.mission_store.get_mission(mission_id).await {
+            Ok(Some(current)) if current.status != MissionStatus::Active => Some(current.status),
+            _ => None,
+        };
+        if let Some(status) = inactive_status {
+            if let Err(err) = client.cancel_job(&node, &shared_token, job_id).await {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    job_id = %job_id,
+                    node = %node.id,
+                    ?err,
+                    "remote job cancellation failed; retaining handle and retrying"
+                );
+            } else {
+                tracing::debug!(
+                    mission_id = %mission_id,
+                    job_id = %job_id,
+                    %status,
+                    "remote job cancellation requested; awaiting terminal state"
+                );
+            }
+        }
+
+        match client.get_job(&node, &shared_token, job_id).await {
+            Err(err) => {
+                failures += 1;
+                if failures >= MAX_CONSECUTIVE_FAILURES {
+                    if inactive_status.is_some() {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            job_id = %job_id,
+                            node = %node.id,
+                            failures,
+                            ?err,
+                            "remote job still unreachable during cancellation; retaining handle"
+                        );
+                        failures = 0;
+                        continue;
+                    }
+                    let content = format!(
+                        "Remote node '{}' became unreachable while running job {} \
+                         ({failures} consecutive poll failures; last error: {err}). \
+                         Marking the mission failed.",
+                        node.id, job_id
+                    );
+                    let _ = finalize_remote_mission(
+                        &owner,
+                        mission_id,
+                        &node.id,
+                        false,
+                        content,
+                        "remote_node_lost",
+                    )
+                    .await;
+                    fleet.record_outcome(outcome("lost", None, Some(err.to_string()), true));
+                    // Finalization moves the mission out of Active. Keep the
+                    // durable handle and continue: the next iteration enters
+                    // the cancellation-aware path, and wrappers only remove
+                    // the ledger entry after a terminal node response.
+                    failures = 0;
+                    continue;
+                }
+            }
+            Ok(status) => {
+                failures = 0;
+                let terminal = matches!(
+                    status.state.as_str(),
+                    "succeeded" | "failed" | "cancelled" | "lost"
+                );
+                if terminal {
+                    let success = status.state == "succeeded";
+                    let content = format!(
+                        "Remote node '{}' job {} finished with state '{}' (exit {:?}){}\n\nlog tail:\n{}",
+                        node.id,
+                        job_id,
+                        status.state,
+                        status.exit_code,
+                        status
+                            .error
+                            .as_deref()
+                            .map(|e| format!("\nerror: {e}"))
+                            .unwrap_or_default(),
+                        status.log_tail.as_deref().unwrap_or("(empty)"),
+                    );
+                    if should_finalize_remote_job(inactive_status) {
+                        let _ = finalize_remote_mission(
+                            &owner,
+                            mission_id,
+                            &node.id,
+                            success,
+                            content,
+                            "remote_node_job",
+                        )
+                        .await;
+                    } else {
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            job_id = %job_id,
+                            node = %node.id,
+                            state = %status.state,
+                            "remote job reached a terminal state after operator interruption; preserving mission status"
+                        );
+                    }
+                    fleet.record_outcome(outcome(
+                        &status.state,
+                        status.exit_code,
+                        status.error.clone(),
+                        true,
+                    ));
+                    return;
+                }
+                if status.state != last_state {
+                    // Sparse progress note: only on job state changes.
+                    let event = AgentEvent::AssistantMessage {
+                        id: Uuid::new_v4(),
+                        content: format!(
+                            "Remote job {} on node '{}' is now {}",
+                            job_id, node.id, status.state
+                        ),
+                        success: true,
+                        cost_cents: 0,
+                        cost_source: crate::agents::CostSource::Unknown,
+                        usage: None,
+                        model: None,
+                        model_normalized: None,
+                        mission_id: Some(mission_id),
+                        shared_files: None,
+                        resumable: false,
+                        completion_evidence: None,
+                    };
+                    let _ = owner.mission_store.log_event(mission_id, &event).await;
+                    owner.send(event);
+                    fleet.record_outcome(outcome(&status.state, None, None, false));
+                    last_state = status.state.clone();
+                }
+            }
+        }
+    }
 }
 
 /// Request body for `POST /api/control/missions/:id/project`. Tri-state per
@@ -6947,7 +7974,9 @@ pub async fn clone_mission(
         next_check_at: source.project.next_check_at.clone(),
         prompt: None,
         remote_node_id: None,
+        remote_requirements: None,
         remote_command: None,
+        remote_async: None,
         extra: Default::default(),
     };
 
@@ -8418,6 +9447,14 @@ fn spawn_control_session(
         ));
     }
 
+    // Event-driven scope teardown: stop a mission's exec scopes as soon as
+    // its status stops needing a live harness. The periodic scope reaper
+    // (scope_reaper::spawn) backstops events missed across restarts.
+    super::scope_reaper::spawn_status_listener(
+        events_tx.subscribe(),
+        Arc::clone(&state.mission_store),
+    );
+
     // Shared registry of in-flight Claude Code background shell tasks. Written
     // by the control actor's ToolResult arm; read by the auto-resume watcher.
     let background_tasks: super::mission_runner::BackgroundTaskRegistry =
@@ -8639,6 +9676,7 @@ fn spawn_control_session(
             workspaces.clone(),
             state.events_tx.clone(),
             telegram_bridge.clone(),
+            config.working_dir.clone(),
         ));
     } else if state.mission_store.is_persistent() {
         tracing::info!("Automation scheduler disabled by config");
@@ -8708,6 +9746,7 @@ async fn automation_scheduler_loop(
     workspaces: workspace::SharedWorkspaceStore,
     events_tx: broadcast::Sender<AgentEvent>,
     telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
+    working_dir: PathBuf,
 ) {
     use super::automation_variables::{substitute_variables, SubstitutionContext};
     use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus, TriggerType};
@@ -8793,6 +9832,7 @@ async fn automation_scheduler_loop(
                     expression: String,
                     timezone: String,
                 },
+                DurableJobTerminal(Uuid),
             }
             let schedule = match &automation.trigger {
                 TriggerType::Interval { seconds } => ScheduleKind::Interval(*seconds),
@@ -8806,6 +9846,9 @@ async fn automation_scheduler_loop(
                 TriggerType::Webhook { .. } => continue,
                 TriggerType::AgentFinished => continue,
                 TriggerType::Telegram { .. } => continue,
+                TriggerType::DurableJobTerminal { job_id } => {
+                    ScheduleKind::DurableJobTerminal(*job_id)
+                }
             };
 
             let mission = match mission_store.get_mission(automation.mission_id).await {
@@ -8942,6 +9985,27 @@ async fn automation_scheduler_loop(
                         }
                     }
                 }
+                ScheduleKind::DurableJobTerminal(job_id) => {
+                    match super::durable_jobs::terminal_for_mission(
+                        &working_dir,
+                        *job_id,
+                        mission.id,
+                    )
+                    .await
+                    {
+                        Ok(terminal) => terminal,
+                        Err(error) => {
+                            tracing::debug!(
+                                automation_id = %automation.id,
+                                mission_id = %mission.id,
+                                durable_job_id = %job_id,
+                                %error,
+                                "Durable-job automation is not ready"
+                            );
+                            false
+                        }
+                    }
+                }
             };
 
             if !should_trigger {
@@ -9061,7 +10125,12 @@ async fn automation_scheduler_loop(
                 automation_id: automation.id,
                 mission_id: mission.id,
                 triggered_at: mission_store::now_string(),
-                trigger_source: "interval".to_string(),
+                trigger_source: match &schedule {
+                    ScheduleKind::Interval(_) => "interval",
+                    ScheduleKind::Cron { .. } => "cron",
+                    ScheduleKind::DurableJobTerminal(_) => "durable_job_terminal",
+                }
+                .to_string(),
                 status: ExecutionStatus::Pending,
                 webhook_payload: None,
                 variables_used: automation.variables.clone(),
@@ -11579,6 +12648,15 @@ async fn control_actor_loop(
                         }
                     }
                     ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, scheduling, respond } => {
+                        // Disk preflight: refuse new missions when the root
+                        // filesystem is critically full instead of letting
+                        // workers die mid-flight on ENOSPC. Actor-level so
+                        // the HTTP, Ask and Telegram entrypoints are all
+                        // covered by this single gate.
+                        if let Some(refusal) = disk_admission_refusal() {
+                            let _ = respond.send(Err(refusal));
+                            continue;
+                        }
                         // First persist current mission history
                         persist_mission_history(
                             &mission_store,
@@ -14015,6 +15093,58 @@ async fn control_actor_loop(
                                             .insert(task_id, task);
                                     }
                                 }
+                            } else if name.ends_with("durable_job_start") {
+                                if let (Some(mid), Some(job)) =
+                                    (mission_id, parse_durable_job_result(result))
+                                {
+                                    let Some(job_id) =
+                                        job.get("id").and_then(|value| value.as_str())
+                                    else {
+                                        continue;
+                                    };
+                                    let command = job
+                                        .get("command")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let mut output_path = job
+                                        .get("stdout_log")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    if let Ok(Some(mission)) = mission_store.get_mission(*mid).await {
+                                        if let Some(workspace) =
+                                            workspaces.get(mission.workspace_id).await
+                                        {
+                                            output_path = WorkspaceExec::new(workspace)
+                                                .translate_path_for_container(
+                                                    std::path::Path::new(&output_path),
+                                                );
+                                        }
+                                    }
+                                    let task = super::mission_runner::BackgroundTask {
+                                        id: format!("durable:{job_id}"),
+                                        output_path,
+                                        command,
+                                        started_at: std::time::Instant::now(),
+                                    };
+                                    tracing::info!(
+                                        mission_id = %mid,
+                                        durable_job_id = %job_id,
+                                        "Captured durable background job; scheduling auto-resume on completion"
+                                    );
+                                    if let Some(runner) = parallel_runners.get_mut(mid) {
+                                        runner
+                                            .background_tasks
+                                            .insert(task.id.clone(), task.clone());
+                                    }
+                                    background_tasks
+                                        .write()
+                                        .await
+                                        .entry(*mid)
+                                        .or_default()
+                                        .insert(task.id.clone(), task);
+                                }
                             }
                         }
                     }
@@ -14737,6 +15867,12 @@ pub async fn create_automation(
         }
     }
 
+    if let mission_store::TriggerType::DurableJobTerminal { job_id } = &trigger {
+        super::durable_jobs::terminal_for_mission(&state.config.working_dir, *job_id, mission_id)
+            .await
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    }
+
     let start_immediately = req.start_immediately;
 
     // For interval/cron triggers, if start_immediately is false, set last_triggered_at
@@ -14788,11 +15924,14 @@ pub async fn create_automation(
         driver: mission_store::AutomationDriver::Scheduler,
     };
 
-    let is_builtin_wakeup = automation
-        .variables
-        .get("__wakeup_source")
-        .map(String::as_str)
-        == Some("claude-builtin");
+    let is_one_shot_wakeup = automation.variables.contains_key("__wakeup_source");
+    let wakeup_key = wakeup_supersession_key(
+        automation
+            .variables
+            .get("__wakeup_source")
+            .map(String::as_str),
+        &automation.trigger,
+    );
 
     tracing::info!(
         mission_id = %mission_id,
@@ -14800,7 +15939,7 @@ pub async fn create_automation(
         command_source = ?automation.command_source,
         trigger = ?automation.trigger,
         fresh_session = ?automation.fresh_session,
-        is_builtin_wakeup,
+        is_one_shot_wakeup,
         "Creating mission automation"
     );
 
@@ -14810,7 +15949,7 @@ pub async fn create_automation(
         .await
         .map_err(internal_error)?;
 
-    // One pending built-in wakeup per mission: a new ScheduleWakeup
+    // One pending wakeup per mission: a new ScheduleWakeup
     // supersedes any earlier un-fired one. Without this, a turn that starts
     // before the previous wakeup fires (user message, other automation)
     // schedules a second wakeup, and the leftovers pile up into overlapping
@@ -14824,7 +15963,7 @@ pub async fn create_automation(
     // overlapping creates converge on exactly the newest wakeup instead of
     // deactivating each other.
     let mut wakeup_iteration: u32 = 1;
-    if is_builtin_wakeup {
+    if let Some(wakeup_key) = wakeup_key {
         if let Ok(existing) = control
             .mission_store
             .get_mission_automations(mission_id)
@@ -14835,8 +15974,10 @@ pub async fn create_automation(
                 .into_iter()
                 .filter(|a| {
                     a.id != automation.id
-                        && a.variables.get("__wakeup_source").map(String::as_str)
-                            == Some("claude-builtin")
+                        && wakeup_supersession_key(
+                            a.variables.get("__wakeup_source").map(String::as_str),
+                            &a.trigger,
+                        ) == Some(wakeup_key.clone())
                 })
                 .collect();
             wakeup_iteration = (priors.len() as u32).saturating_add(1);
@@ -14862,7 +16003,7 @@ pub async fn create_automation(
     // Persist a goal-iteration marker for self-paced loops so the dashboard
     // and assistant can see loop progress after a reload — previously this
     // state lived only in the (transient) wakeup automations.
-    if is_builtin_wakeup {
+    if is_one_shot_wakeup {
         let _ = control.events_tx.send(AgentEvent::GoalIteration {
             iteration: wakeup_iteration,
             objective: automation
@@ -15031,6 +16172,24 @@ pub async fn update_automation(
 
     if let Some(active) = req.active {
         automation.active = active;
+    }
+
+    if let mission_store::TriggerType::Cron { expression, .. } = &automation.trigger {
+        if croner::Cron::new(expression).parse().is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid cron expression: {expression}"),
+            ));
+        }
+    }
+    if let mission_store::TriggerType::DurableJobTerminal { job_id } = &automation.trigger {
+        super::durable_jobs::terminal_for_mission(
+            &state.config.working_dir,
+            *job_id,
+            automation.mission_id,
+        )
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     }
 
     if automation.fresh_session == mission_store::FreshSession::Switch {
@@ -17500,6 +18659,28 @@ mod tests {
             content: content.to_string(),
             metadata: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn durable_job_result_parser_accepts_direct_and_mcp_content_shapes() {
+        let job = serde_json::json!({
+            "id": "11111111-1111-1111-1111-111111111111",
+            "stdout_log": "/workspace/.sandboxed-sh/durable-jobs/job/stdout.log",
+            "command": "lake build"
+        });
+        assert_eq!(parse_durable_job_result(&job), Some(job.clone()));
+
+        let wrapped = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string(&job).unwrap()
+            }]
+        });
+        assert_eq!(parse_durable_job_result(&wrapped), Some(job));
+        assert!(parse_durable_job_result(&serde_json::json!({
+            "content": "not a job"
+        }))
+        .is_none());
     }
 
     #[test]
@@ -21081,6 +22262,127 @@ Investigate <service/> failures.
         // until the user resumes it), so they are not activation-eligible here.
         assert!(!message_activates_mission(MissionStatus::Active));
         assert!(!message_activates_mission(MissionStatus::Paused));
+    }
+
+    #[test]
+    fn raw_remote_auto_placement_reprobes_every_node() {
+        use crate::remote_node::RemoteNodeStatus;
+
+        assert!(remote_node_needs_on_demand_probe(None));
+        assert!(remote_node_needs_on_demand_probe(Some(
+            &RemoteNodeStatus::Unknown
+        )));
+        for status in [
+            RemoteNodeStatus::Degraded,
+            RemoteNodeStatus::Offline,
+            RemoteNodeStatus::Disabled,
+        ] {
+            assert!(remote_node_needs_on_demand_probe(Some(&status)));
+        }
+        assert!(remote_node_needs_on_demand_probe(Some(
+            &RemoteNodeStatus::Online
+        )));
+    }
+
+    #[test]
+    fn durable_wakeup_supersession_is_scoped_to_job_id() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let first_key = wakeup_supersession_key(
+            Some("durable-job-terminal"),
+            &mission_store::TriggerType::DurableJobTerminal { job_id: first },
+        );
+        let replacement_key = wakeup_supersession_key(
+            Some("durable-job-terminal"),
+            &mission_store::TriggerType::DurableJobTerminal { job_id: first },
+        );
+        let independent_key = wakeup_supersession_key(
+            Some("durable-job-terminal"),
+            &mission_store::TriggerType::DurableJobTerminal { job_id: second },
+        );
+
+        assert_eq!(first_key, replacement_key);
+        assert_ne!(first_key, independent_key);
+        assert_eq!(
+            wakeup_supersession_key(
+                Some("automation-manager"),
+                &mission_store::TriggerType::Interval { seconds: 60 }
+            ),
+            wakeup_supersession_key(
+                Some("claude-builtin"),
+                &mission_store::TriggerType::Interval { seconds: 120 }
+            )
+        );
+    }
+
+    #[test]
+    fn remote_terminal_result_preserves_operator_selected_status() {
+        assert!(should_finalize_remote_job(None));
+        assert!(should_finalize_remote_job(Some(MissionStatus::Active)));
+        // A durable handle proves this is the narrow crash window after the
+        // node accepted the job but before Pending was promoted to Active.
+        assert!(should_finalize_remote_job(Some(MissionStatus::Pending)));
+        for status in [
+            MissionStatus::Interrupted,
+            MissionStatus::Paused,
+            MissionStatus::Blocked,
+            MissionStatus::Failed,
+        ] {
+            assert!(
+                !should_finalize_remote_job(Some(status)),
+                "terminal node result must not overwrite {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_dispatch_starts_observer_before_missing_mission_read() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let observer_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_for_observer = Arc::clone(&observer_started);
+        let missing_id = Uuid::new_v4();
+
+        let error = read_dispatched_mission_after_observer_start(&store, missing_id, move || {
+            started_for_observer.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .expect_err("missing post-dispatch mission must fail the response read");
+
+        assert!(observer_started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error.contains(&missing_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn offline_remote_owner_finalizes_persisted_mission_without_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MissionStore> = Arc::new(
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "github:42")
+                .await
+                .unwrap(),
+        );
+        let mission = store
+            .create_mission(Some("offline remote"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .unwrap();
+        let owner = RemoteMissionOwner::offline(Arc::clone(&store));
+
+        finalize_remote_mission(
+            &owner,
+            mission.id,
+            "node-a",
+            true,
+            "remote result".to_string(),
+            "remote_node_job",
+        )
+        .await
+        .unwrap();
+
+        let finalized = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(finalized.status, MissionStatus::Completed);
     }
 
     #[test]

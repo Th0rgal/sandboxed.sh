@@ -139,6 +139,12 @@ function triggerLabel(t: TriggerType): string {
       return `every ${humanizeDuration(t.seconds)}`;
     case 'agent_finished':
       return 'when agent finishes';
+    case 'durable_job_terminal':
+      return 'when durable job finishes';
+    case 'cron':
+      return `cron ${t.expression}`;
+    case 'telegram':
+      return 'telegram';
     case 'webhook':
       return 'webhook';
     default:

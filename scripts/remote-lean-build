@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# remote-lean-build — dispatch the current repo's Lean build to a remote
+# runner node via the host's POST /api/remote-build endpoint.
+#
+# Usage: remote-lean-build [build argv...]        (default: lake build)
+#
+# Run it from anywhere inside a git checkout; the build cwd on the node is
+# derived from your position in the repo (git rev-parse --show-prefix).
+#
+# Requires (injected into mission workspaces by sandboxed.sh):
+#   REMOTE_BUILD_URL         host endpoint, e.g. http://10.88.0.1:3000/api/remote-build
+#   REMOTE_BUILD_TOKEN       per-mission capability token
+#   REMOTE_BUILD_MISSION_ID  mission UUID
+#
+# Exit codes:
+#   remote build's exit code on success/failure of the build itself
+#   2   dirty working tree (commit or stash first — the node builds a pinned commit)
+#   75  remote build unavailable (EX_TEMPFAIL: placement failed / nodes down /
+#       not configured) — fall back to a local build
+set -u
+
+die() { echo "remote-lean-build: $1" >&2; exit "${2:-1}"; }
+
+[ -n "${REMOTE_BUILD_URL:-}" ] || die "REMOTE_BUILD_URL is not set (remote builds unavailable)" 75
+[ -n "${REMOTE_BUILD_TOKEN:-}" ] || die "REMOTE_BUILD_TOKEN is not set" 75
+[ -n "${REMOTE_BUILD_MISSION_ID:-}" ] || die "REMOTE_BUILD_MISSION_ID is not set" 75
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
+command -v curl >/dev/null 2>&1 || die "curl is required"
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git checkout"
+
+# The node fetches a pinned commit; uncommitted changes would silently not
+# be part of the remote build.
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    die "working tree is dirty; commit (and push) your changes first" 2
+fi
+
+repo="$(git remote get-url origin 2>/dev/null)" || die "no 'origin' remote"
+commit="$(git rev-parse HEAD)" || die "cannot resolve HEAD"
+cwd_rel="$(git rev-parse --show-prefix)"; cwd_rel="${cwd_rel%/}"
+
+# Build argv: everything passed on the command line, default `lake build`.
+if [ "$#" -eq 0 ]; then set -- lake build; fi
+
+body="$(python3 - "$REMOTE_BUILD_MISSION_ID" "$REMOTE_BUILD_TOKEN" "$repo" "$commit" "$cwd_rel" "$@" <<'PY'
+import json, sys, os
+mission_id, token, repo, commit, cwd_rel = sys.argv[1:6]
+command = sys.argv[6:]
+req = {
+    "mission_id": mission_id,
+    "token": token,
+    "repo": repo,
+    "commit": commit,
+    "command": command,
+    "wait": True,
+}
+if cwd_rel:
+    req["cwd_rel"] = cwd_rel
+timeout = os.environ.get("REMOTE_BUILD_TIMEOUT_SECS")
+if timeout:
+    req["timeout_secs"] = int(timeout)
+print(json.dumps(req))
+PY
+)" || die "failed to encode request"
+
+echo "remote-lean-build: dispatching $* for ${commit:0:12}${cwd_rel:+ in $cwd_rel} ..." >&2
+response_file="$(mktemp)"
+trap 'rm -f "$response_file"' EXIT
+http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+    -H 'Content-Type: application/json' \
+    --max-time 7500 \
+    -d "$body" "$REMOTE_BUILD_URL")" || die "cannot reach $REMOTE_BUILD_URL" 75
+
+if [ "$http_code" = "401" ] || [ "$http_code" = "403" ] || [ "$http_code" = "503" ]; then
+    echo "remote-lean-build: remote build unavailable:" >&2
+    cat "$response_file" >&2; echo >&2
+    exit 75  # EX_TEMPFAIL: caller should fall back to a local build
+fi
+if [ "$http_code" != "200" ]; then
+    echo "remote-lean-build: HTTP $http_code from $REMOTE_BUILD_URL:" >&2
+    cat "$response_file" >&2; echo >&2
+    exit 1
+fi
+
+python3 - "$response_file" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    resp = json.load(f)
+sys.stderr.write(
+    "remote-lean-build: job %s on node '%s' finished: %s (exit %s, %ss)\n"
+    % (resp.get("job_id"), resp.get("node_id"), resp.get("state"),
+       resp.get("exit_code"), resp.get("duration_secs"))
+)
+log_tail = resp.get("log_tail") or ""
+if log_tail:
+    sys.stdout.write(log_tail)
+    if not log_tail.endswith("\n"):
+        sys.stdout.write("\n")
+for artifact in resp.get("artifacts") or []:
+    sys.stderr.write(
+        "artifact: %(path)s sha256=%(sha256)s (%(size_bytes)d bytes)\n" % artifact
+    )
+exit_code = resp.get("exit_code")
+sys.exit(exit_code if isinstance(exit_code, int) and 0 <= exit_code <= 255 else 1)
+PY

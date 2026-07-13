@@ -24,6 +24,16 @@ const CONTAINER_KEEPALIVE_ENV_KEY: &str = "SANDBOXED_SH_CONTAINER_KEEPALIVE";
 const CONTAINER_KEEPALIVE_ENV_VALUE: &str = "1";
 const ALLOW_TRANSIENT_CONTAINER_NSENTER_ENV: &str =
     "SANDBOXED_SH_ALLOW_TRANSIENT_CONTAINER_NSENTER";
+const NSENTER_USE_TARGET_ROOT_ENV: &str = "SANDBOXED_SH_NSENTER_USE_TARGET_ROOT";
+
+fn replace_command_env(cmd: &mut Command, env: HashMap<String, String>) {
+    cmd.env_clear().envs(env);
+}
+
+fn durable_command_runs_on_api_host(workspace_type: WorkspaceType, uses_nspawn: bool) -> bool {
+    workspace_type == WorkspaceType::Host
+        || (workspace_type == WorkspaceType::Container && !uses_nspawn)
+}
 
 /// TLS CA-bundle env vars that point at a filesystem path. When the host
 /// process that launches a container mission (e.g. the sandboxed.sh daemon
@@ -120,6 +130,12 @@ fn environ_has_keepalive_marker(environ: &[u8]) -> bool {
         .any(|entry| entry == expected.as_bytes())
 }
 
+fn append_nsenter_target_root_arg(args: &mut Vec<String>, enabled: bool) {
+    if enabled {
+        args.push("--root".to_string());
+    }
+}
+
 /// Stable container identity for a workspace, derived from its path. Every
 /// transient scope a workspace spawns (mission boot, per-exec attach, and the
 /// one-shot nspawn wrapper in `nspawn.rs`) embeds this token, so scope
@@ -164,6 +180,122 @@ fn mission_scope_unit(machine_name: &str) -> String {
         })
         .collect();
     format!("sandboxed-mission-{sanitized}.scope")
+}
+
+/// Mission/task tag derived from an exec working directory. Per-mission dirs
+/// are `.../workspaces/mission-<first-8-hex-of-uuid>/…` (see
+/// `workspace::mission_workspace_dir_for_root`), so the tag is recoverable
+/// from any cwd inside a mission workspace. It is embedded in exec scope
+/// unit names so mission-end teardown and the zombie reaper can select one
+/// mission's scopes without a process registry.
+pub fn mission_tag_from_path(cwd: &Path) -> Option<String> {
+    let mut below_workspaces = false;
+    for comp in cwd.components() {
+        let Some(name) = comp.as_os_str().to_str() else {
+            below_workspaces = false;
+            continue;
+        };
+        if below_workspaces {
+            for (prefix, tag) in [("mission-", 'm'), ("task-", 't')] {
+                if let Some(rest) = name.strip_prefix(prefix) {
+                    if rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Some(format!("{tag}{}", rest.to_ascii_lowercase()));
+                    }
+                }
+            }
+        }
+        below_workspaces = name == "workspaces";
+    }
+    None
+}
+
+/// Unit name for a per-exec transient scope:
+/// `sandboxed-exec-<machine>[-m<8hex>|-t<8hex>]-<rand8>`.
+/// The machine token comes first (workspace-level substring discovery by
+/// `list_workspace_scope_units` stays intact), the optional mission/task tag
+/// second (per-mission teardown), and a short random suffix for uniqueness.
+pub fn exec_scope_unit(machine_name: &str, cwd: Option<&Path>) -> String {
+    exec_scope_unit_for_mission(machine_name, cwd, None)
+}
+
+fn exec_scope_unit_for_mission(
+    machine_name: &str,
+    cwd: Option<&Path>,
+    mission_id: Option<uuid::Uuid>,
+) -> String {
+    let rand = uuid::Uuid::new_v4().simple().to_string();
+    let rand8 = &rand[..8];
+    let tag = mission_id
+        .map(|id| format!("m{}", id.simple()))
+        .or_else(|| cwd.and_then(mission_tag_from_path));
+    match tag {
+        Some(tag) => format!("sandboxed-exec-{machine_name}-{tag}-{rand8}"),
+        None => format!("sandboxed-exec-{machine_name}-{rand8}"),
+    }
+}
+
+/// Unit name for a durable job scope. Durable scopes deliberately use a
+/// separate prefix and contain no mission tag: mission-end teardown only owns
+/// `sandboxed-exec-*`, while the durable-job registry owns and cancels these
+/// scopes explicitly.
+pub fn durable_scope_unit(machine_name: &str, job_id: uuid::Uuid) -> String {
+    format!("sandboxed-durable-{machine_name}-{}", job_id.simple())
+}
+
+/// Recover the 8-hex mission short id from an exec scope unit name produced
+/// by [`exec_scope_unit`]. Parses from the END (`…-m<8hex>-<rand8>.scope`) so
+/// machine-name segments can never false-positive. Returns `None` for
+/// legacy-named units (pre-mission-tag) and task-tagged units.
+pub fn mission_short_id_from_exec_unit(unit: &str) -> Option<String> {
+    let name = unit.strip_suffix(".scope").unwrap_or(unit);
+    let mut segs = name.rsplit('-');
+    let _rand = segs.next()?;
+    let tag = segs.next()?;
+    let rest = tag.strip_prefix('m')?;
+    if matches!(rest.len(), 8 | 32) && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(rest[..8].to_string())
+    } else {
+        None
+    }
+}
+
+/// Exact ownership check for newly generated exec scopes. Legacy 8-hex tags
+/// intentionally do not match: stopping them immediately would reintroduce
+/// the collision this check prevents; the ownership-aware periodic reaper
+/// handles those old scopes instead.
+pub fn exec_unit_belongs_to_mission(unit: &str, mission_id: uuid::Uuid) -> bool {
+    let name = unit.strip_suffix(".scope").unwrap_or(unit);
+    let mut segments = name.rsplit('-');
+    let _random = segments.next();
+    let Some(tag) = segments.next().and_then(|tag| tag.strip_prefix('m')) else {
+        return false;
+    };
+    tag.len() == 32
+        && tag.eq_ignore_ascii_case(&mission_id.simple().to_string())
+        && tag.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Recover the exact machine token from a per-exec scope name. Parsing from
+/// the right avoids ambiguous substring/prefix ownership matches when two
+/// user-controlled workspace names overlap.
+pub fn machine_name_from_exec_unit(unit: &str) -> Option<String> {
+    let name = unit
+        .strip_suffix(".scope")
+        .unwrap_or(unit)
+        .strip_prefix("sandboxed-exec-")?;
+    let (before_rand, rand) = name.rsplit_once('-')?;
+    if !matches!(rand.len(), 8 | 32) || !rand.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if let Some((machine, tag)) = before_rand.rsplit_once('-') {
+        let tagged = matches!(tag.len(), 9 | 33)
+            && matches!(tag.as_bytes().first(), Some(b'm' | b't'))
+            && tag[1..].chars().all(|c| c.is_ascii_hexdigit());
+        if tagged {
+            return Some(machine.to_string());
+        }
+    }
+    Some(before_rand.to_string())
 }
 
 /// systemd slice that hosts every mission scope. Putting all mission scopes
@@ -372,12 +504,180 @@ pub(crate) fn resolv_conf_nspawn_args() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ca_env_scrub_prelude, environ_has_keepalive_marker, normalize_container_path,
-        resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec,
-        CA_BUNDLE_ENV_VARS,
+        append_nsenter_target_root_arg, ca_env_scrub_prelude, durable_command_runs_on_api_host,
+        durable_scope_unit, environ_has_keepalive_marker, exec_scope_unit,
+        exec_scope_unit_for_mission, exec_unit_belongs_to_mission, machine_name_from_exec_unit,
+        mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
+        replace_command_env, resolv_conf_bind_args, synthesized_container_resolv_conf,
+        WorkspaceExec, WorkspaceType, CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
     use std::path::Path;
+    use tokio::process::Command;
+
+    #[test]
+    fn mission_tag_extracted_from_workspace_cwd() {
+        assert_eq!(
+            mission_tag_from_path(Path::new(
+                "/root/.sandboxed-sh/containers/dumbcontracts/workspaces/mission-4efda364/repo"
+            ))
+            .as_deref(),
+            Some("m4efda364")
+        );
+        assert_eq!(
+            mission_tag_from_path(Path::new("/workspaces/task-deadbeef")).as_deref(),
+            Some("tdeadbeef")
+        );
+        // Not 8 hex chars → no tag.
+        assert_eq!(
+            mission_tag_from_path(Path::new("/workspaces/mission-xyz")),
+            None
+        );
+        assert_eq!(
+            mission_tag_from_path(Path::new("/workspaces/mission-123456789")),
+            None
+        );
+        // User-controlled parent names must not override the actual mission
+        // directory immediately below `workspaces`.
+        assert_eq!(
+            mission_tag_from_path(Path::new(
+                "/srv/mission-deadbeef/containers/workspaces/mission-4EFDA364/repo"
+            ))
+            .as_deref(),
+            Some("m4efda364")
+        );
+        assert_eq!(
+            mission_tag_from_path(Path::new("/srv/mission-deadbeef/repo")),
+            None
+        );
+        assert_eq!(mission_tag_from_path(Path::new("/srv/monorepo")), None);
+    }
+
+    #[test]
+    fn exec_scope_unit_roundtrips_mission_short_id() {
+        let unit = exec_scope_unit(
+            "sandboxed-dumbcontracts-634e6d35",
+            Some(Path::new("/workspaces/mission-4efda364")),
+        );
+        assert!(unit.starts_with("sandboxed-exec-sandboxed-dumbcontracts-634e6d35-m4efda364-"));
+        assert_eq!(
+            mission_short_id_from_exec_unit(&format!("{unit}.scope")).as_deref(),
+            Some("4efda364")
+        );
+        assert_eq!(
+            mission_short_id_from_exec_unit(&unit).as_deref(),
+            Some("4efda364")
+        );
+
+        // Legacy naming (32-char random suffix, no tag) must not parse — the
+        // machine hash segment is 8 hex but lacks the `m` prefix.
+        assert_eq!(
+            mission_short_id_from_exec_unit(
+                "sandboxed-exec-sandboxed-dumbcontracts-634e6d35-000b8543a2244e49875a6bf64594dbc5.scope"
+            ),
+            None
+        );
+        // Task tags are not mission ids.
+        let task_unit = exec_scope_unit(
+            "sandboxed-misc-deadbeef",
+            Some(Path::new("/workspaces/task-01234567")),
+        );
+        assert_eq!(mission_short_id_from_exec_unit(&task_unit), None);
+        // No cwd → no tag, still unique-suffixed.
+        let bare = exec_scope_unit("sandboxed-misc-deadbeef", None);
+        assert_eq!(mission_short_id_from_exec_unit(&bare), None);
+        assert!(bare.starts_with("sandboxed-exec-sandboxed-misc-deadbeef-"));
+
+        assert_eq!(
+            machine_name_from_exec_unit(&format!("{unit}.scope")).as_deref(),
+            Some("sandboxed-dumbcontracts-634e6d35")
+        );
+        assert_eq!(
+            machine_name_from_exec_unit(&task_unit).as_deref(),
+            Some("sandboxed-misc-deadbeef")
+        );
+        assert_eq!(
+            machine_name_from_exec_unit(&bare).as_deref(),
+            Some("sandboxed-misc-deadbeef")
+        );
+        assert_eq!(
+            machine_name_from_exec_unit(
+                "sandboxed-exec-sandboxed-dumbcontracts-634e6d35-000b8543a2244e49875a6bf64594dbc5.scope"
+            )
+            .as_deref(),
+            Some("sandboxed-dumbcontracts-634e6d35")
+        );
+    }
+
+    #[test]
+    fn durable_scope_is_not_owned_by_mission_reaper() {
+        let id = uuid::Uuid::parse_str("df71826d-2060-44bd-b674-0ab16083e3b3").unwrap();
+        let unit = durable_scope_unit("sandboxed-dumbcontracts-634e6d35", id);
+
+        assert_eq!(
+            unit,
+            "sandboxed-durable-sandboxed-dumbcontracts-634e6d35-df71826d206044bdb6740ab16083e3b3"
+        );
+        assert_eq!(mission_short_id_from_exec_unit(&unit), None);
+        assert!(!unit.starts_with("sandboxed-exec-"));
+    }
+
+    #[tokio::test]
+    async fn durable_host_environment_replaces_service_environment() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env("API_ONLY_SECRET", "must-not-leak");
+        replace_command_env(
+            &mut cmd,
+            HashMap::from([("WORKSPACE_VALUE".to_string(), "visible".to_string())]),
+        );
+
+        let output = cmd.output().await.unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.lines().any(|line| line == "WORKSPACE_VALUE=visible"));
+        assert!(!stdout.contains("API_ONLY_SECRET"));
+        assert!(!stdout.contains("must-not-leak"));
+    }
+
+    #[test]
+    fn durable_container_fallback_replaces_service_environment() {
+        assert!(durable_command_runs_on_api_host(
+            WorkspaceType::Container,
+            false
+        ));
+        assert!(durable_command_runs_on_api_host(WorkspaceType::Host, false));
+        assert!(!durable_command_runs_on_api_host(
+            WorkspaceType::Container,
+            true
+        ));
+    }
+
+    #[test]
+    fn full_mission_scope_tag_prevents_short_id_collisions() {
+        let first = uuid::Uuid::parse_str("deadbeef-0000-4000-8000-000000000001").unwrap();
+        let collision = uuid::Uuid::parse_str("deadbeef-0000-4000-8000-000000000002").unwrap();
+        let unit = exec_scope_unit_for_mission(
+            "sandboxed-dumbcontracts-634e6d35",
+            Some(Path::new("/workspaces/mission-deadbeef")),
+            Some(first),
+        );
+
+        assert!(exec_unit_belongs_to_mission(&unit, first));
+        assert!(!exec_unit_belongs_to_mission(&unit, collision));
+        assert_eq!(
+            mission_short_id_from_exec_unit(&unit).as_deref(),
+            Some("deadbeef")
+        );
+        assert_eq!(
+            machine_name_from_exec_unit(&format!("{unit}.scope")).as_deref(),
+            Some("sandboxed-dumbcontracts-634e6d35")
+        );
+        let legacy = exec_scope_unit(
+            "sandboxed-dumbcontracts-634e6d35",
+            Some(Path::new("/workspaces/mission-deadbeef")),
+        );
+        assert!(!exec_unit_belongs_to_mission(&legacy, first));
+    }
 
     #[test]
     fn synthesized_resolv_conf_uses_public_dns_before_magic_dns() {
@@ -525,6 +825,18 @@ mod tests {
         assert!(!environ_has_keepalive_marker(
             b"PATH=/usr/bin\0SANDBOXED_SH_CONTAINER_KEEPALIVE=0\0HOME=/root\0"
         ));
+    }
+
+    #[test]
+    fn pty_nsenter_target_root_guard_precedes_shell_payload() {
+        let mut args = vec!["--pid".to_string()];
+        append_nsenter_target_root_arg(&mut args, true);
+        args.extend(["/bin/sh".to_string(), "-lc".to_string()]);
+        assert_eq!(args, ["--pid", "--root", "/bin/sh", "-lc"]);
+
+        let mut disabled = vec!["--pid".to_string()];
+        append_nsenter_target_root_arg(&mut disabled, false);
+        assert_eq!(disabled, ["--pid"]);
     }
 }
 
@@ -791,9 +1103,17 @@ impl WorkspaceExec {
         escaped
     }
 
+    fn valid_env_key(key: &str) -> bool {
+        !key.trim().is_empty()
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }
+
     /// Build a shell command with optional env var exports.
-    /// When `env` is provided, all env vars are exported before running the program.
-    /// This is needed for nsenter where env vars don't propagate into the container.
+    /// When `env` is provided, all env vars are exported before running the
+    /// program. nsenter callers intentionally pass `None` and use the child
+    /// process environment so credentials never appear in argv.
     fn build_shell_command_with_env(
         rel_cwd: &str,
         program: &str,
@@ -816,7 +1136,7 @@ impl WorkspaceExec {
                 if k.trim().is_empty() {
                     continue;
                 }
-                if !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                if !Self::valid_env_key(k) {
                     tracing::warn!(key = %k, "Skipping env var with invalid key characters");
                     continue;
                 }
@@ -942,7 +1262,7 @@ impl WorkspaceExec {
         cmd
     }
 
-    fn machine_name(&self) -> Option<String> {
+    pub(crate) fn machine_name(&self) -> Option<String> {
         machine_name_for_path(&self.workspace.path)
     }
 
@@ -1184,6 +1504,7 @@ impl WorkspaceExec {
         stdin: Stdio,
         stdout: Stdio,
         stderr: Stdio,
+        scope_unit: Option<&str>,
     ) -> anyhow::Result<Command> {
         let nsenter = if Path::new("/usr/bin/nsenter").exists() {
             "/usr/bin/nsenter"
@@ -1191,8 +1512,21 @@ impl WorkspaceExec {
             "nsenter"
         };
         let rel_cwd = self.rel_path_in_container(cwd);
-        // Build shell command with env exports - nsenter doesn't pass env vars
-        // into the container namespace, so we need to export them in the shell.
+        // nsenter preserves its caller's environment. Pass workspace variables
+        // through the process environment instead of embedding them in the
+        // shell argument: transient scope descriptions and process listings
+        // expose argv, and workspace variables commonly contain credentials.
+        let env: HashMap<_, _> = env
+            .into_iter()
+            .filter(|(key, _)| {
+                let valid = Self::valid_env_key(key);
+                if !valid {
+                    tracing::warn!(key = %key, "Skipping env var with invalid key characters");
+                }
+                valid
+            })
+            .collect();
+        let empty_env = HashMap::new();
         let shell_cmd = if tailscale_bootstrap {
             tracing::info!(
                 workspace = %self.workspace.name,
@@ -1203,13 +1537,12 @@ impl WorkspaceExec {
                 &rel_cwd,
                 program,
                 args,
-                &env,
+                &empty_env,
                 true,
                 tailnet_only,
             )
         } else {
-            let env_ref = if env.is_empty() { None } else { Some(&env) };
-            Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
+            Self::build_shell_command_with_env(&rel_cwd, program, args, None)
         };
         // Per-mission isolation, nsenter edition. `nsenter` only enters the
         // container's *namespaces* — the spawned process stays in the
@@ -1220,13 +1553,20 @@ impl WorkspaceExec {
         // container's own scope sat at 24G/2MB). Wrap each attach in its
         // own capped transient scope when `MISSION_MEMORY_MAX` is set.
         // The unit embeds the machine name so the API layer can find and
-        // retune every scope belonging to one workspace at runtime.
+        // retune every scope belonging to one workspace at runtime, plus the
+        // mission tag so mission-end teardown can stop exactly this
+        // mission's scopes.
         let caps = self.mission_resource_caps();
-        let exec_unit = format!(
-            "sandboxed-exec-{}-{}",
-            self.machine_name().unwrap_or_else(|| "unknown".to_string()),
-            uuid::Uuid::new_v4().simple()
-        );
+        let mission_id = env
+            .get("MISSION_ID")
+            .and_then(|value| uuid::Uuid::parse_str(value).ok());
+        let exec_unit = scope_unit.map(str::to_owned).unwrap_or_else(|| {
+            exec_scope_unit_for_mission(
+                &self.machine_name().unwrap_or_else(|| "unknown".to_string()),
+                Some(cwd),
+                mission_id,
+            )
+        });
         let mut cmd = if let Some(scope_args) = caps.scope_run_args(&exec_unit) {
             let mut c = Command::new("systemd-run");
             c.args(&scope_args);
@@ -1253,15 +1593,7 @@ impl WorkspaceExec {
         // existing deployment doesn't break on upgrade; once a host is
         // verified, set `SANDBOXED_SH_NSENTER_USE_TARGET_ROOT=1` in the env
         // file to flip the safe default on.
-        let use_target_root = std::env::var("SANDBOXED_SH_NSENTER_USE_TARGET_ROOT")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
+        let use_target_root = env_var_bool(NSENTER_USE_TARGET_ROOT_ENV, false);
         if use_target_root {
             // `--root` with no arg = use the *target* process's root, i.e.
             // the container rootfs. After this flag the new shell can only
@@ -1270,8 +1602,7 @@ impl WorkspaceExec {
         }
         cmd.args(["/bin/sh", "-lc"]);
         cmd.arg(shell_cmd);
-        // Note: env vars are now exported in the shell command, not here.
-        // Setting them here with cmd.envs() doesn't propagate into the container.
+        cmd.env_clear().envs(env);
         cmd.stdin(stdin).stdout(stdout).stderr(stderr);
         Ok(cmd)
     }
@@ -1286,6 +1617,7 @@ impl WorkspaceExec {
         stdin: Stdio,
         stdout: Stdio,
         stderr: Stdio,
+        scope_unit: Option<&str>,
     ) -> anyhow::Result<Command> {
         match self.workspace.workspace_type {
             WorkspaceType::Host => {
@@ -1376,6 +1708,7 @@ impl WorkspaceExec {
                     stdin,
                     stdout,
                     stderr,
+                    scope_unit,
                 )
             }
         }
@@ -1410,6 +1743,7 @@ impl WorkspaceExec {
                     Stdio::null(),
                     Stdio::piped(),
                     Stdio::piped(),
+                    None,
                 )
                 .await
                 .context("Failed to build workspace command")?;
@@ -1478,12 +1812,77 @@ impl WorkspaceExec {
                 Stdio::piped(), // Pipe stdin for processes that read input (e.g., Claude Code --print)
                 Stdio::piped(),
                 Stdio::piped(),
+                None,
             )
             .await
             .context("Failed to build workspace command")?;
 
         let child = cmd.spawn().context("Failed to spawn workspace command")?;
         Ok(child)
+    }
+
+    /// Spawn a workspace-aware command with caller-provided stdio.
+    ///
+    /// Durable jobs use file-backed stdout/stderr rather than pipes so they
+    /// can outlive the agent turn that launched them without blocking on an
+    /// abandoned pipe reader.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_with_stdio(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+        env: HashMap<String, String>,
+        stdin: Stdio,
+        stdout: Stdio,
+        stderr: Stdio,
+        durable_job_id: uuid::Uuid,
+    ) -> anyhow::Result<Child> {
+        let env = self.build_env(env);
+        let host_env = durable_command_runs_on_api_host(
+            self.workspace.workspace_type,
+            use_nspawn_for_workspace(&self.workspace),
+        )
+        .then(|| env.clone());
+        let scope_unit = self
+            .machine_name()
+            .map(|machine| durable_scope_unit(&machine, durable_job_id));
+        let mut cmd = self
+            .build_command(
+                cwd,
+                program,
+                args,
+                env,
+                stdin,
+                stdout,
+                stderr,
+                scope_unit.as_deref(),
+            )
+            .await
+            .context("Failed to build workspace command")?;
+        // Host and container-fallback durable jobs execute in the API host
+        // namespace, so unlike an nspawn/nsenter command there is no
+        // isolation boundary that drops the service process environment.
+        // Replace it explicitly with the workspace/job allowlist before
+        // spawning; otherwise a workspace owner could read API credentials
+        // through a durable job's logs.
+        if let Some(host_env) = host_env {
+            replace_command_env(&mut cmd, host_env);
+        }
+        // Durable-job cancellation targets the spawned process group. Give
+        // every workspace-aware launch its own session so cancelling a job
+        // cannot signal the API service's process group. Descendants of a
+        // systemd-run/nsenter wrapper inherit this group as well.
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd.spawn().context("Failed to spawn workspace command")
     }
 
     pub async fn spawn_streaming_pty(
@@ -1587,7 +1986,7 @@ impl WorkspaceExec {
         })
     }
 
-    /// Build the `(program, args)` for an *interactive* shell that joins this
+    /// Build the `(program, args, env)` for an *interactive* shell that joins this
     /// workspace's shared persistent container leader via `nsenter` — the same
     /// mechanism mission harnesses use (see [`Self::spawn_streaming_pty`]).
     ///
@@ -1605,7 +2004,7 @@ impl WorkspaceExec {
         program: &str,
         args: &[String],
         extra_env: HashMap<String, String>,
-    ) -> anyhow::Result<Option<(String, Vec<String>)>> {
+    ) -> anyhow::Result<Option<(String, Vec<String>, HashMap<String, String>)>> {
         if !(self.workspace.workspace_type == WorkspaceType::Container
             && use_nspawn_for_workspace(&self.workspace))
         {
@@ -1619,14 +2018,14 @@ impl WorkspaceExec {
         let invocation = self
             .build_container_nsenter_invocation(cwd, program, args, &mut env)
             .await?;
-        Ok(Some(invocation))
+        Ok(Some((invocation.0, invocation.1, env)))
     }
 
     /// Build the (program, args) tuple for spawning a command inside an
     /// nspawn container via nsenter. Also mutates `env` to add container
     /// defaults (HOME, SSH_AUTH_SOCK). The returned args end with
-    /// `"/bin/sh", "-lc", <shell_cmd>` where `shell_cmd` re-exports env and
-    /// execs the target program.
+    /// `"/bin/sh", "-lc", <shell_cmd>`. nsenter inherits the environment
+    /// applied to the returned command by [`Self::spawn_unix_pty`].
     async fn build_container_nsenter_invocation(
         &self,
         cwd: &Path,
@@ -1664,21 +2063,21 @@ impl WorkspaceExec {
         }
         .to_string();
         let rel_cwd = self.rel_path_in_container(cwd);
+        let empty_env = HashMap::new();
         let shell_cmd = if needs_tailscale_bootstrap {
             Self::build_tailscale_bootstrap_command(
                 &rel_cwd,
                 program,
                 args,
-                env,
+                &empty_env,
                 true,
                 nsenter_tailnet_only,
             )
         } else {
-            let env_ref = if env.is_empty() { None } else { Some(&*env) };
-            Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
+            Self::build_shell_command_with_env(&rel_cwd, program, args, None)
         };
 
-        let nsenter_args = vec![
+        let mut nsenter_args = vec![
             "--target".to_string(),
             leader,
             "--mount".to_string(),
@@ -1686,10 +2085,15 @@ impl WorkspaceExec {
             "--ipc".to_string(),
             "--net".to_string(),
             "--pid".to_string(),
-            "/bin/sh".to_string(),
-            "-lc".to_string(),
-            shell_cmd,
         ];
+        // Keep PTY launches under the same target-root guard as non-PTY
+        // nsenter. Entering only the mount namespace still retains the host
+        // root directory, allowing absolute paths to escape the container.
+        append_nsenter_target_root_arg(
+            &mut nsenter_args,
+            env_var_bool(NSENTER_USE_TARGET_ROOT_ENV, false),
+        );
+        nsenter_args.extend(["/bin/sh".to_string(), "-lc".to_string(), shell_cmd]);
 
         // Same cgroup-escape hatch as build_nsenter_command, PTY edition:
         // this invocation is what launches harness CLIs (claude/codex/…) for
@@ -1700,10 +2104,13 @@ impl WorkspaceExec {
         // --scope keeps the payload as its own foreground child, so PTY
         // semantics and group-kill teardown are preserved.
         let caps = self.mission_resource_caps();
-        let exec_unit = format!(
-            "sandboxed-exec-{}-{}",
-            self.machine_name().unwrap_or_else(|| "unknown".to_string()),
-            uuid::Uuid::new_v4().simple()
+        let mission_id = env
+            .get("MISSION_ID")
+            .and_then(|value| uuid::Uuid::parse_str(value).ok());
+        let exec_unit = exec_scope_unit_for_mission(
+            &self.machine_name().unwrap_or_else(|| "unknown".to_string()),
+            Some(cwd),
+            mission_id,
         );
         if let Some(scope_args) = caps.scope_run_args(&exec_unit) {
             let mut args = scope_args;
@@ -1766,9 +2173,14 @@ impl WorkspaceExec {
         if !args.is_empty() {
             cmd.args(args);
         }
-        // Inherit parent env, then apply workspace/mission overrides.
+        // Container commands must not inherit API-service credentials. The
+        // complete workspace environment is applied here and inherited by
+        // nsenter without ever appearing in its argv.
+        if self.workspace.workspace_type == WorkspaceType::Container {
+            cmd.env_clear();
+        }
         for (k, v) in env {
-            if k.trim().is_empty() {
+            if !Self::valid_env_key(k) {
                 continue;
             }
             cmd.env(k, v);

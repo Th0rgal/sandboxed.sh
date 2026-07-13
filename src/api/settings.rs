@@ -38,6 +38,8 @@ pub struct SettingsResponse {
     pub max_concurrent_tasks: Option<usize>,
     pub auto_cleanup_enabled: Option<bool>,
     pub auto_cleanup_days: Option<u32>,
+    pub auto_cleanup_stopped_days: Option<u32>,
+    pub auto_cleanup_orphans_enabled: Option<bool>,
     pub ask_assistant_model: Option<String>,
     pub metadata_model: Option<String>,
 }
@@ -51,6 +53,8 @@ impl From<Settings> for SettingsResponse {
             max_concurrent_tasks: settings.max_concurrent_tasks,
             auto_cleanup_enabled: settings.auto_cleanup_enabled,
             auto_cleanup_days: settings.auto_cleanup_days,
+            auto_cleanup_stopped_days: settings.auto_cleanup_stopped_days,
+            auto_cleanup_orphans_enabled: settings.auto_cleanup_orphans_enabled,
             ask_assistant_model: settings.ask_assistant_model,
             metadata_model: settings.metadata_model,
         }
@@ -72,6 +76,10 @@ pub struct UpdateSettingsRequest {
     pub auto_cleanup_enabled: Option<bool>,
     #[serde(default)]
     pub auto_cleanup_days: Option<u32>,
+    #[serde(default)]
+    pub auto_cleanup_stopped_days: Option<u32>,
+    #[serde(default)]
+    pub auto_cleanup_orphans_enabled: Option<bool>,
     /// Double-Option so a present `null` clears it (back to env/default).
     #[serde(default)]
     pub ask_assistant_model: Option<Option<String>>,
@@ -223,6 +231,19 @@ async fn update_settings(
             ));
         }
         new_settings.auto_cleanup_days = Some(value);
+    }
+    if let Some(value) = req.auto_cleanup_stopped_days {
+        // Same floor as auto_cleanup_days, for the same reason.
+        if value < 1 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "auto_cleanup_stopped_days must be at least 1".to_string(),
+            ));
+        }
+        new_settings.auto_cleanup_stopped_days = Some(value);
+    }
+    if let Some(value) = req.auto_cleanup_orphans_enabled {
+        new_settings.auto_cleanup_orphans_enabled = Some(value);
     }
     let mut metadata_model_changed = false;
     if let Some(value) = req.metadata_model {

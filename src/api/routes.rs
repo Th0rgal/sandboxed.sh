@@ -154,6 +154,9 @@ pub struct AppState {
     /// an active probe on dashboard demand and by passive `model_cooldown`
     /// capture on the proxy path. See [`super::codex_usage`].
     pub codex_usage: Arc<super::codex_usage::CodexUsageStore>,
+    /// Cached remote-runner-node statuses + recent dispatch outcomes, kept
+    /// fresh by the background fleet monitor (see `remote_node::monitor`).
+    pub fleet: Arc<crate::remote_node::FleetMonitor>,
 }
 
 /// Start the HTTP server.
@@ -523,7 +526,19 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         control_metrics: Arc::new(super::control_metrics::ControlMetrics::new()),
         provider_usage_cache: super::provider_usage_cache::ProviderUsageCache::new(),
         codex_usage: super::codex_usage::CodexUsageStore::new(),
+        fleet: Arc::new(crate::remote_node::FleetMonitor::new()),
     });
+
+    // Remote-node fleet monitor: periodic heartbeat polling so
+    // `/api/remote-nodes` and dispatch decisions read cached statuses
+    // (REMOTE_NODE_MONITOR_SECS, default 15s, 0 disables). Only spawned when
+    // remote nodes are enabled and configured.
+    if config.remote_nodes.enabled && !config.remote_nodes.nodes.is_empty() {
+        crate::remote_node::spawn_fleet_monitor(
+            Arc::clone(&state.fleet),
+            config.remote_nodes.clone(),
+        );
+    }
 
     // Start background refresh of provider rate-limit / usage info so the
     // dashboard always reads a fresh-enough cache.
@@ -564,6 +579,18 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // `auto_cleanup_enabled` in settings). No-op if the setting is off, so
     // it's safe to always spawn.
     super::mission_workspace_gc::spawn(Arc::clone(&state));
+
+    // Disk-usage watcher: logs + Paloma-webhook alerts on Warn/Critical
+    // crossings, recovery notice on the way back down.
+    super::disk_watch::spawn(Arc::clone(&state));
+
+    // Zombie-scope reaper: stops leftover sandboxed-exec-*.scope units whose
+    // mission no longer needs a live harness (see scope_reaper docs).
+    super::scope_reaper::spawn(Arc::clone(&state));
+
+    // Re-attach poll loops for async remote jobs that were in flight when
+    // the previous process exited (durable handles in remote-jobs.json).
+    super::control::spawn_remote_job_reconciler(Arc::clone(&state));
 
     // Start background OAuth token refresher task
     {
@@ -656,7 +683,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // (verify_spark_offload_token), NOT the dashboard JWT — so it must
         // bypass require_auth like the /v1 proxy, otherwise the in-workspace
         // spark-build wrapper's token is rejected at the auth layer.
-        .nest("/api/spark", super::spark::routes());
+        .nest("/api/spark", super::spark::routes())
+        // Remote lean-build dispatch: same per-mission HMAC capability-token
+        // model as spark (domain-separated), verified inside the handlers,
+        // so it also bypasses require_auth.
+        .nest("/api/remote-build", super::remote_build::routes());
 
     // File upload routes with increased body limit (10GB)
     let upload_route = Router::new()
@@ -1388,47 +1419,33 @@ async fn health(State(state): State<Arc<AppState>>) -> (HeaderMap, Json<HealthRe
     )
 }
 
-/// List configured remote runner nodes with live heartbeat status.
+/// List configured remote runner nodes with cached fleet status.
+///
+/// Statuses come from the background fleet monitor's cache. A node the
+/// monitor has never probed (monitor disabled via `REMOTE_NODE_MONITOR_SECS=0`
+/// or just started) is probed on demand once so the endpoint stays useful,
+/// and the result seeds the shared cache.
 async fn list_remote_nodes(
     State(state): State<Arc<AppState>>,
-) -> Json<Vec<crate::remote_node::NodeStatus>> {
-    let client = crate::remote_node::RemoteNodeClient::default();
-    let mut statuses = Vec::new();
-    for node in &state.config.remote_nodes.nodes {
-        let mut status = crate::remote_node::NodeStatus {
-            id: node.id.clone(),
-            base_url: node.base_url.clone(),
-            token_env: node.token_env.clone(),
-            online: false,
-            capacity_total: None,
-            capacity_available: None,
-            active_leases: None,
-            version: None,
-            error: None,
-        };
-        match std::env::var(&node.token_env)
-            .ok()
-            .filter(|token| !token.trim().is_empty())
-        {
-            Some(token) => match client.heartbeat(node, &token).await {
-                Ok(heartbeat) => {
-                    status.online = heartbeat.online;
-                    status.capacity_total = Some(heartbeat.capacity_total);
-                    status.capacity_available = Some(heartbeat.capacity_available);
-                    status.active_leases = Some(heartbeat.active_leases);
-                    status.version = Some(heartbeat.version);
-                }
-                Err(err) => {
-                    status.error = Some(err.to_string());
-                }
-            },
-            None => {
-                status.error = Some(format!("missing token env {}", node.token_env));
-            }
+) -> Json<crate::remote_node::RemoteNodesResponse> {
+    let settings = &state.config.remote_nodes;
+    let mut nodes = Vec::new();
+    for node in &settings.nodes {
+        if state.fleet.get(&node.id).is_none() {
+            let client = crate::remote_node::RemoteNodeClient::default();
+            crate::remote_node::probe_node(&state.fleet, &client, node).await;
         }
-        statuses.push(status);
+        let cached = state.fleet.get(&node.id);
+        nodes.push(crate::remote_node::RemoteNodeView::from_cache(
+            node,
+            cached.as_ref(),
+        ));
     }
-    Json(statuses)
+    Json(crate::remote_node::RemoteNodesResponse {
+        enabled: settings.enabled,
+        nodes,
+        recent_jobs: state.fleet.recent_outcomes(10),
+    })
 }
 
 /// Optional query parameters for the stats endpoint.
