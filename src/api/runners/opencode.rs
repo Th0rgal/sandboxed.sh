@@ -525,11 +525,11 @@ pub async fn run_opencode_turn(
     // Allow opting out of the per-mission XDG override when an operator
     // explicitly wants the opencode CLI to share storage with the host (e.g.
     // for debugging with `opencode session list` on the host shell).
-    if std::env::var("SANDBOXED_SH_OPENCODE_SHARED_XDG")
+    let shared_opencode_xdg = std::env::var("SANDBOXED_SH_OPENCODE_SHARED_XDG")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .is_some()
-    {
+        .is_some();
+    if shared_opencode_xdg {
         env.remove("XDG_CONFIG_HOME");
         env.remove("XDG_DATA_HOME");
         env.remove("XDG_STATE_HOME");
@@ -583,7 +583,8 @@ pub async fn run_opencode_turn(
         env.insert("PATH".to_string(), path_parts.join(":"));
     }
 
-    let opencode_auth = sync_opencode_auth_to_workspace(workspace, app_working_dir);
+    let opencode_auth =
+        sync_opencode_auth_to_workspace(workspace, app_working_dir, work_dir, shared_opencode_xdg);
 
     // Allow per-mission OpenCode server port; default to an allocated free port.
     let requested_port = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_PORT")

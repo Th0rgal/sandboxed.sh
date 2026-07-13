@@ -5373,11 +5373,53 @@ fn write_json_file(path: &std::path::Path, value: &serde_json::Value) -> std::io
     std::fs::write(path, contents)
 }
 
+fn selected_opencode_auth_path(
+    work_dir: &std::path::Path,
+    shared_path: Option<std::path::PathBuf>,
+    shared_xdg: bool,
+) -> Option<std::path::PathBuf> {
+    if shared_xdg {
+        shared_path
+    } else {
+        Some(
+            work_dir
+                .join(".local")
+                .join("share")
+                .join("opencode")
+                .join("auth.json"),
+        )
+    }
+}
+
+fn selected_opencode_provider_auth_dir(
+    work_dir: &std::path::Path,
+    shared_path: Option<std::path::PathBuf>,
+    shared_xdg: bool,
+) -> Option<std::path::PathBuf> {
+    if shared_xdg {
+        shared_path
+    } else {
+        Some(work_dir.join(".opencode").join("auth"))
+    }
+}
+
 pub(crate) fn sync_opencode_auth_to_workspace(
     workspace: &Workspace,
     app_working_dir: &std::path::Path,
+    work_dir: &std::path::Path,
+    shared_xdg: bool,
 ) -> Option<serde_json::Value> {
     let mut auth_json: Option<serde_json::Value> = None;
+    let auth_path = selected_opencode_auth_path(
+        work_dir,
+        workspace_opencode_auth_path(workspace),
+        shared_xdg,
+    );
+    let provider_auth_dir = selected_opencode_provider_auth_dir(
+        work_dir,
+        workspace_opencode_provider_auth_dir(workspace),
+        shared_xdg,
+    );
 
     if let Some(source_path) = host_opencode_auth_path() {
         if let Ok(contents) = std::fs::read_to_string(&source_path) {
@@ -5386,8 +5428,8 @@ pub(crate) fn sync_opencode_auth_to_workspace(
             }
         }
 
-        if let Some(dest_path) = workspace_opencode_auth_path(workspace) {
-            if dest_path != source_path && source_path.exists() {
+        if let Some(dest_path) = auth_path.as_ref() {
+            if dest_path.as_path() != source_path.as_path() && source_path.exists() {
                 if let Some(parent) = dest_path.parent() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
                         tracing::warn!(
@@ -5397,7 +5439,7 @@ pub(crate) fn sync_opencode_auth_to_workspace(
                         );
                     }
                 }
-                if let Err(e) = std::fs::copy(&source_path, &dest_path) {
+                if let Err(e) = std::fs::copy(&source_path, dest_path) {
                     tracing::warn!(
                         "Failed to copy OpenCode auth.json to workspace {}: {}",
                         dest_path.display(),
@@ -5411,8 +5453,8 @@ pub(crate) fn sync_opencode_auth_to_workspace(
     if auth_json.is_none() {
         auth_json = build_opencode_auth_from_ai_providers(app_working_dir);
         if let Some(ref value) = auth_json {
-            if let Some(dest_path) = workspace_opencode_auth_path(workspace) {
-                if let Err(e) = write_json_file(&dest_path, value) {
+            if let Some(dest_path) = auth_path.as_ref() {
+                if let Err(e) = write_json_file(dest_path, value) {
                     tracing::warn!(
                         "Failed to write OpenCode auth.json to workspace {}: {}",
                         dest_path.display(),
@@ -5432,10 +5474,9 @@ pub(crate) fn sync_opencode_auth_to_workspace(
         "cerebras",
         "minimax",
     ];
-    if let (Some(src_dir), Some(dest_dir)) = (
-        host_opencode_provider_auth_dir(),
-        workspace_opencode_provider_auth_dir(workspace),
-    ) {
+    if let (Some(src_dir), Some(dest_dir)) =
+        (host_opencode_provider_auth_dir(), provider_auth_dir.clone())
+    {
         for provider in providers {
             let src = src_dir.join(format!("{}.json", provider));
             if !src.exists() {
@@ -5464,8 +5505,8 @@ pub(crate) fn sync_opencode_auth_to_workspace(
     }
 
     // Merge provider auth files into auth.json for env export (e.g., XAI_API_KEY)
-    if let Some(provider_dir) = workspace_opencode_provider_auth_dir(workspace) {
-        let provider_entries = load_provider_auth_entries(&provider_dir);
+    if let Some(provider_dir) = provider_auth_dir.as_ref() {
+        let provider_entries = load_provider_auth_entries(provider_dir);
         if !provider_entries.is_empty() {
             let mut merged = match auth_json.take() {
                 Some(serde_json::Value::Object(map)) => map,
@@ -5477,9 +5518,9 @@ pub(crate) fn sync_opencode_auth_to_workspace(
             }
             auth_json = Some(serde_json::Value::Object(merged));
 
-            if let Some(dest_path) = workspace_opencode_auth_path(workspace) {
+            if let Some(dest_path) = auth_path.as_ref() {
                 if let Some(ref value) = auth_json {
-                    if let Err(e) = write_json_file(&dest_path, value) {
+                    if let Err(e) = write_json_file(dest_path, value) {
                         tracing::warn!(
                             "Failed to write merged OpenCode auth.json to workspace {}: {}",
                             dest_path.display(),
@@ -5491,10 +5532,7 @@ pub(crate) fn sync_opencode_auth_to_workspace(
         }
     }
 
-    if let (Some(value), Some(dest_dir)) = (
-        auth_json.as_ref(),
-        workspace_opencode_provider_auth_dir(workspace),
-    ) {
+    if let (Some(value), Some(dest_dir)) = (auth_json.as_ref(), provider_auth_dir) {
         let provider_entries = [
             ("openai", "OpenAI"),
             ("anthropic", "Anthropic"),
@@ -8315,6 +8353,7 @@ mod tests {
         parse_opencode_stderr_text_part, preferred_model_for_cost, preferred_opencode_bin_dir,
         prepend_unique_path_entry, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, running_health, sanitized_opencode_stdout,
+        selected_opencode_auth_path, selected_opencode_provider_auth_dir,
         set_codex_account_cooldown, should_sync_container_opencode, stall_severity,
         strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
         summarize_codex_usage_caps, summarize_recent_opencode_stderr,
@@ -8338,6 +8377,30 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn isolated_opencode_auth_follows_the_mission_xdg_paths() {
+        let work_dir = std::path::Path::new("/containers/demo/workspaces/mission-abcd");
+        let shared_auth = std::path::PathBuf::from("/containers/demo/root/auth.json");
+        let shared_providers = std::path::PathBuf::from("/containers/demo/root/.opencode/auth");
+
+        assert_eq!(
+            selected_opencode_auth_path(work_dir, Some(shared_auth.clone()), false),
+            Some(work_dir.join(".local/share/opencode/auth.json"))
+        );
+        assert_eq!(
+            selected_opencode_provider_auth_dir(work_dir, Some(shared_providers.clone()), false),
+            Some(work_dir.join(".opencode/auth"))
+        );
+        assert_eq!(
+            selected_opencode_auth_path(work_dir, Some(shared_auth.clone()), true),
+            Some(shared_auth)
+        );
+        assert_eq!(
+            selected_opencode_provider_auth_dir(work_dir, Some(shared_providers.clone()), true),
+            Some(shared_providers)
+        );
+    }
 
     #[test]
     fn curl_dependency_error_detects_missing_curl() {
