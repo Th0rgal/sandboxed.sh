@@ -26,6 +26,8 @@ use super::{auth::AuthUser, control::control_for_user, routes::AppState};
 use crate::workspace::WorkspaceType;
 use crate::workspace_exec::WorkspaceExec;
 
+const PIDLESS_START_GRACE_SECS: i64 = 30;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DurableJobStatus {
@@ -264,7 +266,13 @@ pub(crate) async fn terminal_for_mission(
 
     // If neither watcher nor wrapper could persist a terminal record, a dead
     // supervisor still requires owner attention rather than infinite polling.
-    Ok(job.pid.is_some_and(|pid| !process_alive(pid)))
+    // Keep a short grace for the normal start_job window between the initial
+    // record and the post-spawn PID update. After a restart that update can no
+    // longer arrive, so an older pidless record must wake its owner too.
+    Ok(match job.pid {
+        Some(pid) => !process_alive(pid),
+        None => (Utc::now() - job.updated_at).num_seconds() >= PIDLESS_START_GRACE_SECS,
+    })
 }
 
 fn job_dir(state: &AppState, id: Uuid) -> PathBuf {
@@ -973,6 +981,16 @@ mod tests {
             .await
             .unwrap_err()
             .contains("not owned"));
+
+        job.updated_at = Utc::now() - chrono::Duration::seconds(PIDLESS_START_GRACE_SECS + 1);
+        std::fs::write(
+            registry_dir.join("job.json"),
+            serde_json::to_vec(&job).unwrap(),
+        )
+        .unwrap();
+        assert!(terminal_for_mission(dir.path(), job.id, mission_id)
+            .await
+            .unwrap());
 
         let exit = ExitRecord {
             exit_code: Some(0),
