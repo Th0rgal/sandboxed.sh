@@ -1204,7 +1204,9 @@ mcp_servers:
       JWT_SECRET: {jwt_secret}
       HERMES_ASSISTANT_USER_ID: {user_id}
       HERMES_DEFAULT_WORKSPACE_ID: {default_workspace_id}
-    timeout: 120
+    # Ask turns can make multiple sequential LLM/tool calls. Keep the MCP
+    # request alive long enough for the synchronous /ask endpoint to finish.
+    timeout: 600
     connect_timeout: 15
     tools:
       include:
@@ -1214,6 +1216,7 @@ mcp_servers:
         - get_mission_events
         - start_mission
         - send_message_to_mission
+        - ask_mission
         - cancel_mission
         - list_workspaces
       prompts: false
@@ -4652,11 +4655,30 @@ fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::conve
 mod tests {
     use super::{
         evaluate_debounce, evaluate_deploy_request, expand_hermes_env_refs, extract_version_token,
-        hermes_config_base_url, hermes_config_model_label, hermes_uses_native_codex,
-        is_safe_repo_path, normalize_repo_path, prune_deploy_backups, select_repo_path,
-        systemd_service_component_from_states, ComponentStatus, DebounceDecision, DeployRefusal,
-        DEPLOY_DEBOUNCE_SECS,
+        hermes_config_base_url, hermes_config_model_label, hermes_config_yaml,
+        hermes_uses_native_codex, is_safe_repo_path, normalize_repo_path, prune_deploy_backups,
+        select_repo_path, systemd_service_component_from_states, ComponentStatus, DebounceDecision,
+        DeployRefusal, DEPLOY_DEBOUNCE_SECS,
     };
+
+    #[test]
+    fn generated_hermes_config_allows_long_ask_turns() {
+        let yaml = hermes_config_yaml(
+            "hermes-test",
+            "model",
+            "http://api.invalid",
+            "test-key",
+            "/usr/local/bin/assistant-mcp",
+            "http://127.0.0.1:3000",
+            "test-jwt-secret",
+            "test-user",
+            "00000000-0000-0000-0000-000000000000",
+        );
+
+        assert!(yaml.contains("    timeout: 600\n"));
+        assert!(!yaml.contains("    timeout: 120\n"));
+        assert!(yaml.contains("        - ask_mission\n"));
+    }
 
     #[tokio::test]
     async fn prune_deploy_backups_keeps_newest_and_anchors_prefix() {

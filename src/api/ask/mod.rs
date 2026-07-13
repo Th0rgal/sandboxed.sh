@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::api::mission_store::MissionStore;
 use crate::api::proxy_keys::SharedProxyApiKeyStore;
 use crate::api::runners::{effective_mid_turn_kind, MidTurnKind};
-use crate::workspace::SharedWorkspaceStore;
+use crate::workspace::{use_nspawn_for_workspace, SharedWorkspaceStore, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
 
 pub use client::AskClient;
@@ -562,7 +562,9 @@ async fn build_system_prompt(turn: &AskTurn, user_content: &str) -> String {
         ""
     };
 
-    let cwd = turn.work_dir.display();
+    let cwd = turn
+        .workspace_exec
+        .translate_path_for_container(&turn.work_dir);
     format!(
         "You are the Ask co-pilot for an autonomous coding mission. A separate \
          \"working agent\" is doing the real work in this same workspace; you are a \
@@ -1418,9 +1420,13 @@ pub async fn prepend_pending_operator_notes(
 /// `None` for an explicit sandbox request as an error rather than silently
 /// running against the live tree.
 pub async fn prepare_sandbox(exec: &WorkspaceExec, base_work_dir: &Path) -> Option<PathBuf> {
-    let sandbox = PathBuf::from(format!("/tmp/ask-sandbox-{}", Uuid::new_v4()));
-    let base_str = base_work_dir.to_string_lossy().to_string();
-    let sandbox_str = sandbox.to_string_lossy().to_string();
+    let sandbox_guest = PathBuf::from(format!("/tmp/ask-sandbox-{}", Uuid::new_v4()));
+    let sandbox_host = sandbox_host_path(exec, &sandbox_guest);
+    // Shell snippets execute in the workspace context. For nspawn workspaces,
+    // interpolating host paths here makes both `git -C` and `test -d` point at
+    // paths that do not exist in the guest, so every sandbox request fails.
+    let base_str = exec.translate_path_for_container(base_work_dir);
+    let sandbox_str = sandbox_guest.to_string_lossy().to_string();
     let is_git_cmd = format!(
         "git -C {b} rev-parse --git-dir >/dev/null 2>&1",
         b = single_quote(&base_str)
@@ -1452,15 +1458,22 @@ pub async fn prepare_sandbox(exec: &WorkspaceExec, base_work_dir: &Path) -> Opti
                 if out.status.success()
                     && String::from_utf8_lossy(&out.stdout).contains("SANDBOX_OK") =>
             {
-                Some(sandbox)
+                Some(sandbox_host)
             }
-            _ => None,
+            Ok(out) => {
+                log_sandbox_command_failure("copy", &out);
+                None
+            }
+            Err(error) => {
+                tracing::warn!(stage = "copy", %error, "Ask sandbox command failed to start");
+                None
+            }
         };
     }
 
     let cmd = format!(
         "git -C {b} rev-parse --git-dir >/dev/null 2>&1 && \
-         git -C {b} worktree add --detach {s} HEAD >/dev/null 2>&1 && \
+         git -C {b} worktree add --detach {s} HEAD >/dev/null && \
          echo SANDBOX_OK",
         b = single_quote(&base_str),
         s = single_quote(&sandbox_str)
@@ -1474,17 +1487,57 @@ pub async fn prepare_sandbox(exec: &WorkspaceExec, base_work_dir: &Path) -> Opti
             if out.status.success()
                 && String::from_utf8_lossy(&out.stdout).contains("SANDBOX_OK") =>
         {
-            Some(sandbox)
+            Some(sandbox_host)
         }
-        _ => None,
+        Ok(out) => {
+            log_sandbox_command_failure("git-worktree", &out);
+            None
+        }
+        Err(error) => {
+            tracing::warn!(stage = "git-worktree", %error, "Ask sandbox command failed to start");
+            None
+        }
     }
+}
+
+fn sandbox_host_path(exec: &WorkspaceExec, guest_path: &Path) -> PathBuf {
+    sandbox_host_path_for_context(
+        &exec.workspace.path,
+        exec.workspace.workspace_type == WorkspaceType::Container
+            && use_nspawn_for_workspace(&exec.workspace),
+        guest_path,
+    )
+}
+
+fn sandbox_host_path_for_context(
+    workspace_root: &Path,
+    nspawn_container: bool,
+    guest_path: &Path,
+) -> PathBuf {
+    if nspawn_container {
+        workspace_root.join(guest_path.strip_prefix("/").unwrap_or(guest_path))
+    } else {
+        guest_path.to_path_buf()
+    }
+}
+
+fn log_sandbox_command_failure(stage: &str, output: &std::process::Output) {
+    // Keep diagnostics bounded: command stderr can contain large git output,
+    // while paths and exit status are enough to diagnose sandbox preparation.
+    let stderr = truncate(String::from_utf8_lossy(&output.stderr).trim(), 2_000);
+    tracing::warn!(
+        stage,
+        status = ?output.status,
+        stderr,
+        "Ask sandbox preparation failed"
+    );
 }
 
 /// Tear down a sandbox created by [`prepare_sandbox`]. Best-effort: removes the
 /// git worktree if it is one, otherwise `rm -rf`s the copy.
 pub async fn cleanup_sandbox(exec: &WorkspaceExec, base_work_dir: &Path, sandbox: &Path) {
-    let base_str = base_work_dir.to_string_lossy().to_string();
-    let sandbox_str = sandbox.to_string_lossy().to_string();
+    let base_str = exec.translate_path_for_container(base_work_dir);
+    let sandbox_str = exec.translate_path_for_container(sandbox);
     let cmd = format!(
         "git -C {b} worktree remove --force {s} 2>/dev/null || rm -rf {s}",
         b = single_quote(&base_str),
@@ -1558,6 +1611,39 @@ fn message_mentions_secret(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nspawn_sandbox_keeps_distinct_host_and_guest_paths() {
+        let root = Path::new("/srv/containers/demo");
+        let guest = Path::new("/tmp/ask-sandbox-test");
+
+        // The old implementation returned the guest path as the host cwd.
+        // WorkspaceExec cannot relativize it to the container root and would
+        // therefore translate it to `/`.
+        let old_relative = guest.strip_prefix(root).unwrap_or_else(|_| Path::new(""));
+        let old_translation = if old_relative.as_os_str().is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", old_relative.display())
+        };
+        assert_eq!(old_translation, "/");
+
+        let host = sandbox_host_path_for_context(root, true, guest);
+        assert_eq!(host, root.join("tmp/ask-sandbox-test"));
+        assert_eq!(
+            format!("/{}", host.strip_prefix(root).unwrap().display()),
+            guest.display().to_string()
+        );
+    }
+
+    #[test]
+    fn host_sandbox_uses_the_execution_path_directly() {
+        let guest = Path::new("/tmp/ask-sandbox-test");
+        assert_eq!(
+            sandbox_host_path_for_context(Path::new("/ignored"), false, guest),
+            guest
+        );
+    }
 
     async fn temp_store() -> Arc<AskStore> {
         let path = std::env::temp_dir().join(format!("ask-bridge-{}.db", Uuid::new_v4()));
