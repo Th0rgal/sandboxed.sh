@@ -304,7 +304,7 @@ async fn resolve_node(
 fn submit_error_status(err: &RemoteNodeError) -> StatusCode {
     match err {
         RemoteNodeError::Rejected { status, .. }
-            if (400..500).contains(status) && !matches!(*status, 408 | 429) =>
+            if (400..500).contains(status) && !matches!(*status, 401 | 403 | 408 | 429) =>
         {
             StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST)
         }
@@ -763,6 +763,15 @@ mod tests {
             }),
             StatusCode::SERVICE_UNAVAILABLE
         );
+        for status in [401, 403] {
+            assert_eq!(
+                submit_error_status(&RemoteNodeError::Rejected {
+                    status,
+                    body: "node token rejected".to_string(),
+                }),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
         assert_eq!(
             submit_error_status(&RemoteNodeError::Request("offline".to_string())),
             StatusCode::SERVICE_UNAVAILABLE
