@@ -130,6 +130,58 @@ fn environ_has_keepalive_marker(environ: &[u8]) -> bool {
         .any(|entry| entry == expected.as_bytes())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn nspawn_directory_from_cmdline(cmdline: &[u8]) -> Option<PathBuf> {
+    let args: Vec<&[u8]> = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .collect();
+    let program = std::str::from_utf8(args.first()?).ok()?;
+    if Path::new(program).file_name()?.to_str()? != "systemd-nspawn" {
+        return None;
+    }
+    for (index, arg) in args.iter().enumerate().skip(1) {
+        if *arg == b"-D" || *arg == b"--directory" {
+            return std::str::from_utf8(args.get(index + 1)?)
+                .ok()
+                .map(PathBuf::from);
+        }
+        if let Some(value) = arg.strip_prefix(b"--directory=") {
+            return std::str::from_utf8(value).ok().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn find_nspawn_pid_by_canonical_root(root: &Path) -> Option<String> {
+    let expected = root.canonicalize().ok()?;
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let pid = entry.file_name();
+        let Some(pid) = pid.to_str() else {
+            continue;
+        };
+        if !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let Some(directory) = nspawn_directory_from_cmdline(&cmdline) else {
+            continue;
+        };
+        if directory.canonicalize().ok().as_deref() == Some(expected.as_path()) {
+            return Some(pid.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn find_nspawn_pid_by_canonical_root(_root: &Path) -> Option<String> {
+    None
+}
+
 fn append_nsenter_target_root_arg(args: &mut Vec<String>, enabled: bool) {
     if enabled {
         args.push("--root".to_string());
@@ -508,11 +560,11 @@ mod tests {
         durable_scope_unit, environ_has_keepalive_marker, exec_scope_unit,
         exec_scope_unit_for_mission, exec_unit_belongs_to_mission, machine_name_from_exec_unit,
         mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
-        replace_command_env, resolv_conf_bind_args, synthesized_container_resolv_conf,
-        WorkspaceExec, WorkspaceType, CA_BUNDLE_ENV_VARS,
+        nspawn_directory_from_cmdline, replace_command_env, resolv_conf_bind_args,
+        synthesized_container_resolv_conf, WorkspaceExec, WorkspaceType, CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tokio::process::Command;
 
     #[test]
@@ -825,6 +877,26 @@ mod tests {
         assert!(!environ_has_keepalive_marker(
             b"PATH=/usr/bin\0SANDBOXED_SH_CONTAINER_KEEPALIVE=0\0HOME=/root\0"
         ));
+    }
+
+    #[test]
+    fn nspawn_cmdline_directory_supports_short_and_long_forms() {
+        assert_eq!(
+            nspawn_directory_from_cmdline(
+                b"/usr/bin/systemd-nspawn\0-D\0/var/lib/containers/assistant\0--quiet\0"
+            ),
+            Some(PathBuf::from("/var/lib/containers/assistant"))
+        );
+        assert_eq!(
+            nspawn_directory_from_cmdline(
+                b"systemd-nspawn\0--directory=/root/.sandboxed-sh/containers/assistant\0"
+            ),
+            Some(PathBuf::from("/root/.sandboxed-sh/containers/assistant"))
+        );
+        assert_eq!(
+            nspawn_directory_from_cmdline(b"/usr/bin/bash\0-D\0/tmp/not-a-container\0"),
+            None
+        );
     }
 
     #[test]
@@ -1318,7 +1390,14 @@ impl WorkspaceExec {
                 }
             }
         }
-        let nspawn_pid = nspawn_pid?;
+        // Multiple API services can refer to the same container through
+        // different symlinked roots (for example prod and dev). pgrep only
+        // sees the spelling used by the service that started nspawn, so fall
+        // back to canonicalizing every live nspawn `-D` argument before
+        // deciding that no durable leader exists. Starting a second nspawn on
+        // the same root otherwise waits and eventually fails as "tree busy".
+        let nspawn_pid =
+            nspawn_pid.or_else(|| find_nspawn_pid_by_canonical_root(&self.workspace.path))?;
         let child_pids = Command::new("pgrep")
             .args(["-P", &nspawn_pid])
             .output()
