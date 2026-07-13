@@ -294,6 +294,19 @@ impl AutomationManagerMcp {
                             "type": "object",
                             "description": "Optional variable substitutions",
                             "additionalProperties": {"type": "string"}
+                        },
+                        "stop_policy": {
+                            "type": "object",
+                            "description": "Optional lifecycle policy. One-shot durable wakeups use {\"type\":\"after_first_fire\"}.",
+                            "properties": {
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["never", "when_failing_consecutively", "when_all_issues_closed_and_prs_merged", "after_first_fire"]
+                                },
+                                "count": {"type": "integer", "minimum": 1},
+                                "repo": {"type": "string"}
+                            },
+                            "required": ["type"]
                         }
                     }
                 }),
@@ -324,9 +337,22 @@ impl AutomationManagerMcp {
                             "description": "New retry configuration (optional)"
                         },
                         "stop_policy": {
+                            "type": "object",
+                            "description": "New lifecycle policy (optional)",
+                            "properties": {
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["never", "when_failing_consecutively", "when_all_issues_closed_and_prs_merged", "after_first_fire"]
+                                },
+                                "count": {"type": "integer", "minimum": 1},
+                                "repo": {"type": "string"}
+                            },
+                            "required": ["type"]
+                        },
+                        "fresh_session": {
                             "type": "string",
-                            "description": "New stop policy (optional)",
-                            "enum": ["never", "on_mission_completed", "on_terminal_any"]
+                            "enum": ["keep", "always", "switch"],
+                            "description": "New session policy (optional)"
                         },
                         "active": {"type": "boolean", "description": "Enable or disable automation"}
                     }
@@ -851,5 +877,40 @@ async fn main() {
             eprintln!("[automation-mcp] Failed to serialize response");
         }
         stdout.flush().ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_schema_matches_tagged_stop_policy_contract() {
+        let tool = AutomationManagerMcp::get_tools()
+            .into_iter()
+            .find(|tool| tool.name == "update_automation")
+            .expect("update_automation tool");
+        let policy = &tool.input_schema["properties"]["stop_policy"];
+
+        assert_eq!(policy["type"], "object");
+        let variants = policy["properties"]["type"]["enum"]
+            .as_array()
+            .expect("stop policy variants");
+        assert!(variants.iter().any(|value| value == "after_first_fire"));
+        assert!(variants
+            .iter()
+            .any(|value| value == "when_failing_consecutively"));
+
+        let params: UpdateAutomationParams = serde_json::from_value(json!({
+            "id": Uuid::nil().to_string(),
+            "stop_policy": {"type": "after_first_fire"},
+            "fresh_session": "keep"
+        }))
+        .expect("schema-advertised payload must deserialize");
+        assert!(matches!(
+            params.stop_policy,
+            Some(StopPolicy::AfterFirstFire)
+        ));
+        assert!(matches!(params.fresh_session, Some(FreshSession::Keep)));
     }
 }
