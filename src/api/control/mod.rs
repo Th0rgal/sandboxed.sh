@@ -157,9 +157,12 @@ pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
 }
 
 fn remote_node_needs_on_demand_probe(
-    status: Option<&crate::remote_node::RemoteNodeStatus>,
+    _status: Option<&crate::remote_node::RemoteNodeStatus>,
 ) -> bool {
-    status.is_none_or(|status| *status != crate::remote_node::RemoteNodeStatus::Online)
+    // Auto-placement has already rejected the cached fleet. Even an Online
+    // heartbeat may carry stale load or resource figures, so refresh every
+    // configured node once before returning 503.
+    true
 }
 
 fn should_finalize_remote_job(inactive_status: Option<MissionStatus>) -> bool {
@@ -5260,7 +5263,8 @@ pub async fn create_mission(
                     Err(initial_err) => {
                         // The periodic monitor may be disabled, or this request
                         // may race its first heartbeat. Match `/api/remote-build`:
-                        // re-probe missing and non-online nodes, then retry
+                        // re-probe every configured node (including Online
+                        // entries with potentially stale load), then retry
                         // placement once.
                         let retry_nodes: Vec<_> = state
                             .config
@@ -22072,7 +22076,7 @@ Investigate <service/> failures.
     }
 
     #[test]
-    fn raw_remote_auto_placement_reprobes_every_non_online_node() {
+    fn raw_remote_auto_placement_reprobes_every_node() {
         use crate::remote_node::RemoteNodeStatus;
 
         assert!(remote_node_needs_on_demand_probe(None));
@@ -22086,7 +22090,7 @@ Investigate <service/> failures.
         ] {
             assert!(remote_node_needs_on_demand_probe(Some(&status)));
         }
-        assert!(!remote_node_needs_on_demand_probe(Some(
+        assert!(remote_node_needs_on_demand_probe(Some(
             &RemoteNodeStatus::Online
         )));
     }

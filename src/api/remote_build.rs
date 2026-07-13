@@ -232,8 +232,11 @@ struct RemoteBuildAcceptedResponse {
     node_id: String,
 }
 
-fn should_reprobe_after_placement_failure(status: Option<&RemoteNodeStatus>) -> bool {
-    !matches!(status, Some(RemoteNodeStatus::Online))
+fn should_reprobe_after_placement_failure(_status: Option<&RemoteNodeStatus>) -> bool {
+    // A cached Online heartbeat can still contain stale load, disk, or memory
+    // figures. Placement has already rejected every cached candidate, so one
+    // fresh probe of every configured node is the authoritative retry.
+    true
 }
 
 /// Resolve the target node: explicit id or capacity-aware auto placement.
@@ -258,9 +261,9 @@ async fn resolve_node(
             Err(initial_err) => {
                 // The monitor can be disabled, its initial tick can race this
                 // request, or a node can have recovered since a cached miss.
-                // Re-probe missing and non-online nodes, then retry placement
-                // once without masking capacity/label rejection from nodes
-                // whose latest heartbeat still says they are online.
+                // Re-probe every configured node, including cached Online
+                // nodes whose load/resource figures may now be stale, then
+                // retry placement once.
                 let retry_nodes: Vec<_> = settings
                     .nodes
                     .iter()
@@ -767,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_auto_placement_reprobes_every_non_online_cache_state() {
+    fn failed_auto_placement_reprobes_every_cache_state() {
         assert!(should_reprobe_after_placement_failure(None));
         for status in [
             RemoteNodeStatus::Unknown,
@@ -777,7 +780,7 @@ mod tests {
         ] {
             assert!(should_reprobe_after_placement_failure(Some(&status)));
         }
-        assert!(!should_reprobe_after_placement_failure(Some(
+        assert!(should_reprobe_after_placement_failure(Some(
             &RemoteNodeStatus::Online
         )));
     }

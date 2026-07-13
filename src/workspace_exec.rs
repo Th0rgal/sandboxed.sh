@@ -1964,7 +1964,7 @@ impl WorkspaceExec {
         })
     }
 
-    /// Build the `(program, args)` for an *interactive* shell that joins this
+    /// Build the `(program, args, env)` for an *interactive* shell that joins this
     /// workspace's shared persistent container leader via `nsenter` — the same
     /// mechanism mission harnesses use (see [`Self::spawn_streaming_pty`]).
     ///
@@ -1982,7 +1982,7 @@ impl WorkspaceExec {
         program: &str,
         args: &[String],
         extra_env: HashMap<String, String>,
-    ) -> anyhow::Result<Option<(String, Vec<String>)>> {
+    ) -> anyhow::Result<Option<(String, Vec<String>, HashMap<String, String>)>> {
         if !(self.workspace.workspace_type == WorkspaceType::Container
             && use_nspawn_for_workspace(&self.workspace))
         {
@@ -1996,7 +1996,7 @@ impl WorkspaceExec {
         let invocation = self
             .build_container_nsenter_invocation(cwd, program, args, &mut env)
             .await?;
-        Ok(Some(invocation))
+        Ok(Some((invocation.0, invocation.1, env)))
     }
 
     /// Build the (program, args) tuple for spawning a command inside an
