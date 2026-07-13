@@ -185,8 +185,11 @@ fn wakeup_supersession_key(
     }
 }
 
-fn should_finalize_remote_job(inactive_status: Option<MissionStatus>) -> bool {
-    inactive_status.is_none()
+fn should_finalize_remote_job(current_status: Option<MissionStatus>) -> bool {
+    matches!(
+        current_status,
+        None | Some(MissionStatus::Active | MissionStatus::Pending)
+    )
 }
 
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
@@ -5986,7 +5989,7 @@ async fn reconcile_pending_handles(
                     });
                 }
                 _ => {
-                    if mission_status != MissionStatus::Active {
+                    if !should_finalize_remote_job(Some(mission_status)) {
                         tracing::warn!(
                             mission_id = %handle.mission_id,
                             job_id = %handle.job_id,
@@ -22162,6 +22165,10 @@ Investigate <service/> failures.
     #[test]
     fn remote_terminal_result_preserves_operator_selected_status() {
         assert!(should_finalize_remote_job(None));
+        assert!(should_finalize_remote_job(Some(MissionStatus::Active)));
+        // A durable handle proves this is the narrow crash window after the
+        // node accepted the job but before Pending was promoted to Active.
+        assert!(should_finalize_remote_job(Some(MissionStatus::Pending)));
         for status in [
             MissionStatus::Interrupted,
             MissionStatus::Paused,
