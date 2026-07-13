@@ -31,6 +31,7 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/:id", get(get_workspace))
         .route("/:id", put(update_workspace))
         .route("/:id", delete(delete_workspace))
+        .route("/:id/apply-template", post(apply_workspace_template))
         .route("/:id/build", post(build_workspace))
         .route("/:id/sync", post(sync_workspace))
         .route("/:id/exec", post(exec_workspace_command))
@@ -127,6 +128,12 @@ pub struct UpdateWorkspaceRequest {
     pub config_profile: Option<String>,
     /// Freeform workspace configuration (merged with existing config).
     pub config: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApplyWorkspaceTemplateRequest {
+    /// Template to apply. Defaults to the workspace's current template.
+    pub template: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -746,6 +753,97 @@ async fn update_workspace(
     tracing::info!("Updated workspace: {} ({})", workspace.name, id);
 
     Ok(Json(workspace.into()))
+}
+
+/// POST /api/workspaces/:id/apply-template - Reapply the latest template fields.
+async fn apply_workspace_template(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<ApplyWorkspaceTemplateRequest>,
+) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
+    let mut workspace = require_workspace(&state.workspaces, id).await?;
+
+    if workspace.workspace_type != WorkspaceType::Container {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Only container workspaces can apply templates".to_string(),
+        ));
+    }
+    if workspace.status == WorkspaceStatus::Building {
+        return Err((
+            StatusCode::CONFLICT,
+            "Workspace build already in progress".to_string(),
+        ));
+    }
+
+    let template_name = req
+        .template
+        .as_deref()
+        .or(workspace.template.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "No template supplied and workspace has no template".to_string(),
+            )
+        })?
+        .to_string();
+
+    let library = clone_library(&state.library).await.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Library not initialized".to_string(),
+        )
+    })?;
+    let template = library
+        .get_workspace_template(&template_name)
+        .await
+        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?;
+
+    apply_template_fields(&mut workspace, &template_name, template)?;
+    state.workspaces.update(workspace.clone()).await;
+
+    if let Err(error) = workspace::sync_workspace_skills(&workspace, &library).await {
+        tracing::warn!(
+            workspace = %workspace.name,
+            error = %error,
+            "Failed to sync skills after applying workspace template"
+        );
+    }
+
+    tracing::info!(
+        workspace = %workspace.name,
+        template = %template_name,
+        "Applied workspace template"
+    );
+
+    Ok(Json(workspace.into()))
+}
+
+fn apply_template_fields(
+    workspace: &mut Workspace,
+    template_name: &str,
+    template: WorkspaceTemplate,
+) -> Result<(), (StatusCode, String)> {
+    workspace.template = Some(template_name.to_string());
+    workspace.distro = template
+        .distro
+        .as_deref()
+        .map(normalize_distro_value)
+        .transpose()?;
+    workspace.skills = sanitize_skill_list(template.skills);
+    workspace.env_vars = sanitize_env_vars(template.env_vars);
+    workspace.init_scripts = template.init_scripts;
+    workspace.init_script = normalize_init_script(Some(template.init_script));
+    workspace.shared_network = template.shared_network;
+    workspace.tailscale_mode = template.tailscale_mode;
+    workspace.mcps = template.mcps;
+    workspace.mcps_replace_defaults = template.mcps_replace_defaults;
+    workspace.config_profile = template
+        .config_profile
+        .and_then(|profile| (!profile.trim().is_empty()).then(|| profile.trim().to_string()));
+    Ok(())
 }
 
 /// POST /api/workspaces/:id/sync - Manually sync skills and tools to workspace.
@@ -2276,5 +2374,48 @@ mod tests {
     #[test]
     fn test_validate_workspace_name_rejects_empty() {
         assert!(validate_workspace_name("").is_err());
+    }
+
+    #[test]
+    fn apply_template_fields_replaces_template_controlled_configuration() {
+        let mut workspace =
+            Workspace::new_container("demo".to_string(), PathBuf::from("/tmp/demo"));
+        workspace.distro = Some("ubuntu:22.04".to_string());
+        workspace.skills = vec!["old-skill".to_string()];
+        workspace.env_vars = HashMap::from([("OLD".to_string(), "value".to_string())]);
+        workspace.tailscale_mode = Some(TailscaleMode::ExitNode);
+        workspace.config_profile = Some("old".to_string());
+
+        let template = WorkspaceTemplate {
+            name: "lean".to_string(),
+            description: Some("Lean workspace".to_string()),
+            path: "workspace-template/lean.json".to_string(),
+            distro: Some("ubuntu-noble".to_string()),
+            skills: vec!["lean".to_string()],
+            env_vars: HashMap::from([("LEAN_VERSION".to_string(), "4.24.0".to_string())]),
+            encrypted_keys: Vec::new(),
+            init_scripts: vec!["base".to_string(), "lean".to_string()],
+            init_script: "echo ready".to_string(),
+            shared_network: Some(false),
+            tailscale_mode: None,
+            mcps: vec!["lean-lsp".to_string()],
+            mcps_replace_defaults: false,
+            config_profile: None,
+        };
+
+        apply_template_fields(&mut workspace, "lean", template).unwrap();
+
+        assert_eq!(workspace.template.as_deref(), Some("lean"));
+        assert_eq!(workspace.distro.as_deref(), Some("ubuntu-noble"));
+        assert_eq!(workspace.skills, vec!["lean"]);
+        assert_eq!(workspace.env_vars.get("LEAN_VERSION").unwrap(), "4.24.0");
+        assert!(!workspace.env_vars.contains_key("OLD"));
+        assert_eq!(workspace.init_scripts, vec!["base", "lean"]);
+        assert_eq!(workspace.init_script.as_deref(), Some("echo ready"));
+        assert_eq!(workspace.shared_network, Some(false));
+        assert_eq!(workspace.tailscale_mode, None);
+        assert_eq!(workspace.mcps, vec!["lean-lsp"]);
+        assert!(!workspace.mcps_replace_defaults);
+        assert_eq!(workspace.config_profile, None);
     }
 }
