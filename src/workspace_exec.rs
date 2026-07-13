@@ -154,7 +154,7 @@ fn nspawn_directory_from_cmdline(cmdline: &[u8]) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn find_nspawn_pid_by_canonical_root(root: &Path) -> Option<String> {
+fn find_nspawn_by_canonical_root(root: &Path) -> Option<(String, PathBuf)> {
     let expected = root.canonicalize().ok()?;
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let pid = entry.file_name();
@@ -171,15 +171,19 @@ fn find_nspawn_pid_by_canonical_root(root: &Path) -> Option<String> {
             continue;
         };
         if directory.canonicalize().ok().as_deref() == Some(expected.as_path()) {
-            return Some(pid.to_string());
+            return Some((pid.to_string(), directory));
         }
     }
     None
 }
 
 #[cfg(not(target_os = "linux"))]
-fn find_nspawn_pid_by_canonical_root(_root: &Path) -> Option<String> {
+fn find_nspawn_by_canonical_root(_root: &Path) -> Option<(String, PathBuf)> {
     None
+}
+
+fn find_nspawn_pid_by_canonical_root(root: &Path) -> Option<String> {
+    find_nspawn_by_canonical_root(root).map(|(pid, _)| pid)
 }
 
 fn append_nsenter_target_root_arg(args: &mut Vec<String>, enabled: bool) {
@@ -195,7 +199,15 @@ fn append_nsenter_target_root_arg(args: &mut Vec<String>, enabled: bool) {
 /// Keep all scope-naming sites in sync with this — a divergent token makes a
 /// scope invisible to live stats, retune, and the OOM watchdog.
 pub fn machine_name_for_path(path: &Path) -> Option<String> {
-    let base = path
+    // When prod and dev refer to the same container through different
+    // symlinks, adopt the spelling used by the already-running nspawn. Its
+    // boot and exec scopes were hashed from that spelling, so using the local
+    // alias here would make those scopes invisible to stats, live retunes,
+    // mission GC, and the OOM watchdog.
+    let identity_path = find_nspawn_by_canonical_root(path)
+        .map(|(_, directory)| directory)
+        .unwrap_or_else(|| path.to_path_buf());
+    let base = identity_path
         .file_name()
         .and_then(|n| n.to_str())
         .map(|s| s.trim())
@@ -212,7 +224,7 @@ pub fn machine_name_for_path(path: &Path) -> Option<String> {
         .collect();
 
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    identity_path.hash(&mut hasher);
     let suffix = format!("{:08x}", hasher.finish() as u32);
 
     Some(format!("sandboxed-{}-{}", sanitized, suffix))
