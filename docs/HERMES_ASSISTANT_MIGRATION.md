@@ -77,6 +77,7 @@ Tools:
 - `get_workspace`
 - `create_workspace`
 - `update_workspace`
+- `delete_workspace` — requires explicit confirmation
 - `list_workspace_templates`
 - `get_workspace_template`
 - `save_workspace_template`

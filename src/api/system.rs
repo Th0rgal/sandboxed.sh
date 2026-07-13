@@ -1227,6 +1227,7 @@ mcp_servers:
         - get_workspace
         - create_workspace
         - update_workspace
+        - delete_workspace
         - list_workspace_templates
         - get_workspace_template
         - save_workspace_template
@@ -4696,6 +4697,7 @@ mod tests {
             "get_workspace",
             "create_workspace",
             "update_workspace",
+            "delete_workspace",
             "list_workspace_templates",
             "get_workspace_template",
             "save_workspace_template",

@@ -193,6 +193,13 @@ struct WorkspaceIdParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct DeleteWorkspaceParams {
+    workspace_id: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateWorkspaceParams {
     name: String,
     #[serde(default)]
@@ -922,6 +929,18 @@ impl AssistantMcp {
                 }),
             },
             ToolDefinition {
+                name: "delete_workspace".to_string(),
+                description: "Delete a sandboxed.sh workspace and its managed container data. Requires confirm=true; active missions that reference it are not deleted.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["workspace_id", "confirm"],
+                    "properties": {
+                        "workspace_id": {"type": "string"},
+                        "confirm": {"type": "boolean", "description": "Must be true to perform deletion."}
+                    }
+                }),
+            },
+            ToolDefinition {
                 name: "list_workspace_templates".to_string(),
                 description: "List reusable sandboxed.sh workspace templates from the Library.".to_string(),
                 input_schema: json!({"type": "object", "properties": {}}),
@@ -1417,6 +1436,16 @@ impl AssistantMcp {
         let response = self.api_put(&format!("/api/workspaces/{id}"), body).await?;
         let workspace = Self::response_value(response, "Update workspace").await?;
         Ok(json!({"workspace": workspace}))
+    }
+
+    async fn delete_workspace(&self, params: DeleteWorkspaceParams) -> Result<Value, String> {
+        if !params.confirm {
+            return Err("Workspace deletion requires confirm=true".to_string());
+        }
+        let id = parse_uuid(&params.workspace_id)?;
+        let response = self.api_delete(&format!("/api/workspaces/{id}")).await?;
+        Self::response_value(response, "Delete workspace").await?;
+        Ok(json!({"deleted": true, "workspace_id": id.to_string()}))
     }
 
     async fn list_workspace_templates(&self) -> Result<Value, String> {
@@ -1925,6 +1954,11 @@ impl AssistantMcp {
                 let params: UpdateWorkspaceParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
                 self.update_workspace(params).await
+            }
+            "delete_workspace" => {
+                let params: DeleteWorkspaceParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.delete_workspace(params).await
             }
             "list_workspace_templates" => self.list_workspace_templates().await,
             "get_workspace_template" => {
@@ -2738,6 +2772,7 @@ mod tests {
             "get_workspace",
             "create_workspace",
             "update_workspace",
+            "delete_workspace",
             "list_workspace_templates",
             "get_workspace_template",
             "save_workspace_template",
@@ -2748,6 +2783,7 @@ mod tests {
         }
 
         for destructive in [
+            "delete_workspace",
             "delete_workspace_template",
             "rebuild_workspace_from_template",
         ] {
