@@ -160,6 +160,15 @@ fn explicit_owner_authorized(job: &DurableJob, user_id: &str) -> Option<bool> {
     job.owner_user_id.as_deref().map(|owner| owner == user_id)
 }
 
+fn durable_shell_wrapper(command: &str) -> String {
+    // Isolate the caller's shell options and `exit` calls. In particular,
+    // `set -e; false` must terminate only this subshell so the parent can
+    // always persist the restart-safe terminal record.
+    format!(
+        "(\n{command}\n)\ncode=$?\nprintf '{{\"exit_code\":%s,\"signal\":null,\"finished_at\":\"%s\"}}\\n' \"$code\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$SANDBOXED_SH_DURABLE_STATUS\"\nexit \"$code\"\n"
+    )
+}
+
 async fn authorize_job(
     state: &Arc<AppState>,
     user: &AuthUser,
@@ -574,10 +583,7 @@ pub async fn start_job(
         .open(&stderr_log)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let wrapper = format!(
-        "{{ {}; }}\ncode=$?\nprintf '{{\"exit_code\":%s,\"signal\":null,\"finished_at\":\"%s\"}}\\n' \"$code\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$SANDBOXED_SH_DURABLE_STATUS\"\nexit \"$code\"\n",
-        command
-    );
+    let wrapper = durable_shell_wrapper(command);
 
     let now = Utc::now();
     let mut job = DurableJob {
@@ -869,6 +875,22 @@ mod tests {
         job.owner_user_id = Some("alice".to_string());
         assert_eq!(explicit_owner_authorized(&job, "alice"), Some(true));
         assert_eq!(explicit_owner_authorized(&job, "bob"), Some(false));
+    }
+
+    #[test]
+    fn wrapper_records_failure_even_when_command_enables_errexit() {
+        let dir = tempfile::tempdir().unwrap();
+        let status_file = dir.path().join("exit.json");
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-lc", &durable_shell_wrapper("set -eu; false")])
+            .env("SANDBOXED_SH_DURABLE_STATUS", &status_file)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let record: ExitRecord =
+            serde_json::from_slice(&std::fs::read(status_file).unwrap()).unwrap();
+        assert_eq!(record.exit_code, Some(1));
+        assert_eq!(record.signal, None);
     }
 
     #[test]
