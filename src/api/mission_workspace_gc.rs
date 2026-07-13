@@ -202,6 +202,146 @@ fn index_store_file_blocking(
     Ok(out)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedMissionStoreKind {
+    Sqlite,
+    File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedMissionStoreLocation {
+    kind: PersistedMissionStoreKind,
+    user_key: String,
+    status: MissionStatus,
+}
+
+fn persisted_mission_store_location_blocking(
+    missions_dir: &std::path::Path,
+    mission_id: uuid::Uuid,
+) -> Result<Option<PersistedMissionStoreLocation>, String> {
+    let entries = match std::fs::read_dir(missions_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("read {}: {err}", missions_dir.display())),
+    };
+    let id = mission_id.to_string();
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_prefix("missions-") else {
+            continue;
+        };
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("db") => {
+                let Some(user_key) = stem.strip_suffix(".db") else {
+                    continue;
+                };
+                let conn = rusqlite::Connection::open_with_flags(
+                    &path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .map_err(|err| format!("open {}: {err}", path.display()))?;
+                let mut stmt = conn
+                    .prepare("SELECT status FROM missions WHERE id = ?1 LIMIT 1")
+                    .map_err(|err| format!("query {}: {err}", path.display()))?;
+                let mut rows = stmt
+                    .query([id.as_str()])
+                    .map_err(|err| format!("query {}: {err}", path.display()))?;
+                if let Some(row) = rows.next().map_err(|err| err.to_string())? {
+                    let raw: String = row.get(0).map_err(|err| err.to_string())?;
+                    let status = serde_json::from_value(serde_json::Value::String(raw))
+                        .map_err(|err| err.to_string())?;
+                    return Ok(Some(PersistedMissionStoreLocation {
+                        kind: PersistedMissionStoreKind::Sqlite,
+                        user_key: user_key.to_string(),
+                        status,
+                    }));
+                }
+            }
+            Some("json") => {
+                let Some(user_key) = stem.strip_suffix(".json") else {
+                    continue;
+                };
+                let bytes = std::fs::read(&path)
+                    .map_err(|err| format!("read {}: {err}", path.display()))?;
+                let snapshot: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|err| format!("parse {}: {err}", path.display()))?;
+                if let Some(raw) = snapshot
+                    .get("missions")
+                    .and_then(|missions| missions.get(&id))
+                    .and_then(|mission| mission.get("status"))
+                {
+                    let status =
+                        serde_json::from_value(raw.clone()).map_err(|err| err.to_string())?;
+                    return Ok(Some(PersistedMissionStoreLocation {
+                        kind: PersistedMissionStoreKind::File,
+                        user_key: user_key.to_string(),
+                        status,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve one exact mission's owning store without requiring its user
+/// session to have booted in this process. The returned store can finalize
+/// durable work for an offline OAuth user without registering a second,
+/// filename-sanitized control session for that user.
+async fn persisted_mission_store_in_dir(
+    missions_dir: std::path::PathBuf,
+    mission_id: uuid::Uuid,
+) -> Result<Option<(Arc<dyn super::mission_store::MissionStore>, MissionStatus)>, String> {
+    let location = tokio::task::spawn_blocking({
+        let missions_dir = missions_dir.clone();
+        move || persisted_mission_store_location_blocking(&missions_dir, mission_id)
+    })
+    .await
+    .map_err(|err| err.to_string())??;
+    let Some(location) = location else {
+        return Ok(None);
+    };
+    if location.kind == PersistedMissionStoreKind::File {
+        // FileMissionStore rewrites its whole in-memory snapshot. Opening a
+        // second writer here could lose updates if the user's live session
+        // boots while recovery is polling. SQLite is safe for this use: WAL
+        // plus its configured busy timeout serializes the two connections.
+        return Err(
+            "offline durable mission recovery requires the SQLite mission store".to_string(),
+        );
+    }
+    let store: Arc<dyn super::mission_store::MissionStore> = Arc::from(
+        super::mission_store::create_mission_store(
+            super::mission_store::MissionStoreType::Sqlite,
+            missions_dir,
+            &location.user_key,
+        )
+        .await?,
+    );
+    let Some(mission) = store.get_mission(mission_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some((store, mission.status)))
+}
+
+pub(crate) async fn persisted_mission_store(
+    state: &AppState,
+    mission_id: uuid::Uuid,
+) -> Result<Option<(Arc<dyn super::mission_store::MissionStore>, MissionStatus)>, String> {
+    persisted_mission_store_in_dir(
+        state
+            .config
+            .working_dir
+            .join(".sandboxed-sh")
+            .join("missions"),
+        mission_id,
+    )
+    .await
+}
+
 /// Resolve one exact mission from persisted stores without requiring its user
 /// session to have booted in this process. Remote-build admission uses this
 /// after restart so a still-running OAuth user's workspace is not rejected.
@@ -215,54 +355,10 @@ pub(crate) async fn persisted_mission_status(
         .join(".sandboxed-sh")
         .join("missions");
     tokio::task::spawn_blocking(move || {
-        let entries = match std::fs::read_dir(&missions_dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(format!("read {}: {err}", missions_dir.display())),
-        };
-        let id = mission_id.to_string();
-        for entry in entries {
-            let entry = entry.map_err(|err| err.to_string())?;
-            let path = entry.path();
-            match path.extension().and_then(|ext| ext.to_str()) {
-                Some("db") => {
-                    let conn = rusqlite::Connection::open_with_flags(
-                        &path,
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                    )
-                    .map_err(|err| format!("open {}: {err}", path.display()))?;
-                    let mut stmt = conn
-                        .prepare("SELECT status FROM missions WHERE id = ?1 LIMIT 1")
-                        .map_err(|err| format!("query {}: {err}", path.display()))?;
-                    let mut rows = stmt
-                        .query([id.as_str()])
-                        .map_err(|err| format!("query {}: {err}", path.display()))?;
-                    if let Some(row) = rows.next().map_err(|err| err.to_string())? {
-                        let raw: String = row.get(0).map_err(|err| err.to_string())?;
-                        let status = serde_json::from_value(serde_json::Value::String(raw))
-                            .map_err(|err| err.to_string())?;
-                        return Ok(Some(status));
-                    }
-                }
-                Some("json") => {
-                    let bytes = std::fs::read(&path)
-                        .map_err(|err| format!("read {}: {err}", path.display()))?;
-                    let snapshot: serde_json::Value = serde_json::from_slice(&bytes)
-                        .map_err(|err| format!("parse {}: {err}", path.display()))?;
-                    if let Some(raw) = snapshot
-                        .get("missions")
-                        .and_then(|missions| missions.get(&id))
-                        .and_then(|mission| mission.get("status"))
-                    {
-                        let status =
-                            serde_json::from_value(raw.clone()).map_err(|err| err.to_string())?;
-                        return Ok(Some(status));
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(None)
+        Ok(
+            persisted_mission_store_location_blocking(&missions_dir, mission_id)?
+                .map(|location| location.status),
+        )
     })
     .await
     .map_err(|err| err.to_string())?
@@ -704,6 +800,7 @@ async fn directory_size_bytes(path: &std::path::Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::mission_store::{MissionStore, SqliteMissionStore};
 
     #[test]
     fn short_id_collisions_are_resolved_within_the_actual_workspace() {
@@ -750,5 +847,33 @@ mod tests {
             entry_for_workspace(&entries, workspace_id).unwrap().status,
             MissionStatus::Active
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_owner_store_is_found_without_a_live_oauth_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteMissionStore::new(dir.path().to_path_buf(), "github:42")
+            .await
+            .unwrap();
+        let mission = store
+            .create_mission(Some("offline owner"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        drop(store);
+
+        let location = persisted_mission_store_location_blocking(dir.path(), mission.id)
+            .unwrap()
+            .expect("persisted mission owner should be discoverable");
+
+        assert_eq!(location.kind, PersistedMissionStoreKind::Sqlite);
+        assert_eq!(location.user_key, "github_42");
+        assert_eq!(location.status, MissionStatus::Pending);
+        let (reopened, status) =
+            persisted_mission_store_in_dir(dir.path().to_path_buf(), mission.id)
+                .await
+                .unwrap()
+                .expect("offline persisted owner should be usable by the reconciler");
+        assert_eq!(status, MissionStatus::Pending);
+        assert!(reopened.get_mission(mission.id).await.unwrap().is_some());
     }
 }

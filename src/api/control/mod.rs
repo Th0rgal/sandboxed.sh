@@ -5533,8 +5533,9 @@ async fn dispatch_remote_mission_mvp(
         "Remote node '{}' exited with {:?}\n\nstdout:\n{}\n\nstderr:\n{}",
         node.id, response.exit_code, response.stdout, response.stderr
     );
+    let owner = RemoteMissionOwner::live(control);
     finalize_remote_mission(
-        control,
+        &owner,
         mission.id,
         &node.id,
         success,
@@ -5564,8 +5565,36 @@ async fn dispatch_remote_mission_mvp(
 /// Terminal bookkeeping shared by the sync (`/execute`) and async (job) remote
 /// paths: log the final assistant message, flip the mission to
 /// completed/failed with `status_reason`, and broadcast the status change.
+#[derive(Clone)]
+struct RemoteMissionOwner {
+    mission_store: Arc<dyn MissionStore>,
+    events_tx: Option<broadcast::Sender<AgentEvent>>,
+}
+
+impl RemoteMissionOwner {
+    fn live(control: &ControlState) -> Self {
+        Self {
+            mission_store: Arc::clone(&control.mission_store),
+            events_tx: Some(control.events_tx.clone()),
+        }
+    }
+
+    fn offline(mission_store: Arc<dyn MissionStore>) -> Self {
+        Self {
+            mission_store,
+            events_tx: None,
+        }
+    }
+
+    fn send(&self, event: AgentEvent) {
+        if let Some(events_tx) = &self.events_tx {
+            let _ = events_tx.send(event);
+        }
+    }
+}
+
 async fn finalize_remote_mission(
-    control: &ControlState,
+    owner: &RemoteMissionOwner,
     mission_id: Uuid,
     node_id: &str,
     success: bool,
@@ -5586,18 +5615,18 @@ async fn finalize_remote_mission(
         resumable: !success,
         completion_evidence: None,
     };
-    let _ = control.mission_store.log_event(mission_id, &event).await;
-    let _ = control.events_tx.send(event);
+    let _ = owner.mission_store.log_event(mission_id, &event).await;
+    owner.send(event);
     let status = if success {
         MissionStatus::Completed
     } else {
         MissionStatus::Failed
     };
-    control
+    owner
         .mission_store
         .update_mission_status_with_reason(mission_id, status, Some(status_reason))
         .await?;
-    let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+    owner.send(AgentEvent::MissionStatusChanged {
         mission_id,
         status,
         summary: Some(format!("Remote node '{node_id}' finished")),
@@ -5708,14 +5737,14 @@ async fn dispatch_remote_job(
                 "remote job cancellation after activation failure will be retried by poller"
             );
         }
-        let poll_control = control.clone();
+        let poll_owner = RemoteMissionOwner::live(control);
         let fleet = Arc::clone(&state.fleet);
         let ledger_dir = state.config.working_dir.clone();
         let mission_id = mission.id;
         let started_at = chrono::Utc::now();
         tokio::spawn(async move {
             poll_remote_job(
-                poll_control,
+                poll_owner,
                 fleet,
                 client,
                 node,
@@ -5752,7 +5781,7 @@ async fn dispatch_remote_job(
             finished_at: None,
         });
 
-    let poll_control = control.clone();
+    let poll_owner = RemoteMissionOwner::live(control);
     let fleet = Arc::clone(&state.fleet);
     let mission_id = mission.id;
     let ledger_dir = state.config.working_dir.clone();
@@ -5762,7 +5791,7 @@ async fn dispatch_remote_job(
         move || {
             tokio::spawn(async move {
                 poll_remote_job(
-                    poll_control,
+                    poll_owner,
                     fleet,
                     client,
                     node,
@@ -5953,24 +5982,49 @@ async fn reconcile_pending_handles(
                 }
                 continue;
             }
-            // A user whose session has not booted yet must not lose the only
-            // recovery handle. Once found, reattach even when the mission is
-            // inactive: the poll loop will request cancellation and retain
-            // the handle until the node confirms a terminal state.
-            let mut owning: Option<(ControlState, MissionStatus)> = None;
+            // Reattach even when the owner has not booted a control session:
+            // durable node work must still be observed/cancelled while an
+            // OAuth user remains offline after restart.
+            let mut owning: Option<(RemoteMissionOwner, MissionStatus)> = None;
             for session in state.control.all_sessions().await {
                 if let Ok(Some(mission)) =
                     session.mission_store.get_mission(handle.mission_id).await
                 {
-                    owning = Some((session, mission.status));
+                    owning = Some((RemoteMissionOwner::live(&session), mission.status));
                     break;
                 }
             }
-            let Some((session, mission_status)) = owning else {
+            if owning.is_none() {
+                match super::mission_workspace_gc::persisted_mission_store(
+                    state.as_ref(),
+                    handle.mission_id,
+                )
+                .await
+                {
+                    Ok(Some((store, status))) => {
+                        tracing::info!(
+                            mission_id = %handle.mission_id,
+                            job_id = %handle.job_id,
+                            "re-attaching remote job for offline persisted owner"
+                        );
+                        owning = Some((RemoteMissionOwner::offline(store), status));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            mission_id = %handle.mission_id,
+                            job_id = %handle.job_id,
+                            ?err,
+                            "remote job persisted owner lookup failed; will retry"
+                        );
+                    }
+                }
+            }
+            let Some((owner, mission_status)) = owning else {
                 tracing::info!(
                     mission_id = %handle.mission_id,
                     job_id = %handle.job_id,
-                    "remote job handle kept: owning session not booted yet; will retry"
+                    "remote job handle kept: owning persisted mission not found; will retry"
                 );
                 continue;
             };
@@ -5992,7 +6046,7 @@ async fn reconcile_pending_handles(
                     let ledger_dir = working_dir.to_path_buf();
                     tokio::spawn(async move {
                         poll_remote_job(
-                            session,
+                            owner,
                             fleet,
                             crate::remote_node::RemoteNodeClient::default(),
                             node,
@@ -6021,11 +6075,11 @@ async fn reconcile_pending_handles(
                         node = %handle.node_id,
                         "remote job's node no longer configured; failing mission"
                     );
-                    let _ = session
+                    let _ = owner
                         .mission_store
                         .update_mission_status(handle.mission_id, MissionStatus::Failed)
                         .await;
-                    let _ = session.events_tx.send(AgentEvent::MissionStatusChanged {
+                    owner.send(AgentEvent::MissionStatusChanged {
                         mission_id: handle.mission_id,
                         status: MissionStatus::Failed,
                         summary: Some(
@@ -6085,7 +6139,7 @@ async fn poll_recovered_remote_build(
 /// the same path as the synchronous dispatch.
 #[allow(clippy::too_many_arguments)]
 async fn poll_remote_job(
-    control: ControlState,
+    owner: RemoteMissionOwner,
     fleet: Arc<crate::remote_node::FleetMonitor>,
     client: crate::remote_node::RemoteNodeClient,
     node: crate::remote_node::RemoteNodeConfig,
@@ -6118,7 +6172,7 @@ async fn poll_remote_job(
         // request cancellation but retain the durable handle and keep polling
         // until the node confirms a terminal state. A transient cancel outage
         // must not orphan a still-running remote job.
-        let inactive_status = match control.mission_store.get_mission(mission_id).await {
+        let inactive_status = match owner.mission_store.get_mission(mission_id).await {
             Ok(Some(current)) if current.status != MissionStatus::Active => Some(current.status),
             _ => None,
         };
@@ -6164,7 +6218,7 @@ async fn poll_remote_job(
                         node.id, job_id
                     );
                     let _ = finalize_remote_mission(
-                        &control,
+                        &owner,
                         mission_id,
                         &node.id,
                         false,
@@ -6204,7 +6258,7 @@ async fn poll_remote_job(
                     );
                     if should_finalize_remote_job(inactive_status) {
                         let _ = finalize_remote_mission(
-                            &control,
+                            &owner,
                             mission_id,
                             &node.id,
                             success,
@@ -6248,8 +6302,8 @@ async fn poll_remote_job(
                         resumable: false,
                         completion_evidence: None,
                     };
-                    let _ = control.mission_store.log_event(mission_id, &event).await;
-                    let _ = control.events_tx.send(event);
+                    let _ = owner.mission_store.log_event(mission_id, &event).await;
+                    owner.send(event);
                     fleet.record_outcome(outcome(&status.state, None, None, false));
                     last_state = status.state.clone();
                 }
@@ -22214,6 +22268,39 @@ Investigate <service/> failures.
 
         assert!(observer_started.load(std::sync::atomic::Ordering::SeqCst));
         assert!(error.contains(&missing_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn offline_remote_owner_finalizes_persisted_mission_without_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MissionStore> = Arc::new(
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "github:42")
+                .await
+                .unwrap(),
+        );
+        let mission = store
+            .create_mission(Some("offline remote"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .unwrap();
+        let owner = RemoteMissionOwner::offline(Arc::clone(&store));
+
+        finalize_remote_mission(
+            &owner,
+            mission.id,
+            "node-a",
+            true,
+            "remote result".to_string(),
+            "remote_node_job",
+        )
+        .await
+        .unwrap();
+
+        let finalized = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(finalized.status, MissionStatus::Completed);
     }
 
     #[test]

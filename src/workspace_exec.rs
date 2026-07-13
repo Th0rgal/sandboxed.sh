@@ -30,6 +30,11 @@ fn replace_command_env(cmd: &mut Command, env: HashMap<String, String>) {
     cmd.env_clear().envs(env);
 }
 
+fn durable_command_runs_on_api_host(workspace_type: WorkspaceType, uses_nspawn: bool) -> bool {
+    workspace_type == WorkspaceType::Host
+        || (workspace_type == WorkspaceType::Container && !uses_nspawn)
+}
+
 /// TLS CA-bundle env vars that point at a filesystem path. When the host
 /// process that launches a container mission (e.g. the sandboxed.sh daemon
 /// started from a Python venv) has one of these set, the value leaks into the
@@ -499,12 +504,12 @@ pub(crate) fn resolv_conf_nspawn_args() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_nsenter_target_root_arg, ca_env_scrub_prelude, durable_scope_unit,
-        environ_has_keepalive_marker, exec_scope_unit, exec_scope_unit_for_mission,
-        exec_unit_belongs_to_mission, machine_name_from_exec_unit, mission_short_id_from_exec_unit,
-        mission_tag_from_path, normalize_container_path, replace_command_env,
-        resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec,
-        CA_BUNDLE_ENV_VARS,
+        append_nsenter_target_root_arg, ca_env_scrub_prelude, durable_command_runs_on_api_host,
+        durable_scope_unit, environ_has_keepalive_marker, exec_scope_unit,
+        exec_scope_unit_for_mission, exec_unit_belongs_to_mission, machine_name_from_exec_unit,
+        mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
+        replace_command_env, resolv_conf_bind_args, synthesized_container_resolv_conf,
+        WorkspaceExec, WorkspaceType, CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -632,6 +637,19 @@ mod tests {
         assert!(stdout.lines().any(|line| line == "WORKSPACE_VALUE=visible"));
         assert!(!stdout.contains("API_ONLY_SECRET"));
         assert!(!stdout.contains("must-not-leak"));
+    }
+
+    #[test]
+    fn durable_container_fallback_replaces_service_environment() {
+        assert!(durable_command_runs_on_api_host(
+            WorkspaceType::Container,
+            false
+        ));
+        assert!(durable_command_runs_on_api_host(WorkspaceType::Host, false));
+        assert!(!durable_command_runs_on_api_host(
+            WorkspaceType::Container,
+            true
+        ));
     }
 
     #[test]
@@ -1821,8 +1839,11 @@ impl WorkspaceExec {
         durable_job_id: uuid::Uuid,
     ) -> anyhow::Result<Child> {
         let env = self.build_env(env);
-        let host_env =
-            matches!(self.workspace.workspace_type, WorkspaceType::Host).then(|| env.clone());
+        let host_env = durable_command_runs_on_api_host(
+            self.workspace.workspace_type,
+            use_nspawn_for_workspace(&self.workspace),
+        )
+        .then(|| env.clone());
         let scope_unit = self
             .machine_name()
             .map(|machine| durable_scope_unit(&machine, durable_job_id));
@@ -1839,11 +1860,12 @@ impl WorkspaceExec {
             )
             .await
             .context("Failed to build workspace command")?;
-        // Host durable jobs execute in the API host namespace, so unlike an
-        // nspawn/nsenter command there is no isolation boundary that drops
-        // the service process environment. Replace it explicitly with the
-        // workspace/job allowlist before spawning; otherwise a workspace
-        // owner could read API credentials through a durable job's logs.
+        // Host and container-fallback durable jobs execute in the API host
+        // namespace, so unlike an nspawn/nsenter command there is no
+        // isolation boundary that drops the service process environment.
+        // Replace it explicitly with the workspace/job allowlist before
+        // spawning; otherwise a workspace owner could read API credentials
+        // through a durable job's logs.
         if let Some(host_env) = host_env {
             replace_command_env(&mut cmd, host_env);
         }
