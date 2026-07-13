@@ -296,6 +296,22 @@ pub async fn run_opencode_turn(
         )
         .await;
     }
+    if has_anthropic {
+        // OpenCode 1.17 does not load its Anthropic OAuth transport merely
+        // because auth.json contains an OAuth credential. Without the plugin,
+        // the provider is absent from the model catalog (or the plain AI SDK
+        // adapter asks for an API key instead of using the OAuth token).
+        let anthropic_plugin = "opencode-anthropic-auth@latest";
+        ensure_opencode_plugin_specs(&opencode_config_dir_host, &[anthropic_plugin]);
+        ensure_opencode_plugin_installed(
+            &workspace_exec,
+            work_dir,
+            &opencode_config_dir_host,
+            &opencode_config_dir_env,
+            anthropic_plugin,
+        )
+        .await;
+    }
     if has_openai {
         let openai_plugin = "opencode-openai-codex-auth@latest";
         ensure_opencode_plugin_specs(&opencode_config_dir_host, &[openai_plugin]);
