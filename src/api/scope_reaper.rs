@@ -118,6 +118,15 @@ fn status_triggers_teardown(status: &MissionStatus) -> bool {
     }
 }
 
+fn legacy_scope_is_reapable(
+    mission_index_complete: bool,
+    age: Option<Duration>,
+    max_age: Duration,
+    owned_by_live_workspace: bool,
+) -> bool {
+    mission_index_complete && age.is_some_and(|age| age >= max_age) && !owned_by_live_workspace
+}
+
 /// List all `sandboxed-exec-*.scope` unit names currently known to systemd.
 pub(crate) async fn list_exec_scope_units() -> Vec<String> {
     let output = Command::new("systemctl")
@@ -373,19 +382,20 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
             },
             None => {
                 // Legacy naming (or task-tagged): stop only when old enough
-                // AND the owning workspace has no scope-keeping mission.
-                let Some(age) = unit_age(&unit).await else {
-                    report.kept += 1;
-                    continue;
-                };
-                if age < max_age {
-                    report.kept += 1;
-                    continue;
-                }
+                // AND the owning workspace has no scope-keeping mission. An
+                // incomplete cross-store index cannot prove that absence, so
+                // fail closed just like the mission-tagged branch above.
+                let age = unit_age(&unit).await;
                 let owned_by_live_ws = unit_machine
                     .as_ref()
                     .is_some_and(|machine| live_workspace_tokens.contains(machine));
-                if owned_by_live_ws {
+                if !legacy_scope_is_reapable(index_full.complete, age, max_age, owned_by_live_ws) {
+                    if !index_full.complete {
+                        tracing::debug!(
+                            unit,
+                            "reaper: kept (legacy scope but mission index incomplete)"
+                        );
+                    }
                     report.kept += 1;
                     continue;
                 }
@@ -402,4 +412,26 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
         }
     }
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_scopes_fail_closed_when_mission_index_is_incomplete() {
+        let max_age = Duration::from_secs(12 * 3600);
+        let old = Some(max_age + Duration::from_secs(1));
+
+        assert!(!legacy_scope_is_reapable(false, old, max_age, false));
+        assert!(legacy_scope_is_reapable(true, old, max_age, false));
+        assert!(!legacy_scope_is_reapable(true, old, max_age, true));
+        assert!(!legacy_scope_is_reapable(
+            true,
+            Some(max_age - Duration::from_secs(1)),
+            max_age,
+            false
+        ));
+        assert!(!legacy_scope_is_reapable(true, None, max_age, false));
+    }
 }

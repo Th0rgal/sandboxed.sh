@@ -5752,34 +5752,51 @@ async fn dispatch_remote_job(
             finished_at: None,
         });
 
-    let updated = control
-        .mission_store
-        .get_mission(mission.id)
-        .await?
-        .ok_or_else(|| format!("Mission {} disappeared after remote dispatch", mission.id))?;
-
     let poll_control = control.clone();
     let fleet = Arc::clone(&state.fleet);
     let mission_id = mission.id;
     let ledger_dir = state.config.working_dir.clone();
-    tokio::spawn(async move {
-        poll_remote_job(
-            poll_control,
-            fleet,
-            client,
-            node,
-            shared_token,
-            mission_id,
-            job_id,
-            started_at,
-        )
-        .await;
-        // The poll loop only returns once the mission is finalized (or the
-        // job was cancelled/lost); the handle is no longer needed.
-        crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
-    });
+    let updated = read_dispatched_mission_after_observer_start(
+        &control.mission_store,
+        mission.id,
+        move || {
+            tokio::spawn(async move {
+                poll_remote_job(
+                    poll_control,
+                    fleet,
+                    client,
+                    node,
+                    shared_token,
+                    mission_id,
+                    job_id,
+                    started_at,
+                )
+                .await;
+                // The poll loop only returns once the mission is finalized (or the
+                // job was cancelled/lost); the handle is no longer needed.
+                crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+            });
+        },
+    )
+    .await?;
 
     Ok(updated)
+}
+
+/// Start ownership of an accepted remote job before any fallible final read.
+/// The observer must survive both a store error and a row that disappeared
+/// after dispatch, otherwise the durable node job remains unpolled until the
+/// API process restarts.
+async fn read_dispatched_mission_after_observer_start(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    start_observer: impl FnOnce(),
+) -> Result<Mission, String> {
+    start_observer();
+    mission_store
+        .get_mission(mission_id)
+        .await?
+        .ok_or_else(|| format!("Mission {mission_id} disappeared after remote dispatch"))
 }
 
 /// Retry cancellation for an accepted remote job whose durable ledger entry
@@ -22180,6 +22197,23 @@ Investigate <service/> failures.
                 "terminal node result must not overwrite {status}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn remote_dispatch_starts_observer_before_missing_mission_read() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let observer_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_for_observer = Arc::clone(&observer_started);
+        let missing_id = Uuid::new_v4();
+
+        let error = read_dispatched_mission_after_observer_start(&store, missing_id, move || {
+            started_for_observer.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .expect_err("missing post-dispatch mission must fail the response read");
+
+        assert!(observer_started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error.contains(&missing_id.to_string()));
     }
 
     #[test]

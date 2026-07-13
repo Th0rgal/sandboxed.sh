@@ -648,6 +648,94 @@ async fn get_remote_build(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn run_remote_build_wrapper_with_http_status(status: u16) -> std::process::ExitStatus {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create wrapper test directory");
+        let repo = temp.path().join("repo");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&repo).expect("create test repo");
+        std::fs::create_dir_all(&bin).expect("create fake bin directory");
+
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "Remote Build Test"]);
+        git(&["config", "user.email", "remote-build@example.invalid"]);
+        std::fs::write(repo.join("README.md"), "test\n").expect("write tracked file");
+        git(&["add", "README.md"]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "test",
+        ]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ]);
+
+        let fake_curl = bin.join("curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+output=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+        shift
+        output="$1"
+    fi
+    shift
+done
+printf '{}' > "$output"
+printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
+"#,
+        )
+        .expect("write fake curl");
+        let mut permissions = std::fs::metadata(&fake_curl)
+            .expect("stat fake curl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_curl, permissions).expect("make fake curl executable");
+
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        std::process::Command::new("bash")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/remote-lean-build"
+            ))
+            .current_dir(repo)
+            .env("PATH", path)
+            .env(
+                "REMOTE_BUILD_URL",
+                "http://example.invalid/api/remote-build",
+            )
+            .env("REMOTE_BUILD_TOKEN", "expired-test-token")
+            .env("REMOTE_BUILD_MISSION_ID", Uuid::new_v4().to_string())
+            .env("REMOTE_BUILD_TEST_HTTP_STATUS", status.to_string())
+            .status()
+            .expect("run remote-build wrapper")
+    }
+
     #[test]
     fn token_round_trips_and_is_mission_and_domain_scoped() {
         let mission = Uuid::new_v4();
@@ -776,6 +864,25 @@ mod tests {
             submit_error_status(&RemoteNodeError::Request("offline".to_string())),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_treats_host_capability_auth_failures_as_temporary() {
+        for status in [401, 403, 503] {
+            assert_eq!(
+                run_remote_build_wrapper_with_http_status(status).code(),
+                Some(75),
+                "HTTP {status} should request local fallback"
+            );
+        }
+        for status in [400, 422] {
+            assert_eq!(
+                run_remote_build_wrapper_with_http_status(status).code(),
+                Some(1),
+                "HTTP {status} remains a caller error"
+            );
+        }
     }
 
     #[test]

@@ -71,7 +71,7 @@ http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
     --max-time 7500 \
     -d "$body" "$REMOTE_BUILD_URL")" || die "cannot reach $REMOTE_BUILD_URL" 75
 
-if [ "$http_code" = "503" ]; then
+if [ "$http_code" = "401" ] || [ "$http_code" = "403" ] || [ "$http_code" = "503" ]; then
     echo "remote-lean-build: remote build unavailable:" >&2
     cat "$response_file" >&2; echo >&2
     exit 75  # EX_TEMPFAIL: caller should fall back to a local build
