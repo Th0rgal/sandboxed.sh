@@ -4,8 +4,8 @@
 //! semaphore (`SANDBOXED_NODE_CAPACITY`). Each job runs `bash -lc <command>`
 //! in `<workdir>/<mission-id>/` with combined stdout+stderr captured to
 //! `<workdir>/logs/<job-id>.log`. Every terminal path cleans up the process
-//! *group* (SIGTERM, then SIGKILL after 10s) so daemonized children cannot
-//! escape queue accounting.
+//! cgroup when systemd scopes are available, with process-group cleanup as a
+//! fallback, so daemonized children cannot escape queue accounting.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,20 @@ pub const LOG_TAIL_MAX_BYTES: u64 = 64 * 1024;
 
 /// Grace period between SIGTERM and SIGKILL when stopping a job.
 const KILL_GRACE: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum SystemdScopeMode {
+    System,
+    User,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct SystemdScope {
+    unit: String,
+    mode: SystemdScopeMode,
+}
 
 struct QueuedJob {
     id: Uuid,
@@ -365,7 +379,7 @@ pub(crate) async fn run_logged_command(
 
     let outcome = tokio::select! {
         _ = token.cancelled() => {
-            kill_contained_process(systemd_scope.as_deref(), pid, &mut child).await;
+            kill_contained_process(systemd_scope.as_ref(), pid, &mut child).await;
             RunOutcome::Cancelled
         }
         waited = tokio::time::timeout(Duration::from_secs(limit_secs.max(1)), child.wait()) => {
@@ -374,12 +388,12 @@ pub(crate) async fn run_logged_command(
                     // The process-group leader may exit after daemonizing a
                     // child. A terminal job must not leave those descendants
                     // consuming node resources outside queue accounting.
-                    kill_contained_process(systemd_scope.as_deref(), pid, &mut child).await;
+                    kill_contained_process(systemd_scope.as_ref(), pid, &mut child).await;
                     RunOutcome::Exited(status.code())
                 }
                 Ok(Err(err)) => return Err(err.into()),
                 Err(_) => {
-                    kill_contained_process(systemd_scope.as_deref(), pid, &mut child).await;
+                    kill_contained_process(systemd_scope.as_ref(), pid, &mut child).await;
                     RunOutcome::TimedOut { limit_secs }
                 }
             }
@@ -393,11 +407,16 @@ pub(crate) async fn run_logged_command(
 /// `setsid`; a scope's cgroup does, so stopping the unit also reaps those
 /// daemonized descendants. The wrapper inherits the command environment
 /// directly, keeping secrets out of `systemd-run` argv.
-fn contain_command(cmd: tokio::process::Command) -> (tokio::process::Command, Option<String>) {
+fn contain_command(
+    cmd: tokio::process::Command,
+) -> (tokio::process::Command, Option<SystemdScope>) {
     #[cfg(target_os = "linux")]
     {
-        if systemd_scopes_available() {
-            let scope = format!("sandboxed-node-job-{}.scope", Uuid::new_v4().simple());
+        if let Some(mode) = systemd_scope_mode() {
+            let scope = SystemdScope {
+                unit: format!("sandboxed-node-job-{}.scope", Uuid::new_v4().simple()),
+                mode,
+            };
             return (systemd_scope_command(cmd, &scope), Some(scope));
         }
     }
@@ -405,17 +424,30 @@ fn contain_command(cmd: tokio::process::Command) -> (tokio::process::Command, Op
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_scopes_available() -> bool {
-    // The node service is installed as root. Merely seeing systemd's runtime
-    // directory is insufficient in containers and CI runners: an unprivileged
-    // process can see it but cannot create system scopes, which would make the
-    // wrapper fail before the actual job starts.
+fn systemd_scope_mode() -> Option<SystemdScopeMode> {
+    // Merely seeing systemd's runtime directory is insufficient in containers
+    // and CI runners. Root can use the system manager. A hardened non-root
+    // node uses its lingering user manager, exposed through XDG_RUNTIME_DIR;
+    // without either manager we retain the process-group fallback.
+    if !Path::new("/run/systemd/system").is_dir() {
+        return None;
+    }
     // SAFETY: geteuid() is a side-effect-free syscall with no preconditions.
-    (unsafe { libc::geteuid() == 0 }) && Path::new("/run/systemd/system").is_dir()
+    if unsafe { libc::geteuid() == 0 } {
+        return Some(SystemdScopeMode::System);
+    }
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    Path::new(&runtime_dir)
+        .join("bus")
+        .exists()
+        .then_some(SystemdScopeMode::User)
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_scope_command(cmd: tokio::process::Command, scope: &str) -> tokio::process::Command {
+fn systemd_scope_command(
+    cmd: tokio::process::Command,
+    scope: &SystemdScope,
+) -> tokio::process::Command {
     let command = cmd.as_std();
     let program = command.get_program().to_os_string();
     let args: Vec<_> = command.get_args().map(ToOwned::to_owned).collect();
@@ -426,11 +458,14 @@ fn systemd_scope_command(cmd: tokio::process::Command, scope: &str) -> tokio::pr
         .collect();
 
     let mut scoped = tokio::process::Command::new("systemd-run");
+    if scope.mode == SystemdScopeMode::User {
+        scoped.arg("--user");
+    }
     scoped
         .arg("--scope")
         .arg("--quiet")
         .arg("--collect")
-        .arg(format!("--unit={scope}"))
+        .arg(format!("--unit={}", scope.unit))
         .arg("--property=KillMode=control-group")
         .arg("--")
         .arg(program)
@@ -452,28 +487,32 @@ fn systemd_scope_command(cmd: tokio::process::Command, scope: &str) -> tokio::pr
 }
 
 async fn kill_contained_process(
-    _systemd_scope: Option<&str>,
+    _systemd_scope: Option<&SystemdScope>,
     pid: Option<u32>,
     child: &mut tokio::process::Child,
 ) {
     #[cfg(target_os = "linux")]
     if let Some(scope) = _systemd_scope {
-        let stop = tokio::process::Command::new("systemctl")
+        let mut stop_command = tokio::process::Command::new("systemctl");
+        if scope.mode == SystemdScopeMode::User {
+            stop_command.arg("--user");
+        }
+        let stop = stop_command
             .arg("stop")
-            .arg(scope)
+            .arg(&scope.unit)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
         match tokio::time::timeout(KILL_GRACE, stop).await {
             Ok(Ok(status)) if !status.success() => {
-                tracing::warn!(scope, %status, "failed to stop node job systemd scope");
+                tracing::warn!(scope = %scope.unit, %status, "failed to stop node job systemd scope");
             }
             Ok(Err(error)) => {
-                tracing::warn!(scope, %error, "could not stop node job systemd scope");
+                tracing::warn!(scope = %scope.unit, %error, "could not stop node job systemd scope");
             }
             Err(_) => {
-                tracing::warn!(scope, "timed out stopping node job systemd scope");
+                tracing::warn!(scope = %scope.unit, "timed out stopping node job systemd scope");
             }
             Ok(Ok(_)) => {}
         }
@@ -739,13 +778,20 @@ mod tests {
             .current_dir("/")
             .env("NODE_JOB_SECRET", "not-in-argv");
 
-        let scoped = systemd_scope_command(cmd, "sandboxed-node-job-test.scope");
+        let scoped = systemd_scope_command(
+            cmd,
+            &SystemdScope {
+                unit: "sandboxed-node-job-test.scope".to_string(),
+                mode: SystemdScopeMode::User,
+            },
+        );
         let argv = scoped
             .as_std()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
+        assert!(argv.iter().any(|arg| arg == "--user"));
         assert!(argv.iter().any(|arg| arg == "/bin/sh"));
         assert!(argv.iter().any(|arg| arg == "printf ok"));
         assert!(!argv.iter().any(|arg| arg.contains("not-in-argv")));
@@ -759,7 +805,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn systemd_scope_kills_setsid_descendants() {
-        if !systemd_scopes_available() {
+        if systemd_scope_mode().is_none() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();

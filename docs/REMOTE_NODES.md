@@ -134,6 +134,9 @@ Wants=network-online.target
 
 [Service]
 EnvironmentFile=/etc/sandboxed-node.env
+# Let the non-root runner create transient scopes in its own user manager.
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 ExecStart=/usr/local/bin/sandboxed-node
 Restart=always
 RestartSec=5
@@ -156,6 +159,11 @@ WantedBy=multi-user.target
 Create the service account and writable state directory before starting the
 unit (`useradd --system --home /var/lib/sandboxed-node sandboxed-node` and
 `install -d -o sandboxed-node -g sandboxed-node /var/lib/sandboxed-node`).
+Enable its user manager once with
+`loginctl enable-linger sandboxed-node`; job commands then run in transient
+user scopes, so even descendants that call `setsid` are reaped when their job
+finishes. If the user bus is unavailable, the runner safely falls back to
+process-group cleanup and logs any failed scope stop.
 Lean/Lake builds execute repository-controlled code, so running this service as
 root is unsupported; the argv allowlist is defense in depth, not a sandbox.
 The binary refuses UID 0 by default; `SANDBOXED_NODE_ALLOW_ROOT=1` is available
