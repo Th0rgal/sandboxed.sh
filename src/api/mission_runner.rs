@@ -3891,33 +3891,49 @@ fn opencode_session_token_from_line(line: &str) -> Option<&str> {
     None
 }
 
+fn preferred_opencode_bin_dir(nspawn_container: bool, host_home: &str) -> String {
+    if nspawn_container {
+        // Container bootstrap and host synchronization both install the
+        // managed CLI here. Preferring /root/.opencode/bin used to shadow a
+        // newer /usr/local/bin/opencode with a years-old container-local copy.
+        "/usr/local/bin".to_string()
+    } else {
+        format!("{host_home}/.opencode/bin")
+    }
+}
+
+fn prepend_unique_path_entry(current: &str, entry: &str) -> String {
+    std::iter::once(entry)
+        .chain(
+            current
+                .split(':')
+                .filter(|part| !part.is_empty() && *part != entry),
+        )
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn should_sync_container_opencode(is_container: bool, uses_nspawn: bool) -> bool {
+    is_container && uses_nspawn
+}
+
 pub(crate) fn prepend_opencode_bin_to_path(
     env: &mut HashMap<String, String>,
     workspace: &Workspace,
 ) {
-    let home = if workspace.workspace_type == WorkspaceType::Container
-        && workspace::use_nspawn_for_workspace(workspace)
-    {
-        "/root".to_string()
-    } else {
-        home_dir()
-    };
-    let bin_dir = format!("{}/.opencode/bin", home);
+    let nspawn_container = workspace.workspace_type == WorkspaceType::Container
+        && workspace::use_nspawn_for_workspace(workspace);
+    let bin_dir = preferred_opencode_bin_dir(nspawn_container, &home_dir());
 
     let current = env
         .get("PATH")
         .cloned()
         .or_else(|| std::env::var("PATH").ok())
         .unwrap_or_default();
-    let already = current.split(':').any(|p| p == bin_dir);
-    if !already {
-        let next = if current.is_empty() {
-            bin_dir.clone()
-        } else {
-            format!("{}:{}", bin_dir, current)
-        };
-        env.insert("PATH".to_string(), next);
-    }
+    env.insert(
+        "PATH".to_string(),
+        prepend_unique_path_entry(&current, &bin_dir),
+    );
 }
 
 pub(crate) fn extract_opencode_session_id(output: &str) -> Option<String> {
@@ -7082,7 +7098,11 @@ fn copy_host_executable_into_container(
         .map_err(|e| format!("Failed to create container /usr/local/bin: {}", e))?;
 
     let dest = dest_dir.join(name);
-    let tmp = dest_dir.join(format!("{}.tmp", name));
+    // Multiple missions can prepare the same container concurrently. A fixed
+    // temporary filename lets one copy truncate or rename another copy while
+    // it is still in progress, so every atomic install needs its own staging
+    // path.
+    let tmp = dest_dir.join(format!("{}.tmp-{}", name, uuid::Uuid::new_v4().simple()));
     std::fs::copy(host_executable, &tmp).map_err(|e| {
         format!(
             "Failed to copy host executable {} into container: {}",
@@ -7097,10 +7117,120 @@ fn copy_host_executable_into_container(
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
     }
 
-    std::fs::rename(&tmp, &dest)
-        .map_err(|e| format!("Failed to finalize container executable: {}", e))?;
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Failed to finalize container executable: {}", e));
+    }
 
     Ok(format!("/usr/local/bin/{}", name))
+}
+
+fn parse_cli_semver(output: &str) -> Option<(u64, u64, u64)> {
+    output.split_whitespace().find_map(|word| {
+        let candidate = word.trim_start_matches(|c: char| c == 'v' || c == 'V');
+        let mut parts = candidate.split(|c: char| c == '.' || c == '-' || c == '+');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        Some((major, minor, patch))
+    })
+}
+
+async fn host_cli_version(program: &std::path::Path) -> Option<(u64, u64, u64)> {
+    let output = tokio::process::Command::new(program)
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let combined = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_cli_semver(&combined)
+}
+
+async fn workspace_cli_version(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    program: &str,
+) -> Option<(u64, u64, u64)> {
+    let output = workspace_exec
+        .output(cwd, program, &["--version".to_string()], HashMap::new())
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let combined = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_cli_semver(&combined)
+}
+
+/// Keep a container's managed OpenCode CLI identical to the backend host CLI.
+///
+/// Per-workspace execution deliberately resolves binaries inside the target
+/// container. Long-lived containers can therefore retain an old OpenCode even
+/// after the host was upgraded; current plugins then fail during bootstrap
+/// before a model request is made. Exact version equality gives every
+/// workspace the version operators validated on the host and avoids a 100+ MB
+/// copy on every mission.
+async fn sync_container_opencode_from_host(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Result<Option<String>, String> {
+    if !should_sync_container_opencode(
+        workspace_exec.workspace.workspace_type == WorkspaceType::Container,
+        workspace::use_nspawn_for_workspace(&workspace_exec.workspace),
+    ) {
+        return Ok(None);
+    }
+
+    let Some(host_opencode) = resolve_host_executable("opencode") else {
+        return Ok(None);
+    };
+    let Some(host_version) = host_cli_version(&host_opencode).await else {
+        tracing::warn!(
+            host_path = %host_opencode.display(),
+            "Could not determine host OpenCode version; leaving container CLI unchanged"
+        );
+        return Ok(None);
+    };
+
+    let container_program = "/usr/local/bin/opencode";
+    let container_version = if command_available(workspace_exec, cwd, container_program).await {
+        workspace_cli_version(workspace_exec, cwd, container_program).await
+    } else {
+        None
+    };
+
+    if container_version == Some(host_version) {
+        return Ok(None);
+    }
+
+    let installed = copy_host_executable_into_container(&workspace_exec.workspace, &host_opencode)?;
+    let installed_version = workspace_cli_version(workspace_exec, cwd, &installed).await;
+    if installed_version != Some(host_version) {
+        return Err(format!(
+            "Copied host OpenCode {:?} into container, but version probe returned {:?}",
+            host_version, installed_version
+        ));
+    }
+
+    tracing::info!(
+        host_path = %host_opencode.display(),
+        container_path = %installed,
+        old_version = ?container_version,
+        new_version = ?host_version,
+        "Synchronized host OpenCode CLI into container"
+    );
+    Ok(Some(installed))
 }
 
 async fn resolve_opencode_installer_fetcher(
@@ -7172,6 +7302,12 @@ pub(crate) async fn ensure_opencode_cli_available(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
 ) -> Result<(), String> {
+    // Availability alone is insufficient: the per-workspace migration exposed
+    // stale container CLIs that could not load plugins installed from `latest`.
+    // Synchronize from the managed host installation before accepting the
+    // container binary.
+    sync_container_opencode_from_host(workspace_exec, cwd).await?;
+
     if opencode_binary_available(workspace_exec, cwd).await {
         return Ok(());
     }
@@ -8174,12 +8310,14 @@ mod tests {
         is_success_path_provider_payload_error, is_success_path_rate_limited_error,
         is_tool_call_only_output, opencode_goal_terminal_status,
         opencode_idle_timeout_result_message, opencode_output_needs_fallback,
-        opencode_session_exists_in_data_home, opencode_session_token_from_line,
+        opencode_session_exists_in_data_home, opencode_session_token_from_line, parse_cli_semver,
         parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
-        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
+        parse_opencode_stderr_text_part, preferred_model_for_cost, preferred_opencode_bin_dir,
+        prepend_unique_path_entry, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, running_health, sanitized_opencode_stdout,
-        set_codex_account_cooldown, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_codex_usage_caps, summarize_recent_opencode_stderr,
+        set_codex_account_cooldown, should_sync_container_opencode, stall_severity,
+        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
+        summarize_codex_usage_caps, summarize_recent_opencode_stderr,
         text_buffer_stream_looks_degenerate, thinking_overlaps_visible_answer, tls_error_hint,
         truncate_garbled_output, use_thinking_only_fallback, utf8_safe_prefix,
         ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
@@ -11074,6 +11212,55 @@ mod tests {
     fn is_codex_node_wrapper_rejects_nonexistent_file() {
         let wrapper_path = std::path::Path::new("/nonexistent/path/codex");
         assert!(!is_codex_node_wrapper(wrapper_path));
+    }
+
+    #[test]
+    fn parse_cli_semver_accepts_opencode_version_formats() {
+        assert_eq!(parse_cli_semver("1.17.18\n"), Some((1, 17, 18)));
+        assert_eq!(
+            parse_cli_semver("opencode version v1.17.18-beta.2"),
+            Some((1, 17, 18))
+        );
+    }
+
+    #[test]
+    fn parse_cli_semver_rejects_incomplete_or_unrelated_output() {
+        assert_eq!(parse_cli_semver("opencode 1.17"), None);
+        assert_eq!(parse_cli_semver("version unknown"), None);
+    }
+
+    #[test]
+    fn nspawn_opencode_path_prefers_managed_system_binary() {
+        assert_eq!(
+            preferred_opencode_bin_dir(true, "/ignored"),
+            "/usr/local/bin"
+        );
+        assert_eq!(
+            preferred_opencode_bin_dir(false, "/home/agent"),
+            "/home/agent/.opencode/bin"
+        );
+    }
+
+    #[test]
+    fn opencode_path_entry_is_moved_to_front_without_duplicates() {
+        assert_eq!(
+            prepend_unique_path_entry(
+                "/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/local/bin",
+                "/usr/local/bin"
+            ),
+            "/usr/local/bin:/root/.opencode/bin:/usr/bin"
+        );
+        assert_eq!(
+            prepend_unique_path_entry("", "/usr/local/bin"),
+            "/usr/local/bin"
+        );
+    }
+
+    #[test]
+    fn opencode_sync_is_limited_to_nspawn_containers() {
+        assert!(should_sync_container_opencode(true, true));
+        assert!(!should_sync_container_opencode(true, false));
+        assert!(!should_sync_container_opencode(false, true));
     }
 
     #[test]
