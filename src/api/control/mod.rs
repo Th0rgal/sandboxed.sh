@@ -165,6 +165,26 @@ fn remote_node_needs_on_demand_probe(
     true
 }
 
+fn wakeup_supersession_key(
+    source: Option<&str>,
+    trigger: &mission_store::TriggerType,
+) -> Option<String> {
+    match source? {
+        // Wall-clock wakeups all represent the mission's next timer and may
+        // supersede one another regardless of which helper created them.
+        "claude-builtin" | "automation-manager" => Some("wall-clock".to_string()),
+        // Durable completions are independent. Only a replacement watcher for
+        // the same job may supersede an older one.
+        "durable-job-terminal" => match trigger {
+            mission_store::TriggerType::DurableJobTerminal { job_id } => {
+                Some(format!("durable-job:{job_id}"))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn should_finalize_remote_job(inactive_status: Option<MissionStatus>) -> bool {
     inactive_status.is_none()
 }
@@ -15749,6 +15769,13 @@ pub async fn create_automation(
     };
 
     let is_one_shot_wakeup = automation.variables.contains_key("__wakeup_source");
+    let wakeup_key = wakeup_supersession_key(
+        automation
+            .variables
+            .get("__wakeup_source")
+            .map(String::as_str),
+        &automation.trigger,
+    );
 
     tracing::info!(
         mission_id = %mission_id,
@@ -15780,7 +15807,7 @@ pub async fn create_automation(
     // overlapping creates converge on exactly the newest wakeup instead of
     // deactivating each other.
     let mut wakeup_iteration: u32 = 1;
-    if is_one_shot_wakeup {
+    if let Some(wakeup_key) = wakeup_key {
         if let Ok(existing) = control
             .mission_store
             .get_mission_automations(mission_id)
@@ -15789,7 +15816,13 @@ pub async fn create_automation(
             let new_key = (automation.created_at.clone(), automation.id.to_string());
             let priors: Vec<_> = existing
                 .into_iter()
-                .filter(|a| a.id != automation.id && a.variables.contains_key("__wakeup_source"))
+                .filter(|a| {
+                    a.id != automation.id
+                        && wakeup_supersession_key(
+                            a.variables.get("__wakeup_source").map(String::as_str),
+                            &a.trigger,
+                        ) == Some(wakeup_key.clone())
+                })
                 .collect();
             wakeup_iteration = (priors.len() as u32).saturating_add(1);
             for prior in priors
@@ -22093,6 +22126,37 @@ Investigate <service/> failures.
         assert!(remote_node_needs_on_demand_probe(Some(
             &RemoteNodeStatus::Online
         )));
+    }
+
+    #[test]
+    fn durable_wakeup_supersession_is_scoped_to_job_id() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let first_key = wakeup_supersession_key(
+            Some("durable-job-terminal"),
+            &mission_store::TriggerType::DurableJobTerminal { job_id: first },
+        );
+        let replacement_key = wakeup_supersession_key(
+            Some("durable-job-terminal"),
+            &mission_store::TriggerType::DurableJobTerminal { job_id: first },
+        );
+        let independent_key = wakeup_supersession_key(
+            Some("durable-job-terminal"),
+            &mission_store::TriggerType::DurableJobTerminal { job_id: second },
+        );
+
+        assert_eq!(first_key, replacement_key);
+        assert_ne!(first_key, independent_key);
+        assert_eq!(
+            wakeup_supersession_key(
+                Some("automation-manager"),
+                &mission_store::TriggerType::Interval { seconds: 60 }
+            ),
+            wakeup_supersession_key(
+                Some("claude-builtin"),
+                &mission_store::TriggerType::Interval { seconds: 120 }
+            )
+        );
     }
 
     #[test]

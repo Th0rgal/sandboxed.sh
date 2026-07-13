@@ -402,7 +402,7 @@ async fn cancel_job(
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<CancelJobResponse>, (StatusCode, String)> {
     check_auth(&headers, &state)?;
-    let cancel_requested = state.runner.cancel(id);
+    let cancel_requested = state.runner.cancel(id).await.map_err(internal_error)?;
     let record = state
         .jobs
         .get(id)

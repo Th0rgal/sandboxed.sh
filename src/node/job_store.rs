@@ -180,6 +180,35 @@ impl JobStore {
         .await
     }
 
+    /// Atomically claim a queued job for execution. Returns false when a
+    /// concurrent cancellation already made the row terminal.
+    pub async fn mark_running_if_queued(&self, id: Uuid) -> anyhow::Result<bool> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE jobs SET state = 'running', started_at = ?2
+                 WHERE id = ?1 AND state = 'queued'",
+                params![id.to_string(), now_rfc3339()],
+            )
+            .map(|updated| updated == 1)
+        })
+        .await
+    }
+
+    /// Atomically cancel a job only while it is queued. Running jobs are
+    /// stopped by their cancellation token and finish through the runner.
+    pub async fn cancel_if_queued(&self, id: Uuid) -> anyhow::Result<bool> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE jobs SET state = 'cancelled', finished_at = ?2,
+                        error = 'cancelled before start'
+                 WHERE id = ?1 AND state = 'queued'",
+                params![id.to_string(), now_rfc3339()],
+            )
+            .map(|updated| updated == 1)
+        })
+        .await
+    }
+
     /// Record a terminal state for the job.
     pub async fn finish(
         &self,

@@ -41,7 +41,8 @@ pub struct JobRunner {
     store: JobStore,
     work_root: PathBuf,
     max_job_secs: u64,
-    tx: mpsc::Sender<QueuedJob>,
+    tx: mpsc::UnboundedSender<QueuedJob>,
+    max_queued: u32,
     cancels: Mutex<HashMap<Uuid, CancellationToken>>,
     queued: AtomicU32,
     active: AtomicU32,
@@ -60,12 +61,13 @@ impl JobRunner {
             .and_then(|raw| raw.trim().parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or_else(|| (capacity.max(1) as usize).saturating_mul(4));
-        let (tx, mut rx) = mpsc::channel::<QueuedJob>(max_queued);
+        let (tx, mut rx) = mpsc::unbounded_channel::<QueuedJob>();
         let runner = Arc::new(Self {
             store,
             work_root,
             max_job_secs: max_job_secs.max(1),
             tx,
+            max_queued: u32::try_from(max_queued).unwrap_or(u32::MAX),
             cancels: Mutex::new(HashMap::new()),
             queued: AtomicU32::new(0),
             active: AtomicU32::new(0),
@@ -74,12 +76,30 @@ impl JobRunner {
         tokio::spawn(async move {
             let semaphore = Arc::new(Semaphore::new(capacity.max(1) as usize));
             while let Some(job) = rx.recv().await {
-                let permit = match Arc::clone(&semaphore).acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(_) => break, // semaphore closed: shutting down
-                };
                 let runner = Arc::clone(&dispatcher);
+                let semaphore = Arc::clone(&semaphore);
                 tokio::spawn(async move {
+                    let permit = match semaphore.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            runner.queued.fetch_sub(1, Ordering::AcqRel);
+                            runner.drop_cancel_token(job.id);
+                            return;
+                        }
+                    };
+                    let claimed = match runner.store.mark_running_if_queued(job.id).await {
+                        Ok(claimed) => claimed,
+                        Err(err) => {
+                            runner.queued.fetch_sub(1, Ordering::AcqRel);
+                            runner.drop_cancel_token(job.id);
+                            tracing::warn!(job_id = %job.id, "failed to claim queued job: {err}");
+                            return;
+                        }
+                    };
+                    if !claimed {
+                        runner.drop_cancel_token(job.id);
+                        return;
+                    }
                     runner.queued.fetch_sub(1, Ordering::AcqRel);
                     runner.active.fetch_add(1, Ordering::AcqRel);
                     runner.run_one(job).await;
@@ -111,46 +131,76 @@ impl JobRunner {
         mission_id: Uuid,
         payload: JobPayload,
     ) -> anyhow::Result<()> {
-        // Reserve bounded queue capacity before persisting the queued row. The
-        // permit prevents concurrent submitters from all passing an advisory
-        // heartbeat check and growing memory/jobs.db without limit.
-        let permit = self.tx.try_reserve().map_err(|_| NodeQueueFull {
-            max_queued: self.tx.max_capacity(),
-        })?;
         let payload_json = serde_json::to_string(&payload)?;
+        // The dispatcher drains the mpsc channel into semaphore waiters so a
+        // cancelled queued job releases its channel slot immediately. Keep an
+        // explicit atomic bound across both locations.
+        self.queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued < self.max_queued).then_some(queued + 1)
+            })
+            .map_err(|_| NodeQueueFull {
+                max_queued: self.max_queued as usize,
+            })?;
         let log_path = self.log_path(job_id);
-        self.store
+        if let Err(error) = self
+            .store
             .create(
                 job_id,
                 mission_id,
                 payload_json,
                 log_path.display().to_string(),
             )
-            .await?;
+            .await
+        {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            return Err(error);
+        }
         self.cancels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(job_id, CancellationToken::new());
-        self.queued.fetch_add(1, Ordering::AcqRel);
-        permit.send(QueuedJob {
-            id: job_id,
-            mission_id,
-            payload,
-        });
+        if self
+            .tx
+            .send(QueuedJob {
+                id: job_id,
+                mission_id,
+                payload,
+            })
+            .is_err()
+        {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            self.drop_cancel_token(job_id);
+            self.store
+                .finish(
+                    job_id,
+                    JobState::Lost,
+                    None,
+                    Some("node dispatcher stopped before enqueue".to_string()),
+                )
+                .await?;
+            anyhow::bail!("node dispatcher stopped before enqueue");
+        }
         Ok(())
     }
 
     /// Request cancellation of a queued or running job. Returns whether a
     /// live job received the request.
-    pub fn cancel(&self, job_id: Uuid) -> bool {
-        let cancels = self.cancels.lock().unwrap_or_else(|e| e.into_inner());
-        match cancels.get(&job_id) {
-            Some(token) => {
-                token.cancel();
-                true
-            }
-            None => false,
+    pub async fn cancel(&self, job_id: Uuid) -> anyhow::Result<bool> {
+        let token = self
+            .cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&job_id)
+            .cloned();
+        let Some(token) = token else {
+            return Ok(false);
+        };
+        token.cancel();
+        if self.store.cancel_if_queued(job_id).await? {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
         }
+        Ok(true)
     }
 
     fn take_cancel_token(&self, job_id: Uuid) -> CancellationToken {
@@ -209,8 +259,6 @@ impl JobRunner {
                 let mission_dir = self.work_root.join(job.mission_id.to_string());
                 tokio::fs::create_dir_all(&mission_dir).await?;
 
-                self.store.mark_running(job.id).await?;
-
                 let cmd = crate::remote_node::raw_command(command, &mission_dir, env.as_ref());
                 let limit_secs = clamp_timeout(*timeout_secs, self.max_job_secs);
                 let outcome = run_logged_command(cmd, &log_path, limit_secs, token).await?;
@@ -218,7 +266,6 @@ impl JobRunner {
                 Ok((state, exit_code, error, None))
             }
             JobPayload::LeanBuild { .. } => {
-                self.store.mark_running(job.id).await?;
                 let result = super::lean::execute_lean_build(
                     &self.work_root,
                     &log_path,
@@ -443,12 +490,68 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(runner.cancel(job_id));
+        assert!(runner.cancel(job_id).await.unwrap());
 
         let record = wait_for_terminal(&store, job_id).await;
         assert_eq!(record.state, JobState::Cancelled);
         // Cancelling an already-finished (deregistered) job reports false.
-        assert!(!runner.cancel(job_id));
+        assert!(!runner.cancel(job_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelling_queued_job_is_terminal_and_releases_capacity_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JobStore::open(dir.path()).await.unwrap();
+        let runner = JobRunner::spawn(
+            store.clone(),
+            dir.path().to_path_buf(),
+            1,
+            DEFAULT_MAX_JOB_SECS,
+        );
+        let running = Uuid::new_v4();
+        let queued = Uuid::new_v4();
+        for id in [running, queued] {
+            runner
+                .submit(
+                    id,
+                    Uuid::new_v4(),
+                    JobPayload::RawCommand {
+                        command: "sleep 30".to_string(),
+                        timeout_secs: None,
+                        env: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        for _ in 0..100 {
+            if matches!(
+                store.get(running).await.unwrap().map(|record| record.state),
+                Some(JobState::Running)
+            ) && matches!(
+                store.get(queued).await.unwrap().map(|record| record.state),
+                Some(JobState::Queued)
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(runner.queued_count(), 1);
+        assert!(runner.cancel(queued).await.unwrap());
+        let cancelled = store.get(queued).await.unwrap().unwrap();
+        assert_eq!(cancelled.state, JobState::Cancelled);
+        assert!(cancelled.finished_at.is_some());
+        assert_eq!(runner.queued_count(), 0);
+
+        assert!(runner.cancel(running).await.unwrap());
+        assert_eq!(
+            wait_for_terminal(&store, running).await.state,
+            JobState::Cancelled
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(runner.queued_count(), 0);
+        assert_eq!(runner.active_count(), 0);
     }
 
     #[tokio::test]
