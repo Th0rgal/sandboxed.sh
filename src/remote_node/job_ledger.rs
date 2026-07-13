@@ -22,6 +22,10 @@ pub enum JobHandleKind {
     /// A waited `/api/remote-build` request. Recovery only observes the node
     /// job and cleans up its handle; it must not finalize the agent mission.
     RemoteBuild,
+    /// A submit request failed ambiguously after the node may have accepted
+    /// the generated job id. Recovery must cancel/poll this handle, but must
+    /// never finalize the owning mission from its result.
+    Tentative,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,5 +158,43 @@ mod tests {
         let handle: JobHandle = serde_json::from_value(raw).unwrap();
 
         assert_eq!(handle.kind, JobHandleKind::Mission);
+    }
+
+    #[test]
+    fn tentative_handles_round_trip() {
+        let raw = serde_json::json!({
+            "mission_id": Uuid::new_v4(),
+            "node_id": "node-a",
+            "job_id": Uuid::new_v4(),
+            "started_at": chrono::Utc::now(),
+            "kind": "tentative",
+        });
+
+        let handle: JobHandle = serde_json::from_value(raw).unwrap();
+
+        assert_eq!(handle.kind, JobHandleKind::Tentative);
+    }
+
+    #[tokio::test]
+    async fn accepted_handle_replaces_pre_submit_tentative_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+        let mission_id = Uuid::new_v4();
+        let mut handle = JobHandle {
+            mission_id,
+            node_id: "node-a".to_string(),
+            job_id,
+            started_at: chrono::Utc::now(),
+            kind: JobHandleKind::Tentative,
+        };
+        record(dir.path(), handle.clone()).await.unwrap();
+
+        handle.kind = JobHandleKind::Mission;
+        record(dir.path(), handle).await.unwrap();
+
+        let handles = load_result(dir.path()).await.unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].job_id, job_id);
+        assert_eq!(handles[0].kind, JobHandleKind::Mission);
     }
 }

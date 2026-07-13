@@ -235,6 +235,9 @@ impl JobRunner {
                 Err(err) => (JobState::Failed, None, Some(err.to_string()), None),
             }
         };
+        // Execution is over, so cancellation must no longer report that it
+        // reached a live job even while the terminal row is being persisted.
+        self.drop_cancel_token(job.id);
         if let Err(err) = self
             .store
             .finish_with_artifacts(job.id, state, exit_code, error, artifacts_json)
@@ -242,7 +245,6 @@ impl JobRunner {
         {
             tracing::warn!(job_id = %job.id, "failed to persist job outcome: {err}");
         }
-        self.drop_cancel_token(job.id);
     }
 
     async fn execute(
@@ -339,7 +341,7 @@ impl RunOutcome {
 /// cancel/timeout and after the leader exits normally. Shared by raw-command
 /// jobs and the lean-build steps.
 pub(crate) async fn run_logged_command(
-    mut cmd: tokio::process::Command,
+    cmd: tokio::process::Command,
     log_path: &Path,
     limit_secs: u64,
     token: &CancellationToken,
@@ -352,6 +354,7 @@ pub(crate) async fn run_logged_command(
         .append(true)
         .open(log_path)?;
     let stderr_file = stdout_file.try_clone()?;
+    let (mut cmd, systemd_scope) = contain_command(cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
@@ -362,7 +365,7 @@ pub(crate) async fn run_logged_command(
 
     let outcome = tokio::select! {
         _ = token.cancelled() => {
-            kill_process_group(pid, &mut child).await;
+            kill_contained_process(systemd_scope.as_deref(), pid, &mut child).await;
             RunOutcome::Cancelled
         }
         waited = tokio::time::timeout(Duration::from_secs(limit_secs.max(1)), child.wait()) => {
@@ -371,18 +374,101 @@ pub(crate) async fn run_logged_command(
                     // The process-group leader may exit after daemonizing a
                     // child. A terminal job must not leave those descendants
                     // consuming node resources outside queue accounting.
-                    kill_process_group(pid, &mut child).await;
+                    kill_contained_process(systemd_scope.as_deref(), pid, &mut child).await;
                     RunOutcome::Exited(status.code())
                 }
                 Ok(Err(err)) => return Err(err.into()),
                 Err(_) => {
-                    kill_process_group(pid, &mut child).await;
+                    kill_contained_process(systemd_scope.as_deref(), pid, &mut child).await;
                     RunOutcome::TimedOut { limit_secs }
                 }
             }
         }
     };
     Ok(outcome)
+}
+
+/// Put node jobs in a transient systemd scope when the host has a running
+/// system manager. Process groups do not contain descendants that call
+/// `setsid`; a scope's cgroup does, so stopping the unit also reaps those
+/// daemonized descendants. The wrapper inherits the command environment
+/// directly, keeping secrets out of `systemd-run` argv.
+fn contain_command(cmd: tokio::process::Command) -> (tokio::process::Command, Option<String>) {
+    #[cfg(target_os = "linux")]
+    {
+        if Path::new("/run/systemd/system").is_dir() {
+            let scope = format!("sandboxed-node-job-{}.scope", Uuid::new_v4().simple());
+            return (systemd_scope_command(cmd, &scope), Some(scope));
+        }
+    }
+    (cmd, None)
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_scope_command(cmd: tokio::process::Command, scope: &str) -> tokio::process::Command {
+    let command = cmd.as_std();
+    let program = command.get_program().to_os_string();
+    let args: Vec<_> = command.get_args().map(ToOwned::to_owned).collect();
+    let cwd = command.get_current_dir().map(ToOwned::to_owned);
+    let env: Vec<_> = command
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(ToOwned::to_owned)))
+        .collect();
+
+    let mut scoped = tokio::process::Command::new("systemd-run");
+    scoped
+        .arg("--scope")
+        .arg("--quiet")
+        .arg("--collect")
+        .arg(format!("--unit={scope}"))
+        .arg("--property=KillMode=control-group")
+        .arg("--")
+        .arg(program)
+        .args(args);
+    if let Some(cwd) = cwd {
+        scoped.current_dir(cwd);
+    }
+    for (key, value) in env {
+        match value {
+            Some(value) => {
+                scoped.env(key, value);
+            }
+            None => {
+                scoped.env_remove(key);
+            }
+        }
+    }
+    scoped
+}
+
+async fn kill_contained_process(
+    _systemd_scope: Option<&str>,
+    pid: Option<u32>,
+    child: &mut tokio::process::Child,
+) {
+    #[cfg(target_os = "linux")]
+    if let Some(scope) = _systemd_scope {
+        let stop = tokio::process::Command::new("systemctl")
+            .arg("stop")
+            .arg(scope)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match tokio::time::timeout(KILL_GRACE, stop).await {
+            Ok(Ok(status)) if !status.success() => {
+                tracing::warn!(scope, %status, "failed to stop node job systemd scope");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(scope, %error, "could not stop node job systemd scope");
+            }
+            Err(_) => {
+                tracing::warn!(scope, "timed out stopping node job systemd scope");
+            }
+            Ok(Ok(_)) => {}
+        }
+    }
+    kill_process_group(pid, child).await;
 }
 
 /// SIGTERM the job's process group, escalating to SIGKILL after a grace
@@ -633,6 +719,56 @@ mod tests {
             !marker.exists(),
             "background descendant survived the terminal job"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_scope_wrapper_keeps_environment_out_of_argv() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args(["-c", "printf ok"])
+            .current_dir("/")
+            .env("NODE_JOB_SECRET", "not-in-argv");
+
+        let scoped = systemd_scope_command(cmd, "sandboxed-node-job-test.scope");
+        let argv = scoped
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(argv.iter().any(|arg| arg == "/bin/sh"));
+        assert!(argv.iter().any(|arg| arg == "printf ok"));
+        assert!(!argv.iter().any(|arg| arg.contains("not-in-argv")));
+        assert_eq!(scoped.as_std().get_current_dir(), Some(Path::new("/")));
+        assert!(scoped
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "NODE_JOB_SECRET" && value == Some("not-in-argv".as_ref())));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn systemd_scope_kills_setsid_descendants() {
+        if !Path::new("/run/systemd/system").is_dir() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("setsid-survived");
+        let log = dir.path().join("job.log");
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "setsid sh -c 'sleep 5; echo survived > \"$SURVIVOR_MARKER\"' &",
+        ])
+        .env("SURVIVOR_MARKER", &marker);
+
+        let outcome = run_logged_command(cmd, &log, 30, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(outcome.success());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!marker.exists(), "setsid descendant escaped the job cgroup");
     }
 
     async fn wait_for_terminal(store: &JobStore, job_id: Uuid) -> super::super::JobRecord {

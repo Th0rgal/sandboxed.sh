@@ -5683,10 +5683,50 @@ async fn dispatch_remote_job(
     };
 
     let client = crate::remote_node::RemoteNodeClient::default();
-    let accepted = client
-        .submit_job(&node, &shared_token, &request)
-        .await
-        .map_err(|e| e.to_string())?;
+    let submit_started_at = chrono::Utc::now();
+    let ledger_dir = state.config.working_dir.clone();
+    // Record the generated id before the POST. If the process dies after the
+    // node accepts but before the HTTP result is observed, restart recovery
+    // still has enough information to cancel the maybe-accepted job.
+    crate::remote_node::job_ledger::record(
+        &ledger_dir,
+        crate::remote_node::job_ledger::JobHandle {
+            mission_id: mission.id,
+            node_id: node.id.clone(),
+            job_id,
+            started_at: submit_started_at,
+            kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
+        },
+    )
+    .await
+    .map_err(|error| format!("remote job recovery handle could not be prepared: {error}"))?;
+    let accepted = match client.submit_job(&node, &shared_token, &request).await {
+        Ok(accepted) => accepted,
+        Err(crate::remote_node::RemoteNodeError::Request(message)) => {
+            // A transport/response failure is ambiguous: the node may have
+            // durably queued this exact job id before the response was lost.
+            // Keep the cancellation-only handle while returning failure so
+            // restart recovery cannot orphan the possible remote process.
+            spawn_untracked_remote_job_cancellation(
+                Arc::clone(&state.fleet),
+                node,
+                shared_token,
+                mission.id,
+                job_id,
+                submit_started_at,
+                ledger_dir,
+            );
+            return Err(format!(
+                "remote job submit outcome is ambiguous; cancellation is being reconciled: {message}"
+            ));
+        }
+        Err(error) => {
+            // A node HTTP rejection is definitive: the handler did not queue
+            // the job, so this pre-submit handle can be discarded.
+            crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+            return Err(error.to_string());
+        }
+    };
 
     // Persist the job handle BEFORE marking the mission Active: if the API
     // restarts from here on, the startup reconciler can re-attach a poll
@@ -5697,24 +5737,23 @@ async fn dispatch_remote_job(
             mission_id: mission.id,
             node_id: node.id.clone(),
             job_id,
-            started_at: chrono::Utc::now(),
+            started_at: submit_started_at,
             kind: crate::remote_node::job_ledger::JobHandleKind::Mission,
         },
     )
     .await
     {
-        // Never expose an Active mission without a durable recovery handle.
-        // Retain the only copy of the accepted handle in an in-process
-        // cancellation observer. Ledger failures often coincide with broader
-        // outages, so one ignored cancel attempt is not sufficient.
+        // Never expose an Active mission without a durable accepted handle.
+        // The pre-submit tentative entry remains the restart fallback; also
+        // start cancellation immediately rather than letting the job run.
         spawn_untracked_remote_job_cancellation(
             Arc::clone(&state.fleet),
-            client,
             node,
             shared_token,
             mission.id,
             job_id,
-            chrono::Utc::now(),
+            submit_started_at,
+            state.config.working_dir.clone(),
         );
         return Err(format!(
             "remote job accepted but recovery handle could not be persisted: {err}"
@@ -5828,22 +5867,27 @@ async fn read_dispatched_mission_after_observer_start(
         .ok_or_else(|| format!("Mission {mission_id} disappeared after remote dispatch"))
 }
 
-/// Retry cancellation for an accepted remote job whose durable ledger entry
-/// could not be written. The observer intentionally owns the only remaining
-/// `(node, job)` handle until a terminal response arrives; without it a
-/// transient cancel failure leaks remote capacity until the node timeout.
+/// Retry cancellation for a remote job that must not outlive its failed
+/// dispatch. The tentative ledger entry survives a process restart; this
+/// in-process observer removes it only after terminal state or authoritative
+/// 404, so a transient cancel failure cannot leak node capacity.
 fn spawn_untracked_remote_job_cancellation(
     fleet: Arc<crate::remote_node::FleetMonitor>,
-    client: crate::remote_node::RemoteNodeClient,
     node: crate::remote_node::RemoteNodeConfig,
     shared_token: String,
     mission_id: Uuid,
     job_id: Uuid,
     started_at: chrono::DateTime<chrono::Utc>,
+    ledger_dir: std::path::PathBuf,
 ) {
     tokio::spawn(async move {
+        let client = crate::remote_node::RemoteNodeClient::default();
         loop {
             if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
+                if error.is_not_found() {
+                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+                    return;
+                }
                 tracing::warn!(
                     mission_id = %mission_id,
                     node_id = %node.id,
@@ -5852,11 +5896,13 @@ fn spawn_untracked_remote_job_cancellation(
                     "untracked remote job cancellation failed; retrying"
                 );
             }
-            if let Ok(status) = client.get_job(&node, &shared_token, job_id).await {
-                if matches!(
-                    status.state.as_str(),
-                    "succeeded" | "failed" | "cancelled" | "lost"
-                ) {
+            match client.get_job(&node, &shared_token, job_id).await {
+                Ok(status)
+                    if matches!(
+                        status.state.as_str(),
+                        "succeeded" | "failed" | "cancelled" | "lost"
+                    ) =>
+                {
                     fleet.record_outcome(crate::remote_node::DispatchOutcome {
                         mission_id,
                         node_id: node.id.clone(),
@@ -5867,8 +5913,14 @@ fn spawn_untracked_remote_job_cancellation(
                         started_at,
                         finished_at: Some(chrono::Utc::now()),
                     });
+                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
                     return;
                 }
+                Err(error) if error.is_not_found() => {
+                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+                    return;
+                }
+                Ok(_) | Err(_) => {}
             }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
@@ -5945,6 +5997,36 @@ async fn reconcile_pending_handles(
 ) {
     {
         for handle in handles {
+            if handle.kind == crate::remote_node::job_ledger::JobHandleKind::Tentative {
+                let node = state.config.remote_nodes.node(&handle.node_id).cloned();
+                let shared_token = node
+                    .as_ref()
+                    .and_then(|node| std::env::var(&node.token_env).ok())
+                    .filter(|value| !value.trim().is_empty());
+                match (node, shared_token) {
+                    (Some(node), Some(shared_token)) => {
+                        settled.insert(handle.job_id);
+                        spawn_untracked_remote_job_cancellation(
+                            Arc::clone(&state.fleet),
+                            node,
+                            shared_token,
+                            handle.mission_id,
+                            handle.job_id,
+                            handle.started_at,
+                            working_dir.to_path_buf(),
+                        );
+                    }
+                    _ => {
+                        tracing::warn!(
+                            mission_id = %handle.mission_id,
+                            job_id = %handle.job_id,
+                            node = %handle.node_id,
+                            "tentative remote job retained: node config/token unavailable"
+                        );
+                    }
+                }
+                continue;
+            }
             if handle.kind == crate::remote_node::job_ledger::JobHandleKind::RemoteBuild {
                 let node = state.config.remote_nodes.node(&handle.node_id).cloned();
                 let shared_token = node

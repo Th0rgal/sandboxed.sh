@@ -340,6 +340,11 @@ fn spawn_remote_build_observer(
             let client = RemoteNodeClient::default();
             if cancel_requested {
                 if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
+                    if error.is_not_found() {
+                        crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id)
+                            .await;
+                        return;
+                    }
                     tracing::warn!(
                         mission_id = %mission_id,
                         node_id = %node.id,
@@ -366,6 +371,10 @@ fn spawn_remote_build_observer(
                         started_at,
                         finished_at: Some(chrono::Utc::now()),
                     });
+                    crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
+                    return;
+                }
+                Err(error) if cancel_requested && error.is_not_found() => {
                     crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
                     return;
                 }
@@ -437,6 +446,24 @@ async fn submit_remote_build(
 
     let client = RemoteNodeClient::default();
     let started_at = chrono::Utc::now();
+    if let Err(error) = crate::remote_node::job_ledger::record(
+        &state.config.working_dir,
+        crate::remote_node::job_ledger::JobHandle {
+            mission_id: req.mission_id,
+            node_id: node.id.clone(),
+            job_id,
+            started_at,
+            kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
+        },
+    )
+    .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("remote build recovery handle could not be prepared: {error}"),
+        )
+            .into_response();
+    }
     let accepted = match client.submit_job(&node, &shared_token, &submit).await {
         Ok(accepted) => accepted,
         Err(err) => {
@@ -444,6 +471,19 @@ async fn submit_remote_build(
             // can fall back locally. Node-side caller validation stays 4xx and
             // must not be disguised as a fleet outage.
             let status = submit_error_status(&err);
+            if matches!(&err, RemoteNodeError::Request(_)) {
+                spawn_remote_build_observer(
+                    Arc::clone(&state),
+                    node.clone(),
+                    shared_token.clone(),
+                    req.mission_id,
+                    job_id,
+                    started_at,
+                    true,
+                );
+            } else {
+                crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
+            }
             return (
                 status,
                 format!("remote node '{}' did not accept the build: {err}", node.id),
@@ -489,10 +529,9 @@ async fn submit_remote_build(
     )
     .await
     {
-        // No durable recovery handle exists, so retain the accepted ids in an
-        // in-process observer and retry cancellation until the node confirms a
-        // terminal state. A single best-effort cancel can fail during the same
-        // outage that prevented ledger persistence and leak node capacity.
+        // The tentative pre-submit entry remains the restart fallback, but it
+        // cannot authorize normal observation of an accepted build. Cancel it
+        // immediately and retry until the node confirms terminal state.
         spawn_remote_build_observer(
             Arc::clone(&state),
             node.clone(),

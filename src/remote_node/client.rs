@@ -146,7 +146,10 @@ impl RemoteNodeClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(RemoteNodeError::Request(format!("{status}: {body}")));
+            return Err(RemoteNodeError::Rejected {
+                status: status.as_u16(),
+                body,
+            });
         }
         response
             .json::<NodeJobStatus>()
@@ -173,7 +176,10 @@ impl RemoteNodeClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(RemoteNodeError::Request(format!("{status}: {body}")));
+            return Err(RemoteNodeError::Rejected {
+                status: status.as_u16(),
+                body,
+            });
         }
         response
             .json::<CancelJobResponse>()

@@ -109,6 +109,12 @@ pub enum RemoteNodeError {
     InvalidLease(String),
 }
 
+impl RemoteNodeError {
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Rejected { status: 404, .. })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteNodeConfig {
     pub id: String,
