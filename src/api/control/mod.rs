@@ -3580,8 +3580,7 @@ pub async fn post_message(
             .await
             .map_err(internal_error)?
         {
-            let already_writer = mission_is_pr_writer(&mission);
-            if already_writer || message_requests_pr_writer(&mission, &content) {
+            if mission_is_pr_writer(&mission) || message_requests_pr_writer(&mission, &content) {
                 let _guard = PR_WRITER_CREATE_LOCK.lock().await;
                 if let Some(github_pr) = mission.project.github_pr.as_deref() {
                     if let Some(existing) =
@@ -3600,22 +3599,6 @@ pub async fn post_message(
                             ),
                         ));
                     }
-                }
-                if !already_writer {
-                    let mut tags = mission.project.tags.clone();
-                    tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
-                    tags.push("pr-writer".to_string());
-                    control
-                        .mission_store
-                        .update_mission_project(
-                            mission.id,
-                            crate::api::mission_store::MissionProjectPatch {
-                                tags: Some(tags),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map_err(internal_error)?;
                 }
             }
         }
@@ -5405,12 +5388,10 @@ fn mission_is_pr_writer_with_prompt(mission: &Mission, prompt: Option<&str>) -> 
 
 fn message_requests_pr_writer(mission: &Mission, content: &str) -> bool {
     mission.project.github_pr.is_some()
-        && requested_pr_writer(
-            None,
-            Some(&mission.project.tags),
-            mission.project.intent.as_deref(),
-            Some(content),
-        )
+        // A follow-up message is a new capability request. A persisted
+        // `pr-readonly` tag describes the old mandate and must not suppress an
+        // explicit later instruction to fix/commit/push.
+        && inferred_pr_writer(None, None, Some(content))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5618,10 +5599,6 @@ async fn activate_mission_for_message(
     mission: &Mission,
     content: &str,
 ) -> Result<(), String> {
-    if !message_activates_mission(mission.status) {
-        return Ok(());
-    }
-
     // A targeted message can resume terminal/acknowledged work without going
     // through the explicit resume endpoint. Reacquire the writer lease under
     // the same mutex as create/project/resume and keep it until Active is
@@ -5663,14 +5640,16 @@ async fn activate_mission_for_message(
         }
     }
 
-    store
-        .update_mission_status(mission.id, MissionStatus::Active)
-        .await?;
-    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-        mission_id: mission.id,
-        status: MissionStatus::Active,
-        summary: None,
-    });
+    if message_activates_mission(mission.status) {
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await?;
+        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+            mission_id: mission.id,
+            status: MissionStatus::Active,
+            summary: None,
+        });
+    }
     Ok(())
 }
 
@@ -12789,6 +12768,26 @@ async fn control_actor_loop(
                             }
                         }
 
+                        // Reject paused targets before writer capability is
+                        // acquired. Retagging a paused read-only audit for a
+                        // message that cannot run would create a phantom lease.
+                        if let Some(tid) = effective_target {
+                            if let Ok(Some(mission)) = mission_store.get_mission(tid).await {
+                                if mission.status == MissionStatus::Paused {
+                                    let _ = events_tx.send(AgentEvent::Error {
+                                        message: format!(
+                                            "Mission {} is paused; resume it before sending messages",
+                                            tid
+                                        ),
+                                        mission_id: Some(tid),
+                                        resumable: true,
+                                    });
+                                    let _ = respond.send(UserMessageAck::Dropped);
+                                    continue;
+                                }
+                            }
+                        }
+
                         // FLEET-001 scheduled-mission deferral: if the target is a
                         // Pending mission whose `not_before` is still in the future
                         // and it isn't already running, stash the goal and leave it
@@ -12852,6 +12851,28 @@ async fn control_actor_loop(
                         // Case 1: Target is already running in parallel_runners - queue to it
                         if let Some(tid) = effective_target {
                             if target_in_parallel {
+                                if let Ok(Some(mission)) = mission_store.get_mission(tid).await {
+                                    if let Err(error) = activate_mission_for_message(
+                                        &control_hub,
+                                        &mission_store,
+                                        &events_tx,
+                                        &mission,
+                                        &content,
+                                    )
+                                    .await
+                                    {
+                                        let _ = events_tx.send(AgentEvent::Error {
+                                            message: format!(
+                                                "Cannot apply writer lease for mission {}: {}",
+                                                tid, error
+                                            ),
+                                            mission_id: Some(tid),
+                                            resumable: true,
+                                        });
+                                        let _ = respond.send(UserMessageAck::Dropped);
+                                        continue;
+                                    }
+                                }
                                 if let Some(runner) = parallel_runners.get_mut(&tid) {
                                     let was_running = runner.is_running();
                                     runner.queue_message(id, content.clone(), msg_agent, source.clone());
@@ -13241,6 +13262,32 @@ async fn control_actor_loop(
                             Some(tid) => Some(tid),
                             None => *current_mission.read().await,
                         };
+                        if was_running {
+                            if let Some(tid) = target_mission_id {
+                                if let Ok(Some(mission)) = mission_store.get_mission(tid).await {
+                                    if let Err(error) = activate_mission_for_message(
+                                        &control_hub,
+                                        &mission_store,
+                                        &events_tx,
+                                        &mission,
+                                        &content,
+                                    )
+                                    .await
+                                    {
+                                        let _ = events_tx.send(AgentEvent::Error {
+                                            message: format!(
+                                                "Cannot apply writer lease for mission {}: {}",
+                                                tid, error
+                                            ),
+                                            mission_id: Some(tid),
+                                            resumable: true,
+                                        });
+                                        let _ = respond.send(UserMessageAck::Dropped);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         queue.push_back((id, content, msg_agent, target_mission_id, source.clone()));
                         let status_mission_id = if running.is_some() {
                             running_mission_id
