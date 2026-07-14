@@ -5307,6 +5307,7 @@ async fn acquire_durable_pr_writer_lock(
     let file = tokio::task::spawn_blocking(move || {
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -5470,11 +5471,11 @@ async fn find_existing_pr_writer(
         for mission in page {
             if Some(mission.id) == exclude_id
                 || !status_holds_pr_writer_lease(mission.status)
-                || !mission
+                || mission
                     .project
                     .github_pr
                     .as_deref()
-                    .is_some_and(|value| canonical_github_pr(value) == target)
+                    .is_none_or(|value| canonical_github_pr(value) != target)
             {
                 continue;
             }
