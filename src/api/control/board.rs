@@ -472,12 +472,19 @@ async fn spawn_task_worker(
     task: &BoardTask,
     workspace_id: Uuid,
 ) -> Result<Uuid, String> {
+    // Board tasks bypass the public create-mission handler, so apply the same
+    // backend-aware normalization here as a defensive migration for tasks that
+    // were persisted before upsert started normalizing them.
+    let model_override = task
+        .model_override
+        .as_deref()
+        .and_then(|model| super::normalize_model_override_for_backend(Some(&task.backend), model));
     let mission = mission_store
         .create_mission_with_parent(
             Some(&format!("[{}] {}", task.task_key, task.title)),
             Some(workspace_id),
             None,
-            task.model_override.as_deref(),
+            model_override.as_deref(),
             task.model_effort.as_deref(),
             Some(&task.backend),
             None,
@@ -487,6 +494,7 @@ async fn spawn_task_worker(
         .await?;
 
     let mut t = task.clone();
+    t.model_override = model_override;
     t.worker_mission_id = Some(mission.id);
     t.status = BoardTaskStatus::Running;
     t.attempts += 1;
