@@ -5235,6 +5235,22 @@ fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Opti
     .any(|token| tokens.contains(token))
 }
 
+fn requested_pr_writer(
+    explicit: Option<bool>,
+    tags: Option<&[String]>,
+    intent: Option<&str>,
+    prompt: Option<&str>,
+) -> bool {
+    if let Some(explicit) = explicit {
+        return explicit;
+    }
+    if tags.is_some_and(|tags| tags.iter().any(|tag| tag == "pr-readonly")) {
+        return false;
+    }
+    tags.is_some_and(|tags| tags.iter().any(|tag| tag == "pr-writer"))
+        || inferred_pr_writer(None, intent, prompt)
+}
+
 fn status_holds_pr_writer_lease(status: MissionStatus) -> bool {
     matches!(
         status,
@@ -5269,17 +5285,27 @@ async fn find_existing_pr_writer(
     loop {
         let page = store.list_missions(PAGE_SIZE, offset).await?;
         let page_len = page.len();
-        if let Some(mission) = page.into_iter().find(|mission| {
-            Some(mission.id) != exclude_id
-                && status_holds_pr_writer_lease(mission.status)
-                && mission
+        for mission in page {
+            if Some(mission.id) == exclude_id
+                || !status_holds_pr_writer_lease(mission.status)
+                || !mission
                     .project
                     .github_pr
                     .as_deref()
                     .is_some_and(|value| canonical_github_pr(value) == target)
-                && mission_is_pr_writer(mission)
-        }) {
-            return Ok(Some(mission));
+            {
+                continue;
+            }
+            if mission_is_pr_writer(&mission) {
+                return Ok(Some(mission));
+            }
+            // SQLite list queries intentionally omit history. Load the full
+            // mission before treating a legacy prompt-only writer as read-only.
+            if let Some(full) = store.get_mission(mission.id).await? {
+                if mission_is_pr_writer(&full) {
+                    return Ok(Some(full));
+                }
+            }
         }
         if page_len < PAGE_SIZE {
             return Ok(None);
@@ -5500,10 +5526,17 @@ pub async fn create_mission(
 
     // Serialize create+metadata so two controllers cannot race through the
     // preflight and create concurrent writers for the same PR.
-    let pr_writer_guard = if req.github_pr.as_deref().is_some_and(|github_pr| {
-        !github_pr.trim().is_empty()
-            && inferred_pr_writer(req.writer, req.intent.as_deref(), req.prompt.as_deref())
-    }) {
+    let request_is_writer = requested_pr_writer(
+        req.writer,
+        req.tags.as_deref(),
+        req.intent.as_deref(),
+        req.prompt.as_deref(),
+    );
+    let pr_writer_guard = if req
+        .github_pr
+        .as_deref()
+        .is_some_and(|github_pr| !github_pr.trim().is_empty() && request_is_writer)
+    {
         Some(PR_WRITER_CREATE_LOCK.lock().await)
     } else {
         None
@@ -5668,16 +5701,16 @@ pub async fn create_mission(
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty())
     {
-        let capability =
-            if inferred_pr_writer(req.writer, req.intent.as_deref(), req.prompt.as_deref()) {
-                Some("pr-writer")
-            } else if req.writer == Some(false) {
-                Some("pr-readonly")
-            } else {
-                None
-            };
+        let capability = if request_is_writer {
+            Some("pr-writer")
+        } else if req.writer == Some(false) {
+            Some("pr-readonly")
+        } else {
+            None
+        };
         if let Some(capability) = capability {
             let tags = tags.get_or_insert_with(Vec::new);
+            tags.retain(|tag| tag != "pr-writer" && tag != "pr-readonly");
             if !tags.iter().any(|tag| tag == capability) {
                 tags.push(capability.to_string());
             }
@@ -6719,6 +6752,10 @@ pub struct UpdateMissionProjectRequest {
     pub intent: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_string_patch")]
     pub github_pr: Option<Option<String>>,
+    /// Explicit PR branch capability. `true` acquires the writer lease;
+    /// `false` marks the mission read-only.
+    #[serde(default)]
+    pub writer: Option<bool>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_string_patch")]
@@ -6774,24 +6811,21 @@ pub async fn update_mission_project(
     let effective_github_pr = effective_string(&github_pr, &current.project.github_pr);
     let effective_intent = effective_string(&intent, &current.project.intent);
     let mut effective_tags = tags.clone().unwrap_or_else(|| current.project.tags.clone());
-    let explicitly_readonly = effective_tags.iter().any(|tag| tag == "pr-readonly");
     let becomes_writer = effective_github_pr.is_some()
-        && !explicitly_readonly
-        && (effective_tags.iter().any(|tag| tag == "pr-writer")
-            || inferred_pr_writer(
-                None,
-                effective_intent.as_deref(),
-                current.history.first().map(|entry| entry.content.as_str()),
-            ));
-    if becomes_writer && !effective_tags.iter().any(|tag| tag == "pr-writer") {
+        && requested_pr_writer(
+            req.writer,
+            Some(&effective_tags),
+            effective_intent.as_deref(),
+            current.history.first().map(|entry| entry.content.as_str()),
+        );
+    if becomes_writer {
+        effective_tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
         effective_tags.push("pr-writer".to_string());
         tags = Some(effective_tags.clone());
-    } else if tags.is_some() {
-        // Preserve the caller's normalized replacement even when it does not
-        // change writer capability.
-        if tags.as_ref() != Some(&effective_tags) {
-            tags = Some(effective_tags.clone());
-        }
+    } else if effective_github_pr.is_some() && req.writer == Some(false) {
+        effective_tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
+        effective_tags.push("pr-readonly".to_string());
+        tags = Some(effective_tags.clone());
     }
 
     let writer_guard = if becomes_writer {
@@ -19108,6 +19142,18 @@ mod tests {
         assert!(inferred_pr_writer(
             Some(true),
             Some("read_only_audit"),
+            None
+        ));
+        assert!(requested_pr_writer(
+            Some(true),
+            Some(&["pr-readonly".to_string()]),
+            Some("read_only_audit"),
+            None
+        ));
+        assert!(!requested_pr_writer(
+            Some(false),
+            Some(&["pr-writer".to_string()]),
+            Some("integration_repair"),
             None
         ));
     }
