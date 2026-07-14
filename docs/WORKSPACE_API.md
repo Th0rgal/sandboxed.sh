@@ -201,10 +201,12 @@ POST /api/workspaces/:id/resources
 
 `GET` is read-only and shows the effective per-mission `MemoryMax`,
 `MemoryHigh`, `MemorySwapMax`, `CPUWeight`, and `CPUQuota`, any workspace
-overrides, and matching live systemd scopes. Limits inherit from the process
-environment (`MISSION_MEMORY_MAX`, `MISSION_MEMORY_HIGH`,
-`MISSION_MEMORY_SWAP_MAX`, `MISSION_CPU_WEIGHT`, `MISSION_CPU_QUOTA`) unless a
-workspace override is present.
+overrides, and matching live systemd scopes. If live scope discovery fails,
+`scope_list_error` is populated so an empty `running_scope_units` list is not
+mistaken for an idle workspace. Limits inherit from the process environment
+(`MISSION_MEMORY_MAX`, `MISSION_MEMORY_HIGH`, `MISSION_MEMORY_SWAP_MAX`,
+`MISSION_CPU_WEIGHT`, `MISSION_CPU_QUOTA`) unless a workspace override is
+present.
 
 `POST` updates those workspace overrides and can retune current scopes; see the
 request fields in the API response/schema. Use `GET` first when investigating a

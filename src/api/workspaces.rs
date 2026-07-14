@@ -1888,6 +1888,7 @@ pub struct WorkspaceResourcesResponse {
     pub cpu_quota: Option<String>,
     pub workspace_overrides: HashMap<String, String>,
     pub running_scope_units: Vec<String>,
+    pub scope_list_error: Option<String>,
 }
 
 async fn get_workspace_resources(
@@ -1911,10 +1912,14 @@ async fn get_workspace_resources(
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    let running_scope_units = list_workspace_scope_units(&workspace).await.unwrap_or_else(|err| {
-        tracing::warn!(workspace = %workspace.name, %err, "resource visibility: scope listing failed");
-        Vec::new()
-    });
+    let (running_scope_units, scope_list_error) = match list_workspace_scope_units(&workspace).await
+    {
+        Ok(units) => (units, None),
+        Err(err) => {
+            tracing::warn!(workspace = %workspace.name, %err, "resource visibility: scope listing failed");
+            (Vec::new(), Some(err))
+        }
+    };
     Ok(Json(WorkspaceResourcesResponse {
         workspace_id: workspace.id,
         workspace_name: workspace.name,
@@ -1925,6 +1930,7 @@ async fn get_workspace_resources(
         cpu_quota: caps.cpu_quota,
         workspace_overrides,
         running_scope_units,
+        scope_list_error,
     }))
 }
 
