@@ -1100,7 +1100,7 @@ fn opencode_entry_from_mcp(
                 };
                 let mut cmd = vec![env_command, "-i".to_string()];
                 let mut env_pairs: Vec<_> = merged_env.iter().collect();
-                env_pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
+                env_pairs.sort_by_key(|(key, _)| *key);
                 cmd.extend(
                     env_pairs
                         .into_iter()
