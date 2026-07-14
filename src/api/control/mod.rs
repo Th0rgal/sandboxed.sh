@@ -5336,6 +5336,39 @@ async fn ensure_pr_writer_resume_is_exclusive(
     Ok(())
 }
 
+async fn activate_mission_for_message(
+    store: &Arc<dyn MissionStore>,
+    events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
+    mission: &Mission,
+) -> Result<(), String> {
+    if !message_activates_mission(mission.status) {
+        return Ok(());
+    }
+
+    // A targeted message can resume terminal/acknowledged work without going
+    // through the explicit resume endpoint. Reacquire the writer lease under
+    // the same mutex as create/project/resume and keep it until Active is
+    // persisted, so message delivery cannot race a replacement writer.
+    let _pr_writer_guard = if mission_is_pr_writer(mission) {
+        Some(PR_WRITER_CREATE_LOCK.lock().await)
+    } else {
+        None
+    };
+    if _pr_writer_guard.is_some() {
+        ensure_pr_writer_resume_is_exclusive(store, mission).await?;
+    }
+
+    store
+        .update_mission_status(mission.id, MissionStatus::Active)
+        .await?;
+    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+        mission_id: mission.id,
+        status: MissionStatus::Active,
+        summary: None,
+    });
+    Ok(())
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -6833,12 +6866,22 @@ pub async fn update_mission_project(
     let effective_github_pr = effective_string(&github_pr, &current.project.github_pr);
     let effective_intent = effective_string(&intent, &current.project.intent);
     let mut effective_tags = tags.clone().unwrap_or_else(|| current.project.tags.clone());
+    let deferred_goal = control
+        .mission_store
+        .get_deferred_goal(id)
+        .await
+        .map_err(internal_error)?;
+    let writer_prompt = current
+        .history
+        .first()
+        .map(|entry| entry.content.as_str())
+        .or(deferred_goal.as_deref());
     let becomes_writer = effective_github_pr.is_some()
         && requested_pr_writer(
             req.writer,
             Some(&effective_tags),
             effective_intent.as_deref(),
-            current.history.first().map(|entry| entry.content.as_str()),
+            writer_prompt,
         );
     if becomes_writer {
         effective_tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
@@ -12594,21 +12637,23 @@ async fn control_actor_loop(
                                                 let _ = respond.send(UserMessageAck::Dropped);
                                                 continue;
                                             }
-                                            // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
-                                            if message_activates_mission(mission.status) {
-                                                tracing::info!(
-                                                    "Activating parallel mission {} (was {})",
-                                                    tid, mission.status
-                                                );
-                                                if let Err(e) = mission_store.update_mission_status(tid, MissionStatus::Active).await {
-                                                    tracing::warn!("Failed to activate parallel mission {}: {}", tid, e);
-                                                } else {
-                                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                                        mission_id: tid,
-                                                        status: MissionStatus::Active,
-                                                        summary: None,
-                                                    });
-                                                }
+                                            if let Err(error) = activate_mission_for_message(
+                                                &mission_store,
+                                                &events_tx,
+                                                &mission,
+                                            )
+                                            .await
+                                            {
+                                                let _ = events_tx.send(AgentEvent::Error {
+                                                    message: format!(
+                                                        "Cannot activate mission {}: {}",
+                                                        tid, error
+                                                    ),
+                                                    mission_id: Some(tid),
+                                                    resumable: true,
+                                                });
+                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                continue;
                                             }
                                             let mut runner = super::mission_runner::MissionRunner::new(
                                                 tid,
@@ -12720,21 +12765,23 @@ async fn control_actor_loop(
                                                 mission.history.len(), tid
                                             );
                                         }
-                                        // Activate mission if it was pending/interrupted/blocked/completed
-                                        if message_activates_mission(mission.status) {
-                                            tracing::info!(
-                                                "Activating main mission {} (was {})",
-                                                tid, mission.status
-                                            );
-                                            if let Err(e) = mission_store.update_mission_status(tid, MissionStatus::Active).await {
-                                                tracing::warn!("Failed to activate main mission {}: {}", tid, e);
-                                            } else {
-                                                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                                    mission_id: tid,
-                                                    status: MissionStatus::Active,
-                                                    summary: None,
-                                                });
-                                            }
+                                        if let Err(error) = activate_mission_for_message(
+                                            &mission_store,
+                                            &events_tx,
+                                            &mission,
+                                        )
+                                        .await
+                                        {
+                                            let _ = events_tx.send(AgentEvent::Error {
+                                                message: format!(
+                                                    "Cannot activate mission {}: {}",
+                                                    tid, error
+                                                ),
+                                                mission_id: Some(tid),
+                                                resumable: true,
+                                            });
+                                            let _ = respond.send(UserMessageAck::Dropped);
+                                            continue;
                                         }
                                     }
                                     *current_mission.write().await = Some(tid);
@@ -12759,21 +12806,23 @@ async fn control_actor_loop(
                                             for entry in &mission.history {
                                                 history.push((entry.role.clone(), entry.content.clone()));
                                             }
-                                            // Activate mission if it was pending/interrupted/blocked/completed
-                                            if message_activates_mission(mission.status) {
-                                                tracing::info!(
-                                                    "Activating switched mission {} (was {})",
-                                                    tid, mission.status
-                                                );
-                                                if let Err(e) = mission_store.update_mission_status(tid, MissionStatus::Active).await {
-                                                    tracing::warn!("Failed to activate switched mission {}: {}", tid, e);
-                                                } else {
-                                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                                        mission_id: tid,
-                                                        status: MissionStatus::Active,
-                                                        summary: None,
-                                                    });
-                                                }
+                                            if let Err(error) = activate_mission_for_message(
+                                                &mission_store,
+                                                &events_tx,
+                                                &mission,
+                                            )
+                                            .await
+                                            {
+                                                let _ = events_tx.send(AgentEvent::Error {
+                                                    message: format!(
+                                                        "Cannot activate mission {}: {}",
+                                                        tid, error
+                                                    ),
+                                                    mission_id: Some(tid),
+                                                    resumable: true,
+                                                });
+                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                continue;
                                             }
                                         }
                                         *current_mission.write().await = Some(tid);
@@ -12793,21 +12842,23 @@ async fn control_actor_loop(
                                                     mission.history.len(), tid
                                                 );
                                             }
-                                            // Activate mission if it was pending/interrupted/blocked/completed (same mission, reloading)
-                                            if message_activates_mission(mission.status) {
-                                                tracing::info!(
-                                                    "Activating reloaded mission {} (was {})",
-                                                    tid, mission.status
-                                                );
-                                                if let Err(e) = mission_store.update_mission_status(tid, MissionStatus::Active).await {
-                                                    tracing::warn!("Failed to activate reloaded mission {}: {}", tid, e);
-                                                } else {
-                                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                                        mission_id: tid,
-                                                        status: MissionStatus::Active,
-                                                        summary: None,
-                                                    });
-                                                }
+                                            if let Err(error) = activate_mission_for_message(
+                                                &mission_store,
+                                                &events_tx,
+                                                &mission,
+                                            )
+                                            .await
+                                            {
+                                                let _ = events_tx.send(AgentEvent::Error {
+                                                    message: format!(
+                                                        "Cannot activate mission {}: {}",
+                                                        tid, error
+                                                    ),
+                                                    mission_id: Some(tid),
+                                                    resumable: true,
+                                                });
+                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                continue;
                                             }
                                         }
                                     }
@@ -12910,22 +12961,23 @@ async fn control_actor_loop(
                                 let (workspace_id, model_override, model_effort, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
                                     match mission_store.get_mission(mid).await {
                                         Ok(Some(mission)) => {
-                                            // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
-                                            if message_activates_mission(mission.status) {
-                                                tracing::info!(
-                                                    "Activating mission {} (was {})",
-                                                    mid, mission.status
-                                                );
-                                                if let Err(e) = mission_store.update_mission_status(mid, MissionStatus::Active).await {
-                                                    tracing::warn!("Failed to activate mission {}: {}", mid, e);
-                                                } else {
-                                                    // Notify frontend of status change
-                                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                                        mission_id: mid,
-                                                        status: MissionStatus::Active,
-                                                        summary: None,
-                                                    });
-                                                }
+                                            if let Err(error) = activate_mission_for_message(
+                                                &mission_store,
+                                                &events_tx,
+                                                &mission,
+                                            )
+                                            .await
+                                            {
+                                                let _ = events_tx.send(AgentEvent::Error {
+                                                    message: format!(
+                                                        "Cannot activate mission {}: {}",
+                                                        mid, error
+                                                    ),
+                                                    mission_id: Some(mid),
+                                                    resumable: true,
+                                                });
+                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                continue;
                                             }
                                             (
                                                 Some(mission.workspace_id),
