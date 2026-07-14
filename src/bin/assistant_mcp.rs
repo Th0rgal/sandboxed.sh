@@ -150,6 +150,8 @@ struct StartMissionParams {
     #[serde(default)]
     github_pr: Option<String>,
     #[serde(default)]
+    writer: Option<bool>,
+    #[serde(default)]
     tags: Option<Vec<String>>,
     #[serde(default)]
     desired_state: Option<String>,
@@ -817,7 +819,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "start_mission".to_string(),
-                description: "Create a new sandboxed.sh mission and send its initial prompt. Set backend explicitly when possible. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title).".to_string(),
+                description: "Create a new sandboxed.sh mission and send its initial prompt. Set backend explicitly when possible. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Mark PR-changing work with writer=true; the API rejects concurrent writers for the same PR.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -834,6 +836,7 @@ impl AssistantMcp {
                         "track": {"type": "string", "description": "Track/workstream (e.g. \"core-c3\")."},
                         "intent": {"type": "string", "description": "Intent (e.g. \"review_merge_pr\")."},
                         "github_pr": {"type": "string", "description": "Associated PR ref (e.g. \"owner/repo#123\")."},
+                        "writer": {"type": "boolean", "description": "Whether this mission may modify the associated PR branch. Concurrent writers for one PR are rejected."},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "desired_state": {"type": "string", "description": "Track state, e.g. waiting_ci / waiting_review / blocked_external."},
                         "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."}
@@ -1300,6 +1303,7 @@ impl AssistantMcp {
             "track": params.track,
             "intent": params.intent,
             "github_pr": params.github_pr,
+            "writer": params.writer,
             "tags": params.tags,
             "desired_state": params.desired_state,
             "next_check_at": params.next_check_at,

@@ -4945,6 +4945,10 @@ pub struct CreateMissionRequest {
     pub intent: Option<String>,
     /// Project tagging: associated GitHub PR ref (e.g. "owner/repo#123").
     pub github_pr: Option<String>,
+    /// Whether this mission may modify the associated PR branch. When omitted,
+    /// Sandboxed.sh infers writer intent from `intent`/`prompt`. At most one
+    /// non-terminal writer may own a PR at a time.
+    pub writer: Option<bool>,
     /// Project tagging: freeform tags.
     pub tags: Option<Vec<String>>,
     /// Track state, e.g. "waiting_ci" / "waiting_review" / "blocked_external".
@@ -5167,6 +5171,105 @@ fn fable_mandate_requests_integration(intent: Option<&str>, prompt: Option<&str>
     .any(|token| tokens.contains(token))
 }
 
+static PR_WRITER_CREATE_LOCK: std::sync::LazyLock<Mutex<()>> =
+    std::sync::LazyLock::new(|| Mutex::new(()));
+
+fn canonical_github_pr(raw: &str) -> String {
+    let mut value = raw.trim().trim_end_matches('/').to_ascii_lowercase();
+    for prefix in ["https://github.com/", "http://github.com/", "github.com/"] {
+        if let Some(stripped) = value.strip_prefix(prefix) {
+            value = stripped.to_string();
+            break;
+        }
+    }
+    value.replace("/pull/", "#")
+}
+
+fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Option<&str>) -> bool {
+    if let Some(explicit) = explicit {
+        return explicit;
+    }
+    let text = format!(
+        "{} {}",
+        intent.unwrap_or_default(),
+        prompt.unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    let tokens: HashSet<&str> = text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    [
+        "write",
+        "edit",
+        "fix",
+        "repair",
+        "resolve",
+        "integrate",
+        "integration",
+        "rebase",
+        "merge",
+        "commit",
+        "push",
+        "implement",
+        "implementation",
+        "update",
+    ]
+    .iter()
+    .any(|token| tokens.contains(token))
+}
+
+fn status_holds_pr_writer_lease(status: MissionStatus) -> bool {
+    matches!(
+        status,
+        MissionStatus::Pending
+            | MissionStatus::Active
+            | MissionStatus::WaitingBackground
+            | MissionStatus::AwaitingUser
+            | MissionStatus::Paused
+    )
+}
+
+fn mission_is_pr_writer(mission: &Mission) -> bool {
+    if mission.project.tags.iter().any(|tag| tag == "pr-readonly") {
+        return false;
+    }
+    mission.project.tags.iter().any(|tag| tag == "pr-writer")
+        || inferred_pr_writer(
+            None,
+            mission.project.intent.as_deref(),
+            mission.history.first().map(|entry| entry.content.as_str()),
+        )
+}
+
+async fn find_existing_pr_writer(
+    store: &Arc<dyn MissionStore>,
+    github_pr: &str,
+) -> Result<Option<Mission>, String> {
+    const PAGE_SIZE: usize = 200;
+    let target = canonical_github_pr(github_pr);
+    let mut offset = 0;
+    loop {
+        let page = store.list_missions(PAGE_SIZE, offset).await?;
+        let page_len = page.len();
+        if let Some(mission) = page.into_iter().find(|mission| {
+            status_holds_pr_writer_lease(mission.status)
+                && mission
+                    .project
+                    .github_pr
+                    .as_deref()
+                    .is_some_and(|value| canonical_github_pr(value) == target)
+                && mission_is_pr_writer(mission)
+        }) {
+            return Ok(Some(mission));
+        }
+        if page_len < PAGE_SIZE {
+            return Ok(None);
+        }
+        offset += page_len;
+    }
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -5191,6 +5294,7 @@ pub async fn create_mission(
         track: None,
         intent: None,
         github_pr: None,
+        writer: None,
         tags: None,
         desired_state: None,
         next_check_at: None,
@@ -5376,6 +5480,17 @@ pub async fn create_mission(
         ));
     }
 
+    // Serialize create+metadata so two controllers cannot race through the
+    // preflight and create concurrent writers for the same PR.
+    let pr_writer_guard = if req.github_pr.as_deref().is_some_and(|github_pr| {
+        !github_pr.trim().is_empty()
+            && inferred_pr_writer(req.writer, req.intent.as_deref(), req.prompt.as_deref())
+    }) {
+        Some(PR_WRITER_CREATE_LOCK.lock().await)
+    } else {
+        None
+    };
+
     // Validate the remote-node payload before persisting the mission so a
     // bad request cannot leave an orphaned pending mission behind.
     let mut remote_node_id = req
@@ -5470,6 +5585,22 @@ pub async fn create_mission(
     }
 
     let control = control_for_user(&state, &user).await;
+    if let (Some(github_pr), Some(_guard)) = (req.github_pr.as_deref(), pr_writer_guard.as_ref()) {
+        if let Some(existing) = find_existing_pr_writer(&control.mission_store, github_pr)
+            .await
+            .map_err(internal_error)?
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "PR writer lease is already held by mission {} (status={}); acknowledge, interrupt, or complete it before creating another writer for {}",
+                    existing.id,
+                    existing.status,
+                    canonical_github_pr(github_pr)
+                ),
+            ));
+        }
+    }
     control
         .cmd_tx
         .send(ControlCommand::CreateMission {
@@ -5508,12 +5639,28 @@ pub async fn create_mission(
     let github_pr = nonblank(&req.github_pr);
     let desired_state = nonblank(&req.desired_state);
     let next_check_at = nonblank(&req.next_check_at);
-    let tags: Option<Vec<String>> = req.tags.as_ref().map(|tags| {
+    let mut tags: Option<Vec<String>> = req.tags.as_ref().map(|tags| {
         tags.iter()
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect()
     });
+    if req
+        .github_pr
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        let capability =
+            if inferred_pr_writer(req.writer, req.intent.as_deref(), req.prompt.as_deref()) {
+                "pr-writer"
+            } else {
+                "pr-readonly"
+            };
+        let tags = tags.get_or_insert_with(Vec::new);
+        if !tags.iter().any(|tag| tag == capability) {
+            tags.push(capability.to_string());
+        }
+    }
     if project.is_some()
         || track.is_some()
         || intent.is_some()
@@ -8108,6 +8255,7 @@ pub async fn clone_mission(
         track: source.project.track.clone(),
         intent: source.project.intent.clone(),
         github_pr: source.project.github_pr.clone(),
+        writer: None,
         tags: if source.project.tags.is_empty() {
             None
         } else {
@@ -18781,6 +18929,38 @@ mod tests {
             .lock()
             .expect("metadata refresh baseline lock poisoned");
         baselines.clear();
+    }
+
+    #[test]
+    fn canonical_github_pr_equates_url_and_compact_forms() {
+        assert_eq!(
+            canonical_github_pr("https://github.com/lfglabs-dev/verity/pull/2168/"),
+            "lfglabs-dev/verity#2168"
+        );
+        assert_eq!(
+            canonical_github_pr("LFGLABS-DEV/VERITY#2168"),
+            "lfglabs-dev/verity#2168"
+        );
+    }
+
+    #[test]
+    fn pr_writer_inference_prefers_explicit_capability() {
+        assert!(inferred_pr_writer(None, Some("integration_repair"), None));
+        assert!(!inferred_pr_writer(
+            None,
+            Some("read_only_audit"),
+            Some("Inspect CI and report status")
+        ));
+        assert!(!inferred_pr_writer(
+            Some(false),
+            Some("review_merge_pr"),
+            None
+        ));
+        assert!(inferred_pr_writer(
+            Some(true),
+            Some("read_only_audit"),
+            None
+        ));
     }
 
     fn stored_test_event(
