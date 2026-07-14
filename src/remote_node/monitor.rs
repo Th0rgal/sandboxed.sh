@@ -243,6 +243,26 @@ pub fn select_node_auto(
     min_disk_bytes: u64,
     min_mem_bytes: u64,
 ) -> Result<String, PlacementError> {
+    select_node_auto_with_reservations(
+        nodes,
+        statuses,
+        requirements,
+        min_disk_bytes,
+        min_mem_bytes,
+        &HashMap::new(),
+    )
+}
+
+/// Capacity-aware placement that also counts jobs accepted by the core but
+/// not yet reflected in the nodes' periodic heartbeats.
+pub fn select_node_auto_with_reservations(
+    nodes: &[RemoteNodeConfig],
+    statuses: &HashMap<String, CachedNodeStatus>,
+    requirements: &[String],
+    min_disk_bytes: u64,
+    min_mem_bytes: u64,
+    reservations: &HashMap<String, u32>,
+) -> Result<String, PlacementError> {
     let mut reasons: Vec<(String, String)> = Vec::new();
     let mut eligible: Vec<(u32, u64, String)> = Vec::new(); // (load, mem_avail, id)
     for node in nodes {
@@ -296,7 +316,8 @@ pub fn select_node_auto(
         let load = heartbeat
             .active_jobs
             .saturating_add(heartbeat.queued_jobs)
-            .saturating_add(heartbeat.active_leases);
+            .saturating_add(heartbeat.active_leases)
+            .saturating_add(reservations.get(&node.id).copied().unwrap_or(0));
         if load >= heartbeat.capacity_total.saturating_mul(2) {
             reasons.push((
                 node.id.clone(),
@@ -327,13 +348,25 @@ impl FleetMonitor {
         settings: &RemoteNodeSettings,
         requirements: &[String],
     ) -> Result<String, PlacementError> {
+        self.place_auto_with_reservations(settings, requirements, &HashMap::new())
+    }
+
+    /// Like [`Self::place_auto`], with accepted jobs that may not have reached
+    /// the latest node heartbeat yet.
+    pub fn place_auto_with_reservations(
+        &self,
+        settings: &RemoteNodeSettings,
+        requirements: &[String],
+        reservations: &HashMap<String, u32>,
+    ) -> Result<String, PlacementError> {
         let statuses = self.statuses.read().unwrap_or_else(|e| e.into_inner());
-        select_node_auto(
+        select_node_auto_with_reservations(
             &settings.nodes,
             &statuses,
             requirements,
             env_gb_bytes("REMOTE_NODE_MIN_DISK_GB", DEFAULT_MIN_DISK_GB),
             env_gb_bytes("REMOTE_NODE_MIN_MEM_GB", DEFAULT_MIN_MEM_GB),
+            reservations,
         )
     }
 }
@@ -712,6 +745,31 @@ mod tests {
         let picked =
             select_node_auto(&[node_config("e")], &statuses, &[], 20 * GIB, 8 * GIB).unwrap();
         assert_eq!(picked, "e");
+    }
+
+    #[test]
+    fn placement_counts_core_side_reservations_before_heartbeat_catches_up() {
+        let nodes = vec![node_config("a"), node_config("b")];
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "a".to_string(),
+            cached_online("a", &["lean"], 100, 64, 4, 0, 0),
+        );
+        statuses.insert(
+            "b".to_string(),
+            cached_online("b", &["lean"], 100, 32, 4, 0, 0),
+        );
+        let reservations = HashMap::from([("a".to_string(), 1)]);
+        let picked = select_node_auto_with_reservations(
+            &nodes,
+            &statuses,
+            &["lean".to_string()],
+            20 * GIB,
+            8 * GIB,
+            &reservations,
+        )
+        .unwrap();
+        assert_eq!(picked, "b");
     }
 
     #[test]
