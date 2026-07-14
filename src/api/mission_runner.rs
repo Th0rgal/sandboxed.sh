@@ -13,7 +13,7 @@
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,60 @@ use super::control::{
     ControlStatus, ExecutionProgress, FrontendToolHub,
 };
 use super::library::SharedLibrary;
+
+/// Resolve an orchestrator-supplied working directory to the host-side path
+/// consumed by [`WorkspaceExec`]. Container callers naturally refer to guest
+/// paths (for example `/workspace/verity/base`), while the API process must
+/// validate the corresponding path below the container rootfs.
+fn resolve_mission_working_directory(
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    requested: &str,
+) -> Result<PathBuf, String> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Err("working_directory is empty".to_string());
+    }
+
+    let requested_path = Path::new(requested);
+    let resolved = if workspace_type == WorkspaceType::Container {
+        if requested_path.is_absolute() && requested_path.starts_with(workspace_root) {
+            requested_path.to_path_buf()
+        } else if requested_path.is_absolute() {
+            workspace_root.join(requested_path.strip_prefix("/").unwrap_or(requested_path))
+        } else {
+            workspace_root.join(requested_path)
+        }
+    } else if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        workspace_root.join(requested_path)
+    };
+
+    if !resolved.is_dir() {
+        return Err(format!(
+            "working_directory does not exist or is not a directory: {}",
+            resolved.display()
+        ));
+    }
+
+    if workspace_type == WorkspaceType::Container {
+        let canonical_root = workspace_root
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve workspace root: {error}"))?;
+        let canonical_resolved = resolved
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve working_directory: {error}"))?;
+        if !canonical_resolved.starts_with(&canonical_root) {
+            return Err(format!(
+                "working_directory escapes workspace root {}",
+                workspace_root.display()
+            ));
+        }
+    }
+
+    Ok(resolved)
+}
 
 /// Build the synthetic `AgentResult::failure` produced when a turn is
 /// cancelled. If the process has begun a graceful shutdown, return a
@@ -3412,21 +3466,25 @@ async fn run_mission_turn(
 
     // Override with mission-specific working_directory (e.g. git worktree for orchestrated workers)
     let mission_work_dir = if let Some(ref wd) = mission_working_directory {
-        let wd_path = std::path::PathBuf::from(wd);
-        if wd_path.exists() {
-            tracing::info!(
-                "Mission {} using working_directory override: {}",
-                mission_id,
-                wd
-            );
-            wd_path
-        } else {
-            tracing::warn!(
-                "Mission {} working_directory does not exist: {}, using default",
-                mission_id,
-                wd
-            );
-            mission_work_dir
+        match resolve_mission_working_directory(&workspace.path, workspace.workspace_type, wd) {
+            Ok(wd_path) => {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    requested_working_directory = %wd,
+                    resolved_working_directory = %wd_path.display(),
+                    "Using mission working_directory override"
+                );
+                wd_path
+            }
+            Err(error) => {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    requested_working_directory = %wd,
+                    error = %error,
+                    "Mission working_directory is invalid; using prepared mission directory"
+                );
+                mission_work_dir
+            }
         }
     } else {
         mission_work_dir
@@ -8369,18 +8427,18 @@ mod tests {
         overlay_opencode_auth, parse_cli_semver, parse_opencode_goal_objective,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, preferred_opencode_bin_dir, prepend_unique_path_entry,
-        record_codex_error_message, replace_filepath_artifact_with_tool_output, running_health,
-        sanitized_opencode_stdout, selected_opencode_auth_path,
-        selected_opencode_provider_auth_dir, set_codex_account_cooldown,
-        should_sync_container_opencode, stall_severity, strip_ansi_codes,
-        strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
-        summarize_recent_opencode_stderr, text_buffer_stream_looks_degenerate,
-        thinking_overlaps_visible_answer, tls_error_hint, truncate_garbled_output,
-        use_thinking_only_fallback, utf8_safe_prefix, ClaudeIncompleteTurnContext,
-        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
-        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState,
-        CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN, CODEX_RATE_LIMIT_COOLDOWN,
-        STALL_SEVERE_SECS, STALL_WARN_SECS,
+        record_codex_error_message, replace_filepath_artifact_with_tool_output,
+        resolve_mission_working_directory, running_health, sanitized_opencode_stdout,
+        selected_opencode_auth_path, selected_opencode_provider_auth_dir,
+        set_codex_account_cooldown, should_sync_container_opencode, stall_severity,
+        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
+        summarize_codex_usage_caps, summarize_recent_opencode_stderr,
+        text_buffer_stream_looks_degenerate, thinking_overlaps_visible_answer, tls_error_hint,
+        truncate_garbled_output, use_thinking_only_fallback, utf8_safe_prefix,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
+        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -8390,11 +8448,45 @@ mod tests {
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::cost::resolve_cost_cents_and_source;
     use crate::library::types::CommandParam;
+    use crate::workspace::WorkspaceType;
     use serde_json::json;
     use std::borrow::Cow;
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn mission_working_directory_maps_container_guest_absolute_path() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("workspace/verity/base");
+        fs::create_dir_all(&repo).unwrap();
+
+        assert_eq!(
+            resolve_mission_working_directory(
+                root.path(),
+                WorkspaceType::Container,
+                "/workspace/verity/base",
+            )
+            .unwrap(),
+            repo
+        );
+    }
+
+    #[test]
+    fn mission_working_directory_rejects_container_symlink_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+
+        #[cfg(unix)]
+        assert!(resolve_mission_working_directory(
+            root.path(),
+            WorkspaceType::Container,
+            "/escape",
+        )
+        .is_err());
+    }
 
     #[test]
     fn isolated_opencode_auth_follows_the_mission_xdg_paths() {
