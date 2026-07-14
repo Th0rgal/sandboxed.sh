@@ -13175,7 +13175,7 @@ async fn control_actor_loop(
                                                 &mission_store,
                                                 &events_tx,
                                                 &mission,
-                                                &content,
+                                                &msg,
                                             )
                                             .await
                                             {
