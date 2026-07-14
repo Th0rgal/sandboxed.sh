@@ -5524,17 +5524,65 @@ fn find_existing_pr_writer_in_sqlite(
     connection
         .busy_timeout(std::time::Duration::from_secs(2))
         .map_err(|error| error.to_string())?;
+    let table_columns = |table: &str| -> Result<std::collections::HashSet<String>, String> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| format!("inspect {table} in {}: {error}", path.display()))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<std::collections::HashSet<_>, _>>()
+            .map_err(|error| error.to_string())
+    };
+    let mission_columns = table_columns("missions")?;
+    if !mission_columns.contains("github_pr") {
+        // Stores that predate PR metadata cannot hold a PR-scoped lease.
+        return Ok(None);
+    }
+    if !mission_columns.contains("id") || !mission_columns.contains("status") {
+        return Err(format!(
+            "missions table in {} is missing identity/status columns",
+            path.display()
+        ));
+    }
+    let event_columns = table_columns("mission_events")?;
+    let events_have_prompt = ["mission_id", "sequence", "event_type", "content"]
+        .iter()
+        .all(|column| event_columns.contains(*column));
+    let optional_mission_column = |column: &str| {
+        if mission_columns.contains(column) {
+            format!("m.{column}")
+        } else {
+            "NULL".to_string()
+        }
+    };
+    let first_prompt = if events_have_prompt {
+        "(SELECT e.content FROM mission_events e \
+         WHERE e.mission_id = m.id AND e.event_type = 'user_message' \
+         ORDER BY e.sequence ASC LIMIT 1)"
+            .to_string()
+    } else {
+        "NULL".to_string()
+    };
+    let first_prompt_file = if events_have_prompt && event_columns.contains("content_file") {
+        "(SELECT e.content_file FROM mission_events e \
+         WHERE e.mission_id = m.id AND e.event_type = 'user_message' \
+         ORDER BY e.sequence ASC LIMIT 1)"
+            .to_string()
+    } else {
+        "NULL".to_string()
+    };
+    let query = format!(
+        "SELECT m.id, m.status, m.github_pr, {}, {}, {}, {}, {} \
+         FROM missions m WHERE m.github_pr IS NOT NULL",
+        optional_mission_column("intent"),
+        optional_mission_column("tags"),
+        optional_mission_column("deferred_goal"),
+        first_prompt,
+        first_prompt_file,
+    );
     let mut statement = connection
-        .prepare(
-            "SELECT m.id, m.status, m.github_pr, m.intent, m.tags, m.deferred_goal, \
-             (SELECT e.content FROM mission_events e \
-              WHERE e.mission_id = m.id AND e.event_type = 'user_message' \
-              ORDER BY e.sequence ASC LIMIT 1), \
-             (SELECT e.content_file FROM mission_events e \
-              WHERE e.mission_id = m.id AND e.event_type = 'user_message' \
-              ORDER BY e.sequence ASC LIMIT 1) \
-             FROM missions m WHERE m.github_pr IS NOT NULL",
-        )
+        .prepare(&query)
         .map_err(|error| format!("query {}: {error}", path.display()))?;
     let rows = statement
         .query_map([], |row| {
@@ -19888,6 +19936,68 @@ mod tests {
 
         assert_eq!(found.id, mission_id);
         assert_eq!(found.status, MissionStatus::Pending);
+    }
+
+    #[test]
+    fn offline_sqlite_writer_scan_ignores_schema_without_pr_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missions-legacy.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE missions (id TEXT PRIMARY KEY, status TEXT);
+                 CREATE TABLE mission_events (
+                    mission_id TEXT, sequence INTEGER, event_type TEXT, content TEXT
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(
+            find_existing_pr_writer_in_sqlite(&path, "owner/repo#42", None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn offline_sqlite_writer_scan_adapts_to_missing_optional_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missions-partial.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE missions (
+                    id TEXT PRIMARY KEY, status TEXT, github_pr TEXT
+                 );
+                 CREATE TABLE mission_events (
+                    mission_id TEXT, sequence INTEGER, event_type TEXT, content TEXT
+                 );",
+            )
+            .unwrap();
+        let mission_id = Uuid::new_v4();
+        connection
+            .execute(
+                "INSERT INTO missions (id, status, github_pr)
+                 VALUES (?1, 'active', 'owner/repo#44')",
+                rusqlite::params![mission_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mission_events
+                 (mission_id, sequence, event_type, content)
+                 VALUES (?1, 1, 'user_message', 'Fix, commit and push this PR')",
+                rusqlite::params![mission_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let found = find_existing_pr_writer_in_sqlite(&path, "owner/repo#44", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, mission_id);
+        assert_eq!(found.status, MissionStatus::Active);
     }
 
     #[test]
