@@ -3,12 +3,12 @@
 //! When `auto_cleanup_enabled` is on in `SettingsStore`, this task wakes up
 //! once an hour, walks every live control session's mission store, and for
 //! each mission in a terminal status that hasn't been touched within the
-//! configured retention window (`auto_cleanup_days`), it deletes the
+//! configured retention window (`auto_cleanup_days`), it proposes cleanup of the
 //! per-mission workspace directory on disk
 //! (`{workspace_root}/workspaces/mission-{first-8-of-id}/`).
 //!
 //! The conversation history in the SQLite mission store is left intact —
-//! only the agent's sandboxed filesystem is collected. The mission can still
+//! only the agent's sandboxed filesystem is eligible. The mission can still
 //! be opened from the dashboard; "Load earlier messages" continues to work.
 //!
 //! Terminal statuses we collect:
@@ -39,6 +39,11 @@ pub const DEFAULT_STOPPED_RETENTION_DAYS: u32 = 30;
 /// memory even when a session has thousands of missions.
 const LIST_PAGE_SIZE: usize = 200;
 
+/// Deletion is deliberately opt-in. An enabled retention setting alone only
+/// produces auditable `would_remove` records. This makes rollout reversible
+/// and prevents a configuration migration from deleting historical work.
+const EXECUTE_ENV: &str = "WORKSPACE_GC_EXECUTE";
+
 /// Spawn the background GC loop. Safe to call once at server start.
 pub fn spawn(state: Arc<AppState>) {
     tokio::spawn(async move {
@@ -64,10 +69,12 @@ async fn run_loop(state: Arc<AppState>) {
             cutoff: now - chrono::Duration::days(settings.days as i64),
             stopped_cutoff: now - chrono::Duration::days(settings.stopped_days as i64),
             orphans_enabled: settings.orphans_enabled,
+            dry_run: !gc_execution_enabled(),
         };
         let report = run_once(&state, &params).await;
         tracing::info!(
             removed = report.removed,
+            proposed = report.proposed,
             orphans_removed = report.orphans_removed,
             stopped_removed = report.stopped_removed,
             errors = report.errors,
@@ -76,9 +83,17 @@ async fn run_loop(state: Arc<AppState>) {
             duration_ms = started.elapsed().as_millis() as u64,
             retention_days = settings.days,
             stopped_retention_days = settings.stopped_days,
+            dry_run = params.dry_run,
             "mission workspace GC sweep finished",
         );
     }
+}
+
+fn gc_execution_enabled() -> bool {
+    matches!(
+        std::env::var(EXECUTE_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
 }
 
 struct GcSettings {
@@ -514,6 +529,9 @@ pub struct SweepReport {
     pub stopped_removed: usize,
     pub errors: usize,
     pub bytes_freed: u64,
+    /// Directories that passed policy but were retained because this sweep was
+    /// dry-run. These are approval candidates, never a deletion result.
+    pub proposed: usize,
 }
 
 /// Cutoffs and toggles for one sweep.
@@ -524,6 +542,8 @@ pub struct SweepParams {
     pub stopped_cutoff: DateTime<Utc>,
     /// Whether unmatched `mission-*` dirs are collected.
     pub orphans_enabled: bool,
+    /// When true, report candidates without touching the filesystem.
+    pub dry_run: bool,
 }
 
 /// One full pass. Phase 1 is DB-driven (mission → its recorded workspace →
@@ -582,6 +602,19 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
                     continue;
                 }
                 let size = directory_size_bytes(&dir).await;
+                if params.dry_run {
+                    report.proposed += 1;
+                    tracing::info!(
+                        action = "would_remove",
+                        mission_id = %mission.id,
+                        workspace_id = %workspace_id,
+                        path = %dir.display(),
+                        bytes = size,
+                        reason = "terminal mission past retention",
+                        "mission GC audit",
+                    );
+                    continue;
+                }
                 match tokio::fs::remove_dir_all(&dir).await {
                     Ok(()) => {
                         report.removed += 1;
@@ -720,6 +753,21 @@ async fn orphan_sweep(state: &Arc<AppState>, params: &SweepParams, report: &mut 
                 }
                 Verdict::Delete(reason, orphan, stopped) => {
                     let size = directory_size_bytes(&dir).await;
+                    if params.dry_run {
+                        report.proposed += 1;
+                        tracing::info!(
+                            action = "would_remove",
+                            path = %dir.display(),
+                            workspace = %ws.name,
+                            workspace_id = %ws.id,
+                            bytes = size,
+                            reason,
+                            orphan,
+                            stopped,
+                            "mission GC audit",
+                        );
+                        continue;
+                    }
                     match tokio::fs::remove_dir_all(&dir).await {
                         Ok(()) => {
                             report.removed += 1;

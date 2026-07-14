@@ -44,7 +44,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         // Live + persisted memory caps (per-workspace override of the
         // MISSION_MEMORY_* defaults; applies to running scopes via
         // `systemctl set-property --runtime`)
-        .route("/:id/resources", post(update_workspace_resources))
+        .route(
+            "/:id/resources",
+            get(get_workspace_resources).post(update_workspace_resources),
+        )
         // Backend preflight checks
         .route(
             "/:id/backends/:backend_id/preflight",
@@ -1868,6 +1871,61 @@ pub struct UpdateWorkspaceResourcesResponse {
     pub memory_swap_max: Option<String>,
     pub cpu_weight: Option<String>,
     pub cpu_quota: Option<String>,
+}
+
+/// Read-only resource-limit visibility.  This intentionally reports both the
+/// effective values and whether each came from a workspace override or the
+/// process environment, so operators can distinguish an unset limit from an
+/// inherited one before changing a live mission.
+#[derive(Debug, Serialize)]
+pub struct WorkspaceResourcesResponse {
+    pub workspace_id: Uuid,
+    pub workspace_name: String,
+    pub memory_max: Option<String>,
+    pub memory_high: Option<String>,
+    pub memory_swap_max: Option<String>,
+    pub cpu_weight: Option<String>,
+    pub cpu_quota: Option<String>,
+    pub workspace_overrides: HashMap<String, String>,
+    pub running_scope_units: Vec<String>,
+}
+
+async fn get_workspace_resources(
+    AxumPath(id): AxumPath<Uuid>,
+    State(state): State<Arc<super::routes::AppState>>,
+) -> Result<Json<WorkspaceResourcesResponse>, (StatusCode, String)> {
+    let workspace = require_workspace(&state.workspaces, id).await?;
+    let caps = crate::workspace_exec::WorkspaceExec::new(workspace.clone()).mission_resource_caps();
+    let workspace_overrides = workspace
+        .env_vars
+        .iter()
+        .filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "MISSION_MEMORY_MAX"
+                    | "MISSION_MEMORY_HIGH"
+                    | "MISSION_MEMORY_SWAP_MAX"
+                    | "MISSION_CPU_WEIGHT"
+                    | "MISSION_CPU_QUOTA"
+            )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let running_scope_units = list_workspace_scope_units(&workspace).await.unwrap_or_else(|err| {
+        tracing::warn!(workspace = %workspace.name, %err, "resource visibility: scope listing failed");
+        Vec::new()
+    });
+    Ok(Json(WorkspaceResourcesResponse {
+        workspace_id: workspace.id,
+        workspace_name: workspace.name,
+        memory_max: caps.max,
+        memory_high: caps.high,
+        memory_swap_max: caps.swap_max,
+        cpu_weight: caps.cpu_weight,
+        cpu_quota: caps.cpu_quota,
+        workspace_overrides,
+        running_scope_units,
+    }))
 }
 
 /// Validate a systemd memory size: bytes, suffixed (K/M/G/T), percentage,
