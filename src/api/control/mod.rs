@@ -3581,7 +3581,9 @@ pub async fn post_message(
             .map_err(internal_error)?
         {
             if mission_is_pr_writer(&mission) || message_requests_pr_writer(&mission, &content) {
-                let _guard = PR_WRITER_CREATE_LOCK.lock().await;
+                let _guard = acquire_durable_pr_writer_lock(&state.control)
+                    .await
+                    .map_err(internal_error)?;
                 if let Some(github_pr) = mission.project.github_pr.as_deref() {
                     if let Some(existing) =
                         find_existing_pr_writer_global(&state.control, github_pr, Some(mission.id))
@@ -5274,6 +5276,53 @@ fn fable_mandate_requests_integration(intent: Option<&str>, prompt: Option<&str>
 static PR_WRITER_CREATE_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
 
+struct DurablePrWriterLockGuard {
+    _process_guard: tokio::sync::MutexGuard<'static, ()>,
+    file: std::fs::File,
+}
+
+impl Drop for DurablePrWriterLockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+async fn acquire_durable_pr_writer_lock(
+    control_hub: &ControlHub,
+) -> Result<DurablePrWriterLockGuard, String> {
+    // The async mutex prevents this process from blocking one of its runtime
+    // threads on flock while another local request owns the lease lock. The
+    // advisory file lock extends the same critical section across backend and
+    // Hermes/controller processes that share this mission store directory.
+    let process_guard = PR_WRITER_CREATE_LOCK.lock().await;
+    let lock_dir = control_hub
+        .config
+        .working_dir
+        .join(".sandboxed-sh")
+        .join("missions");
+    tokio::fs::create_dir_all(&lock_dir)
+        .await
+        .map_err(|error| format!("create PR writer lock directory: {error}"))?;
+    let lock_path = lock_dir.join(".pr-writer.lock");
+    let file = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("open {}: {error}", lock_path.display()))?;
+        fs2::FileExt::lock_exclusive(&file)
+            .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
+        Ok::<_, String>(file)
+    })
+    .await
+    .map_err(|error| format!("join PR writer lock task: {error}"))??;
+    Ok(DurablePrWriterLockGuard {
+        _process_guard: process_guard,
+        file,
+    })
+}
+
 fn canonical_github_pr(raw: &str) -> String {
     let mut value = raw
         .trim()
@@ -5624,7 +5673,7 @@ async fn activate_mission_for_message(
 }
 
 struct MessageWriterLeaseGuard {
-    _guard: tokio::sync::MutexGuard<'static, ()>,
+    _guard: DurablePrWriterLockGuard,
     retagged: bool,
 }
 
@@ -5640,7 +5689,7 @@ async fn acquire_pr_writer_lease_for_message(
         return Ok(None);
     }
 
-    let guard = PR_WRITER_CREATE_LOCK.lock().await;
+    let guard = acquire_durable_pr_writer_lock(control_hub).await?;
     if let Some(github_pr) = mission.project.github_pr.as_deref() {
         if let Some(existing) =
             find_existing_pr_writer_global(control_hub, github_pr, Some(mission.id)).await?
@@ -6015,7 +6064,9 @@ pub async fn create_mission(
 
     let control = control_for_user(&state, &user).await;
     if request_needs_writer_lease {
-        let _guard = PR_WRITER_CREATE_LOCK.lock().await;
+        let _guard = acquire_durable_pr_writer_lock(&state.control)
+            .await
+            .map_err(internal_error)?;
         if let Some(github_pr) = req.github_pr.as_deref() {
             if let Some(existing) = find_existing_pr_writer_global(&state.control, github_pr, None)
                 .await
@@ -6061,7 +6112,11 @@ pub async fn create_mission(
     // one concurrent creator wins; a loser is durably interrupted before it
     // can receive a goal or become a writer.
     let pr_writer_guard = if request_needs_writer_lease {
-        Some(PR_WRITER_CREATE_LOCK.lock().await)
+        Some(
+            acquire_durable_pr_writer_lock(&state.control)
+                .await
+                .map_err(internal_error)?,
+        )
     } else {
         None
     };
@@ -7258,7 +7313,11 @@ pub async fn update_mission_project(
     }
 
     let writer_guard = if becomes_writer {
-        Some(PR_WRITER_CREATE_LOCK.lock().await)
+        Some(
+            acquire_durable_pr_writer_lock(&state.control)
+                .await
+                .map_err(internal_error)?,
+        )
     } else {
         None
     };
@@ -8872,34 +8931,6 @@ pub async fn resume_mission(
     let control = control_for_user(&state, &user).await;
     tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
 
-    // FLEET-004: a Paused mission resumes its *prior work* from history, so it
-    // first transitions to Interrupted (the status `resume_mission_impl`
-    // accepts) and then falls through to the ResumeMission path below to rebuild
-    // context and restart the runner. (Pending would be wrong here: the FLEET-001
-    // dispatcher only dispatches `not_before`-scheduled missions that carry a
-    // fresh `deferred_goal`, not paused missions continuing from history.)
-    let was_paused = matches!(
-        control.mission_store.get_mission(mission_id).await,
-        Ok(Some(ref m)) if m.status == MissionStatus::Paused
-    );
-    if was_paused {
-        control
-            .mission_store
-            .update_mission_status(mission_id, MissionStatus::Interrupted)
-            .await
-            .map_err(internal_error)?;
-        // FLEET-004: leaving Paused clears the pause timestamp.
-        let _ = control
-            .mission_store
-            .set_mission_paused_at(mission_id, None)
-            .await;
-        let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
-            mission_id,
-            status: MissionStatus::Interrupted,
-            summary: None,
-        });
-    }
-
     let outcome: Result<Mission, (StatusCode, String)> = async {
         let (tx, rx) = oneshot::channel();
         control
@@ -8918,26 +8949,7 @@ pub async fn resume_mission(
     }
     .await;
 
-    match outcome {
-        Ok(mission) => Ok(Json(mission)),
-        Err(err) => {
-            // A failed resume must not leave a paused mission stranded in
-            // Interrupted: restore the operator-visible Paused state (best
-            // effort) before surfacing the error.
-            if was_paused {
-                let _ = control
-                    .mission_store
-                    .update_mission_status(mission_id, MissionStatus::Paused)
-                    .await;
-                let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
-                    mission_id,
-                    status: MissionStatus::Paused,
-                    summary: None,
-                });
-            }
-            Err(err)
-        }
-    }
+    outcome.map(Json)
 }
 
 /// Delete a mission by ID.
@@ -12655,11 +12667,15 @@ async fn control_actor_loop(
     ) -> Result<(Mission, String), String> {
         let mission = load_mission_record(mission_store, mission_id).await?;
 
-        // Check if mission can be resumed (interrupted, blocked, or failed)
+        // Check if mission can be resumed. Paused remains Paused until the
+        // actor has acquired the durable writer lock and accepted the resume.
         // Failed missions can be resumed to retry after transient errors (e.g., 529 overloaded)
         if !matches!(
             mission.status,
-            MissionStatus::Interrupted | MissionStatus::Blocked | MissionStatus::Failed
+            MissionStatus::Interrupted
+                | MissionStatus::Blocked
+                | MissionStatus::Failed
+                | MissionStatus::Paused
         ) {
             return Err(format!(
                 "Mission {} cannot be resumed (status: {})",
@@ -14309,7 +14325,13 @@ async fn control_actor_loop(
                         // resume has failed). Otherwise a create can race between the check
                         // and the status transition and start a second branch-changing
                         // runner for the same PR.
-                        let _pr_writer_guard = PR_WRITER_CREATE_LOCK.lock().await;
+                        let _pr_writer_guard = match acquire_durable_pr_writer_lock(&control_hub).await {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                let _ = respond.send(Err(error));
+                                continue;
+                            }
+                        };
                         // Resume an interrupted mission by building resume context
                         match resume_mission_impl(
                             &mission_store,
@@ -14347,11 +14369,38 @@ async fn control_actor_loop(
                                 // interrupted by the same service restart.
                                 if running.is_some() {
                                     if skip_message {
+                                        if mission.status == MissionStatus::Paused {
+                                            if let Err(error) = mission_store
+                                                .update_mission_status(
+                                                    mission_id,
+                                                    MissionStatus::Interrupted,
+                                                )
+                                                .await
+                                            {
+                                                let _ = respond.send(Err(error));
+                                                continue;
+                                            }
+                                            let _ = mission_store
+                                                .set_mission_paused_at(mission_id, None)
+                                                .await;
+                                            let _ = events_tx.send(
+                                                AgentEvent::MissionStatusChanged {
+                                                    mission_id,
+                                                    status: MissionStatus::Interrupted,
+                                                    summary: None,
+                                                },
+                                            );
+                                        }
                                         tracing::info!(
                                             mission_id = %mission_id,
                                             "Deferring parallel resume until the caller sends a custom message"
                                         );
-                                        let _ = respond.send(Ok(mission));
+                                        let mut updated_mission = mission;
+                                        if updated_mission.status == MissionStatus::Paused {
+                                            updated_mission.status = MissionStatus::Interrupted;
+                                            updated_mission.paused_at = None;
+                                        }
+                                        let _ = respond.send(Ok(updated_mission));
                                         continue;
                                     }
 
@@ -14423,6 +14472,11 @@ async fn control_actor_loop(
                                             e
                                         );
                                     } else {
+                                        if mission.status == MissionStatus::Paused {
+                                            let _ = mission_store
+                                                .set_mission_paused_at(mission_id, None)
+                                                .await;
+                                        }
                                         maybe_schedule_mission_metadata_refresh_for_status(
                                             &mission_store,
                                             &events_tx,
@@ -14467,6 +14521,11 @@ async fn control_actor_loop(
                                 {
                                     tracing::warn!("Failed to resume mission {}: {}", mission_id, e);
                                 } else {
+                                    if mission.status == MissionStatus::Paused {
+                                        let _ = mission_store
+                                            .set_mission_paused_at(mission_id, None)
+                                            .await;
+                                    }
                                     maybe_schedule_mission_metadata_refresh_for_status(
                                         &mission_store,
                                         &events_tx,
