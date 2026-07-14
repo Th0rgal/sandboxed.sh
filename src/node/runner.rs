@@ -695,18 +695,22 @@ mod tests {
                 .await
                 .unwrap();
         }
-        for _ in 0..100 {
-            if matches!(
-                store.get(running).await.unwrap().map(|record| record.state),
-                Some(JobState::Running)
-            ) && matches!(
-                store.get(queued).await.unwrap().map(|record| record.state),
-                Some(JobState::Queued)
-            ) {
-                break;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    store.get(running).await.unwrap().map(|record| record.state),
+                    Some(JobState::Running)
+                ) && matches!(
+                    store.get(queued).await.unwrap().map(|record| record.state),
+                    Some(JobState::Queued)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .expect("first job should start while the second remains queued");
 
         assert_eq!(runner.queued_count(), 1);
         assert!(runner.cancel(queued).await.unwrap());
