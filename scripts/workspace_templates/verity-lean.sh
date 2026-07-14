@@ -88,7 +88,7 @@ fi
 # --dissociate shares download work only. Git objects and the complete `.lake`
 # package tree are private to this mission after the command returns.
 git clone --reference-if-able "$ROOT/base" --dissociate \
-  git@github.com:lfglabs-dev/verity.git "$dest"
+  https://github.com/lfglabs-dev/verity.git "$dest"
 git -C "$dest" fetch origin "$ref"
 if [[ -n "$branch" ]]; then
   git -C "$dest" checkout -B "$branch" FETCH_HEAD
