@@ -5175,14 +5175,30 @@ static PR_WRITER_CREATE_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
 
 fn canonical_github_pr(raw: &str) -> String {
-    let mut value = raw.trim().trim_end_matches('/').to_ascii_lowercase();
+    let mut value = raw
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
     for prefix in ["https://github.com/", "http://github.com/", "github.com/"] {
         if let Some(stripped) = value.strip_prefix(prefix) {
             value = stripped.to_string();
             break;
         }
     }
-    value.replace("/pull/", "#")
+    if let Some((repository, tail)) = value.split_once("/pull/") {
+        let number = tail.split('/').next().unwrap_or_default();
+        return format!("{repository}#{number}");
+    }
+    // Preserve the compact `owner/repo#number` form while discarding a copied
+    // tab suffix such as `#123/files`.
+    if let Some((repository, tail)) = raw.trim().to_ascii_lowercase().split_once('#') {
+        let number = tail.split(['/', '?']).next().unwrap_or_default();
+        return format!("{}#{}", repository.trim_end_matches('/'), number);
+    }
+    value
 }
 
 fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Option<&str>) -> bool {
@@ -5245,6 +5261,7 @@ fn mission_is_pr_writer(mission: &Mission) -> bool {
 async fn find_existing_pr_writer(
     store: &Arc<dyn MissionStore>,
     github_pr: &str,
+    exclude_id: Option<Uuid>,
 ) -> Result<Option<Mission>, String> {
     const PAGE_SIZE: usize = 200;
     let target = canonical_github_pr(github_pr);
@@ -5253,7 +5270,8 @@ async fn find_existing_pr_writer(
         let page = store.list_missions(PAGE_SIZE, offset).await?;
         let page_len = page.len();
         if let Some(mission) = page.into_iter().find(|mission| {
-            status_holds_pr_writer_lease(mission.status)
+            Some(mission.id) != exclude_id
+                && status_holds_pr_writer_lease(mission.status)
                 && mission
                     .project
                     .github_pr
@@ -5586,7 +5604,7 @@ pub async fn create_mission(
 
     let control = control_for_user(&state, &user).await;
     if let (Some(github_pr), Some(_guard)) = (req.github_pr.as_deref(), pr_writer_guard.as_ref()) {
-        if let Some(existing) = find_existing_pr_writer(&control.mission_store, github_pr)
+        if let Some(existing) = find_existing_pr_writer(&control.mission_store, github_pr, None)
             .await
             .map_err(internal_error)?
         {
@@ -5652,13 +5670,17 @@ pub async fn create_mission(
     {
         let capability =
             if inferred_pr_writer(req.writer, req.intent.as_deref(), req.prompt.as_deref()) {
-                "pr-writer"
+                Some("pr-writer")
+            } else if req.writer == Some(false) {
+                Some("pr-readonly")
             } else {
-                "pr-readonly"
+                None
             };
-        let tags = tags.get_or_insert_with(Vec::new);
-        if !tags.iter().any(|tag| tag == capability) {
-            tags.push(capability.to_string());
+        if let Some(capability) = capability {
+            let tags = tags.get_or_insert_with(Vec::new);
+            if !tags.iter().any(|tag| tag == capability) {
+                tags.push(capability.to_string());
+            }
         }
     }
     if project.is_some()
@@ -6713,7 +6735,7 @@ pub async fn update_mission_project(
     Json(req): Json<UpdateMissionProjectRequest>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
-    control
+    let current = control
         .mission_store
         .get_mission(id)
         .await
@@ -6733,25 +6755,81 @@ pub async fn update_mission_project(
             })
         })
     };
-    let tags: Option<Vec<String>> = req.tags.map(|tags| {
+    let project = normalize(req.project);
+    let track = normalize(req.track);
+    let intent = normalize(req.intent);
+    let github_pr = normalize(req.github_pr);
+    let desired_state = normalize(req.desired_state);
+    let next_check_at = normalize(req.next_check_at);
+    let mut tags: Option<Vec<String>> = req.tags.map(|tags| {
         tags.into_iter()
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect()
     });
 
+    let effective_string = |patch: &Option<Option<String>>, current: &Option<String>| {
+        patch.clone().unwrap_or_else(|| current.clone())
+    };
+    let effective_github_pr = effective_string(&github_pr, &current.project.github_pr);
+    let effective_intent = effective_string(&intent, &current.project.intent);
+    let mut effective_tags = tags.clone().unwrap_or_else(|| current.project.tags.clone());
+    let explicitly_readonly = effective_tags.iter().any(|tag| tag == "pr-readonly");
+    let becomes_writer = effective_github_pr.is_some()
+        && !explicitly_readonly
+        && (effective_tags.iter().any(|tag| tag == "pr-writer")
+            || inferred_pr_writer(
+                None,
+                effective_intent.as_deref(),
+                current.history.first().map(|entry| entry.content.as_str()),
+            ));
+    if becomes_writer && !effective_tags.iter().any(|tag| tag == "pr-writer") {
+        effective_tags.push("pr-writer".to_string());
+        tags = Some(effective_tags.clone());
+    } else if tags.is_some() {
+        // Preserve the caller's normalized replacement even when it does not
+        // change writer capability.
+        if tags.as_ref() != Some(&effective_tags) {
+            tags = Some(effective_tags.clone());
+        }
+    }
+
+    let writer_guard = if becomes_writer {
+        Some(PR_WRITER_CREATE_LOCK.lock().await)
+    } else {
+        None
+    };
+    if let (Some(github_pr), Some(_guard)) = (effective_github_pr.as_deref(), writer_guard.as_ref())
+    {
+        if let Some(existing) = find_existing_pr_writer(&control.mission_store, github_pr, Some(id))
+            .await
+            .map_err(internal_error)?
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "PR writer lease is already held by mission {} (status={}); cannot assign mission {} as another writer for {}",
+                    existing.id,
+                    existing.status,
+                    id,
+                    canonical_github_pr(github_pr)
+                ),
+            ));
+        }
+    }
+
     control
         .mission_store
         .update_mission_project(
             id,
             crate::api::mission_store::MissionProjectPatch {
-                project: normalize(req.project),
-                track: normalize(req.track),
-                intent: normalize(req.intent),
-                github_pr: normalize(req.github_pr),
+                project,
+                track,
+                intent,
+                github_pr,
                 tags,
-                desired_state: normalize(req.desired_state),
-                next_check_at: normalize(req.next_check_at),
+                desired_state,
+                next_check_at,
             },
         )
         .await
@@ -19000,6 +19078,16 @@ mod tests {
         );
         assert_eq!(
             canonical_github_pr("LFGLABS-DEV/VERITY#2168"),
+            "lfglabs-dev/verity#2168"
+        );
+        assert_eq!(
+            canonical_github_pr(
+                "https://github.com/lfglabs-dev/verity/pull/2168/files?diff=split#discussion"
+            ),
+            "lfglabs-dev/verity#2168"
+        );
+        assert_eq!(
+            canonical_github_pr("lfglabs-dev/verity#2168/commits"),
             "lfglabs-dev/verity#2168"
         );
     }
