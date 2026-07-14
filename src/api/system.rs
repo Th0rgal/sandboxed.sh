@@ -3457,9 +3457,17 @@ fn stream_deploy(
             .ok()
             .filter(|path| !path.trim().is_empty())
             .unwrap_or_else(|| {
-                let hermes_path = std::path::Path::new("/var/lib/hermes-assistant/bin/palomactl");
-                if hermes_path.parent().is_some_and(std::path::Path::exists) {
-                    hermes_path.to_string_lossy().to_string()
+                let hermes_bin = std::path::Path::new("/var/lib/hermes-assistant/bin");
+                let wrapper = hermes_bin.join("palomactl-wrapper");
+                let real = hermes_bin.join("palomactl.real");
+                if wrapper.exists() || real.exists() {
+                    // Hermes may layer project/health/review-thread commands in
+                    // a stable wrapper whose REAL target is palomactl.real.
+                    // Updating `palomactl` itself would silently erase those
+                    // operator integrations on every sandboxed.sh deploy.
+                    real.to_string_lossy().to_string()
+                } else if hermes_bin.exists() {
+                    hermes_bin.join("palomactl").to_string_lossy().to_string()
                 } else {
                     "/usr/local/bin/palomactl".to_string()
                 }
