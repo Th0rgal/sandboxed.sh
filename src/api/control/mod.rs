@@ -3582,7 +3582,11 @@ pub async fn post_message(
             .await
             .map_err(internal_error)?
         {
-            if mission_is_pr_writer(&mission) || message_requests_pr_writer(&mission, &content) {
+            if mission_is_pr_writer_in_store(&control.mission_store, &mission)
+                .await
+                .map_err(internal_error)?
+                || message_requests_pr_writer(&mission, &content)
+            {
                 let _guard = acquire_durable_pr_writer_lock(&state.control)
                     .await
                     .map_err(internal_error)?;
@@ -5443,6 +5447,17 @@ fn mission_is_pr_writer_with_prompt(mission: &Mission, prompt: Option<&str>) -> 
         || inferred_pr_writer(None, mission.project.intent.as_deref(), prompt)
 }
 
+async fn mission_is_pr_writer_in_store(
+    store: &Arc<dyn MissionStore>,
+    mission: &Mission,
+) -> Result<bool, String> {
+    let initial_prompt = store.get_initial_user_message(mission.id).await?;
+    Ok(mission_is_pr_writer_with_prompt(
+        mission,
+        initial_prompt.as_deref(),
+    ))
+}
+
 fn message_requests_pr_writer(mission: &Mission, content: &str) -> bool {
     mission.project.github_pr.is_some()
         // A follow-up message is a new capability request. A persisted
@@ -5636,9 +5651,9 @@ fn find_existing_pr_writer_in_sqlite(
                 .or(external_prompt.as_deref())
                 .or(deferred_goal.as_deref()),
         );
-        let deferred_goal_requests_writer = deferred_goal
-            .as_deref()
-            .is_some_and(|goal| inferred_pr_writer(None, None, Some(goal)));
+        let deferred_goal_requests_writer = deferred_goal.as_deref().is_some_and(|goal| {
+            requested_pr_writer(None, Some(&tags), intent.as_deref(), Some(goal))
+        });
         if initial_prompt_requests_writer || deferred_goal_requests_writer {
             return Ok(Some(PrWriterLease { id, status }));
         }
@@ -5683,9 +5698,10 @@ async fn find_existing_pr_writer_global(
 
 async fn ensure_pr_writer_resume_is_exclusive(
     control_hub: &ControlHub,
+    store: &Arc<dyn MissionStore>,
     mission: &Mission,
 ) -> Result<(), String> {
-    if !mission_is_pr_writer(mission) {
+    if !mission_is_pr_writer_in_store(store, mission).await? {
         return Ok(());
     }
     let Some(github_pr) = mission.project.github_pr.as_deref() else {
@@ -5741,8 +5757,8 @@ async fn acquire_pr_writer_lease_for_message(
     mission: &Mission,
     content: &str,
 ) -> Result<Option<MessageWriterLeaseGuard>, String> {
-    let becomes_writer =
-        mission_is_pr_writer(mission) || message_requests_pr_writer(mission, content);
+    let was_writer = mission_is_pr_writer_in_store(store, mission).await?;
+    let becomes_writer = was_writer || message_requests_pr_writer(mission, content);
     if !becomes_writer {
         return Ok(None);
     }
@@ -5762,7 +5778,7 @@ async fn acquire_pr_writer_lease_for_message(
         }
     }
 
-    let retagged = !mission_is_pr_writer(mission);
+    let retagged = !was_writer;
     if retagged {
         let mut tags = mission.project.tags.clone();
         tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
@@ -14401,6 +14417,7 @@ async fn control_actor_loop(
                             Ok((mission, resume_prompt)) => {
                                 if let Err(error) = ensure_pr_writer_resume_is_exclusive(
                                     &control_hub,
+                                    &mission_store,
                                     &mission,
                                 )
                                 .await
@@ -19935,6 +19952,55 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn durable_writer_classification_survives_history_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MissionStore> = Arc::new(
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "long-writer")
+                .await
+                .unwrap(),
+        );
+        let mission = store
+            .create_mission(Some("Legacy writer"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_project(
+                mission.id,
+                MissionProjectPatch {
+                    github_pr: Some(Some("owner/repo#46".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for index in 0..206 {
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::UserMessage {
+                        id: Uuid::new_v4(),
+                        content: if index == 0 {
+                            "Fix, commit and push this PR".to_string()
+                        } else {
+                            format!("neutral follow-up {index}")
+                        },
+                        queued: false,
+                        mission_id: Some(mission.id),
+                        source: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let projected = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(projected.history.len(), 200);
+        assert!(!mission_is_pr_writer(&projected));
+        assert!(mission_is_pr_writer_in_store(&store, &projected)
+            .await
+            .unwrap());
+    }
+
     #[test]
     fn offline_sqlite_writer_scan_reads_deferred_goal_without_migrations() {
         let dir = tempfile::tempdir().unwrap();
@@ -19977,6 +20043,40 @@ mod tests {
 
         assert_eq!(found.id, mission_id);
         assert_eq!(found.status, MissionStatus::Pending);
+    }
+
+    #[test]
+    fn offline_sqlite_writer_scan_respects_readonly_deferred_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missions-readonly.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE missions (
+                    id TEXT PRIMARY KEY, status TEXT, github_pr TEXT,
+                    intent TEXT, tags TEXT, deferred_goal TEXT
+                 );
+                 CREATE TABLE mission_events (
+                    mission_id TEXT, sequence INTEGER, event_type TEXT, content TEXT,
+                    content_file TEXT
+                 );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO missions (id, status, github_pr, intent, tags, deferred_goal)
+                 VALUES (?1, 'pending', 'owner/repo#45', NULL, '[\"pr-readonly\"]',
+                         'Fix and update the PR after review')",
+                rusqlite::params![Uuid::new_v4().to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(
+            find_existing_pr_writer_in_sqlite(&path, "owner/repo#45", None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
