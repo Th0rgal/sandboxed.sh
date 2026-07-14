@@ -782,12 +782,13 @@ fn write_mcp_env_launcher(
     std::fs::create_dir_all(&launcher_dir)?;
     let sanitized_name = sanitize_key(&config.name);
     let launcher_name = format!(
-        "{}.sh",
+        "{}-{}.sh",
         if sanitized_name.is_empty() {
             "mcp"
         } else {
             &sanitized_name
-        }
+        },
+        config.id.simple()
     );
     let launcher_host_path = launcher_dir.join(launcher_name);
 

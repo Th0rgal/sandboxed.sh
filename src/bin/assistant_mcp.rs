@@ -826,7 +826,7 @@ impl AssistantMcp {
                         "prompt": {"type": "string"},
                         "workspace_id": {"type": "string"},
                         "backend": {"type": "string", "enum": ["opencode", "claudecode", "codex", "gemini", "grok"]},
-                        "model_override": {"type": "string"},
+                        "model_override": {"type": "string", "description": "Exact account-supported model ID. For Codex Terra use gpt-5.6-terra with medium effort. Never invent variants such as gpt-5.5-sol."},
                         "model_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                         "config_profile": {"type": "string"},
                         "agent": {"type": "string"},

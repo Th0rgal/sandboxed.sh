@@ -74,7 +74,8 @@ install -m 0755 /dev/stdin /usr/local/bin/lean-lsp-mcp-workspace <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 : "${LEAN_PROJECT_PATH:?LEAN_PROJECT_PATH is required}"
-exec lean-lsp-mcp --lean-project-path "$LEAN_PROJECT_PATH" "$@"
+exec /workspace/verity/bin/lean-lsp-mcp \
+  --lean-project-path "$LEAN_PROJECT_PATH" "$@"
 SCRIPT
 
 # Warm and validate the canonical checkout. Workers never use this mutable
@@ -83,8 +84,8 @@ SCRIPT
 # shared worktree caches, or partially copied package repositories.
 (
   cd "$ROOT/base"
-  lake exe cache get
-  lake build
+  "$ELAN_HOME/bin/lake" exe cache get
+  "$ELAN_HOME/bin/lake" build
 )
 
 install -m 0755 /dev/stdin /usr/local/bin/verity-isolated-clone <<'SCRIPT'
@@ -106,22 +107,22 @@ fi
 
 # --dissociate shares download work only. Git objects and the complete `.lake`
 # package tree are private to this mission after the command returns.
-git clone --reference-if-able "$ROOT/base" --dissociate \
+/usr/bin/git clone --reference-if-able "$ROOT/base" --dissociate \
   https://github.com/lfglabs-dev/verity.git "$dest"
 # `git fetch <remote> <refspec>` expects the remote ref (`main`), not the
 # local remote-tracking name (`origin/main`). Accept both forms because Hermes
 # historically supplied the latter.
 fetch_ref="${ref#origin/}"
-git -C "$dest" fetch origin "$fetch_ref"
+/usr/bin/git -C "$dest" fetch origin "$fetch_ref"
 if [[ -n "$branch" ]]; then
-  git -C "$dest" checkout -B "$branch" FETCH_HEAD
+  /usr/bin/git -C "$dest" checkout -B "$branch" FETCH_HEAD
 else
-  git -C "$dest" checkout --detach FETCH_HEAD
+  /usr/bin/git -C "$dest" checkout --detach FETCH_HEAD
 fi
 rm -rf "$dest/.lake"
 (
   cd "$dest"
-  lake exe cache get
+  "$ROOT/.elan/bin/lake" exe cache get
   mkdir -p .lake
   printf '%s\n' "$name" > .lake/sandboxed-cache-owner
   test -d .lake/packages
@@ -133,23 +134,24 @@ SCRIPT
 install -m 0755 /dev/stdin /usr/local/bin/verity-audit <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
+readonly ROOT="/workspace/verity"
 repo="${1:-$PWD}"
 cd "$repo"
-printf 'head=%s\n' "$(git rev-parse HEAD)"
+printf 'head=%s\n' "$(/usr/bin/git rev-parse HEAD)"
 printf 'toolchain=%s\n' "$(<lean-toolchain)"
-lean --version
-lake --version
-gh auth status --hostname github.com >/dev/null
-python3 scripts/check_paths.py
-git status --short
+"$ROOT/.elan/bin/lean" --version
+"$ROOT/.elan/bin/lake" --version
+/usr/bin/gh auth status --hostname github.com >/dev/null
+/usr/bin/python3 scripts/check_paths.py
+/usr/bin/git status --short
 SCRIPT
 
 # Fail template creation rather than registering a workspace with half-working
 # proof tooling.
 test "$(<"$ROOT/base/lean-toolchain")" = "leanprover/lean4:v4.24.0"
-lean --version | grep -F 'version 4.24.0'
-lake --version
-lean-lsp-mcp --help >/dev/null
+"$ELAN_HOME/bin/lean" --version | grep -F 'version 4.24.0'
+"$ELAN_HOME/bin/lake" --version
+"$ROOT/bin/lean-lsp-mcp" --help >/dev/null
 LEAN_PROJECT_PATH="$ROOT/base" /usr/local/bin/lean-lsp-mcp-workspace --help >/dev/null
-gh --version >/dev/null
+/usr/bin/gh --version >/dev/null
 test "$(git -C "$ROOT/base" rev-parse HEAD)" = "$VERITY_REF"

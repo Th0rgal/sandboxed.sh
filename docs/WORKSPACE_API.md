@@ -27,6 +27,11 @@ POST /api/workspaces
   "template": "template-name",
   "distro": "ubuntu-noble",
   "env_vars": {"KEY": "VALUE"},
+  "shared_network": false,
+  "tailscale_mode": "tailnet_only",
+  "mcps": ["lean_lsp"],
+  "mcps_replace_defaults": false,
+  "config_profile": "default",
   "init_script": "#!/bin/bash\napt install -y nodejs"
 }
 ```
@@ -41,6 +46,11 @@ POST /api/workspaces
 | `template` | string | No | Template name (forces `container` type) |
 | `distro` | string | No | Linux distro for containers |
 | `env_vars` | object | No | Environment variables |
+| `shared_network` | boolean/null | No | `false` enables an isolated veth; `true`/`null` uses the host network |
+| `tailscale_mode` | string/null | No | `exit_node` or `tailnet_only` for isolated Tailscale workspaces |
+| `mcps` | string[] | No | MCP config names enabled for missions in this workspace |
+| `mcps_replace_defaults` | boolean | No | When true, do not add default-enabled MCPs |
+| `config_profile` | string/null | No | Default backend config profile |
 | `init_script` | string | No | Script to run on container build |
 
 **Distro options**: `ubuntu-noble`, `ubuntu-jammy`, `debian-bookworm`, `arch-linux`
@@ -70,11 +80,40 @@ PUT /api/workspaces/:id
   "template": "template-name",
   "distro": "ubuntu-noble",
   "env_vars": {"KEY": "VALUE"},
+  "shared_network": false,
+  "tailscale_mode": "tailnet_only",
+  "mcps": ["lean_lsp"],
+  "mcps_replace_defaults": true,
+  "config_profile": "lean",
   "init_script": "#!/bin/bash\napt install -y nodejs"
 }
 ```
 
 **Response**: `Workspace` object.
+
+Updates persist workspace configuration but do not implicitly rebuild a
+container. Use `/build` with `rebuild: true` when filesystem provisioning must
+be recreated.
+
+## Apply a Template
+
+```
+POST /api/workspaces/:id/apply-template
+```
+
+**Body**:
+
+```json
+{"template": "verity-lean"}
+```
+
+The template name is optional when the workspace already references one.
+Template-controlled fields replace the corresponding workspace fields. This
+endpoint does not rebuild the container by itself.
+
+If any encrypted template value failed to decrypt, the request returns an error
+and leaves the workspace unchanged. It never persists a
+`[DECRYPTION_FAILED]` placeholder over an existing secret.
 
 ## Delete Workspace
 
@@ -128,6 +167,16 @@ Note: Mission workspaces generate backend-specific config on execution:
 - **Gemini/Grok**: OpenCode-style MCP/tool config for the native CLI backend
 
 Skills are written to the backend-specific skill directory during mission setup.
+
+The logical workspace can host multiple missions. Each mission gets a directory
+under `workspaces/mission-<short-id>` for generated configuration and default
+file effects. Installed packages, toolchains, and explicitly shared project
+paths remain reusable at the logical workspace level.
+
+Stdio MCP configs point at `0700` mission-local launchers. The launchers clear
+the inherited environment and restore only MCP-specific values plus workspace
+keys allowed by `workspace_env_allowlist`; credentials are not embedded in
+backend config or process arguments.
 
 ## Execute Command
 

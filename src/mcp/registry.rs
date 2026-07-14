@@ -65,6 +65,48 @@ fn command_exists(command: &str) -> bool {
     false
 }
 
+fn is_builtin_workspace_mcp(config: &McpServerConfig, working_dir: &Path) -> bool {
+    if config.name != "workspace" {
+        return false;
+    }
+
+    let McpTransport::Stdio { command, args, .. } = &config.transport else {
+        return false;
+    };
+    if !args.is_empty() {
+        return false;
+    }
+
+    let command_path = Path::new(command);
+    command == "workspace-mcp"
+        || command_path == Path::new("/usr/local/bin/workspace-mcp")
+        || command_path == working_dir.join("target/release/workspace-mcp")
+        || command_path == working_dir.join("target/debug/workspace-mcp")
+}
+
+/// Reconcile the implicit full-environment grant for the trusted built-in
+/// workspace proxy. A config merely named `workspace` is not trusted: an
+/// operator may have repointed it to an unrelated executable.
+fn reconcile_workspace_mcp_env_trust(config: &mut McpServerConfig, working_dir: &Path) -> bool {
+    if config.name != "workspace" {
+        return false;
+    }
+
+    if is_builtin_workspace_mcp(config, working_dir) {
+        if config.workspace_env_allowlist == ["*".to_string()] {
+            return false;
+        }
+        config.workspace_env_allowlist = vec!["*".to_string()];
+        return true;
+    }
+
+    let original_len = config.workspace_env_allowlist.len();
+    config
+        .workspace_env_allowlist
+        .retain(|entry| entry.trim() != "*");
+    config.workspace_env_allowlist.len() != original_len
+}
+
 /// Handle for a stdio MCP process
 struct StdioProcess {
     child: Child,
@@ -433,12 +475,12 @@ impl McpRegistry {
             .iter_mut()
             .filter(|config| config.name == "workspace")
         {
-            if config.workspace_env_allowlist != ["*".to_string()] {
-                config.workspace_env_allowlist = vec!["*".to_string()];
+            if reconcile_workspace_mcp_env_trust(config, working_dir) {
                 let id = config.id;
+                let allowlist = config.workspace_env_allowlist.clone();
                 let _ = config_store
-                    .update(id, |c| {
-                        c.workspace_env_allowlist = vec!["*".to_string()];
+                    .update(id, move |c| {
+                        c.workspace_env_allowlist = allowlist;
                     })
                     .await;
             }
@@ -1322,5 +1364,68 @@ impl McpRegistry {
         } else {
             prefixed_name.to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_workspace_mcp_receives_full_workspace_environment() {
+        let mut config = McpServerConfig::new_stdio(
+            "workspace".to_string(),
+            "/usr/local/bin/workspace-mcp".to_string(),
+            Vec::new(),
+            HashMap::new(),
+        );
+
+        assert!(reconcile_workspace_mcp_env_trust(
+            &mut config,
+            Path::new("/srv/sandboxed")
+        ));
+        assert_eq!(config.workspace_env_allowlist, ["*"]);
+        assert!(!reconcile_workspace_mcp_env_trust(
+            &mut config,
+            Path::new("/srv/sandboxed")
+        ));
+    }
+
+    #[test]
+    fn repointed_workspace_mcp_loses_implicit_wildcard_grant() {
+        let mut config = McpServerConfig::new_stdio(
+            "workspace".to_string(),
+            "/opt/third-party/server".to_string(),
+            Vec::new(),
+            HashMap::new(),
+        );
+        config.workspace_env_allowlist = vec!["PATH".to_string(), "*".to_string()];
+
+        assert!(reconcile_workspace_mcp_env_trust(
+            &mut config,
+            Path::new("/srv/sandboxed")
+        ));
+        assert_eq!(config.workspace_env_allowlist, ["PATH"]);
+        assert!(!reconcile_workspace_mcp_env_trust(
+            &mut config,
+            Path::new("/srv/sandboxed")
+        ));
+    }
+
+    #[test]
+    fn same_basename_at_an_unknown_path_is_not_trusted() {
+        let mut config = McpServerConfig::new_stdio(
+            "workspace".to_string(),
+            "/opt/third-party/workspace-mcp".to_string(),
+            Vec::new(),
+            HashMap::new(),
+        );
+        config.workspace_env_allowlist = vec!["*".to_string()];
+
+        assert!(reconcile_workspace_mcp_env_trust(
+            &mut config,
+            Path::new("/srv/sandboxed")
+        ));
+        assert!(config.workspace_env_allowlist.is_empty());
     }
 }

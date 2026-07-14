@@ -1452,4 +1452,53 @@ mod tests {
         assert!(!stdout.contains("GH_TOKEN"));
         assert!(!stdout.contains("inherited-harness-secret"));
     }
+
+    #[test]
+    fn sanitized_mcp_name_collisions_get_distinct_launchers() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace_root = temp.path();
+        let mission_dir = workspace_root.join("workspaces/mission-deadbeef");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let first = McpServerConfig::new_stdio(
+            "foo-bar".to_string(),
+            "/opt/mcp/first".to_string(),
+            Vec::new(),
+            HashMap::new(),
+        );
+        let second = McpServerConfig::new_stdio(
+            "foo_bar".to_string(),
+            "/opt/mcp/second".to_string(),
+            Vec::new(),
+            HashMap::new(),
+        );
+
+        let first_entry = opencode_entry_from_mcp(
+            &first,
+            &mission_dir,
+            workspace_root,
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let second_entry = opencode_entry_from_mcp(
+            &second,
+            &mission_dir,
+            workspace_root,
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let first_launcher = first_entry["command"][0].as_str().unwrap();
+        let second_launcher = second_entry["command"][0].as_str().unwrap();
+
+        assert_ne!(first_launcher, second_launcher);
+        assert!(std::fs::read_to_string(first_launcher)
+            .unwrap()
+            .contains("exec '/opt/mcp/first'"));
+        assert!(std::fs::read_to_string(second_launcher)
+            .unwrap()
+            .contains("exec '/opt/mcp/second'"));
+    }
 }
