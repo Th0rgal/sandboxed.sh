@@ -555,6 +555,7 @@ pub struct SweepParams {
 pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepReport {
     let cutoff = params.cutoff;
     let mut report = SweepReport::default();
+    let mut dry_run_candidates = std::collections::HashSet::new();
     let sessions = state.control.all_sessions().await;
     for session in sessions {
         let store = session.mission_store.clone();
@@ -603,6 +604,7 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
                 }
                 let size = directory_size_bytes(&dir).await;
                 if params.dry_run {
+                    dry_run_candidates.insert(dir.clone());
                     report.proposed += 1;
                     tracing::info!(
                         action = "would_remove",
@@ -645,7 +647,7 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
         }
     }
 
-    orphan_sweep(state, params, &mut report).await;
+    orphan_sweep(state, params, &dry_run_candidates, &mut report).await;
 
     report
 }
@@ -653,7 +655,12 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
 /// Disk-driven reconciliation pass (phase 2). Every decision is logged with
 /// its reason; deletion requires positive evidence of collectability, and a
 /// live exec scope always wins.
-async fn orphan_sweep(state: &Arc<AppState>, params: &SweepParams, report: &mut SweepReport) {
+async fn orphan_sweep(
+    state: &Arc<AppState>,
+    params: &SweepParams,
+    dry_run_candidates: &std::collections::HashSet<std::path::PathBuf>,
+    report: &mut SweepReport,
+) {
     let index_full = build_mission_index(state).await;
     let index = &index_full.by_short;
     // Any dir whose short id is referenced by a live exec scope is kept
@@ -752,6 +759,14 @@ async fn orphan_sweep(state: &Arc<AppState>, params: &SweepParams, report: &mut 
                     tracing::debug!(path = %dir.display(), reason, "mission GC: kept");
                 }
                 Verdict::Delete(reason, orphan, stopped) => {
+                    if params.dry_run && dry_run_candidates.contains(&dir) {
+                        tracing::debug!(
+                            path = %dir.display(),
+                            reason,
+                            "mission GC: skipped duplicate dry-run candidate",
+                        );
+                        continue;
+                    }
                     let size = directory_size_bytes(&dir).await;
                     if params.dry_run {
                         report.proposed += 1;
