@@ -5314,6 +5314,28 @@ async fn find_existing_pr_writer(
     }
 }
 
+async fn ensure_pr_writer_resume_is_exclusive(
+    store: &Arc<dyn MissionStore>,
+    mission: &Mission,
+) -> Result<(), String> {
+    if !mission_is_pr_writer(mission) {
+        return Ok(());
+    }
+    let Some(github_pr) = mission.project.github_pr.as_deref() else {
+        return Ok(());
+    };
+    if let Some(existing) = find_existing_pr_writer(store, github_pr, Some(mission.id)).await? {
+        return Err(format!(
+            "PR writer lease is already held by mission {} (status={}); cannot resume mission {} as another writer for {}",
+            existing.id,
+            existing.status,
+            mission.id,
+            canonical_github_pr(github_pr)
+        ));
+    }
+    Ok(())
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -13706,6 +13728,14 @@ async fn control_actor_loop(
                         let _ = respond.send(running_list);
                     }
                     ControlCommand::ResumeMission { mission_id, clean_workspace, skip_message, respond } => {
+                        // Resumable terminal writers do not hold a lease, so a replacement
+                        // writer may have been created since this mission stopped. Serialize
+                        // the availability check with create/project updates and keep the
+                        // guard until the resumed mission has been made Active (or the
+                        // resume has failed). Otherwise a create can race between the check
+                        // and the status transition and start a second branch-changing
+                        // runner for the same PR.
+                        let _pr_writer_guard = PR_WRITER_CREATE_LOCK.lock().await;
                         // Resume an interrupted mission by building resume context
                         match resume_mission_impl(
                             &mission_store,
@@ -13715,6 +13745,15 @@ async fn control_actor_loop(
                         )
                         .await {
                             Ok((mission, resume_prompt)) => {
+                                if let Err(error) = ensure_pr_writer_resume_is_exclusive(
+                                    &mission_store,
+                                    &mission,
+                                )
+                                .await
+                                {
+                                    let _ = respond.send(Err(error));
+                                    continue;
+                                }
                                 let already_running_main =
                                     running.is_some() && running_mission_id == Some(mission_id);
                                 let already_running_parallel = parallel_runners
