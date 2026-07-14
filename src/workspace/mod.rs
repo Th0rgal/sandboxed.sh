@@ -359,6 +359,56 @@ impl Workspace {
             "REMOTE_BUILD_MISSION_ID".to_string(),
             mission_id.to_string(),
         );
+        let remote_config = self.config.get("remote_build");
+        let node_id = remote_config
+            .and_then(|config| config.get("node_id"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("auto");
+        m.insert("REMOTE_BUILD_NODE_ID".to_string(), node_id.to_string());
+        let requirements = remote_config
+            .and_then(|config| config.get("requirements"))
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .filter(|item| !item.trim().is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|items| !items.is_empty())
+            .unwrap_or_else(|| vec!["lean"]);
+        m.insert(
+            "REMOTE_BUILD_REQUIREMENTS".to_string(),
+            serde_json::to_string(&requirements).ok()?,
+        );
+        if let Some(timeout) = remote_config
+            .and_then(|config| config.get("timeout_secs"))
+            .and_then(|value| value.as_u64())
+        {
+            m.insert("REMOTE_BUILD_TIMEOUT_SECS".to_string(), timeout.to_string());
+        }
+        let wrapper = remote_build_wrapper_path(self, mission_id);
+        m.insert(
+            "REMOTE_BUILD_COMMAND".to_string(),
+            wrapper.to_string_lossy().to_string(),
+        );
+        let existing_path = self
+            .env_vars
+            .get("PATH")
+            .cloned()
+            .or_else(|| {
+                (self.workspace_type != WorkspaceType::Container)
+                    .then(|| std::env::var("PATH").ok())
+                    .flatten()
+            })
+            .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
+        if let Some(parent) = wrapper.parent() {
+            m.insert(
+                "PATH".to_string(),
+                format!("{}:{existing_path}", parent.display()),
+            );
+        }
         Some(m)
     }
 
@@ -1963,6 +2013,40 @@ async fn prepare_workspace_dir(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+fn remote_build_wrapper_path(workspace: &Workspace, mission_id: Uuid) -> PathBuf {
+    if workspace.workspace_type == WorkspaceType::Container && !is_container_fallback(workspace) {
+        PathBuf::from("/usr/local/bin/remote-lean-build")
+    } else {
+        mission_workspace_dir_for_root(&workspace.path, mission_id)
+            .join(".sandboxed-sh/bin/remote-lean-build")
+    }
+}
+
+async fn install_remote_build_wrapper(
+    workspace: &Workspace,
+    mission_id: Uuid,
+) -> anyhow::Result<()> {
+    let destination = if workspace.workspace_type == WorkspaceType::Container
+        && !is_container_fallback(workspace)
+    {
+        workspace.path.join("usr/local/bin/remote-lean-build")
+    } else {
+        remote_build_wrapper_path(workspace, mission_id)
+    };
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = destination.with_extension(format!("tmp-{}-{mission_id}", std::process::id()));
+    tokio::fs::write(&tmp, include_bytes!("../../scripts/remote-lean-build")).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).await?;
+    }
+    tokio::fs::rename(&tmp, &destination).await?;
+    Ok(())
+}
+
 /// Filter MCP configs based on a workspace's MCP allowlist.
 ///
 /// - Empty `workspace_mcps` → include only MCPs with `default_enabled = true`
@@ -2045,6 +2129,7 @@ pub async fn prepare_mission_workspace_in(
     // can run concurrently without clobbering per-workspace config files.
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
+    install_remote_build_wrapper(workspace, mission_id).await?;
     let mcp_configs = filter_mcp_configs_for_workspace(
         mcp.list_configs().await,
         &workspace.mcps,
@@ -2151,6 +2236,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     // This keeps filesystem and config effects scoped to the mission.
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
+    install_remote_build_wrapper(workspace, mission_id).await?;
 
     // Get custom providers: use provided list or read from file
     let providers_from_file;
@@ -3541,6 +3627,37 @@ pub async fn read_sandboxed_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_build_wrapper_is_mission_scoped_and_executable_for_host_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let workspace = Workspace::default_host(root.path().to_path_buf());
+
+        install_remote_build_wrapper(&workspace, mission_id)
+            .await
+            .unwrap();
+
+        let path = remote_build_wrapper_path(&workspace, mission_id);
+        assert!(path.starts_with(mission_workspace_dir_for_root(root.path(), mission_id)));
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            include_bytes!("../../scripts/remote-lean-build")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                tokio::fs::metadata(path)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
+    }
     use serde_json::json;
 
     #[test]

@@ -300,7 +300,7 @@ A node is eligible when all of the following hold:
   requirement
 - `disk_available` ≥ `REMOTE_NODE_MIN_DISK_GB` (default 20)
 - `mem_available` ≥ `REMOTE_NODE_MIN_MEM_GB` (default 8)
-- `active_jobs + queued_jobs < 2 * capacity_total`
+- `active_jobs + queued_jobs + active_leases + core reservations < 2 * capacity_total`
 
 Eligible nodes are ranked least-loaded first (ties broken by most available
 memory). When no node qualifies the request **fails closed** with every
@@ -317,6 +317,11 @@ token, domain-separated with a `remote-build:` prefix), injected into
 harness envs as `REMOTE_BUILD_URL` / `REMOTE_BUILD_TOKEN` /
 `REMOTE_BUILD_MISSION_ID` whenever remote nodes (or spark offload) are
 enabled. Node bearer tokens never enter the workspace.
+
+Mission preparation also installs `remote-lean-build` and exports its exact
+path as `REMOTE_BUILD_COMMAND`. Container missions receive it in
+`/usr/local/bin`; host missions receive an isolated copy under the mission
+directory, which is prepended to `PATH`.
 
 Request body:
 
@@ -372,6 +377,24 @@ remote-lean-build || { [ $? -eq 75 ] && lake build; }
 
 Optional: `REMOTE_BUILD_TIMEOUT_SECS` forwards a job timeout (clamped by the
 node's `SANDBOXED_NODE_MAX_JOB_SECS`).
+
+Workspace configuration can pin the placement policy without exposing node
+credentials:
+
+```json
+{
+  "remote_build": {
+    "node_id": "auto",
+    "requirements": ["lean"],
+    "timeout_secs": 3600
+  }
+}
+```
+
+Auto placement combines heartbeat load with durable core-side reservations,
+and placement plus reservation is serialized. Concurrent requests therefore
+spread across eligible runners before their next heartbeat instead of all
+selecting the same apparently idle node.
 
 ## Core Configuration
 
