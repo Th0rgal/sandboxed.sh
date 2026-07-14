@@ -3385,6 +3385,59 @@ impl ControlHub {
         self.sessions.read().await.values().cloned().collect()
     }
 
+    /// Every live and persisted mission store. Writer leases are global to a
+    /// PR branch, not scoped to the authenticated dashboard user, so lease
+    /// checks must include stores whose user has no live control session.
+    pub async fn all_mission_stores(&self) -> Result<Vec<Arc<dyn MissionStore>>, String> {
+        let sessions = self.sessions.read().await;
+        let mut stores: Vec<Arc<dyn MissionStore>> = sessions
+            .values()
+            .map(|session| Arc::clone(&session.mission_store))
+            .collect();
+        let live_users: HashSet<String> = sessions
+            .keys()
+            .map(|user| mission_store::sanitize_filename(user))
+            .collect();
+        drop(sessions);
+
+        let base_dir = self
+            .config
+            .working_dir
+            .join(".sandboxed-sh")
+            .join("missions");
+        let mut entries = match tokio::fs::read_dir(&base_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(stores),
+            Err(error) => return Err(format!("read {}: {error}", base_dir.display())),
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_prefix("missions-") else {
+                continue;
+            };
+            if let Some(user) = stem.strip_suffix(".db") {
+                if live_users.contains(user) {
+                    continue;
+                }
+                stores.push(Arc::new(
+                    mission_store::SqliteMissionStore::new(base_dir.clone(), user).await?,
+                ));
+            } else if let Some(user) = stem.strip_suffix(".json") {
+                if live_users.contains(user) {
+                    continue;
+                }
+                stores.push(Arc::new(
+                    mission_store::FileMissionStore::new(base_dir.clone(), user).await?,
+                ));
+            }
+        }
+        Ok(stores)
+    }
+
     /// User ids of all live control sessions. Used by GC/reaper to decide
     /// whether the cross-store mission index is complete (a persisted store
     /// with no live session means missions exist that the index can't see).
@@ -3503,6 +3556,53 @@ pub async fn post_message(
         reset_stall_guard(mid);
     }
     let control = control_for_user(&state, &user).await;
+    if let Some(mission_id) = target_mission_id {
+        if let Some(mission) = control
+            .mission_store
+            .get_mission(mission_id)
+            .await
+            .map_err(internal_error)?
+        {
+            let already_writer = mission_is_pr_writer(&mission);
+            if already_writer || message_requests_pr_writer(&mission, &content) {
+                let _guard = PR_WRITER_CREATE_LOCK.lock().await;
+                if let Some(github_pr) = mission.project.github_pr.as_deref() {
+                    if let Some(existing) =
+                        find_existing_pr_writer_global(&state, github_pr, Some(mission.id))
+                            .await
+                            .map_err(internal_error)?
+                    {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            format!(
+                                "PR writer lease is already held by mission {} (status={}); cannot send a writer message to mission {} for {}",
+                                existing.id,
+                                existing.status,
+                                mission.id,
+                                canonical_github_pr(github_pr)
+                            ),
+                        ));
+                    }
+                }
+                if !already_writer {
+                    let mut tags = mission.project.tags.clone();
+                    tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
+                    tags.push("pr-writer".to_string());
+                    control
+                        .mission_store
+                        .update_mission_project(
+                            mission.id,
+                            crate::api::mission_store::MissionProjectPatch {
+                                tags: Some(tags),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map_err(internal_error)?;
+                }
+            }
+        }
+    }
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
         user_id = %user.id,
@@ -5277,6 +5377,16 @@ fn mission_is_pr_writer_with_prompt(mission: &Mission, prompt: Option<&str>) -> 
         || inferred_pr_writer(None, mission.project.intent.as_deref(), prompt)
 }
 
+fn message_requests_pr_writer(mission: &Mission, content: &str) -> bool {
+    mission.project.github_pr.is_some()
+        && requested_pr_writer(
+            None,
+            Some(&mission.project.tags),
+            mission.project.intent.as_deref(),
+            Some(content),
+        )
+}
+
 async fn find_existing_pr_writer(
     store: &Arc<dyn MissionStore>,
     github_pr: &str,
@@ -5325,6 +5435,21 @@ async fn find_existing_pr_writer(
     }
 }
 
+async fn find_existing_pr_writer_global(
+    state: &Arc<AppState>,
+    github_pr: &str,
+    exclude_id: Option<Uuid>,
+) -> Result<Option<Mission>, String> {
+    // Fail closed if any persisted store cannot be enumerated or read. A
+    // partial cross-user scan cannot prove that a branch is writer-free.
+    for store in state.control.all_mission_stores().await? {
+        if let Some(mission) = find_existing_pr_writer(&store, github_pr, exclude_id).await? {
+            return Ok(Some(mission));
+        }
+    }
+    Ok(None)
+}
+
 async fn ensure_pr_writer_resume_is_exclusive(
     store: &Arc<dyn MissionStore>,
     mission: &Mission,
@@ -5351,6 +5476,7 @@ async fn activate_mission_for_message(
     store: &Arc<dyn MissionStore>,
     events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
     mission: &Mission,
+    content: &str,
 ) -> Result<(), String> {
     if !message_activates_mission(mission.status) {
         return Ok(());
@@ -5360,13 +5486,41 @@ async fn activate_mission_for_message(
     // through the explicit resume endpoint. Reacquire the writer lease under
     // the same mutex as create/project/resume and keep it until Active is
     // persisted, so message delivery cannot race a replacement writer.
-    let _pr_writer_guard = if mission_is_pr_writer(mission) {
+    let becomes_writer =
+        mission_is_pr_writer(mission) || message_requests_pr_writer(mission, content);
+    let _pr_writer_guard = if becomes_writer {
         Some(PR_WRITER_CREATE_LOCK.lock().await)
     } else {
         None
     };
     if _pr_writer_guard.is_some() {
-        ensure_pr_writer_resume_is_exclusive(store, mission).await?;
+        if let Some(github_pr) = mission.project.github_pr.as_deref() {
+            if let Some(existing) =
+                find_existing_pr_writer(store, github_pr, Some(mission.id)).await?
+            {
+                return Err(format!(
+                    "PR writer lease is already held by mission {} (status={}); cannot activate mission {} as another writer for {}",
+                    existing.id,
+                    existing.status,
+                    mission.id,
+                    canonical_github_pr(github_pr)
+                ));
+            }
+        }
+        if !mission_is_pr_writer(mission) {
+            let mut tags = mission.project.tags.clone();
+            tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
+            tags.push("pr-writer".to_string());
+            store
+                .update_mission_project(
+                    mission.id,
+                    crate::api::mission_store::MissionProjectPatch {
+                        tags: Some(tags),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+        }
     }
 
     store
@@ -5701,7 +5855,7 @@ pub async fn create_mission(
     if request_needs_writer_lease {
         let _guard = PR_WRITER_CREATE_LOCK.lock().await;
         if let Some(github_pr) = req.github_pr.as_deref() {
-            if let Some(existing) = find_existing_pr_writer(&control.mission_store, github_pr, None)
+            if let Some(existing) = find_existing_pr_writer_global(&state, github_pr, None)
                 .await
                 .map_err(internal_error)?
             {
@@ -5750,10 +5904,9 @@ pub async fn create_mission(
         None
     };
     if let (Some(github_pr), Some(_guard)) = (req.github_pr.as_deref(), pr_writer_guard.as_ref()) {
-        if let Some(existing) =
-            find_existing_pr_writer(&control.mission_store, github_pr, Some(mission.id))
-                .await
-                .map_err(internal_error)?
+        if let Some(existing) = find_existing_pr_writer_global(&state, github_pr, Some(mission.id))
+            .await
+            .map_err(internal_error)?
         {
             let reason = "pr_writer_lease_conflict";
             control
@@ -6953,7 +7106,7 @@ pub async fn update_mission_project(
     };
     if let (Some(github_pr), Some(_guard)) = (effective_github_pr.as_deref(), writer_guard.as_ref())
     {
-        if let Some(existing) = find_existing_pr_writer(&control.mission_store, github_pr, Some(id))
+        if let Some(existing) = find_existing_pr_writer_global(&state, github_pr, Some(id))
             .await
             .map_err(internal_error)?
         {
@@ -12694,6 +12847,7 @@ async fn control_actor_loop(
                                                 &mission_store,
                                                 &events_tx,
                                                 &mission,
+                                                &content,
                                             )
                                             .await
                                             {
@@ -12822,6 +12976,7 @@ async fn control_actor_loop(
                                             &mission_store,
                                             &events_tx,
                                             &mission,
+                                            &content,
                                         )
                                         .await
                                         {
@@ -12863,6 +13018,7 @@ async fn control_actor_loop(
                                                 &mission_store,
                                                 &events_tx,
                                                 &mission,
+                                                &content,
                                             )
                                             .await
                                             {
@@ -12899,6 +13055,7 @@ async fn control_actor_loop(
                                                 &mission_store,
                                                 &events_tx,
                                                 &mission,
+                                                &content,
                                             )
                                             .await
                                             {
@@ -13018,6 +13175,7 @@ async fn control_actor_loop(
                                                 &mission_store,
                                                 &events_tx,
                                                 &mission,
+                                                &content,
                                             )
                                             .await
                                             {
