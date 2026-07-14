@@ -136,7 +136,7 @@ def inventory(root, index, index_complete, cutoff):
         # Caches, worktrees, images, and unattributed directories remain
         # inventory-only even when old: an operator must establish ownership
         # before any separate cleanup action can be approved.
-        eligible = bool(mission and not active and mtime < cutoff)
+        eligible = bool(index_complete and mission and not active and mtime < cutoff)
         if active:
             reason = "active_mission_protected"
         elif kind != "mission_dir":
