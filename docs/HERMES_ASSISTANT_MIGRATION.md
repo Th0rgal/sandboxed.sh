@@ -64,6 +64,7 @@ Tools:
 - `list_active_missions`
 - `list_missions`
 - `get_mission`
+- `get_mission_digest`
 - `get_mission_events`
 - `get_mission_health` — diagnose stalls/loops/errors + a one-line recommendation
 - `get_mission_diagnostics` — tool-call timeline, repeated calls, error events
@@ -73,6 +74,15 @@ Tools:
 - `resume_mission` — restart an interrupted/blocked/failed mission, optionally with a steering hint
 - `cancel_mission`
 - `list_workspaces`
+- `get_workspace`
+- `create_workspace`
+- `update_workspace`
+- `delete_workspace` — requires explicit confirmation
+- `list_workspace_templates`
+- `get_workspace_template`
+- `save_workspace_template`
+- `delete_workspace_template` — requires explicit confirmation
+- `rebuild_workspace_from_template` — reapplies template fields and force-rebuilds; requires explicit confirmation
 - `workspace_bash`
 
 Configuration:

@@ -1213,12 +1213,27 @@ mcp_servers:
         - list_active_missions
         - list_missions
         - get_mission
+        - get_mission_digest
         - get_mission_events
+        - get_mission_health
+        - get_mission_diagnostics
         - start_mission
         - send_message_to_mission
         - ask_mission
+        - update_mission_settings
+        - resume_mission
         - cancel_mission
         - list_workspaces
+        - get_workspace
+        - create_workspace
+        - update_workspace
+        - delete_workspace
+        - list_workspace_templates
+        - get_workspace_template
+        - save_workspace_template
+        - delete_workspace_template
+        - rebuild_workspace_from_template
+        - workspace_bash
       prompts: false
       resources: false
 
@@ -3313,20 +3328,49 @@ pub async fn deploy_sandboxed_sh(
     ))))
 }
 
+fn sandboxed_service_name_from_path(path: &std::path::Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy();
+    if !name.starts_with("sandboxed-sh") {
+        return None;
+    }
+    Some(format!("{}.service", name.trim_end_matches(".service")))
+}
+
 fn current_sandboxed_service_name() -> Result<String, String> {
+    // argv[0] preserves the systemd ExecStart symlink name
+    // (`sandboxed-sh-prod`) while current_exe() resolves that symlink to the
+    // versioned artifact's generic `sandboxed-sh` filename.
+    if let Some(service) = std::env::args_os()
+        .next()
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(sandboxed_service_name_from_path)
+    {
+        return Ok(service);
+    }
+
+    // Fall back to the systemd cgroup for launchers that replace argv[0].
+    // A v2 entry looks like `0::/system.slice/sandboxed-sh-prod.service`.
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
+        if let Some(service) = cgroup
+            .lines()
+            .flat_map(|line| line.rsplit('/'))
+            .find(|component| {
+                component.starts_with("sandboxed-sh") && component.ends_with(".service")
+            })
+        {
+            return Ok(service.to_string());
+        }
+    }
+
     let current_exe = std::env::current_exe()
         .map_err(|e| format!("Failed to detect current binary path: {}", e))?;
-    let exe_name = current_exe
-        .file_name()
-        .ok_or_else(|| {
-            format!(
-                "Current binary path has no file name: {}",
-                current_exe.display()
-            )
-        })?
-        .to_string_lossy()
-        .to_string();
-    Ok(format!("{}.service", exe_name))
+    sandboxed_service_name_from_path(&current_exe).ok_or_else(|| {
+        format!(
+            "Cannot derive a sandboxed.sh service from executable path {}",
+            current_exe.display()
+        )
+    })
 }
 
 /// The actual deploy stream — git checkout (optional), build (optional),
@@ -3398,6 +3442,7 @@ fn stream_deploy(
         const MAIN_CARGO_BIN: &str = "sandboxed-sh";
         const MCP_CARGO_BIN: &str = "orchestrator-mcp";
         const ASSISTANT_MCP_CARGO_BIN: &str = "assistant-mcp";
+        const PALOMA_CARGO_BIN: &str = "palomactl";
         let install_dest_main = current_exe.to_string_lossy().to_string();
         // Match the MCP install location: same dir as the main binary, fixed name.
         let install_dest_mcp = current_exe
@@ -3408,12 +3453,31 @@ fn stream_deploy(
             .parent()
             .map(|p| p.join(ASSISTANT_MCP_CARGO_BIN).to_string_lossy().to_string())
             .unwrap_or_else(|| format!("/usr/local/bin/{}", ASSISTANT_MCP_CARGO_BIN));
+        let install_dest_paloma = std::env::var("PALOMACTL_INSTALL_PATH")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or_else(|| {
+                let hermes_bin = std::path::Path::new("/var/lib/hermes-assistant/bin");
+                let wrapper = hermes_bin.join("palomactl-wrapper");
+                let real = hermes_bin.join("palomactl.real");
+                if wrapper.exists() || real.exists() {
+                    // Hermes may layer project/health/review-thread commands in
+                    // a stable wrapper whose REAL target is palomactl.real.
+                    // Updating `palomactl` itself would silently erase those
+                    // operator integrations on every sandboxed.sh deploy.
+                    real.to_string_lossy().to_string()
+                } else if hermes_bin.exists() {
+                    hermes_bin.join("palomactl").to_string_lossy().to_string()
+                } else {
+                    "/usr/local/bin/palomactl".to_string()
+                }
+            });
 
         if !req.skip_build {
-            yield sse("log", format!("Building {} + {} + {} (cargo build, debug)", MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN), Some(25));
+            yield sse("log", format!("Building {} + {} + {} + {} (cargo build, debug)", MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN, PALOMA_CARGO_BIN), Some(25));
             let build_cmd = format!(
-                "source /root/.cargo/env 2>/dev/null; cargo build --bin {} --bin {} --bin {}",
-                MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN
+                "source /root/.cargo/env 2>/dev/null; cargo build --bin {} --bin {} --bin {} --bin {}",
+                MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN, PALOMA_CARGO_BIN
             );
             match Command::new("bash")
                 .args(["-c", &build_cmd])
@@ -3449,6 +3513,7 @@ fn stream_deploy(
             .join("target")
             .join("debug")
             .join(ASSISTANT_MCP_CARGO_BIN);
+        let src_paloma = repo_path.join("target").join("debug").join(PALOMA_CARGO_BIN);
         if !src_main.exists() {
             yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_main.display()), None);
             return;
@@ -3459,6 +3524,10 @@ fn stream_deploy(
         }
         if !src_assistant_mcp.exists() {
             yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_assistant_mcp.display()), None);
+            return;
+        }
+        if !src_paloma.exists() {
+            yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_paloma.display()), None);
             return;
         }
 
@@ -3568,7 +3637,38 @@ fn stream_deploy(
                 return;
             }
         }
-        yield sse("log", format!("Backups: {}, {}, {}", bkp_main, bkp_mcp, bkp_assistant_mcp), Some(88));
+
+        yield sse("log", format!("Installing {} → {}", src_paloma.display(), install_dest_paloma), Some(87));
+        let bkp_paloma = format!("{}.pre-deploy-{}", install_dest_paloma, sha);
+        if std::path::Path::new(&install_dest_paloma).exists() {
+            let _ = tokio::fs::copy(&install_dest_paloma, &bkp_paloma).await;
+        }
+        let install_paloma = Command::new("install")
+            .args([
+                "-m", "0755",
+                src_paloma.to_string_lossy().as_ref(),
+                &install_dest_paloma,
+            ])
+            .output()
+            .await;
+        match install_paloma {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
+                let _ = tokio::fs::rename(&bkp_assistant_mcp, &install_dest_assistant_mcp).await;
+                yield sse("error", format!("Install of palomactl failed (service binaries rolled back): {}", String::from_utf8_lossy(&o.stderr)), None);
+                return;
+            }
+            Err(e) => {
+                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
+                let _ = tokio::fs::rename(&bkp_assistant_mcp, &install_dest_assistant_mcp).await;
+                yield sse("error", format!("install command error for palomactl (service binaries rolled back): {}", e), None);
+                return;
+            }
+        }
+        yield sse("log", format!("Backups: {}, {}, {}, {}", bkp_main, bkp_mcp, bkp_assistant_mcp, bkp_paloma), Some(88));
 
         // Prune old backups now that every install succeeded. The rollback
         // paths above consume this deploy's backups via rename, so pruning
@@ -3581,6 +3681,7 @@ fn stream_deploy(
             &install_dest_main,
             &install_dest_mcp,
             &install_dest_assistant_mcp,
+            &install_dest_paloma,
         ] {
             let (pruned, freed) = prune_deploy_backups(dest, keep).await;
             pruned_total += pruned.len();
@@ -4657,12 +4758,12 @@ mod tests {
         evaluate_debounce, evaluate_deploy_request, expand_hermes_env_refs, extract_version_token,
         hermes_config_base_url, hermes_config_model_label, hermes_config_yaml,
         hermes_uses_native_codex, is_safe_repo_path, normalize_repo_path, prune_deploy_backups,
-        select_repo_path, systemd_service_component_from_states, ComponentStatus, DebounceDecision,
-        DeployRefusal, DEPLOY_DEBOUNCE_SECS,
+        sandboxed_service_name_from_path, select_repo_path, systemd_service_component_from_states,
+        ComponentStatus, DebounceDecision, DeployRefusal, DEPLOY_DEBOUNCE_SECS,
     };
 
     #[test]
-    fn generated_hermes_config_allows_long_ask_turns() {
+    fn generated_hermes_config_allows_long_ask_turns_and_workspace_management() {
         let yaml = hermes_config_yaml(
             "hermes-test",
             "model",
@@ -4678,6 +4779,23 @@ mod tests {
         assert!(yaml.contains("    timeout: 600\n"));
         assert!(!yaml.contains("    timeout: 120\n"));
         assert!(yaml.contains("        - ask_mission\n"));
+        for tool in [
+            "get_workspace",
+            "create_workspace",
+            "update_workspace",
+            "delete_workspace",
+            "list_workspace_templates",
+            "get_workspace_template",
+            "save_workspace_template",
+            "delete_workspace_template",
+            "rebuild_workspace_from_template",
+            "workspace_bash",
+        ] {
+            assert!(
+                yaml.contains(&format!("        - {tool}\n")),
+                "generated Hermes config missing {tool}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5029,6 +5147,32 @@ mod tests {
     fn select_repo_path_uses_default_when_empty() {
         let result = select_repo_path(Some("  ".to_string()), Some("".to_string()));
         assert_eq!(result, crate::settings::DEFAULT_SANDBOXED_REPO_PATH);
+    }
+
+    #[test]
+    fn service_name_uses_execstart_symlink_instead_of_versioned_target_name() {
+        assert_eq!(
+            sandboxed_service_name_from_path(std::path::Path::new(
+                "/usr/local/bin/sandboxed-sh-prod"
+            )),
+            Some("sandboxed-sh-prod.service".to_string())
+        );
+        assert_eq!(
+            sandboxed_service_name_from_path(std::path::Path::new(
+                "/usr/local/bin/sandboxed-sh-dev"
+            )),
+            Some("sandboxed-sh-dev.service".to_string())
+        );
+        assert_eq!(
+            sandboxed_service_name_from_path(std::path::Path::new(
+                "/usr/local/lib/sandboxed-sh/abc123/sandboxed-sh"
+            )),
+            Some("sandboxed-sh.service".to_string())
+        );
+        assert_eq!(
+            sandboxed_service_name_from_path(std::path::Path::new("/usr/bin/other")),
+            None
+        );
     }
 
     #[test]

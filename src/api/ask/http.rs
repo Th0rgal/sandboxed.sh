@@ -80,10 +80,21 @@ pub struct AskThreadDetail {
 fn resolve_base_work_dir(
     working_directory: Option<&str>,
     workspace_path: &std::path::Path,
+    nspawn_container: bool,
     mission_id: Uuid,
 ) -> std::path::PathBuf {
     if let Some(dir) = working_directory.map(std::path::PathBuf::from) {
-        if dir.exists() {
+        // Mission metadata records the path as the harness saw it. In an
+        // nspawn workspace that is a guest path such as
+        // `/workspaces/mission-abcd/repo`, not a host path. Checking it on the
+        // host either fails (and silently selects the wrong directory) or,
+        // for generic paths such as `/tmp`, accidentally selects a host tree.
+        if nspawn_container && dir.is_absolute() && !dir.starts_with(workspace_path) {
+            let host_dir = workspace_path.join(dir.strip_prefix("/").unwrap_or(&dir));
+            if host_dir.exists() {
+                return host_dir;
+            }
+        } else if dir.exists() {
             return dir;
         }
     }
@@ -160,9 +171,12 @@ pub async fn ask_send(
         Some(mission.workspace_id),
     )
     .await;
+    let nspawn_container = workspace.workspace_type == crate::workspace::WorkspaceType::Container
+        && crate::workspace::use_nspawn_for_workspace(&workspace);
     let base_work_dir = resolve_base_work_dir(
         mission.working_directory.as_deref(),
         &workspace.path,
+        nspawn_container,
         mission_id,
     );
 
@@ -285,9 +299,12 @@ pub async fn ask_send_stream(
         Some(mission.workspace_id),
     )
     .await;
+    let nspawn_container = workspace.workspace_type == crate::workspace::WorkspaceType::Container
+        && crate::workspace::use_nspawn_for_workspace(&workspace);
     let base_work_dir = resolve_base_work_dir(
         mission.working_directory.as_deref(),
         &workspace.path,
+        nspawn_container,
         mission_id,
     );
 
@@ -431,4 +448,39 @@ pub async fn delete_ask_thread(
     Ok(Json(
         serde_json::json!({ "ok": true, "deleted": thread_id }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn nspawn_working_directory_is_resolved_inside_container_root() {
+        let root = tempdir().unwrap();
+        let guest = "/workspaces/mission-abcd/repo";
+        let host = root.path().join("workspaces/mission-abcd/repo");
+        std::fs::create_dir_all(&host).unwrap();
+        let resolved = resolve_base_work_dir(
+            Some(guest),
+            root.path(),
+            true,
+            Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap(),
+        );
+        assert_eq!(resolved, host);
+    }
+
+    #[test]
+    fn host_working_directory_is_left_unchanged() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let resolved = resolve_base_work_dir(
+            repo.to_str(),
+            root.path(),
+            false,
+            Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap(),
+        );
+        assert_eq!(resolved, repo);
+    }
 }

@@ -31,6 +31,7 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/:id", get(get_workspace))
         .route("/:id", put(update_workspace))
         .route("/:id", delete(delete_workspace))
+        .route("/:id/apply-template", post(apply_workspace_template))
         .route("/:id/build", post(build_workspace))
         .route("/:id/sync", post(sync_workspace))
         .route("/:id/exec", post(exec_workspace_command))
@@ -127,6 +128,12 @@ pub struct UpdateWorkspaceRequest {
     pub config_profile: Option<String>,
     /// Freeform workspace configuration (merged with existing config).
     pub config: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApplyWorkspaceTemplateRequest {
+    /// Template to apply. Defaults to the workspace's current template.
+    pub template: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -748,6 +755,110 @@ async fn update_workspace(
     Ok(Json(workspace.into()))
 }
 
+/// POST /api/workspaces/:id/apply-template - Reapply the latest template fields.
+async fn apply_workspace_template(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<ApplyWorkspaceTemplateRequest>,
+) -> Result<Json<WorkspaceResponse>, (StatusCode, String)> {
+    let mut workspace = require_workspace(&state.workspaces, id).await?;
+
+    if workspace.workspace_type != WorkspaceType::Container {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Only container workspaces can apply templates".to_string(),
+        ));
+    }
+    if workspace.status == WorkspaceStatus::Building {
+        return Err((
+            StatusCode::CONFLICT,
+            "Workspace build already in progress".to_string(),
+        ));
+    }
+
+    let template_name = req
+        .template
+        .as_deref()
+        .or(workspace.template.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "No template supplied and workspace has no template".to_string(),
+            )
+        })?
+        .to_string();
+
+    let library = clone_library(&state.library).await.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Library not initialized".to_string(),
+        )
+    })?;
+    let template = library
+        .get_workspace_template(&template_name)
+        .await
+        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?;
+
+    apply_template_fields(&mut workspace, &template_name, template)?;
+    state.workspaces.update(workspace.clone()).await;
+
+    if let Err(error) = workspace::sync_workspace_skills(&workspace, &library).await {
+        tracing::warn!(
+            workspace = %workspace.name,
+            error = %error,
+            "Failed to sync skills after applying workspace template"
+        );
+    }
+
+    tracing::info!(
+        workspace = %workspace.name,
+        template = %template_name,
+        "Applied workspace template"
+    );
+
+    Ok(Json(workspace.into()))
+}
+
+fn apply_template_fields(
+    workspace: &mut Workspace,
+    template_name: &str,
+    template: WorkspaceTemplate,
+) -> Result<(), (StatusCode, String)> {
+    if template
+        .env_vars
+        .values()
+        .any(|value| value.starts_with("[DECRYPTION_FAILED]"))
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "Template '{template_name}' contains env vars that could not be decrypted; workspace configuration was left unchanged"
+            ),
+        ));
+    }
+
+    workspace.template = Some(template_name.to_string());
+    workspace.distro = template
+        .distro
+        .as_deref()
+        .map(normalize_distro_value)
+        .transpose()?;
+    workspace.skills = sanitize_skill_list(template.skills);
+    workspace.env_vars = sanitize_env_vars(template.env_vars);
+    workspace.init_scripts = template.init_scripts;
+    workspace.init_script = normalize_init_script(Some(template.init_script));
+    workspace.shared_network = template.shared_network;
+    workspace.tailscale_mode = template.tailscale_mode;
+    workspace.mcps = template.mcps;
+    workspace.mcps_replace_defaults = template.mcps_replace_defaults;
+    workspace.config_profile = template
+        .config_profile
+        .and_then(|profile| (!profile.trim().is_empty()).then(|| profile.trim().to_string()));
+    Ok(())
+}
+
 /// POST /api/workspaces/:id/sync - Manually sync skills and tools to workspace.
 async fn sync_workspace(
     State(state): State<Arc<super::routes::AppState>>,
@@ -1230,17 +1341,7 @@ async fn exec_workspace_command(
     let timeout_secs = req.timeout_secs.unwrap_or(300).clamp(1, 600);
 
     // Determine working directory
-    let cwd = match &req.cwd {
-        Some(path) => {
-            let path = Path::new(path);
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                workspace.path.join(path)
-            }
-        }
-        None => workspace.path.clone(),
-    };
+    let cwd = resolve_workspace_exec_cwd(&workspace, req.cwd.as_deref())?;
 
     // `timeout(1)` enforces the limit inside the workspace: TERM at expiry,
     // escalating to KILL 5s later (`-k`) so TERM-ignoring commands still die
@@ -1288,6 +1389,47 @@ async fn exec_workspace_command(
             timed_out: true,
         })),
     }
+}
+
+fn resolve_workspace_exec_cwd(
+    workspace: &Workspace,
+    requested: Option<&str>,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let Some(requested) = requested else {
+        return Ok(workspace.path.clone());
+    };
+    let requested = Path::new(requested);
+
+    if workspace.workspace_type != WorkspaceType::Container {
+        return Ok(if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            workspace.path.join(requested)
+        });
+    }
+
+    // WorkspaceExec accepts host paths and translates them back into guest
+    // paths. Hermes/users naturally supply guest-absolute paths such as
+    // `/workspace/verity/base`; map those under the container root first.
+    let resolved = if requested.is_absolute() {
+        if requested.starts_with(&workspace.path) {
+            requested.to_path_buf()
+        } else {
+            workspace
+                .path
+                .join(requested.strip_prefix("/").unwrap_or(requested))
+        }
+    } else {
+        workspace.path.join(requested)
+    };
+
+    if !path_within(&workspace.path, &resolved) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Working directory must remain inside the workspace".to_string(),
+        ));
+    }
+    Ok(resolved)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2276,5 +2418,119 @@ mod tests {
     #[test]
     fn test_validate_workspace_name_rejects_empty() {
         assert!(validate_workspace_name("").is_err());
+    }
+
+    #[test]
+    fn apply_template_fields_replaces_template_controlled_configuration() {
+        let mut workspace =
+            Workspace::new_container("demo".to_string(), PathBuf::from("/tmp/demo"));
+        workspace.distro = Some("ubuntu:22.04".to_string());
+        workspace.skills = vec!["old-skill".to_string()];
+        workspace.env_vars = HashMap::from([("OLD".to_string(), "value".to_string())]);
+        workspace.tailscale_mode = Some(TailscaleMode::ExitNode);
+        workspace.config_profile = Some("old".to_string());
+
+        let template = WorkspaceTemplate {
+            name: "lean".to_string(),
+            description: Some("Lean workspace".to_string()),
+            path: "workspace-template/lean.json".to_string(),
+            distro: Some("ubuntu-noble".to_string()),
+            skills: vec!["lean".to_string()],
+            env_vars: HashMap::from([("LEAN_VERSION".to_string(), "4.24.0".to_string())]),
+            encrypted_keys: Vec::new(),
+            init_scripts: vec!["base".to_string(), "lean".to_string()],
+            init_script: "echo ready".to_string(),
+            shared_network: Some(false),
+            tailscale_mode: None,
+            mcps: vec!["lean-lsp".to_string()],
+            mcps_replace_defaults: false,
+            config_profile: None,
+        };
+
+        apply_template_fields(&mut workspace, "lean", template).unwrap();
+
+        assert_eq!(workspace.template.as_deref(), Some("lean"));
+        assert_eq!(workspace.distro.as_deref(), Some("ubuntu-noble"));
+        assert_eq!(workspace.skills, vec!["lean"]);
+        assert_eq!(workspace.env_vars.get("LEAN_VERSION").unwrap(), "4.24.0");
+        assert!(!workspace.env_vars.contains_key("OLD"));
+        assert_eq!(workspace.init_scripts, vec!["base", "lean"]);
+        assert_eq!(workspace.init_script.as_deref(), Some("echo ready"));
+        assert_eq!(workspace.shared_network, Some(false));
+        assert_eq!(workspace.tailscale_mode, None);
+        assert_eq!(workspace.mcps, vec!["lean-lsp"]);
+        assert!(!workspace.mcps_replace_defaults);
+        assert_eq!(workspace.config_profile, None);
+    }
+
+    #[test]
+    fn apply_template_fields_rejects_failed_decryption_without_mutating_workspace() {
+        let mut workspace =
+            Workspace::new_container("demo".to_string(), PathBuf::from("/tmp/demo"));
+        workspace.template = Some("working".to_string());
+        workspace.env_vars = HashMap::from([("TOKEN".to_string(), "valid".to_string())]);
+
+        let template = WorkspaceTemplate {
+            name: "broken".to_string(),
+            description: None,
+            path: "workspace-template/broken.json".to_string(),
+            distro: Some("ubuntu-noble".to_string()),
+            skills: Vec::new(),
+            env_vars: HashMap::from([(
+                "TOKEN".to_string(),
+                "[DECRYPTION_FAILED]<encrypted>ciphertext</encrypted>".to_string(),
+            )]),
+            encrypted_keys: vec!["TOKEN".to_string()],
+            init_scripts: Vec::new(),
+            init_script: "echo should-not-run".to_string(),
+            shared_network: None,
+            tailscale_mode: None,
+            mcps: Vec::new(),
+            mcps_replace_defaults: true,
+            config_profile: None,
+        };
+
+        let error = apply_template_fields(&mut workspace, "broken", template).unwrap_err();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(workspace.template.as_deref(), Some("working"));
+        assert_eq!(
+            workspace.env_vars.get("TOKEN").map(String::as_str),
+            Some("valid")
+        );
+        assert!(workspace.init_script.is_none());
+    }
+
+    #[test]
+    fn container_exec_cwd_maps_guest_absolute_path_under_workspace_root() {
+        let root = TempDir::new().unwrap();
+        let workspace = Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+
+        let cwd = resolve_workspace_exec_cwd(&workspace, Some("/workspace/verity/base"))
+            .expect("guest path should map into the container root");
+
+        assert_eq!(cwd, root.path().join("workspace/verity/base"));
+    }
+
+    #[test]
+    fn container_exec_cwd_accepts_host_path_inside_workspace() {
+        let root = TempDir::new().unwrap();
+        let workspace = Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+        let host_path = root.path().join("workspace/verity/base");
+
+        let cwd = resolve_workspace_exec_cwd(&workspace, host_path.to_str())
+            .expect("host path inside the workspace should remain unchanged");
+
+        assert_eq!(cwd, host_path);
+    }
+
+    #[test]
+    fn container_exec_cwd_rejects_relative_escape() {
+        let root = TempDir::new().unwrap();
+        let workspace = Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+
+        let error = resolve_workspace_exec_cwd(&workspace, Some("../../etc"))
+            .expect_err("relative traversal must not leave the workspace");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 }

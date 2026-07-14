@@ -616,7 +616,7 @@ impl OrchestratorMcp {
                                     "title": { "type": "string" },
                                     "prompt": { "type": "string", "description": "Full worker prompt: exact scope, absolute paths, success condition, verification command" },
                                     "backend": { "type": "string", "description": "codex | opencode | grok (never claudecode)" },
-                                    "model_override": { "type": "string" },
+                                    "model_override": { "type": "string", "description": "Exact account-supported model ID. For Codex Terra use gpt-5.6-terra with medium effort. Never invent variants such as gpt-5.5-sol." },
                                     "model_effort": { "type": "string", "description": "low | medium | high | xhigh | max (codex)" },
                                     "working_directory": { "type": "string", "description": "Worker cwd; superseded by worktree.path if a worktree is given" },
                                     "depends_on": { "type": "array", "items": { "type": "string" }, "description": "task_keys that must settle successfully or be accepted first" },
@@ -712,7 +712,7 @@ impl OrchestratorMcp {
                         },
                         "model_override": {
                             "type": "string",
-                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.6-sol') for codex, Gemini models for gemini, Grok models for grok, 'provider/model' format for opencode."
+                            "description": "Exact account-supported model ID. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.6-terra', recommended with medium effort) for codex, Gemini models for gemini, Grok models for grok, 'provider/model' format for opencode. Never invent variants such as 'gpt-5.5-sol'."
                         },
                         "model_effort": {
                             "type": "string",
@@ -758,7 +758,7 @@ impl OrchestratorMcp {
                                 "properties": {
                                     "title": { "type": "string" },
                                     "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "grok"] },
-                                    "model_override": { "type": "string" },
+                                    "model_override": { "type": "string", "description": "Exact account-supported model ID. For Codex Terra use gpt-5.6-terra with medium effort; gpt-5.5-sol is unsupported." },
                                     "model_effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
                                     "agent": { "type": "string" },
                                     "config_profile": { "type": "string" },

@@ -5081,6 +5081,92 @@ fn native_backend_prefix(raw_model: &str) -> Option<&str> {
     }
 }
 
+fn native_backend_agent(raw_agent: &str) -> Option<&'static str> {
+    match raw_agent.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some("codex"),
+        "claudecode" => Some("claudecode"),
+        "gemini" => Some("gemini"),
+        "grok" => Some("grok"),
+        _ => None,
+    }
+}
+
+/// Consume native harness names used through the legacy `agent` field.
+///
+/// These values select a backend; they are not library/sub-agent names and
+/// must not reach the native CLI (Claude Code would otherwise receive e.g.
+/// `--agent claudecode`). OpenCode remains the exception because it can have a
+/// real library agent named `codex`.
+fn apply_native_backend_agent_selector(
+    agent: &mut Option<String>,
+    backend: &mut Option<String>,
+) -> Result<(), String> {
+    let Some(agent_backend) = agent.as_deref().and_then(native_backend_agent) else {
+        return Ok(());
+    };
+
+    match backend.as_deref() {
+        None => {
+            *backend = Some(agent_backend.to_string());
+            *agent = None;
+        }
+        Some("opencode") => {}
+        Some(selected) if selected != agent_backend => {
+            return Err(format!(
+                "Agent '{}' selects backend '{}', but mission backend is '{}'",
+                agent.as_deref().unwrap_or_default(),
+                agent_backend,
+                selected
+            ));
+        }
+        Some(_) => *agent = None,
+    }
+
+    Ok(())
+}
+
+fn is_fable_model(model: Option<&str>) -> bool {
+    model
+        .map(str::to_ascii_lowercase)
+        .map(|model| model.contains("fable"))
+        .unwrap_or(false)
+}
+
+/// Fable is a research lane for mathematical hypothesis generation. A fleet
+/// controller must never hand it repository integration authority: an earlier
+/// cross-project routing incident sent a Beal review+merge mandate to Fable.
+fn fable_mandate_requests_integration(intent: Option<&str>, prompt: Option<&str>) -> bool {
+    let normalized = format!(
+        "{} {}",
+        intent.unwrap_or_default(),
+        prompt.unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    let tokens: std::collections::HashSet<&str> = normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    [
+        "review",
+        "reviewer",
+        "merge",
+        "merging",
+        "merged",
+        "rebase",
+        "rebasing",
+        "commit",
+        "committing",
+        "push",
+        "pushing",
+        "conflict",
+        "conflicts",
+        "integration",
+        "integrate",
+    ]
+    .iter()
+    .any(|token| tokens.contains(token))
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -5135,7 +5221,7 @@ pub async fn create_mission(
 
     let title = req.title.clone();
     let workspace_id = req.workspace_id;
-    let agent = req.agent.clone();
+    let mut agent = req.agent.clone();
     let config_profile = req.config_profile.clone();
     let mut backend = req.backend.clone();
     let mut model_override = req.model_override.clone();
@@ -5154,6 +5240,14 @@ pub async fn create_mission(
         if value.trim().is_empty() {
             model_effort = None;
         }
+    }
+
+    // Hermes historically used `agent="codex"` as the native harness selector
+    // while leaving `backend` unset. Treat native harness agent names as an
+    // unambiguous backend hint before applying the server default. Library
+    // agent names such as `build` or `plan` remain independent of the backend.
+    if let Err(error) = apply_native_backend_agent_selector(&mut agent, &mut backend) {
+        return Err((StatusCode::BAD_REQUEST, error));
     }
 
     // Native harness-qualified model IDs (for example
@@ -5270,6 +5364,16 @@ pub async fn create_mission(
         {
             model_override = Some(default_model);
         }
+    }
+
+    if is_fable_model(model_override.as_deref())
+        && fable_mandate_requests_integration(req.intent.as_deref(), req.prompt.as_deref())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Fable is restricted to mathematical hypothesis generation and cannot receive review, commit, push, conflict-resolution, or merge mandates. Use Codex or Claude Opus for repository integration."
+                .to_string(),
+        ));
     }
 
     // Validate the remote-node payload before persisting the mission so a
@@ -21599,6 +21703,27 @@ And the report:
     }
 
     #[test]
+    fn fable_rejects_repository_integration_mandates() {
+        assert!(is_fable_model(Some("claude-fable-5")));
+        assert!(fable_mandate_requests_integration(
+            Some("review_merge_pr"),
+            Some("Review PR #2 and merge it")
+        ));
+        assert!(fable_mandate_requests_integration(
+            None,
+            Some("Resolve the conflicts, commit, and push")
+        ));
+    }
+
+    #[test]
+    fn fable_allows_hypothesis_generation() {
+        assert!(!fable_mandate_requests_integration(
+            Some("hypothesis_generation"),
+            Some("Explore mathematical hypotheses for the Beal conjecture")
+        ));
+    }
+
+    #[test]
     fn test_native_backend_prefix_only_accepts_harness_qualifiers() {
         assert_eq!(native_backend_prefix("codex/gpt-5.6-terra"), Some("codex"));
         assert_eq!(
@@ -21607,6 +21732,50 @@ And the report:
         );
         assert_eq!(native_backend_prefix("openai/gpt-5.6-terra"), None);
         assert_eq!(native_backend_prefix("codex/"), None);
+    }
+
+    #[test]
+    fn test_native_backend_agent_only_accepts_native_harness_names() {
+        assert_eq!(native_backend_agent("codex"), Some("codex"));
+        assert_eq!(native_backend_agent(" Codex "), Some("codex"));
+        assert_eq!(native_backend_agent("claudecode"), Some("claudecode"));
+        assert_eq!(native_backend_agent("gemini"), Some("gemini"));
+        assert_eq!(native_backend_agent("grok"), Some("grok"));
+        assert_eq!(native_backend_agent("build"), None);
+        assert_eq!(native_backend_agent("plan"), None);
+        assert_eq!(native_backend_agent("opencode"), None);
+    }
+
+    #[test]
+    fn native_backend_agent_selector_is_consumed_for_native_harnesses() {
+        let mut agent = Some("ClaudeCode".to_string());
+        let mut backend = None;
+        apply_native_backend_agent_selector(&mut agent, &mut backend).unwrap();
+        assert_eq!(backend.as_deref(), Some("claudecode"));
+        assert_eq!(agent, None);
+
+        let mut agent = Some("codex".to_string());
+        let mut backend = Some("codex".to_string());
+        apply_native_backend_agent_selector(&mut agent, &mut backend).unwrap();
+        assert_eq!(agent, None);
+    }
+
+    #[test]
+    fn native_backend_agent_selector_preserves_real_opencode_agent() {
+        let mut agent = Some("codex".to_string());
+        let mut backend = Some("opencode".to_string());
+        apply_native_backend_agent_selector(&mut agent, &mut backend).unwrap();
+        assert_eq!(backend.as_deref(), Some("opencode"));
+        assert_eq!(agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn native_backend_agent_selector_rejects_conflicting_backend() {
+        let mut agent = Some("gemini".to_string());
+        let mut backend = Some("codex".to_string());
+        let error = apply_native_backend_agent_selector(&mut agent, &mut backend).unwrap_err();
+        assert!(error.contains("selects backend 'gemini'"));
+        assert_eq!(agent.as_deref(), Some("gemini"));
     }
 
     #[test]

@@ -2268,6 +2268,7 @@ pub async fn validate_model_override(
             }
         }
         "codex" => {
+            reject_known_unsupported_codex_model(model_override)?;
             // Codex expects raw model IDs from OpenAI
             let openai = providers.iter().find(|p| p.id == "openai");
             if let Some(provider) = openai {
@@ -2381,6 +2382,16 @@ pub async fn validate_model_override(
     }
 }
 
+fn reject_known_unsupported_codex_model(model_id: &str) -> Result<(), String> {
+    if model_id == "gpt-5.5-sol" {
+        return Err(
+            "Model 'gpt-5.5-sol' is not supported by Codex with ChatGPT authentication. Use 'gpt-5.6-terra' (recommended with model_effort='medium') or select an account-supported model explicitly."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn is_grok_backend_model_id(model_id: &str) -> bool {
     GROK_CLI_TEXT_MODEL_IDS.contains(&model_id)
 }
@@ -2452,6 +2463,14 @@ mod tests {
                 "bare/non-API slug should not be exposed: {invalid_id}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_invented_gpt_55_sol_variant_before_dispatch() {
+        let error = reject_known_unsupported_codex_model("gpt-5.5-sol")
+            .expect_err("invented model variant must be rejected");
+        assert!(error.contains("gpt-5.6-terra"));
+        assert!(reject_known_unsupported_codex_model("gpt-5.6-terra").is_ok());
     }
 
     #[test]

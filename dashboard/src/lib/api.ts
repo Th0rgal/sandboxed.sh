@@ -1177,6 +1177,7 @@ export interface McpServerConfig {
   scope: McpScope;
   description: string | null;
   enabled: boolean;
+  workspace_env_allowlist: string[];
   version: string | null;
   tools: string[];
   created_at: string;
@@ -1247,6 +1248,7 @@ export interface UpdateMcpRequest {
   enabled?: boolean;
   transport?: McpTransport;
   scope?: McpScope;
+  workspace_env_allowlist?: string[];
 }
 
 export async function updateMcp(
