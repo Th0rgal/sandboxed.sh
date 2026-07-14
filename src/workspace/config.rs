@@ -32,7 +32,6 @@ fn claude_entry_from_mcp(
     workspace_root: &Path,
     workspace_type: WorkspaceType,
     workspace_env: &HashMap<String, String>,
-    workspace_env_file: Option<&str>,
     shared_network: Option<bool>,
 ) -> serde_json::Value {
     match &config.transport {
@@ -79,15 +78,7 @@ fn claude_entry_from_mcp(
                 .get("environment")
                 .and_then(|v| v.as_object())
             {
-                let mut env_map = env.clone();
-                if let Some(env_file) = workspace_env_file {
-                    env_map.remove("SANDBOXED_SH_WORKSPACE_ENV_VARS");
-                    env_map.insert(
-                        "SANDBOXED_SH_WORKSPACE_ENV_VARS_FILE".to_string(),
-                        json!(env_file),
-                    );
-                }
-                entry.insert("env".to_string(), serde_json::Value::Object(env_map));
+                entry.insert("env".to_string(), serde_json::Value::Object(env.clone()));
             }
 
             serde_json::Value::Object(entry)
@@ -738,17 +729,6 @@ async fn write_claudecode_config(
     let claude_dir = workspace_dir.join(".claude");
     tokio::fs::create_dir_all(&claude_dir).await?;
 
-    let workspace_env_file = if !workspace_env.is_empty() {
-        let sandboxed_dir = workspace_dir.join(".sandboxed-sh");
-        tokio::fs::create_dir_all(&sandboxed_dir).await?;
-        let env_path = sandboxed_dir.join("workspace_env.json");
-        let payload = serde_json::to_string_pretty(workspace_env)?;
-        write_file_atomic(&env_path, payload)?;
-        Some(".sandboxed-sh/workspace_env.json".to_string())
-    } else {
-        None
-    };
-
     // Build MCP servers config in Claude Code format
     let mut mcp_servers = serde_json::Map::new();
     let mut used = std::collections::HashSet::new();
@@ -766,7 +746,6 @@ async fn write_claudecode_config(
                 workspace_root,
                 workspace_type,
                 workspace_env,
-                workspace_env_file.as_deref(),
                 shared_network,
             ),
         );
@@ -1363,5 +1342,96 @@ mod tests {
             ),
             mission_dir.join(".codex")
         );
+    }
+
+    #[test]
+    fn third_party_mcp_only_receives_allowlisted_workspace_env() {
+        let workspace_root = Path::new("/srv/workspace-root");
+        let mission_dir = workspace_root.join("workspaces/mission-deadbeef");
+        let mut mcp = McpServerConfig::new_stdio(
+            "lean_lsp".to_string(),
+            "/workspace/tools/lean-lsp-mcp".to_string(),
+            Vec::new(),
+            HashMap::new(),
+        );
+        mcp.workspace_env_allowlist = vec!["PATH".to_string(), "ELAN_HOME".to_string()];
+
+        let workspace_env = HashMap::from([
+            ("PATH".to_string(), "/root/.elan/bin:/usr/bin".to_string()),
+            ("ELAN_HOME".to_string(), "/root/.elan".to_string()),
+            ("GH_TOKEN".to_string(), "github-secret".to_string()),
+            ("SSH_PRIVATE_KEY_B64".to_string(), "ssh-secret".to_string()),
+            ("GPG_PRIVATE_KEY_B64".to_string(), "gpg-secret".to_string()),
+        ]);
+
+        let entry = codex_entry_from_mcp(
+            &mcp,
+            &mission_dir,
+            workspace_root,
+            WorkspaceType::Host,
+            &workspace_env,
+            None,
+            None,
+        )
+        .expect("stdio MCP entry");
+        let rendered = update_codex_mcp_config("", &[entry]);
+
+        assert!(rendered.contains("-i"));
+        assert!(rendered.contains("PATH=/root/.elan/bin:/usr/bin"));
+        assert!(rendered.contains("ELAN_HOME=/root/.elan"));
+        assert!(!rendered.contains("GH_TOKEN"));
+        assert!(!rendered.contains("github-secret"));
+        assert!(!rendered.contains("SSH_PRIVATE_KEY_B64"));
+        assert!(!rendered.contains("ssh-secret"));
+        assert!(!rendered.contains("GPG_PRIVATE_KEY_B64"));
+        assert!(!rendered.contains("gpg-secret"));
+        assert!(!rendered.contains("SANDBOXED_SH_WORKSPACE_ENV_VARS_FILE"));
+    }
+
+    #[test]
+    fn third_party_mcp_isolated_process_does_not_inherit_harness_env() {
+        let workspace_root = Path::new("/srv/workspace-root");
+        let mission_dir = workspace_root.join("workspaces/mission-deadbeef");
+        let mcp = McpServerConfig::new_stdio(
+            "third_party".to_string(),
+            "env".to_string(),
+            Vec::new(),
+            HashMap::new(),
+        );
+        let workspace_env = HashMap::from([(
+            "GH_TOKEN".to_string(),
+            "must-not-cross-boundary".to_string(),
+        )]);
+
+        let entry = opencode_entry_from_mcp(
+            &mcp,
+            &mission_dir,
+            workspace_root,
+            WorkspaceType::Host,
+            &workspace_env,
+            None,
+        );
+        let command = entry["command"].as_array().expect("command array");
+
+        assert_eq!(command[1], "-i");
+        assert!(command
+            .iter()
+            .any(|part| part.as_str().is_some_and(|part| part.starts_with("PATH="))));
+        assert!(!entry.to_string().contains("GH_TOKEN"));
+        assert!(!entry.to_string().contains("must-not-cross-boundary"));
+
+        let command_parts: Vec<&str> = command
+            .iter()
+            .map(|part| part.as_str().expect("string command part"))
+            .collect();
+        let output = std::process::Command::new(command_parts[0])
+            .args(&command_parts[1..])
+            .env("GH_TOKEN", "inherited-harness-secret")
+            .output()
+            .expect("run isolated MCP command");
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("GH_TOKEN"));
+        assert!(!stdout.contains("inherited-harness-secret"));
     }
 }

@@ -184,6 +184,10 @@ impl McpRegistry {
         );
         workspace.scope = McpScope::Workspace;
         workspace.default_enabled = true;
+        // workspace-mcp is a trusted compatibility shell/file proxy. It needs
+        // the same environment as the workspace commands it executes. Native
+        // harness bash remains the default for ordinary missions.
+        workspace.workspace_env_allowlist = vec!["*".to_string()];
         // Prefer bunx (Bun) when present, but fall back to npx for compatibility.
         let js_runner = if command_exists("bunx") {
             "bunx"
@@ -417,6 +421,24 @@ impl McpRegistry {
                 let _ = config_store
                     .update(id, |c| {
                         c.default_enabled = true;
+                    })
+                    .await;
+            }
+        }
+
+        // workspace-mcp is the only built-in compatibility proxy that needs
+        // the full workspace environment for commands it executes. Persist
+        // that trust decision explicitly so all other MCPs stay deny-by-default.
+        for config in configs
+            .iter_mut()
+            .filter(|config| config.name == "workspace")
+        {
+            if config.workspace_env_allowlist != ["*".to_string()] {
+                config.workspace_env_allowlist = vec!["*".to_string()];
+                let id = config.id;
+                let _ = config_store
+                    .update(id, |c| {
+                        c.workspace_env_allowlist = vec!["*".to_string()];
                     })
                     .await;
             }
@@ -693,6 +715,7 @@ impl McpRegistry {
         if let Some(default_enabled) = req.default_enabled {
             config.default_enabled = default_enabled;
         }
+        config.workspace_env_allowlist = req.workspace_env_allowlist;
 
         // Save to persistent store
         let config = self.config_store.add(config).await?;
@@ -818,6 +841,9 @@ impl McpRegistry {
                 }
                 if let Some(default_enabled) = req.default_enabled {
                     c.default_enabled = default_enabled;
+                }
+                if let Some(workspace_env_allowlist) = &req.workspace_env_allowlist {
+                    c.workspace_env_allowlist = workspace_env_allowlist.clone();
                 }
             })
             .await?;

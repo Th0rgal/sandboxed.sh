@@ -181,6 +181,15 @@ pub struct McpServerConfig {
     /// `default_enabled = true` are written into its config.
     #[serde(default)]
     pub default_enabled: bool,
+    /// Workspace environment variable names this MCP may receive.
+    ///
+    /// Stdio MCP processes are launched with a clean environment. Only their
+    /// transport-specific `env`, mission runtime metadata, and workspace keys
+    /// listed here are restored. `"*"` is reserved for trusted internal MCPs
+    /// that execute workspace commands and intentionally need the full
+    /// workspace environment.
+    #[serde(default)]
+    pub workspace_env_allowlist: Vec<String>,
     /// Optional version string
     pub version: Option<String>,
     /// Tool names exposed by this MCP (populated after connection)
@@ -209,6 +218,7 @@ impl McpServerConfig {
             description: None,
             enabled: true,
             default_enabled: false,
+            workspace_env_allowlist: Vec::new(),
             version: None,
             tools: Vec::new(),
             tool_descriptors: Vec::new(),
@@ -232,6 +242,7 @@ impl McpServerConfig {
             description: None,
             enabled: true,
             default_enabled: false,
+            workspace_env_allowlist: Vec::new(),
             version: None,
             tools: Vec::new(),
             tool_descriptors: Vec::new(),
@@ -301,6 +312,9 @@ pub struct AddMcpRequest {
     /// Whether this MCP is included by default in new workspaces.
     #[serde(default)]
     pub default_enabled: Option<bool>,
+    /// Workspace environment variables this MCP may receive.
+    #[serde(default)]
+    pub workspace_env_allowlist: Vec<String>,
 }
 
 /// Request to update an MCP server.
@@ -313,6 +327,8 @@ pub struct UpdateMcpRequest {
     pub scope: Option<McpScope>,
     /// Whether this MCP is included by default in new workspaces.
     pub default_enabled: Option<bool>,
+    /// Replace the workspace environment allowlist when present.
+    pub workspace_env_allowlist: Option<Vec<String>>,
 }
 
 /// MCP tool list response from server.

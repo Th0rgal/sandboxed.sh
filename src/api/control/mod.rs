@@ -5081,6 +5081,16 @@ fn native_backend_prefix(raw_model: &str) -> Option<&str> {
     }
 }
 
+fn native_backend_agent(raw_agent: &str) -> Option<&'static str> {
+    match raw_agent.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some("codex"),
+        "claudecode" => Some("claudecode"),
+        "gemini" => Some("gemini"),
+        "grok" => Some("grok"),
+        _ => None,
+    }
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -5153,6 +5163,30 @@ pub async fn create_mission(
     if let Some(value) = model_effort.as_ref() {
         if value.trim().is_empty() {
             model_effort = None;
+        }
+    }
+
+    // Hermes historically used `agent="codex"` as the native harness selector
+    // while leaving `backend` unset. Treat native harness agent names as an
+    // unambiguous backend hint before applying the server default. Library
+    // agent names such as `build` or `plan` remain independent of the backend.
+    if let Some(agent_backend) = agent.as_deref().and_then(native_backend_agent) {
+        match backend.as_deref() {
+            None => backend = Some(agent_backend.to_string()),
+            // OpenCode may legitimately have a library agent named `codex`.
+            Some("opencode") => {}
+            Some(selected) if selected != agent_backend => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Agent '{}' selects backend '{}', but mission backend is '{}'",
+                        agent.as_deref().unwrap_or_default(),
+                        agent_backend,
+                        selected
+                    ),
+                ));
+            }
+            Some(_) => {}
         }
     }
 
@@ -21607,6 +21641,18 @@ And the report:
         );
         assert_eq!(native_backend_prefix("openai/gpt-5.6-terra"), None);
         assert_eq!(native_backend_prefix("codex/"), None);
+    }
+
+    #[test]
+    fn test_native_backend_agent_only_accepts_native_harness_names() {
+        assert_eq!(native_backend_agent("codex"), Some("codex"));
+        assert_eq!(native_backend_agent(" Codex "), Some("codex"));
+        assert_eq!(native_backend_agent("claudecode"), Some("claudecode"));
+        assert_eq!(native_backend_agent("gemini"), Some("gemini"));
+        assert_eq!(native_backend_agent("grok"), Some("grok"));
+        assert_eq!(native_backend_agent("build"), None);
+        assert_eq!(native_backend_agent("plan"), None);
+        assert_eq!(native_backend_agent("opencode"), None);
     }
 
     #[test]

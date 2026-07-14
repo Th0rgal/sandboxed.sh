@@ -157,6 +157,16 @@ struct StartMissionParams {
     next_check_at: Option<String>,
 }
 
+fn native_backend_from_agent(agent: Option<&str>) -> Option<String> {
+    match agent?.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some("codex".to_string()),
+        "claudecode" => Some("claudecode".to_string()),
+        "gemini" => Some("gemini".to_string()),
+        "grok" => Some("grok".to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SendMessageParams {
     mission_id: String,
@@ -807,7 +817,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "start_mission".to_string(),
-                description: "Create a new sandboxed.sh mission and send its initial prompt. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title).".to_string(),
+                description: "Create a new sandboxed.sh mission and send its initial prompt. Set backend explicitly when possible. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title).".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -1268,10 +1278,13 @@ impl AssistantMcp {
 
     async fn start_mission(&self, params: StartMissionParams) -> Result<Value, String> {
         let workspace_id = resolve_default_workspace_id(params.workspace_id);
+        let backend = params
+            .backend
+            .or_else(|| native_backend_from_agent(params.agent.as_deref()));
         let body = json!({
             "title": params.title,
             "workspace_id": workspace_id,
-            "backend": params.backend,
+            "backend": backend,
             "model_override": params.model_override,
             "model_effort": params.model_effort,
             "config_profile": params.config_profile,
@@ -2616,6 +2629,20 @@ mod tests {
 
         assert_eq!(workspace_id.as_deref(), Some("assistant-workspace"));
         clear_env();
+    }
+
+    #[test]
+    fn native_agent_names_select_the_matching_backend() {
+        assert_eq!(
+            native_backend_from_agent(Some("codex")).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            native_backend_from_agent(Some(" ClaudeCode ")).as_deref(),
+            Some("claudecode")
+        );
+        assert_eq!(native_backend_from_agent(Some("build")), None);
+        assert_eq!(native_backend_from_agent(None), None);
     }
 
     #[test]

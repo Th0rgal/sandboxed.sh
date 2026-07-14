@@ -771,6 +771,34 @@ fn opencode_entry_from_mcp(
     workspace_env: &HashMap<String, String>,
     shared_network: Option<bool>,
 ) -> serde_json::Value {
+    fn allowed_workspace_env(
+        config: &McpServerConfig,
+        workspace_env: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        if config
+            .workspace_env_allowlist
+            .iter()
+            .any(|key| key.trim() == "*")
+        {
+            return workspace_env.clone();
+        }
+
+        config
+            .workspace_env_allowlist
+            .iter()
+            .filter_map(|key| {
+                let key = key.trim();
+                if key.is_empty() {
+                    None
+                } else {
+                    workspace_env
+                        .get(key)
+                        .map(|value| (key.to_string(), value.clone()))
+                }
+            })
+            .collect()
+    }
+
     fn resolve_host_command_path(cmd: &str) -> String {
         let cmd_path = Path::new(cmd);
         if cmd_path.is_absolute() || cmd.contains('/') {
@@ -862,19 +890,31 @@ fn opencode_entry_from_mcp(
             let mut entry = serde_json::Map::new();
             entry.insert("type".to_string(), json!("local"));
 
+            // Do not implicitly forward a workspace's complete environment to
+            // every third-party MCP. Only MCP-specific env and explicitly
+            // allowlisted workspace keys cross this boundary.
+            let allowed_workspace_env = allowed_workspace_env(config, workspace_env);
             let mut merged_env = env.clone();
-            if !workspace_env.is_empty() {
-                for (key, value) in workspace_env {
+            if !allowed_workspace_env.is_empty() {
+                for (key, value) in &allowed_workspace_env {
                     merged_env
                         .entry(key.clone())
                         .or_insert_with(|| value.clone());
                 }
-                let workspace_env_json =
-                    serde_json::to_string(workspace_env).unwrap_or_else(|_| "{}".to_string());
+                let workspace_env_json = serde_json::to_string(&allowed_workspace_env)
+                    .unwrap_or_else(|_| "{}".to_string());
                 merged_env
                     .entry("SANDBOXED_SH_WORKSPACE_ENV_VARS".to_string())
                     .or_insert(workspace_env_json);
             }
+            // A predictable non-secret PATH keeps scripts with `/usr/bin/env`
+            // shebangs working without inheriting the harness environment.
+            merged_env.entry("PATH".to_string()).or_insert_with(|| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+            });
+            merged_env
+                .entry("HOME".to_string())
+                .or_insert_with(|| workspace_dir.to_string_lossy().to_string());
             merged_env
                 .entry("SANDBOXED_SH_WORKSPACE".to_string())
                 .or_insert_with(|| workspace_dir.to_string_lossy().to_string());
@@ -934,6 +974,7 @@ fn opencode_entry_from_mcp(
                 nspawn_env.insert("SANDBOXED_SH_WORKSPACE".to_string(), rel_str.clone());
                 nspawn_env.insert("SANDBOXED_SH_WORKSPACE_ROOT".to_string(), "/".to_string());
                 nspawn_env.insert("WORKING_DIR".to_string(), rel_str.clone());
+                nspawn_env.insert("HOME".to_string(), rel_str.clone());
 
                 let mut cmd = vec![
                     resolve_host_command_path("systemd-nspawn"),
@@ -994,7 +1035,7 @@ fn opencode_entry_from_mcp(
                     cmd.push("--bind-ro=/etc/resolv.conf".to_string());
                 } else {
                     // Isolated network mode - check if Tailscale is configured
-                    let tailscale_args = nspawn::tailscale_nspawn_extra_args(&merged_env);
+                    let tailscale_args = nspawn::tailscale_nspawn_extra_args(workspace_env);
                     if tailscale_args.is_empty() {
                         // Tailscale not configured - fall back to binding resolv.conf for DNS
                         // This ensures DNS works even if the user sets shared_network=false
@@ -1030,7 +1071,8 @@ fn opencode_entry_from_mcp(
                     };
                     merged_env.insert("SANDBOXED_SH_WORKSPACE".to_string(), rel_str.clone());
                     merged_env.insert("SANDBOXED_SH_WORKSPACE_ROOT".to_string(), "/".to_string());
-                    merged_env.insert("WORKING_DIR".to_string(), rel_str);
+                    merged_env.insert("WORKING_DIR".to_string(), rel_str.clone());
+                    merged_env.insert("HOME".to_string(), rel_str);
                 }
 
                 let resolved_command = match workspace_type {
@@ -1042,12 +1084,31 @@ fn opencode_entry_from_mcp(
                     ),
                     WorkspaceType::Host => resolve_host_command_path(command),
                 };
-                let mut cmd = vec![resolved_command];
+                // Harness CLIs normally spawn MCPs as child processes, which
+                // would otherwise inherit every workspace credential even if
+                // the generated config omitted it. `env -i` makes the
+                // allowlist an actual process boundary rather than cosmetic
+                // config filtering.
+                let env_command = match workspace_type {
+                    WorkspaceType::Container => resolve_container_command_path(
+                        "env",
+                        workspace_root,
+                        container_fallback,
+                        per_workspace_runner,
+                    ),
+                    WorkspaceType::Host => resolve_host_command_path("env"),
+                };
+                let mut cmd = vec![env_command, "-i".to_string()];
+                let mut env_pairs: Vec<_> = merged_env.iter().collect();
+                env_pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
+                cmd.extend(
+                    env_pairs
+                        .into_iter()
+                        .map(|(key, value)| format!("{}={}", key, value)),
+                );
+                cmd.push(resolved_command);
                 cmd.extend(args.clone());
                 entry.insert("command".to_string(), json!(cmd));
-                if !merged_env.is_empty() {
-                    entry.insert("environment".to_string(), json!(merged_env));
-                }
             }
             entry.insert("enabled".to_string(), json!(config.enabled));
             serde_json::Value::Object(entry)
