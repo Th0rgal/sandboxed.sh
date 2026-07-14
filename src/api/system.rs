@@ -3328,20 +3328,49 @@ pub async fn deploy_sandboxed_sh(
     ))))
 }
 
+fn sandboxed_service_name_from_path(path: &std::path::Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy();
+    if !name.starts_with("sandboxed-sh") {
+        return None;
+    }
+    Some(format!("{}.service", name.trim_end_matches(".service")))
+}
+
 fn current_sandboxed_service_name() -> Result<String, String> {
+    // argv[0] preserves the systemd ExecStart symlink name
+    // (`sandboxed-sh-prod`) while current_exe() resolves that symlink to the
+    // versioned artifact's generic `sandboxed-sh` filename.
+    if let Some(service) = std::env::args_os()
+        .next()
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(sandboxed_service_name_from_path)
+    {
+        return Ok(service);
+    }
+
+    // Fall back to the systemd cgroup for launchers that replace argv[0].
+    // A v2 entry looks like `0::/system.slice/sandboxed-sh-prod.service`.
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
+        if let Some(service) = cgroup
+            .lines()
+            .flat_map(|line| line.rsplit('/'))
+            .find(|component| {
+                component.starts_with("sandboxed-sh") && component.ends_with(".service")
+            })
+        {
+            return Ok(service.to_string());
+        }
+    }
+
     let current_exe = std::env::current_exe()
         .map_err(|e| format!("Failed to detect current binary path: {}", e))?;
-    let exe_name = current_exe
-        .file_name()
-        .ok_or_else(|| {
-            format!(
-                "Current binary path has no file name: {}",
-                current_exe.display()
-            )
-        })?
-        .to_string_lossy()
-        .to_string();
-    Ok(format!("{}.service", exe_name))
+    sandboxed_service_name_from_path(&current_exe).ok_or_else(|| {
+        format!(
+            "Cannot derive a sandboxed.sh service from executable path {}",
+            current_exe.display()
+        )
+    })
 }
 
 /// The actual deploy stream — git checkout (optional), build (optional),
@@ -4672,8 +4701,8 @@ mod tests {
         evaluate_debounce, evaluate_deploy_request, expand_hermes_env_refs, extract_version_token,
         hermes_config_base_url, hermes_config_model_label, hermes_config_yaml,
         hermes_uses_native_codex, is_safe_repo_path, normalize_repo_path, prune_deploy_backups,
-        select_repo_path, systemd_service_component_from_states, ComponentStatus, DebounceDecision,
-        DeployRefusal, DEPLOY_DEBOUNCE_SECS,
+        sandboxed_service_name_from_path, select_repo_path, systemd_service_component_from_states,
+        ComponentStatus, DebounceDecision, DeployRefusal, DEPLOY_DEBOUNCE_SECS,
     };
 
     #[test]
@@ -5061,6 +5090,32 @@ mod tests {
     fn select_repo_path_uses_default_when_empty() {
         let result = select_repo_path(Some("  ".to_string()), Some("".to_string()));
         assert_eq!(result, crate::settings::DEFAULT_SANDBOXED_REPO_PATH);
+    }
+
+    #[test]
+    fn service_name_uses_execstart_symlink_instead_of_versioned_target_name() {
+        assert_eq!(
+            sandboxed_service_name_from_path(std::path::Path::new(
+                "/usr/local/bin/sandboxed-sh-prod"
+            )),
+            Some("sandboxed-sh-prod.service".to_string())
+        );
+        assert_eq!(
+            sandboxed_service_name_from_path(std::path::Path::new(
+                "/usr/local/bin/sandboxed-sh-dev"
+            )),
+            Some("sandboxed-sh-dev.service".to_string())
+        );
+        assert_eq!(
+            sandboxed_service_name_from_path(std::path::Path::new(
+                "/usr/local/lib/sandboxed-sh/abc123/sandboxed-sh"
+            )),
+            Some("sandboxed-sh.service".to_string())
+        );
+        assert_eq!(
+            sandboxed_service_name_from_path(std::path::Path::new("/usr/bin/other")),
+            None
+        );
     }
 
     #[test]
