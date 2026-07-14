@@ -5091,6 +5091,48 @@ fn native_backend_agent(raw_agent: &str) -> Option<&'static str> {
     }
 }
 
+fn is_fable_model(model: Option<&str>) -> bool {
+    model
+        .map(str::to_ascii_lowercase)
+        .map(|model| model.contains("fable"))
+        .unwrap_or(false)
+}
+
+/// Fable is a research lane for mathematical hypothesis generation. A fleet
+/// controller must never hand it repository integration authority: an earlier
+/// cross-project routing incident sent a Beal review+merge mandate to Fable.
+fn fable_mandate_requests_integration(intent: Option<&str>, prompt: Option<&str>) -> bool {
+    let normalized = format!(
+        "{} {}",
+        intent.unwrap_or_default(),
+        prompt.unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    let tokens: std::collections::HashSet<&str> = normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    [
+        "review",
+        "reviewer",
+        "merge",
+        "merging",
+        "merged",
+        "rebase",
+        "rebasing",
+        "commit",
+        "committing",
+        "push",
+        "pushing",
+        "conflict",
+        "conflicts",
+        "integration",
+        "integrate",
+    ]
+    .iter()
+    .any(|token| tokens.contains(token))
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -5304,6 +5346,16 @@ pub async fn create_mission(
         {
             model_override = Some(default_model);
         }
+    }
+
+    if is_fable_model(model_override.as_deref())
+        && fable_mandate_requests_integration(req.intent.as_deref(), req.prompt.as_deref())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Fable is restricted to mathematical hypothesis generation and cannot receive review, commit, push, conflict-resolution, or merge mandates. Use Codex or Claude Opus for repository integration."
+                .to_string(),
+        ));
     }
 
     // Validate the remote-node payload before persisting the mission so a
@@ -21630,6 +21682,27 @@ And the report:
             normalize_model_override_for_backend(Some("codex"), "codex/gpt-5.6-terra"),
             Some("gpt-5.6-terra".to_string())
         );
+    }
+
+    #[test]
+    fn fable_rejects_repository_integration_mandates() {
+        assert!(is_fable_model(Some("claude-fable-5")));
+        assert!(fable_mandate_requests_integration(
+            Some("review_merge_pr"),
+            Some("Review PR #2 and merge it")
+        ));
+        assert!(fable_mandate_requests_integration(
+            None,
+            Some("Resolve the conflicts, commit, and push")
+        ));
+    }
+
+    #[test]
+    fn fable_allows_hypothesis_generation() {
+        assert!(!fable_mandate_requests_integration(
+            Some("hypothesis_generation"),
+            Some("Explore mathematical hypotheses for the Beal conjecture")
+        ));
     }
 
     #[test]

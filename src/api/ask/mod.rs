@@ -1442,9 +1442,9 @@ pub async fn prepare_sandbox(exec: &WorkspaceExec, base_work_dir: &Path) -> Opti
         let copy_cmd = format!(
             "set -e; test -d {b}; rm -rf {s}; mkdir -p {s}; \
              if command -v rsync >/dev/null 2>&1; then \
-               rsync -a --exclude .git --exclude node_modules --exclude target --exclude .next -- {b}/ {s}/; \
+               rsync -a --exclude .git --exclude .lake --exclude node_modules --exclude target --exclude .next -- {b}/ {s}/; \
              else \
-               (cd {b} && tar --exclude .git --exclude node_modules --exclude target --exclude .next -cf - .) | (cd {s} && tar -xf -); \
+               (cd {b} && tar --exclude .git --exclude .lake --exclude node_modules --exclude target --exclude .next -cf - .) | (cd {s} && tar -xf -); \
              fi; echo SANDBOX_OK",
             b = single_quote(&base_str),
             s = single_quote(&sandbox_str)

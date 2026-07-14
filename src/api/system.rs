@@ -3442,6 +3442,7 @@ fn stream_deploy(
         const MAIN_CARGO_BIN: &str = "sandboxed-sh";
         const MCP_CARGO_BIN: &str = "orchestrator-mcp";
         const ASSISTANT_MCP_CARGO_BIN: &str = "assistant-mcp";
+        const PALOMA_CARGO_BIN: &str = "palomactl";
         let install_dest_main = current_exe.to_string_lossy().to_string();
         // Match the MCP install location: same dir as the main binary, fixed name.
         let install_dest_mcp = current_exe
@@ -3452,12 +3453,23 @@ fn stream_deploy(
             .parent()
             .map(|p| p.join(ASSISTANT_MCP_CARGO_BIN).to_string_lossy().to_string())
             .unwrap_or_else(|| format!("/usr/local/bin/{}", ASSISTANT_MCP_CARGO_BIN));
+        let install_dest_paloma = std::env::var("PALOMACTL_INSTALL_PATH")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or_else(|| {
+                let hermes_path = std::path::Path::new("/var/lib/hermes-assistant/bin/palomactl");
+                if hermes_path.parent().is_some_and(std::path::Path::exists) {
+                    hermes_path.to_string_lossy().to_string()
+                } else {
+                    "/usr/local/bin/palomactl".to_string()
+                }
+            });
 
         if !req.skip_build {
-            yield sse("log", format!("Building {} + {} + {} (cargo build, debug)", MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN), Some(25));
+            yield sse("log", format!("Building {} + {} + {} + {} (cargo build, debug)", MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN, PALOMA_CARGO_BIN), Some(25));
             let build_cmd = format!(
-                "source /root/.cargo/env 2>/dev/null; cargo build --bin {} --bin {} --bin {}",
-                MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN
+                "source /root/.cargo/env 2>/dev/null; cargo build --bin {} --bin {} --bin {} --bin {}",
+                MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN, PALOMA_CARGO_BIN
             );
             match Command::new("bash")
                 .args(["-c", &build_cmd])
@@ -3493,6 +3505,7 @@ fn stream_deploy(
             .join("target")
             .join("debug")
             .join(ASSISTANT_MCP_CARGO_BIN);
+        let src_paloma = repo_path.join("target").join("debug").join(PALOMA_CARGO_BIN);
         if !src_main.exists() {
             yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_main.display()), None);
             return;
@@ -3503,6 +3516,10 @@ fn stream_deploy(
         }
         if !src_assistant_mcp.exists() {
             yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_assistant_mcp.display()), None);
+            return;
+        }
+        if !src_paloma.exists() {
+            yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_paloma.display()), None);
             return;
         }
 
@@ -3612,7 +3629,38 @@ fn stream_deploy(
                 return;
             }
         }
-        yield sse("log", format!("Backups: {}, {}, {}", bkp_main, bkp_mcp, bkp_assistant_mcp), Some(88));
+
+        yield sse("log", format!("Installing {} → {}", src_paloma.display(), install_dest_paloma), Some(87));
+        let bkp_paloma = format!("{}.pre-deploy-{}", install_dest_paloma, sha);
+        if std::path::Path::new(&install_dest_paloma).exists() {
+            let _ = tokio::fs::copy(&install_dest_paloma, &bkp_paloma).await;
+        }
+        let install_paloma = Command::new("install")
+            .args([
+                "-m", "0755",
+                src_paloma.to_string_lossy().as_ref(),
+                &install_dest_paloma,
+            ])
+            .output()
+            .await;
+        match install_paloma {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
+                let _ = tokio::fs::rename(&bkp_assistant_mcp, &install_dest_assistant_mcp).await;
+                yield sse("error", format!("Install of palomactl failed (service binaries rolled back): {}", String::from_utf8_lossy(&o.stderr)), None);
+                return;
+            }
+            Err(e) => {
+                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
+                let _ = tokio::fs::rename(&bkp_assistant_mcp, &install_dest_assistant_mcp).await;
+                yield sse("error", format!("install command error for palomactl (service binaries rolled back): {}", e), None);
+                return;
+            }
+        }
+        yield sse("log", format!("Backups: {}, {}, {}, {}", bkp_main, bkp_mcp, bkp_assistant_mcp, bkp_paloma), Some(88));
 
         // Prune old backups now that every install succeeded. The rollback
         // paths above consume this deploy's backups via rename, so pruning
@@ -3625,6 +3673,7 @@ fn stream_deploy(
             &install_dest_main,
             &install_dest_mcp,
             &install_dest_assistant_mcp,
+            &install_dest_paloma,
         ] {
             let (pruned, freed) = prune_deploy_backups(dest, keep).await;
             pruned_total += pruned.len();

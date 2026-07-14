@@ -1152,13 +1152,30 @@ impl WorkspaceExec {
         // (claudecode) launch the agent with HOME/XDG_CONFIG_HOME pointed at a
         // per-mission dir. Export non-secret pointers to those files so both
         // `gh` and `git` can still find them.
-        let git_creds = self.workspace.resolved_git_credentials.clone().or_else(|| {
-            crate::workspace::git_credentials::GitCredentialConfig::resolve(
+        // Resolve again for every spawned process. Connected GitHub/App tokens
+        // and workspace secrets may rotate while a long-running mission is
+        // alive; retaining only the mission-prep snapshot leaves later Bash or
+        // `gh` subprocesses unauthenticated. Refresh the credential files
+        // silently, then expose only their non-secret paths through env.
+        let git_creds =
+            crate::workspace::git_credentials::GitCredentialConfig::resolve_with_workspace_env(
                 &self.workspace.path,
                 None,
+                &self.workspace.env_vars,
             )
-        });
+            .or_else(|| self.workspace.resolved_git_credentials.clone());
         if let Some(creds) = git_creds {
+            if let Err(error) = creds.write_for_workspace(
+                &self.workspace.path,
+                self.workspace.workspace_type,
+                &self.workspace.env_vars,
+            ) {
+                tracing::debug!(
+                    workspace = %self.workspace.name,
+                    error = %error,
+                    "Could not refresh GitHub credential files before subprocess spawn"
+                );
+            }
             creds.apply_to_env(
                 &mut merged,
                 &self.workspace.path,
