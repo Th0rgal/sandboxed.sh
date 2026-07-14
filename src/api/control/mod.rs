@@ -3609,12 +3609,12 @@ pub async fn upsert_mission_board_tasks(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(id): Path<Uuid>,
-    Json(req): Json<BoardUpsertRequest>,
+    Json(mut req): Json<BoardUpsertRequest>,
 ) -> Result<Json<BoardResponse>, (StatusCode, String)> {
     if req.tasks.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "tasks is required".to_string()));
     }
-    for t in &req.tasks {
+    for t in &mut req.tasks {
         if t.task_key.trim().is_empty() || t.prompt.trim().is_empty() {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -3641,6 +3641,10 @@ pub async fn upsert_mission_board_tasks(
                 ),
             ));
         }
+        t.model_override = t
+            .model_override
+            .as_deref()
+            .and_then(|model| normalize_model_override_for_backend(Some(&t.backend), model));
     }
 
     let control = control_for_user(&state, &user).await;
@@ -5066,6 +5070,17 @@ fn normalize_model_override_for_backend(backend: Option<&str>, raw_model: &str) 
     Some(trimmed.to_string())
 }
 
+fn native_backend_prefix(raw_model: &str) -> Option<&str> {
+    let (prefix, model_id) = raw_model.trim().split_once('/')?;
+    if model_id.trim().is_empty() {
+        return None;
+    }
+    match prefix {
+        "codex" | "claudecode" | "gemini" | "grok" => Some(prefix),
+        _ => None,
+    }
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -5138,6 +5153,30 @@ pub async fn create_mission(
     if let Some(value) = model_effort.as_ref() {
         if value.trim().is_empty() {
             model_effort = None;
+        }
+    }
+
+    // Native harness-qualified model IDs (for example
+    // `codex/gpt-5.6-terra`) carry an unambiguous backend. Hermes and older
+    // orchestrator clients use this compact form. Resolve it before applying
+    // the server default, otherwise the model is incorrectly validated against
+    // that default backend's catalog (commonly Anthropic/Claude Code).
+    if let Some(model) = model_override.as_deref() {
+        if let Some(prefixed_backend) = native_backend_prefix(model) {
+            match backend.as_deref() {
+                None => backend = Some(prefixed_backend.to_string()),
+                Some("opencode") => {}
+                Some(selected) if selected != prefixed_backend => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Model '{}' selects backend '{}', but mission backend is '{}'",
+                            model, prefixed_backend, selected
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
         }
     }
 
@@ -21553,6 +21592,21 @@ And the report:
             normalize_model_override_for_backend(Some("opencode"), "openai/gpt-5.6"),
             Some("openai/gpt-5.6".to_string())
         );
+        assert_eq!(
+            normalize_model_override_for_backend(Some("codex"), "codex/gpt-5.6-terra"),
+            Some("gpt-5.6-terra".to_string())
+        );
+    }
+
+    #[test]
+    fn test_native_backend_prefix_only_accepts_harness_qualifiers() {
+        assert_eq!(native_backend_prefix("codex/gpt-5.6-terra"), Some("codex"));
+        assert_eq!(
+            native_backend_prefix("claudecode/claude-opus-4-7"),
+            Some("claudecode")
+        );
+        assert_eq!(native_backend_prefix("openai/gpt-5.6-terra"), None);
+        assert_eq!(native_backend_prefix("codex/"), None);
     }
 
     #[test]
