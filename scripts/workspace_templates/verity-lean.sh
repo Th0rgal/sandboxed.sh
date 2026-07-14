@@ -7,13 +7,32 @@ set -euo pipefail
 readonly VERITY_REF="538c4a9ce2baa25b56062bdc727eb0191ad9e67f"
 readonly LEAN_LSP_MCP_REF="83b0286574ac46101567f2971c29d55abb2483f9"
 readonly LEAN4_SKILLS_REF="5a331e22c7f9416ef40594e2f076f91306c78b16"
+readonly UV_VERSION="0.11.28"
 readonly ROOT="/workspace/verity"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-  build-essential ca-certificates ccache cmake curl git jq libffi-dev \
+  build-essential ca-certificates ccache cmake curl git gnupg jq libffi-dev \
   libgmp-dev ninja-build pkg-config python3 python3-venv ripgrep zlib1g-dev
+
+if ! command -v gh >/dev/null 2>&1; then
+  install -d -m 0755 /etc/apt/keyrings
+  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  printf '%s\n' \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    > /etc/apt/sources.list.d/github-cli.list
+  apt-get update -qq
+  apt-get install -y --no-install-recommends gh
+fi
+
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
+    | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+fi
+test "$(uv --version | awk '{print $2}')" = "$UV_VERSION"
 
 mkdir -p "$ROOT"/{base,bin,tools,worktrees}
 

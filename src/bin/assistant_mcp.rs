@@ -2409,7 +2409,15 @@ fn scrub_sensitive_json(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
-                if is_sensitive_key(key) {
+                if key.eq_ignore_ascii_case("env_vars") {
+                    if let Value::Object(env_vars) = child {
+                        for env_value in env_vars.values_mut() {
+                            *env_value = Value::String("[redacted]".to_string());
+                        }
+                    } else {
+                        *child = Value::String("[redacted]".to_string());
+                    }
+                } else if is_sensitive_key(key) {
                     *child = Value::String("[redacted]".to_string());
                 } else {
                     scrub_sensitive_json(child);
@@ -2545,7 +2553,12 @@ mod tests {
             "mission": {
                 "title": "Hermes",
                 "api_key": "sk-test",
-                "notes": ["visible", "github_pat_123"]
+                "notes": ["visible", "github_pat_123"],
+                "env_vars": {
+                    "DATABASE_URL": "postgres://user:password@example.test/db",
+                    "AWS_ACCESS_KEY_ID": "not-matched-by-value-heuristics",
+                    "PATH": "/usr/local/bin:/usr/bin"
+                }
             },
             "token": "plain-token"
         });
@@ -2556,6 +2569,12 @@ mod tests {
         assert_eq!(value["mission"]["api_key"], "[redacted]");
         assert_eq!(value["mission"]["notes"][0], "visible");
         assert_eq!(value["mission"]["notes"][1], "[redacted]");
+        assert_eq!(value["mission"]["env_vars"]["DATABASE_URL"], "[redacted]");
+        assert_eq!(
+            value["mission"]["env_vars"]["AWS_ACCESS_KEY_ID"],
+            "[redacted]"
+        );
+        assert_eq!(value["mission"]["env_vars"]["PATH"], "[redacted]");
         assert_eq!(value["token"], "[redacted]");
     }
 

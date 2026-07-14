@@ -826,6 +826,19 @@ fn apply_template_fields(
     template_name: &str,
     template: WorkspaceTemplate,
 ) -> Result<(), (StatusCode, String)> {
+    if template
+        .env_vars
+        .values()
+        .any(|value| value.starts_with("[DECRYPTION_FAILED]"))
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "Template '{template_name}' contains env vars that could not be decrypted; workspace configuration was left unchanged"
+            ),
+        ));
+    }
+
     workspace.template = Some(template_name.to_string());
     workspace.distro = template
         .distro
@@ -2417,5 +2430,42 @@ mod tests {
         assert_eq!(workspace.mcps, vec!["lean-lsp"]);
         assert!(!workspace.mcps_replace_defaults);
         assert_eq!(workspace.config_profile, None);
+    }
+
+    #[test]
+    fn apply_template_fields_rejects_failed_decryption_without_mutating_workspace() {
+        let mut workspace =
+            Workspace::new_container("demo".to_string(), PathBuf::from("/tmp/demo"));
+        workspace.template = Some("working".to_string());
+        workspace.env_vars = HashMap::from([("TOKEN".to_string(), "valid".to_string())]);
+
+        let template = WorkspaceTemplate {
+            name: "broken".to_string(),
+            description: None,
+            path: "workspace-template/broken.json".to_string(),
+            distro: Some("ubuntu-noble".to_string()),
+            skills: Vec::new(),
+            env_vars: HashMap::from([(
+                "TOKEN".to_string(),
+                "[DECRYPTION_FAILED]<encrypted>ciphertext</encrypted>".to_string(),
+            )]),
+            encrypted_keys: vec!["TOKEN".to_string()],
+            init_scripts: Vec::new(),
+            init_script: "echo should-not-run".to_string(),
+            shared_network: None,
+            tailscale_mode: None,
+            mcps: Vec::new(),
+            mcps_replace_defaults: true,
+            config_profile: None,
+        };
+
+        let error = apply_template_fields(&mut workspace, "broken", template).unwrap_err();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(workspace.template.as_deref(), Some("working"));
+        assert_eq!(
+            workspace.env_vars.get("TOKEN").map(String::as_str),
+            Some("valid")
+        );
+        assert!(workspace.init_script.is_none());
     }
 }
