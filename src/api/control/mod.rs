@@ -3354,6 +3354,7 @@ impl ControlHub {
             };
 
         let state = spawn_control_session(
+            self.clone(),
             self.config.clone(),
             Arc::clone(&self.root_agent),
             Arc::clone(&self.mcp),
@@ -3584,7 +3585,7 @@ pub async fn post_message(
                 let _guard = PR_WRITER_CREATE_LOCK.lock().await;
                 if let Some(github_pr) = mission.project.github_pr.as_deref() {
                     if let Some(existing) =
-                        find_existing_pr_writer_global(&state, github_pr, Some(mission.id))
+                        find_existing_pr_writer_global(&state.control, github_pr, Some(mission.id))
                             .await
                             .map_err(internal_error)?
                     {
@@ -5367,6 +5368,15 @@ fn requested_pr_writer(
         || inferred_pr_writer(None, intent, prompt)
 }
 
+fn normalize_mission_tags(tags: Option<&[String]>) -> Option<Vec<String>> {
+    tags.map(|tags| {
+        tags.iter()
+            .map(|tag| tag.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .collect()
+    })
+}
+
 fn status_holds_pr_writer_lease(status: MissionStatus) -> bool {
     matches!(
         status,
@@ -5529,13 +5539,13 @@ fn find_existing_pr_writer_in_sqlite(
 }
 
 async fn find_existing_pr_writer_global(
-    state: &Arc<AppState>,
+    control_hub: &ControlHub,
     github_pr: &str,
     exclude_id: Option<Uuid>,
 ) -> Result<Option<PrWriterLease>, String> {
     // Fail closed if any persisted store cannot be enumerated or read. A
     // partial cross-user scan cannot prove that a branch is writer-free.
-    let inventory = state.control.mission_store_inventory().await?;
+    let inventory = control_hub.mission_store_inventory().await?;
     for store in inventory.live {
         if let Some(mission) = find_existing_pr_writer(&store, github_pr, exclude_id).await? {
             return Ok(Some(mission));
@@ -5564,7 +5574,7 @@ async fn find_existing_pr_writer_global(
 }
 
 async fn ensure_pr_writer_resume_is_exclusive(
-    store: &Arc<dyn MissionStore>,
+    control_hub: &ControlHub,
     mission: &Mission,
 ) -> Result<(), String> {
     if !mission_is_pr_writer(mission) {
@@ -5573,7 +5583,9 @@ async fn ensure_pr_writer_resume_is_exclusive(
     let Some(github_pr) = mission.project.github_pr.as_deref() else {
         return Ok(());
     };
-    if let Some(existing) = find_existing_pr_writer(store, github_pr, Some(mission.id)).await? {
+    if let Some(existing) =
+        find_existing_pr_writer_global(control_hub, github_pr, Some(mission.id)).await?
+    {
         return Err(format!(
             "PR writer lease is already held by mission {} (status={}); cannot resume mission {} as another writer for {}",
             existing.id,
@@ -5586,6 +5598,7 @@ async fn ensure_pr_writer_resume_is_exclusive(
 }
 
 async fn activate_mission_for_message(
+    control_hub: &ControlHub,
     store: &Arc<dyn MissionStore>,
     events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
     mission: &Mission,
@@ -5609,7 +5622,7 @@ async fn activate_mission_for_message(
     if _pr_writer_guard.is_some() {
         if let Some(github_pr) = mission.project.github_pr.as_deref() {
             if let Some(existing) =
-                find_existing_pr_writer(store, github_pr, Some(mission.id)).await?
+                find_existing_pr_writer_global(control_hub, github_pr, Some(mission.id)).await?
             {
                 return Err(format!(
                     "PR writer lease is already held by mission {} (status={}); cannot activate mission {} as another writer for {}",
@@ -5860,9 +5873,10 @@ pub async fn create_mission(
     // Writer creation is checked once before actor creation and again while
     // tagging the returned mission. Never hold this mutex while waiting on the
     // control actor: actor commands also acquire it when resuming writers.
+    let normalized_request_tags = normalize_mission_tags(req.tags.as_deref());
     let request_is_writer = requested_pr_writer(
         req.writer,
-        req.tags.as_deref(),
+        normalized_request_tags.as_deref(),
         req.intent.as_deref(),
         req.prompt.as_deref(),
     );
@@ -5968,7 +5982,7 @@ pub async fn create_mission(
     if request_needs_writer_lease {
         let _guard = PR_WRITER_CREATE_LOCK.lock().await;
         if let Some(github_pr) = req.github_pr.as_deref() {
-            if let Some(existing) = find_existing_pr_writer_global(&state, github_pr, None)
+            if let Some(existing) = find_existing_pr_writer_global(&state.control, github_pr, None)
                 .await
                 .map_err(internal_error)?
             {
@@ -6017,9 +6031,10 @@ pub async fn create_mission(
         None
     };
     if let (Some(github_pr), Some(_guard)) = (req.github_pr.as_deref(), pr_writer_guard.as_ref()) {
-        if let Some(existing) = find_existing_pr_writer_global(&state, github_pr, Some(mission.id))
-            .await
-            .map_err(internal_error)?
+        if let Some(existing) =
+            find_existing_pr_writer_global(&state.control, github_pr, Some(mission.id))
+                .await
+                .map_err(internal_error)?
         {
             let reason = "pr_writer_lease_conflict";
             control
@@ -6063,12 +6078,7 @@ pub async fn create_mission(
     let github_pr = nonblank(&req.github_pr);
     let desired_state = nonblank(&req.desired_state);
     let next_check_at = nonblank(&req.next_check_at);
-    let mut tags: Option<Vec<String>> = req.tags.as_ref().map(|tags| {
-        tags.iter()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect()
-    });
+    let mut tags = normalized_request_tags;
     if req
         .github_pr
         .as_deref()
@@ -7219,7 +7229,7 @@ pub async fn update_mission_project(
     };
     if let (Some(github_pr), Some(_guard)) = (effective_github_pr.as_deref(), writer_guard.as_ref())
     {
-        if let Some(existing) = find_existing_pr_writer_global(&state, github_pr, Some(id))
+        if let Some(existing) = find_existing_pr_writer_global(&state.control, github_pr, Some(id))
             .await
             .map_err(internal_error)?
         {
@@ -10124,6 +10134,7 @@ async fn paloma_webhook_forwarder_loop(
 /// Spawn the global control session actor.
 #[allow(clippy::too_many_arguments)]
 fn spawn_control_session(
+    control_hub: ControlHub,
     config: Config,
     root_agent: AgentRef,
     mcp: Arc<McpRegistry>,
@@ -10249,6 +10260,7 @@ fn spawn_control_session(
 
     // Spawn the main control actor
     tokio::spawn(control_actor_loop(
+        control_hub,
         config.clone(),
         root_agent,
         mcp,
@@ -12288,6 +12300,7 @@ async fn agent_finished_automation_messages(
     clippy::collapsible_else_if
 )]
 async fn control_actor_loop(
+    control_hub: ControlHub,
     config: Config,
     root_agent: AgentRef,
     mcp: Arc<McpRegistry>,
@@ -12957,6 +12970,7 @@ async fn control_actor_loop(
                                                 continue;
                                             }
                                             if let Err(error) = activate_mission_for_message(
+                                                &control_hub,
                                                 &mission_store,
                                                 &events_tx,
                                                 &mission,
@@ -13086,6 +13100,7 @@ async fn control_actor_loop(
                                             );
                                         }
                                         if let Err(error) = activate_mission_for_message(
+                                            &control_hub,
                                             &mission_store,
                                             &events_tx,
                                             &mission,
@@ -13128,6 +13143,7 @@ async fn control_actor_loop(
                                                 history.push((entry.role.clone(), entry.content.clone()));
                                             }
                                             if let Err(error) = activate_mission_for_message(
+                                                &control_hub,
                                                 &mission_store,
                                                 &events_tx,
                                                 &mission,
@@ -13165,6 +13181,7 @@ async fn control_actor_loop(
                                                 );
                                             }
                                             if let Err(error) = activate_mission_for_message(
+                                                &control_hub,
                                                 &mission_store,
                                                 &events_tx,
                                                 &mission,
@@ -13285,6 +13302,7 @@ async fn control_actor_loop(
                                     match mission_store.get_mission(mid).await {
                                         Ok(Some(mission)) => {
                                             if let Err(error) = activate_mission_for_message(
+                                                &control_hub,
                                                 &mission_store,
                                                 &events_tx,
                                                 &mission,
@@ -14122,7 +14140,7 @@ async fn control_actor_loop(
                         .await {
                             Ok((mission, resume_prompt)) => {
                                 if let Err(error) = ensure_pr_writer_resume_is_exclusive(
-                                    &mission_store,
+                                    &control_hub,
                                     &mission,
                                 )
                                 .await
@@ -19569,6 +19587,15 @@ mod tests {
             Some(false),
             Some(&["pr-writer".to_string()]),
             Some("integration_repair"),
+            None
+        ));
+        let normalized =
+            normalize_mission_tags(Some(&[" pr-writer ".to_string(), " ".to_string()])).unwrap();
+        assert_eq!(normalized, ["pr-writer"]);
+        assert!(requested_pr_writer(
+            None,
+            Some(&normalized),
+            Some("read_only_audit"),
             None
         ));
     }
