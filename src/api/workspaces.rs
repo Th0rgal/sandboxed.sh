@@ -1341,17 +1341,7 @@ async fn exec_workspace_command(
     let timeout_secs = req.timeout_secs.unwrap_or(300).clamp(1, 600);
 
     // Determine working directory
-    let cwd = match &req.cwd {
-        Some(path) => {
-            let path = Path::new(path);
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                workspace.path.join(path)
-            }
-        }
-        None => workspace.path.clone(),
-    };
+    let cwd = resolve_workspace_exec_cwd(&workspace, req.cwd.as_deref())?;
 
     // `timeout(1)` enforces the limit inside the workspace: TERM at expiry,
     // escalating to KILL 5s later (`-k`) so TERM-ignoring commands still die
@@ -1399,6 +1389,47 @@ async fn exec_workspace_command(
             timed_out: true,
         })),
     }
+}
+
+fn resolve_workspace_exec_cwd(
+    workspace: &Workspace,
+    requested: Option<&str>,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let Some(requested) = requested else {
+        return Ok(workspace.path.clone());
+    };
+    let requested = Path::new(requested);
+
+    if workspace.workspace_type != WorkspaceType::Container {
+        return Ok(if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            workspace.path.join(requested)
+        });
+    }
+
+    // WorkspaceExec accepts host paths and translates them back into guest
+    // paths. Hermes/users naturally supply guest-absolute paths such as
+    // `/workspace/verity/base`; map those under the container root first.
+    let resolved = if requested.is_absolute() {
+        if requested.starts_with(&workspace.path) {
+            requested.to_path_buf()
+        } else {
+            workspace
+                .path
+                .join(requested.strip_prefix("/").unwrap_or(requested))
+        }
+    } else {
+        workspace.path.join(requested)
+    };
+
+    if !path_within(&workspace.path, &resolved) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Working directory must remain inside the workspace".to_string(),
+        ));
+    }
+    Ok(resolved)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2467,5 +2498,39 @@ mod tests {
             Some("valid")
         );
         assert!(workspace.init_script.is_none());
+    }
+
+    #[test]
+    fn container_exec_cwd_maps_guest_absolute_path_under_workspace_root() {
+        let root = TempDir::new().unwrap();
+        let workspace = Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+
+        let cwd = resolve_workspace_exec_cwd(&workspace, Some("/workspace/verity/base"))
+            .expect("guest path should map into the container root");
+
+        assert_eq!(cwd, root.path().join("workspace/verity/base"));
+    }
+
+    #[test]
+    fn container_exec_cwd_accepts_host_path_inside_workspace() {
+        let root = TempDir::new().unwrap();
+        let workspace = Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+        let host_path = root.path().join("workspace/verity/base");
+
+        let cwd = resolve_workspace_exec_cwd(&workspace, host_path.to_str())
+            .expect("host path inside the workspace should remain unchanged");
+
+        assert_eq!(cwd, host_path);
+    }
+
+    #[test]
+    fn container_exec_cwd_rejects_relative_escape() {
+        let root = TempDir::new().unwrap();
+        let workspace = Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+
+        let error = resolve_workspace_exec_cwd(&workspace, Some("../../etc"))
+            .expect_err("relative traversal must not leave the workspace");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 }
