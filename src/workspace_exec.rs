@@ -757,6 +757,45 @@ mod tests {
     }
 
     #[test]
+    fn tailnet_only_bootstrap_clears_configured_exit_node() {
+        let command = WorkspaceExec::build_tailscale_bootstrap_command(
+            "/root",
+            "/bin/true",
+            &[],
+            &HashMap::from([
+                ("TS_AUTHKEY".to_string(), "secret".to_string()),
+                ("TS_EXIT_NODE".to_string(), "100.64.0.1".to_string()),
+            ]),
+            true,
+            true,
+        );
+
+        let clear_env = command
+            .find("export TS_EXIT_NODE='';")
+            .expect("tailnet-only mode must clear TS_EXIT_NODE before bootstrap");
+        let bootstrap = command
+            .find("/usr/local/bin/sandboxed-tailscale-up")
+            .expect("bootstrap command should be present");
+        assert!(clear_env < bootstrap);
+        assert!(command.contains("tailscale set --exit-node="));
+    }
+
+    #[test]
+    fn exit_node_bootstrap_preserves_configured_exit_node() {
+        let command = WorkspaceExec::build_tailscale_bootstrap_command(
+            "/root",
+            "/bin/true",
+            &[],
+            &HashMap::from([("TS_EXIT_NODE".to_string(), "100.64.0.1".to_string())]),
+            true,
+            false,
+        );
+
+        assert!(!command.contains("export TS_EXIT_NODE='';"));
+        assert!(!command.contains("tailscale set --exit-node="));
+    }
+
+    #[test]
     fn resolv_conf_bind_disables_nspawn_resolver_initialization() {
         assert_eq!(
             resolv_conf_bind_args(Path::new("/tmp/sandboxed-resolv.conf")),
@@ -1310,6 +1349,15 @@ impl WorkspaceExec {
             }
         }
 
+        // Tailnet-only workspaces may still carry TS_EXIT_NODE because the
+        // same template is also used for exit-node mode. Do not let the
+        // bootstrap enable policy routing through that node: replacing only
+        // the main-table default route afterwards does not undo Tailscale's
+        // policy rules and can leave DNS/public HTTPS unreachable.
+        if tailnet_only {
+            cmd.push_str("export TS_EXIT_NODE=''; ");
+        }
+
         // Run the Tailscale bootstrap script if it exists.
         // The script calls sandboxed-network-up (DHCP via udhcpc, which sets up
         // the IP, default route, and DNS), then starts tailscaled and authenticates.
@@ -1325,7 +1373,10 @@ impl WorkspaceExec {
             // regular internet traffic through the host gateway (not exit node).
             // This ensures the container can reach both tailnet devices AND the internet.
             cmd.push_str(
-                "_oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
+                "if command -v tailscale >/dev/null 2>&1; then \
+                 tailscale set --exit-node= >/dev/null 2>&1 || true; \
+                 fi; \
+                 _oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
                  _oa_gw=\"${_oa_ip%.*}.1\"; \
                  if [ -n \"$_oa_ip\" ]; then \
                    ip route del default 2>/dev/null || true; \

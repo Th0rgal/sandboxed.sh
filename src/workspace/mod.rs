@@ -763,6 +763,100 @@ pub fn task_workspace_dir_for_root(root: &Path, task_id: Uuid) -> PathBuf {
     workspaces_root_for(root).join(format!("task-{}", short_id))
 }
 
+fn mcp_launcher_shell_escape(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_mcp_env_launcher(
+    config: &McpServerConfig,
+    workspace_dir: &Path,
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    container_fallback: bool,
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> anyhow::Result<String> {
+    let launcher_dir = workspace_dir.join(".sandboxed-sh").join("mcp-launchers");
+    std::fs::create_dir_all(&launcher_dir)?;
+    let sanitized_name = sanitize_key(&config.name);
+    let launcher_name = format!(
+        "{}.sh",
+        if sanitized_name.is_empty() {
+            "mcp"
+        } else {
+            &sanitized_name
+        }
+    );
+    let launcher_host_path = launcher_dir.join(launcher_name);
+
+    let mut script = String::from(
+        "#!/bin/bash\n\
+         while IFS='=' read -r _oa_key _oa_value; do\n\
+           [[ $_oa_key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && unset \"$_oa_key\" || true\n\
+         done < <(/usr/bin/env)\n\
+         unset _oa_key _oa_value\n",
+    );
+    let mut env_pairs: Vec<_> = env
+        .iter()
+        .filter(|(key, _)| {
+            let mut chars = key.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .collect();
+    env_pairs.sort_by_key(|(key, _)| *key);
+    for (key, value) in env_pairs {
+        script.push_str("export ");
+        script.push_str(key);
+        script.push('=');
+        script.push_str(&mcp_launcher_shell_escape(value));
+        script.push('\n');
+    }
+    script.push_str("exec ");
+    script.push_str(&mcp_launcher_shell_escape(command));
+    for arg in args {
+        script.push(' ');
+        script.push_str(&mcp_launcher_shell_escape(arg));
+    }
+    script.push('\n');
+
+    let temp_path = launcher_host_path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let write_result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o700);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(script.as_bytes())?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        }
+        std::fs::rename(&temp_path, &launcher_host_path)
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result?;
+
+    if workspace_type == WorkspaceType::Container && !container_fallback {
+        let relative = launcher_host_path
+            .strip_prefix(workspace_root)
+            .map_err(|_| anyhow::anyhow!("MCP launcher is outside the container workspace"))?;
+        Ok(format!("/{}", relative.to_string_lossy()))
+    } else {
+        Ok(launcher_host_path.to_string_lossy().to_string())
+    }
+}
+
 fn opencode_entry_from_mcp(
     config: &McpServerConfig,
     workspace_dir: &Path,
@@ -770,7 +864,7 @@ fn opencode_entry_from_mcp(
     workspace_type: WorkspaceType,
     workspace_env: &HashMap<String, String>,
     shared_network: Option<bool>,
-) -> serde_json::Value {
+) -> anyhow::Result<serde_json::Value> {
     fn allowed_workspace_env(
         config: &McpServerConfig,
         workspace_env: &HashMap<String, String>,
@@ -884,7 +978,7 @@ fn opencode_entry_from_mcp(
             if !headers.is_empty() {
                 entry.insert("headers".to_string(), json!(headers));
             }
-            json!(entry)
+            Ok(json!(entry))
         }
         McpTransport::Stdio { command, args, env } => {
             let mut entry = serde_json::Map::new();
@@ -960,6 +1054,41 @@ fn opencode_entry_from_mcp(
                 && !per_workspace_runner
                 && nspawn::nspawn_available();
 
+            if workspace_type == WorkspaceType::Container && !container_fallback {
+                let relative = workspace_dir
+                    .strip_prefix(workspace_root)
+                    .unwrap_or_else(|_| Path::new(""));
+                let guest_dir = if relative.as_os_str().is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/{}", relative.to_string_lossy())
+                };
+                merged_env.insert("SANDBOXED_SH_WORKSPACE".to_string(), guest_dir.clone());
+                merged_env.insert("SANDBOXED_SH_WORKSPACE_ROOT".to_string(), "/".to_string());
+                merged_env.insert("WORKING_DIR".to_string(), guest_dir.clone());
+                merged_env.insert("HOME".to_string(), guest_dir);
+            }
+
+            let resolved_command = match workspace_type {
+                WorkspaceType::Container => resolve_container_command_path(
+                    command,
+                    workspace_root,
+                    container_fallback,
+                    per_workspace_runner || use_nspawn,
+                ),
+                WorkspaceType::Host => resolve_host_command_path(command),
+            };
+            let launcher = write_mcp_env_launcher(
+                config,
+                workspace_dir,
+                workspace_root,
+                workspace_type,
+                container_fallback,
+                &resolved_command,
+                args,
+                &merged_env,
+            )?;
+
             if use_nspawn {
                 let rel = workspace_dir
                     .strip_prefix(workspace_root)
@@ -969,12 +1098,6 @@ fn opencode_entry_from_mcp(
                 } else {
                     format!("/{}", rel.to_string_lossy())
                 };
-
-                let mut nspawn_env = merged_env.clone();
-                nspawn_env.insert("SANDBOXED_SH_WORKSPACE".to_string(), rel_str.clone());
-                nspawn_env.insert("SANDBOXED_SH_WORKSPACE_ROOT".to_string(), "/".to_string());
-                nspawn_env.insert("WORKING_DIR".to_string(), rel_str.clone());
-                nspawn_env.insert("HOME".to_string(), rel_str.clone());
 
                 let mut cmd = vec![
                     resolve_host_command_path("systemd-nspawn"),
@@ -1016,14 +1139,6 @@ fn opencode_entry_from_mcp(
                         "--bind={}:/root/context",
                         global_context_root.display()
                     ));
-                    nspawn_env.insert(
-                        "SANDBOXED_SH_CONTEXT_ROOT".to_string(),
-                        "/root/context".to_string(),
-                    );
-                    nspawn_env.insert(
-                        "SANDBOXED_SH_CONTEXT_DIR_NAME".to_string(),
-                        context_dir_name,
-                    );
                 }
 
                 // Network configuration based on shared_network setting:
@@ -1046,72 +1161,17 @@ fn opencode_entry_from_mcp(
                         cmd.extend(tailscale_args);
                     }
                 }
-                for (key, value) in &nspawn_env {
-                    cmd.push(format!("--setenv={}={}", key, value));
-                }
-                cmd.push(command.clone());
-                cmd.extend(args.clone());
+                cmd.push(launcher);
                 entry.insert("command".to_string(), json!(cmd));
             } else {
-                // When per_workspace_runner is true and workspace is a container,
-                // the harness (Claude Code / OpenCode) runs inside the container
-                // and spawns MCP servers as subprocesses. Env vars must use
-                // container-relative paths, not host paths.
-                if workspace_type == WorkspaceType::Container
-                    && per_workspace_runner
-                    && !container_fallback
-                {
-                    let rel = workspace_dir
-                        .strip_prefix(workspace_root)
-                        .unwrap_or_else(|_| Path::new(""));
-                    let rel_str = if rel.as_os_str().is_empty() {
-                        "/".to_string()
-                    } else {
-                        format!("/{}", rel.to_string_lossy())
-                    };
-                    merged_env.insert("SANDBOXED_SH_WORKSPACE".to_string(), rel_str.clone());
-                    merged_env.insert("SANDBOXED_SH_WORKSPACE_ROOT".to_string(), "/".to_string());
-                    merged_env.insert("WORKING_DIR".to_string(), rel_str.clone());
-                    merged_env.insert("HOME".to_string(), rel_str);
-                }
-
-                let resolved_command = match workspace_type {
-                    WorkspaceType::Container => resolve_container_command_path(
-                        command,
-                        workspace_root,
-                        container_fallback,
-                        per_workspace_runner,
-                    ),
-                    WorkspaceType::Host => resolve_host_command_path(command),
-                };
-                // Harness CLIs normally spawn MCPs as child processes, which
-                // would otherwise inherit every workspace credential even if
-                // the generated config omitted it. `env -i` makes the
-                // allowlist an actual process boundary rather than cosmetic
-                // config filtering.
-                let env_command = match workspace_type {
-                    WorkspaceType::Container => resolve_container_command_path(
-                        "env",
-                        workspace_root,
-                        container_fallback,
-                        per_workspace_runner,
-                    ),
-                    WorkspaceType::Host => resolve_host_command_path("env"),
-                };
-                let mut cmd = vec![env_command, "-i".to_string()];
-                let mut env_pairs: Vec<_> = merged_env.iter().collect();
-                env_pairs.sort_by_key(|(key, _)| *key);
-                cmd.extend(
-                    env_pairs
-                        .into_iter()
-                        .map(|(key, value)| format!("{}={}", key, value)),
-                );
-                cmd.push(resolved_command);
-                cmd.extend(args.clone());
-                entry.insert("command".to_string(), json!(cmd));
+                // The launcher clears the inherited harness environment and
+                // restores only the allowlisted variables internally. Secret
+                // values live in a mode-0700 file, never in generated config
+                // or process argv (`ps` and /proc/*/cmdline).
+                entry.insert("command".to_string(), json!([launcher]));
             }
             entry.insert("enabled".to_string(), json!(config.enabled));
-            serde_json::Value::Object(entry)
+            Ok(serde_json::Value::Object(entry))
         }
     }
 }
