@@ -11,6 +11,8 @@
 #   REMOTE_BUILD_URL         host endpoint, e.g. http://10.88.0.1:3000/api/remote-build
 #   REMOTE_BUILD_TOKEN       per-mission capability token
 #   REMOTE_BUILD_MISSION_ID  mission UUID
+#   REMOTE_BUILD_NODE_ID     explicit runner id or "auto" (default)
+#   REMOTE_BUILD_REQUIREMENTS JSON array of runner labels (default: ["lean"])
 #
 # Exit codes:
 #   remote build's exit code on success/failure of the build itself
@@ -59,6 +61,19 @@ if cwd_rel:
 timeout = os.environ.get("REMOTE_BUILD_TIMEOUT_SECS")
 if timeout:
     req["timeout_secs"] = int(timeout)
+node_id = os.environ.get("REMOTE_BUILD_NODE_ID", "auto").strip()
+if node_id:
+    req["node_id"] = node_id
+requirements_raw = os.environ.get("REMOTE_BUILD_REQUIREMENTS", '["lean"]')
+try:
+    requirements = json.loads(requirements_raw)
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"REMOTE_BUILD_REQUIREMENTS is not valid JSON: {exc}")
+if not isinstance(requirements, list) or not all(
+    isinstance(item, str) and item.strip() for item in requirements
+):
+    raise SystemExit("REMOTE_BUILD_REQUIREMENTS must be a JSON array of non-empty strings")
+req["requirements"] = requirements
 print(json.dumps(req))
 PY
 )" || die "failed to encode request"
