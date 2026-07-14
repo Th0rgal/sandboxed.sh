@@ -3441,9 +3441,11 @@ impl ControlHub {
                 }
                 offline_sqlite.push(entry.path());
             } else if let Some(user) = stem.strip_suffix(".json") {
-                if live_users.contains(user) {
-                    continue;
-                }
+                // A live user can be backed by SQLite while a second process
+                // or an interrupted migration still owns missions in the
+                // legacy file store. Scanning it twice when the live store is
+                // itself file-backed is harmless; skipping it can miss a
+                // writer lease.
                 offline_file_users.push(user.to_string());
             }
         }
@@ -5498,9 +5500,10 @@ async fn find_existing_pr_writer(
                 // durable deferred goal until dispatch. Treat that prompt as
                 // capability evidence before declaring this lease read-only.
                 if let Some(goal) = store.get_deferred_goal(mission.id).await? {
-                    if mission_is_pr_writer_with_prompt(&full, Some(&goal))
-                        || message_requests_pr_writer(&full, &goal)
-                    {
+                    // This is the mission's initial mandate, not a later
+                    // steering message. Explicit `pr-readonly` must therefore
+                    // continue to win over inferred write verbs in the goal.
+                    if mission_is_pr_writer_with_prompt(&full, Some(&goal)) {
                         return Ok(Some(pr_writer_lease(&full)));
                     }
                 }
@@ -19799,7 +19802,7 @@ pub async fn telegram_webhook_receiver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::mission_store::MissionMode;
+    use crate::api::mission_store::{MissionMode, MissionProjectPatch};
     use std::sync::Arc;
 
     static METADATA_REFRESH_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
@@ -19891,6 +19894,44 @@ mod tests {
             Some(&normalized),
             Some("read_only_audit"),
             None
+        ));
+    }
+
+    #[tokio::test]
+    async fn readonly_initial_goal_does_not_lease_but_followup_can_escalate() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(
+                Some("Read-only PR audit"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .update_mission_project(
+                mission.id,
+                MissionProjectPatch {
+                    github_pr: Some(Some("owner/repo#42".to_string())),
+                    tags: Some(vec!["pr-readonly".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mission = store.get_mission(mission.id).await.unwrap().unwrap();
+
+        assert!(!mission_is_pr_writer_with_prompt(
+            &mission,
+            Some("Fix and update the PR after review")
+        ));
+        assert!(message_requests_pr_writer(
+            &mission,
+            "Fix and update the PR after review"
         ));
     }
 
