@@ -5263,15 +5263,18 @@ fn status_holds_pr_writer_lease(status: MissionStatus) -> bool {
 }
 
 fn mission_is_pr_writer(mission: &Mission) -> bool {
+    mission_is_pr_writer_with_prompt(
+        mission,
+        mission.history.first().map(|entry| entry.content.as_str()),
+    )
+}
+
+fn mission_is_pr_writer_with_prompt(mission: &Mission, prompt: Option<&str>) -> bool {
     if mission.project.tags.iter().any(|tag| tag == "pr-readonly") {
         return false;
     }
     mission.project.tags.iter().any(|tag| tag == "pr-writer")
-        || inferred_pr_writer(
-            None,
-            mission.project.intent.as_deref(),
-            mission.history.first().map(|entry| entry.content.as_str()),
-        )
+        || inferred_pr_writer(None, mission.project.intent.as_deref(), prompt)
 }
 
 async fn find_existing_pr_writer(
@@ -5304,6 +5307,14 @@ async fn find_existing_pr_writer(
             if let Some(full) = store.get_mission(mission.id).await? {
                 if mission_is_pr_writer(&full) {
                     return Ok(Some(full));
+                }
+                // Scheduled missions can carry their only prompt in the
+                // durable deferred goal until dispatch. Treat that prompt as
+                // capability evidence before declaring this lease read-only.
+                if let Some(goal) = store.get_deferred_goal(mission.id).await? {
+                    if mission_is_pr_writer_with_prompt(&full, Some(&goal)) {
+                        return Ok(Some(full));
+                    }
                 }
             }
         }
@@ -5579,23 +5590,19 @@ pub async fn create_mission(
         ));
     }
 
-    // Serialize create+metadata so two controllers cannot race through the
-    // preflight and create concurrent writers for the same PR.
+    // Writer creation is checked once before actor creation and again while
+    // tagging the returned mission. Never hold this mutex while waiting on the
+    // control actor: actor commands also acquire it when resuming writers.
     let request_is_writer = requested_pr_writer(
         req.writer,
         req.tags.as_deref(),
         req.intent.as_deref(),
         req.prompt.as_deref(),
     );
-    let pr_writer_guard = if req
+    let request_needs_writer_lease = req
         .github_pr
         .as_deref()
-        .is_some_and(|github_pr| !github_pr.trim().is_empty() && request_is_writer)
-    {
-        Some(PR_WRITER_CREATE_LOCK.lock().await)
-    } else {
-        None
-    };
+        .is_some_and(|github_pr| !github_pr.trim().is_empty() && request_is_writer);
 
     // Validate the remote-node payload before persisting the mission so a
     // bad request cannot leave an orphaned pending mission behind.
@@ -5691,20 +5698,23 @@ pub async fn create_mission(
     }
 
     let control = control_for_user(&state, &user).await;
-    if let (Some(github_pr), Some(_guard)) = (req.github_pr.as_deref(), pr_writer_guard.as_ref()) {
-        if let Some(existing) = find_existing_pr_writer(&control.mission_store, github_pr, None)
-            .await
-            .map_err(internal_error)?
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                format!(
-                    "PR writer lease is already held by mission {} (status={}); acknowledge, interrupt, or complete it before creating another writer for {}",
-                    existing.id,
-                    existing.status,
-                    canonical_github_pr(github_pr)
-                ),
-            ));
+    if request_needs_writer_lease {
+        let _guard = PR_WRITER_CREATE_LOCK.lock().await;
+        if let Some(github_pr) = req.github_pr.as_deref() {
+            if let Some(existing) = find_existing_pr_writer(&control.mission_store, github_pr, None)
+                .await
+                .map_err(internal_error)?
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "PR writer lease is already held by mission {} (status={}); acknowledge, interrupt, or complete it before creating another writer for {}",
+                        existing.id,
+                        existing.status,
+                        canonical_github_pr(github_pr)
+                    ),
+                ));
+            }
         }
     }
     control
@@ -5730,6 +5740,48 @@ pub async fn create_mission(
         .map_err(session_unavailable)?;
 
     let mut mission = rx.await.map_err(recv_failed)?.map_err(internal_error)?;
+
+    // Close the preflight-to-create race under the store-only mutex. Exactly
+    // one concurrent creator wins; a loser is durably interrupted before it
+    // can receive a goal or become a writer.
+    let pr_writer_guard = if request_needs_writer_lease {
+        Some(PR_WRITER_CREATE_LOCK.lock().await)
+    } else {
+        None
+    };
+    if let (Some(github_pr), Some(_guard)) = (req.github_pr.as_deref(), pr_writer_guard.as_ref()) {
+        if let Some(existing) =
+            find_existing_pr_writer(&control.mission_store, github_pr, Some(mission.id))
+                .await
+                .map_err(internal_error)?
+        {
+            let reason = "pr_writer_lease_conflict";
+            control
+                .mission_store
+                .update_mission_status_with_reason(
+                    mission.id,
+                    MissionStatus::Interrupted,
+                    Some(reason),
+                )
+                .await
+                .map_err(internal_error)?;
+            let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                mission_id: mission.id,
+                status: MissionStatus::Interrupted,
+                summary: Some(reason.to_string()),
+            });
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "PR writer lease is already held by mission {} (status={}); interrupted duplicate mission {} for {}",
+                    existing.id,
+                    existing.status,
+                    mission.id,
+                    canonical_github_pr(github_pr)
+                ),
+            ));
+        }
+    }
 
     // Apply project tagging metadata if provided at creation time. Empty/blank
     // strings are treated as unset; tags are trimmed and empties dropped.
@@ -5806,6 +5858,7 @@ pub async fn create_mission(
             mission.project.tags = v;
         }
     }
+    drop(pr_writer_guard);
 
     // Atomic create+start: stash the initial prompt as the deferred goal. The
     // FLEET-001 scheduler pass (every ~5s) dispatches pending missions with a
