@@ -546,6 +546,47 @@ pub struct SweepParams {
     pub dry_run: bool,
 }
 
+/// Convert systemd exec units into the exact workspace/mission pairs they
+/// protect. Malformed or legacy units without a mission tag cannot authorize
+/// removal and are ignored here; the scope reaper owns their separate policy.
+fn protected_exec_scopes<'a>(
+    units: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashSet<(String, String)> {
+    units
+        .into_iter()
+        .filter_map(|unit| {
+            Some((
+                crate::workspace_exec::machine_name_from_exec_unit(unit)?,
+                crate::workspace_exec::mission_short_id_from_exec_unit(unit)?,
+            ))
+        })
+        .collect()
+}
+
+/// Whether a live exec scope protects one mission directory. This guard runs
+/// before phase 1 can propose or remove the directory.
+#[derive(Debug, PartialEq, Eq)]
+enum MissionDirectoryCandidate {
+    RetainLiveScope,
+    Eligible,
+}
+
+fn mission_directory_candidate(
+    scope_protected: &std::collections::HashSet<(String, String)>,
+    workspace_path: &std::path::Path,
+    mission_id: uuid::Uuid,
+) -> MissionDirectoryCandidate {
+    let Some(workspace_token) = crate::workspace_exec::machine_name_for_path(workspace_path) else {
+        return MissionDirectoryCandidate::Eligible;
+    };
+    let mission_short = mission_id.simple().to_string()[..8].to_string();
+    if scope_protected.contains(&(workspace_token, mission_short)) {
+        MissionDirectoryCandidate::RetainLiveScope
+    } else {
+        MissionDirectoryCandidate::Eligible
+    }
+}
+
 /// One full pass. Phase 1 is DB-driven (mission → its recorded workspace →
 /// dir). Phase 2 is disk-driven (every `mission-*` dir under every known
 /// workspace root, reconciled against the mission index) — it catches what
@@ -556,6 +597,15 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
     let cutoff = params.cutoff;
     let mut report = SweepReport::default();
     let mut dry_run_candidates = std::collections::HashSet::new();
+    // Snapshot live exec scopes before considering *any* mission directory.
+    // A scope may have a process holding cwd/fds in the directory, so it wins
+    // over terminal status in both dry-run and execution mode.
+    let scope_protected = protected_exec_scopes(
+        super::scope_reaper::list_exec_scope_units()
+            .await
+            .iter()
+            .map(String::as_str),
+    );
     let sessions = state.control.all_sessions().await;
     for session in sessions {
         let store = session.mission_store.clone();
@@ -600,6 +650,17 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
                 };
                 let dir = workspace::mission_workspace_dir_for_root(&ws.path, mission.id);
                 if !dir.exists() {
+                    continue;
+                }
+                if mission_directory_candidate(&scope_protected, &ws.path, mission.id)
+                    == MissionDirectoryCandidate::RetainLiveScope
+                {
+                    tracing::debug!(
+                        mission_id = %mission.id,
+                        workspace_id = %workspace_id,
+                        path = %dir.display(),
+                        "mission GC: kept (live exec scope)",
+                    );
                     continue;
                 }
                 let size = directory_size_bytes(&dir).await;
@@ -647,7 +708,14 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
         }
     }
 
-    orphan_sweep(state, params, &dry_run_candidates, &mut report).await;
+    orphan_sweep(
+        state,
+        params,
+        &dry_run_candidates,
+        &scope_protected,
+        &mut report,
+    )
+    .await;
 
     report
 }
@@ -659,23 +727,11 @@ async fn orphan_sweep(
     state: &Arc<AppState>,
     params: &SweepParams,
     dry_run_candidates: &std::collections::HashSet<std::path::PathBuf>,
+    scope_protected: &std::collections::HashSet<(String, String)>,
     report: &mut SweepReport,
 ) {
     let index_full = build_mission_index(state).await;
     let index = &index_full.by_short;
-    // Any dir whose short id is referenced by a live exec scope is kept
-    // unconditionally: a process may hold cwd/fds there.
-    let scope_protected: std::collections::HashSet<(String, String)> =
-        super::scope_reaper::list_exec_scope_units()
-            .await
-            .iter()
-            .filter_map(|unit| {
-                Some((
-                    crate::workspace_exec::machine_name_from_exec_unit(unit)?,
-                    crate::workspace_exec::mission_short_id_from_exec_unit(unit)?,
-                ))
-            })
-            .collect();
 
     for ws in state.workspaces.list().await {
         let root = workspace::workspaces_root_for(&ws.path);
@@ -909,6 +965,23 @@ mod tests {
         assert_eq!(
             entry_for_workspace(&entries, workspace_id).unwrap().status,
             MissionStatus::Active
+        );
+    }
+
+    #[test]
+    fn live_exec_scope_prevents_terminal_old_dir_from_becoming_a_gc_candidate() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mission_id = uuid::Uuid::parse_str("deadbeef-0000-0000-0000-000000000000").unwrap();
+        let machine = crate::workspace_exec::machine_name_for_path(workspace.path()).unwrap();
+        let scope = format!("sandboxed-exec-{machine}-mdeadbeef-12345678.scope");
+        let protected = protected_exec_scopes([scope.as_str()]);
+
+        // Phase 1 reaches this decision only after terminal status and age
+        // checks. Retaining here happens before either dry-run proposal or
+        // remove_dir_all, so neither mode can act on this directory.
+        assert_eq!(
+            mission_directory_candidate(&protected, workspace.path(), mission_id),
+            MissionDirectoryCandidate::RetainLiveScope
         );
     }
 
