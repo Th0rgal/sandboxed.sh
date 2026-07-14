@@ -5091,6 +5091,40 @@ fn native_backend_agent(raw_agent: &str) -> Option<&'static str> {
     }
 }
 
+/// Consume native harness names used through the legacy `agent` field.
+///
+/// These values select a backend; they are not library/sub-agent names and
+/// must not reach the native CLI (Claude Code would otherwise receive e.g.
+/// `--agent claudecode`). OpenCode remains the exception because it can have a
+/// real library agent named `codex`.
+fn apply_native_backend_agent_selector(
+    agent: &mut Option<String>,
+    backend: &mut Option<String>,
+) -> Result<(), String> {
+    let Some(agent_backend) = agent.as_deref().and_then(native_backend_agent) else {
+        return Ok(());
+    };
+
+    match backend.as_deref() {
+        None => {
+            *backend = Some(agent_backend.to_string());
+            *agent = None;
+        }
+        Some("opencode") => {}
+        Some(selected) if selected != agent_backend => {
+            return Err(format!(
+                "Agent '{}' selects backend '{}', but mission backend is '{}'",
+                agent.as_deref().unwrap_or_default(),
+                agent_backend,
+                selected
+            ));
+        }
+        Some(_) => *agent = None,
+    }
+
+    Ok(())
+}
+
 fn is_fable_model(model: Option<&str>) -> bool {
     model
         .map(str::to_ascii_lowercase)
@@ -5187,7 +5221,7 @@ pub async fn create_mission(
 
     let title = req.title.clone();
     let workspace_id = req.workspace_id;
-    let agent = req.agent.clone();
+    let mut agent = req.agent.clone();
     let config_profile = req.config_profile.clone();
     let mut backend = req.backend.clone();
     let mut model_override = req.model_override.clone();
@@ -5212,24 +5246,8 @@ pub async fn create_mission(
     // while leaving `backend` unset. Treat native harness agent names as an
     // unambiguous backend hint before applying the server default. Library
     // agent names such as `build` or `plan` remain independent of the backend.
-    if let Some(agent_backend) = agent.as_deref().and_then(native_backend_agent) {
-        match backend.as_deref() {
-            None => backend = Some(agent_backend.to_string()),
-            // OpenCode may legitimately have a library agent named `codex`.
-            Some("opencode") => {}
-            Some(selected) if selected != agent_backend => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "Agent '{}' selects backend '{}', but mission backend is '{}'",
-                        agent.as_deref().unwrap_or_default(),
-                        agent_backend,
-                        selected
-                    ),
-                ));
-            }
-            Some(_) => {}
-        }
+    if let Err(error) = apply_native_backend_agent_selector(&mut agent, &mut backend) {
+        return Err((StatusCode::BAD_REQUEST, error));
     }
 
     // Native harness-qualified model IDs (for example
@@ -21726,6 +21744,38 @@ And the report:
         assert_eq!(native_backend_agent("build"), None);
         assert_eq!(native_backend_agent("plan"), None);
         assert_eq!(native_backend_agent("opencode"), None);
+    }
+
+    #[test]
+    fn native_backend_agent_selector_is_consumed_for_native_harnesses() {
+        let mut agent = Some("ClaudeCode".to_string());
+        let mut backend = None;
+        apply_native_backend_agent_selector(&mut agent, &mut backend).unwrap();
+        assert_eq!(backend.as_deref(), Some("claudecode"));
+        assert_eq!(agent, None);
+
+        let mut agent = Some("codex".to_string());
+        let mut backend = Some("codex".to_string());
+        apply_native_backend_agent_selector(&mut agent, &mut backend).unwrap();
+        assert_eq!(agent, None);
+    }
+
+    #[test]
+    fn native_backend_agent_selector_preserves_real_opencode_agent() {
+        let mut agent = Some("codex".to_string());
+        let mut backend = Some("opencode".to_string());
+        apply_native_backend_agent_selector(&mut agent, &mut backend).unwrap();
+        assert_eq!(backend.as_deref(), Some("opencode"));
+        assert_eq!(agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn native_backend_agent_selector_rejects_conflicting_backend() {
+        let mut agent = Some("gemini".to_string());
+        let mut backend = Some("codex".to_string());
+        let error = apply_native_backend_agent_selector(&mut agent, &mut backend).unwrap_err();
+        assert!(error.contains("selects backend 'gemini'"));
+        assert_eq!(agent.as_deref(), Some("gemini"));
     }
 
     #[test]
