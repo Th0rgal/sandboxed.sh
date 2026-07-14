@@ -3279,6 +3279,13 @@ pub struct ControlHub {
     telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 }
 
+struct MissionStoreInventory {
+    live: Vec<Arc<dyn MissionStore>>,
+    offline_sqlite: Vec<PathBuf>,
+    offline_file_users: Vec<String>,
+    base_dir: PathBuf,
+}
+
 impl ControlHub {
     pub fn new(
         config: Config,
@@ -3385,12 +3392,11 @@ impl ControlHub {
         self.sessions.read().await.values().cloned().collect()
     }
 
-    /// Every live and persisted mission store. Writer leases are global to a
-    /// PR branch, not scoped to the authenticated dashboard user, so lease
-    /// checks must include stores whose user has no live control session.
-    pub async fn all_mission_stores(&self) -> Result<Vec<Arc<dyn MissionStore>>, String> {
+    /// Inventory every live and persisted mission store without opening
+    /// offline SQLite stores in read-write migration mode.
+    async fn mission_store_inventory(&self) -> Result<MissionStoreInventory, String> {
         let sessions = self.sessions.read().await;
-        let mut stores: Vec<Arc<dyn MissionStore>> = sessions
+        let live: Vec<Arc<dyn MissionStore>> = sessions
             .values()
             .map(|session| Arc::clone(&session.mission_store))
             .collect();
@@ -3407,9 +3413,18 @@ impl ControlHub {
             .join("missions");
         let mut entries = match tokio::fs::read_dir(&base_dir).await {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(stores),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(MissionStoreInventory {
+                    live,
+                    offline_sqlite: Vec::new(),
+                    offline_file_users: Vec::new(),
+                    base_dir,
+                })
+            }
             Err(error) => return Err(format!("read {}: {error}", base_dir.display())),
         };
+        let mut offline_sqlite = Vec::new();
+        let mut offline_file_users = Vec::new();
         while let Some(entry) = entries
             .next_entry()
             .await
@@ -3423,19 +3438,20 @@ impl ControlHub {
                 if live_users.contains(user) {
                     continue;
                 }
-                stores.push(Arc::new(
-                    mission_store::SqliteMissionStore::new(base_dir.clone(), user).await?,
-                ));
+                offline_sqlite.push(entry.path());
             } else if let Some(user) = stem.strip_suffix(".json") {
                 if live_users.contains(user) {
                     continue;
                 }
-                stores.push(Arc::new(
-                    mission_store::FileMissionStore::new(base_dir.clone(), user).await?,
-                ));
+                offline_file_users.push(user.to_string());
             }
         }
-        Ok(stores)
+        Ok(MissionStoreInventory {
+            live,
+            offline_sqlite,
+            offline_file_users,
+            base_dir,
+        })
     }
 
     /// User ids of all live control sessions. Used by GC/reaper to decide
@@ -5387,11 +5403,24 @@ fn message_requests_pr_writer(mission: &Mission, content: &str) -> bool {
         )
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PrWriterLease {
+    id: Uuid,
+    status: MissionStatus,
+}
+
+fn pr_writer_lease(mission: &Mission) -> PrWriterLease {
+    PrWriterLease {
+        id: mission.id,
+        status: mission.status,
+    }
+}
+
 async fn find_existing_pr_writer(
     store: &Arc<dyn MissionStore>,
     github_pr: &str,
     exclude_id: Option<Uuid>,
-) -> Result<Option<Mission>, String> {
+) -> Result<Option<PrWriterLease>, String> {
     const PAGE_SIZE: usize = 200;
     let target = canonical_github_pr(github_pr);
     let mut offset = 0;
@@ -5410,20 +5439,20 @@ async fn find_existing_pr_writer(
                 continue;
             }
             if mission_is_pr_writer(&mission) {
-                return Ok(Some(mission));
+                return Ok(Some(pr_writer_lease(&mission)));
             }
             // SQLite list queries intentionally omit history. Load the full
             // mission before treating a legacy prompt-only writer as read-only.
             if let Some(full) = store.get_mission(mission.id).await? {
                 if mission_is_pr_writer(&full) {
-                    return Ok(Some(full));
+                    return Ok(Some(pr_writer_lease(&full)));
                 }
                 // Scheduled missions can carry their only prompt in the
                 // durable deferred goal until dispatch. Treat that prompt as
                 // capability evidence before declaring this lease read-only.
                 if let Some(goal) = store.get_deferred_goal(mission.id).await? {
                     if mission_is_pr_writer_with_prompt(&full, Some(&goal)) {
-                        return Ok(Some(full));
+                        return Ok(Some(pr_writer_lease(&full)));
                     }
                 }
             }
@@ -5435,14 +5464,98 @@ async fn find_existing_pr_writer(
     }
 }
 
+fn find_existing_pr_writer_in_sqlite(
+    path: &std::path::Path,
+    github_pr: &str,
+    exclude_id: Option<Uuid>,
+) -> Result<Option<PrWriterLease>, String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT m.id, m.status, m.github_pr, m.intent, m.tags, m.deferred_goal, \
+             (SELECT e.content FROM mission_events e \
+              WHERE e.mission_id = m.id AND e.event_type = 'user_message' \
+              ORDER BY e.sequence ASC LIMIT 1) \
+             FROM missions m WHERE m.github_pr IS NOT NULL",
+        )
+        .map_err(|error| format!("query {}: {error}", path.display()))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let target = canonical_github_pr(github_pr);
+    for row in rows {
+        let (id, status, candidate_pr, intent, tags, deferred_goal, first_prompt) =
+            row.map_err(|error| error.to_string())?;
+        let Ok(id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        if Some(id) == exclude_id || canonical_github_pr(&candidate_pr) != target {
+            continue;
+        }
+        let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
+            .unwrap_or(MissionStatus::Active);
+        if !status_holds_pr_writer_lease(status) {
+            continue;
+        }
+        let tags: Vec<String> = tags
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or_default();
+        if requested_pr_writer(
+            None,
+            Some(&tags),
+            intent.as_deref(),
+            first_prompt.as_deref().or(deferred_goal.as_deref()),
+        ) {
+            return Ok(Some(PrWriterLease { id, status }));
+        }
+    }
+    Ok(None)
+}
+
 async fn find_existing_pr_writer_global(
     state: &Arc<AppState>,
     github_pr: &str,
     exclude_id: Option<Uuid>,
-) -> Result<Option<Mission>, String> {
+) -> Result<Option<PrWriterLease>, String> {
     // Fail closed if any persisted store cannot be enumerated or read. A
     // partial cross-user scan cannot prove that a branch is writer-free.
-    for store in state.control.all_mission_stores().await? {
+    let inventory = state.control.mission_store_inventory().await?;
+    for store in inventory.live {
+        if let Some(mission) = find_existing_pr_writer(&store, github_pr, exclude_id).await? {
+            return Ok(Some(mission));
+        }
+    }
+    for path in inventory.offline_sqlite {
+        let github_pr = github_pr.to_string();
+        let found = tokio::task::spawn_blocking(move || {
+            find_existing_pr_writer_in_sqlite(&path, &github_pr, exclude_id)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    for user in inventory.offline_file_users {
+        let store: Arc<dyn MissionStore> = Arc::new(
+            mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await?,
+        );
         if let Some(mission) = find_existing_pr_writer(&store, github_pr, exclude_id).await? {
             return Ok(Some(mission));
         }
@@ -19458,6 +19571,41 @@ mod tests {
             Some("integration_repair"),
             None
         ));
+    }
+
+    #[test]
+    fn offline_sqlite_writer_scan_reads_deferred_goal_without_migrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missions-offline.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE missions (
+                    id TEXT PRIMARY KEY, status TEXT, github_pr TEXT,
+                    intent TEXT, tags TEXT, deferred_goal TEXT
+                 );
+                 CREATE TABLE mission_events (
+                    mission_id TEXT, sequence INTEGER, event_type TEXT, content TEXT
+                 );",
+            )
+            .unwrap();
+        let mission_id = Uuid::new_v4();
+        connection
+            .execute(
+                "INSERT INTO missions (id, status, github_pr, intent, tags, deferred_goal)
+                 VALUES (?1, 'pending', ?2, NULL, '[]', 'Fix, commit and push')",
+                rusqlite::params![mission_id.to_string(), "owner/repo#42"],
+            )
+            .unwrap();
+        drop(connection);
+
+        let found =
+            find_existing_pr_writer_in_sqlite(&path, "https://github.com/owner/repo/pull/42", None)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(found.id, mission_id);
+        assert_eq!(found.status, MissionStatus::Pending);
     }
 
     fn stored_test_event(
