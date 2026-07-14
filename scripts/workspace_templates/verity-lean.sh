@@ -92,7 +92,7 @@ install -m 0755 /dev/stdin /usr/local/bin/verity-isolated-clone <<'SCRIPT'
 set -euo pipefail
 readonly ROOT="/workspace/verity"
 name="${1:?usage: verity-isolated-clone <name> [git-ref] [branch]}"
-ref="${2:-origin/main}"
+ref="${2:-main}"
 branch="${3:-}"
 if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "invalid clone name: $name" >&2
@@ -108,7 +108,11 @@ fi
 # package tree are private to this mission after the command returns.
 git clone --reference-if-able "$ROOT/base" --dissociate \
   https://github.com/lfglabs-dev/verity.git "$dest"
-git -C "$dest" fetch origin "$ref"
+# `git fetch <remote> <refspec>` expects the remote ref (`main`), not the
+# local remote-tracking name (`origin/main`). Accept both forms because Hermes
+# historically supplied the latter.
+fetch_ref="${ref#origin/}"
+git -C "$dest" fetch origin "$fetch_ref"
 if [[ -n "$branch" ]]; then
   git -C "$dest" checkout -B "$branch" FETCH_HEAD
 else

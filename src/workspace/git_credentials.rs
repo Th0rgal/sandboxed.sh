@@ -168,13 +168,38 @@ impl GitCredentialConfig {
         app_working_dir: Option<&Path>,
         workspace_env: &HashMap<String, String>,
     ) -> Option<Self> {
+        Self::resolve_dashboard_connection(workspace_root, app_working_dir)
+            .or_else(Self::from_env)
+            .or_else(|| Self::from_workspace_env(workspace_env))
+    }
+
+    fn resolve_dashboard_connection(
+        workspace_root: &Path,
+        app_working_dir: Option<&Path>,
+    ) -> Option<Self> {
         let candidates = github_connection_candidates(workspace_root, app_working_dir);
         for path in &candidates {
             if let Some(conn) = GithubConnectionStore::read_from_path(path) {
                 return Some(Self::from_connection(&conn));
             }
         }
-        Self::from_env().or_else(|| Self::from_workspace_env(workspace_env))
+        None
+    }
+
+    /// Refresh credentials for a subprocess without replacing a connected
+    /// dashboard account with a lower-fidelity service/workspace token when
+    /// the connection store is temporarily undiscoverable from this spawn.
+    pub fn resolve_for_spawn(
+        workspace_root: &Path,
+        app_working_dir: Option<&Path>,
+        workspace_env: &HashMap<String, String>,
+        cached: Option<&Self>,
+    ) -> Option<Self> {
+        Self::resolve_dashboard_connection(workspace_root, app_working_dir)
+            .or_else(|| cached.filter(|creds| creds.login.is_some()).cloned())
+            .or_else(Self::from_env)
+            .or_else(|| Self::from_workspace_env(workspace_env))
+            .or_else(|| cached.cloned())
     }
 
     /// Whether a commit identity is configured. Without it `git commit` fails
@@ -784,6 +809,26 @@ mod tests {
         assert_eq!(cfg.token(), "workspace-token");
         assert_eq!(cfg.user_name(), Some("Ada"));
         assert_eq!(cfg.user_email(), Some("ada@example.com"));
+    }
+
+    #[test]
+    fn spawn_refresh_preserves_cached_dashboard_account_over_fallback_token() {
+        let root = tempfile::tempdir().unwrap();
+        let cached = GitCredentialConfig {
+            token: "dashboard-token".into(),
+            user_name: Some("Dashboard User".into()),
+            user_email: Some("dashboard@example.com".into()),
+            login: Some("dashboard-login".into()),
+        };
+        let mut env = HashMap::new();
+        env.insert("GH_TOKEN".into(), "workspace-fallback".into());
+
+        let resolved =
+            GitCredentialConfig::resolve_for_spawn(root.path(), None, &env, Some(&cached)).unwrap();
+
+        assert_eq!(resolved.token(), "dashboard-token");
+        assert_eq!(resolved.login.as_deref(), Some("dashboard-login"));
+        assert_eq!(resolved.user_name(), Some("Dashboard User"));
     }
 
     #[test]

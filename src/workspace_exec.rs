@@ -1157,13 +1157,12 @@ impl WorkspaceExec {
         // alive; retaining only the mission-prep snapshot leaves later Bash or
         // `gh` subprocesses unauthenticated. Refresh the credential files
         // silently, then expose only their non-secret paths through env.
-        let git_creds =
-            crate::workspace::git_credentials::GitCredentialConfig::resolve_with_workspace_env(
-                &self.workspace.path,
-                None,
-                &self.workspace.env_vars,
-            )
-            .or_else(|| self.workspace.resolved_git_credentials.clone());
+        let git_creds = crate::workspace::git_credentials::GitCredentialConfig::resolve_for_spawn(
+            &self.workspace.path,
+            None,
+            &self.workspace.env_vars,
+            self.workspace.resolved_git_credentials.as_ref(),
+        );
         if let Some(creds) = git_creds {
             if let Err(error) = creds.write_for_workspace(
                 &self.workspace.path,
