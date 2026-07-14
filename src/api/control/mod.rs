@@ -13412,7 +13412,68 @@ async fn control_actor_loop(
                                     let _ = respond.send(Err("Mission not currently executing".to_string()));
                                 }
                             } else {
-                                let _ = respond.send(Err(format!("Mission {} not found", mission_id)));
+                                // A mission can exist durably without owning a
+                                // runner yet (for example a scheduled/deferred
+                                // Pending mission). Cancellation must still
+                                // release it, otherwise deferred work and PR
+                                // writer leases can become impossible to clear.
+                                // Existing terminal rows are an idempotent
+                                // success so cleanup loops do not trip their
+                                // circuit breaker by cancelling twice.
+                                match mission_store.get_mission(mission_id).await {
+                                    Ok(Some(mission)) if mission.status == MissionStatus::Interrupted
+                                        || mission.status.is_terminal()
+                                        || mission.status == MissionStatus::Acknowledged =>
+                                    {
+                                        let _ = respond.send(Ok(()));
+                                    }
+                                    Ok(Some(_)) => {
+                                        let update = mission_store
+                                            .update_mission_status(
+                                                mission_id,
+                                                MissionStatus::Interrupted,
+                                            )
+                                            .await;
+                                        if let Err(error) = update {
+                                            let _ = respond.send(Err(error));
+                                            continue;
+                                        }
+                                        let _ = mission_store
+                                            .set_deferred_goal(mission_id, None)
+                                            .await;
+                                        let _ = events_tx.send(
+                                            AgentEvent::MissionStatusChanged {
+                                                mission_id,
+                                                status: MissionStatus::Interrupted,
+                                                summary: None,
+                                            },
+                                        );
+                                        close_mission_desktop_sessions(
+                                            &mission_store,
+                                            mission_id,
+                                            &config.working_dir,
+                                        )
+                                        .await;
+                                        cancel_child_missions(
+                                            mission_id,
+                                            &mission_store,
+                                            &mut parallel_runners,
+                                            &events_tx,
+                                            &config.working_dir,
+                                        )
+                                        .await;
+                                        let _ = respond.send(Ok(()));
+                                    }
+                                    Ok(None) => {
+                                        let _ = respond.send(Err(format!(
+                                            "Mission {} not found",
+                                            mission_id
+                                        )));
+                                    }
+                                    Err(error) => {
+                                        let _ = respond.send(Err(error));
+                                    }
+                                }
                             }
                         }
                     }
