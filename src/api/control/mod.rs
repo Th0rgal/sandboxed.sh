@@ -5442,7 +5442,9 @@ async fn find_existing_pr_writer(
                 // durable deferred goal until dispatch. Treat that prompt as
                 // capability evidence before declaring this lease read-only.
                 if let Some(goal) = store.get_deferred_goal(mission.id).await? {
-                    if mission_is_pr_writer_with_prompt(&full, Some(&goal)) {
+                    if mission_is_pr_writer_with_prompt(&full, Some(&goal))
+                        || message_requests_pr_writer(&full, &goal)
+                    {
                         return Ok(Some(pr_writer_lease(&full)));
                     }
                 }
@@ -5518,7 +5520,7 @@ fn find_existing_pr_writer_in_sqlite(
             ),
             _ => None,
         };
-        if requested_pr_writer(
+        let initial_prompt_requests_writer = requested_pr_writer(
             None,
             Some(&tags),
             intent.as_deref(),
@@ -5526,7 +5528,11 @@ fn find_existing_pr_writer_in_sqlite(
                 .as_deref()
                 .or(external_prompt.as_deref())
                 .or(deferred_goal.as_deref()),
-        ) {
+        );
+        let deferred_goal_requests_writer = deferred_goal
+            .as_deref()
+            .is_some_and(|goal| inferred_pr_writer(None, None, Some(goal)));
+        if initial_prompt_requests_writer || deferred_goal_requests_writer {
             return Ok(Some(PrWriterLease { id, status }));
         }
     }
@@ -5599,46 +5605,10 @@ async fn activate_mission_for_message(
     mission: &Mission,
     content: &str,
 ) -> Result<(), String> {
-    // A targeted message can resume terminal/acknowledged work without going
-    // through the explicit resume endpoint. Reacquire the writer lease under
-    // the same mutex as create/project/resume and keep it until Active is
-    // persisted, so message delivery cannot race a replacement writer.
-    let becomes_writer =
-        mission_is_pr_writer(mission) || message_requests_pr_writer(mission, content);
-    let _pr_writer_guard = if becomes_writer {
-        Some(PR_WRITER_CREATE_LOCK.lock().await)
-    } else {
-        None
-    };
-    if _pr_writer_guard.is_some() {
-        if let Some(github_pr) = mission.project.github_pr.as_deref() {
-            if let Some(existing) =
-                find_existing_pr_writer_global(control_hub, github_pr, Some(mission.id)).await?
-            {
-                return Err(format!(
-                    "PR writer lease is already held by mission {} (status={}); cannot activate mission {} as another writer for {}",
-                    existing.id,
-                    existing.status,
-                    mission.id,
-                    canonical_github_pr(github_pr)
-                ));
-            }
-        }
-        if !mission_is_pr_writer(mission) {
-            let mut tags = mission.project.tags.clone();
-            tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
-            tags.push("pr-writer".to_string());
-            store
-                .update_mission_project(
-                    mission.id,
-                    crate::api::mission_store::MissionProjectPatch {
-                        tags: Some(tags),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-        }
-    }
+    // Keep the writer mutex until Active is persisted so a replacement writer
+    // cannot race a terminal mission's message-based reactivation.
+    let _pr_writer_guard =
+        acquire_pr_writer_lease_for_message(control_hub, store, mission, content).await?;
 
     if message_activates_mission(mission.status) {
         store
@@ -5651,6 +5621,78 @@ async fn activate_mission_for_message(
         });
     }
     Ok(())
+}
+
+struct MessageWriterLeaseGuard {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+    retagged: bool,
+}
+
+async fn acquire_pr_writer_lease_for_message(
+    control_hub: &ControlHub,
+    store: &Arc<dyn MissionStore>,
+    mission: &Mission,
+    content: &str,
+) -> Result<Option<MessageWriterLeaseGuard>, String> {
+    let becomes_writer =
+        mission_is_pr_writer(mission) || message_requests_pr_writer(mission, content);
+    if !becomes_writer {
+        return Ok(None);
+    }
+
+    let guard = PR_WRITER_CREATE_LOCK.lock().await;
+    if let Some(github_pr) = mission.project.github_pr.as_deref() {
+        if let Some(existing) =
+            find_existing_pr_writer_global(control_hub, github_pr, Some(mission.id)).await?
+        {
+            return Err(format!(
+                "PR writer lease is already held by mission {} (status={}); cannot activate mission {} as another writer for {}",
+                existing.id,
+                existing.status,
+                mission.id,
+                canonical_github_pr(github_pr)
+            ));
+        }
+    }
+
+    let retagged = !mission_is_pr_writer(mission);
+    if retagged {
+        let mut tags = mission.project.tags.clone();
+        tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
+        tags.push("pr-writer".to_string());
+        store
+            .update_mission_project(
+                mission.id,
+                crate::api::mission_store::MissionProjectPatch {
+                    tags: Some(tags),
+                    ..Default::default()
+                },
+            )
+            .await?;
+    }
+
+    Ok(Some(MessageWriterLeaseGuard {
+        _guard: guard,
+        retagged,
+    }))
+}
+
+async fn rollback_message_writer_tag(
+    store: &Arc<dyn MissionStore>,
+    mission: &Mission,
+    lease: &Option<MessageWriterLeaseGuard>,
+) {
+    if lease.as_ref().is_some_and(|lease| lease.retagged) {
+        let _ = store
+            .update_mission_project(
+                mission.id,
+                crate::api::mission_store::MissionProjectPatch {
+                    tags: Some(mission.project.tags.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
 }
 
 pub async fn create_mission(
@@ -12804,14 +12846,36 @@ async fn control_actor_loop(
                                         if m.status == MissionStatus::Pending
                                             && !m.is_dispatchable_at(now)
                                         {
+                                            let writer_lease = match acquire_pr_writer_lease_for_message(
+                                                &control_hub,
+                                                &mission_store,
+                                                &m,
+                                                &content,
+                                            )
+                                            .await
+                                            {
+                                                Ok(lease) => lease,
+                                                Err(error) => {
+                                                    let _ = events_tx.send(AgentEvent::Error {
+                                                        message: format!(
+                                                            "Cannot reserve writer lease for mission {}: {}",
+                                                            tid, error
+                                                        ),
+                                                        mission_id: Some(tid),
+                                                        resumable: true,
+                                                    });
+                                                    let _ = respond.send(UserMessageAck::Dropped);
+                                                    continue;
+                                                }
+                                            };
                                             // Append to any previously-stashed goal so
                                             // multiple pre-dispatch messages aren't lost.
-                                            let combined = match mission_store
+                                            let previous_goal = mission_store
                                                 .get_deferred_goal(tid)
                                                 .await
                                                 .ok()
-                                                .flatten()
-                                            {
+                                                .flatten();
+                                            let combined = match previous_goal.as_deref() {
                                                 Some(prev) if !prev.is_empty() => {
                                                     format!("{prev}\n{content}")
                                                 }
@@ -12821,10 +12885,18 @@ async fn control_actor_loop(
                                                 .set_deferred_goal(tid, Some(combined))
                                                 .await
                                             {
+                                                rollback_message_writer_tag(
+                                                    &mission_store,
+                                                    &m,
+                                                    &writer_lease,
+                                                )
+                                                .await;
                                                 tracing::warn!(
                                                     mission_id = %tid,
                                                     "Failed to stash deferred goal: {e}"
                                                 );
+                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                continue;
                                             }
                                             // Surface the queued goal so the UI shows it
                                             // as pending until dispatch.
@@ -12938,12 +13010,53 @@ async fn control_actor_loop(
                                     // from a successful delivery. Stash the content as the
                                     // deferred goal instead — the scheduler pass re-injects
                                     // it as a normal targeted message once a slot frees.
-                                    let combined = match mission_store
+                                    let mission = match mission_store.get_mission(tid).await {
+                                        Ok(Some(mission)) => mission,
+                                        Ok(None) => {
+                                            let _ = respond.send(UserMessageAck::Dropped);
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            let _ = events_tx.send(AgentEvent::Error {
+                                                message: format!(
+                                                    "Cannot load mission {} before deferral: {}",
+                                                    tid, error
+                                                ),
+                                                mission_id: Some(tid),
+                                                resumable: true,
+                                            });
+                                            let _ = respond.send(UserMessageAck::Dropped);
+                                            continue;
+                                        }
+                                    };
+                                    let writer_lease = match acquire_pr_writer_lease_for_message(
+                                        &control_hub,
+                                        &mission_store,
+                                        &mission,
+                                        &content,
+                                    )
+                                    .await
+                                    {
+                                        Ok(lease) => lease,
+                                        Err(error) => {
+                                            let _ = events_tx.send(AgentEvent::Error {
+                                                message: format!(
+                                                    "Cannot reserve writer lease for mission {}: {}",
+                                                    tid, error
+                                                ),
+                                                mission_id: Some(tid),
+                                                resumable: true,
+                                            });
+                                            let _ = respond.send(UserMessageAck::Dropped);
+                                            continue;
+                                        }
+                                    };
+                                    let previous_goal = mission_store
                                         .get_deferred_goal(tid)
                                         .await
                                         .ok()
-                                        .flatten()
-                                    {
+                                        .flatten();
+                                    let combined = match previous_goal.as_deref() {
                                         Some(prev) if !prev.is_empty() => {
                                             format!("{prev}\n{content}")
                                         }
@@ -12967,6 +13080,12 @@ async fn control_actor_loop(
                                             let _ = respond.send(UserMessageAck::Queued);
                                         }
                                         Err(e) => {
+                                            rollback_message_writer_tag(
+                                                &mission_store,
+                                                &mission,
+                                                &writer_lease,
+                                            )
+                                            .await;
                                             tracing::warn!(
                                                 mission_id = %tid,
                                                 "Cannot start parallel mission (max {} reached) and \
@@ -19684,6 +19803,14 @@ mod tests {
                 "INSERT INTO missions (id, status, github_pr, intent, tags, deferred_goal)
                  VALUES (?1, 'pending', ?2, NULL, '[]', 'Fix, commit and push')",
                 rusqlite::params![mission_id.to_string(), "owner/repo#42"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mission_events
+                 (mission_id, sequence, event_type, content, content_file)
+                 VALUES (?1, 1, 'user_message', 'Inspect status only', NULL)",
+                rusqlite::params![mission_id.to_string()],
             )
             .unwrap();
         drop(connection);
