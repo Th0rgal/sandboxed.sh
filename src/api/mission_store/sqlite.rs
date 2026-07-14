@@ -2782,6 +2782,38 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn get_initial_user_message(&self, id: Uuid) -> Result<Option<String>, String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let row = conn
+                .query_row(
+                    "SELECT content, content_file FROM mission_events
+                     WHERE mission_id = ?1 AND event_type = 'user_message'
+                     ORDER BY sequence ASC LIMIT 1",
+                    params![id_str],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            match row {
+                Some((Some(content), _)) => Ok(Some(content)),
+                Some((None, Some(path))) => std::fs::read_to_string(&path)
+                    .map(Some)
+                    .map_err(|error| format!("read initial mission prompt {path}: {error}")),
+                _ => Ok(None),
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
     async fn create_mission_with_parent(
         &self,
         title: Option<&str>,
@@ -14755,5 +14787,59 @@ mod tests {
             .await
             .expect("list")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn initial_user_message_is_not_lost_beyond_history_window() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Long mission"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        for index in 0..206 {
+            let content = if index == 0 {
+                "Fix, commit and push the original PR".to_string()
+            } else {
+                format!("later message {index}")
+            };
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::UserMessage {
+                        id: Uuid::new_v4(),
+                        content,
+                        queued: false,
+                        mission_id: Some(mission.id),
+                        source: None,
+                    },
+                )
+                .await
+                .expect("persist user event");
+        }
+
+        let projected = store
+            .get_mission(mission.id)
+            .await
+            .expect("get mission")
+            .expect("mission exists");
+        assert_eq!(projected.history.len(), 200);
+        assert_ne!(
+            projected
+                .history
+                .first()
+                .map(|entry| entry.content.as_str()),
+            Some("Fix, commit and push the original PR")
+        );
+        assert_eq!(
+            store
+                .get_initial_user_message(mission.id)
+                .await
+                .expect("initial prompt")
+                .as_deref(),
+            Some("Fix, commit and push the original PR")
+        );
     }
 }

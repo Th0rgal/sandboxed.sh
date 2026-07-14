@@ -1037,6 +1037,9 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                      resolve the cause, then retry."
                         .to_string()
                 }
+                Ok(Ok(UserMessageAck::Rejected(reason))) => {
+                    format!("Error: the steering message was rejected: {reason}")
+                }
                 Ok(Err(_)) | Err(_) => {
                     // The control loop accepted the command but never confirmed —
                     // the message is most likely in flight; don't claim failure.

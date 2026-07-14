@@ -3632,7 +3632,12 @@ pub async fn post_message(
         // The wire response keeps its historical bool shape: `queued` is true
         // only when the message is waiting for the next turn boundary.
         // Dropped messages surface as an `AgentEvent::Error` on the stream.
-        Ok(ack) => ack == UserMessageAck::Queued,
+        Ok(UserMessageAck::Queued) => true,
+        Ok(UserMessageAck::Delivered) => false,
+        Ok(UserMessageAck::Dropped) => false,
+        Ok(UserMessageAck::Rejected(reason)) => {
+            return Err((StatusCode::CONFLICT, reason));
+        }
         Err(_) => {
             let status = control.status.read().await;
             status.state != ControlRunState::Idle
@@ -5485,7 +5490,8 @@ async fn find_existing_pr_writer(
             // SQLite list queries intentionally omit history. Load the full
             // mission before treating a legacy prompt-only writer as read-only.
             if let Some(full) = store.get_mission(mission.id).await? {
-                if mission_is_pr_writer(&full) {
+                let initial_prompt = store.get_initial_user_message(mission.id).await?;
+                if mission_is_pr_writer_with_prompt(&full, initial_prompt.as_deref()) {
                     return Ok(Some(pr_writer_lease(&full)));
                 }
                 // Scheduled missions can carry their only prompt in the
@@ -12881,7 +12887,7 @@ async fn control_actor_loop(
                                                         mission_id: Some(tid),
                                                         resumable: true,
                                                     });
-                                                    let _ = respond.send(UserMessageAck::Dropped);
+                                                    let _ = respond.send(UserMessageAck::Rejected(error));
                                                     continue;
                                                 }
                                             };
@@ -12958,7 +12964,7 @@ async fn control_actor_loop(
                                             mission_id: Some(tid),
                                             resumable: true,
                                         });
-                                        let _ = respond.send(UserMessageAck::Dropped);
+                                        let _ = respond.send(UserMessageAck::Rejected(error));
                                         continue;
                                     }
                                 }
@@ -13064,7 +13070,7 @@ async fn control_actor_loop(
                                                 mission_id: Some(tid),
                                                 resumable: true,
                                             });
-                                            let _ = respond.send(UserMessageAck::Dropped);
+                                            let _ = respond.send(UserMessageAck::Rejected(error));
                                             continue;
                                         }
                                     };
@@ -13157,7 +13163,7 @@ async fn control_actor_loop(
                                                     mission_id: Some(tid),
                                                     resumable: true,
                                                 });
-                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                let _ = respond.send(UserMessageAck::Rejected(error));
                                                 continue;
                                             }
                                             let mut runner = super::mission_runner::MissionRunner::new(
@@ -13287,7 +13293,7 @@ async fn control_actor_loop(
                                                 mission_id: Some(tid),
                                                 resumable: true,
                                             });
-                                            let _ = respond.send(UserMessageAck::Dropped);
+                                            let _ = respond.send(UserMessageAck::Rejected(error));
                                             continue;
                                         }
                                     }
@@ -13330,7 +13336,7 @@ async fn control_actor_loop(
                                                     mission_id: Some(tid),
                                                     resumable: true,
                                                 });
-                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                let _ = respond.send(UserMessageAck::Rejected(error));
                                                 continue;
                                             }
                                         }
@@ -13368,7 +13374,7 @@ async fn control_actor_loop(
                                                     mission_id: Some(tid),
                                                     resumable: true,
                                                 });
-                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                let _ = respond.send(UserMessageAck::Rejected(error));
                                                 continue;
                                             }
                                         }
@@ -13418,7 +13424,7 @@ async fn control_actor_loop(
                                             mission_id: Some(tid),
                                             resumable: true,
                                         });
-                                        let _ = respond.send(UserMessageAck::Dropped);
+                                        let _ = respond.send(UserMessageAck::Rejected(error));
                                         continue;
                                     }
                                 }
@@ -13515,7 +13521,7 @@ async fn control_actor_loop(
                                                     mission_id: Some(mid),
                                                     resumable: true,
                                                 });
-                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                let _ = respond.send(UserMessageAck::Rejected(error));
                                                 continue;
                                             }
                                             (
