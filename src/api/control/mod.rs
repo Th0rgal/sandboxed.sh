@@ -5490,6 +5490,9 @@ fn find_existing_pr_writer_in_sqlite(
             "SELECT m.id, m.status, m.github_pr, m.intent, m.tags, m.deferred_goal, \
              (SELECT e.content FROM mission_events e \
               WHERE e.mission_id = m.id AND e.event_type = 'user_message' \
+              ORDER BY e.sequence ASC LIMIT 1), \
+             (SELECT e.content_file FROM mission_events e \
+              WHERE e.mission_id = m.id AND e.event_type = 'user_message' \
               ORDER BY e.sequence ASC LIMIT 1) \
              FROM missions m WHERE m.github_pr IS NOT NULL",
         )
@@ -5504,12 +5507,13 @@ fn find_existing_pr_writer_in_sqlite(
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })
         .map_err(|error| error.to_string())?;
     let target = canonical_github_pr(github_pr);
     for row in rows {
-        let (id, status, candidate_pr, intent, tags, deferred_goal, first_prompt) =
+        let (id, status, candidate_pr, intent, tags, deferred_goal, first_prompt, prompt_file) =
             row.map_err(|error| error.to_string())?;
         let Ok(id) = Uuid::parse_str(&id) else {
             continue;
@@ -5526,11 +5530,21 @@ fn find_existing_pr_writer_in_sqlite(
             .as_deref()
             .and_then(|value| serde_json::from_str(value).ok())
             .unwrap_or_default();
+        let external_prompt = match (first_prompt.as_deref(), prompt_file.as_deref()) {
+            (None, Some(path)) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|error| format!("read externalized mission prompt {path}: {error}"))?,
+            ),
+            _ => None,
+        };
         if requested_pr_writer(
             None,
             Some(&tags),
             intent.as_deref(),
-            first_prompt.as_deref().or(deferred_goal.as_deref()),
+            first_prompt
+                .as_deref()
+                .or(external_prompt.as_deref())
+                .or(deferred_goal.as_deref()),
         ) {
             return Ok(Some(PrWriterLease { id, status }));
         }
@@ -19612,7 +19626,8 @@ mod tests {
                     intent TEXT, tags TEXT, deferred_goal TEXT
                  );
                  CREATE TABLE mission_events (
-                    mission_id TEXT, sequence INTEGER, event_type TEXT, content TEXT
+                    mission_id TEXT, sequence INTEGER, event_type TEXT, content TEXT,
+                    content_file TEXT
                  );",
             )
             .unwrap();
@@ -19633,6 +19648,51 @@ mod tests {
 
         assert_eq!(found.id, mission_id);
         assert_eq!(found.status, MissionStatus::Pending);
+    }
+
+    #[test]
+    fn offline_sqlite_writer_scan_reads_externalized_initial_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missions-offline.db");
+        let prompt_path = dir.path().join("initial-prompt.txt");
+        std::fs::write(&prompt_path, "Fix this PR, commit and push").unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE missions (
+                    id TEXT PRIMARY KEY, status TEXT, github_pr TEXT,
+                    intent TEXT, tags TEXT, deferred_goal TEXT
+                 );
+                 CREATE TABLE mission_events (
+                    mission_id TEXT, sequence INTEGER, event_type TEXT, content TEXT,
+                    content_file TEXT
+                 );",
+            )
+            .unwrap();
+        let mission_id = Uuid::new_v4();
+        connection
+            .execute(
+                "INSERT INTO missions (id, status, github_pr, intent, tags, deferred_goal)
+                 VALUES (?1, 'active', ?2, NULL, '[]', NULL)",
+                rusqlite::params![mission_id.to_string(), "owner/repo#43"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mission_events
+                 (mission_id, sequence, event_type, content, content_file)
+                 VALUES (?1, 1, 'user_message', NULL, ?2)",
+                rusqlite::params![mission_id.to_string(), prompt_path.to_string_lossy()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let found = find_existing_pr_writer_in_sqlite(&path, "owner/repo#43", None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.id, mission_id);
+        assert_eq!(found.status, MissionStatus::Active);
     }
 
     fn stored_test_event(
