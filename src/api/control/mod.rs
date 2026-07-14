@@ -3401,10 +3401,6 @@ impl ControlHub {
             .values()
             .map(|session| Arc::clone(&session.mission_store))
             .collect();
-        let live_users: HashSet<String> = sessions
-            .keys()
-            .map(|user| mission_store::sanitize_filename(user))
-            .collect();
         drop(sessions);
 
         let base_dir = self
@@ -3435,10 +3431,11 @@ impl ControlHub {
             let Some(stem) = name.strip_prefix("missions-") else {
                 continue;
             };
-            if let Some(user) = stem.strip_suffix(".db") {
-                if live_users.contains(user) {
-                    continue;
-                }
+            if let Some(_user) = stem.strip_suffix(".db") {
+                // The live session may be file-backed or an in-memory
+                // fallback, so it cannot prove that this persisted SQLite
+                // store is represented by `live`. A duplicate read-only scan
+                // is safer than admitting a second writer during migration.
                 offline_sqlite.push(entry.path());
             } else if let Some(user) = stem.strip_suffix(".json") {
                 // A live user can be backed by SQLite while a second process
@@ -7364,11 +7361,12 @@ pub async fn update_mission_project(
         .get_deferred_goal(id)
         .await
         .map_err(internal_error)?;
-    let writer_prompt = current
-        .history
-        .first()
-        .map(|entry| entry.content.as_str())
-        .or(deferred_goal.as_deref());
+    let initial_prompt = control
+        .mission_store
+        .get_initial_user_message(id)
+        .await
+        .map_err(internal_error)?;
+    let writer_prompt = initial_prompt.as_deref().or(deferred_goal.as_deref());
     let becomes_writer = effective_github_pr.is_some()
         && requested_pr_writer(
             req.writer,
