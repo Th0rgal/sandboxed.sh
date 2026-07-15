@@ -145,9 +145,9 @@ Group=sandboxed-node
 WorkingDirectory=/var/lib/sandboxed-node
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectHome=true
-# ProtectHome also hides /run/user; expose only this runner's runtime directory
-# so systemd-run --user can reach the lingering user manager's bus.
+ProtectHome=tmpfs
+# The tmpfs mode hides home and runtime contents while allowing this narrow
+# bind, so systemd-run --user can reach the lingering user manager's bus.
 BindPaths=/run/user/%U
 ProtectSystem=strict
 ReadWritePaths=/var/lib/sandboxed-node
