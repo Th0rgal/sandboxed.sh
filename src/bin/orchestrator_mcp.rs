@@ -1740,6 +1740,20 @@ impl OrchestratorMcp {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        // Auto-detect once for the whole batch. Creating the first worktree
+        // adds another `.git` entry under the workspace, so resolving again
+        // for a later task would make an originally unambiguous checkout look
+        // ambiguous and fall back to the workspace root.
+        let implicit_worktree_repo = params
+            .tasks
+            .iter()
+            .any(|spec| {
+                spec.worktree
+                    .as_ref()
+                    .is_some_and(|worktree| worktree.repo_path.is_none())
+            })
+            .then(|| resolve_repo_path(None));
+
         let mut registered = Vec::with_capacity(params.tasks.len());
         let mut worktrees_created = Vec::new();
         for spec in params.tasks {
@@ -1759,12 +1773,22 @@ impl OrchestratorMcp {
                 ));
             }
 
+            // Resolve an implicit repository before adding the worktree. Once the
+            // worktree exists, auto-detection may see both checkouts and fall back
+            // to the workspace root, which is not useful to the host scheduler.
+            let resolved_worktree_repo = spec.worktree.as_ref().map(|wt| {
+                wt.repo_path.clone().unwrap_or_else(|| {
+                    implicit_worktree_repo
+                        .clone()
+                        .expect("implicit worktree repository was resolved before the batch")
+                })
+            });
             let working_directory = if let Some(wt) = &spec.worktree {
                 self.create_worktree(CreateWorktreeParams {
                     path: wt.path.clone(),
                     branch: wt.branch.clone(),
                     base: wt.base.clone(),
-                    repo_path: wt.repo_path.clone(),
+                    repo_path: resolved_worktree_repo.clone(),
                 })
                 .map_err(|e| format!("task `{}`: worktree failed: {}", spec.task_key, e))?;
                 worktrees_created.push(json!({
@@ -1776,6 +1800,19 @@ impl OrchestratorMcp {
             } else {
                 spec.working_directory.clone()
             };
+            let (repository, branch) = spec
+                .worktree
+                .as_ref()
+                .map(|wt| {
+                    let repo_path = resolved_worktree_repo
+                        .as_deref()
+                        .expect("worktree repository was resolved before creation");
+                    (
+                        Some(repository_identity_for_scheduler(repo_path)),
+                        Some(wt.branch.clone()),
+                    )
+                })
+                .unwrap_or((None, None));
             if let Some(wd) = working_directory.as_deref() {
                 validate_working_directory_visible_to_worker(wd)?;
             }
@@ -1788,6 +1825,8 @@ impl OrchestratorMcp {
                 "model_override": spec.model_override,
                 "model_effort": spec.model_effort,
                 "working_directory": working_directory,
+                "repository": repository,
+                "branch": branch,
                 "depends_on": spec.depends_on,
             }));
         }
@@ -2685,6 +2724,37 @@ fn resolve_repo_path(explicit: Option<&str>) -> String {
     workspace_root
 }
 
+/// Persist a repository identifier the API/control process can use after this
+/// container-scoped MCP exits. Container guest paths are not necessarily
+/// visible on the host, while an OWNER/REPO identity works with `gh --repo`.
+fn repository_identity_for_scheduler(repo_path: &str) -> String {
+    if !std::path::Path::new(repo_path).exists() {
+        return repo_path.to_string();
+    }
+    let remote = Command::new("git")
+        .current_dir(repo_path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+    remote
+        .as_deref()
+        .and_then(github_repository_identity)
+        .unwrap_or_else(|| repo_path.to_string())
+}
+
+fn github_repository_identity(remote: &str) -> Option<String> {
+    let trimmed = remote.trim().trim_end_matches(".git");
+    let slug = trimmed
+        .split("github.com/")
+        .nth(1)
+        .or_else(|| trimmed.rsplit_once("github.com:").map(|(_, tail)| tail))?;
+    let slug = slug.trim_start_matches('/');
+    (slug.split('/').count() == 2).then(|| slug.to_string())
+}
+
 // =============================================================================
 // Container resource estimation
 // =============================================================================
@@ -3353,7 +3423,9 @@ async fn main() {
 
 #[cfg(test)]
 mod working_directory_tests {
-    use super::{path_is_within, validate_working_directory_visible_to_worker};
+    use super::{
+        github_repository_identity, path_is_within, validate_working_directory_visible_to_worker,
+    };
 
     fn with_env<F: FnOnce()>(workspace_type: Option<&str>, workspace: Option<&str>, f: F) {
         // SAFETY: tests in this module are run serially via `#[test]` with
@@ -3459,6 +3531,22 @@ mod working_directory_tests {
                 .expect_err("sibling path with prefix match should be rejected");
             assert!(err.contains("not be visible to the worker"));
         });
+    }
+
+    #[test]
+    fn github_repository_identity_parses_https_and_ssh_remotes() {
+        assert_eq!(
+            github_repository_identity("https://github.com/lfglabs-dev/verity.git").as_deref(),
+            Some("lfglabs-dev/verity")
+        );
+        assert_eq!(
+            github_repository_identity("git@github.com:lfglabs-dev/verity.git").as_deref(),
+            Some("lfglabs-dev/verity")
+        );
+        assert_eq!(
+            github_repository_identity("https://example.com/repo.git"),
+            None
+        );
     }
 }
 
