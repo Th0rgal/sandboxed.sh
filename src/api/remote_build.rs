@@ -175,6 +175,14 @@ fn default_requirements() -> Vec<String> {
     vec!["lean".to_string()]
 }
 
+fn normalized_lean_requirements(requirements: &[String]) -> Vec<String> {
+    let mut normalized = requirements.to_vec();
+    if !normalized.iter().any(|requirement| requirement == "lean") {
+        normalized.push("lean".to_string());
+    }
+    normalized
+}
+
 fn default_node_id() -> String {
     "auto".to_string()
 }
@@ -358,10 +366,24 @@ async fn resolve_node(
             format!("placed node '{picked}' vanished from configuration"),
         ));
     }
-    settings.node(node_id).cloned().ok_or((
+    let node = settings.node(node_id).cloned().ok_or((
         StatusCode::BAD_REQUEST,
         format!("remote node '{node_id}' is not configured"),
-    ))
+    ))?;
+    if requirements.iter().any(|requirement| requirement == "lean")
+        && state
+            .fleet
+            .get(node_id)
+            .and_then(|cached| cached.last_heartbeat)
+            .and_then(|heartbeat| heartbeat.lean_runtime_ready)
+            == Some(false)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("remote node '{node_id}' has no executable Lake runtime"),
+        ));
+    }
+    Ok(node)
 }
 
 fn submit_error_status(err: &RemoteNodeError) -> StatusCode {
@@ -467,11 +489,15 @@ async fn submit_remote_build(
     if req.command.is_empty() {
         return (StatusCode::BAD_REQUEST, "command argv required").into_response();
     }
+    // Every endpoint payload is a declarative Lean build. Callers may add
+    // placement labels, but may not remove the runtime readiness gate by
+    // sending an empty or unrelated requirements list.
+    let requirements = normalized_lean_requirements(&req.requirements);
 
     // Serialize placement through tentative-handle persistence. Otherwise a
     // burst can select the same idle node before its next heartbeat.
     let placement_guard = placement_lock().lock().await;
-    let node = match resolve_node(&state, &req.node_id, &req.requirements).await {
+    let node = match resolve_node(&state, &req.node_id, &requirements).await {
         Ok(node) => node,
         Err((status, message)) => return (status, message).into_response(),
     };
@@ -985,6 +1011,19 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         assert_eq!(req.cwd_rel.as_deref(), Some("verity"));
         assert_eq!(req.timeout_secs, Some(1200));
         assert_eq!(req.artifacts, vec![".lake/build/lib/*"]);
+    }
+
+    #[test]
+    fn lean_requirement_cannot_be_removed_by_request_overrides() {
+        assert_eq!(normalized_lean_requirements(&[]), vec!["lean".to_string()]);
+        assert_eq!(
+            normalized_lean_requirements(&["high-memory".to_string()]),
+            vec!["high-memory".to_string(), "lean".to_string()]
+        );
+        assert_eq!(
+            normalized_lean_requirements(&["lean".to_string(), "gpu".to_string()]),
+            vec!["lean".to_string(), "gpu".to_string()]
+        );
     }
 
     #[test]
