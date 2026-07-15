@@ -289,10 +289,14 @@ Validation (node-side, before anything runs):
   `lake build ...` and `lean ...`. The service environment is cleared before
   execution so node bearer/signing secrets are not inherited by build code.
 - `env` keys must be within `SANDBOXED_NODE_ENV_ALLOWLIST`.
-- When the payload omits `LEAN_NUM_THREADS` or `LAKE_JOBS`, the node defaults
-  each missing key to its usable logical-CPU count (`available_parallelism`,
-  including OS affinity/cgroup caps). Explicit allowlisted payload values take
-  precedence independently for each key.
+- When the payload omits `LEAN_NUM_THREADS` or `LAKE_JOBS`, the node divides
+  its usable logical-CPU budget (`available_parallelism`, including OS
+  affinity/cgroup caps) across both levels. Lake defaults to at most four jobs
+  and Lean receives the remaining per-job thread budget. When only one key is
+  supplied, the other is derived from the remaining CPU budget. Explicit
+  allowlisted payload values still take precedence. Direct `lean ...` jobs do
+  not have Lake fan-out, so they receive the full thread budget and default
+  `LAKE_JOBS` to one.
 - `timeout_secs` is clamped to `SANDBOXED_NODE_MAX_JOB_SECS`.
 
 Execution model:
