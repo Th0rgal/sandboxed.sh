@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PendingToolCall {
@@ -62,10 +63,29 @@ impl ToolCallJournal {
     async fn store(&self, entries: &[Entry]) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             tokio::fs::create_dir_all(parent).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+            }
         }
         let bytes = serde_json::to_vec_pretty(entries)?;
         let tmp = self.path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, bytes).await?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp).await?;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
+        }
         tokio::fs::rename(tmp, &self.path).await?;
         Ok(())
     }
@@ -136,6 +156,26 @@ mod tests {
             start_payload: serde_json::json!({"command": "do-once"}),
         };
         journal.started(descriptor.clone()).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(journal.path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&journal.path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         journal.started(descriptor.clone()).await.unwrap();
         assert_eq!(journal.pending().await.unwrap(), vec![descriptor]);
         journal.completed("call-1").await.unwrap();
