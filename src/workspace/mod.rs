@@ -807,6 +807,54 @@ pub fn mission_workspace_dir_for_root(root: &Path, mission_id: Uuid) -> PathBuf 
     workspaces_root_for(root).join(format!("mission-{}", short_id))
 }
 
+/// Resolve a configured project directory to its host-visible path.
+///
+/// Mission state (harness config, HOME and XDG data) deliberately lives in a
+/// per-mission directory, but a workspace can also expose a durable project
+/// checkout.  In an nspawn container, workspace environment paths name guest
+/// paths, so translate an absolute guest path through the container root
+/// before handing it to [`crate::workspace_exec::WorkspaceExec`].  Never
+/// accept a project path outside the selected workspace root.
+pub fn configured_project_dir(workspace: &Workspace, fallback: &Path) -> PathBuf {
+    configured_project_dir_with_nspawn(workspace, fallback, use_nspawn_for_workspace(workspace))
+}
+
+fn configured_project_dir_with_nspawn(
+    workspace: &Workspace,
+    fallback: &Path,
+    uses_nspawn: bool,
+) -> PathBuf {
+    let Some(project) = workspace
+        .env_vars
+        .get("LEAN_PROJECT_PATH")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return fallback.to_path_buf();
+    };
+
+    let configured = Path::new(project);
+    let candidate = if workspace.workspace_type == WorkspaceType::Container && uses_nspawn {
+        workspace
+            .path
+            .join(configured.strip_prefix("/").unwrap_or(configured))
+    } else {
+        configured.to_path_buf()
+    };
+
+    if candidate.starts_with(&workspace.path) {
+        candidate
+    } else {
+        tracing::warn!(
+            workspace = %workspace.name,
+            project_path = %project,
+            workspace_root = %workspace.path.display(),
+            "Ignoring project path outside selected workspace"
+        );
+        fallback.to_path_buf()
+    }
+}
+
 /// Workspace directory for a task under a specific workspace root.
 pub fn task_workspace_dir_for_root(root: &Path, task_id: Uuid) -> PathBuf {
     let short_id = &task_id.to_string()[..8];
@@ -3627,6 +3675,23 @@ pub async fn read_sandboxed_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verity_project_path_maps_to_container_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let mut workspace =
+            Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+        workspace.env_vars.insert(
+            "LEAN_PROJECT_PATH".to_string(),
+            "/workspace/verity/base".to_string(),
+        );
+        let mission_dir = root.path().join("workspaces/mission-deadbeef");
+
+        assert_eq!(
+            configured_project_dir_with_nspawn(&workspace, &mission_dir, true),
+            root.path().join("workspace/verity/base")
+        );
+    }
 
     #[tokio::test]
     async fn remote_build_wrapper_is_mission_scoped_and_executable_for_host_workspaces() {
