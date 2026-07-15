@@ -1352,6 +1352,12 @@ pub struct BoardTask {
     /// Working directory for the worker (usually an isolated git worktree).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+    /// Declared repository (path or OWNER/REPO identity) for retry artifact checks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// Declared git branch created for this task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Task keys (same board) that must settle successfully or be accepted
     /// before this task may start.
     pub depends_on: Vec<String>,
@@ -1360,6 +1366,12 @@ pub struct BoardTask {
     pub outcome: Option<BoardTaskOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_mission_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_worker_mission_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_outcome: Option<BoardTaskOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_result_digest: Option<String>,
     /// Number of worker spawns so far (1 = first attempt).
     pub attempts: u32,
     /// Truncated tail of the worker's final message, set on settle.
@@ -1385,6 +1397,10 @@ pub struct NewBoardTask {
     pub model_effort: Option<String>,
     #[serde(default)]
     pub working_directory: Option<String>,
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
 }

@@ -1776,6 +1776,20 @@ impl OrchestratorMcp {
             } else {
                 spec.working_directory.clone()
             };
+            let (repository, branch) = spec
+                .worktree
+                .as_ref()
+                .map(|wt| {
+                    (
+                        Some(
+                            resolve_repo_path(wt.repo_path.as_deref())
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                        Some(wt.branch.clone()),
+                    )
+                })
+                .unwrap_or((None, None));
             if let Some(wd) = working_directory.as_deref() {
                 validate_working_directory_visible_to_worker(wd)?;
             }
@@ -1788,6 +1802,8 @@ impl OrchestratorMcp {
                 "model_override": spec.model_override,
                 "model_effort": spec.model_effort,
                 "working_directory": working_directory,
+                "repository": repository,
+                "branch": branch,
                 "depends_on": spec.depends_on,
             }));
         }

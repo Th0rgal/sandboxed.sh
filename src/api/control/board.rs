@@ -23,6 +23,8 @@
 //! `try_send` (never awaited — the scheduler runs on the consuming task).
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -48,6 +50,162 @@ const STUCK_PENDING_SECS: i64 = 90;
 /// Digest truncation: keep the head and tail of the worker's final message.
 const DIGEST_HEAD_CHARS: usize = 400;
 const DIGEST_TAIL_CHARS: usize = 1200;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetryPreflight {
+    NothingFound,
+    Surviving {
+        branch_state: String,
+        pr_number: Option<u64>,
+    },
+    Merged {
+        pr_number: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDisposition {
+    Spawn,
+    ParkForBossReview,
+}
+
+fn retry_disposition(task: &BoardTask, preflight: &RetryPreflight) -> RetryDisposition {
+    if task.attempts > 0 && matches!(preflight, RetryPreflight::Merged { .. }) {
+        RetryDisposition::ParkForBossReview
+    } else {
+        RetryDisposition::Spawn
+    }
+}
+
+fn retry_prompt(task: &BoardTask, preflight: &RetryPreflight) -> String {
+    let RetryPreflight::Surviving {
+        branch_state,
+        pr_number,
+    } = preflight
+    else {
+        return task.prompt.clone();
+    };
+    let pr = pr_number
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "[Prior-attempt digest]\nPrior worker: {}\nPrior outcome: {}\nPrior result: {}\nBranch: {} ({branch_state})\nPR: {pr}\n\
+         Continue the prior attempt: checkout the existing branch, never recreate from master, never force-push.\n\n{}",
+        task.prior_worker_mission_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        task.prior_outcome
+            .map(|outcome| outcome.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        task.prior_result_digest.as_deref().unwrap_or("unavailable"),
+        task.branch.as_deref().unwrap_or("unknown"),
+        task.prompt,
+    )
+}
+
+fn repository_identity(repository: &str) -> Option<String> {
+    if !Path::new(repository).exists() {
+        return repository.contains('/').then(|| repository.to_string());
+    }
+    let output = Command::new("git")
+        .current_dir(repository)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let trimmed = url.trim_end_matches(".git");
+    let slug = trimmed
+        .split("github.com/")
+        .nth(1)
+        .or_else(|| trimmed.rsplit_once(':').map(|(_, tail)| tail))?;
+    Some(slug.trim_start_matches('/').to_string())
+}
+
+async fn retry_preflight(task: &BoardTask) -> RetryPreflight {
+    let Some(repository) = task.repository.clone() else {
+        return RetryPreflight::NothingFound;
+    };
+    let Some(branch) = task.branch.clone() else {
+        return RetryPreflight::NothingFound;
+    };
+    let working_directory = task.working_directory.clone();
+    let task_key = task.task_key.clone();
+    tokio::task::spawn_blocking(move || {
+        let local_repo = if Path::new(&repository).exists() {
+            Some(repository.as_str())
+        } else {
+            working_directory.as_deref().filter(|path| Path::new(path).exists())
+        };
+        let local_exists = local_repo.is_some_and(|repo| {
+            Command::new("git")
+                .current_dir(repo)
+                .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+                .status()
+                .is_ok_and(|status| status.success())
+        });
+        let remote_exists = local_repo.is_some_and(|repo| {
+            match Command::new("git")
+                .current_dir(repo)
+                .args(["ls-remote", "--exit-code", "origin", &format!("refs/heads/{branch}")])
+                .output()
+            {
+                Ok(output) => output.status.success(),
+                Err(error) => {
+                    tracing::warn!(task = %task_key, "board: retry remote branch lookup failed: {error}");
+                    false
+                }
+            }
+        });
+
+        let mut open_pr = None;
+        if let Some(identity) = repository_identity(&repository) {
+            match Command::new("gh")
+                .args([
+                    "pr", "list", "--repo", &identity, "--head", &branch, "--state", "all",
+                    "--limit", "20", "--json", "number,state,mergedAt",
+                ])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    if let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
+                        for row in rows {
+                            let number = row["number"].as_u64().unwrap_or_default();
+                            if row["mergedAt"].is_string() {
+                                return RetryPreflight::Merged { pr_number: number };
+                            }
+                            if row["state"].as_str() == Some("OPEN") {
+                                open_pr = Some(number);
+                            }
+                        }
+                    }
+                }
+                Ok(output) => tracing::warn!(task = %task_key, status = %output.status,
+                    "board: retry PR lookup failed; continuing best-effort"),
+                Err(error) => tracing::warn!(task = %task_key,
+                    "board: retry PR lookup unavailable; continuing best-effort: {error}"),
+            }
+        }
+        if local_exists || remote_exists || open_pr.is_some() {
+            let state = match (local_exists, remote_exists) {
+                (true, true) => "local and remote branch exist",
+                (true, false) => "local branch exists",
+                (false, true) => "remote branch exists",
+                (false, false) => "open PR exists",
+            };
+            RetryPreflight::Surviving {
+                branch_state: state.into(),
+                pr_number: open_pr,
+            }
+        } else {
+            RetryPreflight::NothingFound
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(task = %task.task_key, "board: retry preflight failed: {error}");
+        RetryPreflight::NothingFound
+    })
+}
 
 /// Snapshot of runner occupancy, computed by the actor loop each pass.
 pub struct RunnerSnapshot {
@@ -416,7 +574,40 @@ pub async fn scheduler_pass(
                     if available == 0 {
                         break;
                     }
-                    match spawn_task_worker(mission_store, cmd_tx, &task, boss.workspace_id).await {
+                    let preflight = if task.attempts > 0 {
+                        retry_preflight(&task).await
+                    } else {
+                        RetryPreflight::NothingFound
+                    };
+                    if retry_disposition(&task, &preflight) == RetryDisposition::ParkForBossReview {
+                        let RetryPreflight::Merged { pr_number } = preflight else {
+                            unreachable!();
+                        };
+                        let mut parked = task.clone();
+                        parked.status = BoardTaskStatus::Settled;
+                        parked.outcome = Some(BoardTaskOutcome::Blocked);
+                        parked.result_digest = Some(format!(
+                            "Retry suppressed: declared branch was already merged in PR #{pr_number}; boss review required."
+                        ));
+                        parked.notes = append_note(
+                            &parked.notes,
+                            &format!("auto-respawn parked: PR #{pr_number} is merged"),
+                        );
+                        if let Err(error) = mission_store.save_board_task(&parked).await {
+                            tracing::warn!(task = %task.task_key,
+                                "board: failed to park merged retry: {error}");
+                        }
+                        continue;
+                    }
+                    match spawn_task_worker(
+                        mission_store,
+                        cmd_tx,
+                        &task,
+                        boss.workspace_id,
+                        &preflight,
+                    )
+                    .await
+                    {
                         Ok(worker_id) => {
                             available -= 1;
                             tracing::info!(task = %task.task_key, worker = %worker_id, boss = %boss_id,
@@ -471,6 +662,7 @@ async fn spawn_task_worker(
     cmd_tx: &mpsc::Sender<ControlCommand>,
     task: &BoardTask,
     workspace_id: Uuid,
+    preflight: &RetryPreflight,
 ) -> Result<Uuid, String> {
     // Board tasks bypass the public create-mission handler, so apply the same
     // backend-aware normalization here as a defensive migration for tasks that
@@ -503,7 +695,7 @@ async fn spawn_task_worker(
     }
     mission_store.save_board_task(&t).await?;
 
-    let prompt = format!("{}{}", t.prompt, worker_contract(&t));
+    let prompt = format!("{}{}", retry_prompt(&t, preflight), worker_contract(&t));
     if !self_send_message(cmd_tx, mission.id, prompt) {
         // Channel full: leave the task running; the zombie sweep re-kicks the
         // pending worker mission after the grace period.
@@ -535,6 +727,9 @@ async fn settle_task(
                     .unwrap_or_default()
             ),
         );
+        task.prior_worker_mission_id = task.worker_mission_id;
+        task.prior_outcome = Some(outcome);
+        task.prior_result_digest = Some(digest_excerpt(output));
         task.worker_mission_id = None;
         if let Err(e) = mission_store.save_board_task(&task).await {
             tracing::warn!(task = %task.task_key, "board: failed to persist retry: {}", e);
@@ -654,10 +849,15 @@ mod tests {
             model_override: None,
             model_effort: None,
             working_directory: None,
+            repository: None,
+            branch: None,
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             status,
             outcome,
             worker_mission_id: None,
+            prior_worker_mission_id: None,
+            prior_outcome: None,
+            prior_result_digest: None,
             attempts: 0,
             result_digest: None,
             notes: None,
@@ -839,6 +1039,8 @@ mod tests {
                         model_override: Some("gpt-5.6-sol".into()),
                         model_effort: None,
                         working_directory: None,
+                        repository: None,
+                        branch: None,
                         depends_on: vec![],
                     },
                     NewBoardTask {
@@ -849,6 +1051,8 @@ mod tests {
                         model_override: None,
                         model_effort: None,
                         working_directory: None,
+                        repository: None,
+                        branch: None,
                         depends_on: vec!["t1".into()],
                     },
                 ],
@@ -888,6 +1092,8 @@ mod tests {
                     model_override: None,
                     model_effort: None,
                     working_directory: None,
+                    repository: None,
+                    branch: None,
                     depends_on: vec![],
                 }],
             )
@@ -958,6 +1164,8 @@ mod tests {
                         model_override: None,
                         model_effort: None,
                         working_directory: None,
+                        repository: None,
+                        branch: None,
                         depends_on: vec![],
                     },
                     NewBoardTask {
@@ -968,6 +1176,8 @@ mod tests {
                         model_override: None,
                         model_effort: None,
                         working_directory: None,
+                        repository: None,
+                        branch: None,
                         depends_on: vec![],
                     },
                 ],
