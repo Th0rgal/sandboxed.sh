@@ -816,7 +816,9 @@ mod tests {
                 ) && matches!(
                     store.get(queued).await.unwrap().map(|record| record.state),
                     Some(JobState::Queued)
-                ) {
+                ) && runner.active_count() == 1
+                    && runner.queued_count() == 1
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
