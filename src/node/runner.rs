@@ -382,7 +382,7 @@ pub(crate) async fn run_logged_command(
         .append(true)
         .open(log_path)?;
     let stderr_file = stdout_file.try_clone()?;
-    let (mut cmd, systemd_scope) = contain_command(cmd, environment);
+    let (mut cmd, systemd_scope) = contain_command(cmd, environment)?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
@@ -424,7 +424,7 @@ pub(crate) async fn run_logged_command(
 fn contain_command(
     cmd: tokio::process::Command,
     environment: CommandEnvironment,
-) -> (tokio::process::Command, Option<SystemdScope>) {
+) -> std::io::Result<(tokio::process::Command, Option<SystemdScope>)> {
     #[cfg(target_os = "linux")]
     {
         if let Some(mode) = systemd_scope_mode() {
@@ -432,10 +432,13 @@ fn contain_command(
                 unit: format!("sandboxed-node-job-{}.scope", Uuid::new_v4().simple()),
                 mode,
             };
-            return (systemd_scope_command(cmd, environment, &scope), Some(scope));
+            return Ok((
+                systemd_scope_command(cmd, environment, &scope)?,
+                Some(scope),
+            ));
         }
     }
-    (cmd, None)
+    Ok((cmd, None))
 }
 
 #[cfg(target_os = "linux")]
@@ -482,7 +485,7 @@ fn systemd_scope_command(
     cmd: tokio::process::Command,
     environment: CommandEnvironment,
     scope: &SystemdScope,
-) -> tokio::process::Command {
+) -> std::io::Result<tokio::process::Command> {
     let command = cmd.as_std();
     let program = command.get_program().to_os_string();
     let args: Vec<_> = command.get_args().map(ToOwned::to_owned).collect();
@@ -509,15 +512,15 @@ fn systemd_scope_command(
         // systemd-run's own environment intact for the user bus, but reset
         // the environment at the payload boundary and add back only the
         // command's explicitly configured entries.
-        scoped.arg("env").arg("-i");
+        scoped
+            .arg(std::env::current_exe()?)
+            .arg("--sandboxed-scope-exec-cleared-env");
         for (key, value) in &env {
             if let Some(value) = value {
-                let mut assignment = key.clone();
-                assignment.push("=");
-                assignment.push(value);
-                scoped.arg(assignment);
+                scoped.arg(key).env(key, value);
             }
         }
+        scoped.arg("--");
     }
     scoped.arg(program).args(args);
     if let Some(cwd) = cwd {
@@ -535,7 +538,48 @@ fn systemd_scope_command(
             }
         }
     }
-    scoped
+    Ok(scoped)
+}
+
+/// Replace the node process with a scope payload whose environment contains
+/// only the named variables. Values stay in the inherited environment until
+/// `exec`, never in argv. Returns `Ok(false)` for a normal node invocation.
+pub fn maybe_exec_cleared_scope_payload() -> std::io::Result<bool> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--sandboxed-scope-exec-cleared-env")) {
+        return Ok(false);
+    }
+
+    let mut keys = Vec::new();
+    loop {
+        let arg = args.next().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing scope payload")
+        })?;
+        if arg == "--" {
+            break;
+        }
+        keys.push(arg);
+    }
+    let program = args.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing scope payload program",
+        )
+    })?;
+    let env = keys
+        .into_iter()
+        .filter_map(|key| std::env::var_os(&key).map(|value| (key, value)))
+        .collect::<Vec<_>>();
+    let mut command = std::process::Command::new(program);
+    command.args(args).env_clear().envs(env);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        return Err(command.exec());
+    }
+    #[cfg(not(unix))]
+    Ok(true)
 }
 
 async fn kill_contained_process(
@@ -847,7 +891,8 @@ mod tests {
                 unit: "sandboxed-node-job-test.scope".to_string(),
                 mode: SystemdScopeMode::User,
             },
-        );
+        )
+        .unwrap();
         let argv = scoped
             .as_std()
             .get_args()
@@ -878,7 +923,8 @@ mod tests {
                 unit: "sandboxed-node-job-test.scope".to_string(),
                 mode: SystemdScopeMode::User,
             },
-        );
+        )
+        .unwrap();
         let argv = scoped
             .as_std()
             .get_args()
@@ -890,9 +936,11 @@ mod tests {
             .position(|arg| arg == "--")
             .map(|index| &argv[index + 1..])
             .expect("systemd-run payload separator");
-        assert_eq!(payload.first().map(String::as_str), Some("env"));
-        assert!(payload.iter().any(|arg| arg == "-i"));
-        assert!(payload.iter().any(|arg| arg == "EXPLICIT_JOB_ENV=present"));
+        assert!(payload
+            .iter()
+            .any(|arg| arg == "--sandboxed-scope-exec-cleared-env"));
+        assert!(payload.iter().any(|arg| arg == "EXPLICIT_JOB_ENV"));
+        assert!(!payload.iter().any(|arg| arg.contains("present")));
         assert!(!payload
             .iter()
             .any(|arg| arg.starts_with("SANDBOXED_NODE_TOKEN=")));
