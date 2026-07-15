@@ -43,6 +43,10 @@ enum SystemdScopeMode {
 struct SystemdScope {
     unit: String,
     mode: SystemdScopeMode,
+    /// User-manager runtime selected from the runner's effective UID. This is
+    /// carried explicitly because a system service's `%U` specifier expands
+    /// to the system manager (root), not necessarily to `User=`.
+    user_runtime_dir: Option<PathBuf>,
 }
 
 struct QueuedJob {
@@ -463,10 +467,11 @@ fn contain_command(
     }
     #[cfg(target_os = "linux")]
     {
-        if let Some(mode) = systemd_scope_mode() {
+        if let Some((mode, user_runtime_dir)) = systemd_scope_mode() {
             let scope = SystemdScope {
                 unit: format!("sandboxed-node-job-{}.scope", Uuid::new_v4().simple()),
                 mode,
+                user_runtime_dir,
             };
             return Ok((
                 systemd_scope_command(cmd, environment, &scope)?,
@@ -478,7 +483,7 @@ fn contain_command(
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_scope_mode() -> Option<SystemdScopeMode> {
+fn systemd_scope_mode() -> Option<(SystemdScopeMode, Option<PathBuf>)> {
     // Merely seeing systemd's runtime directory is insufficient in containers
     // and CI runners. Root can use the system manager. A hardened non-root
     // node uses its lingering user manager, exposed through XDG_RUNTIME_DIR;
@@ -488,18 +493,16 @@ fn systemd_scope_mode() -> Option<SystemdScopeMode> {
     }
     // SAFETY: geteuid() is a side-effect-free syscall with no preconditions.
     if unsafe { libc::geteuid() == 0 } {
-        return Some(SystemdScopeMode::System);
+        return Some((SystemdScopeMode::System, None));
     }
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
-    match user_systemd_scope_mode(Path::new(&runtime_dir)) {
-        Ok(mode) => Some(mode),
+    match user_systemd_runtime_dir() {
+        Ok(runtime_dir) => Some((SystemdScopeMode::User, Some(runtime_dir))),
         Err(error) => {
             static WARN_DEGRADED_CONTAINMENT: std::sync::Once = std::sync::Once::new();
             WARN_DEGRADED_CONTAINMENT.call_once(|| {
                 tracing::warn!(
-                    bus = %Path::new(&runtime_dir).join("bus").display(),
                     %error,
-                    "transient user scopes are unavailable; containment degraded to process groups; ProtectHome=true may be hiding /run/user (bind the runner's /run/user/%U into the unit)"
+                    "transient user scopes are unavailable; containment degraded to process groups; enable lingering for the runner user and expose /run/user/<runner-uid>"
                 );
             });
             None
@@ -508,12 +511,31 @@ fn systemd_scope_mode() -> Option<SystemdScopeMode> {
 }
 
 #[cfg(target_os = "linux")]
-fn user_systemd_scope_mode(runtime_dir: &Path) -> std::io::Result<SystemdScopeMode> {
+fn user_systemd_runtime_dir() -> std::io::Result<PathBuf> {
+    let configured = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    // SAFETY: geteuid() is a side-effect-free syscall with no preconditions.
+    let derived = PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }));
+    select_user_systemd_runtime_dir(configured.as_deref(), &derived)
+}
+
+#[cfg(target_os = "linux")]
+fn select_user_systemd_runtime_dir(
+    configured: Option<&Path>,
+    derived: &Path,
+) -> std::io::Result<PathBuf> {
     // Connecting verifies that the path is both visible and usable by this
     // process. A metadata/existence check can pass for an inaccessible,
     // stale, or non-socket path and make systemd-run fail later per job.
-    std::os::unix::net::UnixStream::connect(runtime_dir.join("bus"))?;
-    Ok(SystemdScopeMode::User)
+    let mut last_error = None;
+    for runtime_dir in configured.into_iter().chain(std::iter::once(derived)) {
+        match std::os::unix::net::UnixStream::connect(runtime_dir.join("bus")) {
+            Ok(_) => return Ok(runtime_dir.to_path_buf()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "user manager bus not found")
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -534,6 +556,12 @@ fn systemd_scope_command(
     let mut scoped = tokio::process::Command::new("systemd-run");
     if scope.mode == SystemdScopeMode::User {
         scoped.arg("--user");
+        if let Some(runtime_dir) = &scope.user_runtime_dir {
+            scoped.env("XDG_RUNTIME_DIR", runtime_dir).env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", runtime_dir.join("bus").display()),
+            );
+        }
     }
     scoped
         .arg("--scope")
@@ -628,6 +656,12 @@ async fn kill_contained_process(
         let mut stop_command = tokio::process::Command::new("systemctl");
         if scope.mode == SystemdScopeMode::User {
             stop_command.arg("--user");
+            if let Some(runtime_dir) = &scope.user_runtime_dir {
+                stop_command.env("XDG_RUNTIME_DIR", runtime_dir).env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    format!("unix:path={}", runtime_dir.join("bus").display()),
+                );
+            }
         }
         let stop = stop_command
             .arg("stop")
@@ -928,6 +962,7 @@ mod tests {
             &SystemdScope {
                 unit: "sandboxed-node-job-test.scope".to_string(),
                 mode: SystemdScopeMode::User,
+                user_runtime_dir: Some(PathBuf::from("/run/user/1234")),
             },
         )
         .unwrap();
@@ -946,6 +981,13 @@ mod tests {
             .as_std()
             .get_envs()
             .any(|(key, value)| key == "NODE_JOB_SECRET" && value == Some("not-in-argv".as_ref())));
+        assert!(scoped.as_std().get_envs().any(|(key, value)| {
+            key == "XDG_RUNTIME_DIR" && value == Some("/run/user/1234".as_ref())
+        }));
+        assert!(scoped.as_std().get_envs().any(|(key, value)| {
+            key == "DBUS_SESSION_BUS_ADDRESS"
+                && value == Some("unix:path=/run/user/1234/bus".as_ref())
+        }));
     }
 
     #[cfg(target_os = "linux")]
@@ -960,6 +1002,7 @@ mod tests {
             &SystemdScope {
                 unit: "sandboxed-node-job-test.scope".to_string(),
                 mode: SystemdScopeMode::User,
+                user_runtime_dir: None,
             },
         )
         .unwrap();
@@ -990,7 +1033,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("bus"), b"not a socket").unwrap();
 
-        assert!(user_systemd_scope_mode(dir.path()).is_err());
+        assert!(select_user_systemd_runtime_dir(Some(dir.path()), dir.path()).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -1000,8 +1043,21 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(dir.path().join("bus")).unwrap();
 
         assert_eq!(
-            user_systemd_scope_mode(dir.path()).unwrap(),
-            SystemdScopeMode::User
+            select_user_systemd_runtime_dir(Some(dir.path()), dir.path()).unwrap(),
+            dir.path()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_scope_probe_ignores_stale_configured_runtime() {
+        let stale = tempfile::tempdir().unwrap();
+        let derived = tempfile::tempdir().unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(derived.path().join("bus")).unwrap();
+
+        assert_eq!(
+            select_user_systemd_runtime_dir(Some(stale.path()), derived.path()).unwrap(),
+            derived.path()
         );
     }
 
