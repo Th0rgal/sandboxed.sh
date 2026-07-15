@@ -156,15 +156,16 @@ fn has_delivery_evidence(output: &str) -> bool {
     let legacy_completion = normalized.starts_with("i will mark this complete:");
     let mut progress = normalized.as_str();
     for prefix in ["acknowledged", "okay", "ok", "sure", "understood", "got it"] {
-        if let Some(rest) = progress.strip_prefix(prefix)
-            && rest
+        if let Some(rest) = progress.strip_prefix(prefix) {
+            let boundary = rest
                 .chars()
                 .next()
-                .is_none_or(|c| c.is_ascii_punctuation() || c.is_whitespace())
-        {
-            progress =
-                rest.trim_start_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace());
-            break;
+                .map_or(true, |c| c.is_ascii_punctuation() || c.is_whitespace());
+            if boundary {
+                progress = rest
+                    .trim_start_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace());
+                break;
+            }
         }
     }
     let future_intent = [
