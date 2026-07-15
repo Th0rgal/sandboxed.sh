@@ -48,8 +48,12 @@ def mission_index(missions_dir):
                 prefix = mission_id[:8].lower()
                 record = {"mission_id": mission_id, "status": status.lower(),
                           "updated_at": updated_at, "workspace_id": workspace_id,
-                          "owner": db.stem.removeprefix("missions-")}
+                          "owner": db.stem.removeprefix("missions-"),
+                          "short_id_collision": False}
                 previous = records.get(prefix)
+                if previous is not None:
+                    record["short_id_collision"] = True
+                    previous["short_id_collision"] = True
                 if previous is None or (record["status"] in ACTIVE and previous["status"] not in ACTIVE):
                     records[prefix] = record
             conn.close()
@@ -136,6 +140,7 @@ def inventory(root, index, index_complete, cutoff):
         active = bool(mission and mission["status"] in ACTIVE)
         terminal = bool(mission and mission["status"] in TERMINAL)
         mission_updated_at = iso_time(mission["updated_at"]) if mission else None
+        short_id_collision = bool(mission and mission["short_id_collision"])
         # Only a terminal, attributed mission directory is ever proposed.
         # Caches, worktrees, images, and unattributed directories remain
         # inventory-only even when old: an operator must establish ownership
@@ -144,6 +149,7 @@ def inventory(root, index, index_complete, cutoff):
             kind == "mission_dir"
             and index_complete
             and mission
+            and not short_id_collision
             and terminal
             and mission_updated_at is not None
             and mission_updated_at < cutoff
@@ -156,6 +162,8 @@ def inventory(root, index, index_complete, cutoff):
             reason = "mission_attribution_incomplete"
         elif not mission:
             reason = "unattributed_requires_owner_approval"
+        elif short_id_collision:
+            reason = "short_id_collision_protected"
         elif not terminal:
             reason = "non_terminal_mission_protected"
         elif mission_updated_at is None:

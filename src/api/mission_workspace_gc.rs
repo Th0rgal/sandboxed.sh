@@ -172,6 +172,18 @@ pub(crate) fn entry_for_workspace(
         })
 }
 
+/// Whether the most protective known owner of a shared short-id directory is
+/// terminal and past retention. Phase 1 must use the same collision policy as
+/// the disk-driven sweep before proposing or removing the shared path.
+fn indexed_mission_directory_is_collectible(
+    entries: &[MissionIndexEntry],
+    workspace_id: uuid::Uuid,
+    cutoff: DateTime<Utc>,
+) -> bool {
+    entry_for_workspace(entries, workspace_id)
+        .is_some_and(|entry| is_gc_eligible_status(&entry.status) && entry.updated_at < cutoff)
+}
+
 /// Read one persisted SQLite mission store without booting a session.
 fn index_store_file_blocking(
     path: &std::path::Path,
@@ -606,6 +618,7 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
             .iter()
             .map(String::as_str),
     );
+    let mission_index = build_mission_index(state).await;
     let sessions = state.control.all_sessions().await;
     for session in sessions {
         let store = session.mission_store.clone();
@@ -650,6 +663,18 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
                 };
                 let dir = workspace::mission_workspace_dir_for_root(&ws.path, mission.id);
                 if !dir.exists() {
+                    continue;
+                }
+                let short = mission.id.simple().to_string()[..8].to_string();
+                if mission_index.by_short.get(&short).is_some_and(|entries| {
+                    !indexed_mission_directory_is_collectible(entries, workspace_id, cutoff)
+                }) {
+                    tracing::debug!(
+                        mission_id = %mission.id,
+                        workspace_id = %workspace_id,
+                        path = %dir.display(),
+                        "mission GC: kept (short-id collision owner protected)",
+                    );
                     continue;
                 }
                 if mission_directory_candidate(&scope_protected, &ws.path, mission.id)
@@ -713,6 +738,7 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
         params,
         &dry_run_candidates,
         &scope_protected,
+        &mission_index,
         &mut report,
     )
     .await;
@@ -728,9 +754,9 @@ async fn orphan_sweep(
     params: &SweepParams,
     dry_run_candidates: &std::collections::HashSet<std::path::PathBuf>,
     scope_protected: &std::collections::HashSet<(String, String)>,
+    index_full: &MissionIndex,
     report: &mut SweepReport,
 ) {
-    let index_full = build_mission_index(state).await;
     let index = &index_full.by_short;
 
     for ws in state.workspaces.list().await {
@@ -966,6 +992,11 @@ mod tests {
             entry_for_workspace(&entries, workspace_id).unwrap().status,
             MissionStatus::Active
         );
+        assert!(!indexed_mission_directory_is_collectible(
+            &entries,
+            workspace_id,
+            now - chrono::Duration::days(7),
+        ));
     }
 
     #[test]

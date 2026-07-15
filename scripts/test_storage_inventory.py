@@ -21,6 +21,8 @@ with tempfile.TemporaryDirectory() as temp:
     conn.execute("INSERT INTO missions VALUES (?, ?, ?, ?)", ("dddddddd-dddd-dddd-dddd-dddddddddddd", "paused", "2025-01-01T00:00:00Z", "ws-d"))
     conn.execute("INSERT INTO missions VALUES (?, ?, ?, ?)", ("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "awaiting_user", "2025-01-01T00:00:00Z", "ws-e"))
     conn.execute("INSERT INTO missions VALUES (?, ?, ?, ?)", ("ffffffff-ffff-ffff-ffff-ffffffffffff", "failed", "not-a-timestamp", "ws-f"))
+    conn.execute("INSERT INTO missions VALUES (?, ?, ?, ?)", ("99999999-0000-0000-0000-000000000001", "completed", "2025-01-01T00:00:00Z", "ws-g"))
+    conn.execute("INSERT INTO missions VALUES (?, ?, ?, ?)", ("99999999-0000-0000-0000-000000000002", "paused", "2025-01-01T00:00:00Z", "ws-g"))
     conn.commit(); conn.close()
     workspaces = root / "workspaces"; workspaces.mkdir()
     active = workspaces / "mission-aaaaaaaa"; active.mkdir(); (active / "live").write_text("x")
@@ -29,11 +31,12 @@ with tempfile.TemporaryDirectory() as temp:
     paused = workspaces / "mission-dddddddd"; paused.mkdir()
     awaiting_user = workspaces / "mission-eeeeeeee"; awaiting_user.mkdir()
     invalid_timestamp = workspaces / "mission-ffffffff"; invalid_timestamp.mkdir()
+    collided = workspaces / "mission-99999999"; collided.mkdir()
     cache = workspaces / "cache"; cache.mkdir(); (cache / "artifact").write_text("x" * 32)
     lean_cache = old / ".lake"; lean_cache.mkdir(); (lean_cache / "olean").write_text("x" * 32)
     old_time = time.time() - 20 * 86400; __import__("os").utime(old, (old_time, old_time))
     __import__("os").utime(recently_updated, (old_time, old_time))
-    for path in (paused, awaiting_user, invalid_timestamp):
+    for path in (paused, awaiting_user, invalid_timestamp, collided):
         __import__("os").utime(path, (old_time, old_time))
     __import__("os").utime(cache, (old_time, old_time))
     # This reproduces the prior predicate bug: an old cache nested below a
@@ -53,6 +56,8 @@ with tempfile.TemporaryDirectory() as temp:
     assert items["mission-eeeeeeee"]["reason"] == "non_terminal_mission_protected"
     assert items["mission-ffffffff"]["action"] == "keep"
     assert items["mission-ffffffff"]["reason"] == "mission_timestamp_invalid"
+    assert items["mission-99999999"]["action"] == "keep"
+    assert items["mission-99999999"]["reason"] == "short_id_collision_protected"
     assert items["cache"]["action"] == "keep"
     assert items["cache"]["reason"] == "unattributed_requires_owner_approval"
     assert items[".lake"]["kind"] == "build_cache"
