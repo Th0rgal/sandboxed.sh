@@ -576,7 +576,7 @@ pub fn maybe_exec_cleared_scope_payload() -> std::io::Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        return Err(command.exec());
+        Err(command.exec())
     }
     #[cfg(not(unix))]
     Ok(true)
