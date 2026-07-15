@@ -836,12 +836,25 @@ impl AppServerEventTranslator {
             let Some(descriptor) = self.pending_tool_calls.remove(&id) else {
                 continue;
             };
-            events.push(ExecutionEvent::Error {
-                    message: format!(
-                        "codex app-server transport failure: pending tool call {} ({}) remained unresolved after thread/resume; the command was not replayed",
-                        descriptor.id, descriptor.name
-                    ),
-                });
+            let message = format!(
+                "codex app-server transport failure: pending tool call {} ({}) remained unresolved after thread/resume; the command was not replayed",
+                descriptor.id, descriptor.name
+            );
+            // Close the lifecycle for downstream accounting without claiming
+            // that the tool succeeded or failed remotely. The execution
+            // outcome is explicitly unknown and the turn still receives a
+            // fatal Error event immediately afterwards.
+            events.push(ExecutionEvent::ToolResult {
+                id: descriptor.id.clone(),
+                name: descriptor.name.clone(),
+                result: serde_json::json!({
+                    "status": "transport_interrupted",
+                    "execution_outcome": "unknown",
+                    "replayed": false,
+                    "error": message,
+                }),
+            });
+            events.push(ExecutionEvent::Error { message });
         }
         events
     }
@@ -1551,13 +1564,18 @@ mod tests {
 
         let interrupted = translator.pending_tool_ids();
         let reconciled = translator.transport_failures(&interrupted);
-        assert!(reconciled
-            .iter()
-            .all(|event| !matches!(event, ExecutionEvent::ToolResult { .. })));
         assert!(matches!(
             reconciled.as_slice(),
-            [ExecutionEvent::Error { message }]
-                if message.contains("transport")
+            [
+                ExecutionEvent::ToolResult { id, name, result },
+                ExecutionEvent::Error { message }
+            ]
+                if id == "tool-1"
+                    && name == "write_file"
+                    && result["status"] == "transport_interrupted"
+                    && result["execution_outcome"] == "unknown"
+                    && result["replayed"] == false
+                    && message.contains("transport")
                     && message.contains("tool-1")
                     && message.contains("write_file")
         ));
@@ -1589,8 +1607,15 @@ mod tests {
         assert!(translator.pending_tool_ids().is_empty());
         assert!(matches!(
             events.as_slice(),
-            [ExecutionEvent::Error { message }]
-                if message.contains("tool-terminal") && message.contains("bash")
+            [
+                ExecutionEvent::ToolResult { id, name, result },
+                ExecutionEvent::Error { message }
+            ]
+                if id == "tool-terminal"
+                    && name == "bash"
+                    && result["execution_outcome"] == "unknown"
+                    && message.contains("tool-terminal")
+                    && message.contains("bash")
         ));
     }
 
