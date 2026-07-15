@@ -827,6 +827,38 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn user_scope_wrapper_preserves_cleared_payload_environment() {
+        let mut cmd = tokio::process::Command::new("/usr/bin/env");
+        cmd.env_clear().env("EXPLICIT_JOB_ENV", "present");
+
+        let scoped = systemd_scope_command(
+            cmd,
+            &SystemdScope {
+                unit: "sandboxed-node-job-test.scope".to_string(),
+                mode: SystemdScopeMode::User,
+            },
+        );
+        let argv = scoped
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let payload = argv
+            .iter()
+            .position(|arg| arg == "--")
+            .map(|index| &argv[index + 1..])
+            .expect("systemd-run payload separator");
+        assert_eq!(payload.first().map(String::as_str), Some("env"));
+        assert!(payload.iter().any(|arg| arg == "-i"));
+        assert!(payload.iter().any(|arg| arg == "EXPLICIT_JOB_ENV=present"));
+        assert!(!payload
+            .iter()
+            .any(|arg| arg.starts_with("SANDBOXED_NODE_TOKEN=")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn user_scope_probe_requires_an_accessible_bus_socket() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("bus"), b"not a socket").unwrap();
