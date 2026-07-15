@@ -1759,12 +1759,19 @@ impl OrchestratorMcp {
                 ));
             }
 
+            // Resolve an implicit repository before adding the worktree. Once the
+            // worktree exists, auto-detection may see both checkouts and fall back
+            // to the workspace root, which is not useful to the host scheduler.
+            let resolved_worktree_repo = spec
+                .worktree
+                .as_ref()
+                .map(|wt| resolve_repo_path(wt.repo_path.as_deref()));
             let working_directory = if let Some(wt) = &spec.worktree {
                 self.create_worktree(CreateWorktreeParams {
                     path: wt.path.clone(),
                     branch: wt.branch.clone(),
                     base: wt.base.clone(),
-                    repo_path: wt.repo_path.clone(),
+                    repo_path: resolved_worktree_repo.clone(),
                 })
                 .map_err(|e| format!("task `{}`: worktree failed: {}", spec.task_key, e))?;
                 worktrees_created.push(json!({
@@ -1780,9 +1787,11 @@ impl OrchestratorMcp {
                 .worktree
                 .as_ref()
                 .map(|wt| {
-                    let repo_path = resolve_repo_path(wt.repo_path.as_deref());
+                    let repo_path = resolved_worktree_repo
+                        .as_deref()
+                        .expect("worktree repository was resolved before creation");
                     (
-                        Some(repository_identity_for_scheduler(&repo_path)),
+                        Some(repository_identity_for_scheduler(repo_path)),
                         Some(wt.branch.clone()),
                     )
                 })
