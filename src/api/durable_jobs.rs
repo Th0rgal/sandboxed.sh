@@ -203,18 +203,15 @@ async fn authorize_legacy_job(
             "legacy durable job has no caller ownership metadata",
         )
     })?;
-    let workspace_id = job.workspace_id.ok_or_else(|| {
-        err(
-            StatusCode::FORBIDDEN,
-            "legacy durable job has no workspace ownership metadata",
-        )
-    })?;
     let mission = mission_store
         .get_mission(mission_id)
         .await
         .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .ok_or_else(|| err(StatusCode::FORBIDDEN, "durable job belongs to another user"))?;
-    if mission.workspace_id != workspace_id {
+    if job
+        .workspace_id
+        .is_some_and(|workspace_id| mission.workspace_id != workspace_id)
+    {
         return Err(err(
             StatusCode::FORBIDDEN,
             "durable job belongs to another user",
