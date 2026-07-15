@@ -142,10 +142,14 @@ if [ -z "$job_id" ]; then
         -d "$body" "$REMOTE_BUILD_URL")"
     curl_status=$?
     if [ "$curl_status" -ne 0 ]; then
-        if [ "$curl_status" -eq 28 ]; then
-            die "submit timed out with an unknown outcome; do not fall back locally, retry the same command after checking the fleet" 1
-        fi
-        die "cannot reach $REMOTE_BUILD_URL" 75
+        case "$curl_status" in
+            5|6|7)
+                die "cannot reach $REMOTE_BUILD_URL" 75
+                ;;
+            *)
+                die "submit transport failed with an unknown outcome (curl $curl_status); do not fall back locally, check the fleet before retrying" 1
+                ;;
+        esac
     fi
 
     if [ "$http_code" = "401" ] || [ "$http_code" = "403" ] || [ "$http_code" = "503" ]; then
@@ -190,6 +194,10 @@ finally:
     if os.path.exists(tmp):
         os.unlink(tmp)
 PY
+    persist_status=$?
+    if [ "$persist_status" -ne 0 ]; then
+        die "accepted job $job_id on node '$node_id' but failed to persist its receipt; do not fall back locally or resubmit" 1
+    fi
     echo "remote-lean-build: submitted job $job_id on node '$node_id'; receipt $state_file" >&2
 fi
 

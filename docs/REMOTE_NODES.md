@@ -427,11 +427,14 @@ remote-lean-build || { [ $? -eq 75 ] && lake build; }
 Optional: `REMOTE_BUILD_TIMEOUT_SECS` forwards a job timeout (clamped by the
 node's `SANDBOXED_NODE_MAX_JOB_SECS`). `REMOTE_BUILD_SUBMIT_TIMEOUT_SECS`
 controls the pre-receipt HTTP budget (default 90 seconds, long enough for a
-fresh probe plus node submission). A submit timeout is treated as an ambiguous
-outcome and never triggers local fallback. `REMOTE_BUILD_STATE_DIR` overrides
-the receipt directory. Receipts never contain the capability token or the Git
-remote URL. `REMOTE_BUILD_FORCE_NEW=1` deliberately bypasses a live matching
-receipt and should be reserved for operator-directed retries.
+fresh probe plus node submission). Submit timeouts and response-side transport
+failures are treated as ambiguous outcomes and never trigger local fallback;
+only failures that happen before connecting are fallback-safe. Failure to
+persist the receipt after a `202` is also fail-closed and reports the accepted
+job handle. `REMOTE_BUILD_STATE_DIR` overrides the receipt directory. Receipts
+never contain the capability token or the Git remote URL.
+`REMOTE_BUILD_FORCE_NEW=1` deliberately bypasses a live matching receipt and
+should be reserved for operator-directed retries.
 
 Workspace configuration can pin the placement policy without exposing node
 credentials:

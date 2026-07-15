@@ -875,7 +875,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn run_remote_build_wrapper_with_http_status(status: u16) -> std::process::ExitStatus {
+    fn run_remote_build_wrapper_with_submit_result(
+        status: u16,
+        curl_exit: u8,
+    ) -> std::process::ExitStatus {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("create wrapper test directory");
@@ -929,7 +932,7 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 printf '{}' > "$output"
-[ "$REMOTE_BUILD_TEST_HTTP_STATUS" != "0" ] || exit 28
+[ "$REMOTE_BUILD_TEST_CURL_EXIT" = "0" ] || exit "$REMOTE_BUILD_TEST_CURL_EXIT"
 printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
 "#,
         )
@@ -959,6 +962,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             .env("REMOTE_BUILD_TOKEN", "expired-test-token")
             .env("REMOTE_BUILD_MISSION_ID", Uuid::new_v4().to_string())
             .env("REMOTE_BUILD_TEST_HTTP_STATUS", status.to_string())
+            .env("REMOTE_BUILD_TEST_CURL_EXIT", curl_exit.to_string())
             .status()
             .expect("run remote-build wrapper")
     }
@@ -1111,22 +1115,32 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
     fn wrapper_treats_host_capability_auth_failures_as_temporary() {
         for status in [401, 403, 503] {
             assert_eq!(
-                run_remote_build_wrapper_with_http_status(status).code(),
+                run_remote_build_wrapper_with_submit_result(status, 0).code(),
                 Some(75),
                 "HTTP {status} should request local fallback"
             );
         }
         for status in [400, 422] {
             assert_eq!(
-                run_remote_build_wrapper_with_http_status(status).code(),
+                run_remote_build_wrapper_with_submit_result(status, 0).code(),
                 Some(1),
                 "HTTP {status} remains a caller error"
             );
         }
         assert_eq!(
-            run_remote_build_wrapper_with_http_status(0).code(),
+            run_remote_build_wrapper_with_submit_result(0, 28).code(),
             Some(1),
             "a submit timeout has an ambiguous outcome and must not request local fallback"
+        );
+        assert_eq!(
+            run_remote_build_wrapper_with_submit_result(0, 56).code(),
+            Some(1),
+            "a response-side transport failure may follow acceptance and must not request fallback"
+        );
+        assert_eq!(
+            run_remote_build_wrapper_with_submit_result(0, 7).code(),
+            Some(75),
+            "a pre-connect failure is safe for local fallback"
         );
     }
 
@@ -1197,6 +1211,10 @@ case "$url" in
         printf '200'
         ;;
     *)
+        if [ "$REMOTE_BUILD_TEST_POLL_MODE" = "persist-fail" ]; then
+            rm -rf "$REMOTE_BUILD_TEST_STATE_DIR"
+            printf 'not-a-directory' > "$REMOTE_BUILD_TEST_STATE_DIR"
+        fi
         count=0
         [ ! -f "$REMOTE_BUILD_TEST_SUBMIT_COUNT" ] || count=$(cat "$REMOTE_BUILD_TEST_SUBMIT_COUNT")
         count=$((count + 1))
@@ -1235,6 +1253,7 @@ esac
                 .env("REMOTE_BUILD_TOKEN", "test-token")
                 .env("REMOTE_BUILD_MISSION_ID", &mission_id)
                 .env("REMOTE_BUILD_STATE_DIR", &state)
+                .env("REMOTE_BUILD_TEST_STATE_DIR", &state)
                 .env("REMOTE_BUILD_POLL_SECS", "1")
                 .env("REMOTE_BUILD_CLIENT_TIMEOUT_SECS", "1")
                 .env("REMOTE_BUILD_TEST_POLL_MODE", poll_mode)
@@ -1287,6 +1306,32 @@ esac
         assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
         assert!(String::from_utf8_lossy(&replayed.stderr).contains("replaying terminal job"));
         assert_eq!(String::from_utf8_lossy(&replayed.stdout), "remote ok\n");
+
+        for receipt in std::fs::read_dir(&state).expect("read receipts before persistence failure")
+        {
+            std::fs::remove_file(receipt.expect("read receipt entry").path())
+                .expect("remove prior receipt");
+        }
+        let persistence_failed = run("persist-fail");
+        if state.is_file() {
+            std::fs::remove_file(&state).expect("remove persistence-failure sentinel");
+            std::fs::create_dir(&state).expect("restore state directory");
+        }
+        let mut state_permissions = std::fs::metadata(&state)
+            .expect("stat state directory after persistence failure")
+            .permissions();
+        state_permissions.set_mode(0o700);
+        std::fs::set_permissions(&state, state_permissions)
+            .expect("restore state directory permissions");
+        assert_eq!(
+            persistence_failed.status.code(),
+            Some(1),
+            "unexpected persistence-failure result: stdout={} stderr={}",
+            String::from_utf8_lossy(&persistence_failed.stdout),
+            String::from_utf8_lossy(&persistence_failed.stderr)
+        );
+        assert!(String::from_utf8_lossy(&persistence_failed.stderr)
+            .contains("failed to persist its receipt"));
     }
 
     #[test]
