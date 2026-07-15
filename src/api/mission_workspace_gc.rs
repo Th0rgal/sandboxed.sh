@@ -589,6 +589,12 @@ fn protected_exec_scopes<'a>(
         .collect()
 }
 
+fn protected_exec_scope_snapshot(
+    units: Result<Vec<String>, String>,
+) -> Result<std::collections::HashSet<(String, String)>, String> {
+    units.map(|units| protected_exec_scopes(units.iter().map(String::as_str)))
+}
+
 /// Whether a live exec scope protects one mission directory. This guard runs
 /// before phase 1 can propose or remove the directory.
 #[derive(Debug, PartialEq, Eq)]
@@ -626,12 +632,16 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
     // Snapshot live exec scopes before considering *any* mission directory.
     // A scope may have a process holding cwd/fds in the directory, so it wins
     // over terminal status in both dry-run and execution mode.
-    let scope_protected = protected_exec_scopes(
-        super::scope_reaper::list_exec_scope_units()
-            .await
-            .iter()
-            .map(String::as_str),
-    );
+    let scope_protected =
+        match protected_exec_scope_snapshot(super::scope_reaper::try_list_exec_scope_units().await)
+        {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                report.errors += 1;
+                tracing::warn!(%err, "mission GC: scope snapshot unavailable; skipping sweep");
+                return report;
+            }
+        };
     let mission_index = build_mission_index(state).await;
     let sessions = state.control.all_sessions().await;
     for session in sessions {
@@ -1057,6 +1067,13 @@ mod tests {
             mission_directory_candidate(&protected, workspace.path(), mission_id),
             MissionDirectoryCandidate::RetainLiveScope
         );
+    }
+
+    #[test]
+    fn unavailable_exec_scope_snapshot_disables_workspace_collection() {
+        let snapshot = protected_exec_scope_snapshot(Err("systemctl unavailable".to_string()));
+
+        assert!(snapshot.is_err());
     }
 
     #[tokio::test]
