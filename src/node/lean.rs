@@ -957,6 +957,29 @@ mod tests {
             Some("3")
         );
         assert_eq!(overridden.get("LAKE_JOBS").map(String::as_str), Some("5"));
+
+        let only_threads = lean_concurrency_env(
+            &HashMap::from([("LEAN_NUM_THREADS".to_string(), "7".to_string())]),
+            12,
+        );
+        assert_eq!(
+            only_threads.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            only_threads.get("LAKE_JOBS").map(String::as_str),
+            Some("12")
+        );
+
+        let only_lake = lean_concurrency_env(
+            &HashMap::from([("LAKE_JOBS".to_string(), "9".to_string())]),
+            12,
+        );
+        assert_eq!(
+            only_lake.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("12")
+        );
+        assert_eq!(only_lake.get("LAKE_JOBS").map(String::as_str), Some("9"));
     }
 
     #[test]
