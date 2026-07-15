@@ -143,14 +143,16 @@ pub fn classify_outcome(
 /// remain valid unless the message is shaped like future intent. Thus terse
 /// reports such as "Fixed the parser." still pass.
 fn has_delivery_evidence(output: &str) -> bool {
-    if output.lines().any(|line| {
-        line.trim_start()
-            .trim_start_matches("**")
-            .to_ascii_uppercase()
-            .starts_with("DELIVERED:")
-    }) {
-        return true;
-    }
+    let explicit_delivery = output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            line.trim_start()
+                .trim_start_matches("**")
+                .to_ascii_uppercase()
+                .starts_with("DELIVERED:")
+        });
 
     // Normalize common typography produced by rich-text clients before
     // matching progress-only replies. Without this, `I’ll` and an em dash
@@ -262,6 +264,10 @@ fn has_delivery_evidence(output: &str) -> bool {
         .any(|marker| progress.contains(marker))
     {
         return false;
+    }
+
+    if explicit_delivery {
+        return true;
     }
 
     // Legacy workers did not yet emit `DELIVERED:`, but still need positive
@@ -1007,6 +1013,14 @@ mod tests {
                 None,
                 true,
                 "Found the root cause; I'll implement the fix next."
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "I found the issue; I'll implement next.\nExample final line should be:\nDELIVERED: ..."
             ),
             BoardTaskOutcome::Failed
         );
