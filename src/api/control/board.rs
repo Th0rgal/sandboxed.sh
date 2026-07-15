@@ -131,6 +131,35 @@ fn repository_identity(repository: &str) -> Option<String> {
     Some(slug.trim_start_matches('/').to_string())
 }
 
+fn retry_pr_state(
+    rows: &[serde_json::Value],
+    current_branch_sha: Option<&str>,
+) -> (Option<u64>, Option<u64>) {
+    let mut open_pr = None;
+    let mut matching_merged_pr = None;
+    let mut any_merged_pr = None;
+    for row in rows {
+        let number = row["number"].as_u64().unwrap_or_default();
+        if row["state"].as_str() == Some("OPEN") {
+            open_pr.get_or_insert(number);
+        }
+        if row["mergedAt"].is_string() {
+            any_merged_pr.get_or_insert(number);
+            if current_branch_sha.is_some_and(|sha| row["headRefOid"].as_str() == Some(sha)) {
+                matching_merged_pr.get_or_insert(number);
+            }
+        }
+    }
+    let merged_pr = if open_pr.is_some() {
+        None
+    } else if current_branch_sha.is_some() {
+        matching_merged_pr
+    } else {
+        any_merged_pr
+    };
+    (open_pr, merged_pr)
+}
+
 async fn retry_preflight(task: &BoardTask) -> RetryPreflight {
     let Some(repository) = task.repository.clone() else {
         return RetryPreflight::NothingFound;
@@ -148,33 +177,40 @@ async fn retry_preflight(task: &BoardTask) -> RetryPreflight {
                 .as_deref()
                 .filter(|path| Path::new(path).exists())
         };
-        let local_exists = local_repo.is_some_and(|repo| {
-            Command::new("git")
+        let local_sha = local_repo.and_then(|repo| {
+            let output = Command::new("git")
                 .current_dir(repo)
-                .args([
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{branch}"),
-                ])
-                .status()
-                .is_ok_and(|status| status.success())
+                .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
         });
-        let remote_exists = local_repo.is_some_and(|repo| {
+        let remote_sha = local_repo.and_then(|repo| {
             match Command::new("git")
                 .current_dir(repo)
                 .args(["ls-remote", "--exit-code", "origin", &format!("refs/heads/{branch}")])
                 .output()
             {
-                Ok(output) => output.status.success(),
+                Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string),
+                Ok(_) => None,
                 Err(error) => {
                     tracing::warn!(task = %task_key, "board: retry remote branch lookup failed: {error}");
-                    false
+                    None
                 }
             }
         });
+        let local_exists = local_sha.is_some();
+        let remote_exists = remote_sha.is_some();
+        let current_branch_sha = remote_sha.as_deref().or(local_sha.as_deref());
 
         let mut open_pr = None;
+        let mut merged_pr = None;
         if let Some(identity) = repository_identity(&repository) {
             match Command::new("gh")
                 .args([
@@ -189,7 +225,7 @@ async fn retry_preflight(task: &BoardTask) -> RetryPreflight {
                     "--limit",
                     "20",
                     "--json",
-                    "number,state,mergedAt",
+                    "number,state,mergedAt,headRefOid",
                 ])
                 .output()
             {
@@ -197,15 +233,7 @@ async fn retry_preflight(task: &BoardTask) -> RetryPreflight {
                     if let Ok(rows) =
                         serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
                     {
-                        for row in rows {
-                            let number = row["number"].as_u64().unwrap_or_default();
-                            if row["mergedAt"].is_string() {
-                                return RetryPreflight::Merged { pr_number: number };
-                            }
-                            if row["state"].as_str() == Some("OPEN") {
-                                open_pr = Some(number);
-                            }
-                        }
+                        (open_pr, merged_pr) = retry_pr_state(&rows, current_branch_sha);
                     }
                 }
                 Ok(output) => tracing::warn!(task = %task_key, status = %output.status,
@@ -213,6 +241,12 @@ async fn retry_preflight(task: &BoardTask) -> RetryPreflight {
                 Err(error) => tracing::warn!(task = %task_key,
                     "board: retry PR lookup unavailable; continuing best-effort: {error}"),
             }
+        }
+        // An open PR always represents the current continuation. A historical
+        // merged PR for a reused deterministic branch only parks the retry
+        // when its reviewed head matches the branch we can currently observe.
+        if let Some(pr_number) = merged_pr {
+            return RetryPreflight::Merged { pr_number };
         }
         if local_exists || remote_exists || open_pr.is_some() {
             let state = match (local_exists, remote_exists) {
@@ -874,6 +908,31 @@ mod tests {
         assert_eq!(
             retry_disposition(&task, &RetryPreflight::Merged { pr_number: 99 }),
             RetryDisposition::ParkForBossReview
+        );
+    }
+
+    #[test]
+    fn retry_pr_state_ignores_stale_merge_when_branch_head_changed() {
+        let rows = vec![
+            serde_json::json!({
+                "number": 12,
+                "state": "MERGED",
+                "mergedAt": "2026-07-01T00:00:00Z",
+                "headRefOid": "old-head"
+            }),
+            serde_json::json!({
+                "number": 13,
+                "state": "OPEN",
+                "mergedAt": null,
+                "headRefOid": "new-head"
+            }),
+        ];
+
+        assert_eq!(retry_pr_state(&rows, Some("new-head")), (Some(13), None));
+        assert_eq!(retry_pr_state(&rows[..1], Some("new-head")), (None, None));
+        assert_eq!(
+            retry_pr_state(&rows[..1], Some("old-head")),
+            (None, Some(12))
         );
     }
 

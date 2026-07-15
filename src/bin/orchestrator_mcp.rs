@@ -1780,8 +1780,9 @@ impl OrchestratorMcp {
                 .worktree
                 .as_ref()
                 .map(|wt| {
+                    let repo_path = resolve_repo_path(wt.repo_path.as_deref());
                     (
-                        Some(resolve_repo_path(wt.repo_path.as_deref())),
+                        Some(repository_identity_for_scheduler(&repo_path)),
                         Some(wt.branch.clone()),
                     )
                 })
@@ -2697,6 +2698,37 @@ fn resolve_repo_path(explicit: Option<&str>) -> String {
     workspace_root
 }
 
+/// Persist a repository identifier the API/control process can use after this
+/// container-scoped MCP exits. Container guest paths are not necessarily
+/// visible on the host, while an OWNER/REPO identity works with `gh --repo`.
+fn repository_identity_for_scheduler(repo_path: &str) -> String {
+    if !std::path::Path::new(repo_path).exists() {
+        return repo_path.to_string();
+    }
+    let remote = Command::new("git")
+        .current_dir(repo_path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+    remote
+        .as_deref()
+        .and_then(github_repository_identity)
+        .unwrap_or_else(|| repo_path.to_string())
+}
+
+fn github_repository_identity(remote: &str) -> Option<String> {
+    let trimmed = remote.trim().trim_end_matches(".git");
+    let slug = trimmed
+        .split("github.com/")
+        .nth(1)
+        .or_else(|| trimmed.rsplit_once("github.com:").map(|(_, tail)| tail))?;
+    let slug = slug.trim_start_matches('/');
+    (slug.split('/').count() == 2).then(|| slug.to_string())
+}
+
 // =============================================================================
 // Container resource estimation
 // =============================================================================
@@ -3365,7 +3397,9 @@ async fn main() {
 
 #[cfg(test)]
 mod working_directory_tests {
-    use super::{path_is_within, validate_working_directory_visible_to_worker};
+    use super::{
+        github_repository_identity, path_is_within, validate_working_directory_visible_to_worker,
+    };
 
     fn with_env<F: FnOnce()>(workspace_type: Option<&str>, workspace: Option<&str>, f: F) {
         // SAFETY: tests in this module are run serially via `#[test]` with
@@ -3471,6 +3505,22 @@ mod working_directory_tests {
                 .expect_err("sibling path with prefix match should be rejected");
             assert!(err.contains("not be visible to the worker"));
         });
+    }
+
+    #[test]
+    fn github_repository_identity_parses_https_and_ssh_remotes() {
+        assert_eq!(
+            github_repository_identity("https://github.com/lfglabs-dev/verity.git").as_deref(),
+            Some("lfglabs-dev/verity")
+        );
+        assert_eq!(
+            github_repository_identity("git@github.com:lfglabs-dev/verity.git").as_deref(),
+            Some("lfglabs-dev/verity")
+        );
+        assert_eq!(
+            github_repository_identity("https://example.com/repo.git"),
+            None
+        );
     }
 }
 
