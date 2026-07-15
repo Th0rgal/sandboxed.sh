@@ -250,22 +250,26 @@ async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
         Ok(handles) => {
             let mut reservations = HashMap::new();
             for handle in handles {
-                *reservations.entry(handle.node_id).or_insert(0) += 1;
+                let cached = state.fleet.get(&handle.node_id);
+                let heartbeat_started_at = cached
+                    .as_ref()
+                    .and_then(|status| status.last_probe_started_at);
+                let heartbeat_has_job_counters = cached
+                    .as_ref()
+                    .and_then(|status| status.last_heartbeat.as_ref())
+                    .is_some_and(|heartbeat| {
+                        heartbeat.protocol_version
+                            >= crate::remote_node::protocol::NODE_PROTOCOL_VERSION
+                    });
+                if handle_needs_reservation(
+                    &handle,
+                    heartbeat_started_at,
+                    heartbeat_has_job_counters,
+                ) {
+                    *reservations.entry(handle.node_id).or_insert(0) += 1;
+                }
             }
-            let heartbeat_job_counts = reservations
-                .keys()
-                .filter_map(|node_id| {
-                    state.fleet.get(node_id).and_then(|status| {
-                        status.last_heartbeat.map(|heartbeat| {
-                            (
-                                node_id.clone(),
-                                heartbeat.active_jobs.saturating_add(heartbeat.queued_jobs),
-                            )
-                        })
-                    })
-                })
-                .collect();
-            reconcile_heartbeat_visible_jobs(reservations, &heartbeat_job_counts)
+            reservations
         }
         Err(error) => {
             tracing::warn!(?error, "remote job reservations could not be loaded");
@@ -274,20 +278,24 @@ async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
     }
 }
 
-fn reconcile_heartbeat_visible_jobs(
-    mut ledger_counts: HashMap<String, u32>,
-    heartbeat_job_counts: &HashMap<String, u32>,
-) -> HashMap<String, u32> {
-    ledger_counts.retain(|node_id, ledger_count| {
-        *ledger_count = ledger_count.saturating_sub(
-            heartbeat_job_counts
-                .get(node_id)
-                .copied()
-                .unwrap_or_default(),
-        );
-        *ledger_count > 0
-    });
-    ledger_counts
+fn heartbeat_cannot_reflect(
+    handle_started_at: chrono::DateTime<chrono::Utc>,
+    heartbeat_started_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    heartbeat_started_at.is_none_or(|started_at| handle_started_at > started_at)
+}
+
+fn handle_needs_reservation(
+    handle: &crate::remote_node::job_ledger::JobHandle,
+    heartbeat_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    heartbeat_has_job_counters: bool,
+) -> bool {
+    if !heartbeat_has_job_counters {
+        return true;
+    }
+    handle
+        .accepted_at
+        .is_none_or(|accepted_at| heartbeat_cannot_reflect(accepted_at, heartbeat_started_at))
 }
 
 /// Resolve the target node: explicit id or capacity-aware auto placement.
@@ -511,6 +519,7 @@ async fn submit_remote_build(
             node_id: node.id.clone(),
             job_id,
             started_at,
+            accepted_at: None,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
         },
     )
@@ -583,6 +592,7 @@ async fn submit_remote_build(
             node_id: node.id.clone(),
             job_id,
             started_at,
+            accepted_at: Some(chrono::Utc::now()),
             kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
         },
     )
@@ -747,14 +757,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reservations_exclude_jobs_already_visible_in_heartbeat() {
-        let ledger = HashMap::from([("node-a".to_string(), 2), ("node-b".to_string(), 2)]);
-        let visible = HashMap::from([("node-a".to_string(), 1), ("node-b".to_string(), 3)]);
+    fn reservations_only_exclude_jobs_older_than_the_heartbeat_probe() {
+        let heartbeat_started_at = chrono::Utc::now();
 
-        assert_eq!(
-            reconcile_heartbeat_visible_jobs(ledger, &visible),
-            HashMap::from([("node-a".to_string(), 1)])
-        );
+        assert!(!heartbeat_cannot_reflect(
+            heartbeat_started_at - chrono::Duration::seconds(1),
+            Some(heartbeat_started_at)
+        ));
+        assert!(heartbeat_cannot_reflect(
+            heartbeat_started_at + chrono::Duration::seconds(1),
+            Some(heartbeat_started_at)
+        ));
+        assert!(heartbeat_cannot_reflect(heartbeat_started_at, None));
+    }
+
+    #[test]
+    fn tentative_handle_stays_reserved_across_overlapping_probe() {
+        let now = chrono::Utc::now();
+        let mut handle = crate::remote_node::job_ledger::JobHandle {
+            mission_id: Uuid::new_v4(),
+            node_id: "node-a".to_string(),
+            job_id: Uuid::new_v4(),
+            started_at: now,
+            accepted_at: None,
+            kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
+        };
+
+        assert!(handle_needs_reservation(
+            &handle,
+            Some(now + chrono::Duration::seconds(1)),
+            true,
+        ));
+
+        handle.accepted_at = Some(now + chrono::Duration::seconds(2));
+        assert!(handle_needs_reservation(
+            &handle,
+            Some(now + chrono::Duration::seconds(1)),
+            true,
+        ));
+        assert!(!handle_needs_reservation(
+            &handle,
+            Some(now + chrono::Duration::seconds(3)),
+            true,
+        ));
+        assert!(handle_needs_reservation(
+            &handle,
+            Some(now + chrono::Duration::seconds(3)),
+            false,
+        ));
     }
 
     #[cfg(unix)]
