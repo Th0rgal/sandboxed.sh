@@ -425,11 +425,21 @@ fn contain_command(
     cmd: tokio::process::Command,
     environment: CommandEnvironment,
 ) -> std::io::Result<(tokio::process::Command, Option<SystemdScope>)> {
-    // A libtest executable does not have sandboxed-node's hidden trampoline
-    // entrypoint. Construction is covered directly below; execution tests
-    // retain the process-group fallback for clear-env commands.
-    #[cfg(test)]
-    if environment == CommandEnvironment::Clear {
+    // Cargo's lib and binary test harnesses do not run sandboxed-node's main,
+    // so they cannot service the hidden trampoline entrypoint. Construction
+    // is covered directly below; execution tests retain the process-group
+    // fallback for clear-env commands.
+    if environment == CommandEnvironment::Clear
+        && std::env::current_exe()
+            .ok()
+            .and_then(|path| {
+                path.parent()
+                    .and_then(Path::file_name)
+                    .map(ToOwned::to_owned)
+            })
+            .as_deref()
+            == Some(std::ffi::OsStr::new("deps"))
+    {
         return Ok((cmd, None));
     }
     #[cfg(target_os = "linux")]
