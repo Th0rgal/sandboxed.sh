@@ -370,18 +370,32 @@ async fn resolve_node(
         StatusCode::BAD_REQUEST,
         format!("remote node '{node_id}' is not configured"),
     ))?;
-    if requirements.iter().any(|requirement| requirement == "lean")
-        && state
-            .fleet
-            .get(node_id)
+    if requirements.iter().any(|requirement| requirement == "lean") {
+        // Explicit placement must not bypass the fail-closed readiness gate
+        // when the monitor is disabled or has not completed its first tick.
+        // Probe synchronously so the decision covers the runner's current
+        // identity and PATH rather than an absent or stale cache entry.
+        let client = RemoteNodeClient::default();
+        crate::remote_node::probe_node(&state.fleet, &client, &node).await;
+        let cached = state.fleet.get(node_id);
+        if cached.as_ref().is_none_or(|cached| {
+            cached.status != RemoteNodeStatus::Online || cached.last_heartbeat.is_none()
+        }) {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("remote node '{node_id}' readiness probe failed"),
+            ));
+        }
+        if cached
             .and_then(|cached| cached.last_heartbeat)
             .and_then(|heartbeat| heartbeat.lean_runtime_ready)
             == Some(false)
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("remote node '{node_id}' has no executable Lake runtime"),
-        ));
+        {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("remote node '{node_id}' has no executable Lake runtime"),
+            ));
+        }
     }
     Ok(node)
 }

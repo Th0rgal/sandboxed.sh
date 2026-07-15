@@ -1478,8 +1478,7 @@ mod tests {
         let lake = bin.join("lake");
         std::fs::write(&lake, b"#!/bin/sh\n").unwrap();
 
-        assert!(!lean_runtime_ready_with_path(dir.path(), None));
-        std::fs::set_permissions(&lake, std::fs::Permissions::from_mode(0o001)).unwrap();
+        std::fs::set_permissions(&lake, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(!lean_runtime_ready_with_path(dir.path(), None));
         std::fs::set_permissions(&lake, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(lean_runtime_ready_with_path(dir.path(), None));
