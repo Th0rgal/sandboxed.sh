@@ -465,6 +465,66 @@ fn node_shared_token(node: &RemoteNodeConfig) -> Result<String, (StatusCode, Str
         ))
 }
 
+fn remote_build_is_terminal(state: &str) -> bool {
+    matches!(state, "succeeded" | "failed" | "cancelled" | "lost")
+}
+
+/// Keep the fleet rollup aligned with the runner's latest state, not merely
+/// the state returned by `POST /jobs`. Long jobs commonly transition from
+/// `queued` to `running` before the next heartbeat, and the rollup is what
+/// controllers use to explain current placement.
+fn remote_build_dispatch_outcome(
+    node_id: &str,
+    status: &NodeJobStatus,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> DispatchOutcome {
+    let terminal = remote_build_is_terminal(&status.state);
+    DispatchOutcome {
+        mission_id: status.mission_id,
+        node_id: node_id.to_string(),
+        job_id: Some(status.job_id),
+        state: status.state.clone(),
+        exit_code: status.exit_code,
+        error: status.error.clone(),
+        started_at,
+        finished_at: terminal.then(chrono::Utc::now),
+    }
+}
+
+fn record_remote_build_status(
+    state: &AppState,
+    node_id: &str,
+    status: &NodeJobStatus,
+    started_at: chrono::DateTime<chrono::Utc>,
+) {
+    state
+        .fleet
+        .record_outcome(remote_build_dispatch_outcome(node_id, status, started_at));
+}
+
+async fn remote_build_started_at(state: &AppState, job_id: Uuid) -> chrono::DateTime<chrono::Utc> {
+    if let Some(started_at) = state
+        .fleet
+        .recent_outcomes(usize::MAX)
+        .into_iter()
+        .find(|outcome| outcome.job_id == Some(job_id))
+        .map(|outcome| outcome.started_at)
+    {
+        return started_at;
+    }
+    match crate::remote_node::job_ledger::load(&state.config.working_dir).await {
+        Ok(handles) => handles
+            .into_iter()
+            .find(|handle| handle.job_id == job_id)
+            .map(|handle| handle.started_at)
+            .unwrap_or_else(chrono::Utc::now),
+        Err(error) => {
+            tracing::warn!(job_id = %job_id, ?error, "remote build start time could not be recovered");
+            chrono::Utc::now()
+        }
+    }
+}
+
 fn spawn_remote_build_observer(
     state: Arc<AppState>,
     node: RemoteNodeConfig,
@@ -495,22 +555,8 @@ fn spawn_remote_build_observer(
                 }
             }
             match client.get_job(&node, &shared_token, job_id).await {
-                Ok(status)
-                    if matches!(
-                        status.state.as_str(),
-                        "succeeded" | "failed" | "cancelled" | "lost"
-                    ) =>
-                {
-                    state.fleet.record_outcome(DispatchOutcome {
-                        mission_id,
-                        node_id: node.id.clone(),
-                        job_id: Some(job_id),
-                        state: status.state,
-                        exit_code: status.exit_code,
-                        error: status.error,
-                        started_at,
-                        finished_at: Some(chrono::Utc::now()),
-                    });
+                Ok(status) if remote_build_is_terminal(&status.state) => {
+                    record_remote_build_status(&state, &node.id, &status, started_at);
                     crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
                     return;
                 }
@@ -518,7 +564,8 @@ fn spawn_remote_build_observer(
                     crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
                     return;
                 }
-                Ok(_) | Err(_) => {}
+                Ok(status) => record_remote_build_status(&state, &node.id, &status, started_at),
+                Err(_) => {}
             }
         }
     });
@@ -731,16 +778,8 @@ async fn submit_remote_build(
             Ok(status) => status,
             Err(_) => continue, // transient poll failure; the job keeps running
         };
-        if matches!(
-            status.state.as_str(),
-            "succeeded" | "failed" | "cancelled" | "lost"
-        ) {
-            state.fleet.record_outcome(outcome(
-                &status.state,
-                status.exit_code,
-                status.error.clone(),
-                true,
-            ));
+        record_remote_build_status(&state, &node.id, &status, started_at);
+        if remote_build_is_terminal(&status.state) {
             crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
             let duration_secs = (chrono::Utc::now() - started_at).num_seconds().max(0) as u64;
             return Json(RemoteBuildWaitResponse {
@@ -829,10 +868,9 @@ async fn get_remote_build(
             "job does not belong to this mission".to_string(),
         ));
     }
-    if matches!(
-        status.state.as_str(),
-        "succeeded" | "failed" | "cancelled" | "lost"
-    ) {
+    let started_at = remote_build_started_at(&state, job_id).await;
+    record_remote_build_status(&state, &node.id, &status, started_at);
+    if remote_build_is_terminal(&status.state) {
         crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
     }
     Ok(Json(status))
@@ -841,6 +879,37 @@ async fn get_remote_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node_job_status(state: &str) -> NodeJobStatus {
+        NodeJobStatus {
+            job_id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            state: state.to_string(),
+            exit_code: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            log_tail: None,
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn polled_remote_build_state_is_visible_in_fleet_rollup() {
+        let started_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let running =
+            remote_build_dispatch_outcome("federation", &node_job_status("running"), started_at);
+        assert_eq!(running.state, "running");
+        assert_eq!(running.node_id, "federation");
+        assert_eq!(running.started_at, started_at);
+        assert!(running.finished_at.is_none());
+
+        let succeeded =
+            remote_build_dispatch_outcome("federation", &node_job_status("succeeded"), started_at);
+        assert_eq!(succeeded.state, "succeeded");
+        assert!(succeeded.finished_at.is_some());
+    }
 
     #[test]
     fn reservations_only_exclude_jobs_older_than_the_heartbeat_probe() {

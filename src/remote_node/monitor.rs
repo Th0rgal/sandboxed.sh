@@ -183,9 +183,8 @@ impl FleetMonitor {
     pub fn record_outcome(&self, outcome: DispatchOutcome) {
         let mut recent = self.recent.write().unwrap_or_else(|e| e.into_inner());
         if let Some(job_id) = outcome.job_id {
-            if let Some(existing) = recent.iter_mut().find(|entry| entry.job_id == Some(job_id)) {
-                *existing = outcome;
-                return;
+            if let Some(position) = recent.iter().position(|entry| entry.job_id == Some(job_id)) {
+                recent.remove(position);
             }
         }
         recent.push_front(outcome);
@@ -872,6 +871,22 @@ mod tests {
         let recent = fleet.recent_outcomes(10);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].state, "succeeded");
+
+        for _ in 0..12 {
+            fleet.record_outcome(outcome("queued", Some(Uuid::new_v4())));
+        }
+        fleet.record_outcome(outcome("running", Some(job_id)));
+        let recent = fleet.recent_outcomes(10);
+        assert_eq!(recent[0].job_id, Some(job_id));
+        assert_eq!(recent[0].state, "running");
+        assert_eq!(
+            fleet
+                .recent_outcomes(usize::MAX)
+                .iter()
+                .filter(|entry| entry.job_id == Some(job_id))
+                .count(),
+            1
+        );
 
         for _ in 0..(RECENT_OUTCOMES_CAP + 10) {
             fleet.record_outcome(outcome("executed", None));
