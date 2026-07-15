@@ -440,6 +440,18 @@ fn submit_error_status(err: &RemoteNodeError) -> StatusCode {
     }
 }
 
+fn job_status_error_status(err: &RemoteNodeError) -> StatusCode {
+    match err {
+        // Preserve terminal lookup failures from the runner so a resumable
+        // client can stop polling a handle that no longer exists. Keep node
+        // authentication and transient/transport failures behind the core.
+        RemoteNodeError::Rejected { status, .. } if matches!(*status, 400 | 404) => {
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
+        }
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
 fn node_shared_token(node: &RemoteNodeConfig) -> Result<String, (StatusCode, String)> {
     std::env::var(&node.token_env)
         .ok()
@@ -808,7 +820,7 @@ async fn get_remote_build(
     let status = RemoteNodeClient::default()
         .get_job(&node, &shared_token, job_id)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        .map_err(|e| (job_status_error_status(&e), e.to_string()))?;
     // The capability token is mission-scoped: never leak another mission's
     // job status through it.
     if status.mission_id != query.mission_id {
@@ -1118,6 +1130,36 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         assert_eq!(
             submit_error_status(&RemoteNodeError::Connect("offline".to_string())),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn job_status_errors_preserve_unrecoverable_lookup_failures_only() {
+        for status in [400, 404] {
+            assert_eq!(
+                job_status_error_status(&RemoteNodeError::Rejected {
+                    status,
+                    body: "job not found".to_string(),
+                }),
+                StatusCode::from_u16(status).unwrap()
+            );
+        }
+        for status in [401, 403, 429, 500, 503] {
+            assert_eq!(
+                job_status_error_status(&RemoteNodeError::Rejected {
+                    status,
+                    body: "runner failure".to_string(),
+                }),
+                StatusCode::BAD_GATEWAY
+            );
+        }
+        assert_eq!(
+            job_status_error_status(&RemoteNodeError::Connect("offline".to_string())),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            job_status_error_status(&RemoteNodeError::Request("offline".to_string())),
+            StatusCode::BAD_GATEWAY
         );
     }
 
