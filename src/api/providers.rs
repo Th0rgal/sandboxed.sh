@@ -959,9 +959,25 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "pay-per-token".to_string(),
                 description: "Grok models via xAI API key".to_string(),
                 models: vec![
-                    // These IDs must match what the Grok Build CLI accepts
-                    // (`grok models`) — the bare `grok-build` alias is rejected
-                    // by current CLIs. xAI API model IDs: https://docs.x.ai/docs/models
+                    ProviderModel {
+                        id: "grok-4.5".to_string(),
+                        name: "Grok 4.5".to_string(),
+                        description: Some("Latest flagship Grok model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "grok-4.5-latest".to_string(),
+                        name: "Grok 4.5 (Latest)".to_string(),
+                        description: Some("Rolling alias for Grok 4.5".to_string()),
+                    },
+                    ProviderModel {
+                        id: "grok-build-latest".to_string(),
+                        name: "Grok Build (Latest)".to_string(),
+                        description: Some(
+                            "Rolling Grok Build alias backed by Grok 4.5".to_string(),
+                        ),
+                    },
+                    // Legacy IDs retained for accounts that still advertise them.
+                    // Native Grok CLI choices are filtered separately below.
                     ProviderModel {
                         id: "grok-build-0.1".to_string(),
                         name: "Grok Build".to_string(),
@@ -2554,11 +2570,13 @@ mod tests {
         // The CLI-valid coding model id (bare `grok-build` is rejected by
         // current CLIs). `composer-2.5` is intentionally NOT here: it's a
         // product name, not a valid xAI API id, and the API rejects it.
-        // `grok-4.5` is intentionally not seeded unless live account catalog
-        // discovery returns it; Grok CLI 0.2.93 rejects it with "unknown model id"
-        // for the current production OAuth/API token.
         assert!(xai.models.iter().any(|model| model.id == "grok-build-0.1"));
-        assert!(!xai.models.iter().any(|model| model.id == "grok-4.5"));
+        assert!(xai.models.iter().any(|model| model.id == "grok-4.5"));
+        assert!(xai.models.iter().any(|model| model.id == "grok-4.5-latest"));
+        assert!(xai
+            .models
+            .iter()
+            .any(|model| model.id == "grok-build-latest"));
         assert!(!xai.models.iter().any(|model| model.id == "composer-2.5"));
     }
 
