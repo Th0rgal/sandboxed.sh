@@ -152,7 +152,16 @@ fn has_delivery_evidence(output: &str) -> bool {
         return true;
     }
 
-    let normalized = output.trim().to_ascii_lowercase();
+    // Normalize common typography produced by rich-text clients before
+    // matching progress-only replies. Without this, `I’ll` and an em dash
+    // after an acknowledgement bypass the ASCII-oriented intent checks.
+    let normalized = output
+        .trim()
+        .to_lowercase()
+        .replace('\u{2018}', "'")
+        .replace('\u{2019}', "'")
+        .replace('\u{2013}', "-")
+        .replace('\u{2014}', "-");
     let legacy_completion = normalized.starts_with("i will mark this complete:");
     let mut progress = normalized.as_str();
     for prefix in ["acknowledged", "okay", "ok", "sure", "understood", "got it"] {
@@ -780,6 +789,18 @@ mod tests {
         );
         assert_eq!(
             classify_outcome(None, true, "I'll inspect it and get started."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "I’ll inspect it and get started."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Acknowledged — I'll inspect it and get started."
+            ),
             BoardTaskOutcome::Failed
         );
         assert_eq!(
