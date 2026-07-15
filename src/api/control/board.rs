@@ -160,7 +160,6 @@ fn has_delivery_evidence(output: &str) -> bool {
         .to_lowercase()
         .replace(['\u{2018}', '\u{2019}'], "'")
         .replace(['\u{2013}', '\u{2014}'], "-");
-    let legacy_completion = normalized.starts_with("i will mark this complete:");
     let mut progress = normalized.as_str();
     for prefix in ["acknowledged", "okay", "ok", "sure", "understood", "got it"] {
         if let Some(rest) = progress.strip_prefix(prefix) {
@@ -175,21 +174,48 @@ fn has_delivery_evidence(output: &str) -> bool {
             }
         }
     }
-    let future_intent = [
+    if progress.is_empty() {
+        return false;
+    }
+
+    // Check this after stripping an acknowledgement so replies such as
+    // `OK, I will mark this complete: ...` retain the documented legacy
+    // completion shape.
+    if progress.starts_with("i will mark this complete:") {
+        return true;
+    }
+
+    let explicit_future_intent = [
         "i'll",
         "i will",
         "get started",
         "start on",
         "inspect it",
         "look into",
-        "work on",
-        "begin",
         "take a look",
     ]
     .iter()
     .any(|phrase| progress.starts_with(phrase));
 
-    legacy_completion || !future_intent
+    // Bare imperative prefixes need a word boundary. In particular, do not
+    // reject completion summaries such as `Beginning-state reset fixed` or
+    // `Work on the parser is complete` merely because their first bytes look
+    // like an instruction.
+    let begin_intent = progress == "begin" || progress.starts_with("begin ");
+    let work_on_intent = progress.starts_with("work on ")
+        && ![
+            "complete",
+            "completed",
+            "done",
+            "finished",
+            "fixed",
+            "implemented",
+            "verified",
+        ]
+        .iter()
+        .any(|marker| progress.contains(marker));
+
+    !(explicit_future_intent || begin_intent || work_on_intent)
 }
 
 /// Head+tail truncation that keeps the final summary (workers put their
@@ -786,6 +812,22 @@ mod tests {
             BoardTaskOutcome::Success
         );
         assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "OK, I will mark this complete: fixed the parser and verified cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Acknowledged."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "OK."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
             classify_outcome(None, true, "I'll inspect it and get started."),
             BoardTaskOutcome::Failed
         );
@@ -812,6 +854,26 @@ mod tests {
         assert_eq!(
             classify_outcome(None, true, "Completed work on the parser."),
             BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Work on the parser is complete; verified cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Beginning-state reset fixed; verified cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Begin by inspecting the parser."),
+            BoardTaskOutcome::Failed
         );
         assert_eq!(
             classify_outcome(
