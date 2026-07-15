@@ -143,9 +143,6 @@ Wants=network-online.target
 
 [Service]
 EnvironmentFile=/etc/sandboxed-node.env
-# Let the non-root runner create transient scopes in its own user manager.
-Environment=XDG_RUNTIME_DIR=/run/user/%U
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 ExecStart=/usr/local/bin/sandboxed-node
 Restart=always
 RestartSec=5
@@ -176,6 +173,12 @@ Enable its user manager once with
 user scopes, so even descendants that call `setsid` are reaped when their job
 finishes. If the user bus is unavailable, the runner safely falls back to
 process-group cleanup and logs any failed scope stop.
+
+The runner derives `/run/user/<effective-uid>` itself. Do not put
+`XDG_RUNTIME_DIR=/run/user/%U` in a system unit: `%U` describes the systemd
+manager user there (normally root), not the account named by `User=`. An
+explicit, correct `XDG_RUNTIME_DIR` remains supported, but a stale or
+inaccessible value is ignored in favour of the effective-UID path.
 Lean/Lake builds execute repository-controlled code, so running this service as
 root is unsupported; the argv allowlist is defense in depth, not a sandbox.
 The binary refuses UID 0 by default; `SANDBOXED_NODE_ALLOW_ROOT=1` is available
