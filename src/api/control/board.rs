@@ -89,7 +89,9 @@ fn retry_prompt(task: &BoardTask, preflight: &RetryPreflight) -> String {
         // retain the same conservative branch guard for every declared retry
         // rather than falling back to the original unguarded prompt.
         RetryPreflight::NothingFound
-            if task.prior_worker_mission_id.is_some() && task.branch.is_some() =>
+            if task.attempts > 1
+                && task.prior_worker_mission_id.is_some()
+                && task.branch.is_some() =>
         {
             ("declared retry branch; re-check before editing", None)
         }
@@ -896,6 +898,20 @@ mod tests {
         assert!(prompt.contains("checkout the existing branch"));
         assert!(prompt.contains("never recreate from master"));
         assert!(prompt.contains("never force-push"));
+    }
+
+    #[test]
+    fn post_rejection_fresh_spawn_does_not_reuse_retry_guard() {
+        let mut task = mk("fresh-after-reject", &[], BoardTaskStatus::Pending, None);
+        task.attempts = 1;
+        task.branch = Some("agent/already-merged".into());
+        task.prior_worker_mission_id = Some(Uuid::new_v4());
+        task.prior_outcome = Some(BoardTaskOutcome::Failed);
+
+        assert_eq!(
+            retry_prompt(&task, &RetryPreflight::NothingFound),
+            task.prompt
+        );
     }
 
     #[test]
