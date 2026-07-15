@@ -98,6 +98,14 @@ jobs consume the same permits. A full node rejects a new `/execute` request
 with HTTP 429; queued jobs wait for a shared permit. This prevents the two API
 paths from each consuming the configured capacity independently.
 
+A node configured with the `lean` label must have an executable `lake` proxy
+either at `$SANDBOXED_NODE_WORK_DIR/caches/elan/bin/lake` or on the service's
+absolute `PATH`. Install Elan under the `sandboxed-node` account and prewarm the
+project toolchains (for example `leanprover/lean4:v4.24.0`) before adding the
+label. The heartbeat reports `lean_runtime_ready`; when the proxy is missing,
+the node withholds `lean` and core rejects it for Lean placement instead of
+accepting jobs that will fail with `ENOENT`.
+
 Nippur and Ashur are configured identically with their own
 `SANDBOXED_NODE_ID` and token.
 
@@ -126,6 +134,8 @@ To rotate a node token with zero downtime:
 - `active_jobs` / `queued_jobs` (async job API)
 - `cached_toolchains` (Lean toolchain dirs under the node's shared elan
   cache; empty until the first `lean_build` job warms it)
+- `lean_runtime_ready` (`true` when the Lake proxy used by declarative builds
+  is executable; older nodes deserialize this as unknown)
 
 `capacity_available` is a snapshot of the shared semaphore, so it already
 accounts for work admitted through either `/execute` or `/jobs`.

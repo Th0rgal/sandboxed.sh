@@ -617,7 +617,7 @@ mod tests {
             mission_id,
             node_id: state.node_id.clone(),
             lease_token: create_lease_token(&claims, &state.shared_token).expect("lease token"),
-            command: "sleep 0.2".to_string(),
+            command: "sleep 1".to_string(),
         };
 
         let running = tokio::spawn(execute(
@@ -625,7 +625,7 @@ mod tests {
             headers.clone(),
             Json(request()),
         ));
-        for _ in 0..20 {
+        for _ in 0..100 {
             if state.active_leases.load(Ordering::Acquire) == 1 {
                 break;
             }
