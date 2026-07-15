@@ -161,7 +161,21 @@ fn has_delivery_evidence(output: &str) -> bool {
         .replace(['\u{2018}', '\u{2019}'], "'")
         .replace(['\u{2013}', '\u{2014}'], "-");
     let mut progress = normalized.as_str();
-    for prefix in ["acknowledged", "okay", "ok", "sure", "understood", "got it"] {
+    // Longest phrases first so `sure thing` is removed as one acknowledgement
+    // rather than leaving `thing, ...` in front of a future-only reply.
+    for prefix in [
+        "acknowledged",
+        "sounds good",
+        "sure thing",
+        "of course",
+        "absolutely",
+        "certainly",
+        "understood",
+        "got it",
+        "okay",
+        "sure",
+        "ok",
+    ] {
         if let Some(rest) = progress.strip_prefix(prefix) {
             let boundary = match rest.chars().next() {
                 Some(c) => c.is_ascii_punctuation() || c.is_whitespace(),
@@ -841,6 +855,14 @@ mod tests {
                 true,
                 "Acknowledged — I'll inspect it and get started."
             ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Sure thing, I'll inspect it and get started."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Sounds good — I will look into it."),
             BoardTaskOutcome::Failed
         );
         assert_eq!(
