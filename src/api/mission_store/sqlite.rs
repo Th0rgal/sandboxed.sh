@@ -14707,6 +14707,8 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].status, BoardTaskStatus::Pending);
         assert_eq!(tasks[1].depends_on, vec!["t1".to_string()]);
+        assert_eq!(tasks[0].repository.as_deref(), Some("Th0rgal/sandboxed.sh"));
+        assert_eq!(tasks[0].branch.as_deref(), Some("agent/test"));
 
         // Active boards includes our boss.
         let active = store.list_active_board_missions().await.expect("active");
