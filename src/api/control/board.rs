@@ -157,10 +157,10 @@ fn has_delivery_evidence(output: &str) -> bool {
     let mut progress = normalized.as_str();
     for prefix in ["acknowledged", "okay", "ok", "sure", "understood", "got it"] {
         if let Some(rest) = progress.strip_prefix(prefix) {
-            let boundary = rest
-                .chars()
-                .next()
-                .map_or(true, |c| c.is_ascii_punctuation() || c.is_whitespace());
+            let boundary = match rest.chars().next() {
+                Some(c) => c.is_ascii_punctuation() || c.is_whitespace(),
+                None => true,
+            };
             if boundary {
                 progress = rest
                     .trim_start_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace());
