@@ -412,8 +412,11 @@ persists the returned job/node receipt under
 the mission-authenticated status endpoint. Receipts are scoped to the remote
 endpoint as well as the immutable request. Running the same command after a
 client/tool interruption resumes the recorded job instead of submitting a
-duplicate. It prints the remote log tail and exits with the remote build's exit
-code. On
+duplicate; if the terminal status was already persisted, it replays that
+evidence without polling or resubmitting. It prints the remote log tail and
+exits with the remote build's exit code. Once a job has been accepted, polling
+errors and client timeouts never request local fallback: rerun the identical
+command to resume it. On
 HTTP 503 (placement failure, fleet down, feature off) it prints the reason
 and exits 75 (`EX_TEMPFAIL`) so scripts can fall back to a local build:
 

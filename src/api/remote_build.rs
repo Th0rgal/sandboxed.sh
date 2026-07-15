@@ -1245,7 +1245,11 @@ esac
         };
 
         let interrupted = run("fail");
-        assert_eq!(interrupted.status.code(), Some(75));
+        assert_eq!(
+            interrupted.status.code(),
+            Some(1),
+            "an accepted remote job must never request local fallback"
+        );
         assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
         let receipts = std::fs::read_dir(&state)
             .expect("read receipt directory")
@@ -1273,6 +1277,16 @@ esac
         assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
         assert!(String::from_utf8_lossy(&resumed.stderr).contains("resuming job"));
         assert_eq!(String::from_utf8_lossy(&resumed.stdout), "remote ok\n");
+
+        let replayed = run("fail");
+        assert!(
+            replayed.status.success(),
+            "terminal receipt replay failed: {}",
+            String::from_utf8_lossy(&replayed.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
+        assert!(String::from_utf8_lossy(&replayed.stderr).contains("replaying terminal job"));
+        assert_eq!(String::from_utf8_lossy(&replayed.stdout), "remote ok\n");
     }
 
     #[test]

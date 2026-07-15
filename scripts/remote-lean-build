@@ -124,6 +124,9 @@ PY
         submitted|queued|running)
             echo "remote-lean-build: resuming job $job_id on node '$node_id' for ${commit:0:12} ..." >&2
             ;;
+        succeeded|failed|cancelled|lost)
+            echo "remote-lean-build: replaying terminal job $job_id on node '$node_id' for ${commit:0:12} ..." >&2
+            ;;
         *)
             job_id=""; node_id=""; receipt_state=""
             ;;
@@ -210,15 +213,17 @@ case "$client_timeout_secs" in
 esac
 [ "$poll_secs" -gt 0 ] || die "REMOTE_BUILD_POLL_SECS must be greater than zero"
 [ "$client_timeout_secs" -gt 0 ] || die "REMOTE_BUILD_CLIENT_TIMEOUT_SECS must be greater than zero"
-deadline=$(( $(date +%s) + client_timeout_secs ))
+if [ "$receipt_state" != "succeeded" ] && [ "$receipt_state" != "failed" ] \
+    && [ "$receipt_state" != "cancelled" ] && [ "$receipt_state" != "lost" ]; then
+    deadline=$(( $(date +%s) + client_timeout_secs ))
 
-while :; do
-    http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
-        -H "Authorization: Bearer $REMOTE_BUILD_TOKEN" \
-        --max-time 20 "$poll_url")" || http_code="000"
+    while :; do
+        http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+            -H "Authorization: Bearer $REMOTE_BUILD_TOKEN" \
+            --max-time 20 "$poll_url")" || http_code="000"
 
-    if [ "$http_code" = "200" ]; then
-        receipt_state="$(python3 - "$state_file" "$response_file" <<'PY'
+        if [ "$http_code" = "200" ]; then
+            receipt_state="$(python3 - "$state_file" "$response_file" <<'PY'
 import json, os, sys, tempfile
 path, response_path = sys.argv[1:]
 receipt = json.load(open(path))
@@ -235,24 +240,25 @@ finally:
         os.unlink(tmp)
 print(status.get("state") or "")
 PY
-        )" || die "invalid remote-build status response"
-        case "$receipt_state" in
-            succeeded|failed|cancelled|lost) break ;;
-        esac
-    elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
-        echo "remote-lean-build: polling authorization failed" >&2
-        exit 75
-    elif [ "$http_code" = "400" ] || [ "$http_code" = "404" ]; then
-        echo "remote-lean-build: cannot recover job $job_id (HTTP $http_code):" >&2
-        cat "$response_file" >&2; echo >&2
-        exit 1
-    fi
+            )" || die "invalid remote-build status response"
+            case "$receipt_state" in
+                succeeded|failed|cancelled|lost) break ;;
+            esac
+        elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+            echo "remote-lean-build: polling authorization failed; the accepted job remains resumable" >&2
+            exit 1
+        elif [ "$http_code" = "400" ] || [ "$http_code" = "404" ]; then
+            echo "remote-lean-build: cannot recover job $job_id (HTTP $http_code):" >&2
+            cat "$response_file" >&2; echo >&2
+            exit 1
+        fi
 
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-        die "timed out polling job $job_id; resume it by running the same command again" 75
-    fi
-    sleep "$poll_secs"
-done
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            die "timed out polling job $job_id; do not fall back locally, resume it by running the same command again" 1
+        fi
+        sleep "$poll_secs"
+    done
+fi
 
 python3 - "$state_file" <<'PY'
 import datetime, json, sys
