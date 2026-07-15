@@ -437,7 +437,20 @@ fn systemd_scope_mode() -> Option<SystemdScopeMode> {
         return Some(SystemdScopeMode::System);
     }
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
-    user_systemd_scope_mode(Path::new(&runtime_dir)).ok()
+    match user_systemd_scope_mode(Path::new(&runtime_dir)) {
+        Ok(mode) => Some(mode),
+        Err(error) => {
+            static WARN_DEGRADED_CONTAINMENT: std::sync::Once = std::sync::Once::new();
+            WARN_DEGRADED_CONTAINMENT.call_once(|| {
+                tracing::warn!(
+                    bus = %Path::new(&runtime_dir).join("bus").display(),
+                    %error,
+                    "transient user scopes are unavailable; containment degraded to process groups; ProtectHome=true may be hiding /run/user (bind the runner's /run/user/%U into the unit)"
+                );
+            });
+            None
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
