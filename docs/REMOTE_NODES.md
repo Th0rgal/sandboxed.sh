@@ -409,10 +409,11 @@ uncommitted changes would be silently ignored), submits asynchronously to
 `$REMOTE_BUILD_URL` with `$REMOTE_BUILD_TOKEN`/`$REMOTE_BUILD_MISSION_ID`,
 persists the returned job/node receipt under
 `${XDG_STATE_HOME:-$HOME/.local/state}/sandboxed-sh/remote-builds/`, then polls
-the mission-authenticated status endpoint. Running the same immutable command
-after a client/tool interruption resumes the recorded job instead of
-submitting a duplicate. It prints the remote log tail and exits with the remote
-build's exit code. On
+the mission-authenticated status endpoint. Receipts are scoped to the remote
+endpoint as well as the immutable request. Running the same command after a
+client/tool interruption resumes the recorded job instead of submitting a
+duplicate. It prints the remote log tail and exits with the remote build's exit
+code. On
 HTTP 503 (placement failure, fleet down, feature off) it prints the reason
 and exits 75 (`EX_TEMPFAIL`) so scripts can fall back to a local build:
 

@@ -78,12 +78,13 @@ print(json.dumps(req))
 PY
 )" || die "failed to encode request"
 
-request_key="$(python3 - "$body" <<'PY'
+request_key="$(python3 - "$body" "$REMOTE_BUILD_URL" <<'PY'
 import hashlib, json, sys
 request = json.loads(sys.argv[1])
 request.pop("token", None)
 request.pop("wait", None)
-canonical = json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+fingerprint = {"endpoint": sys.argv[2], "request": request}
+canonical = json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
 print(hashlib.sha256(canonical).hexdigest())
 PY
 )" || die "failed to fingerprint request"
