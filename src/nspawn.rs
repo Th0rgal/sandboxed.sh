@@ -11,6 +11,24 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+pub(crate) const SYSTEMD_SERVICE_ENV_VARS: &[&str] = &[
+    "MEMORY_PRESSURE_WATCH",
+    "MEMORY_PRESSURE_WRITE",
+    "NOTIFY_SOCKET",
+    "WATCHDOG_USEC",
+    "WATCHDOG_PID",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "LISTEN_FDNAMES",
+];
+
+/// Prevent systemd service-manager state from leaking into a child process.
+pub(crate) fn scrub_systemd_service_environment(command: &mut Command) {
+    for name in SYSTEMD_SERVICE_ENV_VARS {
+        command.env_remove(name);
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum NspawnError {
     #[error("Failed to create container directory: {0}")]
@@ -557,14 +575,17 @@ fn scope_wrapped_nspawn_command(path: &Path, env: &HashMap<String, String>) -> C
     let token =
         crate::workspace_exec::machine_name_for_path(path).unwrap_or_else(|| "unknown".to_string());
     let unit = format!("sandboxed-exec-{}-{}", token, uuid::Uuid::new_v4().simple());
-    if let Some(scope_args) = caps.scope_run_args(&unit) {
+    let mut command = if let Some(scope_args) = caps.scope_run_args(&unit) {
         let mut c = Command::new("systemd-run");
         c.args(&scope_args);
         c.arg("systemd-nspawn");
         c
     } else {
         Command::new("systemd-nspawn")
-    }
+    };
+    scrub_systemd_service_environment(&mut command);
+    command.arg("--console=pipe");
+    command
 }
 
 /// Execute a command inside a container using systemd-nspawn.
@@ -974,6 +995,36 @@ async fn unmount_all_under(root: &Path) {
                 .args(["-l", &mp])
                 .output()
                 .await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scope_wrapped_nspawn_command;
+    use std::collections::HashMap;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    use super::SYSTEMD_SERVICE_ENV_VARS;
+
+    #[test]
+    fn headless_nspawn_command_uses_pipe_console_and_scrubs_service_environment() {
+        let command = scope_wrapped_nspawn_command(Path::new("/tmp/workspace"), &HashMap::new());
+        let command = command.as_std();
+
+        assert!(command
+            .get_args()
+            .any(|arg| arg == OsStr::new("--console=pipe")));
+        for name in SYSTEMD_SERVICE_ENV_VARS {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == OsStr::new(name))
+                    .map(|(_, value)| value),
+                Some(None),
+                "{name} must be explicitly removed"
+            );
         }
     }
 }

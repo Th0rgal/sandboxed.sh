@@ -565,17 +565,35 @@ pub(crate) fn resolv_conf_nspawn_args() -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn persistent_nspawn_command(scope_args: Option<&[String]>) -> Command {
+    let mut command = if let Some(scope_args) = scope_args {
+        let mut command = Command::new("systemd-run");
+        command.args(scope_args);
+        command.arg("systemd-nspawn");
+        command
+    } else {
+        Command::new("systemd-nspawn")
+    };
+    nspawn::scrub_systemd_service_environment(&mut command);
+    command.arg("--console=pipe");
+    command
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::nspawn;
+
     use super::{
         append_nsenter_target_root_arg, ca_env_scrub_prelude, durable_command_runs_on_api_host,
         durable_scope_unit, environ_has_keepalive_marker, exec_scope_unit,
         exec_scope_unit_for_mission, exec_unit_belongs_to_mission, machine_name_from_exec_unit,
         mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
-        nspawn_directory_from_cmdline, replace_command_env, resolv_conf_bind_args,
-        synthesized_container_resolv_conf, WorkspaceExec, WorkspaceType, CA_BUNDLE_ENV_VARS,
+        nspawn_directory_from_cmdline, persistent_nspawn_command, replace_command_env,
+        resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec, WorkspaceType,
+        CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use tokio::process::Command;
 
@@ -714,6 +732,30 @@ mod tests {
             WorkspaceType::Container,
             true
         ));
+    }
+
+    #[test]
+    fn persistent_nspawn_boot_scrubs_service_environment() {
+        let command = persistent_nspawn_command(Some(&["--scope".to_string()]));
+        assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg == OsStr::new("systemd-nspawn")));
+        assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg == OsStr::new("--console=pipe")));
+        for name in nspawn::SYSTEMD_SERVICE_ENV_VARS {
+            assert_eq!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .find(|(key, _)| *key == OsStr::new(name))
+                    .map(|(_, value)| value),
+                Some(None),
+                "{name} must be explicitly removed"
+            );
+        }
     }
 
     #[test]
@@ -1526,21 +1568,11 @@ impl WorkspaceExec {
         // path).
         let caps = self.mission_resource_caps();
         let scope_args = caps.scope_run_args(&mission_scope_unit(&name));
-        let mut cmd = if let Some(scope_args) = scope_args {
-            let mut c = Command::new("systemd-run");
-            c.args(&scope_args);
-            // systemd-nspawn's own scope-creation is disabled below via
-            // --register=no/--keep-unit, so it joins this scope's cgroup.
-            c.arg("systemd-nspawn");
-            c
-        } else {
-            Command::new("systemd-nspawn")
-        };
+        let mut cmd = persistent_nspawn_command(scope_args.as_deref());
         cmd.arg("-D").arg(root);
         cmd.arg(format!("--machine={}", name));
         cmd.arg("--quiet");
         cmd.arg("--timezone=off");
-        cmd.arg("--console=pipe");
         cmd.arg("--register=no");
         cmd.arg("--keep-unit");
 
