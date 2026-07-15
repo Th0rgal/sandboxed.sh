@@ -79,12 +79,21 @@ fn retry_disposition(task: &BoardTask, preflight: &RetryPreflight) -> RetryDispo
 }
 
 fn retry_prompt(task: &BoardTask, preflight: &RetryPreflight) -> String {
-    let RetryPreflight::Surviving {
-        branch_state,
-        pr_number,
-    } = preflight
-    else {
-        return task.prompt.clone();
+    let (branch_state, pr_number) = match preflight {
+        RetryPreflight::Surviving {
+            branch_state,
+            pr_number,
+        } => (branch_state.as_str(), *pr_number),
+        // A spawn message can be dropped after the live preflight result was
+        // computed. The zombie re-kick only has persisted task metadata, so
+        // retain the same conservative branch guard for every declared retry
+        // rather than falling back to the original unguarded prompt.
+        RetryPreflight::NothingFound
+            if task.prior_worker_mission_id.is_some() && task.branch.is_some() =>
+        {
+            ("declared retry branch; re-check before editing", None)
+        }
+        _ => return task.prompt.clone(),
     };
     let pr = pr_number
         .map(|number| format!("#{number}"))
@@ -541,7 +550,11 @@ pub async fn scheduler_pass(
                     if seconds_since(&task.updated_at) > STUCK_PENDING_SECS {
                         tracing::info!(task = %task.task_key, worker = %worker_id,
                             "board: re-kicking stuck pending worker");
-                        let prompt = format!("{}{}", task.prompt, worker_contract(task));
+                        let prompt = format!(
+                            "{}{}",
+                            retry_prompt(task, &RetryPreflight::NothingFound),
+                            worker_contract(task)
+                        );
                         if self_send_message(cmd_tx, worker_id, prompt) {
                             let mut t = task.clone();
                             t.notes = append_note(&t.notes, "re-kicked stuck pending worker");
@@ -829,6 +842,22 @@ mod tests {
         let prompt = retry_prompt(&task, &preflight);
 
         assert_ne!(prompt, task.prompt);
+        assert!(prompt.contains("Prior-attempt digest"));
+        assert!(prompt.contains("checkout the existing branch"));
+        assert!(prompt.contains("never recreate from master"));
+        assert!(prompt.contains("never force-push"));
+    }
+
+    #[test]
+    fn retry_rekick_retains_branch_guard_from_persisted_metadata() {
+        let mut task = mk("retry-rekick", &[], BoardTaskStatus::Running, None);
+        task.attempts = 2;
+        task.branch = Some("agent/already-pushed".into());
+        task.prior_worker_mission_id = Some(Uuid::new_v4());
+        task.prior_outcome = Some(BoardTaskOutcome::Failed);
+
+        let prompt = retry_prompt(&task, &RetryPreflight::NothingFound);
+
         assert!(prompt.contains("Prior-attempt digest"));
         assert!(prompt.contains("checkout the existing branch"));
         assert!(prompt.contains("never recreate from master"));
