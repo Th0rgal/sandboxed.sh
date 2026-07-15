@@ -15,6 +15,7 @@
 //!   `<build cwd>/.lake` before a build and refreshed after a successful one.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -232,6 +233,43 @@ fn cache_env(work_root: &Path) -> Vec<(String, String)> {
         ),
         ("PATH".to_string(), path),
     ]
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn lean_runtime_ready_with_path(work_root: &Path, service_path: Option<&OsStr>) -> bool {
+    let cached_lake = caches_dir(work_root).join("elan/bin/lake");
+    executable_file(&cached_lake)
+        || service_path
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            // Repository-controlled relative PATH entries must never make a
+            // node advertise itself as a trustworthy Lean runner.
+            .filter(|dir| dir.is_absolute())
+            .any(|dir| executable_file(&dir.join("lake")))
+}
+
+/// Whether a `lean`-labelled node can actually start the Lake proxy used by
+/// declarative builds. Toolchains may be downloaded lazily by Elan, but a
+/// missing proxy would make every accepted Lean job fail with `ENOENT`.
+pub fn lean_runtime_ready(work_root: &Path) -> bool {
+    lean_runtime_ready_with_path(work_root, std::env::var_os("PATH").as_deref())
 }
 
 /// Add Lean/Lake concurrency defaults derived from the node process's usable
@@ -1420,6 +1458,43 @@ mod tests {
                 "leanprover--lean4---v4.16.0".to_string(),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lean_runtime_readiness_requires_an_executable_lake_proxy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("caches/elan/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let lake = bin.join("lake");
+        std::fs::write(&lake, b"#!/bin/sh\n").unwrap();
+
+        assert!(!lean_runtime_ready_with_path(dir.path(), None));
+        std::fs::set_permissions(&lake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(lean_runtime_ready_with_path(dir.path(), None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lean_runtime_readiness_accepts_an_absolute_service_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let service_bin = tempfile::tempdir().unwrap();
+        let lake = service_bin.path().join("lake");
+        std::fs::write(&lake, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&lake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(lean_runtime_ready_with_path(
+            dir.path(),
+            Some(service_bin.path().as_os_str())
+        ));
+        assert!(!lean_runtime_ready_with_path(
+            dir.path(),
+            Some(OsStr::new("relative/bin"))
+        ));
     }
 
     #[test]

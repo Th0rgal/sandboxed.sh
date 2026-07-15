@@ -214,6 +214,8 @@ async fn heartbeat(
     check_auth(&headers, &state)?;
     let active_leases = state.active_leases.load(Ordering::Acquire);
     let resources = host_resources(&state.work_root);
+    let lean_runtime_ready = sandboxed_sh::node::lean_runtime_ready(&state.work_root);
+    let labels = advertised_labels(&state.labels, lean_runtime_ready);
     Ok(Json(NodeHeartbeat {
         node_id: state.node_id.clone(),
         online: true,
@@ -224,7 +226,7 @@ async fn heartbeat(
         active_leases,
         version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: NODE_PROTOCOL_VERSION,
-        labels: state.labels.clone(),
+        labels,
         cpu_total: resources.cpu_total,
         mem_total_bytes: resources.mem_total_bytes,
         mem_available_bytes: resources.mem_available_bytes,
@@ -233,7 +235,16 @@ async fn heartbeat(
         active_jobs: state.runner.active_count(),
         queued_jobs: state.runner.queued_count(),
         cached_toolchains: sandboxed_sh::node::cached_toolchains(&state.work_root),
+        lean_runtime_ready: Some(lean_runtime_ready),
     }))
+}
+
+fn advertised_labels(configured: &[String], lean_runtime_ready: bool) -> Vec<String> {
+    let mut labels = configured.to_vec();
+    if !lean_runtime_ready {
+        labels.retain(|label| label != "lean");
+    }
+    labels
 }
 
 /// Signing secrets accepted for lease validation: the current token plus,
@@ -577,6 +588,16 @@ mod tests {
         let idle = heartbeat(State(state), headers).await.expect("heartbeat").0;
         assert_eq!(idle.active_leases, 0);
         assert_eq!(idle.capacity_available, 2);
+    }
+
+    #[test]
+    fn heartbeat_withholds_lean_label_without_a_lake_proxy() {
+        let labels = vec!["lean".to_string(), "high-memory".to_string()];
+        assert_eq!(
+            advertised_labels(&labels, false),
+            vec!["high-memory".to_string()]
+        );
+        assert_eq!(advertised_labels(&labels, true), labels);
     }
 
     #[tokio::test]

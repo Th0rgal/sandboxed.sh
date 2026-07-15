@@ -215,6 +215,7 @@ mod tests {
                 active_jobs: 0,
                 queued_jobs: 0,
                 cached_toolchains: vec![],
+                lean_runtime_ready: Some(true),
             })
         }
         let app = Router::new().route("/heartbeat", get(heartbeat));
@@ -234,5 +235,6 @@ mod tests {
         let heartbeat = client.heartbeat(&node, "unused").await.unwrap();
         assert_eq!(heartbeat.capacity_available, 1);
         assert_eq!(heartbeat.labels, vec!["lean".to_string()]);
+        assert_eq!(heartbeat.lean_runtime_ready, Some(true));
     }
 }

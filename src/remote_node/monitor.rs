@@ -293,6 +293,15 @@ pub fn select_node_auto_with_reservations(
             reasons.push((node.id.clone(), "no heartbeat data".to_string()));
             continue;
         };
+        if requirements.iter().any(|requirement| requirement == "lean")
+            && heartbeat.lean_runtime_ready == Some(false)
+        {
+            reasons.push((
+                node.id.clone(),
+                "Lean runtime unavailable (Lake proxy missing)".to_string(),
+            ));
+            continue;
+        }
         // Labels come from the heartbeat, falling back to static config for
         // nodes that don't report any (mirrors RemoteNodeView).
         let labels: &[String] = if heartbeat.labels.is_empty() {
@@ -420,6 +429,7 @@ pub struct RemoteNodeView {
     pub disk_total_bytes: Option<u64>,
     pub disk_available_bytes: Option<u64>,
     pub cached_toolchains: Vec<String>,
+    pub lean_runtime_ready: Option<bool>,
     pub last_seen: Option<DateTime<Utc>>,
     pub error: Option<String>,
 }
@@ -454,6 +464,7 @@ impl RemoteNodeView {
             cached_toolchains: heartbeat
                 .map(|h| h.cached_toolchains.clone())
                 .unwrap_or_default(),
+            lean_runtime_ready: heartbeat.and_then(|h| h.lean_runtime_ready),
             last_seen: cached.and_then(|c| c.last_seen),
             error: cached.and_then(|c| c.last_error.clone()),
         }
@@ -766,6 +777,36 @@ mod tests {
         let picked =
             select_node_auto(&[node_config("e")], &statuses, &[], 20 * GIB, 8 * GIB).unwrap();
         assert_eq!(picked, "e");
+    }
+
+    #[test]
+    fn place_auto_rejects_a_lean_label_when_runtime_is_not_ready() {
+        let node = node_config("missing-lake");
+        let mut status = cached_online("missing-lake", &["lean"], 100, 32, 2, 0, 0);
+        status
+            .last_heartbeat
+            .as_mut()
+            .expect("heartbeat")
+            .lean_runtime_ready = Some(false);
+        let statuses = HashMap::from([("missing-lake".to_string(), status)]);
+
+        let error = select_node_auto(&[node], &statuses, &["lean".to_string()], 20 * GIB, 8 * GIB)
+            .unwrap_err();
+        assert!(error.reasons[0].1.contains("Lake proxy missing"));
+
+        // Compatibility: the readiness field is irrelevant to jobs that do
+        // not request the Lean capability.
+        assert_eq!(
+            select_node_auto(
+                &[node_config("missing-lake")],
+                &statuses,
+                &[],
+                20 * GIB,
+                8 * GIB,
+            )
+            .unwrap(),
+            "missing-lake"
+        );
     }
 
     #[test]
