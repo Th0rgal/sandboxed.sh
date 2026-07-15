@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -30,6 +31,9 @@ struct NodeState {
     labels: Vec<String>,
     work_root: PathBuf,
     capacity_total: u32,
+    /// Shared permits for every process the node starts, whether it came from
+    /// synchronous `/execute` or the async job API.
+    admission: Arc<Semaphore>,
     active_leases: AtomicU32,
     jobs: JobStore,
     runner: Arc<JobRunner>,
@@ -78,10 +82,15 @@ async fn main() -> anyhow::Result<()> {
     let work_root = std::env::var("SANDBOXED_NODE_WORK_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/var/lib/sandboxed-node/work"));
-    let capacity_total = std::env::var("SANDBOXED_NODE_CAPACITY")
-        .ok()
-        .and_then(|raw| raw.parse::<u32>().ok())
-        .unwrap_or(1);
+    let capacity_total = match std::env::var("SANDBOXED_NODE_CAPACITY") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|capacity| *capacity > 0)
+            .ok_or_else(|| anyhow::anyhow!("SANDBOXED_NODE_CAPACITY must be a positive integer"))?,
+        Err(_) => 1,
+    };
     let max_job_secs = std::env::var("SANDBOXED_NODE_MAX_JOB_SECS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
@@ -95,11 +104,13 @@ async fn main() -> anyhow::Result<()> {
     if recovered > 0 {
         warn!("marked {recovered} in-flight job(s) from a previous run as lost");
     }
-    let runner = JobRunner::spawn(
+    let admission = Arc::new(Semaphore::new(capacity_total as usize));
+    let runner = JobRunner::spawn_with_admission(
         jobs.clone(),
         work_root.clone(),
         capacity_total,
         max_job_secs,
+        Arc::clone(&admission),
     );
 
     // Periodic disk GC for lean-build checkouts and lake cache slots
@@ -113,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
         labels,
         work_root,
         capacity_total,
+        admission,
         active_leases: AtomicU32::new(0),
         jobs,
         runner,
@@ -202,7 +214,9 @@ async fn heartbeat(
         node_id: state.node_id.clone(),
         online: true,
         capacity_total: state.capacity_total,
-        capacity_available: state.capacity_total.saturating_sub(active_leases),
+        // This is only a monitoring snapshot; the shared semaphore above is
+        // the atomic enforcement point.
+        capacity_available: state.admission.available_permits() as u32,
         active_leases,
         version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: NODE_PROTOCOL_VERSION,
@@ -261,6 +275,15 @@ async fn execute(
     )
     .map(|(_, secret)| secret.to_string())
     .unwrap_or_else(|_| state.shared_token.clone());
+    // Do not turn an overloaded node into an unbounded set of concurrent
+    // child processes. `try_acquire_owned` is atomic and shares permits with
+    // async jobs, so both APIs fail closed at the same capacity boundary.
+    let _permit = state.admission.clone().try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "node capacity exhausted".to_string(),
+        )
+    })?;
     state.active_leases.fetch_add(1, Ordering::AcqRel);
     let result = run_lease_command(
         &state.node_id,
@@ -460,20 +483,32 @@ mod tests {
         headers
     }
 
-    async fn test_state(work_root: PathBuf) -> Arc<NodeState> {
+    async fn test_state_with_capacity(work_root: PathBuf, capacity_total: u32) -> Arc<NodeState> {
         let jobs = JobStore::open(&work_root).await.expect("job store");
-        let runner = JobRunner::spawn(jobs.clone(), work_root.clone(), 2, DEFAULT_MAX_JOB_SECS);
+        let admission = Arc::new(Semaphore::new(capacity_total as usize));
+        let runner = JobRunner::spawn_with_admission(
+            jobs.clone(),
+            work_root.clone(),
+            capacity_total,
+            DEFAULT_MAX_JOB_SECS,
+            Arc::clone(&admission),
+        );
         Arc::new(NodeState {
             node_id: "test-node".to_string(),
             shared_token: "node-secret".to_string(),
             previous_token: Some("node-secret-old".to_string()),
             labels: vec!["test".to_string()],
             work_root,
-            capacity_total: 2,
+            capacity_total,
+            admission,
             active_leases: AtomicU32::new(0),
             jobs,
             runner,
         })
+    }
+
+    async fn test_state(work_root: PathBuf) -> Arc<NodeState> {
+        test_state_with_capacity(work_root, 2).await
     }
 
     #[tokio::test]
@@ -538,6 +573,106 @@ mod tests {
         let idle = heartbeat(State(state), headers).await.expect("heartbeat").0;
         assert_eq!(idle.active_leases, 0);
         assert_eq!(idle.capacity_available, 2);
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_concurrent_work_when_shared_capacity_is_full() {
+        let work_root = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_capacity(work_root.path().to_path_buf(), 1).await;
+        let headers = auth_headers(&state.shared_token);
+        let mission_id = Uuid::new_v4();
+        let claims = LeaseClaims {
+            mission_id,
+            node_id: state.node_id.clone(),
+            scope: SCOPE_MISSION_EXECUTE.to_string(),
+            expires_at: (chrono::Utc::now() + chrono::Duration::minutes(1)).timestamp(),
+            job_id: None,
+        };
+        let request = || LeaseRequest {
+            mission_id,
+            node_id: state.node_id.clone(),
+            lease_token: create_lease_token(&claims, &state.shared_token).expect("lease token"),
+            command: "sleep 0.2".to_string(),
+        };
+
+        let running = tokio::spawn(execute(
+            State(Arc::clone(&state)),
+            headers.clone(),
+            Json(request()),
+        ));
+        for _ in 0..20 {
+            if state.active_leases.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.active_leases.load(Ordering::Acquire), 1);
+
+        let rejected = execute(State(Arc::clone(&state)), headers, Json(request())).await;
+        assert_eq!(rejected.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        let _ = running
+            .await
+            .expect("execute task")
+            .expect("execute response");
+    }
+
+    #[tokio::test]
+    async fn execute_and_async_jobs_share_the_same_capacity_boundary() {
+        let work_root = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_capacity(work_root.path().to_path_buf(), 1).await;
+        let headers = auth_headers(&state.shared_token);
+        let mission_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let job_claims = LeaseClaims {
+            mission_id,
+            node_id: state.node_id.clone(),
+            scope: SCOPE_JOB_SUBMIT.to_string(),
+            expires_at: (chrono::Utc::now() + chrono::Duration::minutes(1)).timestamp(),
+            job_id: Some(job_id),
+        };
+        let _ = submit_job(
+            State(Arc::clone(&state)),
+            headers.clone(),
+            Json(SubmitJobRequest {
+                job_id,
+                mission_id,
+                lease_token: create_lease_token(&job_claims, &state.shared_token)
+                    .expect("lease token"),
+                payload: sandboxed_sh::remote_node::JobPayload::RawCommand {
+                    command: "sleep 0.2".to_string(),
+                    timeout_secs: Some(30),
+                    env: None,
+                },
+            }),
+        )
+        .await
+        .expect("job accepted");
+        for _ in 0..20 {
+            if state.runner.active_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.runner.active_count(), 1);
+
+        let execute_claims = LeaseClaims {
+            scope: SCOPE_MISSION_EXECUTE.to_string(),
+            job_id: None,
+            ..job_claims
+        };
+        let rejected = execute(
+            State(Arc::clone(&state)),
+            headers,
+            Json(LeaseRequest {
+                mission_id,
+                node_id: state.node_id.clone(),
+                lease_token: create_lease_token(&execute_claims, &state.shared_token)
+                    .expect("lease token"),
+                command: "true".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(rejected.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

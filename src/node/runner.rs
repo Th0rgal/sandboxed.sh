@@ -71,6 +71,26 @@ impl JobRunner {
         capacity: u32,
         max_job_secs: u64,
     ) -> Arc<Self> {
+        Self::spawn_with_admission(
+            store,
+            work_root,
+            capacity,
+            max_job_secs,
+            Arc::new(Semaphore::new(capacity.max(1) as usize)),
+        )
+    }
+
+    /// Start a runner that shares its execution permits with other node work
+    /// (notably synchronous `/execute` requests). This is what makes the
+    /// node-wide capacity limit an admission control boundary rather than a
+    /// heartbeat-only metric.
+    pub fn spawn_with_admission(
+        store: JobStore,
+        work_root: PathBuf,
+        capacity: u32,
+        max_job_secs: u64,
+        admission: Arc<Semaphore>,
+    ) -> Arc<Self> {
         let max_queued = std::env::var("SANDBOXED_NODE_MAX_QUEUED")
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
@@ -89,12 +109,11 @@ impl JobRunner {
         });
         let dispatcher = Arc::clone(&runner);
         tokio::spawn(async move {
-            let semaphore = Arc::new(Semaphore::new(capacity.max(1) as usize));
             while let Some(job) = rx.recv().await {
                 let runner = Arc::clone(&dispatcher);
-                let semaphore = Arc::clone(&semaphore);
+                let admission = Arc::clone(&admission);
                 tokio::spawn(async move {
-                    let permit = match semaphore.acquire_owned().await {
+                    let permit = match admission.acquire_owned().await {
                         Ok(permit) => permit,
                         Err(_) => {
                             runner.queued.fetch_sub(1, Ordering::AcqRel);
