@@ -929,6 +929,7 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 printf '{}' > "$output"
+[ "$REMOTE_BUILD_TEST_HTTP_STATUS" != "0" ] || exit 28
 printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
 "#,
         )
@@ -1122,6 +1123,11 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
                 "HTTP {status} remains a caller error"
             );
         }
+        assert_eq!(
+            run_remote_build_wrapper_with_http_status(0).code(),
+            Some(1),
+            "a submit timeout has an ambiguous outcome and must not request local fallback"
+        );
     }
 
     #[cfg(unix)]
@@ -1241,6 +1247,22 @@ esac
         let interrupted = run("fail");
         assert_eq!(interrupted.status.code(), Some(75));
         assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
+        let receipts = std::fs::read_dir(&state)
+            .expect("read receipt directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect receipts");
+        assert_eq!(receipts.len(), 1);
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(receipts[0].path()).expect("read persisted receipt"),
+        )
+        .expect("parse persisted receipt");
+        assert!(receipt.get("token").is_none());
+        assert!(receipt.get("repo").is_none());
+        assert!(receipt.get("wait").is_none());
+        assert_eq!(
+            receipt.get("job_id").and_then(serde_json::Value::as_str),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
 
         let resumed = run("success");
         assert!(
