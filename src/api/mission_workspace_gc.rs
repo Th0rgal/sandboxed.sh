@@ -179,9 +179,11 @@ fn indexed_mission_directory_is_collectible(
     entries: &[MissionIndexEntry],
     workspace_id: uuid::Uuid,
     cutoff: DateTime<Utc>,
+    index_complete: bool,
 ) -> bool {
-    entry_for_workspace(entries, workspace_id)
-        .is_some_and(|entry| is_gc_eligible_status(&entry.status) && entry.updated_at < cutoff)
+    index_complete
+        && entry_for_workspace(entries, workspace_id)
+            .is_some_and(|entry| is_gc_eligible_status(&entry.status) && entry.updated_at < cutoff)
 }
 
 /// Read one persisted SQLite mission store without booting a session.
@@ -667,7 +669,12 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
                 }
                 let short = mission.id.simple().to_string()[..8].to_string();
                 if mission_index.by_short.get(&short).is_some_and(|entries| {
-                    !indexed_mission_directory_is_collectible(entries, workspace_id, cutoff)
+                    !indexed_mission_directory_is_collectible(
+                        entries,
+                        workspace_id,
+                        cutoff,
+                        mission_index.complete,
+                    )
                 }) {
                     tracing::debug!(
                         mission_id = %mission.id,
@@ -996,6 +1003,25 @@ mod tests {
             &entries,
             workspace_id,
             now - chrono::Duration::days(7),
+            true,
+        ));
+
+        let terminal_only = vec![MissionIndexEntry {
+            status: MissionStatus::Completed,
+            updated_at: now - chrono::Duration::days(40),
+            workspace_id,
+        }];
+        assert!(indexed_mission_directory_is_collectible(
+            &terminal_only,
+            workspace_id,
+            now - chrono::Duration::days(7),
+            true,
+        ));
+        assert!(!indexed_mission_directory_is_collectible(
+            &terminal_only,
+            workspace_id,
+            now - chrono::Duration::days(7),
+            false,
         ));
     }
 
