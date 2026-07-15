@@ -1230,6 +1230,9 @@ case "$url" in
         [ ! -f "$REMOTE_BUILD_TEST_SUBMIT_COUNT" ] || count=$(cat "$REMOTE_BUILD_TEST_SUBMIT_COUNT")
         count=$((count + 1))
         printf '%s' "$count" > "$REMOTE_BUILD_TEST_SUBMIT_COUNT"
+        if [ "$REMOTE_BUILD_TEST_POLL_MODE" = "ambiguous" ]; then
+            exit 28
+        fi
         printf '{"job_id":"11111111-1111-1111-1111-111111111111","node_id":"lean:gpu"}' > "$output"
         printf '202'
         ;;
@@ -1371,6 +1374,43 @@ esac
         );
         assert!(String::from_utf8_lossy(&persistence_failed.stderr)
             .contains("failed to persist its receipt"));
+
+        for entry in std::fs::read_dir(&state).expect("read state before ambiguous submission") {
+            let path = entry.expect("read state entry").path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).expect("remove stale test lock directory");
+            } else {
+                std::fs::remove_file(path).expect("remove prior test receipt");
+            }
+        }
+        std::fs::write(&submit_count, "0").expect("reset submit counter");
+        let ambiguous = run("ambiguous");
+        assert_eq!(ambiguous.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("unknown outcome"));
+        let blocked_retry = run("success");
+        assert_eq!(blocked_retry.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&blocked_retry.stderr).contains("previous submission"));
+        assert_eq!(
+            std::fs::read_to_string(&submit_count).unwrap(),
+            "1",
+            "an ambiguous first submit must block an identical retry"
+        );
+        let ambiguous_receipt = std::fs::read_dir(&state)
+            .expect("read ambiguous receipt directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .expect("ambiguous receipt");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(ambiguous_receipt).expect("read ambiguous receipt"),
+        )
+        .expect("parse ambiguous receipt");
+        assert_eq!(
+            receipt.get("state").and_then(serde_json::Value::as_str),
+            Some("ambiguous")
+        );
+        assert!(receipt.get("token").is_none());
+        assert!(receipt.get("repo").is_none());
     }
 
     #[test]

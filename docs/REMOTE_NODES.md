@@ -429,7 +429,9 @@ If the core cannot connect to the selected node before sending the request, it
 returns 503 and local fallback remains safe. If submission instead has an
 ambiguous response-side transport failure, core returns 502 while its tentative
 ledger reconciles/cancels the possible job. The wrapper exits 1 for that
-response and never falls back.
+response and never falls back. It also persists a secret-free `ambiguous`
+receipt, so an identical retry cannot submit a second job before operators
+confirm reconciliation; `REMOTE_BUILD_FORCE_NEW=1` is an explicit override.
 
 Optional: `REMOTE_BUILD_TIMEOUT_SECS` forwards a job timeout (clamped by the
 node's `SANDBOXED_NODE_MAX_JOB_SECS`). `REMOTE_BUILD_SUBMIT_TIMEOUT_SECS`
