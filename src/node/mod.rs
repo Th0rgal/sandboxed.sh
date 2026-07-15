@@ -8,7 +8,7 @@ pub mod lean;
 pub mod runner;
 
 pub use job_store::{JobRecord, JobState, JobStore};
-pub use lean::{cached_toolchains, spawn_cache_gc};
+pub use lean::{cached_toolchains, lean_runtime_ready, spawn_cache_gc};
 pub use runner::{
     maybe_exec_cleared_scope_payload, read_log_tail, JobRunner, NodeQueueFull,
     DEFAULT_MAX_JOB_SECS, LOG_TAIL_MAX_BYTES,

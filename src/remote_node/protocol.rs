@@ -68,6 +68,10 @@ pub struct NodeHeartbeat {
     /// Prewarmed toolchains cached on the node (empty until S3).
     #[serde(default)]
     pub cached_toolchains: Vec<String>,
+    /// Whether the node can resolve an executable Lake proxy. `None` means an
+    /// older node that predates readiness reporting.
+    #[serde(default)]
+    pub lean_runtime_ready: Option<bool>,
 }
 
 /// Legacy per-node status shape (kept for API compatibility).
@@ -586,6 +590,7 @@ mod tests {
             active_jobs: 1,
             queued_jobs: 2,
             cached_toolchains: vec![],
+            lean_runtime_ready: Some(true),
         };
         let json = serde_json::to_string(&heartbeat).unwrap();
         let parsed: NodeHeartbeat = serde_json::from_str(&json).unwrap();
