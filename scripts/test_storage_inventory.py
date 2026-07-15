@@ -75,6 +75,15 @@ with tempfile.TemporaryDirectory() as temp:
     for name in (".lake", "worktrees", "images", "unattributed-old"):
         assert items[name]["action"] == "keep", name
 
+    legacy = missions / "missions-legacy.json"
+    legacy.write_text('{"missions": {}}')
+    result = subprocess.run([sys.executable, str(SCRIPT), "--missions-dir", str(missions), "--root", str(workspaces), "--retention-days", "7"], check=True, capture_output=True, text=True)
+    rows = [json.loads(line) for line in result.stdout.splitlines()]
+    items = {Path(row["path"]).name: row for row in rows if row["record_type"] == "storage_item"}
+    assert items["mission-bbbbbbbb"]["action"] == "keep"
+    assert items["mission-bbbbbbbb"]["reason"] == "mission_attribution_incomplete"
+    legacy.unlink()
+
     broken = missions / "missions-broken.db"
     broken.write_text("not sqlite")
     result = subprocess.run([sys.executable, str(SCRIPT), "--missions-dir", str(missions), "--root", str(workspaces), "--retention-days", "7"], check=True, capture_output=True, text=True)

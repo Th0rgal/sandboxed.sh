@@ -40,6 +40,9 @@ def mission_index(missions_dir):
     if not missions_path.is_dir():
         print(json.dumps({"record_type": "audit", "action": "index_error", "path": str(missions_path), "error": "missions directory is missing or unreadable"}), file=sys.stderr)
         return records, False
+    for legacy_store in missions_path.glob("missions-*.json"):
+        print(json.dumps({"record_type": "audit", "action": "index_error", "path": str(legacy_store), "error": "legacy JSON mission store is not indexed"}), file=sys.stderr)
+        complete = False
     for db in missions_path.glob("missions-*.db"):
         try:
             conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
