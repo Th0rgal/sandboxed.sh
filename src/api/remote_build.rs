@@ -424,6 +424,10 @@ async fn resolve_node(
 
 fn submit_error_status(err: &RemoteNodeError) -> StatusCode {
     match err {
+        // A transport failure may happen after the node accepted the request.
+        // The tentative ledger/observer will reconcile it, but the caller must
+        // not start a duplicate local build in the meantime.
+        RemoteNodeError::Request(_) => StatusCode::BAD_GATEWAY,
         RemoteNodeError::Rejected { status, .. }
             if (400..500).contains(status) && !matches!(*status, 401 | 403 | 408 | 429) =>
         {
@@ -1106,7 +1110,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         }
         assert_eq!(
             submit_error_status(&RemoteNodeError::Request("offline".to_string())),
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::BAD_GATEWAY
         );
     }
 
