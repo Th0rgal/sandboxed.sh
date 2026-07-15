@@ -347,9 +347,16 @@ Gemini CLI login flow. Gemini missions use raw model ids such as
 
 ### 3.5.3 Grok
 
-Configure xAI credentials in **Settings → Providers**, set `XAI_API_KEY` or
-`GROK_CODE_XAI_API_KEY`, or run the Grok CLI login flow. Grok missions use raw
-model ids such as `grok-4.5`.
+For OpenCode/API-key routing, configure `XAI_API_KEY` in **Settings →
+Providers** and select `xai/grok-4.5`. The official rolling aliases are
+`xai/grok-4.5-latest` and `xai/grok-build-latest`.
+
+For the native `grok` backend, use the Grok CLI login flow (or its supported
+credential configuration) and select the raw canonical ID `grok-4.5`, not the
+`xai/`-prefixed form. Native CLI availability is discovered per account and
+can vary by region, including for EU accounts; run `grok models` on the server
+if the CLI reports an unknown or unavailable model. An account-level absence
+does not remove the official model from the global xAI API catalog.
 
 ---
 
