@@ -437,10 +437,29 @@ fn systemd_scope_mode() -> Option<SystemdScopeMode> {
         return Some(SystemdScopeMode::System);
     }
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
-    Path::new(&runtime_dir)
-        .join("bus")
-        .exists()
-        .then_some(SystemdScopeMode::User)
+    match user_systemd_scope_mode(Path::new(&runtime_dir)) {
+        Ok(mode) => Some(mode),
+        Err(error) => {
+            static WARN_DEGRADED_CONTAINMENT: std::sync::Once = std::sync::Once::new();
+            WARN_DEGRADED_CONTAINMENT.call_once(|| {
+                tracing::warn!(
+                    bus = %Path::new(&runtime_dir).join("bus").display(),
+                    %error,
+                    "transient user scopes are unavailable; containment degraded to process groups; ProtectHome=true may be hiding /run/user (bind the runner's /run/user/%U into the unit)"
+                );
+            });
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn user_systemd_scope_mode(runtime_dir: &Path) -> std::io::Result<SystemdScopeMode> {
+    // Connecting verifies that the path is both visible and usable by this
+    // process. A metadata/existence check can pass for an inaccessible,
+    // stale, or non-socket path and make systemd-run fail later per job.
+    std::os::unix::net::UnixStream::connect(runtime_dir.join("bus"))?;
+    Ok(SystemdScopeMode::User)
 }
 
 #[cfg(target_os = "linux")]
@@ -695,18 +714,22 @@ mod tests {
                 .await
                 .unwrap();
         }
-        for _ in 0..100 {
-            if matches!(
-                store.get(running).await.unwrap().map(|record| record.state),
-                Some(JobState::Running)
-            ) && matches!(
-                store.get(queued).await.unwrap().map(|record| record.state),
-                Some(JobState::Queued)
-            ) {
-                break;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    store.get(running).await.unwrap().map(|record| record.state),
+                    Some(JobState::Running)
+                ) && matches!(
+                    store.get(queued).await.unwrap().map(|record| record.state),
+                    Some(JobState::Queued)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .expect("first job should start while the second remains queued");
 
         assert_eq!(runner.queued_count(), 1);
         assert!(runner.cancel(queued).await.unwrap());
@@ -800,6 +823,27 @@ mod tests {
             .as_std()
             .get_envs()
             .any(|(key, value)| key == "NODE_JOB_SECRET" && value == Some("not-in-argv".as_ref())));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_scope_probe_requires_an_accessible_bus_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bus"), b"not a socket").unwrap();
+
+        assert!(user_systemd_scope_mode(dir.path()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_scope_probe_selects_user_mode_for_accessible_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(dir.path().join("bus")).unwrap();
+
+        assert_eq!(
+            user_systemd_scope_mode(dir.path()).unwrap(),
+            SystemdScopeMode::User
+        );
     }
 
     #[cfg(target_os = "linux")]

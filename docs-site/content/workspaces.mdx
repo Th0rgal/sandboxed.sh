@@ -5,7 +5,10 @@ description: Isolated environments for agent tasks
 
 # Workspaces
 
-Workspaces are isolated environments where agents execute tasks. Each workspace has its own file system, installed software, and configuration.
+Workspaces are reusable execution environments where agents run missions. A
+workspace owns the filesystem, installed software, toolchains, network policy,
+and intentionally shared project paths. Each mission still receives its own
+working directory and generated harness configuration.
 
 ## Types
 
@@ -78,6 +81,18 @@ pending → building → ready → (in use) → (destroyed)
 | `ready` | Available for missions |
 | `error` | Build failed (check logs) |
 
+## Multiple Missions
+
+Several missions can target the same workspace. Sandboxed.sh creates
+`workspaces/mission-<short-id>` for each mission, so their default file effects
+and OpenCode/Claude/Codex configuration remain separate. They reuse the
+workspace's container, installed toolchain, and explicit shared paths such as a
+canonical repository or read-only cache.
+
+For concurrent writers, create a clone or worktree per mission. Sharing a
+workspace is intended to avoid repeated provisioning, not to make agents write
+to the same checkout.
+
 ## Configuration
 
 ### Skills and Tools
@@ -91,7 +106,8 @@ Workspaces can have skills and tools from your Library:
 }
 ```
 
-These are synced to `.opencode/skill/` and `.opencode/tool/` inside the workspace.
+These are synced to the backend-specific directory inside each mission:
+`.opencode`, `.claude`, or `.codex`.
 
 ### Environment Variables
 
@@ -145,6 +161,23 @@ curl -X POST "https://agent.yourdomain.com/api/workspaces" \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"name": "my-project", "template": "fullstack"}'
 ```
+
+Applying an updated template replaces the fields controlled by that template;
+rebuilding then recreates the container. Assistant-facing template reads redact
+all environment values. If an encrypted value cannot be decrypted, Sandboxed.sh
+refuses to apply or patch-save the template instead of persisting a placeholder.
+
+## MCP Security
+
+Stdio MCP servers run in the selected workspace through a mission-local launcher
+with mode `0700`. The launcher clears inherited variables and restores only the
+MCP's own environment plus workspace keys explicitly named in
+`workspace_env_allowlist`. Secret values do not appear in generated harness
+configuration or process arguments.
+
+The wildcard `"*"` is reserved for the built-in `workspace-mcp` compatibility
+proxy. Third-party MCPs should receive the smallest practical allowlist, such as
+`PATH`, `ELAN_HOME`, and `LEAN_PROJECT_PATH` for a Lean language server.
 
 ## Executing Commands
 
@@ -210,6 +243,8 @@ If a container build fails:
 2. **Create templates for repeated setups.** Don't rebuild the same environment.
 3. **Keep init scripts idempotent.** Should work on re-run.
 4. **Version your templates.** They're in your Library git repo.
+5. **Pin external tools and use absolute helper paths.** Template init runs
+   before generic harness bootstrap and runtime launchers use a clean environment.
 
 ## Next Steps
 

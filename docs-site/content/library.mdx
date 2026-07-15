@@ -154,7 +154,9 @@ MCP (Model Context Protocol) servers provide tools and resources to agents.
 }
 ```
 
-MCP servers run on the host and are available to all missions.
+Workspace-scoped MCP servers run beside the harness in the selected host or
+container workspace. Stdio servers receive a clean, explicitly allowlisted
+environment; they do not inherit every workspace credential.
 
 ## Workspace Templates
 
@@ -185,7 +187,7 @@ Create workspaces from templates for consistent, reproducible environments.
 | Commands | Global | Available everywhere |
 | Rules | Global | All missions |
 | Agents | Global | Selectable per-mission |
-| MCPs | Global | Run on host |
+| MCP definitions | Global registry | Selected per workspace; run in its execution context |
 | Templates | Per-workspace | Container creation |
 
 ## Syncing

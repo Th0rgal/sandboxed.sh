@@ -344,7 +344,7 @@ impl AgentEvent {
 /// `respond` channel. Distinguishes "delivered, a turn is starting" from
 /// "dropped" — both used to be `false`, which made drops invisible to
 /// callers that need delivery guarantees (e.g. the Copilot's steering tool).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserMessageAck {
     /// The target is busy mid-turn; the message was queued and will be
     /// picked up at the next turn boundary.
@@ -355,6 +355,9 @@ pub enum UserMessageAck {
     /// rejected goal kickoff, …). An `AgentEvent::Error` with details was
     /// emitted on the event stream.
     Dropped,
+    /// The actor rejected the message after HTTP preflight. The reason is
+    /// returned to synchronous callers instead of being visible only on SSE.
+    Rejected(String),
 }
 
 /// Internal control commands (queued and processed by the actor).

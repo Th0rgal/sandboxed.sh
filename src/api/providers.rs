@@ -72,9 +72,11 @@ const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
 /// Text/code model IDs accepted by the native Grok CLI backend for the current
 /// OAuth-based Grok Build path. This is intentionally narrower than xAI's
 /// OpenAI-compatible `/v1/models` catalog: API-routable models such as
-/// `grok-4.5` can still appear as `xai/grok-4.5` for the custom router, but the
-/// `grok` backend must only offer IDs that `grok --model ...` accepts.
+/// rolling aliases can still appear for the custom router, but the `grok`
+/// backend only offers canonical IDs documented for Grok Build. Actual access
+/// remains account/region-dependent and is diagnosed by the CLI at runtime.
 const GROK_CLI_TEXT_MODEL_IDS: &[&str] = &[
+    "grok-4.5",
     "grok-build-0.1",
     "grok-4.3",
     "grok-4.20-0309-reasoning",
@@ -959,9 +961,25 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "pay-per-token".to_string(),
                 description: "Grok models via xAI API key".to_string(),
                 models: vec![
-                    // These IDs must match what the Grok Build CLI accepts
-                    // (`grok models`) — the bare `grok-build` alias is rejected
-                    // by current CLIs. xAI API model IDs: https://docs.x.ai/docs/models
+                    ProviderModel {
+                        id: "grok-4.5".to_string(),
+                        name: "Grok 4.5".to_string(),
+                        description: Some("Latest flagship Grok model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "grok-4.5-latest".to_string(),
+                        name: "Grok 4.5 (Latest)".to_string(),
+                        description: Some("Rolling alias for Grok 4.5".to_string()),
+                    },
+                    ProviderModel {
+                        id: "grok-build-latest".to_string(),
+                        name: "Grok Build (Latest)".to_string(),
+                        description: Some(
+                            "Rolling Grok Build alias backed by Grok 4.5".to_string(),
+                        ),
+                    },
+                    // Legacy IDs retained for accounts that still advertise them.
+                    // Native Grok CLI choices are filtered separately below.
                     ProviderModel {
                         id: "grok-build-0.1".to_string(),
                         name: "Grok Build".to_string(),
@@ -2268,6 +2286,7 @@ pub async fn validate_model_override(
             }
         }
         "codex" => {
+            reject_known_unsupported_codex_model(model_override)?;
             // Codex expects raw model IDs from OpenAI
             let openai = providers.iter().find(|p| p.id == "openai");
             if let Some(provider) = openai {
@@ -2381,6 +2400,16 @@ pub async fn validate_model_override(
     }
 }
 
+fn reject_known_unsupported_codex_model(model_id: &str) -> Result<(), String> {
+    if model_id == "gpt-5.5-sol" {
+        return Err(
+            "Model 'gpt-5.5-sol' is not supported by Codex with ChatGPT authentication. Use 'gpt-5.6-terra' (recommended with model_effort='medium') or select an account-supported model explicitly."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn is_grok_backend_model_id(model_id: &str) -> bool {
     GROK_CLI_TEXT_MODEL_IDS.contains(&model_id)
 }
@@ -2452,6 +2481,14 @@ mod tests {
                 "bare/non-API slug should not be exposed: {invalid_id}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_invented_gpt_55_sol_variant_before_dispatch() {
+        let error = reject_known_unsupported_codex_model("gpt-5.5-sol")
+            .expect_err("invented model variant must be rejected");
+        assert!(error.contains("gpt-5.6-terra"));
+        assert!(reject_known_unsupported_codex_model("gpt-5.6-terra").is_ok());
     }
 
     #[test]
@@ -2535,11 +2572,13 @@ mod tests {
         // The CLI-valid coding model id (bare `grok-build` is rejected by
         // current CLIs). `composer-2.5` is intentionally NOT here: it's a
         // product name, not a valid xAI API id, and the API rejects it.
-        // `grok-4.5` is intentionally not seeded unless live account catalog
-        // discovery returns it; Grok CLI 0.2.93 rejects it with "unknown model id"
-        // for the current production OAuth/API token.
         assert!(xai.models.iter().any(|model| model.id == "grok-build-0.1"));
-        assert!(!xai.models.iter().any(|model| model.id == "grok-4.5"));
+        assert!(xai.models.iter().any(|model| model.id == "grok-4.5"));
+        assert!(xai.models.iter().any(|model| model.id == "grok-4.5-latest"));
+        assert!(xai
+            .models
+            .iter()
+            .any(|model| model.id == "grok-build-latest"));
         assert!(!xai.models.iter().any(|model| model.id == "composer-2.5"));
     }
 
@@ -2549,10 +2588,10 @@ mod tests {
         assert!(is_grok_backend_model_id("grok-4.20-0309-reasoning"));
         assert!(is_grok_backend_model_id("grok-4.20-0309-non-reasoning"));
         assert!(is_grok_backend_model_id("grok-4.20-multi-agent-0309"));
-        // xAI API/catalog IDs are not automatically valid for the native
-        // Grok CLI backend. Prod Grok CLI 0.2.93 currently rejects this one
-        // with "unknown model id".
-        assert!(!is_grok_backend_model_id("grok-4.5"));
+        assert!(is_grok_backend_model_id("grok-4.5"));
+        // API rolling aliases are not assumed to be native CLI model IDs.
+        assert!(!is_grok_backend_model_id("grok-4.5-latest"));
+        assert!(!is_grok_backend_model_id("grok-build-latest"));
         assert!(!is_grok_backend_model_id("grok-imagine-image"));
         // `composer-*` is a product name, not a Grok CLI model id.
         assert!(!is_grok_backend_model_id("composer-2.5"));
@@ -2575,7 +2614,7 @@ mod tests {
             .collect();
 
         assert!(option_ids.contains(&"grok-build-0.1"));
-        assert!(!option_ids.contains(&"grok-4.5"));
+        assert!(option_ids.contains(&"grok-4.5"));
         assert!(!option_ids.contains(&"composer-2.5"));
     }
 

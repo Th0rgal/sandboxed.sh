@@ -13,7 +13,8 @@
 //! qualifies, so the in-workspace `remote-lean-build` wrapper can fall back
 //! to a local build (exit 75).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::{
@@ -239,6 +240,56 @@ fn should_reprobe_after_placement_failure(_status: Option<&RemoteNodeStatus>) ->
     true
 }
 
+fn placement_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
+    match crate::remote_node::job_ledger::load(&state.config.working_dir).await {
+        Ok(handles) => {
+            let mut reservations = HashMap::new();
+            for handle in handles {
+                *reservations.entry(handle.node_id).or_insert(0) += 1;
+            }
+            let heartbeat_job_counts = reservations
+                .keys()
+                .filter_map(|node_id| {
+                    state.fleet.get(node_id).and_then(|status| {
+                        status.last_heartbeat.map(|heartbeat| {
+                            (
+                                node_id.clone(),
+                                heartbeat.active_jobs.saturating_add(heartbeat.queued_jobs),
+                            )
+                        })
+                    })
+                })
+                .collect();
+            reconcile_heartbeat_visible_jobs(reservations, &heartbeat_job_counts)
+        }
+        Err(error) => {
+            tracing::warn!(?error, "remote job reservations could not be loaded");
+            HashMap::new()
+        }
+    }
+}
+
+fn reconcile_heartbeat_visible_jobs(
+    mut ledger_counts: HashMap<String, u32>,
+    heartbeat_job_counts: &HashMap<String, u32>,
+) -> HashMap<String, u32> {
+    ledger_counts.retain(|node_id, ledger_count| {
+        *ledger_count = ledger_count.saturating_sub(
+            heartbeat_job_counts
+                .get(node_id)
+                .copied()
+                .unwrap_or_default(),
+        );
+        *ledger_count > 0
+    });
+    ledger_counts
+}
+
 /// Resolve the target node: explicit id or capacity-aware auto placement.
 /// All misses map to `503` so the wrapper can fall back to a local build —
 /// except an explicitly named unknown node, which is a caller bug (`400`).
@@ -255,7 +306,10 @@ async fn resolve_node(
         ));
     }
     if node_id.eq_ignore_ascii_case("auto") {
-        let first = state.fleet.place_auto(settings, requirements);
+        let reservations = core_side_reservations(state).await;
+        let first = state
+            .fleet
+            .place_auto_with_reservations(settings, requirements, &reservations);
         let picked = match first {
             Ok(picked) => picked,
             Err(initial_err) => {
@@ -284,9 +338,10 @@ async fn resolve_node(
                         .map(|node| crate::remote_node::probe_node(&state.fleet, &client, node)),
                 )
                 .await;
+                let reservations = core_side_reservations(state).await;
                 state
                     .fleet
-                    .place_auto(settings, requirements)
+                    .place_auto_with_reservations(settings, requirements, &reservations)
                     .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?
             }
         };
@@ -405,6 +460,9 @@ async fn submit_remote_build(
         return (StatusCode::BAD_REQUEST, "command argv required").into_response();
     }
 
+    // Serialize placement through tentative-handle persistence. Otherwise a
+    // burst can select the same idle node before its next heartbeat.
+    let placement_guard = placement_lock().lock().await;
     let node = match resolve_node(&state, &req.node_id, &req.requirements).await {
         Ok(node) => node,
         Err((status, message)) => return (status, message).into_response(),
@@ -464,6 +522,7 @@ async fn submit_remote_build(
         )
             .into_response();
     }
+    drop(placement_guard);
     let accepted = match client.submit_job(&node, &shared_token, &submit).await {
         Ok(accepted) => accepted,
         Err(err) => {
@@ -686,6 +745,17 @@ async fn get_remote_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reservations_exclude_jobs_already_visible_in_heartbeat() {
+        let ledger = HashMap::from([("node-a".to_string(), 2), ("node-b".to_string(), 2)]);
+        let visible = HashMap::from([("node-a".to_string(), 1), ("node-b".to_string(), 3)]);
+
+        assert_eq!(
+            reconcile_heartbeat_visible_jobs(ledger, &visible),
+            HashMap::from([("node-a".to_string(), 1)])
+        );
+    }
 
     #[cfg(unix)]
     fn run_remote_build_wrapper_with_http_status(status: u16) -> std::process::ExitStatus {

@@ -359,6 +359,56 @@ impl Workspace {
             "REMOTE_BUILD_MISSION_ID".to_string(),
             mission_id.to_string(),
         );
+        let remote_config = self.config.get("remote_build");
+        let node_id = remote_config
+            .and_then(|config| config.get("node_id"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("auto");
+        m.insert("REMOTE_BUILD_NODE_ID".to_string(), node_id.to_string());
+        let requirements = remote_config
+            .and_then(|config| config.get("requirements"))
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .filter(|item| !item.trim().is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|items| !items.is_empty())
+            .unwrap_or_else(|| vec!["lean"]);
+        m.insert(
+            "REMOTE_BUILD_REQUIREMENTS".to_string(),
+            serde_json::to_string(&requirements).ok()?,
+        );
+        if let Some(timeout) = remote_config
+            .and_then(|config| config.get("timeout_secs"))
+            .and_then(|value| value.as_u64())
+        {
+            m.insert("REMOTE_BUILD_TIMEOUT_SECS".to_string(), timeout.to_string());
+        }
+        let wrapper = remote_build_wrapper_path(self, mission_id);
+        m.insert(
+            "REMOTE_BUILD_COMMAND".to_string(),
+            wrapper.to_string_lossy().to_string(),
+        );
+        let existing_path = self
+            .env_vars
+            .get("PATH")
+            .cloned()
+            .or_else(|| {
+                (self.workspace_type != WorkspaceType::Container)
+                    .then(|| std::env::var("PATH").ok())
+                    .flatten()
+            })
+            .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
+        if let Some(parent) = wrapper.parent() {
+            m.insert(
+                "PATH".to_string(),
+                format!("{}:{existing_path}", parent.display()),
+            );
+        }
         Some(m)
     }
 
@@ -763,6 +813,101 @@ pub fn task_workspace_dir_for_root(root: &Path, task_id: Uuid) -> PathBuf {
     workspaces_root_for(root).join(format!("task-{}", short_id))
 }
 
+fn mcp_launcher_shell_escape(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_mcp_env_launcher(
+    config: &McpServerConfig,
+    workspace_dir: &Path,
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    container_fallback: bool,
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> anyhow::Result<String> {
+    let launcher_dir = workspace_dir.join(".sandboxed-sh").join("mcp-launchers");
+    std::fs::create_dir_all(&launcher_dir)?;
+    let sanitized_name = sanitize_key(&config.name);
+    let launcher_name = format!(
+        "{}-{}.sh",
+        if sanitized_name.is_empty() {
+            "mcp"
+        } else {
+            &sanitized_name
+        },
+        config.id.simple()
+    );
+    let launcher_host_path = launcher_dir.join(launcher_name);
+
+    let mut script = String::from(
+        "#!/bin/bash\n\
+         while IFS='=' read -r _oa_key _oa_value; do\n\
+           [[ $_oa_key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && unset \"$_oa_key\" || true\n\
+         done < <(/usr/bin/env)\n\
+         unset _oa_key _oa_value\n",
+    );
+    let mut env_pairs: Vec<_> = env
+        .iter()
+        .filter(|(key, _)| {
+            let mut chars = key.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .collect();
+    env_pairs.sort_by_key(|(key, _)| *key);
+    for (key, value) in env_pairs {
+        script.push_str("export ");
+        script.push_str(key);
+        script.push('=');
+        script.push_str(&mcp_launcher_shell_escape(value));
+        script.push('\n');
+    }
+    script.push_str("exec ");
+    script.push_str(&mcp_launcher_shell_escape(command));
+    for arg in args {
+        script.push(' ');
+        script.push_str(&mcp_launcher_shell_escape(arg));
+    }
+    script.push('\n');
+
+    let temp_path = launcher_host_path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let write_result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o700);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(script.as_bytes())?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        }
+        std::fs::rename(&temp_path, &launcher_host_path)
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result?;
+
+    if workspace_type == WorkspaceType::Container && !container_fallback {
+        let relative = launcher_host_path
+            .strip_prefix(workspace_root)
+            .map_err(|_| anyhow::anyhow!("MCP launcher is outside the container workspace"))?;
+        Ok(format!("/{}", relative.to_string_lossy()))
+    } else {
+        Ok(launcher_host_path.to_string_lossy().to_string())
+    }
+}
+
 fn opencode_entry_from_mcp(
     config: &McpServerConfig,
     workspace_dir: &Path,
@@ -770,7 +915,35 @@ fn opencode_entry_from_mcp(
     workspace_type: WorkspaceType,
     workspace_env: &HashMap<String, String>,
     shared_network: Option<bool>,
-) -> serde_json::Value {
+) -> anyhow::Result<serde_json::Value> {
+    fn allowed_workspace_env(
+        config: &McpServerConfig,
+        workspace_env: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        if config
+            .workspace_env_allowlist
+            .iter()
+            .any(|key| key.trim() == "*")
+        {
+            return workspace_env.clone();
+        }
+
+        config
+            .workspace_env_allowlist
+            .iter()
+            .filter_map(|key| {
+                let key = key.trim();
+                if key.is_empty() {
+                    None
+                } else {
+                    workspace_env
+                        .get(key)
+                        .map(|value| (key.to_string(), value.clone()))
+                }
+            })
+            .collect()
+    }
+
     fn resolve_host_command_path(cmd: &str) -> String {
         let cmd_path = Path::new(cmd);
         if cmd_path.is_absolute() || cmd.contains('/') {
@@ -856,25 +1029,37 @@ fn opencode_entry_from_mcp(
             if !headers.is_empty() {
                 entry.insert("headers".to_string(), json!(headers));
             }
-            json!(entry)
+            Ok(json!(entry))
         }
         McpTransport::Stdio { command, args, env } => {
             let mut entry = serde_json::Map::new();
             entry.insert("type".to_string(), json!("local"));
 
+            // Do not implicitly forward a workspace's complete environment to
+            // every third-party MCP. Only MCP-specific env and explicitly
+            // allowlisted workspace keys cross this boundary.
+            let allowed_workspace_env = allowed_workspace_env(config, workspace_env);
             let mut merged_env = env.clone();
-            if !workspace_env.is_empty() {
-                for (key, value) in workspace_env {
+            if !allowed_workspace_env.is_empty() {
+                for (key, value) in &allowed_workspace_env {
                     merged_env
                         .entry(key.clone())
                         .or_insert_with(|| value.clone());
                 }
-                let workspace_env_json =
-                    serde_json::to_string(workspace_env).unwrap_or_else(|_| "{}".to_string());
+                let workspace_env_json = serde_json::to_string(&allowed_workspace_env)
+                    .unwrap_or_else(|_| "{}".to_string());
                 merged_env
                     .entry("SANDBOXED_SH_WORKSPACE_ENV_VARS".to_string())
                     .or_insert(workspace_env_json);
             }
+            // A predictable non-secret PATH keeps scripts with `/usr/bin/env`
+            // shebangs working without inheriting the harness environment.
+            merged_env.entry("PATH".to_string()).or_insert_with(|| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+            });
+            merged_env
+                .entry("HOME".to_string())
+                .or_insert_with(|| workspace_dir.to_string_lossy().to_string());
             merged_env
                 .entry("SANDBOXED_SH_WORKSPACE".to_string())
                 .or_insert_with(|| workspace_dir.to_string_lossy().to_string());
@@ -920,6 +1105,41 @@ fn opencode_entry_from_mcp(
                 && !per_workspace_runner
                 && nspawn::nspawn_available();
 
+            if workspace_type == WorkspaceType::Container && !container_fallback {
+                let relative = workspace_dir
+                    .strip_prefix(workspace_root)
+                    .unwrap_or_else(|_| Path::new(""));
+                let guest_dir = if relative.as_os_str().is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/{}", relative.to_string_lossy())
+                };
+                merged_env.insert("SANDBOXED_SH_WORKSPACE".to_string(), guest_dir.clone());
+                merged_env.insert("SANDBOXED_SH_WORKSPACE_ROOT".to_string(), "/".to_string());
+                merged_env.insert("WORKING_DIR".to_string(), guest_dir.clone());
+                merged_env.insert("HOME".to_string(), guest_dir);
+            }
+
+            let resolved_command = match workspace_type {
+                WorkspaceType::Container => resolve_container_command_path(
+                    command,
+                    workspace_root,
+                    container_fallback,
+                    per_workspace_runner || use_nspawn,
+                ),
+                WorkspaceType::Host => resolve_host_command_path(command),
+            };
+            let launcher = write_mcp_env_launcher(
+                config,
+                workspace_dir,
+                workspace_root,
+                workspace_type,
+                container_fallback,
+                &resolved_command,
+                args,
+                &merged_env,
+            )?;
+
             if use_nspawn {
                 let rel = workspace_dir
                     .strip_prefix(workspace_root)
@@ -929,11 +1149,6 @@ fn opencode_entry_from_mcp(
                 } else {
                     format!("/{}", rel.to_string_lossy())
                 };
-
-                let mut nspawn_env = merged_env.clone();
-                nspawn_env.insert("SANDBOXED_SH_WORKSPACE".to_string(), rel_str.clone());
-                nspawn_env.insert("SANDBOXED_SH_WORKSPACE_ROOT".to_string(), "/".to_string());
-                nspawn_env.insert("WORKING_DIR".to_string(), rel_str.clone());
 
                 let mut cmd = vec![
                     resolve_host_command_path("systemd-nspawn"),
@@ -975,14 +1190,6 @@ fn opencode_entry_from_mcp(
                         "--bind={}:/root/context",
                         global_context_root.display()
                     ));
-                    nspawn_env.insert(
-                        "SANDBOXED_SH_CONTEXT_ROOT".to_string(),
-                        "/root/context".to_string(),
-                    );
-                    nspawn_env.insert(
-                        "SANDBOXED_SH_CONTEXT_DIR_NAME".to_string(),
-                        context_dir_name,
-                    );
                 }
 
                 // Network configuration based on shared_network setting:
@@ -994,7 +1201,7 @@ fn opencode_entry_from_mcp(
                     cmd.push("--bind-ro=/etc/resolv.conf".to_string());
                 } else {
                     // Isolated network mode - check if Tailscale is configured
-                    let tailscale_args = nspawn::tailscale_nspawn_extra_args(&merged_env);
+                    let tailscale_args = nspawn::tailscale_nspawn_extra_args(workspace_env);
                     if tailscale_args.is_empty() {
                         // Tailscale not configured - fall back to binding resolv.conf for DNS
                         // This ensures DNS works even if the user sets shared_network=false
@@ -1005,52 +1212,17 @@ fn opencode_entry_from_mcp(
                         cmd.extend(tailscale_args);
                     }
                 }
-                for (key, value) in &nspawn_env {
-                    cmd.push(format!("--setenv={}={}", key, value));
-                }
-                cmd.push(command.clone());
-                cmd.extend(args.clone());
+                cmd.push(launcher);
                 entry.insert("command".to_string(), json!(cmd));
             } else {
-                // When per_workspace_runner is true and workspace is a container,
-                // the harness (Claude Code / OpenCode) runs inside the container
-                // and spawns MCP servers as subprocesses. Env vars must use
-                // container-relative paths, not host paths.
-                if workspace_type == WorkspaceType::Container
-                    && per_workspace_runner
-                    && !container_fallback
-                {
-                    let rel = workspace_dir
-                        .strip_prefix(workspace_root)
-                        .unwrap_or_else(|_| Path::new(""));
-                    let rel_str = if rel.as_os_str().is_empty() {
-                        "/".to_string()
-                    } else {
-                        format!("/{}", rel.to_string_lossy())
-                    };
-                    merged_env.insert("SANDBOXED_SH_WORKSPACE".to_string(), rel_str.clone());
-                    merged_env.insert("SANDBOXED_SH_WORKSPACE_ROOT".to_string(), "/".to_string());
-                    merged_env.insert("WORKING_DIR".to_string(), rel_str);
-                }
-
-                let resolved_command = match workspace_type {
-                    WorkspaceType::Container => resolve_container_command_path(
-                        command,
-                        workspace_root,
-                        container_fallback,
-                        per_workspace_runner,
-                    ),
-                    WorkspaceType::Host => resolve_host_command_path(command),
-                };
-                let mut cmd = vec![resolved_command];
-                cmd.extend(args.clone());
-                entry.insert("command".to_string(), json!(cmd));
-                if !merged_env.is_empty() {
-                    entry.insert("environment".to_string(), json!(merged_env));
-                }
+                // The launcher clears the inherited harness environment and
+                // restores only the allowlisted variables internally. Secret
+                // values live in a mode-0700 file, never in generated config
+                // or process argv (`ps` and /proc/*/cmdline).
+                entry.insert("command".to_string(), json!([launcher]));
             }
             entry.insert("enabled".to_string(), json!(config.enabled));
-            serde_json::Value::Object(entry)
+            Ok(serde_json::Value::Object(entry))
         }
     }
 }
@@ -1841,6 +2013,40 @@ async fn prepare_workspace_dir(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+fn remote_build_wrapper_path(workspace: &Workspace, mission_id: Uuid) -> PathBuf {
+    if workspace.workspace_type == WorkspaceType::Container && !is_container_fallback(workspace) {
+        PathBuf::from("/usr/local/bin/remote-lean-build")
+    } else {
+        mission_workspace_dir_for_root(&workspace.path, mission_id)
+            .join(".sandboxed-sh/bin/remote-lean-build")
+    }
+}
+
+async fn install_remote_build_wrapper(
+    workspace: &Workspace,
+    mission_id: Uuid,
+) -> anyhow::Result<()> {
+    let destination = if workspace.workspace_type == WorkspaceType::Container
+        && !is_container_fallback(workspace)
+    {
+        workspace.path.join("usr/local/bin/remote-lean-build")
+    } else {
+        remote_build_wrapper_path(workspace, mission_id)
+    };
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = destination.with_extension(format!("tmp-{}-{mission_id}", std::process::id()));
+    tokio::fs::write(&tmp, include_bytes!("../../scripts/remote-lean-build")).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).await?;
+    }
+    tokio::fs::rename(&tmp, &destination).await?;
+    Ok(())
+}
+
 /// Filter MCP configs based on a workspace's MCP allowlist.
 ///
 /// - Empty `workspace_mcps` → include only MCPs with `default_enabled = true`
@@ -1923,6 +2129,7 @@ pub async fn prepare_mission_workspace_in(
     // can run concurrently without clobbering per-workspace config files.
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
+    install_remote_build_wrapper(workspace, mission_id).await?;
     let mcp_configs = filter_mcp_configs_for_workspace(
         mcp.list_configs().await,
         &workspace.mcps,
@@ -2029,6 +2236,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     // This keeps filesystem and config effects scoped to the mission.
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
+    install_remote_build_wrapper(workspace, mission_id).await?;
 
     // Get custom providers: use provided list or read from file
     let providers_from_file;
@@ -3419,6 +3627,37 @@ pub async fn read_sandboxed_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_build_wrapper_is_mission_scoped_and_executable_for_host_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let workspace = Workspace::default_host(root.path().to_path_buf());
+
+        install_remote_build_wrapper(&workspace, mission_id)
+            .await
+            .unwrap();
+
+        let path = remote_build_wrapper_path(&workspace, mission_id);
+        assert!(path.starts_with(mission_workspace_dir_for_root(root.path(), mission_id)));
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            include_bytes!("../../scripts/remote-lean-build")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                tokio::fs::metadata(path)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
+    }
     use serde_json::json;
 
     #[test]

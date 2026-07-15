@@ -46,7 +46,8 @@ fn run(args: Vec<String>) -> Result<()> {
                 .ok_or_else(|| anyhow!("missing PR number"))?
                 .parse::<u64>()
                 .context("PR number must be numeric")?;
-            let gates = pr_gates(&root, repo, number)?;
+            let worker_head = value_after_flag(&args, "--worker-head");
+            let gates = pr_gates_with_worker_head(&root, repo, number, worker_head)?;
             println!("{}", serde_json::to_string_pretty(&gates)?);
             if let Some(rec) = gates.recommendation.as_deref() {
                 println!("recommendation={rec}");
@@ -81,7 +82,7 @@ fn run(args: Vec<String>) -> Result<()> {
 
 fn print_usage() {
     println!(
-        "usage:\n  palomactl status\n  palomactl reconcile\n  palomactl pr-gates <owner/repo> <number>\n  palomactl set-mode <project> <mode> --until <iso>\n  palomactl dispatch-plan --project <slug>"
+        "usage:\n  palomactl status\n  palomactl reconcile\n  palomactl pr-gates <owner/repo> <number> [--worker-head <sha>]\n  palomactl set-mode <project> <mode> --until <iso>\n  palomactl dispatch-plan --project <slug>"
     );
 }
 
@@ -449,6 +450,20 @@ struct CheckRun {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WorkflowRun {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    head_sha: String,
+    #[serde(default)]
+    url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PrGates {
     #[serde(default)]
     owner_repo: String,
@@ -468,6 +483,19 @@ struct PrGates {
     conflicting: bool,
     #[serde(default)]
     checks: Vec<CheckRun>,
+    /// GitHub's complete check rollup for the current PR head is represented by
+    /// `checks`. Workflow runs are kept separately because a run can conclude
+    /// `action_required` before creating any job, in which case it is absent
+    /// from `statusCheckRollup` entirely.
+    #[serde(default)]
+    workflow_runs: Vec<WorkflowRun>,
+    /// Head that GitHub currently associates with the PR.
+    #[serde(default, alias = "headRefOid")]
+    current_head: Option<String>,
+    /// Head on which the worker's local validation/review was performed.
+    /// Supplied by the controller through `--worker-head`.
+    #[serde(default)]
+    worker_head: Option<String>,
     #[serde(default)]
     bugbot_accessible: bool,
     #[serde(default)]
@@ -484,40 +512,84 @@ fn apply_pr_gate_recommendation(gates: &mut PrGates) {
     gates.conflicting = gates.conflicting
         || merge_state_status.as_deref() == Some("dirty")
         || (gates.mergeable == Some(false) && !blocked && !behind);
+    let accepted_check_conclusion = |conclusion: &str| {
+        matches!(
+            conclusion.to_ascii_lowercase().as_str(),
+            "success" | "skipped" | "neutral"
+        )
+    };
     let checks_green = !gates.checks.is_empty()
         && gates.checks.iter().all(|c| {
             c.status.eq_ignore_ascii_case("completed")
                 && c.conclusion
                     .as_deref()
-                    .map(|conclusion| conclusion.eq_ignore_ascii_case("success"))
+                    .map(accepted_check_conclusion)
                     .unwrap_or(false)
         });
+    let action_required = gates.workflow_runs.iter().any(|run| {
+        run.status.eq_ignore_ascii_case("completed")
+            && run
+                .conclusion
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case("action_required"))
+                .unwrap_or(false)
+    });
+    let workflow_runs_green = gates.workflow_runs.is_empty()
+        || gates.workflow_runs.iter().all(|run| {
+            run.status.eq_ignore_ascii_case("completed")
+                && run
+                    .conclusion
+                    .as_deref()
+                    .map(accepted_check_conclusion)
+                    .unwrap_or(false)
+        });
+    let exact_head = match (&gates.worker_head, &gates.current_head) {
+        (Some(worker), Some(current)) => worker.eq_ignore_ascii_case(current),
+        _ => true,
+    };
     let closed = gates.state.eq_ignore_ascii_case("closed");
     gates.recommendation = if gates.merged {
         Some("already_merged".to_string())
     } else if gates.draft {
         Some("wait_for_ready_for_review".to_string())
+    } else if closed {
+        Some("closed_without_merge".to_string())
+    } else if !exact_head {
+        Some("head_changed_since_worker".to_string())
+    } else if action_required {
+        Some("action_required_external".to_string())
     } else if blocked {
         Some("blocked_by_policy".to_string())
     } else if behind {
         Some("needs_update_with_base".to_string())
     } else if gates.conflicting {
         Some("needs_conflict_resolution".to_string())
-    } else if closed {
-        Some("closed_without_merge".to_string())
-    } else if checks_green {
+    } else if checks_green && workflow_runs_green {
         Some("ready_for_review_or_merge".to_string())
     } else {
         Some("needs_checks_or_review".to_string())
     };
 }
 
+#[cfg(test)]
 fn pr_gates(root: &Path, owner_repo: &str, number: u64) -> Result<PrGates> {
+    pr_gates_with_worker_head(root, owner_repo, number, None)
+}
+
+fn pr_gates_with_worker_head(
+    root: &Path,
+    owner_repo: &str,
+    number: u64,
+    worker_head: Option<&str>,
+) -> Result<PrGates> {
     let mut gates = load_pr_fixture(root, owner_repo, number)
         .or_else(|| gh_pr_gates(owner_repo, number))
         .ok_or_else(|| anyhow!("could not read PR gates from fixture or gh"))?;
     gates.owner_repo = owner_repo.to_string();
     gates.number = number;
+    if let Some(head) = worker_head.map(str::trim).filter(|head| !head.is_empty()) {
+        gates.worker_head = Some(head.to_string());
+    }
     apply_pr_gate_recommendation(&mut gates);
     Ok(gates)
 }
@@ -648,6 +720,12 @@ fn parse_gh_pr_gates(owner_repo: &str, number: u64, value: &Value) -> PrGates {
             .map(|s| s.to_ascii_lowercase()),
         conflicting: false,
         checks,
+        workflow_runs: Vec::new(),
+        current_head: value
+            .get("headRefOid")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        worker_head: None,
         bugbot_accessible,
         recommendation: None,
     }
@@ -662,7 +740,7 @@ fn gh_pr_gates(owner_repo: &str, number: u64) -> Option<PrGates> {
             "--repo",
             owner_repo,
             "--json",
-            "state,isDraft,mergeable,mergeStateStatus,mergedAt,statusCheckRollup,comments",
+            "state,isDraft,mergeable,mergeStateStatus,mergedAt,headRefOid,statusCheckRollup,comments",
         ])
         .output()
         .ok()?;
@@ -670,7 +748,65 @@ fn gh_pr_gates(owner_repo: &str, number: u64) -> Option<PrGates> {
         return None;
     }
     let value: Value = serde_json::from_slice(&output.stdout).ok()?;
-    Some(parse_gh_pr_gates(owner_repo, number, &value))
+    let mut gates = parse_gh_pr_gates(owner_repo, number, &value);
+    if let Some(head) = gates.current_head.as_deref() {
+        let runs = Command::new("gh")
+            .args([
+                "run",
+                "list",
+                "--repo",
+                owner_repo,
+                "--commit",
+                head,
+                "--limit",
+                "100",
+                "--json",
+                "name,status,conclusion,headSha,url",
+            ])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| serde_json::from_slice::<Vec<Value>>(&output.stdout).ok())
+            .unwrap_or_default();
+        // `gh run list` is newest-first. Keep the latest run per workflow so a
+        // successfully approved/rerun workflow supersedes an older
+        // `action_required` attempt instead of blocking the PR forever.
+        let mut seen_workflows = BTreeSet::new();
+        gates.workflow_runs = runs
+            .into_iter()
+            .filter(|run| {
+                let name = run.get("name").and_then(Value::as_str).unwrap_or_default();
+                seen_workflows.insert(name.to_string())
+            })
+            .map(|run| WorkflowRun {
+                name: run
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                status: run
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                conclusion: run
+                    .get("conclusion")
+                    .and_then(Value::as_str)
+                    .map(str::to_ascii_lowercase),
+                head_sha: run
+                    .get("headSha")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                url: run
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect();
+    }
+    Some(gates)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1131,6 +1267,75 @@ mod tests {
         assert_eq!(
             gates.recommendation.as_deref(),
             Some("ready_for_review_or_merge")
+        );
+    }
+
+    #[test]
+    fn skipped_and_neutral_rollup_entries_are_non_blocking() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/fixtures/pr-109.json"),
+            r#"{
+              "state":"open",
+              "mergeable":true,
+              "checks":[
+                {"name":"build","status":"completed","conclusion":"success"},
+                {"name":"optional","status":"completed","conclusion":"skipped"},
+                {"name":"advisory","status":"completed","conclusion":"neutral"}
+              ]
+            }"#,
+        );
+        let gates = pr_gates(tmp.path(), "lfglabs-dev/verity", 109).unwrap();
+        assert_eq!(
+            gates.recommendation.as_deref(),
+            Some("ready_for_review_or_merge")
+        );
+    }
+
+    #[test]
+    fn action_required_run_without_jobs_is_blocked_external() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/fixtures/pr-110.json"),
+            r#"{
+              "state":"open",
+              "mergeable":true,
+              "checks":[],
+              "workflow_runs":[{
+                "name":"Verify proofs",
+                "status":"completed",
+                "conclusion":"action_required",
+                "head_sha":"abc123"
+              }]
+            }"#,
+        );
+        let gates = pr_gates(tmp.path(), "lfglabs-dev/verity", 110).unwrap();
+        assert_eq!(
+            gates.recommendation.as_deref(),
+            Some("action_required_external")
+        );
+    }
+
+    #[test]
+    fn derived_head_invalidates_worker_evidence() {
+        let tmp = tempdir().unwrap();
+        write(
+            &tmp.path().join(".paloma/fixtures/pr-111.json"),
+            r#"{
+              "state":"open",
+              "mergeable":true,
+              "current_head":"derived456",
+              "checks":[{"name":"ci","status":"completed","conclusion":"success"}]
+            }"#,
+        );
+        let gates =
+            pr_gates_with_worker_head(tmp.path(), "lfglabs-dev/verity", 111, Some("worker123"))
+                .unwrap();
+        assert_eq!(gates.worker_head.as_deref(), Some("worker123"));
+        assert_eq!(gates.current_head.as_deref(), Some("derived456"));
+        assert_eq!(
+            gates.recommendation.as_deref(),
+            Some("head_changed_since_worker")
         );
     }
 

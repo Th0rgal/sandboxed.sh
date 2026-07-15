@@ -928,6 +928,51 @@ impl AppServerEventTranslator {
                                 }
                             }
                         }
+                        "mcpToolCall" | "mcp_tool_call" => {
+                            // Codex app-server v2 models MCP calls as their own
+                            // thread-item kind (rather than a generic
+                            // `toolCall`).  Missing this lifecycle made real,
+                            // successful MCP activity invisible to the runner,
+                            // which then falsely failed tool-required turns as
+                            // stalled and retried an expensive Lean query.
+                            let server =
+                                item.get("server").and_then(|v| v.as_str()).unwrap_or("mcp");
+                            let tool = item
+                                .get("tool")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown_tool");
+                            let name = format!("mcp__{server}__{tool}");
+                            if method == "item/started" {
+                                let args = item
+                                    .get("arguments")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                if !self.emitted_tool_result_ids.contains(&id) {
+                                    self.pending_tool_calls.insert(id.clone(), name.clone());
+                                }
+                                if !self.emitted_tool_result_ids.contains(&id)
+                                    && self.emitted_tool_call_ids.insert(id.clone())
+                                {
+                                    events.push(ExecutionEvent::ToolCall { id, name, args });
+                                }
+                            } else {
+                                let result = item
+                                    .get("result")
+                                    .filter(|value| !value.is_null())
+                                    .cloned()
+                                    .or_else(|| {
+                                        item.get("error")
+                                            .filter(|value| !value.is_null())
+                                            .cloned()
+                                            .map(|error| serde_json::json!({ "error": error }))
+                                    })
+                                    .unwrap_or(serde_json::Value::Null);
+                                self.pending_tool_calls.remove(&id);
+                                if self.emitted_tool_result_ids.insert(id.clone()) {
+                                    events.push(ExecutionEvent::ToolResult { id, name, result });
+                                }
+                            }
+                        }
                         "commandExecution" => {
                             // Bash-like commands. Surface as a synthetic
                             // tool call named "bash" to match the exec-mode
@@ -1576,6 +1621,61 @@ mod tests {
             .is_empty());
         assert!(translator
             .handle_notification("item/started", &params, false)
+            .events
+            .is_empty());
+        assert!(translator.pending_tool_ids().is_empty());
+    }
+
+    #[test]
+    fn mcp_tool_call_lifecycle_is_surfaced_and_deduplicated() {
+        let mut translator = AppServerEventTranslator::default();
+        let started = json!({
+            "item": {
+                "id": "mcp-1",
+                "type": "mcpToolCall",
+                "server": "lean_lsp",
+                "tool": "lean_diagnostic_messages",
+                "arguments": {"file_path": "/workspace/verity/Main.lean"},
+                "status": "inProgress"
+            }
+        });
+        let completed = json!({
+            "item": {
+                "id": "mcp-1",
+                "type": "mcpToolCall",
+                "server": "lean_lsp",
+                "tool": "lean_diagnostic_messages",
+                "arguments": {"file_path": "/workspace/verity/Main.lean"},
+                "status": "completed",
+                "result": {"content": [{"type": "text", "text": "ok"}]},
+                "error": null
+            }
+        });
+
+        let call = translator.handle_notification("item/started", &started, false);
+        assert!(matches!(
+            call.events.as_slice(),
+            [ExecutionEvent::ToolCall { id, name, args }]
+                if id == "mcp-1"
+                    && name == "mcp__lean_lsp__lean_diagnostic_messages"
+                    && args.get("file_path").and_then(|value| value.as_str())
+                        == Some("/workspace/verity/Main.lean")
+        ));
+        assert!(translator
+            .handle_notification("item/started", &started, false)
+            .events
+            .is_empty());
+
+        let result = translator.handle_notification("item/completed", &completed, false);
+        assert!(matches!(
+            result.events.as_slice(),
+            [ExecutionEvent::ToolResult { id, name, result }]
+                if id == "mcp-1"
+                    && name == "mcp__lean_lsp__lean_diagnostic_messages"
+                    && result.get("content").is_some()
+        ));
+        assert!(translator
+            .handle_notification("item/completed", &completed, false)
             .events
             .is_empty());
         assert!(translator.pending_tool_ids().is_empty());

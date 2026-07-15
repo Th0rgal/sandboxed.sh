@@ -49,6 +49,9 @@ missions. Sandboxed.sh currently supports:
 - **Native bash works** because the harness runs inside the workspace.
 - **No host proxy bash tools** are required for standard missions.
 - **Per-workspace isolation** prevents cross-workspace file effects.
+- **Per-mission working directories** isolate generated config and default file
+  effects while allowing several missions to reuse one workspace's installed
+  toolchain and explicitly shared project paths.
 
 ## Backend registry (metadata)
 
@@ -111,6 +114,12 @@ Codex is executed **per workspace** using the Codex CLI/app-server driver:
   and rotated when rate limits require it.
 - Goal-mode missions keep the raw `/goal <objective>` prefix so the Codex
   driver can route through goal APIs instead of a plain turn.
+
+Model overrides must be exact IDs supported by the authenticated account.
+`gpt-5.5-sol`, for example, is not a valid Codex/ChatGPT model and is rejected
+when the mission is created instead of failing after dispatch. Use
+`gpt-5.6-terra` with `model_effort=medium` when the Terra lane is intended;
+Sandboxed.sh does not silently substitute a different model.
 
 ## Gemini and Grok harnesses
 
@@ -179,14 +188,31 @@ MCP tools (desktop/playwright/workspace) can be enabled when needed.
 
 ## MCP execution scope (current)
 
-Workspace-scoped MCP servers (desktop/playwright/workspace) run **alongside the
-harness process**:
+Workspace-scoped MCP servers run **alongside the harness process**:
 
 - When the harness runs inside a container (per-workspace runner enabled), MCPs
   execute directly in that container.
 - When the harness runs on the host (`SANDBOXED_SH_PER_WORKSPACE_RUNNER=false`),
   container workspaces wrap MCP commands with systemd-nspawn (when available) so
   tools still execute inside the container.
+
+Every stdio MCP is started through a mission-local `0700` launcher. The launcher
+clears inherited harness variables and restores only:
+
+- the MCP transport's own `env` map;
+- mission/runtime metadata required by Sandboxed.sh; and
+- workspace variables named in `workspace_env_allowlist`.
+
+The generated OpenCode, Claude, and Codex configs contain the launcher path, not
+secret values. Launcher names include the MCP configuration UUID so names that
+normalize to the same key cannot overwrite one another. `"*"` access is granted
+implicitly only when the `workspace` entry still points to the built-in
+`workspace-mcp` executable; repointing that entry revokes the implicit wildcard.
+
+Codex app-server reports MCP operations as `mcpToolCall` items, distinct from
+generic `toolCall` items. The driver translates both lifecycle forms into the
+unified tool stream so tool-required missions are not retried or marked stalled
+after a successful MCP call.
 
 Desktop streaming note:
 - The UI streams X11 from the **host** (Xvfb + MJPEG).

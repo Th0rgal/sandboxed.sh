@@ -20,15 +20,23 @@ The CLI never writes live mission or PR state back into project markdown.
 ```bash
 cargo run --bin palomactl -- status
 cargo run --bin palomactl -- reconcile
-cargo run --bin palomactl -- pr-gates <owner/repo> <number>
+cargo run --bin palomactl -- pr-gates <owner/repo> <number> [--worker-head <sha>]
 cargo run --bin palomactl -- set-mode <project> <mode> --until <iso>
 cargo run --bin palomactl -- dispatch-plan --project <slug>
 ```
 
 `pr-gates` reads `.paloma/fixtures/pr-<number>.json` first. If no fixture is
-available, it performs a read-only `gh pr view` and reports draft, mergeability,
-conflict state, checks, and whether Bugbot comments are visible. A PR with green
-checks but conflicts reports `needs_conflict_resolution`.
+available, it performs read-only `gh pr view` and `gh run list` queries and
+reports draft, mergeability, conflict state, the complete current-head check
+rollup, workflow runs, and whether Bugbot comments are visible. The workflow
+query matters because GitHub can conclude a run as `action_required` before it
+creates any job; such a run is absent from `statusCheckRollup`.
+
+Controllers should always pass the SHA validated by the worker through
+`--worker-head`. If automation has since derived a new PR head, the
+recommendation becomes `head_changed_since_worker` and the old local proof or
+review must not be reused. A PR with green checks but conflicts still reports
+`needs_conflict_resolution`.
 
 ## Thomas natural-language mapping
 

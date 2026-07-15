@@ -111,6 +111,30 @@ impl GitCredentialConfig {
         })
     }
 
+    /// Build from workspace-scoped environment values. This is the fallback
+    /// used when no dashboard connection or service-level token exists. It is
+    /// intentionally resolved at process-spawn time so a secret refresher can
+    /// rotate `GH_TOKEN` without requiring a backend restart.
+    pub fn from_workspace_env(workspace_env: &HashMap<String, String>) -> Option<Self> {
+        let value = |key: &str| {
+            workspace_env
+                .get(key)
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.starts_with("[DECRYPTION_FAILED]"))
+                .map(str::to_string)
+        };
+        let token = value("GITHUB_TOKEN").or_else(|| value("GH_TOKEN"))?;
+        let user_name = value("GIT_AUTHOR_NAME").or_else(|| value("GIT_USER_NAME"));
+        let user_email = value("GIT_AUTHOR_EMAIL").or_else(|| value("GIT_USER_EMAIL"));
+        Some(Self {
+            token,
+            user_name,
+            user_email,
+            login: None,
+        })
+    }
+
     /// Build from a dashboard-connected GitHub account. The commit identity is
     /// always derived from the account (profile name/email, falling back to the
     /// login and GitHub `noreply` form), so [`Self::has_identity`] is always
@@ -131,13 +155,51 @@ impl GitCredentialConfig {
     /// dashboard stores the connected account. Extra fallbacks cover legacy/dev
     /// layouts and direct `WorkspaceExec` calls that only have a workspace.
     pub fn resolve(workspace_root: &Path, app_working_dir: Option<&Path>) -> Option<Self> {
+        Self::resolve_with_workspace_env(workspace_root, app_working_dir, &HashMap::new())
+    }
+
+    /// Resolve a fresh credential for a workspace. Dashboard credentials have
+    /// precedence, followed by the service environment and finally the
+    /// workspace-scoped environment. Callers that spawn subprocesses should
+    /// use this path on every spawn rather than retaining a possibly stale
+    /// token in memory.
+    pub fn resolve_with_workspace_env(
+        workspace_root: &Path,
+        app_working_dir: Option<&Path>,
+        workspace_env: &HashMap<String, String>,
+    ) -> Option<Self> {
+        Self::resolve_dashboard_connection(workspace_root, app_working_dir)
+            .or_else(Self::from_env)
+            .or_else(|| Self::from_workspace_env(workspace_env))
+    }
+
+    fn resolve_dashboard_connection(
+        workspace_root: &Path,
+        app_working_dir: Option<&Path>,
+    ) -> Option<Self> {
         let candidates = github_connection_candidates(workspace_root, app_working_dir);
         for path in &candidates {
             if let Some(conn) = GithubConnectionStore::read_from_path(path) {
                 return Some(Self::from_connection(&conn));
             }
         }
-        Self::from_env()
+        None
+    }
+
+    /// Refresh credentials for a subprocess without replacing a connected
+    /// dashboard account with a lower-fidelity service/workspace token when
+    /// the connection store is temporarily undiscoverable from this spawn.
+    pub fn resolve_for_spawn(
+        workspace_root: &Path,
+        app_working_dir: Option<&Path>,
+        workspace_env: &HashMap<String, String>,
+        cached: Option<&Self>,
+    ) -> Option<Self> {
+        Self::resolve_dashboard_connection(workspace_root, app_working_dir)
+            .or_else(|| cached.filter(|creds| creds.login.is_some()).cloned())
+            .or_else(Self::from_env)
+            .or_else(|| Self::from_workspace_env(workspace_env))
+            .or_else(|| cached.cloned())
     }
 
     /// Whether a commit identity is configured. Without it `git commit` fails
@@ -170,7 +232,9 @@ impl GitCredentialConfig {
         mission_id: Uuid,
         app_working_dir: Option<&Path>,
     ) {
-        let Some(creds) = Self::resolve(&workspace.path, app_working_dir) else {
+        let Some(creds) =
+            Self::resolve_with_workspace_env(&workspace.path, app_working_dir, &workspace.env_vars)
+        else {
             workspace.resolved_git_credentials = None;
             return;
         };
@@ -733,6 +797,48 @@ mod tests {
             "/root/.git-credentials"
         );
         assert!(!merged.values().any(|value| value.contains("gho_secret")));
+    }
+
+    #[test]
+    fn workspace_token_is_a_supported_last_resort() {
+        let mut env = HashMap::new();
+        env.insert("GH_TOKEN".into(), "workspace-token".into());
+        env.insert("GIT_AUTHOR_NAME".into(), "Ada".into());
+        env.insert("GIT_AUTHOR_EMAIL".into(), "ada@example.com".into());
+        let cfg = GitCredentialConfig::from_workspace_env(&env).unwrap();
+        assert_eq!(cfg.token(), "workspace-token");
+        assert_eq!(cfg.user_name(), Some("Ada"));
+        assert_eq!(cfg.user_email(), Some("ada@example.com"));
+    }
+
+    #[test]
+    fn spawn_refresh_preserves_cached_dashboard_account_over_fallback_token() {
+        let root = tempfile::tempdir().unwrap();
+        let cached = GitCredentialConfig {
+            token: "dashboard-token".into(),
+            user_name: Some("Dashboard User".into()),
+            user_email: Some("dashboard@example.com".into()),
+            login: Some("dashboard-login".into()),
+        };
+        let mut env = HashMap::new();
+        env.insert("GH_TOKEN".into(), "workspace-fallback".into());
+
+        let resolved =
+            GitCredentialConfig::resolve_for_spawn(root.path(), None, &env, Some(&cached)).unwrap();
+
+        assert_eq!(resolved.token(), "dashboard-token");
+        assert_eq!(resolved.login.as_deref(), Some("dashboard-login"));
+        assert_eq!(resolved.user_name(), Some("Dashboard User"));
+    }
+
+    #[test]
+    fn decryption_failure_marker_is_never_used_as_a_token() {
+        let mut env = HashMap::new();
+        env.insert(
+            "GH_TOKEN".into(),
+            "[DECRYPTION_FAILED]encrypted-payload".into(),
+        );
+        assert!(GitCredentialConfig::from_workspace_env(&env).is_none());
     }
 
     #[test]

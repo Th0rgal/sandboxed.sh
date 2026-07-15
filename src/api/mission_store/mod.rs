@@ -1476,6 +1476,18 @@ pub trait MissionStore: Send + Sync {
     /// Get a single mission by ID.
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String>;
 
+    /// Load the oldest persisted user message without applying the history
+    /// projection/window used by `get_mission`.
+    async fn get_initial_user_message(&self, id: Uuid) -> Result<Option<String>, String> {
+        Ok(self.get_mission(id).await?.and_then(|mission| {
+            mission
+                .history
+                .into_iter()
+                .find(|entry| entry.role == "user")
+                .map(|entry| entry.content)
+        }))
+    }
+
     /// Create a new mission.
     async fn create_mission(
         &self,

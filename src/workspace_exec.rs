@@ -565,17 +565,35 @@ pub(crate) fn resolv_conf_nspawn_args() -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn persistent_nspawn_command(scope_args: Option<&[String]>) -> Command {
+    let mut command = if let Some(scope_args) = scope_args {
+        let mut command = Command::new("systemd-run");
+        command.args(scope_args);
+        command.arg("systemd-nspawn");
+        command
+    } else {
+        Command::new("systemd-nspawn")
+    };
+    nspawn::scrub_systemd_service_environment(&mut command);
+    command.arg("--console=pipe");
+    command
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::nspawn;
+
     use super::{
         append_nsenter_target_root_arg, ca_env_scrub_prelude, durable_command_runs_on_api_host,
         durable_scope_unit, environ_has_keepalive_marker, exec_scope_unit,
         exec_scope_unit_for_mission, exec_unit_belongs_to_mission, machine_name_from_exec_unit,
         mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
-        nspawn_directory_from_cmdline, replace_command_env, resolv_conf_bind_args,
-        synthesized_container_resolv_conf, WorkspaceExec, WorkspaceType, CA_BUNDLE_ENV_VARS,
+        nspawn_directory_from_cmdline, persistent_nspawn_command, replace_command_env,
+        resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec, WorkspaceType,
+        CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use tokio::process::Command;
 
@@ -717,6 +735,30 @@ mod tests {
     }
 
     #[test]
+    fn persistent_nspawn_boot_scrubs_service_environment() {
+        let command = persistent_nspawn_command(Some(&["--scope".to_string()]));
+        assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg == OsStr::new("systemd-nspawn")));
+        assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg == OsStr::new("--console=pipe")));
+        for name in nspawn::SYSTEMD_SERVICE_ENV_VARS {
+            assert_eq!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .find(|(key, _)| *key == OsStr::new(name))
+                    .map(|(_, value)| value),
+                Some(None),
+                "{name} must be explicitly removed"
+            );
+        }
+    }
+
+    #[test]
     fn full_mission_scope_tag_prevents_short_id_collisions() {
         let first = uuid::Uuid::parse_str("deadbeef-0000-4000-8000-000000000001").unwrap();
         let collision = uuid::Uuid::parse_str("deadbeef-0000-4000-8000-000000000002").unwrap();
@@ -754,6 +796,45 @@ mod tests {
              nameserver 8.8.8.8\n\
              nameserver 100.100.100.100\n"
         );
+    }
+
+    #[test]
+    fn tailnet_only_bootstrap_clears_configured_exit_node() {
+        let command = WorkspaceExec::build_tailscale_bootstrap_command(
+            "/root",
+            "/bin/true",
+            &[],
+            &HashMap::from([
+                ("TS_AUTHKEY".to_string(), "secret".to_string()),
+                ("TS_EXIT_NODE".to_string(), "100.64.0.1".to_string()),
+            ]),
+            true,
+            true,
+        );
+
+        let clear_env = command
+            .find("export TS_EXIT_NODE='';")
+            .expect("tailnet-only mode must clear TS_EXIT_NODE before bootstrap");
+        let bootstrap = command
+            .find("/usr/local/bin/sandboxed-tailscale-up")
+            .expect("bootstrap command should be present");
+        assert!(clear_env < bootstrap);
+        assert!(command.contains("tailscale set --exit-node="));
+    }
+
+    #[test]
+    fn exit_node_bootstrap_preserves_configured_exit_node() {
+        let command = WorkspaceExec::build_tailscale_bootstrap_command(
+            "/root",
+            "/bin/true",
+            &[],
+            &HashMap::from([("TS_EXIT_NODE".to_string(), "100.64.0.1".to_string())]),
+            true,
+            false,
+        );
+
+        assert!(!command.contains("export TS_EXIT_NODE='';"));
+        assert!(!command.contains("tailscale set --exit-node="));
     }
 
     #[test]
@@ -1152,13 +1233,29 @@ impl WorkspaceExec {
         // (claudecode) launch the agent with HOME/XDG_CONFIG_HOME pointed at a
         // per-mission dir. Export non-secret pointers to those files so both
         // `gh` and `git` can still find them.
-        let git_creds = self.workspace.resolved_git_credentials.clone().or_else(|| {
-            crate::workspace::git_credentials::GitCredentialConfig::resolve(
-                &self.workspace.path,
-                None,
-            )
-        });
+        // Resolve again for every spawned process. Connected GitHub/App tokens
+        // and workspace secrets may rotate while a long-running mission is
+        // alive; retaining only the mission-prep snapshot leaves later Bash or
+        // `gh` subprocesses unauthenticated. Refresh the credential files
+        // silently, then expose only their non-secret paths through env.
+        let git_creds = crate::workspace::git_credentials::GitCredentialConfig::resolve_for_spawn(
+            &self.workspace.path,
+            None,
+            &self.workspace.env_vars,
+            self.workspace.resolved_git_credentials.as_ref(),
+        );
         if let Some(creds) = git_creds {
+            if let Err(error) = creds.write_for_workspace(
+                &self.workspace.path,
+                self.workspace.workspace_type,
+                &self.workspace.env_vars,
+            ) {
+                tracing::debug!(
+                    workspace = %self.workspace.name,
+                    error = %error,
+                    "Could not refresh GitHub credential files before subprocess spawn"
+                );
+            }
             creds.apply_to_env(
                 &mut merged,
                 &self.workspace.path,
@@ -1294,6 +1391,15 @@ impl WorkspaceExec {
             }
         }
 
+        // Tailnet-only workspaces may still carry TS_EXIT_NODE because the
+        // same template is also used for exit-node mode. Do not let the
+        // bootstrap enable policy routing through that node: replacing only
+        // the main-table default route afterwards does not undo Tailscale's
+        // policy rules and can leave DNS/public HTTPS unreachable.
+        if tailnet_only {
+            cmd.push_str("export TS_EXIT_NODE=''; ");
+        }
+
         // Run the Tailscale bootstrap script if it exists.
         // The script calls sandboxed-network-up (DHCP via udhcpc, which sets up
         // the IP, default route, and DNS), then starts tailscaled and authenticates.
@@ -1309,7 +1415,10 @@ impl WorkspaceExec {
             // regular internet traffic through the host gateway (not exit node).
             // This ensures the container can reach both tailnet devices AND the internet.
             cmd.push_str(
-                "_oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
+                "if command -v tailscale >/dev/null 2>&1; then \
+                 tailscale set --exit-node= >/dev/null 2>&1 || true; \
+                 fi; \
+                 _oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
                  _oa_gw=\"${_oa_ip%.*}.1\"; \
                  if [ -n \"$_oa_ip\" ]; then \
                    ip route del default 2>/dev/null || true; \
@@ -1459,21 +1568,11 @@ impl WorkspaceExec {
         // path).
         let caps = self.mission_resource_caps();
         let scope_args = caps.scope_run_args(&mission_scope_unit(&name));
-        let mut cmd = if let Some(scope_args) = scope_args {
-            let mut c = Command::new("systemd-run");
-            c.args(&scope_args);
-            // systemd-nspawn's own scope-creation is disabled below via
-            // --register=no/--keep-unit, so it joins this scope's cgroup.
-            c.arg("systemd-nspawn");
-            c
-        } else {
-            Command::new("systemd-nspawn")
-        };
+        let mut cmd = persistent_nspawn_command(scope_args.as_deref());
         cmd.arg("-D").arg(root);
         cmd.arg(format!("--machine={}", name));
         cmd.arg("--quiet");
         cmd.arg("--timezone=off");
-        cmd.arg("--console=pipe");
         cmd.arg("--register=no");
         cmd.arg("--keep-unit");
 
