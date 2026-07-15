@@ -187,6 +187,55 @@ fn default_node_id() -> String {
     "auto".to_string()
 }
 
+async fn probe_explicit_lean_node(
+    state: &AppState,
+    node_id: &str,
+    requirements: &[String],
+) -> Result<(), (StatusCode, String)> {
+    if node_id.eq_ignore_ascii_case("auto")
+        || !requirements.iter().any(|requirement| requirement == "lean")
+    {
+        return Ok(());
+    }
+    let settings = &state.config.remote_nodes;
+    if !settings.enabled || settings.nodes.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "remote build nodes are not configured".to_string(),
+        ));
+    }
+    let node = settings.node(node_id).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("remote node '{node_id}' is not configured"),
+    ))?;
+
+    // This network I/O deliberately happens before the process-wide placement
+    // mutex is acquired. A slow explicit node must not block unrelated auto
+    // placement to healthy runners.
+    let client = RemoteNodeClient::default();
+    crate::remote_node::probe_node(&state.fleet, &client, node).await;
+    let cached = state.fleet.get(node_id);
+    if cached.as_ref().is_none_or(|cached| {
+        cached.status != RemoteNodeStatus::Online || cached.last_heartbeat.is_none()
+    }) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("remote node '{node_id}' readiness probe failed"),
+        ));
+    }
+    if cached
+        .and_then(|cached| cached.last_heartbeat)
+        .and_then(|heartbeat| heartbeat.lean_runtime_ready)
+        == Some(false)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("remote node '{node_id}' has no executable Lake runtime"),
+        ));
+    }
+    Ok(())
+}
+
 fn default_wait() -> bool {
     true
 }
@@ -370,33 +419,6 @@ async fn resolve_node(
         StatusCode::BAD_REQUEST,
         format!("remote node '{node_id}' is not configured"),
     ))?;
-    if requirements.iter().any(|requirement| requirement == "lean") {
-        // Explicit placement must not bypass the fail-closed readiness gate
-        // when the monitor is disabled or has not completed its first tick.
-        // Probe synchronously so the decision covers the runner's current
-        // identity and PATH rather than an absent or stale cache entry.
-        let client = RemoteNodeClient::default();
-        crate::remote_node::probe_node(&state.fleet, &client, &node).await;
-        let cached = state.fleet.get(node_id);
-        if cached.as_ref().is_none_or(|cached| {
-            cached.status != RemoteNodeStatus::Online || cached.last_heartbeat.is_none()
-        }) {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("remote node '{node_id}' readiness probe failed"),
-            ));
-        }
-        if cached
-            .and_then(|cached| cached.last_heartbeat)
-            .and_then(|heartbeat| heartbeat.lean_runtime_ready)
-            == Some(false)
-        {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("remote node '{node_id}' has no executable Lake runtime"),
-            ));
-        }
-    }
     Ok(node)
 }
 
@@ -507,6 +529,11 @@ async fn submit_remote_build(
     // placement labels, but may not remove the runtime readiness gate by
     // sending an empty or unrelated requirements list.
     let requirements = normalized_lean_requirements(&req.requirements);
+    if let Err((status, message)) =
+        probe_explicit_lean_node(&state, &req.node_id, &requirements).await
+    {
+        return (status, message).into_response();
+    }
 
     // Serialize placement through tentative-handle persistence. Otherwise a
     // burst can select the same idle node before its next heartbeat.
