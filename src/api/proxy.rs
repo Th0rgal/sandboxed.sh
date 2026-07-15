@@ -5107,6 +5107,10 @@ mod tests {
         let e = parse_direct_model_entry("xai/grok-4.5").expect("known provider");
         assert_eq!(e.provider_id, "xai");
         assert_eq!(e.model_id, "grok-4.5");
+        let latest = parse_direct_model_entry("xai/grok-4.5-latest").expect("official xAI alias");
+        assert_eq!(latest.model_id, "grok-4.5-latest");
+        let build = parse_direct_model_entry("xai/grok-build-latest").expect("official xAI alias");
+        assert_eq!(build.model_id, "grok-build-latest");
         // Model ids may themselves contain slashes (kept after the first split).
         let e2 = parse_direct_model_entry("openai/codex-mini/latest").expect("known provider");
         assert_eq!(e2.provider_id, "openai");

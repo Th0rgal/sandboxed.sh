@@ -72,9 +72,11 @@ const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
 /// Text/code model IDs accepted by the native Grok CLI backend for the current
 /// OAuth-based Grok Build path. This is intentionally narrower than xAI's
 /// OpenAI-compatible `/v1/models` catalog: API-routable models such as
-/// `grok-4.5` can still appear as `xai/grok-4.5` for the custom router, but the
-/// `grok` backend must only offer IDs that `grok --model ...` accepts.
+/// rolling aliases can still appear for the custom router, but the `grok`
+/// backend only offers canonical IDs documented for Grok Build. Actual access
+/// remains account/region-dependent and is diagnosed by the CLI at runtime.
 const GROK_CLI_TEXT_MODEL_IDS: &[&str] = &[
+    "grok-4.5",
     "grok-build-0.1",
     "grok-4.3",
     "grok-4.20-0309-reasoning",
@@ -2586,10 +2588,10 @@ mod tests {
         assert!(is_grok_backend_model_id("grok-4.20-0309-reasoning"));
         assert!(is_grok_backend_model_id("grok-4.20-0309-non-reasoning"));
         assert!(is_grok_backend_model_id("grok-4.20-multi-agent-0309"));
-        // xAI API/catalog IDs are not automatically valid for the native
-        // Grok CLI backend. Prod Grok CLI 0.2.93 currently rejects this one
-        // with "unknown model id".
-        assert!(!is_grok_backend_model_id("grok-4.5"));
+        assert!(is_grok_backend_model_id("grok-4.5"));
+        // API rolling aliases are not assumed to be native CLI model IDs.
+        assert!(!is_grok_backend_model_id("grok-4.5-latest"));
+        assert!(!is_grok_backend_model_id("grok-build-latest"));
         assert!(!is_grok_backend_model_id("grok-imagine-image"));
         // `composer-*` is a product name, not a Grok CLI model id.
         assert!(!is_grok_backend_model_id("composer-2.5"));
@@ -2612,7 +2614,7 @@ mod tests {
             .collect();
 
         assert!(option_ids.contains(&"grok-build-0.1"));
-        assert!(!option_ids.contains(&"grok-4.5"));
+        assert!(option_ids.contains(&"grok-4.5"));
         assert!(!option_ids.contains(&"composer-2.5"));
     }
 
