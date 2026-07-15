@@ -3710,6 +3710,19 @@ fn validate_and_normalize_board_tasks(
                 ),
             ));
         }
+        if let Some(model) = t.model_override.as_deref() {
+            if let Some(prefixed_backend) = native_backend_prefix(model) {
+                if t.backend != "opencode" && t.backend != prefixed_backend {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "task `{}`: model '{}' selects backend '{}', but task backend is '{}'",
+                            t.task_key, model, prefixed_backend, t.backend
+                        ),
+                    ));
+                }
+            }
+        }
         t.model_override = t
             .model_override
             .as_deref()
