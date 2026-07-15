@@ -22,8 +22,8 @@ Supported now:
 - the command runs under `SANDBOXED_NODE_WORK_DIR/<mission-id>`
 - async job API on the node (`POST /jobs`, `GET /jobs/:id`,
   `POST /jobs/:id/cancel`, `GET /jobs`): jobs are persisted to
-  `<workdir>/jobs.db`, run under a capacity semaphore
-  (`SANDBOXED_NODE_CAPACITY`), capture combined stdout+stderr to
+  `<workdir>/jobs.db`, run under the node-wide capacity semaphore shared with
+  `/execute` (`SANDBOXED_NODE_CAPACITY`), capture combined stdout+stderr to
   `<workdir>/logs/<job-id>.log`, and are killed by process group on
   cancel/timeout (`SANDBOXED_NODE_MAX_JOB_SECS`, default 14400s). Jobs left
   in flight across a node restart are marked `lost`
@@ -92,6 +92,12 @@ export SANDBOXED_NODE_LABELS=lean,docker
 /usr/local/bin/sandboxed-node
 ```
 
+`SANDBOXED_NODE_CAPACITY`, when set, must be a positive integer. It is one
+node-wide execution budget: synchronous `/execute` leases and asynchronous
+jobs consume the same permits. A full node rejects a new `/execute` request
+with HTTP 429; queued jobs wait for a shared permit. This prevents the two API
+paths from each consuming the configured capacity independently.
+
 Nippur and Ashur are configured identically with their own
 `SANDBOXED_NODE_ID` and token.
 
@@ -120,6 +126,9 @@ To rotate a node token with zero downtime:
 - `active_jobs` / `queued_jobs` (async job API)
 - `cached_toolchains` (Lean toolchain dirs under the node's shared elan
   cache; empty until the first `lean_build` job warms it)
+
+`capacity_available` is a snapshot of the shared semaphore, so it already
+accounts for work admitted through either `/execute` or `/jobs`.
 
 All new fields are serde-default-tolerant in both directions, so mixed-version
 core/node fleets keep working during upgrades.
