@@ -389,7 +389,6 @@ async fn send_message_streaming_app_server(
             ..Default::default()
         };
         let mut terminal = false;
-        let mut transport_failed = false;
         let mut stream_closed_unexpectedly = false;
 
         // Mutable so we can swap in a fresh session after a reconnect.
@@ -446,11 +445,9 @@ async fn send_message_streaming_app_server(
                             );
                         }
                         let _ = tx.send(ExecutionEvent::Cancelled).await;
-                        // Cancellation is terminal for this driver/session.
-                        // Mark it explicitly so the durable tool-call journal
-                        // is removed below instead of retaining command
-                        // arguments for a turn that will never be resumed.
-                        terminal = true;
+                        // Cancellation is terminal for this driver/session;
+                        // the unconditional terminal cleanup below removes the
+                        // durable journal for this non-resumable handle.
                         break 'outer;
                     }
                     msg = inbound.recv() => match msg {
@@ -474,7 +471,6 @@ async fn send_message_streaming_app_server(
                         for event in interrupted {
                             let _ = tx.send(event).await;
                         }
-                        transport_failed = true;
                         break 'outer;
                     }
                 };
@@ -483,6 +479,7 @@ async fn send_message_streaming_app_server(
                     InboundMessage::Notification { method, params } => {
                         let outcome =
                             translator.handle_notification(&method, &params, is_goal_mission);
+                        let mut journal_failed = false;
                         for ev in outcome.events {
                             match &ev {
                                 ExecutionEvent::ToolCall { id, .. } => {
@@ -492,8 +489,14 @@ async fn send_message_streaming_app_server(
                                             tool_call_journal.started(descriptor.clone()).await
                                         {
                                             tracing::error!(?err, tool_call_id = %id, "failed to persist codex tool-call start");
+                                            // Forward the real lifecycle event
+                                            // first so the downstream runner
+                                            // keeps this tool pending and
+                                            // cannot suppress the fatal error
+                                            // after prior assistant text.
+                                            let _ = tx.send(ev.clone()).await;
                                             let _ = tx.send(ExecutionEvent::Error { message: format!("codex app-server could not durably journal pending tool call {id}: {err}") }).await;
-                                            terminal = true;
+                                            journal_failed = true;
                                             break;
                                         }
                                     }
@@ -510,13 +513,15 @@ async fn send_message_streaming_app_server(
                                 break;
                             }
                         }
+                        if journal_failed {
+                            break 'outer;
+                        }
                         if outcome.terminal {
                             let interrupted = reconcile_pending_before_terminal(
                                 &mut translator,
                                 &mut pending_tool_reconciliation,
                             );
                             if !interrupted.is_empty() {
-                                transport_failed = true;
                                 for event in interrupted {
                                     let _ = tx.send(event).await;
                                 }
@@ -654,7 +659,6 @@ async fn send_message_streaming_app_server(
                         "failed to reload codex tool-call journal after resume"
                     );
                     let _ = tx.send(ExecutionEvent::Error { message: format!("codex app-server transport reconciliation failed to load its durable tool-call journal: {err}") }).await;
-                    transport_failed = true;
                     break 'outer;
                 }
             }
@@ -674,7 +678,6 @@ async fn send_message_streaming_app_server(
         }
 
         if stream_closed_unexpectedly {
-            transport_failed = true;
             let interrupted_ids = translator.pending_tool_ids();
             let interrupted = translator.transport_failures(&interrupted_ids);
             if !interrupted.is_empty() {
@@ -695,10 +698,12 @@ async fn send_message_streaming_app_server(
             })
             .await;
 
-        if terminal && !transport_failed {
-            if let Err(err) = tool_call_journal.clear().await {
-                tracing::warn!(?err, "failed to clean completed codex tool-call journal");
-            }
+        // This driver will never resume its local session/thread after the
+        // handle exits. Clear the journal after clean completion,
+        // cancellation, and terminalized transport failure alike so command
+        // arguments are not retained indefinitely in /tmp.
+        if let Err(err) = tool_call_journal.clear().await {
+            tracing::warn!(?err, "failed to clean terminal codex tool-call journal");
         }
 
         let _ = session_arc.shutdown().await;
