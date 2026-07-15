@@ -6605,6 +6605,7 @@ async fn dispatch_remote_job(
             node_id: node.id.clone(),
             job_id,
             started_at: submit_started_at,
+            accepted_at: None,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
         },
     )
@@ -6648,6 +6649,7 @@ async fn dispatch_remote_job(
             node_id: node.id.clone(),
             job_id,
             started_at: submit_started_at,
+            accepted_at: Some(chrono::Utc::now()),
             kind: crate::remote_node::job_ledger::JobHandleKind::Mission,
         },
     )

@@ -254,7 +254,7 @@ async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
                     .fleet
                     .get(&handle.node_id)
                     .and_then(|status| status.last_probe_started_at);
-                if heartbeat_cannot_reflect(handle.started_at, heartbeat_started_at) {
+                if handle_needs_reservation(&handle, heartbeat_started_at) {
                     *reservations.entry(handle.node_id).or_insert(0) += 1;
                 }
             }
@@ -272,6 +272,15 @@ fn heartbeat_cannot_reflect(
     heartbeat_started_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> bool {
     heartbeat_started_at.is_none_or(|started_at| handle_started_at > started_at)
+}
+
+fn handle_needs_reservation(
+    handle: &crate::remote_node::job_ledger::JobHandle,
+    heartbeat_started_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    handle
+        .accepted_at
+        .is_none_or(|accepted_at| heartbeat_cannot_reflect(accepted_at, heartbeat_started_at))
 }
 
 /// Resolve the target node: explicit id or capacity-aware auto placement.
@@ -495,6 +504,7 @@ async fn submit_remote_build(
             node_id: node.id.clone(),
             job_id,
             started_at,
+            accepted_at: None,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
         },
     )
@@ -567,6 +577,7 @@ async fn submit_remote_build(
             node_id: node.id.clone(),
             job_id,
             started_at,
+            accepted_at: Some(chrono::Utc::now()),
             kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
         },
     )
@@ -743,6 +754,34 @@ mod tests {
             Some(heartbeat_started_at)
         ));
         assert!(heartbeat_cannot_reflect(heartbeat_started_at, None));
+    }
+
+    #[test]
+    fn tentative_handle_stays_reserved_across_overlapping_probe() {
+        let now = chrono::Utc::now();
+        let mut handle = crate::remote_node::job_ledger::JobHandle {
+            mission_id: Uuid::new_v4(),
+            node_id: "node-a".to_string(),
+            job_id: Uuid::new_v4(),
+            started_at: now,
+            accepted_at: None,
+            kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
+        };
+
+        assert!(handle_needs_reservation(
+            &handle,
+            Some(now + chrono::Duration::seconds(1))
+        ));
+
+        handle.accepted_at = Some(now + chrono::Duration::seconds(2));
+        assert!(handle_needs_reservation(
+            &handle,
+            Some(now + chrono::Duration::seconds(1))
+        ));
+        assert!(!handle_needs_reservation(
+            &handle,
+            Some(now + chrono::Duration::seconds(3))
+        ));
     }
 
     #[cfg(unix)]
