@@ -38,6 +38,7 @@ use super::{ControlCommand, MissionStatus};
 /// One slot is always reserved for the boss itself so digest delivery can
 /// never be starved by board workers occupying every parallel slot.
 const RESERVED_BOSS_SLOTS: usize = 1;
+const RETRY_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// Max attempts per task (1 original + 1 automatic retry).
 const MAX_ATTEMPTS: u32 = 2;
@@ -130,16 +131,23 @@ async fn retry_preflight(task: &BoardTask) -> RetryPreflight {
     };
     let working_directory = task.working_directory.clone();
     let task_key = task.task_key.clone();
-    tokio::task::spawn_blocking(move || {
+    let preflight = tokio::task::spawn_blocking(move || {
         let local_repo = if Path::new(&repository).exists() {
             Some(repository.as_str())
         } else {
-            working_directory.as_deref().filter(|path| Path::new(path).exists())
+            working_directory
+                .as_deref()
+                .filter(|path| Path::new(path).exists())
         };
         let local_exists = local_repo.is_some_and(|repo| {
             Command::new("git")
                 .current_dir(repo)
-                .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
                 .status()
                 .is_ok_and(|status| status.success())
         });
@@ -161,13 +169,25 @@ async fn retry_preflight(task: &BoardTask) -> RetryPreflight {
         if let Some(identity) = repository_identity(&repository) {
             match Command::new("gh")
                 .args([
-                    "pr", "list", "--repo", &identity, "--head", &branch, "--state", "all",
-                    "--limit", "20", "--json", "number,state,mergedAt",
+                    "pr",
+                    "list",
+                    "--repo",
+                    &identity,
+                    "--head",
+                    &branch,
+                    "--state",
+                    "all",
+                    "--limit",
+                    "20",
+                    "--json",
+                    "number,state,mergedAt",
                 ])
                 .output()
             {
                 Ok(output) if output.status.success() => {
-                    if let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
+                    if let Ok(rows) =
+                        serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+                    {
                         for row in rows {
                             let number = row["number"].as_u64().unwrap_or_default();
                             if row["mergedAt"].is_string() {
@@ -199,12 +219,22 @@ async fn retry_preflight(task: &BoardTask) -> RetryPreflight {
         } else {
             RetryPreflight::NothingFound
         }
-    })
-    .await
-    .unwrap_or_else(|error| {
-        tracing::warn!(task = %task.task_key, "board: retry preflight failed: {error}");
-        RetryPreflight::NothingFound
-    })
+    });
+    match tokio::time::timeout(RETRY_PREFLIGHT_TIMEOUT, preflight).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            tracing::warn!(task = %task.task_key, "board: retry preflight failed: {error}");
+            RetryPreflight::NothingFound
+        }
+        Err(_) => {
+            tracing::warn!(
+                task = %task.task_key,
+                timeout_secs = RETRY_PREFLIGHT_TIMEOUT.as_secs(),
+                "board: retry preflight timed out; continuing best-effort"
+            );
+            RetryPreflight::NothingFound
+        }
+    }
 }
 
 /// Snapshot of runner occupancy, computed by the actor loop each pass.
