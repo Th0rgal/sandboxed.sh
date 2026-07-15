@@ -250,11 +250,11 @@ async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
         Ok(handles) => {
             let mut reservations = HashMap::new();
             for handle in handles {
-                let heartbeat_seen_at = state
+                let heartbeat_started_at = state
                     .fleet
                     .get(&handle.node_id)
-                    .and_then(|status| status.last_seen);
-                if heartbeat_cannot_reflect(handle.started_at, heartbeat_seen_at) {
+                    .and_then(|status| status.last_probe_started_at);
+                if heartbeat_cannot_reflect(handle.started_at, heartbeat_started_at) {
                     *reservations.entry(handle.node_id).or_insert(0) += 1;
                 }
             }
@@ -269,9 +269,9 @@ async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
 
 fn heartbeat_cannot_reflect(
     handle_started_at: chrono::DateTime<chrono::Utc>,
-    heartbeat_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    heartbeat_started_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> bool {
-    heartbeat_seen_at.is_none_or(|seen_at| handle_started_at > seen_at)
+    heartbeat_started_at.is_none_or(|started_at| handle_started_at > started_at)
 }
 
 /// Resolve the target node: explicit id or capacity-aware auto placement.
@@ -731,18 +731,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reservations_only_include_jobs_newer_than_the_heartbeat() {
-        let heartbeat_seen_at = chrono::Utc::now();
+    fn reservations_only_exclude_jobs_older_than_the_heartbeat_probe() {
+        let heartbeat_started_at = chrono::Utc::now();
 
         assert!(!heartbeat_cannot_reflect(
-            heartbeat_seen_at - chrono::Duration::seconds(1),
-            Some(heartbeat_seen_at)
+            heartbeat_started_at - chrono::Duration::seconds(1),
+            Some(heartbeat_started_at)
         ));
         assert!(heartbeat_cannot_reflect(
-            heartbeat_seen_at + chrono::Duration::seconds(1),
-            Some(heartbeat_seen_at)
+            heartbeat_started_at + chrono::Duration::seconds(1),
+            Some(heartbeat_started_at)
         ));
-        assert!(heartbeat_cannot_reflect(heartbeat_seen_at, None));
+        assert!(heartbeat_cannot_reflect(heartbeat_started_at, None));
     }
 
     #[cfg(unix)]
