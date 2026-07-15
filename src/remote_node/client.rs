@@ -10,6 +10,14 @@ use super::protocol::{
 };
 use super::{RemoteNodeConfig, RemoteNodeError};
 
+fn transport_error(error: reqwest::Error) -> RemoteNodeError {
+    if error.is_connect() {
+        RemoteNodeError::Connect(error.to_string())
+    } else {
+        RemoteNodeError::Request(error.to_string())
+    }
+}
+
 /// Total request timeout for `/execute`, which blocks until the remote
 /// command completes.
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -50,7 +58,7 @@ impl RemoteNodeClient {
             .bearer_auth(token)
             .send()
             .await
-            .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
+            .map_err(transport_error)?;
         if !response.status().is_success() {
             return Err(RemoteNodeError::Request(format!(
                 "heartbeat returned {}",
@@ -81,7 +89,7 @@ impl RemoteNodeClient {
             .json(request)
             .send()
             .await
-            .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
+            .map_err(transport_error)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -112,7 +120,7 @@ impl RemoteNodeClient {
             .json(request)
             .send()
             .await
-            .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
+            .map_err(transport_error)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -142,7 +150,7 @@ impl RemoteNodeClient {
             .bearer_auth(shared_token)
             .send()
             .await
-            .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
+            .map_err(transport_error)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -172,7 +180,7 @@ impl RemoteNodeClient {
             .bearer_auth(shared_token)
             .send()
             .await
-            .map_err(|e| RemoteNodeError::Request(e.to_string()))?;
+            .map_err(transport_error)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -236,5 +244,36 @@ mod tests {
         assert_eq!(heartbeat.capacity_available, 1);
         assert_eq!(heartbeat.labels, vec!["lean".to_string()]);
         assert_eq!(heartbeat.lean_runtime_ready, Some(true));
+    }
+
+    #[tokio::test]
+    async fn submit_classifies_preconnect_failure_as_safe() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = RemoteNodeClient::default();
+        let node = RemoteNodeConfig {
+            id: "offline".to_string(),
+            base_url: format!("http://{addr}"),
+            token_env: "TOKEN".to_string(),
+            labels: None,
+        };
+        let request = SubmitJobRequest {
+            job_id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            lease_token: "unused".to_string(),
+            payload: crate::remote_node::protocol::JobPayload::RawCommand {
+                command: "true".to_string(),
+                timeout_secs: None,
+                env: None,
+            },
+        };
+
+        let error = client
+            .submit_job(&node, "unused", &request)
+            .await
+            .expect_err("a closed listening port must fail before submission");
+        assert!(matches!(error, RemoteNodeError::Connect(_)), "{error}");
     }
 }

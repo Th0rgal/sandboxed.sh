@@ -31,12 +31,6 @@ command -v curl >/dev/null 2>&1 || die "curl is required"
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git checkout"
 
-# The node fetches a pinned commit; uncommitted changes would silently not
-# be part of the remote build.
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-    die "working tree is dirty; commit (and push) your changes first" 2
-fi
-
 repo="$(git remote get-url origin 2>/dev/null)" || die "no 'origin' remote"
 commit="$(git rev-parse HEAD)" || die "cannot resolve HEAD"
 cwd_rel="$(git rev-parse --show-prefix)"; cwd_rel="${cwd_rel%/}"
@@ -54,7 +48,7 @@ req = {
     "repo": repo,
     "commit": commit,
     "command": command,
-    "wait": True,
+    "wait": False,
 }
 if cwd_rel:
     req["cwd_rel"] = cwd_rel
@@ -78,33 +72,365 @@ print(json.dumps(req))
 PY
 )" || die "failed to encode request"
 
-echo "remote-lean-build: dispatching $* for ${commit:0:12}${cwd_rel:+ in $cwd_rel} ..." >&2
+request_key="$(python3 - "$body" "$REMOTE_BUILD_URL" <<'PY'
+import hashlib, json, sys
+request = json.loads(sys.argv[1])
+request.pop("token", None)
+request.pop("wait", None)
+fingerprint = {"endpoint": sys.argv[2], "request": request}
+canonical = json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
+print(hashlib.sha256(canonical).hexdigest())
+PY
+)" || die "failed to fingerprint request"
+
+home_state_root="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}"
+state_root="${REMOTE_BUILD_STATE_DIR:-$home_state_root/sandboxed-sh/remote-builds}"
+umask 077
+mkdir -p "$state_root" || die "cannot create receipt directory $state_root" 75
+state_file="$state_root/$request_key.json"
+submit_timeout_secs="${REMOTE_BUILD_SUBMIT_TIMEOUT_SECS:-90}"
+lock_timeout_secs="${REMOTE_BUILD_LOCK_TIMEOUT_SECS:-120}"
+case "$submit_timeout_secs" in
+    ''|*[!0-9]*) die "REMOTE_BUILD_SUBMIT_TIMEOUT_SECS must be a positive integer" ;;
+esac
+case "$lock_timeout_secs" in
+    ''|*[!0-9]*) die "REMOTE_BUILD_LOCK_TIMEOUT_SECS must be a positive integer" ;;
+esac
+[ "$submit_timeout_secs" -gt 0 ] || die "REMOTE_BUILD_SUBMIT_TIMEOUT_SECS must be greater than zero"
+[ "$lock_timeout_secs" -gt 0 ] || die "REMOTE_BUILD_LOCK_TIMEOUT_SECS must be greater than zero"
+
 response_file="$(mktemp)"
-trap 'rm -f "$response_file"' EXIT
-http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
-    -H 'Content-Type: application/json' \
-    --max-time 7500 \
-    -d "$body" "$REMOTE_BUILD_URL")" || die "cannot reach $REMOTE_BUILD_URL" 75
+submit_lock_held=0
+submit_lock_persistent=0
+submit_lock_dir="$state_file.lock"
+submit_recovery_blocker="$submit_lock_dir/recovery-blocker"
+release_submit_lock() {
+    if [ "$submit_lock_held" = "1" ] && [ "$submit_lock_persistent" = "0" ]; then
+        rm -f "$submit_lock_dir/owner"
+        rm -f "$submit_recovery_blocker"
+        rmdir "$submit_lock_dir" >/dev/null 2>&1 || true
+        submit_lock_held=0
+    fi
+}
+cleanup() {
+    release_submit_lock
+    rm -f "$response_file"
+}
+trap cleanup EXIT
 
-if [ "$http_code" = "401" ] || [ "$http_code" = "403" ] || [ "$http_code" = "503" ]; then
-    echo "remote-lean-build: remote build unavailable:" >&2
-    cat "$response_file" >&2; echo >&2
-    exit 75  # EX_TEMPFAIL: caller should fall back to a local build
-fi
-if [ "$http_code" != "200" ]; then
-    echo "remote-lean-build: HTTP $http_code from $REMOTE_BUILD_URL:" >&2
-    cat "$response_file" >&2; echo >&2
-    exit 1
+# Serialize receipt discovery, first submission, and durable receipt creation
+# for this immutable request. `mkdir` is atomic on the workspace filesystem;
+# the owner PID lets a retry recover a lock left by an interrupted wrapper.
+lock_deadline=$(( $(date +%s) + lock_timeout_secs ))
+while ! mkdir "$submit_lock_dir" 2>/dev/null; do
+    lock_owner=""
+    if [ -f "$submit_lock_dir/owner" ]; then
+        read -r lock_owner < "$submit_lock_dir/owner" || lock_owner=""
+    fi
+    if [ -f "$submit_recovery_blocker" ]; then
+        if [ "${REMOTE_BUILD_FORCE_NEW:-0}" = "1" ]; then
+            case "$lock_owner" in
+                ''|*[!0-9]*)
+                    rm -f "$submit_lock_dir/owner" "$submit_recovery_blocker"
+                    rmdir "$submit_lock_dir" >/dev/null 2>&1 || true
+                    continue
+                    ;;
+                *)
+                    if ! kill -0 "$lock_owner" 2>/dev/null; then
+                        rm -f "$submit_lock_dir/owner" "$submit_recovery_blocker"
+                        rmdir "$submit_lock_dir" >/dev/null 2>&1 || true
+                        continue
+                    fi
+                    ;;
+            esac
+        fi
+        case "$lock_owner" in
+            *[!0-9]*|'')
+                die "a previous submission stopped after its recovery blocker was armed; reconcile the remote fleet before forcing a new build" 1
+                ;;
+            *)
+                if ! kill -0 "$lock_owner" 2>/dev/null; then
+                    die "a previous submission stopped after its recovery blocker was armed; reconcile the remote fleet before forcing a new build" 1
+                fi
+                ;;
+        esac
+    fi
+    case "$lock_owner" in
+        ambiguous)
+            die "a previous accepted submission could not persist its receipt; reconcile the remote fleet before forcing a new build" 1
+            ;;
+        ''|*[!0-9]*)
+            # Avoid racing the tiny mkdir -> owner-file window. An empty lock
+            # older than two seconds belongs to a wrapper that died there.
+            if python3 - "$submit_lock_dir" <<'PY'
+import os, sys, time
+try:
+    stale = time.time() - os.stat(sys.argv[1]).st_mtime > 2
+except OSError:
+    stale = False
+raise SystemExit(0 if stale else 1)
+PY
+            then
+                rmdir "$submit_lock_dir" >/dev/null 2>&1 || true
+                continue
+            fi
+            ;;
+        *)
+            if ! kill -0 "$lock_owner" 2>/dev/null; then
+                rm -f "$submit_lock_dir/owner"
+                rmdir "$submit_lock_dir" >/dev/null 2>&1 || true
+                continue
+            fi
+            ;;
+    esac
+    if [ "$(date +%s)" -ge "$lock_deadline" ]; then
+        die "timed out waiting for the existing submission of ${commit:0:12}; retry to resume it" 1
+    fi
+    sleep 1
+done
+submit_lock_held=1
+printf '%s\n' "$$" > "$submit_lock_dir/owner" \
+    || die "cannot record submission lock owner for $state_file" 75
+
+job_id=""
+node_id=""
+receipt_state=""
+if [ "${REMOTE_BUILD_FORCE_NEW:-0}" != "1" ] && [ -f "$state_file" ]; then
+    IFS=$'\t' read -r job_id node_id receipt_state < <(python3 - "$state_file" <<'PY'
+import json, re, sys
+try:
+    receipt = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    raise SystemExit(0)
+job = str(receipt.get("job_id") or "")
+node = str(receipt.get("node_id") or "")
+state = str(receipt.get("state") or "")
+if state == "ambiguous":
+    print("ambiguous", "ambiguous", state, sep="\t")
+    raise SystemExit(0)
+node_is_safe_field = bool(node.strip()) and not any(ch in node for ch in "\t\r\n")
+if re.fullmatch(r"[0-9a-fA-F-]{36}", job) and node_is_safe_field:
+    print(job, node, state, sep="\t")
+PY
+    )
+    case "$receipt_state" in
+        submitted|queued|running)
+            echo "remote-lean-build: resuming job $job_id on node '$node_id' for ${commit:0:12} ..." >&2
+            ;;
+        succeeded|failed|cancelled|lost)
+            echo "remote-lean-build: replaying terminal job $job_id on node '$node_id' for ${commit:0:12} ..." >&2
+            ;;
+        ambiguous)
+            die "a previous submission for ${commit:0:12} has an ambiguous outcome; do not resubmit until core reconciliation is confirmed (set REMOTE_BUILD_FORCE_NEW=1 only after that check)" 1
+            ;;
+        *)
+            job_id=""; node_id=""; receipt_state=""
+            ;;
+    esac
 fi
 
-python3 - "$response_file" <<'PY'
-import json, sys
+persist_ambiguous_receipt() {
+    reason="$1"
+    python3 - "$state_file" "$body" "$reason" <<'PY'
+import json, os, sys, tempfile
+path, raw_request, reason = sys.argv[1:]
+request = json.loads(raw_request)
+request.pop("token", None)
+request.pop("repo", None)
+request.pop("wait", None)
+request.update({"state": "ambiguous", "submit_outcome": reason})
+fd, tmp = tempfile.mkstemp(prefix=".remote-build-", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w") as out:
+        json.dump(request, out, sort_keys=True)
+        out.write("\n")
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
+if [ -z "$job_id" ]; then
+    # The node fetches a pinned commit; uncommitted changes would silently not
+    # be part of a new remote build. An existing receipt remains resumable after
+    # the checkout changes because its immutable request was already accepted.
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+        die "working tree is dirty; commit (and push) your changes before submitting a new build" 2
+    fi
+    # Pre-create the durable blocker while no remote request has been made.
+    # Cleanup removes it on known pre-acceptance outcomes; ambiguous/accepted
+    # failures retain it so a dead owner PID can never permit a duplicate job.
+    printf '%s\n' "armed" > "$submit_recovery_blocker" \
+        || die "cannot arm the remote-build recovery blocker before submission" 75
+    echo "remote-lean-build: dispatching $* for ${commit:0:12}${cwd_rel:+ in $cwd_rel} ..." >&2
+    http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+        -H 'Content-Type: application/json' \
+        --max-time "$submit_timeout_secs" \
+        -d "$body" "$REMOTE_BUILD_URL")"
+    curl_status=$?
+    if [ "$curl_status" -ne 0 ]; then
+        case "$curl_status" in
+            5|6|7)
+                die "cannot reach $REMOTE_BUILD_URL" 75
+                ;;
+            *)
+                if ! persist_ambiguous_receipt "curl-$curl_status"; then
+                    printf '%s\n' "ambiguous" > "$submit_lock_dir/owner" || true
+                    submit_lock_persistent=1
+                fi
+                die "submit transport failed with an unknown outcome (curl $curl_status); do not fall back locally, check the fleet before retrying" 1
+                ;;
+        esac
+    fi
+
+    if [ "$http_code" = "401" ] || [ "$http_code" = "403" ] || [ "$http_code" = "503" ]; then
+        echo "remote-lean-build: remote build unavailable:" >&2
+        cat "$response_file" >&2; echo >&2
+        exit 75  # EX_TEMPFAIL: caller should fall back to a local build
+    fi
+    if [ "$http_code" != "202" ]; then
+        case "$http_code" in
+            5??)
+                if [ "$http_code" != "503" ] && ! persist_ambiguous_receipt "http-$http_code"; then
+                    printf '%s\n' "ambiguous" > "$submit_lock_dir/owner" || true
+                    submit_lock_persistent=1
+                fi
+                ;;
+        esac
+        echo "remote-lean-build: HTTP $http_code from $REMOTE_BUILD_URL:" >&2
+        cat "$response_file" >&2; echo >&2
+        exit 1
+    fi
+
+    # From this point the node has accepted work. Keep the pre-created blocker
+    # unless a complete durable receipt is written below.
+    submit_lock_persistent=1
+
+    IFS=$'\t' read -r job_id node_id < <(python3 - "$response_file" <<'PY'
+import json, re, sys
+response = json.load(open(sys.argv[1]))
+job = str(response.get("job_id") or "")
+node = str(response.get("node_id") or "")
+if not re.fullmatch(r"[0-9a-fA-F-]{36}", job):
+    raise SystemExit("invalid job_id in submit response")
+if not node.strip() or any(ch in node for ch in "\t\r\n"):
+    raise SystemExit("invalid node_id in submit response")
+print(job, node, sep="\t")
+PY
+    ) || die "invalid remote-build submit response"
+
+    python3 - "$state_file" "$body" "$job_id" "$node_id" <<'PY'
+import json, os, sys, tempfile
+path, raw_request, job_id, node_id = sys.argv[1:]
+request = json.loads(raw_request)
+request.pop("token", None)
+request.pop("repo", None)
+request.pop("wait", None)
+request.update({"job_id": job_id, "node_id": node_id, "state": "submitted"})
+fd, tmp = tempfile.mkstemp(prefix=".remote-build-", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w") as out:
+        json.dump(request, out, sort_keys=True)
+        out.write("\n")
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+    persist_status=$?
+    if [ "$persist_status" -ne 0 ]; then
+        die "accepted job $job_id on node '$node_id' but failed to persist its receipt; do not fall back locally or resubmit" 1
+    fi
+    submit_lock_persistent=0
+    echo "remote-lean-build: submitted job $job_id on node '$node_id'; receipt $state_file" >&2
+fi
+
+release_submit_lock
+
+encoded_node="$(python3 - "$node_id" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=""))
+PY
+)"
+encoded_mission="$(python3 - "$REMOTE_BUILD_MISSION_ID" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=""))
+PY
+)"
+poll_url="${REMOTE_BUILD_URL%/}/$job_id?mission_id=$encoded_mission&node_id=$encoded_node"
+poll_secs="${REMOTE_BUILD_POLL_SECS:-3}"
+client_timeout_secs="${REMOTE_BUILD_CLIENT_TIMEOUT_SECS:-7500}"
+case "$poll_secs" in
+    ''|*[!0-9]*) die "REMOTE_BUILD_POLL_SECS must be a positive integer" ;;
+esac
+case "$client_timeout_secs" in
+    ''|*[!0-9]*) die "REMOTE_BUILD_CLIENT_TIMEOUT_SECS must be a positive integer" ;;
+esac
+[ "$poll_secs" -gt 0 ] || die "REMOTE_BUILD_POLL_SECS must be greater than zero"
+[ "$client_timeout_secs" -gt 0 ] || die "REMOTE_BUILD_CLIENT_TIMEOUT_SECS must be greater than zero"
+if [ "$receipt_state" != "succeeded" ] && [ "$receipt_state" != "failed" ] \
+    && [ "$receipt_state" != "cancelled" ] && [ "$receipt_state" != "lost" ]; then
+    deadline=$(( $(date +%s) + client_timeout_secs ))
+
+    while :; do
+        http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+            -H "Authorization: Bearer $REMOTE_BUILD_TOKEN" \
+            --max-time 20 "$poll_url")" || http_code="000"
+
+        if [ "$http_code" = "200" ]; then
+            receipt_state="$(python3 - "$state_file" "$response_file" <<'PY'
+import json, os, sys, tempfile
+path, response_path = sys.argv[1:]
+receipt = json.load(open(path))
+status = json.load(open(response_path))
+receipt.update(status)
+fd, tmp = tempfile.mkstemp(prefix=".remote-build-", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w") as out:
+        json.dump(receipt, out, sort_keys=True)
+        out.write("\n")
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+print(status.get("state") or "")
+PY
+            )" || die "invalid remote-build status response"
+            case "$receipt_state" in
+                succeeded|failed|cancelled|lost) break ;;
+            esac
+        elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+            echo "remote-lean-build: polling authorization failed; the accepted job remains resumable" >&2
+            exit 1
+        elif [ "$http_code" = "400" ] || [ "$http_code" = "404" ]; then
+            echo "remote-lean-build: cannot recover job $job_id (HTTP $http_code):" >&2
+            cat "$response_file" >&2; echo >&2
+            exit 1
+        fi
+
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            die "timed out polling job $job_id; do not fall back locally, resume it by running the same command again" 1
+        fi
+        sleep "$poll_secs"
+    done
+fi
+
+python3 - "$state_file" <<'PY'
+import datetime, json, sys
 with open(sys.argv[1]) as f:
     resp = json.load(f)
+duration = None
+try:
+    started = datetime.datetime.fromisoformat(resp["started_at"])
+    finished = datetime.datetime.fromisoformat(resp["finished_at"])
+    duration = max(0, int((finished - started).total_seconds()))
+except (KeyError, TypeError, ValueError):
+    pass
 sys.stderr.write(
     "remote-lean-build: job %s on node '%s' finished: %s (exit %s, %ss)\n"
     % (resp.get("job_id"), resp.get("node_id"), resp.get("state"),
-       resp.get("exit_code"), resp.get("duration_secs"))
+       resp.get("exit_code"), duration if duration is not None else "?")
 )
 log_tail = resp.get("log_tail") or ""
 if log_tail:

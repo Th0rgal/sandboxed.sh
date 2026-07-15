@@ -424,12 +424,31 @@ async fn resolve_node(
 
 fn submit_error_status(err: &RemoteNodeError) -> StatusCode {
     match err {
+        // DNS/connect failures happen before an HTTP request reaches the node,
+        // so no remote job can have been accepted and local fallback is safe.
+        RemoteNodeError::Connect(_) => StatusCode::SERVICE_UNAVAILABLE,
+        // A transport failure may happen after the node accepted the request.
+        // The tentative ledger/observer will reconcile it, but the caller must
+        // not start a duplicate local build in the meantime.
+        RemoteNodeError::Request(_) => StatusCode::BAD_GATEWAY,
         RemoteNodeError::Rejected { status, .. }
             if (400..500).contains(status) && !matches!(*status, 401 | 403 | 408 | 429) =>
         {
             StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST)
         }
         _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+fn job_status_error_status(err: &RemoteNodeError) -> StatusCode {
+    match err {
+        // Preserve terminal lookup failures from the runner so a resumable
+        // client can stop polling a handle that no longer exists. Keep node
+        // authentication and transient/transport failures behind the core.
+        RemoteNodeError::Rejected { status, .. } if matches!(*status, 400 | 404) => {
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
+        }
+        _ => StatusCode::BAD_GATEWAY,
     }
 }
 
@@ -602,9 +621,9 @@ async fn submit_remote_build(
     let accepted = match client.submit_job(&node, &shared_token, &submit).await {
         Ok(accepted) => accepted,
         Err(err) => {
-            // Transport outages and queue saturation remain 503 so the wrapper
-            // can fall back locally. Node-side caller validation stays 4xx and
-            // must not be disguised as a fleet outage.
+            // Pre-connect outages and queue saturation remain 503 so the
+            // wrapper can fall back locally. Response-side transport failures
+            // are ambiguous and return 502 to prohibit duplicate local work.
             let status = submit_error_status(&err);
             if matches!(&err, RemoteNodeError::Request(_)) {
                 spawn_remote_build_observer(
@@ -801,7 +820,7 @@ async fn get_remote_build(
     let status = RemoteNodeClient::default()
         .get_job(&node, &shared_token, job_id)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        .map_err(|e| (job_status_error_status(&e), e.to_string()))?;
     // The capability token is mission-scoped: never leak another mission's
     // job status through it.
     if status.mission_id != query.mission_id {
@@ -875,7 +894,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn run_remote_build_wrapper_with_http_status(status: u16) -> std::process::ExitStatus {
+    fn run_remote_build_wrapper_with_submit_result(
+        status: u16,
+        curl_exit: u8,
+    ) -> std::process::ExitStatus {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("create wrapper test directory");
@@ -929,6 +951,7 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 printf '{}' > "$output"
+[ "$REMOTE_BUILD_TEST_CURL_EXIT" = "0" ] || exit "$REMOTE_BUILD_TEST_CURL_EXIT"
 printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
 "#,
         )
@@ -958,6 +981,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             .env("REMOTE_BUILD_TOKEN", "expired-test-token")
             .env("REMOTE_BUILD_MISSION_ID", Uuid::new_v4().to_string())
             .env("REMOTE_BUILD_TEST_HTTP_STATUS", status.to_string())
+            .env("REMOTE_BUILD_TEST_CURL_EXIT", curl_exit.to_string())
             .status()
             .expect("run remote-build wrapper")
     }
@@ -1101,7 +1125,41 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         }
         assert_eq!(
             submit_error_status(&RemoteNodeError::Request("offline".to_string())),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            submit_error_status(&RemoteNodeError::Connect("offline".to_string())),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn job_status_errors_preserve_unrecoverable_lookup_failures_only() {
+        for status in [400, 404] {
+            assert_eq!(
+                job_status_error_status(&RemoteNodeError::Rejected {
+                    status,
+                    body: "job not found".to_string(),
+                }),
+                StatusCode::from_u16(status).unwrap()
+            );
+        }
+        for status in [401, 403, 429, 500, 503] {
+            assert_eq!(
+                job_status_error_status(&RemoteNodeError::Rejected {
+                    status,
+                    body: "runner failure".to_string(),
+                }),
+                StatusCode::BAD_GATEWAY
+            );
+        }
+        assert_eq!(
+            job_status_error_status(&RemoteNodeError::Connect("offline".to_string())),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            job_status_error_status(&RemoteNodeError::Request("offline".to_string())),
+            StatusCode::BAD_GATEWAY
         );
     }
 
@@ -1110,18 +1168,309 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
     fn wrapper_treats_host_capability_auth_failures_as_temporary() {
         for status in [401, 403, 503] {
             assert_eq!(
-                run_remote_build_wrapper_with_http_status(status).code(),
+                run_remote_build_wrapper_with_submit_result(status, 0).code(),
                 Some(75),
                 "HTTP {status} should request local fallback"
             );
         }
         for status in [400, 422] {
             assert_eq!(
-                run_remote_build_wrapper_with_http_status(status).code(),
+                run_remote_build_wrapper_with_submit_result(status, 0).code(),
                 Some(1),
                 "HTTP {status} remains a caller error"
             );
         }
+        assert_eq!(
+            run_remote_build_wrapper_with_submit_result(0, 28).code(),
+            Some(1),
+            "a submit timeout has an ambiguous outcome and must not request local fallback"
+        );
+        assert_eq!(
+            run_remote_build_wrapper_with_submit_result(0, 56).code(),
+            Some(1),
+            "a response-side transport failure may follow acceptance and must not request fallback"
+        );
+        assert_eq!(
+            run_remote_build_wrapper_with_submit_result(0, 7).code(),
+            Some(75),
+            "a pre-connect failure is safe for local fallback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_resumes_an_interrupted_async_job_without_resubmitting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create wrapper test directory");
+        let repo = temp.path().join("repo");
+        let bin = temp.path().join("bin");
+        let state = temp.path().join("state");
+        let submit_count = temp.path().join("submit-count");
+        std::fs::create_dir_all(&repo).expect("create test repo");
+        std::fs::create_dir_all(&bin).expect("create fake bin directory");
+
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "Remote Build Test"]);
+        git(&["config", "user.email", "remote-build@example.invalid"]);
+        std::fs::write(repo.join("README.md"), "test\n").expect("write tracked file");
+        git(&["add", "README.md"]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "test",
+        ]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ]);
+
+        let fake_curl = bin.join("curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+output=""
+url=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) shift; output="$1" ;;
+        http://*) url="$1" ;;
+    esac
+    shift
+done
+case "$url" in
+    */api/remote-build/*)
+        if [ "$REMOTE_BUILD_TEST_POLL_MODE" = "fail" ]; then
+            exit 7
+        fi
+        printf '{"job_id":"11111111-1111-1111-1111-111111111111","mission_id":"%s","state":"succeeded","exit_code":0,"created_at":"2026-07-15T20:00:00Z","started_at":"2026-07-15T20:00:01Z","finished_at":"2026-07-15T20:00:03Z","error":null,"log_tail":"remote ok\\n","artifacts":[]}' "$REMOTE_BUILD_TEST_MISSION_ID" > "$output"
+        printf '200'
+        ;;
+    *)
+        if [ "$REMOTE_BUILD_TEST_POLL_MODE" = "persist-fail" ]; then
+            chmod 500 "$REMOTE_BUILD_TEST_STATE_DIR"
+        fi
+        count=0
+        [ ! -f "$REMOTE_BUILD_TEST_SUBMIT_COUNT" ] || count=$(cat "$REMOTE_BUILD_TEST_SUBMIT_COUNT")
+        count=$((count + 1))
+        printf '%s' "$count" > "$REMOTE_BUILD_TEST_SUBMIT_COUNT"
+        if [ "$REMOTE_BUILD_TEST_POLL_MODE" = "ambiguous" ]; then
+            exit 28
+        fi
+        printf '{"job_id":"11111111-1111-1111-1111-111111111111","node_id":"lean:gpu"}' > "$output"
+        printf '202'
+        ;;
+esac
+"#,
+        )
+        .expect("write fake curl");
+        let mut permissions = std::fs::metadata(&fake_curl)
+            .expect("stat fake curl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_curl, permissions).expect("make fake curl executable");
+
+        let mission_id = Uuid::new_v4().to_string();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let command = |poll_mode: &str| {
+            let mut command = std::process::Command::new("bash");
+            command
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/scripts/remote-lean-build"
+                ))
+                .current_dir(&repo)
+                .env("PATH", &path)
+                .env(
+                    "REMOTE_BUILD_URL",
+                    "http://example.invalid/api/remote-build",
+                )
+                .env("REMOTE_BUILD_TOKEN", "test-token")
+                .env("REMOTE_BUILD_MISSION_ID", &mission_id)
+                .env("REMOTE_BUILD_STATE_DIR", &state)
+                .env("REMOTE_BUILD_TEST_STATE_DIR", &state)
+                .env("REMOTE_BUILD_POLL_SECS", "1")
+                .env("REMOTE_BUILD_CLIENT_TIMEOUT_SECS", "1")
+                .env("REMOTE_BUILD_TEST_POLL_MODE", poll_mode)
+                .env("REMOTE_BUILD_TEST_MISSION_ID", &mission_id)
+                .env("REMOTE_BUILD_TEST_SUBMIT_COUNT", &submit_count);
+            command
+        };
+        let run = |poll_mode: &str| {
+            command(poll_mode)
+                .output()
+                .expect("run remote-build wrapper")
+        };
+
+        let first = command("fail")
+            .spawn()
+            .expect("start first concurrent wrapper");
+        let second = command("fail")
+            .spawn()
+            .expect("start second concurrent wrapper");
+        for interrupted in [
+            first.wait_with_output().expect("wait for first wrapper"),
+            second.wait_with_output().expect("wait for second wrapper"),
+        ] {
+            assert_eq!(
+                interrupted.status.code(),
+                Some(1),
+                "an accepted remote job must never request local fallback: stdout={} stderr={}",
+                String::from_utf8_lossy(&interrupted.stdout),
+                String::from_utf8_lossy(&interrupted.stderr)
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
+        let receipts = std::fs::read_dir(&state)
+            .expect("read receipt directory")
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .ok()
+                    .and_then(|entry| entry.path().extension().map(|ext| ext == "json"))
+                    .unwrap_or(false)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect receipts");
+        assert_eq!(receipts.len(), 1);
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(receipts[0].path()).expect("read persisted receipt"),
+        )
+        .expect("parse persisted receipt");
+        assert!(receipt.get("token").is_none());
+        assert!(receipt.get("repo").is_none());
+        assert!(receipt.get("wait").is_none());
+        assert_eq!(
+            receipt.get("job_id").and_then(serde_json::Value::as_str),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+
+        std::fs::write(repo.join("DIRTY-WORKTREE"), "changed after submit\n")
+            .expect("dirty checkout after accepted build");
+        let resumed = run("success");
+        assert!(
+            resumed.status.success(),
+            "resume failed: {}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
+        assert!(String::from_utf8_lossy(&resumed.stderr).contains("resuming job"));
+        assert_eq!(String::from_utf8_lossy(&resumed.stdout), "remote ok\n");
+
+        let replayed = run("fail");
+        assert!(
+            replayed.status.success(),
+            "terminal receipt replay failed: {}",
+            String::from_utf8_lossy(&replayed.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
+        assert!(String::from_utf8_lossy(&replayed.stderr).contains("replaying terminal job"));
+        assert_eq!(String::from_utf8_lossy(&replayed.stdout), "remote ok\n");
+
+        std::fs::remove_file(repo.join("DIRTY-WORKTREE"))
+            .expect("restore clean checkout before new submission");
+        for receipt in std::fs::read_dir(&state).expect("read receipts before persistence failure")
+        {
+            std::fs::remove_file(receipt.expect("read receipt entry").path())
+                .expect("remove prior receipt");
+        }
+        let persistence_failed = run("persist-fail");
+        if state.is_file() {
+            std::fs::remove_file(&state).expect("remove persistence-failure sentinel");
+            std::fs::create_dir(&state).expect("restore state directory");
+        }
+        let mut state_permissions = std::fs::metadata(&state)
+            .expect("stat state directory after persistence failure")
+            .permissions();
+        state_permissions.set_mode(0o700);
+        std::fs::set_permissions(&state, state_permissions)
+            .expect("restore state directory permissions");
+        assert_eq!(
+            persistence_failed.status.code(),
+            Some(1),
+            "unexpected persistence-failure result: stdout={} stderr={}",
+            String::from_utf8_lossy(&persistence_failed.stdout),
+            String::from_utf8_lossy(&persistence_failed.stderr)
+        );
+        assert!(String::from_utf8_lossy(&persistence_failed.stderr)
+            .contains("failed to persist its receipt"));
+        let persistence_retry = run("success");
+        assert_eq!(persistence_retry.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&persistence_retry.stderr)
+            .contains("previous submission stopped"));
+        assert_eq!(
+            std::fs::read_to_string(&submit_count).unwrap(),
+            "2",
+            "the accepted persistence-failure submission must block an identical retry"
+        );
+        let forced_after_reconciliation = command("success")
+            .env("REMOTE_BUILD_FORCE_NEW", "1")
+            .output()
+            .expect("force a new build after explicit reconciliation");
+        assert!(
+            forced_after_reconciliation.status.success(),
+            "explicitly forced build failed: {}",
+            String::from_utf8_lossy(&forced_after_reconciliation.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "3");
+
+        for entry in std::fs::read_dir(&state).expect("read state before ambiguous submission") {
+            let path = entry.expect("read state entry").path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).expect("remove stale test lock directory");
+            } else {
+                std::fs::remove_file(path).expect("remove prior test receipt");
+            }
+        }
+        std::fs::write(&submit_count, "0").expect("reset submit counter");
+        let ambiguous = run("ambiguous");
+        assert_eq!(ambiguous.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("unknown outcome"));
+        let blocked_retry = run("success");
+        assert_eq!(blocked_retry.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&blocked_retry.stderr).contains("previous submission"));
+        assert_eq!(
+            std::fs::read_to_string(&submit_count).unwrap(),
+            "1",
+            "an ambiguous first submit must block an identical retry"
+        );
+        let ambiguous_receipt = std::fs::read_dir(&state)
+            .expect("read ambiguous receipt directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .expect("ambiguous receipt");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(ambiguous_receipt).expect("read ambiguous receipt"),
+        )
+        .expect("parse ambiguous receipt");
+        assert_eq!(
+            receipt.get("state").and_then(serde_json::Value::as_str),
+            Some("ambiguous")
+        );
+        assert!(receipt.get("token").is_none());
+        assert!(receipt.get("repo").is_none());
     }
 
     #[test]

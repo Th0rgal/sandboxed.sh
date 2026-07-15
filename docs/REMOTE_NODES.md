@@ -39,8 +39,9 @@ Supported now:
   `remote_requirements` labels) picks the least-loaded eligible node from the
   fleet cache and fails closed with a per-node exclusion report
 - `POST /api/remote-build`: an in-workspace, capability-token-authenticated
-  endpoint that dispatches a `lean_build` job (auto-placed by default) and
-  waits for the result — used by the `remote-lean-build` wrapper
+  endpoint that dispatches a `lean_build` job (auto-placed by default). The
+  wrapper submits asynchronously and polls the mission-scoped status endpoint
+  so interrupted clients can resume the same immutable job.
 - dispatch failures fail closed: the mission is marked failed and the API
   returns an error
 - future `not_before` scheduling with `remote_node_id` is rejected for now so
@@ -408,10 +409,20 @@ remote-lean-build lake build Verity
 
 It derives `repo` (`git remote get-url origin`), `commit`
 (`git rev-parse HEAD`) and `cwd_rel` (`git rev-parse --show-prefix`),
-refuses a dirty tree (exit 2 — the node builds a pinned commit, so
-uncommitted changes would be silently ignored), POSTs to
+refuses a dirty tree for a new submission (exit 2 — the node builds a pinned
+commit, so uncommitted changes would be silently ignored), submits asynchronously to
 `$REMOTE_BUILD_URL` with `$REMOTE_BUILD_TOKEN`/`$REMOTE_BUILD_MISSION_ID`,
-prints the remote log tail, and exits with the remote build's exit code. On
+persists the returned job/node receipt under
+`${XDG_STATE_HOME:-$HOME/.local/state}/sandboxed-sh/remote-builds/`, then polls
+the mission-authenticated status endpoint. Receipts are scoped to the remote
+endpoint as well as the immutable request. Running the same command after a
+client/tool interruption resumes the recorded job instead of submitting a
+duplicate; if the terminal status was already persisted, it replays that
+evidence without polling or resubmitting. Existing receipts remain resumable
+when the checkout later becomes dirty. It prints the remote log tail and
+exits with the remote build's exit code. Once a job has been accepted, polling
+errors and client timeouts never request local fallback: rerun the identical
+command to resume it. On
 HTTP 503 (placement failure, fleet down, feature off) it prints the reason
 and exits 75 (`EX_TEMPFAIL`) so scripts can fall back to a local build:
 
@@ -419,8 +430,25 @@ and exits 75 (`EX_TEMPFAIL`) so scripts can fall back to a local build:
 remote-lean-build || { [ $? -eq 75 ] && lake build; }
 ```
 
+If the core cannot connect to the selected node before sending the request, it
+returns 503 and local fallback remains safe. If submission instead has an
+ambiguous response-side transport failure, core returns 502 while its tentative
+ledger reconciles/cancels the possible job. The wrapper exits 1 for that
+response and never falls back. It also persists a secret-free `ambiguous`
+receipt, so an identical retry cannot submit a second job before operators
+confirm reconciliation; `REMOTE_BUILD_FORCE_NEW=1` is an explicit override.
+
 Optional: `REMOTE_BUILD_TIMEOUT_SECS` forwards a job timeout (clamped by the
-node's `SANDBOXED_NODE_MAX_JOB_SECS`).
+node's `SANDBOXED_NODE_MAX_JOB_SECS`). `REMOTE_BUILD_SUBMIT_TIMEOUT_SECS`
+controls the pre-receipt HTTP budget (default 90 seconds, long enough for a
+fresh probe plus node submission). Submit timeouts and response-side transport
+failures are treated as ambiguous outcomes and never trigger local fallback;
+only failures that happen before connecting are fallback-safe. Failure to
+persist the receipt after a `202` is also fail-closed and reports the accepted
+job handle. `REMOTE_BUILD_STATE_DIR` overrides the receipt directory. Receipts
+never contain the capability token or the Git remote URL.
+`REMOTE_BUILD_FORCE_NEW=1` deliberately bypasses a live matching receipt and
+should be reserved for operator-directed retries.
 
 Workspace configuration can pin the placement policy without exposing node
 credentials:
