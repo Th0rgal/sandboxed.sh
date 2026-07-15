@@ -23140,6 +23140,8 @@ And the report:
             model_override: Some(model.to_string()),
             model_effort: None,
             working_directory: None,
+            repository: None,
+            branch: None,
             depends_on: Vec::new(),
         }
     }

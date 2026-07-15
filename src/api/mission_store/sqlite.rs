@@ -1253,11 +1253,21 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to query board_tasks schema: {e}"))?;
             if !exists {
                 tracing::info!(column, "Running migration: adding board task column");
-                conn.execute(
+                match conn.execute(
                     &format!("ALTER TABLE board_tasks ADD COLUMN {column} {ty}"),
                     [],
-                )
-                .map_err(|e| format!("Failed to add board_tasks.{column}: {e}"))?;
+                ) {
+                    Ok(_) => {}
+                    Err(error) if error.to_string().contains("duplicate column") => {
+                        tracing::debug!(
+                            column,
+                            "board task column already exists after concurrent migration"
+                        );
+                    }
+                    Err(error) => {
+                        return Err(format!("Failed to add board_tasks.{column}: {error}"));
+                    }
+                }
             }
         }
 
@@ -11941,6 +11951,16 @@ mod tests {
                 .ok();
             conn.execute("ALTER TABLE missions DROP COLUMN next_check_at", [])
                 .ok();
+            for column in [
+                "repository",
+                "branch",
+                "prior_worker_mission_id",
+                "prior_outcome",
+                "prior_result_digest",
+            ] {
+                conn.execute(&format!("ALTER TABLE board_tasks DROP COLUMN {column}"), [])
+                    .expect("drop board task column for migration race");
+            }
         }
 
         // Two concurrent initializations on the SAME db file — both must succeed.
@@ -11983,6 +12003,23 @@ mod tests {
                 exists,
                 "{} column must exist after concurrent migration",
                 col
+            );
+        }
+        for col in [
+            "repository",
+            "branch",
+            "prior_worker_mission_id",
+            "prior_outcome",
+            "prior_result_digest",
+        ] {
+            let exists: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('board_tasks') WHERE name = ?1")
+                .unwrap()
+                .exists([col])
+                .unwrap();
+            assert!(
+                exists,
+                "{col} board_tasks column must survive concurrent migration"
             );
         }
     }
