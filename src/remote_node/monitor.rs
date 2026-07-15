@@ -441,6 +441,9 @@ impl RemoteNodeView {
         if labels.is_empty() {
             labels = config.labels.clone().unwrap_or_default();
         }
+        if heartbeat.and_then(|h| h.lean_runtime_ready) == Some(false) {
+            labels.retain(|label| label != "lean");
+        }
         Self {
             id: config.id.clone(),
             base_url: config.base_url.clone(),
@@ -807,6 +810,22 @@ mod tests {
             .unwrap(),
             "missing-lake"
         );
+    }
+
+    #[test]
+    fn node_view_does_not_restore_a_withheld_lean_label() {
+        let mut config = node_config("missing-lake");
+        config.labels = Some(vec!["lean".to_string(), "cpu".to_string()]);
+        let mut status = cached_online("missing-lake", &[], 100, 32, 2, 0, 0);
+        status
+            .last_heartbeat
+            .as_mut()
+            .expect("heartbeat")
+            .lean_runtime_ready = Some(false);
+
+        let view = RemoteNodeView::from_cache(&config, Some(&status));
+        assert_eq!(view.labels, vec!["cpu".to_string()]);
+        assert_eq!(view.lean_runtime_ready, Some(false));
     }
 
     #[test]
