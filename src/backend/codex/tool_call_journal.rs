@@ -1,6 +1,6 @@
 //! Durable app-server tool-call lifecycle journal.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ fn lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 impl ToolCallJournal {
-    pub fn new(working_dir: &Path, session_id: &str, thread_id: &str) -> Self {
+    pub fn new(session_id: &str, thread_id: &str) -> Self {
         let safe = |value: &str| {
             value
                 .chars()
@@ -43,8 +43,8 @@ impl ToolCallJournal {
                 .collect::<String>()
         };
         Self {
-            path: working_dir
-                .join(".sandboxed-sh")
+            path: std::env::temp_dir()
+                .join("sandboxed-sh")
                 .join("codex-tool-calls")
                 .join(format!("{}-{}.json", safe(session_id), safe(thread_id))),
         }
@@ -128,7 +128,8 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_is_atomic_idempotent_and_clearable() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = ToolCallJournal::new(dir.path(), "session", "thread");
+        let journal = ToolCallJournal::new(&uuid::Uuid::new_v4().to_string(), "thread");
+        assert!(!journal.path.starts_with(dir.path()));
         let descriptor = PendingToolCall {
             id: "call-1".into(),
             name: "bash".into(),

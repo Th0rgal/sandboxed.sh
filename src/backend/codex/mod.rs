@@ -378,11 +378,7 @@ async fn send_message_streaming_app_server(
     let reconnect_cwd = session.directory.clone();
     let reconnect_workspace_exec = workspace_exec.cloned();
     let reconnect_thread_id = thread.id.clone();
-    let tool_call_journal = ToolCallJournal::new(
-        std::path::Path::new(&session.directory),
-        &session.id,
-        &thread.id,
-    );
+    let tool_call_journal = ToolCallJournal::new(&session.id, &thread.id);
 
     let handle = tokio::spawn(async move {
         // Seed the cached objective so the first GoalIteration event has
