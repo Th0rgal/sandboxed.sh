@@ -1781,11 +1781,7 @@ impl OrchestratorMcp {
                 .as_ref()
                 .map(|wt| {
                     (
-                        Some(
-                            resolve_repo_path(wt.repo_path.as_deref())
-                                .to_string_lossy()
-                                .into_owned(),
-                        ),
+                        Some(resolve_repo_path(wt.repo_path.as_deref())),
                         Some(wt.branch.clone()),
                     )
                 })
