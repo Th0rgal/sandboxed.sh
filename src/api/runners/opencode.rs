@@ -2084,12 +2084,12 @@ pub async fn run_opencode_turn(
 }
 
 fn opencode_path(
-    _mission_path: Option<&str>,
+    mission_path: Option<&str>,
     work_dir_arg: &str,
     telegram_action_helpers_enabled: bool,
 ) -> String {
     let process_path = std::env::var("PATH").unwrap_or_default();
-    let current_path = process_path.as_str();
+    let current_path = mission_path.unwrap_or(&process_path);
     let bun_bins = "/root/.bun/bin:/root/.cache/.bun/bin";
     let mut path_parts = Vec::new();
     if !current_path.contains("/root/.bun/bin") {
