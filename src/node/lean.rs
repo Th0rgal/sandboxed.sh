@@ -290,6 +290,7 @@ pub fn lean_runtime_ready(work_root: &Path) -> bool {
 fn lean_concurrency_env(
     payload_env: &HashMap<String, String>,
     available_parallelism: usize,
+    uses_lake_fanout: bool,
 ) -> HashMap<String, String> {
     const MAX_DEFAULT_LAKE_JOBS: usize = 4;
 
@@ -305,13 +306,21 @@ fn lean_concurrency_env(
     let mut effective = HashMap::new();
 
     if !explicit_lake_jobs {
-        let thread_cost = positive_value(payload_env, "LEAN_NUM_THREADS").unwrap_or(1);
-        let jobs = (budget / thread_cost).clamp(1, MAX_DEFAULT_LAKE_JOBS);
+        let jobs = if uses_lake_fanout {
+            let thread_cost = positive_value(payload_env, "LEAN_NUM_THREADS").unwrap_or(1);
+            (budget / thread_cost).clamp(1, MAX_DEFAULT_LAKE_JOBS)
+        } else {
+            1
+        };
         effective.insert("LAKE_JOBS".to_string(), jobs.to_string());
     }
     if !explicit_threads {
-        let lake_cost = positive_value(payload_env, "LAKE_JOBS")
-            .unwrap_or_else(|| budget.min(MAX_DEFAULT_LAKE_JOBS));
+        let lake_cost = if uses_lake_fanout {
+            positive_value(payload_env, "LAKE_JOBS")
+                .unwrap_or_else(|| budget.min(MAX_DEFAULT_LAKE_JOBS))
+        } else {
+            1
+        };
         let threads = (budget / lake_cost).max(1);
         effective.insert("LEAN_NUM_THREADS".to_string(), threads.to_string());
     }
@@ -797,7 +806,11 @@ pub async fn execute_lean_build(
     let available_parallelism = std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(1);
-    for (key, value) in lean_concurrency_env(env, available_parallelism) {
+    for (key, value) in lean_concurrency_env(
+        env,
+        available_parallelism,
+        command.first().is_some_and(|c| c == "lake"),
+    ) {
         cmd.env(key, value);
     }
     let limit_secs = clamp_timeout(*timeout_secs, max_job_secs);
@@ -1015,7 +1028,7 @@ mod tests {
 
     #[test]
     fn concurrency_env_uses_capability_defaults_and_preserves_explicit_values() {
-        let defaults = lean_concurrency_env(&HashMap::new(), 12);
+        let defaults = lean_concurrency_env(&HashMap::new(), 12, true);
         assert_eq!(
             defaults.get("LEAN_NUM_THREADS").map(String::as_str),
             Some("3")
@@ -1026,7 +1039,7 @@ mod tests {
             ("LEAN_NUM_THREADS".to_string(), "3".to_string()),
             ("LAKE_JOBS".to_string(), "5".to_string()),
         ]);
-        let overridden = lean_concurrency_env(&explicit, 12);
+        let overridden = lean_concurrency_env(&explicit, 12, true);
         assert_eq!(
             overridden.get("LEAN_NUM_THREADS").map(String::as_str),
             Some("3")
@@ -1036,6 +1049,7 @@ mod tests {
         let only_threads = lean_concurrency_env(
             &HashMap::from([("LEAN_NUM_THREADS".to_string(), "7".to_string())]),
             12,
+            true,
         );
         assert_eq!(
             only_threads.get("LEAN_NUM_THREADS").map(String::as_str),
@@ -1046,6 +1060,7 @@ mod tests {
         let only_lake = lean_concurrency_env(
             &HashMap::from([("LAKE_JOBS".to_string(), "9".to_string())]),
             12,
+            true,
         );
         assert_eq!(
             only_lake.get("LEAN_NUM_THREADS").map(String::as_str),
@@ -1053,19 +1068,26 @@ mod tests {
         );
         assert_eq!(only_lake.get("LAKE_JOBS").map(String::as_str), Some("9"));
 
-        let dgx_defaults = lean_concurrency_env(&HashMap::new(), 20);
+        let dgx_defaults = lean_concurrency_env(&HashMap::new(), 20, true);
         assert_eq!(
             dgx_defaults.get("LEAN_NUM_THREADS").map(String::as_str),
             Some("5")
         );
         assert_eq!(dgx_defaults.get("LAKE_JOBS").map(String::as_str), Some("4"));
 
-        let single_core = lean_concurrency_env(&HashMap::new(), 1);
+        let single_core = lean_concurrency_env(&HashMap::new(), 1, true);
         assert_eq!(
             single_core.get("LEAN_NUM_THREADS").map(String::as_str),
             Some("1")
         );
         assert_eq!(single_core.get("LAKE_JOBS").map(String::as_str), Some("1"));
+
+        let direct_lean = lean_concurrency_env(&HashMap::new(), 20, false);
+        assert_eq!(
+            direct_lean.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("20")
+        );
+        assert_eq!(direct_lean.get("LAKE_JOBS").map(String::as_str), Some("1"));
     }
 
     #[test]
