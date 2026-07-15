@@ -3680,6 +3680,57 @@ pub struct BoardResponse {
     pub utilization: BoardUtilization,
 }
 
+fn validate_and_normalize_board_tasks(
+    tasks: &mut [NewBoardTask],
+) -> Result<(), (StatusCode, String)> {
+    for t in tasks {
+        if t.task_key.trim().is_empty() || t.prompt.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "every task needs a non-empty task_key and prompt".to_string(),
+            ));
+        }
+        // Same operator policy as the orchestrator MCP: worker missions never
+        // burn Claude tokens. Enforced here too so the API can't be used to
+        // bypass the MCP-level check.
+        let claude_allowed = std::env::var("SANDBOXED_SH_ALLOW_CLAUDE_WORKERS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let is_claude = t.backend.eq_ignore_ascii_case("claudecode")
+            || t.model_override
+                .as_deref()
+                .map(|m| m.to_ascii_lowercase().contains("claude"))
+                .unwrap_or(false);
+        if t.backend.trim().is_empty() || (is_claude && !claude_allowed) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "task `{}`: workers need an explicit non-Claude backend (got `{}`)",
+                    t.task_key, t.backend
+                ),
+            ));
+        }
+        if let Some(model) = t.model_override.as_deref() {
+            if let Some(prefixed_backend) = native_backend_prefix(model) {
+                if t.backend != "opencode" && t.backend != prefixed_backend {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "task `{}`: model '{}' selects backend '{}', but task backend is '{}'",
+                            t.task_key, model, prefixed_backend, t.backend
+                        ),
+                    ));
+                }
+            }
+        }
+        t.model_override = t
+            .model_override
+            .as_deref()
+            .and_then(|model| normalize_model_override_for_backend(Some(&t.backend), model));
+    }
+    Ok(())
+}
+
 fn board_utilization(tasks: &[BoardTask], max_parallel: usize) -> BoardUtilization {
     let count = |s: BoardTaskStatus| tasks.iter().filter(|t| t.status == s).count();
     BoardUtilization {
@@ -3724,38 +3775,7 @@ pub async fn upsert_mission_board_tasks(
     if req.tasks.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "tasks is required".to_string()));
     }
-    for t in &mut req.tasks {
-        if t.task_key.trim().is_empty() || t.prompt.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "every task needs a non-empty task_key and prompt".to_string(),
-            ));
-        }
-        // Same operator policy as the orchestrator MCP: worker missions never
-        // burn Claude tokens. Enforced here too so the API can't be used to
-        // bypass the MCP-level check.
-        let claude_allowed = std::env::var("SANDBOXED_SH_ALLOW_CLAUDE_WORKERS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let is_claude = t.backend.eq_ignore_ascii_case("claudecode")
-            || t.model_override
-                .as_deref()
-                .map(|m| m.to_ascii_lowercase().contains("claude"))
-                .unwrap_or(false);
-        if t.backend.trim().is_empty() || (is_claude && !claude_allowed) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "task `{}`: workers need an explicit non-Claude backend (got `{}`)",
-                    t.task_key, t.backend
-                ),
-            ));
-        }
-        t.model_override = t
-            .model_override
-            .as_deref()
-            .and_then(|model| normalize_model_override_for_backend(Some(&t.backend), model));
-    }
+    validate_and_normalize_board_tasks(&mut req.tasks)?;
 
     let control = control_for_user(&state, &user).await;
     // The boss mission must exist — tasks attached to a typo'd uuid would
@@ -23109,6 +23129,53 @@ And the report:
             normalize_model_override_for_backend(Some("codex"), "codex/gpt-5.6-terra"),
             Some("gpt-5.6-terra".to_string())
         );
+    }
+
+    fn board_task_with_backend_and_model(backend: &str, model: &str) -> NewBoardTask {
+        NewBoardTask {
+            task_key: "model-check".to_string(),
+            title: "Model check".to_string(),
+            prompt: "Verify board model validation".to_string(),
+            backend: backend.to_string(),
+            model_override: Some(model.to_string()),
+            model_effort: None,
+            working_directory: None,
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn board_upsert_rejects_native_model_backend_mismatch_without_persisting() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let boss_id = Uuid::new_v4();
+        let mut tasks = vec![board_task_with_backend_and_model(
+            "grok",
+            "codex/gpt-5.6-terra",
+        )];
+
+        let result = validate_and_normalize_board_tasks(&mut tasks);
+        if result.is_ok() {
+            store.upsert_board_tasks(boss_id, tasks).await.unwrap();
+        }
+
+        let (status, error) = result.expect_err("mismatched native backend must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.contains("task `model-check`"));
+        assert!(error.contains("codex"));
+        assert!(error.contains("grok"));
+        assert!(store.list_board_tasks(boss_id).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn board_upsert_normalizes_matching_native_model_backend_prefix() {
+        let mut tasks = vec![board_task_with_backend_and_model(
+            "codex",
+            "codex/gpt-5.6-terra",
+        )];
+
+        validate_and_normalize_board_tasks(&mut tasks).unwrap();
+
+        assert_eq!(tasks[0].model_override.as_deref(), Some("gpt-5.6-terra"));
     }
 
     #[test]

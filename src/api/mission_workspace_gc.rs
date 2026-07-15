@@ -3,12 +3,12 @@
 //! When `auto_cleanup_enabled` is on in `SettingsStore`, this task wakes up
 //! once an hour, walks every live control session's mission store, and for
 //! each mission in a terminal status that hasn't been touched within the
-//! configured retention window (`auto_cleanup_days`), it deletes the
+//! configured retention window (`auto_cleanup_days`), it proposes cleanup of the
 //! per-mission workspace directory on disk
 //! (`{workspace_root}/workspaces/mission-{first-8-of-id}/`).
 //!
 //! The conversation history in the SQLite mission store is left intact —
-//! only the agent's sandboxed filesystem is collected. The mission can still
+//! only the agent's sandboxed filesystem is eligible. The mission can still
 //! be opened from the dashboard; "Load earlier messages" continues to work.
 //!
 //! Terminal statuses we collect:
@@ -39,6 +39,11 @@ pub const DEFAULT_STOPPED_RETENTION_DAYS: u32 = 30;
 /// memory even when a session has thousands of missions.
 const LIST_PAGE_SIZE: usize = 200;
 
+/// Deletion is deliberately opt-in. An enabled retention setting alone only
+/// produces auditable `would_remove` records. This makes rollout reversible
+/// and prevents a configuration migration from deleting historical work.
+const EXECUTE_ENV: &str = "WORKSPACE_GC_EXECUTE";
+
 /// Spawn the background GC loop. Safe to call once at server start.
 pub fn spawn(state: Arc<AppState>) {
     tokio::spawn(async move {
@@ -64,10 +69,12 @@ async fn run_loop(state: Arc<AppState>) {
             cutoff: now - chrono::Duration::days(settings.days as i64),
             stopped_cutoff: now - chrono::Duration::days(settings.stopped_days as i64),
             orphans_enabled: settings.orphans_enabled,
+            dry_run: !gc_execution_enabled(),
         };
         let report = run_once(&state, &params).await;
         tracing::info!(
             removed = report.removed,
+            proposed = report.proposed,
             orphans_removed = report.orphans_removed,
             stopped_removed = report.stopped_removed,
             errors = report.errors,
@@ -76,9 +83,17 @@ async fn run_loop(state: Arc<AppState>) {
             duration_ms = started.elapsed().as_millis() as u64,
             retention_days = settings.days,
             stopped_retention_days = settings.stopped_days,
+            dry_run = params.dry_run,
             "mission workspace GC sweep finished",
         );
     }
+}
+
+fn gc_execution_enabled() -> bool {
+    matches!(
+        std::env::var(EXECUTE_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
 }
 
 struct GcSettings {
@@ -154,6 +169,32 @@ pub(crate) fn entry_for_workspace(
                 protection_rank(&entry.status),
                 entry.updated_at.timestamp_micros(),
             )
+        })
+}
+
+/// Whether the most protective known owner of a shared short-id directory is
+/// terminal and past retention. Phase 1 must use the same collision policy as
+/// the disk-driven sweep before proposing or removing the shared path.
+fn indexed_mission_directory_is_collectible(
+    entries: &[MissionIndexEntry],
+    workspace_id: uuid::Uuid,
+    cutoff: DateTime<Utc>,
+    index_complete: bool,
+) -> bool {
+    index_complete
+        && entry_for_workspace(entries, workspace_id)
+            .is_some_and(|entry| is_gc_eligible_status(&entry.status) && entry.updated_at < cutoff)
+}
+
+fn phase_one_index_allows_collection(
+    index: &MissionIndex,
+    mission_short: &str,
+    workspace_id: uuid::Uuid,
+    cutoff: DateTime<Utc>,
+) -> bool {
+    index.complete
+        && index.by_short.get(mission_short).is_some_and(|entries| {
+            indexed_mission_directory_is_collectible(entries, workspace_id, cutoff, true)
         })
 }
 
@@ -514,6 +555,9 @@ pub struct SweepReport {
     pub stopped_removed: usize,
     pub errors: usize,
     pub bytes_freed: u64,
+    /// Directories that passed policy but were retained because this sweep was
+    /// dry-run. These are approval candidates, never a deletion result.
+    pub proposed: usize,
 }
 
 /// Cutoffs and toggles for one sweep.
@@ -524,6 +568,55 @@ pub struct SweepParams {
     pub stopped_cutoff: DateTime<Utc>,
     /// Whether unmatched `mission-*` dirs are collected.
     pub orphans_enabled: bool,
+    /// When true, report candidates without touching the filesystem.
+    pub dry_run: bool,
+}
+
+/// Convert systemd exec units into the exact workspace/mission pairs they
+/// protect. Malformed or legacy units without a mission tag cannot authorize
+/// removal and are ignored here; the scope reaper owns their separate policy.
+fn protected_exec_scopes<'a>(
+    units: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashSet<(String, String)> {
+    units
+        .into_iter()
+        .filter_map(|unit| {
+            Some((
+                crate::workspace_exec::machine_name_from_exec_unit(unit)?,
+                crate::workspace_exec::mission_short_id_from_exec_unit(unit)?,
+            ))
+        })
+        .collect()
+}
+
+fn protected_exec_scope_snapshot(
+    units: Result<Vec<String>, String>,
+) -> Result<std::collections::HashSet<(String, String)>, String> {
+    units.map(|units| protected_exec_scopes(units.iter().map(String::as_str)))
+}
+
+/// Whether a live exec scope protects one mission directory. This guard runs
+/// before phase 1 can propose or remove the directory.
+#[derive(Debug, PartialEq, Eq)]
+enum MissionDirectoryCandidate {
+    RetainLiveScope,
+    Eligible,
+}
+
+fn mission_directory_candidate(
+    scope_protected: &std::collections::HashSet<(String, String)>,
+    workspace_path: &std::path::Path,
+    mission_id: uuid::Uuid,
+) -> MissionDirectoryCandidate {
+    let Some(workspace_token) = crate::workspace_exec::machine_name_for_path(workspace_path) else {
+        return MissionDirectoryCandidate::Eligible;
+    };
+    let mission_short = mission_id.simple().to_string()[..8].to_string();
+    if scope_protected.contains(&(workspace_token, mission_short)) {
+        MissionDirectoryCandidate::RetainLiveScope
+    } else {
+        MissionDirectoryCandidate::Eligible
+    }
 }
 
 /// One full pass. Phase 1 is DB-driven (mission → its recorded workspace →
@@ -535,6 +628,21 @@ pub struct SweepParams {
 pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepReport {
     let cutoff = params.cutoff;
     let mut report = SweepReport::default();
+    let mut dry_run_candidates = std::collections::HashSet::new();
+    // Snapshot live exec scopes before considering *any* mission directory.
+    // A scope may have a process holding cwd/fds in the directory, so it wins
+    // over terminal status in both dry-run and execution mode.
+    let scope_protected =
+        match protected_exec_scope_snapshot(super::scope_reaper::try_list_exec_scope_units().await)
+        {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                report.errors += 1;
+                tracing::warn!(%err, "mission GC: scope snapshot unavailable; skipping sweep");
+                return report;
+            }
+        };
+    let mission_index = build_mission_index(state).await;
     let sessions = state.control.all_sessions().await;
     for session in sessions {
         let store = session.mission_store.clone();
@@ -581,7 +689,43 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
                 if !dir.exists() {
                     continue;
                 }
+                let short = mission.id.simple().to_string()[..8].to_string();
+                if !phase_one_index_allows_collection(&mission_index, &short, workspace_id, cutoff)
+                {
+                    tracing::debug!(
+                        mission_id = %mission.id,
+                        workspace_id = %workspace_id,
+                        path = %dir.display(),
+                        "mission GC: kept (short-id collision owner protected)",
+                    );
+                    continue;
+                }
+                if mission_directory_candidate(&scope_protected, &ws.path, mission.id)
+                    == MissionDirectoryCandidate::RetainLiveScope
+                {
+                    tracing::debug!(
+                        mission_id = %mission.id,
+                        workspace_id = %workspace_id,
+                        path = %dir.display(),
+                        "mission GC: kept (live exec scope)",
+                    );
+                    continue;
+                }
                 let size = directory_size_bytes(&dir).await;
+                if params.dry_run {
+                    dry_run_candidates.insert(dir.clone());
+                    report.proposed += 1;
+                    tracing::info!(
+                        action = "would_remove",
+                        mission_id = %mission.id,
+                        workspace_id = %workspace_id,
+                        path = %dir.display(),
+                        bytes = size,
+                        reason = "terminal mission past retention",
+                        "mission GC audit",
+                    );
+                    continue;
+                }
                 match tokio::fs::remove_dir_all(&dir).await {
                     Ok(()) => {
                         report.removed += 1;
@@ -612,7 +756,15 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
         }
     }
 
-    orphan_sweep(state, params, &mut report).await;
+    orphan_sweep(
+        state,
+        params,
+        &dry_run_candidates,
+        &scope_protected,
+        &mission_index,
+        &mut report,
+    )
+    .await;
 
     report
 }
@@ -620,22 +772,15 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
 /// Disk-driven reconciliation pass (phase 2). Every decision is logged with
 /// its reason; deletion requires positive evidence of collectability, and a
 /// live exec scope always wins.
-async fn orphan_sweep(state: &Arc<AppState>, params: &SweepParams, report: &mut SweepReport) {
-    let index_full = build_mission_index(state).await;
+async fn orphan_sweep(
+    state: &Arc<AppState>,
+    params: &SweepParams,
+    dry_run_candidates: &std::collections::HashSet<std::path::PathBuf>,
+    scope_protected: &std::collections::HashSet<(String, String)>,
+    index_full: &MissionIndex,
+    report: &mut SweepReport,
+) {
     let index = &index_full.by_short;
-    // Any dir whose short id is referenced by a live exec scope is kept
-    // unconditionally: a process may hold cwd/fds there.
-    let scope_protected: std::collections::HashSet<(String, String)> =
-        super::scope_reaper::list_exec_scope_units()
-            .await
-            .iter()
-            .filter_map(|unit| {
-                Some((
-                    crate::workspace_exec::machine_name_from_exec_unit(unit)?,
-                    crate::workspace_exec::mission_short_id_from_exec_unit(unit)?,
-                ))
-            })
-            .collect();
 
     for ws in state.workspaces.list().await {
         let root = workspace::workspaces_root_for(&ws.path);
@@ -719,7 +864,30 @@ async fn orphan_sweep(state: &Arc<AppState>, params: &SweepParams, report: &mut 
                     tracing::debug!(path = %dir.display(), reason, "mission GC: kept");
                 }
                 Verdict::Delete(reason, orphan, stopped) => {
+                    if params.dry_run && dry_run_candidates.contains(&dir) {
+                        tracing::debug!(
+                            path = %dir.display(),
+                            reason,
+                            "mission GC: skipped duplicate dry-run candidate",
+                        );
+                        continue;
+                    }
                     let size = directory_size_bytes(&dir).await;
+                    if params.dry_run {
+                        report.proposed += 1;
+                        tracing::info!(
+                            action = "would_remove",
+                            path = %dir.display(),
+                            workspace = %ws.name,
+                            workspace_id = %ws.id,
+                            bytes = size,
+                            reason,
+                            orphan,
+                            stopped,
+                            "mission GC audit",
+                        );
+                        continue;
+                    }
                     match tokio::fs::remove_dir_all(&dir).await {
                         Ok(()) => {
                             report.removed += 1;
@@ -847,6 +1015,65 @@ mod tests {
             entry_for_workspace(&entries, workspace_id).unwrap().status,
             MissionStatus::Active
         );
+        assert!(!indexed_mission_directory_is_collectible(
+            &entries,
+            workspace_id,
+            now - chrono::Duration::days(7),
+            true,
+        ));
+
+        let terminal_only = vec![MissionIndexEntry {
+            status: MissionStatus::Completed,
+            updated_at: now - chrono::Duration::days(40),
+            workspace_id,
+        }];
+        assert!(indexed_mission_directory_is_collectible(
+            &terminal_only,
+            workspace_id,
+            now - chrono::Duration::days(7),
+            true,
+        ));
+        assert!(!indexed_mission_directory_is_collectible(
+            &terminal_only,
+            workspace_id,
+            now - chrono::Duration::days(7),
+            false,
+        ));
+
+        let incomplete_empty = MissionIndex {
+            by_short: std::collections::HashMap::new(),
+            complete: false,
+        };
+        assert!(!phase_one_index_allows_collection(
+            &incomplete_empty,
+            "deadbeef",
+            workspace_id,
+            now - chrono::Duration::days(7),
+        ));
+    }
+
+    #[test]
+    fn live_exec_scope_prevents_terminal_old_dir_from_becoming_a_gc_candidate() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mission_id = uuid::Uuid::parse_str("deadbeef-0000-0000-0000-000000000000").unwrap();
+        let machine = crate::workspace_exec::machine_name_for_path(workspace.path()).unwrap();
+        let scope = format!("sandboxed-exec-{machine}-mdeadbeef-12345678.scope");
+        let protected = protected_exec_scopes([scope.as_str()]);
+
+        // Phase 1 reaches this decision only after terminal status and age
+        // checks. Retaining here happens before either dry-run proposal or
+        // remove_dir_all, so neither mode can act on this directory.
+        assert_eq!(
+            mission_directory_candidate(&protected, workspace.path(), mission_id),
+            MissionDirectoryCandidate::RetainLiveScope
+        );
+    }
+
+    #[test]
+    fn unavailable_exec_scope_snapshot_disables_workspace_collection() {
+        let snapshot = protected_exec_scope_snapshot(Err("systemctl unavailable".to_string()));
+
+        assert!(snapshot.is_err());
     }
 
     #[tokio::test]

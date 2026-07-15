@@ -37,6 +37,10 @@ struct NodeState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if sandboxed_sh::node::maybe_exec_cleared_scope_payload()? {
+        return Ok(());
+    }
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
