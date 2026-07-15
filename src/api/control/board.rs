@@ -588,6 +588,56 @@ mod tests {
     use super::*;
     use crate::api::mission_store::NewBoardTask;
 
+    #[test]
+    fn retry_with_surviving_branch_includes_prior_attempt_digest() {
+        let mut task = mk("retry", &[], BoardTaskStatus::Pending, None);
+        task.attempts = 1;
+        task.repository = Some("Th0rgal/sandboxed.sh".into());
+        task.branch = Some("agent/already-pushed".into());
+        task.prior_worker_mission_id = Some(Uuid::new_v4());
+        task.prior_outcome = Some(BoardTaskOutcome::Failed);
+
+        let preflight = RetryPreflight::Surviving {
+            branch_state: "remote branch exists".into(),
+            pr_number: Some(42),
+        };
+        let prompt = retry_prompt(&task, &preflight);
+
+        assert_ne!(prompt, task.prompt);
+        assert!(prompt.contains("Prior-attempt digest"));
+        assert!(prompt.contains("checkout the existing branch"));
+        assert!(prompt.contains("never recreate from master"));
+        assert!(prompt.contains("never force-push"));
+    }
+
+    #[test]
+    fn retry_with_merged_pr_is_parked_for_boss_review() {
+        let mut task = mk("merged", &[], BoardTaskStatus::Pending, None);
+        task.attempts = 1;
+        task.repository = Some("Th0rgal/sandboxed.sh".into());
+        task.branch = Some("agent/already-merged".into());
+
+        assert_eq!(
+            retry_disposition(&task, &RetryPreflight::Merged { pr_number: 99 }),
+            RetryDisposition::ParkForBossReview
+        );
+    }
+
+    #[test]
+    fn retry_without_repository_metadata_keeps_original_prompt() {
+        let mut task = mk("legacy", &[], BoardTaskStatus::Pending, None);
+        task.attempts = 1;
+
+        assert_eq!(
+            retry_prompt(&task, &RetryPreflight::NothingFound),
+            task.prompt
+        );
+        assert_eq!(
+            retry_disposition(&task, &RetryPreflight::NothingFound),
+            RetryDisposition::Spawn
+        );
+    }
+
     fn mk(
         key: &str,
         deps: &[&str],
