@@ -163,29 +163,37 @@ fn has_delivery_evidence(output: &str) -> bool {
     let mut progress = normalized.as_str();
     // Longest phrases first so `sure thing` is removed as one acknowledgement
     // rather than leaving `thing, ...` in front of a future-only reply.
-    for prefix in [
-        "acknowledged",
-        "sounds good",
-        "sure thing",
-        "of course",
-        "absolutely",
-        "certainly",
-        "understood",
-        "got it",
-        "okay",
-        "sure",
-        "ok",
-    ] {
-        if let Some(rest) = progress.strip_prefix(prefix) {
-            let boundary = match rest.chars().next() {
-                Some(c) => c.is_ascii_punctuation() || c.is_whitespace(),
-                None => true,
-            };
-            if boundary {
-                progress = rest
-                    .trim_start_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace());
-                break;
+    loop {
+        let mut stripped = false;
+        for prefix in [
+            "acknowledged",
+            "sounds good",
+            "sure thing",
+            "of course",
+            "absolutely",
+            "certainly",
+            "understood",
+            "got it",
+            "okay",
+            "sure",
+            "ok",
+        ] {
+            if let Some(rest) = progress.strip_prefix(prefix) {
+                let boundary = match rest.chars().next() {
+                    Some(c) => c.is_ascii_punctuation() || c.is_whitespace(),
+                    None => true,
+                };
+                if boundary {
+                    progress = rest.trim_start_matches(|c: char| {
+                        c.is_ascii_punctuation() || c.is_whitespace()
+                    });
+                    stripped = true;
+                    break;
+                }
             }
+        }
+        if !stripped {
+            break;
         }
     }
     if progress.is_empty() {
@@ -195,45 +203,64 @@ fn has_delivery_evidence(output: &str) -> bool {
     // Check this after stripping an acknowledgement so replies such as
     // `OK, I will mark this complete: ...` retain the documented legacy
     // completion shape.
-    if progress.starts_with("i will mark this complete:") {
-        return true;
+    if let Some(summary) = progress.strip_prefix("i will mark this complete:") {
+        progress = summary.trim_start();
+        if progress.is_empty() {
+            return false;
+        }
     }
 
+    // First-person remaining-work statements are future intent even when an
+    // investigative update precedes them (`Found the cause; I'll fix it`).
     let explicit_future_intent = [
         "i'll",
         "i will",
         "we'll",
         "we will",
-        "will ",
-        "going to",
-        "get started",
-        "start on",
-        "inspect it",
-        "look into",
-        "take a look",
+        "i'm going to",
+        "we're going to",
     ]
     .iter()
-    .any(|phrase| progress.starts_with(phrase));
+    .any(|phrase| contains_bounded_phrase(progress, phrase));
+    let action_only_prefix = ["start on", "inspect it", "look into", "take a look"]
+        .iter()
+        .any(|phrase| progress.starts_with(phrase));
+    // `Get Started` is often a UI label. Only the standalone/action forms are
+    // intent; `Get Started button fixed` remains a valid legacy summary.
+    let get_started_intent = progress == "get started"
+        || progress.starts_with("get started on ")
+        || progress.starts_with("get started with ");
 
     // Bare imperative prefixes need a word boundary. In particular, do not
     // reject completion summaries such as `Beginning-state reset fixed` or
     // `Work on the parser is complete` merely because their first bytes look
     // like an instruction.
     let begin_intent = progress == "begin" || progress.starts_with("begin ");
-    let work_on_intent = progress.starts_with("work on ")
-        && ![
-            "complete",
-            "completed",
-            "done",
-            "finished",
-            "fixed",
-            "implemented",
-            "verified",
-        ]
-        .iter()
-        .any(|marker| progress.contains(marker));
+    if explicit_future_intent || action_only_prefix || get_started_intent || begin_intent {
+        return false;
+    }
 
-    if explicit_future_intent || begin_intent || work_on_intent {
+    // Never let a positive keyword inside a negated/unfinished statement act
+    // as delivery evidence (`not fixed`, `not complete yet`, `unfinished`).
+    const NON_COMPLETION_MARKERS: [&str; 13] = [
+        " not complete",
+        " not completed",
+        " not done",
+        " not fixed",
+        " not implemented",
+        " not resolved",
+        " incomplete",
+        " unfinished",
+        " still need",
+        " need to ",
+        " needs to ",
+        " continue ",
+        " remaining work",
+    ];
+    if NON_COMPLETION_MARKERS
+        .iter()
+        .any(|marker| progress.contains(marker))
+    {
         return false;
     }
 
@@ -291,6 +318,23 @@ fn has_delivery_evidence(output: &str) -> bool {
         || COMPLETION_MARKERS
             .iter()
             .any(|marker| progress.contains(marker))
+}
+
+fn contains_bounded_phrase(text: &str, phrase: &str) -> bool {
+    text.match_indices(phrase).any(|(start, matched)| {
+        let before_ok = start == 0
+            || text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        let end = start + matched.len();
+        let after_ok = end == text.len()
+            || text[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        before_ok && after_ok
+    })
 }
 
 /// Head+tail truncation that keeps the final summary (workers put their
@@ -938,6 +982,38 @@ mod tests {
             classify_outcome(
                 None,
                 true,
+                "OK, sure thing, I'll inspect it and get started."
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Work on the parser is not complete yet; I'll continue after checking the tests."
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "I have not fixed the parser yet; I'll continue after checking tests."
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Found the root cause; I'll implement the fix next."
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
                 "Updated the API will now reject invalid input; verified cargo test."
             ),
             BoardTaskOutcome::Success
@@ -959,6 +1035,14 @@ mod tests {
                 None,
                 true,
                 "Beginning-state reset fixed; verified cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Get Started button fixed; verified with cargo test."
             ),
             BoardTaskOutcome::Success
         );
