@@ -575,18 +575,22 @@ fn persistent_nspawn_command(scope_args: Option<&[String]>) -> Command {
         Command::new("systemd-nspawn")
     };
     nspawn::scrub_systemd_service_environment(&mut command);
+    command.arg("--console=pipe");
     command
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::nspawn;
+
     use super::{
         append_nsenter_target_root_arg, ca_env_scrub_prelude, durable_command_runs_on_api_host,
         durable_scope_unit, environ_has_keepalive_marker, exec_scope_unit,
         exec_scope_unit_for_mission, exec_unit_belongs_to_mission, machine_name_from_exec_unit,
         mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
-        nspawn_directory_from_cmdline, persistent_nspawn_command, replace_command_env, resolv_conf_bind_args,
-        synthesized_container_resolv_conf, WorkspaceExec, WorkspaceType, CA_BUNDLE_ENV_VARS,
+        nspawn_directory_from_cmdline, persistent_nspawn_command, replace_command_env,
+        resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec, WorkspaceType,
+        CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
     use std::ffi::OsStr;
@@ -733,6 +737,14 @@ mod tests {
     #[test]
     fn persistent_nspawn_boot_scrubs_service_environment() {
         let command = persistent_nspawn_command(Some(&["--scope".to_string()]));
+        assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg == OsStr::new("systemd-nspawn")));
+        assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg == OsStr::new("--console=pipe")));
         for name in nspawn::SYSTEMD_SERVICE_ENV_VARS {
             assert_eq!(
                 command
@@ -1561,7 +1573,6 @@ impl WorkspaceExec {
         cmd.arg(format!("--machine={}", name));
         cmd.arg("--quiet");
         cmd.arg("--timezone=off");
-        cmd.arg("--console=pipe");
         cmd.arg("--register=no");
         cmd.arg("--keep-unit");
 

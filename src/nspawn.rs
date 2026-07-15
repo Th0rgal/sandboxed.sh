@@ -584,6 +584,7 @@ fn scope_wrapped_nspawn_command(path: &Path, env: &HashMap<String, String>) -> C
         Command::new("systemd-nspawn")
     };
     scrub_systemd_service_environment(&mut command);
+    command.arg("--console=pipe");
     command
 }
 
