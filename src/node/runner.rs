@@ -425,6 +425,13 @@ fn contain_command(
     cmd: tokio::process::Command,
     environment: CommandEnvironment,
 ) -> std::io::Result<(tokio::process::Command, Option<SystemdScope>)> {
+    // A libtest executable does not have sandboxed-node's hidden trampoline
+    // entrypoint. Construction is covered directly below; execution tests
+    // retain the process-group fallback for clear-env commands.
+    #[cfg(test)]
+    if environment == CommandEnvironment::Clear {
+        return Ok((cmd, None));
+    }
     #[cfg(target_os = "linux")]
     {
         if let Some(mode) = systemd_scope_mode() {
