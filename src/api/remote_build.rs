@@ -1201,7 +1201,7 @@ case "$url" in
         [ ! -f "$REMOTE_BUILD_TEST_SUBMIT_COUNT" ] || count=$(cat "$REMOTE_BUILD_TEST_SUBMIT_COUNT")
         count=$((count + 1))
         printf '%s' "$count" > "$REMOTE_BUILD_TEST_SUBMIT_COUNT"
-        printf '{"job_id":"11111111-1111-1111-1111-111111111111","node_id":"test-node"}' > "$output"
+        printf '{"job_id":"11111111-1111-1111-1111-111111111111","node_id":"lean:gpu"}' > "$output"
         printf '202'
         ;;
 esac

@@ -116,7 +116,8 @@ except (OSError, ValueError):
 job = str(receipt.get("job_id") or "")
 node = str(receipt.get("node_id") or "")
 state = str(receipt.get("state") or "")
-if re.fullmatch(r"[0-9a-fA-F-]{36}", job) and re.fullmatch(r"[A-Za-z0-9._-]+", node):
+node_is_safe_field = bool(node.strip()) and not any(ch in node for ch in "\t\r\n")
+if re.fullmatch(r"[0-9a-fA-F-]{36}", job) and node_is_safe_field:
     print(job, node, state, sep="\t")
 PY
     )
@@ -165,7 +166,7 @@ job = str(response.get("job_id") or "")
 node = str(response.get("node_id") or "")
 if not re.fullmatch(r"[0-9a-fA-F-]{36}", job):
     raise SystemExit("invalid job_id in submit response")
-if not re.fullmatch(r"[A-Za-z0-9._-]+", node):
+if not node.strip() or any(ch in node for ch in "\t\r\n"):
     raise SystemExit("invalid node_id in submit response")
 print(job, node, sep="\t")
 PY
