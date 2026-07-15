@@ -678,6 +678,14 @@ mod tests {
 
     #[test]
     fn classify_blocked_and_failed() {
+        assert_ne!(
+            classify_outcome(
+                None,
+                true,
+                "Acknowledged. I'll inspect it and get started."
+            ),
+            BoardTaskOutcome::Success
+        );
         assert_eq!(
             classify_outcome(
                 Some(TerminalReason::TurnComplete),
