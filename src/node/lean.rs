@@ -941,7 +941,10 @@ mod tests {
     #[test]
     fn concurrency_env_uses_capability_defaults_and_preserves_explicit_values() {
         let defaults = lean_concurrency_env(&HashMap::new(), 12);
-        assert_eq!(defaults.get("LEAN_NUM_THREADS").map(String::as_str), Some("12"));
+        assert_eq!(
+            defaults.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("12")
+        );
         assert_eq!(defaults.get("LAKE_JOBS").map(String::as_str), Some("12"));
 
         let explicit = HashMap::from([
