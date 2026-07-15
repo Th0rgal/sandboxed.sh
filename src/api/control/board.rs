@@ -159,8 +159,10 @@ fn has_delivery_evidence(output: &str) -> bool {
         "sure",
         "understood",
         "got it",
-        "i'll",
-        "i will",
+        "i'll get started",
+        "i'll start",
+        "i will get started",
+        "i will start",
     ]
     .iter()
     .any(|prefix| normalized.starts_with(prefix));
@@ -744,6 +746,14 @@ mod tests {
                 None,
                 true,
                 "Fixed the settle path and added regression tests."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "I will mark this complete: fixed the parser and verified cargo test."
             ),
             BoardTaskOutcome::Success
         );
