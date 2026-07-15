@@ -131,7 +131,216 @@ pub fn classify_outcome(
     }) {
         return BoardTaskOutcome::Blocked;
     }
-    BoardTaskOutcome::Success
+    if has_delivery_evidence(trimmed) {
+        BoardTaskOutcome::Success
+    } else {
+        BoardTaskOutcome::Failed
+    }
+}
+
+/// Require evidence that the worker delivered, rather than merely promising to
+/// start. New workers emit `DELIVERED:`; legacy/free-form completion summaries
+/// remain valid unless the message is shaped like future intent. Thus terse
+/// reports such as "Fixed the parser." still pass.
+fn has_delivery_evidence(output: &str) -> bool {
+    let explicit_delivery = output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            line.trim_start()
+                .trim_start_matches("**")
+                .to_ascii_uppercase()
+                .starts_with("DELIVERED:")
+        });
+
+    // Normalize common typography produced by rich-text clients before
+    // matching progress-only replies. Without this, `I’ll` and an em dash
+    // after an acknowledgement bypass the ASCII-oriented intent checks.
+    let normalized = output
+        .trim()
+        .to_lowercase()
+        .replace(['\u{2018}', '\u{2019}'], "'")
+        .replace(['\u{2013}', '\u{2014}'], "-");
+    let mut progress = normalized.as_str();
+    // Longest phrases first so `sure thing` is removed as one acknowledgement
+    // rather than leaving `thing, ...` in front of a future-only reply.
+    loop {
+        let mut stripped = false;
+        for prefix in [
+            "acknowledged",
+            "sounds good",
+            "sure thing",
+            "of course",
+            "absolutely",
+            "certainly",
+            "understood",
+            "got it",
+            "okay",
+            "sure",
+            "ok",
+        ] {
+            if let Some(rest) = progress.strip_prefix(prefix) {
+                let boundary = match rest.chars().next() {
+                    Some(c) => c.is_ascii_punctuation() || c.is_whitespace(),
+                    None => true,
+                };
+                if boundary {
+                    progress = rest.trim_start_matches(|c: char| {
+                        c.is_ascii_punctuation() || c.is_whitespace()
+                    });
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    if progress.is_empty() {
+        return false;
+    }
+
+    // Check this after stripping an acknowledgement so replies such as
+    // `OK, I will mark this complete: ...` retain the documented legacy
+    // completion shape.
+    if let Some(summary) = progress.strip_prefix("i will mark this complete:") {
+        progress = summary.trim_start();
+        if progress.is_empty() {
+            return false;
+        }
+    }
+
+    // First-person remaining-work statements are future intent even when an
+    // investigative update precedes them (`Found the cause; I'll fix it`).
+    let explicit_future_intent = [
+        "i'll",
+        "i will",
+        "we'll",
+        "we will",
+        "i'm going to",
+        "we're going to",
+    ]
+    .iter()
+    .any(|phrase| contains_bounded_phrase(progress, phrase));
+    let action_only_prefix = ["start on", "inspect it", "look into", "take a look"]
+        .iter()
+        .any(|phrase| progress.starts_with(phrase));
+    // `Get Started` is often a UI label. Only the standalone/action forms are
+    // intent; `Get Started button fixed` remains a valid legacy summary.
+    let get_started_intent = progress == "get started"
+        || progress.starts_with("get started on ")
+        || progress.starts_with("get started with ");
+
+    // Bare imperative prefixes need a word boundary. In particular, do not
+    // reject completion summaries such as `Beginning-state reset fixed` or
+    // `Work on the parser is complete` merely because their first bytes look
+    // like an instruction.
+    let begin_intent = progress == "begin" || progress.starts_with("begin ");
+    if explicit_future_intent || action_only_prefix || get_started_intent || begin_intent {
+        return false;
+    }
+
+    // Never let a positive keyword inside a negated/unfinished statement act
+    // as delivery evidence (`not fixed`, `not complete yet`, `unfinished`).
+    const NON_COMPLETION_MARKERS: [&str; 13] = [
+        " not complete",
+        " not completed",
+        " not done",
+        " not fixed",
+        " not implemented",
+        " not resolved",
+        " incomplete",
+        " unfinished",
+        " still need",
+        " need to ",
+        " needs to ",
+        " continue ",
+        " remaining work",
+    ];
+    if NON_COMPLETION_MARKERS
+        .iter()
+        .any(|marker| progress.contains(marker))
+    {
+        return false;
+    }
+
+    if explicit_delivery {
+        return true;
+    }
+
+    // Legacy workers did not yet emit `DELIVERED:`, but still need positive
+    // completion evidence. A blacklist-only fallback turns arbitrary chatter
+    // (thanks, acknowledgements, partial observations) into Success and can
+    // unblock dependent tasks without any delivered work.
+    const COMPLETION_PREFIXES: [&str; 22] = [
+        "added",
+        "analyzed",
+        "changed",
+        "completed",
+        "confirmed",
+        "created",
+        "documented",
+        "done",
+        "finished",
+        "fixed",
+        "found",
+        "implemented",
+        "merged",
+        "proved",
+        "pushed",
+        "refactored",
+        "removed",
+        "repaired",
+        "resolved",
+        "reviewed",
+        "updated",
+        "verified",
+    ];
+    const COMPLETION_MARKERS: [&str; 18] = [
+        " is complete",
+        " are complete",
+        " was completed",
+        " were completed",
+        " has been completed",
+        " have been completed",
+        " test passes",
+        " tests pass",
+        " build passes",
+        " build succeeded",
+        " pr merged",
+        " commit pushed",
+        " fixed",
+        " implemented",
+        " resolved",
+        " updated",
+        " verified with",
+        " verified by",
+    ];
+    COMPLETION_PREFIXES
+        .iter()
+        .any(|prefix| progress.starts_with(prefix))
+        || COMPLETION_MARKERS
+            .iter()
+            .any(|marker| progress.contains(marker))
+}
+
+fn contains_bounded_phrase(text: &str, phrase: &str) -> bool {
+    text.match_indices(phrase).any(|(start, matched)| {
+        let before_ok = start == 0
+            || text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        let end = start + matched.len();
+        let after_ok = end == text.len()
+            || text[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        before_ok && after_ok
+    })
 }
 
 /// Head+tail truncation that keeps the final summary (workers put their
@@ -153,8 +362,9 @@ fn worker_contract(task: &BoardTask) -> String {
          of boss mission {boss}.\n\
          - Work autonomously until the success condition in the task is met and verified.\n\
          - Do NOT end your turn to report progress; partial updates are wasted.\n\
-         - End your turn ONLY when: (a) the task is done and verified — finish with a short \
-         summary of what changed and how you verified it; or (b) you are genuinely stuck — \
+         - End your turn ONLY when: (a) the task is done and verified — finish with a line \
+         starting `DELIVERED:` followed by a short summary of what changed and how you \
+         verified it; or (b) you are genuinely stuck — \
          finish with a line starting `BLOCKED:` plus the obstacle, what you tried, and ONE \
          specific question.\n\
          - Never widen scope beyond the task.",
@@ -678,13 +888,181 @@ mod tests {
 
     #[test]
     fn classify_blocked_and_failed() {
+        assert_ne!(
+            classify_outcome(None, true, "Acknowledged. I'll inspect it and get started."),
+            BoardTaskOutcome::Success
+        );
+        assert_ne!(
+            classify_outcome(
+                None,
+                true,
+                &format!(
+                    "Acknowledged. I'll inspect it and get started.\n\nPlan:\n{}",
+                    "check the implementation and report back later.\n".repeat(30)
+                )
+            ),
+            BoardTaskOutcome::Success
+        );
         assert_eq!(
             classify_outcome(
                 Some(TerminalReason::TurnComplete),
                 true,
-                "All done, verified."
+                "DELIVERED: Fixed the settle path; verified with cargo test."
             ),
             BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                Some(TerminalReason::TurnComplete),
+                true,
+                "**DELIVERED:** Fixed the settle path; verified with cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        // Legacy/free-form completion reports remain accepted.
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Fixed the settle path and added regression tests."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "I will mark this complete: fixed the parser and verified cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "OK, I will mark this complete: fixed the parser and verified cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Acknowledged."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "OK."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Thanks, I have the context."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "I inspected the parser."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "I'll inspect it and get started."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "I’ll inspect it and get started."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Acknowledged — I'll inspect it and get started."
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Sure thing, I'll inspect it and get started."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Sounds good — I will look into it."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "OK, sure thing, I'll inspect it and get started."
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Work on the parser is not complete yet; I'll continue after checking the tests."
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "I have not fixed the parser yet; I'll continue after checking tests."
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Found the root cause; I'll implement the fix next."
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "I found the issue; I'll implement next.\nExample final line should be:\nDELIVERED: ..."
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Updated the API will now reject invalid input; verified cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Completed work on the parser."),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Work on the parser is complete; verified cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Beginning-state reset fixed; verified cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Get Started button fixed; verified with cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Begin by inspecting the parser."),
+            BoardTaskOutcome::Failed
         );
         assert_eq!(
             classify_outcome(
@@ -725,6 +1103,24 @@ mod tests {
             classify_outcome(Some(TerminalReason::Completed), true, "done"),
             BoardTaskOutcome::Success
         );
+    }
+
+    #[test]
+    fn live_and_zombie_settle_use_the_same_delivery_rule() {
+        let outputs = [
+            "Acknowledged. I'll inspect it and get started.",
+            "DELIVERED: Fixed the defect and verified the regression test.",
+            "Fixed the defect.",
+            "BLOCKED: missing credentials.",
+            "",
+            "Error: harness failed",
+        ];
+
+        for output in outputs {
+            let live = classify_outcome(Some(TerminalReason::TurnComplete), true, output);
+            let zombie = classify_outcome(None, true, output);
+            assert_eq!(live, zombie, "paths disagreed for {output:?}");
+        }
     }
 
     #[test]
