@@ -1356,11 +1356,19 @@ mod tests {
             Vec::new(),
             HashMap::new(),
         );
-        mcp.workspace_env_allowlist = vec!["PATH".to_string(), "ELAN_HOME".to_string()];
+        mcp.workspace_env_allowlist = vec![
+            "PATH".to_string(),
+            "ELAN_HOME".to_string(),
+            "LEAN_PROJECT_PATH".to_string(),
+        ];
 
         let workspace_env = HashMap::from([
             ("PATH".to_string(), "/root/.elan/bin:/usr/bin".to_string()),
             ("ELAN_HOME".to_string(), "/root/.elan".to_string()),
+            (
+                "LEAN_PROJECT_PATH".to_string(),
+                "/workspace/verity/base".to_string(),
+            ),
             ("GH_TOKEN".to_string(), "github-secret".to_string()),
             ("SSH_PRIVATE_KEY_B64".to_string(), "ssh-secret".to_string()),
             ("GPG_PRIVATE_KEY_B64".to_string(), "gpg-secret".to_string()),
@@ -1393,6 +1401,7 @@ mod tests {
         let launcher_contents = std::fs::read_to_string(&launcher).unwrap();
         assert!(launcher_contents.contains("PATH='/root/.elan/bin:/usr/bin'"));
         assert!(launcher_contents.contains("ELAN_HOME='/root/.elan'"));
+        assert!(launcher_contents.contains("LEAN_PROJECT_PATH='/workspace/verity/base'"));
         assert!(!launcher_contents.contains("github-secret"));
         assert!(!launcher_contents.contains("ssh-secret"));
         assert!(!launcher_contents.contains("gpg-secret"));

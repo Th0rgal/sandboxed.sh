@@ -1,5 +1,6 @@
 pub mod app_server;
 pub mod client;
+mod tool_call_journal;
 
 use anyhow::Error;
 use async_trait::async_trait;
@@ -12,6 +13,7 @@ use crate::backend::events::ExecutionEvent;
 use crate::backend::{AgentInfo, Backend, Session, SessionConfig};
 
 use client::CodexConfig;
+use tool_call_journal::{PendingToolCall, ToolCallJournal};
 
 /// Codex backend that spawns the Codex CLI for mission execution.
 pub struct CodexBackend {
@@ -376,6 +378,7 @@ async fn send_message_streaming_app_server(
     let reconnect_cwd = session.directory.clone();
     let reconnect_workspace_exec = workspace_exec.cloned();
     let reconnect_thread_id = thread.id.clone();
+    let tool_call_journal = ToolCallJournal::new(&session.id, &thread.id);
 
     let handle = tokio::spawn(async move {
         // Seed the cached objective so the first GoalIteration event has
@@ -442,6 +445,9 @@ async fn send_message_streaming_app_server(
                             );
                         }
                         let _ = tx.send(ExecutionEvent::Cancelled).await;
+                        // Cancellation is terminal for this driver/session;
+                        // the unconditional terminal cleanup below removes the
+                        // durable journal for this non-resumable handle.
                         break 'outer;
                     }
                     msg = inbound.recv() => match msg {
@@ -458,26 +464,10 @@ async fn send_message_streaming_app_server(
                         let (_, interrupted_ids) = pending_tool_reconciliation
                             .take()
                             .expect("reconciliation timer fired without pending state");
-                        let interrupted =
-                            translator.reconcile_interrupted_tools(&interrupted_ids);
+                        let interrupted = translator.transport_failures(&interrupted_ids);
                         if interrupted.is_empty() {
                             continue;
                         }
-                        let names = interrupted
-                            .iter()
-                            .filter_map(|event| match event {
-                                ExecutionEvent::ToolResult { name, .. } => Some(name.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let _ = tx
-                            .send(ExecutionEvent::Error {
-                                message: format!(
-                                    "codex app-server transport interrupted while pending tool calls ({names}) could not be reconciled after thread/resume; synthetic infra_transport_interrupted results were emitted and commands were not replayed"
-                                ),
-                            })
-                            .await;
                         for event in interrupted {
                             let _ = tx.send(event).await;
                         }
@@ -489,11 +479,42 @@ async fn send_message_streaming_app_server(
                     InboundMessage::Notification { method, params } => {
                         let outcome =
                             translator.handle_notification(&method, &params, is_goal_mission);
+                        let mut journal_failed = false;
                         for ev in outcome.events {
+                            match &ev {
+                                ExecutionEvent::ToolCall { id, .. } => {
+                                    if let Some(descriptor) = translator.pending_tool_calls.get(id)
+                                    {
+                                        if let Err(err) =
+                                            tool_call_journal.started(descriptor.clone()).await
+                                        {
+                                            tracing::error!(?err, tool_call_id = %id, "failed to persist codex tool-call start");
+                                            // Forward the real lifecycle event
+                                            // first so the downstream runner
+                                            // keeps this tool pending and
+                                            // cannot suppress the fatal error
+                                            // after prior assistant text.
+                                            let _ = tx.send(ev.clone()).await;
+                                            let _ = tx.send(ExecutionEvent::Error { message: format!("codex app-server could not durably journal pending tool call {id}: {err}") }).await;
+                                            journal_failed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                ExecutionEvent::ToolResult { id, .. } => {
+                                    if let Err(err) = tool_call_journal.completed(id).await {
+                                        tracing::error!(?err, tool_call_id = %id, "failed to persist codex tool-call completion");
+                                    }
+                                }
+                                _ => {}
+                            }
                             if tx.send(ev).await.is_err() {
                                 terminal = true;
                                 break;
                             }
+                        }
+                        if journal_failed {
+                            break 'outer;
                         }
                         if outcome.terminal {
                             let interrupted = reconcile_pending_before_terminal(
@@ -501,12 +522,6 @@ async fn send_message_streaming_app_server(
                                 &mut pending_tool_reconciliation,
                             );
                             if !interrupted.is_empty() {
-                                let _ = tx
-                                    .send(ExecutionEvent::Error {
-                                        message: "codex app-server resumed with pending tool calls but emitted a terminal turn before replaying their completion; synthetic infra_transport_interrupted results were emitted"
-                                            .to_string(),
-                                    })
-                                    .await;
                                 for event in interrupted {
                                     let _ = tx.send(event).await;
                                 }
@@ -636,12 +651,23 @@ async fn send_message_streaming_app_server(
             };
             session_arc = new_session;
             inbound = new_inbound;
+            match tool_call_journal.pending().await {
+                Ok(descriptors) => translator.restore_pending(descriptors),
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        "failed to reload codex tool-call journal after resume"
+                    );
+                    let _ = tx.send(ExecutionEvent::Error { message: format!("codex app-server transport reconciliation failed to load its durable tool-call journal: {err}") }).await;
+                    break 'outer;
+                }
+            }
             let interrupted_ids = translator.pending_tool_ids();
             if !interrupted_ids.is_empty() {
                 tracing::warn!(
                     pending_tool_count = interrupted_ids.len(),
                     grace_seconds = PENDING_TOOL_RECONCILE_GRACE.as_secs(),
-                    "codex app-server resumed with in-flight tool calls; waiting for completion replay before synthetic terminalization"
+                    "codex app-server resumed with journaled in-flight tool calls; waiting for completion replay"
                 );
                 pending_tool_reconciliation = Some((
                     tokio::time::Instant::now() + PENDING_TOOL_RECONCILE_GRACE,
@@ -653,13 +679,8 @@ async fn send_message_streaming_app_server(
 
         if stream_closed_unexpectedly {
             let interrupted_ids = translator.pending_tool_ids();
-            let interrupted = translator.reconcile_interrupted_tools(&interrupted_ids);
+            let interrupted = translator.transport_failures(&interrupted_ids);
             if !interrupted.is_empty() {
-                let _ = tx
-                    .send(ExecutionEvent::Error {
-                        message: "codex app-server stream closed while tool calls were pending; synthetic infra_transport_interrupted results were emitted and commands were not replayed".to_string(),
-                    })
-                    .await;
                 for event in interrupted {
                     let _ = tx.send(event).await;
                 }
@@ -676,6 +697,14 @@ async fn send_message_streaming_app_server(
                 session_id: session_id.clone(),
             })
             .await;
+
+        // This driver will never resume its local session/thread after the
+        // handle exits. Clear the journal after clean completion,
+        // cancellation, and terminalized transport failure alike so command
+        // arguments are not retained indefinitely in /tmp.
+        if let Err(err) = tool_call_journal.clear().await {
+            tracing::warn!(?err, "failed to clean terminal codex tool-call journal");
+        }
 
         let _ = session_arc.shutdown().await;
     });
@@ -734,7 +763,7 @@ struct AppServerEventTranslator {
     /// Tool calls emitted to consumers but not yet paired with a terminal
     /// result. Persisted across an app-server reconnect within this driver so
     /// a resumed stream can replay completion or be terminalized exactly once.
-    pending_tool_calls: std::collections::HashMap<String, String>,
+    pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
     emitted_tool_call_ids: std::collections::HashSet<String>,
     emitted_tool_result_ids: std::collections::HashSet<String>,
 }
@@ -751,7 +780,7 @@ fn reconcile_pending_before_terminal(
     let Some((_, interrupted_ids)) = pending.take() else {
         return Vec::new();
     };
-    translator.reconcile_interrupted_tools(&interrupted_ids)
+    translator.transport_failures(&interrupted_ids)
 }
 
 fn usage_tokens(usage: &serde_json::Value, keys: &[&str]) -> u64 {
@@ -797,7 +826,16 @@ impl AppServerEventTranslator {
         self.pending_tool_calls.keys().cloned().collect()
     }
 
-    fn reconcile_interrupted_tools(
+    fn restore_pending(&mut self, descriptors: Vec<PendingToolCall>) {
+        for descriptor in descriptors {
+            if !self.emitted_tool_result_ids.contains(&descriptor.id) {
+                self.pending_tool_calls
+                    .insert(descriptor.id.clone(), descriptor);
+            }
+        }
+    }
+
+    fn transport_failures(
         &mut self,
         interrupted_ids: &std::collections::HashSet<String>,
     ) -> Vec<ExecutionEvent> {
@@ -805,21 +843,32 @@ impl AppServerEventTranslator {
         ids.sort();
         let mut events = Vec::new();
         for id in ids {
-            let Some(name) = self.pending_tool_calls.remove(&id) else {
+            let Some(descriptor) = self.pending_tool_calls.remove(&id) else {
                 continue;
             };
-            if self.emitted_tool_result_ids.insert(id.clone()) {
-                events.push(ExecutionEvent::ToolResult {
-                    id,
-                    name,
-                    result: serde_json::json!({
-                        "status": "infra_transport_interrupted",
-                        "synthetic": true,
-                        "command_replayed": false,
-                        "message": "app-server stream closed before the tool result was observed",
-                    }),
-                });
-            }
+            let message = format!(
+                "codex app-server transport failure: pending tool call {} ({}) remained unresolved after thread/resume; the command was not replayed",
+                descriptor.id, descriptor.name
+            );
+            // Surface the fatal error while the downstream runner still sees
+            // the tool as pending. Otherwise an existing assistant text can
+            // suppress the error after ToolResult clears `pending_tools` and
+            // incorrectly turn an unknown execution outcome into success.
+            events.push(ExecutionEvent::Error {
+                message: message.clone(),
+            });
+            // Then close the lifecycle for downstream accounting without
+            // claiming that the tool succeeded or failed remotely.
+            events.push(ExecutionEvent::ToolResult {
+                id: descriptor.id.clone(),
+                name: descriptor.name.clone(),
+                result: serde_json::json!({
+                    "status": "transport_interrupted",
+                    "execution_outcome": "unknown",
+                    "replayed": false,
+                    "error": message,
+                }),
+            });
         }
         events
     }
@@ -909,7 +958,14 @@ impl AppServerEventTranslator {
                                     .cloned()
                                     .unwrap_or(serde_json::Value::Null);
                                 if !self.emitted_tool_result_ids.contains(&id) {
-                                    self.pending_tool_calls.insert(id.clone(), name.clone());
+                                    self.pending_tool_calls.insert(
+                                        id.clone(),
+                                        PendingToolCall {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            start_payload: item.clone(),
+                                        },
+                                    );
                                 }
                                 if !self.emitted_tool_result_ids.contains(&id)
                                     && self.emitted_tool_call_ids.insert(id.clone())
@@ -948,7 +1004,14 @@ impl AppServerEventTranslator {
                                     .cloned()
                                     .unwrap_or(serde_json::Value::Null);
                                 if !self.emitted_tool_result_ids.contains(&id) {
-                                    self.pending_tool_calls.insert(id.clone(), name.clone());
+                                    self.pending_tool_calls.insert(
+                                        id.clone(),
+                                        PendingToolCall {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            start_payload: item.clone(),
+                                        },
+                                    );
                                 }
                                 if !self.emitted_tool_result_ids.contains(&id)
                                     && self.emitted_tool_call_ids.insert(id.clone())
@@ -983,8 +1046,14 @@ impl AppServerEventTranslator {
                                 .unwrap_or(serde_json::Value::Null);
                             if method == "item/started" {
                                 if !self.emitted_tool_result_ids.contains(&id) {
-                                    self.pending_tool_calls
-                                        .insert(id.clone(), "bash".to_string());
+                                    self.pending_tool_calls.insert(
+                                        id.clone(),
+                                        PendingToolCall {
+                                            id: id.clone(),
+                                            name: "bash".to_string(),
+                                            start_payload: item.clone(),
+                                        },
+                                    );
                                 }
                                 if !self.emitted_tool_result_ids.contains(&id)
                                     && self.emitted_tool_call_ids.insert(id.clone())
@@ -1487,7 +1556,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_tool_is_reconciled_exactly_once_without_replay() {
+    fn unresolved_tool_after_resume_is_an_explicit_transport_failure() {
         let mut translator = AppServerEventTranslator::default();
         let started = translator.handle_notification(
             "item/started",
@@ -1508,20 +1577,24 @@ mod tests {
         ));
 
         let interrupted = translator.pending_tool_ids();
-        let reconciled = translator.reconcile_interrupted_tools(&interrupted);
+        let reconciled = translator.transport_failures(&interrupted);
         assert!(matches!(
             reconciled.as_slice(),
-            [ExecutionEvent::ToolResult { id, name, result }]
+            [
+                ExecutionEvent::Error { message },
+                ExecutionEvent::ToolResult { id, name, result }
+            ]
                 if id == "tool-1"
                     && name == "write_file"
-                    && result.get("status").and_then(|v| v.as_str())
-                        == Some("infra_transport_interrupted")
-                    && result.get("command_replayed").and_then(|v| v.as_bool()) == Some(false)
+                    && result["status"] == "transport_interrupted"
+                    && result["execution_outcome"] == "unknown"
+                    && result["replayed"] == false
+                    && message.contains("transport")
+                    && message.contains("tool-1")
+                    && message.contains("write_file")
         ));
         assert!(translator.pending_tool_ids().is_empty());
-        assert!(translator
-            .reconcile_interrupted_tools(&interrupted)
-            .is_empty());
+        assert!(translator.transport_failures(&interrupted).is_empty());
     }
 
     #[test]
@@ -1548,13 +1621,20 @@ mod tests {
         assert!(translator.pending_tool_ids().is_empty());
         assert!(matches!(
             events.as_slice(),
-            [ExecutionEvent::ToolResult { id, name, .. }]
-                if id == "tool-terminal" && name == "bash"
+            [
+                ExecutionEvent::Error { message },
+                ExecutionEvent::ToolResult { id, name, result }
+            ]
+                if id == "tool-terminal"
+                    && name == "bash"
+                    && result["execution_outcome"] == "unknown"
+                    && message.contains("tool-terminal")
+                    && message.contains("bash")
         ));
     }
 
     #[test]
-    fn resumed_real_completion_wins_over_synthetic_reconciliation() {
+    fn resumed_real_completion_closes_pending_tool_exactly_once() {
         let mut translator = AppServerEventTranslator::default();
         let params = json!({
             "item": {
@@ -1579,9 +1659,9 @@ mod tests {
             [ExecutionEvent::ToolResult { id, name, result }]
                 if id == "cmd-1" && name == "bash" && result == "ok"
         ));
-        assert!(translator
-            .reconcile_interrupted_tools(&interrupted)
-            .is_empty());
+        assert!(translator.transport_failures(&interrupted).is_empty());
+        let duplicate = translator.handle_notification("item/completed", &params, false);
+        assert!(duplicate.events.is_empty());
     }
 
     #[test]
