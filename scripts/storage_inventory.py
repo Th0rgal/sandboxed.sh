@@ -14,7 +14,7 @@ import sqlite3
 import sys
 
 ACTIVE = {"active", "pending", "waiting_background"}
-TERMINAL = {"completed", "acknowledged", "failed", "interrupted", "blocked", "not_feasible"}
+TERMINAL = {"completed", "failed", "interrupted", "blocked", "not_feasible"}
 
 
 def iso_time(value):
@@ -28,20 +28,21 @@ def iso_time(value):
 
 
 def mission_index(missions_dir):
-    """Return (prefix -> record, complete) from persisted stores, read-only.
+    """Return (prefix -> record, complete, audit records) from persisted stores.
 
     ``complete`` is false if any discovered store could not be read.  Callers
     must then retain every unowned directory: absence from a partial index is
     not evidence that a directory is stale.
     """
     records = {}
+    audit_records = []
     complete = True
     missions_path = Path(missions_dir)
     if not missions_path.is_dir():
-        print(json.dumps({"record_type": "audit", "action": "index_error", "path": str(missions_path), "error": "missions directory is missing or unreadable"}), file=sys.stderr)
-        return records, False
+        audit_records.append({"record_type": "audit", "action": "index_error", "path": str(missions_path), "error": "missions directory is missing or unreadable"})
+        return records, False, audit_records
     for legacy_store in missions_path.glob("missions-*.json"):
-        print(json.dumps({"record_type": "audit", "action": "index_error", "path": str(legacy_store), "error": "legacy JSON mission store is not indexed"}), file=sys.stderr)
+        audit_records.append({"record_type": "audit", "action": "index_error", "path": str(legacy_store), "error": "legacy JSON mission store is not indexed"})
         complete = False
     for db in missions_path.glob("missions-*.db"):
         try:
@@ -63,9 +64,9 @@ def mission_index(missions_dir):
         except (sqlite3.Error, OSError) as error:
             # Fail closed: an unreadable store does not create a cleanup
             # candidate; the corresponding directory remains unattributed.
-            print(json.dumps({"record_type": "audit", "action": "index_error", "path": str(db), "error": str(error)}), file=sys.stderr)
+            audit_records.append({"record_type": "audit", "action": "index_error", "path": str(db), "error": str(error)})
             complete = False
-    return records, complete
+    return records, complete, audit_records
 
 
 def bytes_under(path):
@@ -198,9 +199,10 @@ def main():
         parser.error("--apply is intentionally unsupported; inventory never deletes data")
     now = dt.datetime.now(dt.timezone.utc)
     cutoff = now - dt.timedelta(days=args.retention_days)
-    indexed, index_complete = mission_index(args.missions_dir)
+    indexed, index_complete, index_audit_records = mission_index(args.missions_dir)
     records = [{"record_type": "audit", "action": "inventory_started", "dry_run": True,
                 "retention_days": args.retention_days, "at": now.isoformat()}]
+    records.extend(index_audit_records)
     for root in args.root:
         records.extend(inventory(root, indexed, index_complete, cutoff))
     output = "".join(json.dumps(record, sort_keys=True) + "\n" for record in records)
