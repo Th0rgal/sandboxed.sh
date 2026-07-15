@@ -31,12 +31,6 @@ command -v curl >/dev/null 2>&1 || die "curl is required"
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git checkout"
 
-# The node fetches a pinned commit; uncommitted changes would silently not
-# be part of the remote build.
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-    die "working tree is dirty; commit (and push) your changes first" 2
-fi
-
 repo="$(git remote get-url origin 2>/dev/null)" || die "no 'origin' remote"
 commit="$(git rev-parse HEAD)" || die "cannot resolve HEAD"
 cwd_rel="$(git rev-parse --show-prefix)"; cwd_rel="${cwd_rel%/}"
@@ -135,6 +129,12 @@ PY
 fi
 
 if [ -z "$job_id" ]; then
+    # The node fetches a pinned commit; uncommitted changes would silently not
+    # be part of a new remote build. An existing receipt remains resumable after
+    # the checkout changes because its immutable request was already accepted.
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+        die "working tree is dirty; commit (and push) your changes before submitting a new build" 2
+    fi
     echo "remote-lean-build: dispatching $* for ${commit:0:12}${cwd_rel:+ in $cwd_rel} ..." >&2
     http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
         -H 'Content-Type: application/json' \

@@ -1287,6 +1287,8 @@ esac
             Some("11111111-1111-1111-1111-111111111111")
         );
 
+        std::fs::write(repo.join("DIRTY-WORKTREE"), "changed after submit\n")
+            .expect("dirty checkout after accepted build");
         let resumed = run("success");
         assert!(
             resumed.status.success(),
@@ -1307,6 +1309,8 @@ esac
         assert!(String::from_utf8_lossy(&replayed.stderr).contains("replaying terminal job"));
         assert_eq!(String::from_utf8_lossy(&replayed.stdout), "remote ok\n");
 
+        std::fs::remove_file(repo.join("DIRTY-WORKTREE"))
+            .expect("restore clean checkout before new submission");
         for receipt in std::fs::read_dir(&state).expect("read receipts before persistence failure")
         {
             std::fs::remove_file(receipt.expect("read receipt entry").path())

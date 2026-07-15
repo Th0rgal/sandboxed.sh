@@ -404,8 +404,8 @@ remote-lean-build lake build Verity
 
 It derives `repo` (`git remote get-url origin`), `commit`
 (`git rev-parse HEAD`) and `cwd_rel` (`git rev-parse --show-prefix`),
-refuses a dirty tree (exit 2 — the node builds a pinned commit, so
-uncommitted changes would be silently ignored), submits asynchronously to
+refuses a dirty tree for a new submission (exit 2 — the node builds a pinned
+commit, so uncommitted changes would be silently ignored), submits asynchronously to
 `$REMOTE_BUILD_URL` with `$REMOTE_BUILD_TOKEN`/`$REMOTE_BUILD_MISSION_ID`,
 persists the returned job/node receipt under
 `${XDG_STATE_HOME:-$HOME/.local/state}/sandboxed-sh/remote-builds/`, then polls
@@ -413,7 +413,8 @@ the mission-authenticated status endpoint. Receipts are scoped to the remote
 endpoint as well as the immutable request. Running the same command after a
 client/tool interruption resumes the recorded job instead of submitting a
 duplicate; if the terminal status was already persisted, it replays that
-evidence without polling or resubmitting. It prints the remote log tail and
+evidence without polling or resubmitting. Existing receipts remain resumable
+when the checkout later becomes dirty. It prints the remote log tail and
 exits with the remote build's exit code. Once a job has been accepted, polling
 errors and client timeouts never request local fallback: rerun the identical
 command to resume it. On
