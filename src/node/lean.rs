@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::job_store::JobState;
-use super::runner::{clamp_timeout, run_logged_command};
+use super::runner::{clamp_timeout, run_logged_command, CommandEnvironment};
 use crate::remote_node::{ArtifactEntry, JobPayload, JobSource};
 
 /// Default allowlist for lean-build env keys
@@ -504,7 +504,14 @@ async fn run_git_step(
     if let Some((key, value)) = git_ssh_env() {
         cmd.env(key, value);
     }
-    let outcome = run_logged_command(cmd, log_path, GIT_STEP_TIMEOUT_SECS, token).await?;
+    let outcome = run_logged_command(
+        cmd,
+        CommandEnvironment::Inherit,
+        log_path,
+        GIT_STEP_TIMEOUT_SECS,
+        token,
+    )
+    .await?;
     if !outcome.success() {
         let (_, code, error) = outcome.into_job_result();
         anyhow::bail!(
@@ -706,7 +713,8 @@ pub async fn execute_lean_build(
         cmd.env(key, value);
     }
     let limit_secs = clamp_timeout(*timeout_secs, max_job_secs);
-    let outcome = run_logged_command(cmd, log_path, limit_secs, token).await?;
+    let outcome =
+        run_logged_command(cmd, CommandEnvironment::Clear, log_path, limit_secs, token).await?;
     let success = outcome.success();
 
     let mut result_artifacts = Vec::new();

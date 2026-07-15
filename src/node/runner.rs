@@ -278,7 +278,14 @@ impl JobRunner {
 
                 let cmd = crate::remote_node::raw_command(command, &mission_dir, env.as_ref());
                 let limit_secs = clamp_timeout(*timeout_secs, self.max_job_secs);
-                let outcome = run_logged_command(cmd, &log_path, limit_secs, token).await?;
+                let outcome = run_logged_command(
+                    cmd,
+                    CommandEnvironment::Clear,
+                    &log_path,
+                    limit_secs,
+                    token,
+                )
+                .await?;
                 let (state, exit_code, error) = outcome.into_job_result();
                 Ok((state, exit_code, error, None))
             }
@@ -323,6 +330,12 @@ pub(crate) enum RunOutcome {
     TimedOut { limit_secs: u64 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommandEnvironment {
+    Inherit,
+    Clear,
+}
+
 impl RunOutcome {
     /// Whether the process ran to completion with exit code 0.
     pub(crate) fn success(&self) -> bool {
@@ -356,6 +369,7 @@ impl RunOutcome {
 /// jobs and the lean-build steps.
 pub(crate) async fn run_logged_command(
     cmd: tokio::process::Command,
+    environment: CommandEnvironment,
     log_path: &Path,
     limit_secs: u64,
     token: &CancellationToken,
@@ -368,7 +382,7 @@ pub(crate) async fn run_logged_command(
         .append(true)
         .open(log_path)?;
     let stderr_file = stdout_file.try_clone()?;
-    let (mut cmd, systemd_scope) = contain_command(cmd);
+    let (mut cmd, systemd_scope) = contain_command(cmd, environment);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
@@ -405,10 +419,11 @@ pub(crate) async fn run_logged_command(
 /// Put node jobs in a transient systemd scope when the host has a running
 /// system manager. Process groups do not contain descendants that call
 /// `setsid`; a scope's cgroup does, so stopping the unit also reaps those
-/// daemonized descendants. The wrapper inherits the command environment
-/// directly, keeping secrets out of `systemd-run` argv.
+/// daemonized descendants. Commands that clear their environment are marked
+/// explicitly because `std::process::Command` does not expose that setting.
 fn contain_command(
     cmd: tokio::process::Command,
+    environment: CommandEnvironment,
 ) -> (tokio::process::Command, Option<SystemdScope>) {
     #[cfg(target_os = "linux")]
     {
@@ -417,7 +432,7 @@ fn contain_command(
                 unit: format!("sandboxed-node-job-{}.scope", Uuid::new_v4().simple()),
                 mode,
             };
-            return (systemd_scope_command(cmd, &scope), Some(scope));
+            return (systemd_scope_command(cmd, environment, &scope), Some(scope));
         }
     }
     (cmd, None)
@@ -465,6 +480,7 @@ fn user_systemd_scope_mode(runtime_dir: &Path) -> std::io::Result<SystemdScopeMo
 #[cfg(target_os = "linux")]
 fn systemd_scope_command(
     cmd: tokio::process::Command,
+    environment: CommandEnvironment,
     scope: &SystemdScope,
 ) -> tokio::process::Command {
     let command = cmd.as_std();
@@ -486,19 +502,36 @@ fn systemd_scope_command(
         .arg("--collect")
         .arg(format!("--unit={}", scope.unit))
         .arg("--property=KillMode=control-group")
-        .arg("--")
-        .arg(program)
-        .args(args);
+        .arg("--");
+    if environment == CommandEnvironment::Clear {
+        // With --scope, systemd-run executes the payload itself, so the
+        // payload otherwise inherits the runner service's environment. Keep
+        // systemd-run's own environment intact for the user bus, but reset
+        // the environment at the payload boundary and add back only the
+        // command's explicitly configured entries.
+        scoped.arg("env").arg("-i");
+        for (key, value) in &env {
+            if let Some(value) = value {
+                let mut assignment = key.clone();
+                assignment.push("=");
+                assignment.push(value);
+                scoped.arg(assignment);
+            }
+        }
+    }
+    scoped.arg(program).args(args);
     if let Some(cwd) = cwd {
         scoped.current_dir(cwd);
     }
-    for (key, value) in env {
-        match value {
-            Some(value) => {
-                scoped.env(key, value);
-            }
-            None => {
-                scoped.env_remove(key);
+    if environment == CommandEnvironment::Inherit {
+        for (key, value) in env {
+            match value {
+                Some(value) => {
+                    scoped.env(key, value);
+                }
+                None => {
+                    scoped.env_remove(key);
+                }
             }
         }
     }
@@ -781,9 +814,15 @@ mod tests {
         cmd.args(["-c", "(sleep 1; echo survived > \"$SURVIVOR_MARKER\") &"])
             .env("SURVIVOR_MARKER", &marker);
 
-        let outcome = run_logged_command(cmd, &log, 30, &CancellationToken::new())
-            .await
-            .unwrap();
+        let outcome = run_logged_command(
+            cmd,
+            CommandEnvironment::Inherit,
+            &log,
+            30,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(outcome.success());
         tokio::time::sleep(Duration::from_millis(1_250)).await;
@@ -803,6 +842,7 @@ mod tests {
 
         let scoped = systemd_scope_command(
             cmd,
+            CommandEnvironment::Inherit,
             &SystemdScope {
                 unit: "sandboxed-node-job-test.scope".to_string(),
                 mode: SystemdScopeMode::User,
@@ -833,6 +873,7 @@ mod tests {
 
         let scoped = systemd_scope_command(
             cmd,
+            CommandEnvironment::Clear,
             &SystemdScope {
                 unit: "sandboxed-node-job-test.scope".to_string(),
                 mode: SystemdScopeMode::User,
@@ -894,9 +935,15 @@ mod tests {
         ])
         .env("SURVIVOR_MARKER", &marker);
 
-        let outcome = run_logged_command(cmd, &log, 30, &CancellationToken::new())
-            .await
-            .unwrap();
+        let outcome = run_logged_command(
+            cmd,
+            CommandEnvironment::Inherit,
+            &log,
+            30,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert!(outcome.success());
         tokio::time::sleep(Duration::from_millis(500)).await;
