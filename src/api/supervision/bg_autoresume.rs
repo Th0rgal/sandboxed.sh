@@ -561,6 +561,15 @@ pub(crate) async fn background_task_autoresume_loop(
                     );
                     continue;
                 }
+                Ok(UserMessageAck::Rejected(reason)) => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        task = %task.id,
+                        reason = %reason,
+                        "bg-autoresume: resume rejected; preserving task for retry"
+                    );
+                    continue;
+                }
                 Ok(_) => {
                     tracing::info!(
                         mission_id = %mission_id,

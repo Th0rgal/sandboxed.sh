@@ -7366,14 +7366,22 @@ pub async fn update_mission_project(
         .get_initial_user_message(id)
         .await
         .map_err(internal_error)?;
-    let writer_prompt = initial_prompt.as_deref().or(deferred_goal.as_deref());
-    let becomes_writer = effective_github_pr.is_some()
-        && requested_pr_writer(
+    let initial_prompt_requests_writer = requested_pr_writer(
+        req.writer,
+        Some(&effective_tags),
+        effective_intent.as_deref(),
+        initial_prompt.as_deref(),
+    );
+    let deferred_goal_requests_writer = deferred_goal.as_deref().is_some_and(|goal| {
+        requested_pr_writer(
             req.writer,
             Some(&effective_tags),
             effective_intent.as_deref(),
-            writer_prompt,
-        );
+            Some(goal),
+        )
+    });
+    let becomes_writer = effective_github_pr.is_some()
+        && (initial_prompt_requests_writer || deferred_goal_requests_writer);
     if becomes_writer {
         effective_tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
         effective_tags.push("pr-writer".to_string());
