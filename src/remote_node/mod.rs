@@ -101,6 +101,8 @@ pub enum RemoteNodeError {
     MissingToken(String, String),
     #[error("invalid remote node config: {0}")]
     InvalidConfig(String),
+    #[error("remote node connection failed before the request was sent: {0}")]
+    Connect(String),
     #[error("remote node request failed: {0}")]
     Request(String),
     #[error("remote node rejected request with HTTP {status}: {body}")]

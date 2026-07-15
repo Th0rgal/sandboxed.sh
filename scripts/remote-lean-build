@@ -89,13 +89,74 @@ umask 077
 mkdir -p "$state_root" || die "cannot create receipt directory $state_root" 75
 state_file="$state_root/$request_key.json"
 submit_timeout_secs="${REMOTE_BUILD_SUBMIT_TIMEOUT_SECS:-90}"
+lock_timeout_secs="${REMOTE_BUILD_LOCK_TIMEOUT_SECS:-120}"
 case "$submit_timeout_secs" in
     ''|*[!0-9]*) die "REMOTE_BUILD_SUBMIT_TIMEOUT_SECS must be a positive integer" ;;
 esac
+case "$lock_timeout_secs" in
+    ''|*[!0-9]*) die "REMOTE_BUILD_LOCK_TIMEOUT_SECS must be a positive integer" ;;
+esac
 [ "$submit_timeout_secs" -gt 0 ] || die "REMOTE_BUILD_SUBMIT_TIMEOUT_SECS must be greater than zero"
+[ "$lock_timeout_secs" -gt 0 ] || die "REMOTE_BUILD_LOCK_TIMEOUT_SECS must be greater than zero"
 
 response_file="$(mktemp)"
-trap 'rm -f "$response_file"' EXIT
+submit_lock_held=0
+submit_lock_dir="$state_file.lock"
+release_submit_lock() {
+    if [ "$submit_lock_held" = "1" ]; then
+        rm -f "$submit_lock_dir/owner"
+        rmdir "$submit_lock_dir" >/dev/null 2>&1 || true
+        submit_lock_held=0
+    fi
+}
+cleanup() {
+    release_submit_lock
+    rm -f "$response_file"
+}
+trap cleanup EXIT
+
+# Serialize receipt discovery, first submission, and durable receipt creation
+# for this immutable request. `mkdir` is atomic on the workspace filesystem;
+# the owner PID lets a retry recover a lock left by an interrupted wrapper.
+lock_deadline=$(( $(date +%s) + lock_timeout_secs ))
+while ! mkdir "$submit_lock_dir" 2>/dev/null; do
+    lock_owner=""
+    if [ -f "$submit_lock_dir/owner" ]; then
+        read -r lock_owner < "$submit_lock_dir/owner" || lock_owner=""
+    fi
+    case "$lock_owner" in
+        ''|*[!0-9]*)
+            # Avoid racing the tiny mkdir -> owner-file window. An empty lock
+            # older than two seconds belongs to a wrapper that died there.
+            if python3 - "$submit_lock_dir" <<'PY'
+import os, sys, time
+try:
+    stale = time.time() - os.stat(sys.argv[1]).st_mtime > 2
+except OSError:
+    stale = False
+raise SystemExit(0 if stale else 1)
+PY
+            then
+                rmdir "$submit_lock_dir" >/dev/null 2>&1 || true
+                continue
+            fi
+            ;;
+        *)
+            if ! kill -0 "$lock_owner" 2>/dev/null; then
+                rm -f "$submit_lock_dir/owner"
+                rmdir "$submit_lock_dir" >/dev/null 2>&1 || true
+                continue
+            fi
+            ;;
+    esac
+    if [ "$(date +%s)" -ge "$lock_deadline" ]; then
+        die "timed out waiting for the existing submission of ${commit:0:12}; retry to resume it" 1
+    fi
+    sleep 1
+done
+submit_lock_held=1
+printf '%s\n' "$$" > "$submit_lock_dir/owner" \
+    || die "cannot record submission lock owner for $state_file" 75
 
 job_id=""
 node_id=""
@@ -200,6 +261,8 @@ PY
     fi
     echo "remote-lean-build: submitted job $job_id on node '$node_id'; receipt $state_file" >&2
 fi
+
+release_submit_lock
 
 encoded_node="$(python3 - "$node_id" <<'PY'
 import sys, urllib.parse

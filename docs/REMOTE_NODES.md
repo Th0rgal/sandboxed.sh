@@ -425,9 +425,11 @@ and exits 75 (`EX_TEMPFAIL`) so scripts can fall back to a local build:
 remote-lean-build || { [ $? -eq 75 ] && lake build; }
 ```
 
-If submission to a selected node has an ambiguous response-side transport
-failure, core returns 502 while its tentative ledger reconciles/cancels the
-possible job. The wrapper exits 1 for that response and never falls back.
+If the core cannot connect to the selected node before sending the request, it
+returns 503 and local fallback remains safe. If submission instead has an
+ambiguous response-side transport failure, core returns 502 while its tentative
+ledger reconciles/cancels the possible job. The wrapper exits 1 for that
+response and never falls back.
 
 Optional: `REMOTE_BUILD_TIMEOUT_SECS` forwards a job timeout (clamped by the
 node's `SANDBOXED_NODE_MAX_JOB_SECS`). `REMOTE_BUILD_SUBMIT_TIMEOUT_SECS`

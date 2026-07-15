@@ -424,6 +424,9 @@ async fn resolve_node(
 
 fn submit_error_status(err: &RemoteNodeError) -> StatusCode {
     match err {
+        // DNS/connect failures happen before an HTTP request reaches the node,
+        // so no remote job can have been accepted and local fallback is safe.
+        RemoteNodeError::Connect(_) => StatusCode::SERVICE_UNAVAILABLE,
         // A transport failure may happen after the node accepted the request.
         // The tentative ledger/observer will reconcile it, but the caller must
         // not start a duplicate local build in the meantime.
@@ -606,9 +609,9 @@ async fn submit_remote_build(
     let accepted = match client.submit_job(&node, &shared_token, &submit).await {
         Ok(accepted) => accepted,
         Err(err) => {
-            // Transport outages and queue saturation remain 503 so the wrapper
-            // can fall back locally. Node-side caller validation stays 4xx and
-            // must not be disguised as a fleet outage.
+            // Pre-connect outages and queue saturation remain 503 so the
+            // wrapper can fall back locally. Response-side transport failures
+            // are ambiguous and return 502 to prohibit duplicate local work.
             let status = submit_error_status(&err);
             if matches!(&err, RemoteNodeError::Request(_)) {
                 spawn_remote_build_observer(
@@ -1112,6 +1115,10 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             submit_error_status(&RemoteNodeError::Request("offline".to_string())),
             StatusCode::BAD_GATEWAY
         );
+        assert_eq!(
+            submit_error_status(&RemoteNodeError::Connect("offline".to_string())),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[cfg(unix)]
@@ -1242,8 +1249,9 @@ esac
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let run = |poll_mode: &str| {
-            std::process::Command::new("bash")
+        let command = |poll_mode: &str| {
+            let mut command = std::process::Command::new("bash");
+            command
                 .arg(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/scripts/remote-lean-build"
@@ -1262,20 +1270,43 @@ esac
                 .env("REMOTE_BUILD_CLIENT_TIMEOUT_SECS", "1")
                 .env("REMOTE_BUILD_TEST_POLL_MODE", poll_mode)
                 .env("REMOTE_BUILD_TEST_MISSION_ID", &mission_id)
-                .env("REMOTE_BUILD_TEST_SUBMIT_COUNT", &submit_count)
+                .env("REMOTE_BUILD_TEST_SUBMIT_COUNT", &submit_count);
+            command
+        };
+        let run = |poll_mode: &str| {
+            command(poll_mode)
                 .output()
                 .expect("run remote-build wrapper")
         };
 
-        let interrupted = run("fail");
-        assert_eq!(
-            interrupted.status.code(),
-            Some(1),
-            "an accepted remote job must never request local fallback"
-        );
+        let first = command("fail")
+            .spawn()
+            .expect("start first concurrent wrapper");
+        let second = command("fail")
+            .spawn()
+            .expect("start second concurrent wrapper");
+        for interrupted in [
+            first.wait_with_output().expect("wait for first wrapper"),
+            second.wait_with_output().expect("wait for second wrapper"),
+        ] {
+            assert_eq!(
+                interrupted.status.code(),
+                Some(1),
+                "an accepted remote job must never request local fallback: stdout={} stderr={}",
+                String::from_utf8_lossy(&interrupted.stdout),
+                String::from_utf8_lossy(&interrupted.stderr)
+            );
+        }
         assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
         let receipts = std::fs::read_dir(&state)
             .expect("read receipt directory")
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .ok()
+                    .and_then(|entry| entry.path().extension().map(|ext| ext == "json"))
+                    .unwrap_or(false)
+            })
             .collect::<Result<Vec<_>, _>>()
             .expect("collect receipts");
         assert_eq!(receipts.len(), 1);
