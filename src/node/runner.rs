@@ -437,10 +437,16 @@ fn systemd_scope_mode() -> Option<SystemdScopeMode> {
         return Some(SystemdScopeMode::System);
     }
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
-    Path::new(&runtime_dir)
-        .join("bus")
-        .exists()
-        .then_some(SystemdScopeMode::User)
+    user_systemd_scope_mode(Path::new(&runtime_dir)).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn user_systemd_scope_mode(runtime_dir: &Path) -> std::io::Result<SystemdScopeMode> {
+    // Connecting verifies that the path is both visible and usable by this
+    // process. A metadata/existence check can pass for an inaccessible,
+    // stale, or non-socket path and make systemd-run fail later per job.
+    std::os::unix::net::UnixStream::connect(runtime_dir.join("bus"))?;
+    Ok(SystemdScopeMode::User)
 }
 
 #[cfg(target_os = "linux")]
@@ -804,6 +810,27 @@ mod tests {
             .as_std()
             .get_envs()
             .any(|(key, value)| key == "NODE_JOB_SECRET" && value == Some("not-in-argv".as_ref())));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_scope_probe_requires_an_accessible_bus_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bus"), b"not a socket").unwrap();
+
+        assert!(user_systemd_scope_mode(dir.path()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_scope_probe_selects_user_mode_for_accessible_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(dir.path().join("bus")).unwrap();
+
+        assert_eq!(
+            user_systemd_scope_mode(dir.path()).unwrap(),
+            SystemdScopeMode::User
+        );
     }
 
     #[cfg(target_os = "linux")]
