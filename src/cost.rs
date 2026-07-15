@@ -258,7 +258,7 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
     },
     PricingEntry {
         canonical: "grok-4.5",
-        aliases: &["grok-4.5"],
+        aliases: &["grok-4.5", "grok-4.5-latest", "grok-build-latest"],
         pricing: pricing(2_000, 6_000, None, Some(500)),
     },
     PricingEntry {
@@ -598,6 +598,8 @@ mod tests {
         assert_eq!(normalize_model("grok-4-fast-reasoning"), "grok-4-fast");
         assert_eq!(normalize_model("xAI/Grok Inference"), "grok-4-fast");
         assert_eq!(normalize_model("xai/grok-4.5"), "grok-4.5");
+        assert_eq!(normalize_model("xai/grok-4.5-latest"), "grok-4.5");
+        assert_eq!(normalize_model("xai/grok-build-latest"), "grok-4.5");
         assert_eq!(normalize_model("grok-build"), "grok-build");
         assert_eq!(normalize_model("zai/glm-5"), "glm-5");
         assert_eq!(normalize_model("zai/glm-5.2"), "glm-5.2");

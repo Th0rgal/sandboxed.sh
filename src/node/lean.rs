@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::job_store::JobState;
-use super::runner::{clamp_timeout, run_logged_command};
+use super::runner::{clamp_timeout, run_logged_command, CommandEnvironment};
 use crate::remote_node::{ArtifactEntry, JobPayload, JobSource};
 
 /// Default allowlist for lean-build env keys
@@ -232,6 +232,24 @@ fn cache_env(work_root: &Path) -> Vec<(String, String)> {
         ),
         ("PATH".to_string(), path),
     ]
+}
+
+/// Add Lean/Lake concurrency defaults derived from the node process's usable
+/// parallelism. `available_parallelism` accounts for OS affinity and cgroup
+/// limits, so operator-imposed CPU caps remain authoritative. Payload values
+/// are copied last and therefore always win, including independently setting
+/// only one of the two knobs.
+fn lean_concurrency_env(
+    payload_env: &HashMap<String, String>,
+    available_parallelism: usize,
+) -> HashMap<String, String> {
+    let default = available_parallelism.max(1).to_string();
+    let mut effective = HashMap::from([
+        ("LEAN_NUM_THREADS".to_string(), default.clone()),
+        ("LAKE_JOBS".to_string(), default),
+    ]);
+    effective.extend(payload_env.clone());
+    effective
 }
 
 /// Derive the default lake cache key from the build cwd: sha256 over the
@@ -504,7 +522,14 @@ async fn run_git_step(
     if let Some((key, value)) = git_ssh_env() {
         cmd.env(key, value);
     }
-    let outcome = run_logged_command(cmd, log_path, GIT_STEP_TIMEOUT_SECS, token).await?;
+    let outcome = run_logged_command(
+        cmd,
+        CommandEnvironment::Inherit,
+        log_path,
+        GIT_STEP_TIMEOUT_SECS,
+        token,
+    )
+    .await?;
     if !outcome.success() {
         let (_, code, error) = outcome.into_job_result();
         anyhow::bail!(
@@ -702,11 +727,15 @@ pub async fn execute_lean_build(
     for (key, value) in cache_env(work_root) {
         cmd.env(key, value);
     }
-    for (key, value) in env {
+    let available_parallelism = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    for (key, value) in lean_concurrency_env(env, available_parallelism) {
         cmd.env(key, value);
     }
     let limit_secs = clamp_timeout(*timeout_secs, max_job_secs);
-    let outcome = run_logged_command(cmd, log_path, limit_secs, token).await?;
+    let outcome =
+        run_logged_command(cmd, CommandEnvironment::Clear, log_path, limit_secs, token).await?;
     let success = outcome.success();
 
     let mut result_artifacts = Vec::new();
@@ -915,6 +944,50 @@ mod tests {
 
     fn allowlist() -> Vec<String> {
         parse_env_allowlist(DEFAULT_ENV_ALLOWLIST)
+    }
+
+    #[test]
+    fn concurrency_env_uses_capability_defaults_and_preserves_explicit_values() {
+        let defaults = lean_concurrency_env(&HashMap::new(), 12);
+        assert_eq!(
+            defaults.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("12")
+        );
+        assert_eq!(defaults.get("LAKE_JOBS").map(String::as_str), Some("12"));
+
+        let explicit = HashMap::from([
+            ("LEAN_NUM_THREADS".to_string(), "3".to_string()),
+            ("LAKE_JOBS".to_string(), "5".to_string()),
+        ]);
+        let overridden = lean_concurrency_env(&explicit, 12);
+        assert_eq!(
+            overridden.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(overridden.get("LAKE_JOBS").map(String::as_str), Some("5"));
+
+        let only_threads = lean_concurrency_env(
+            &HashMap::from([("LEAN_NUM_THREADS".to_string(), "7".to_string())]),
+            12,
+        );
+        assert_eq!(
+            only_threads.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            only_threads.get("LAKE_JOBS").map(String::as_str),
+            Some("12")
+        );
+
+        let only_lake = lean_concurrency_env(
+            &HashMap::from([("LAKE_JOBS".to_string(), "9".to_string())]),
+            12,
+        );
+        assert_eq!(
+            only_lake.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("12")
+        );
+        assert_eq!(only_lake.get("LAKE_JOBS").map(String::as_str), Some("9"));
     }
 
     #[test]
