@@ -502,6 +502,29 @@ fn record_remote_build_status(
         .record_outcome(remote_build_dispatch_outcome(node_id, status, started_at));
 }
 
+async fn remote_build_started_at(state: &AppState, job_id: Uuid) -> chrono::DateTime<chrono::Utc> {
+    if let Some(started_at) = state
+        .fleet
+        .recent_outcomes(usize::MAX)
+        .into_iter()
+        .find(|outcome| outcome.job_id == Some(job_id))
+        .map(|outcome| outcome.started_at)
+    {
+        return started_at;
+    }
+    match crate::remote_node::job_ledger::load(&state.config.working_dir).await {
+        Ok(handles) => handles
+            .into_iter()
+            .find(|handle| handle.job_id == job_id)
+            .map(|handle| handle.started_at)
+            .unwrap_or_else(chrono::Utc::now),
+        Err(error) => {
+            tracing::warn!(job_id = %job_id, ?error, "remote build start time could not be recovered");
+            chrono::Utc::now()
+        }
+    }
+}
+
 fn spawn_remote_build_observer(
     state: Arc<AppState>,
     node: RemoteNodeConfig,
@@ -845,13 +868,7 @@ async fn get_remote_build(
             "job does not belong to this mission".to_string(),
         ));
     }
-    let started_at = state
-        .fleet
-        .recent_outcomes(usize::MAX)
-        .into_iter()
-        .find(|outcome| outcome.job_id == Some(job_id))
-        .map(|outcome| outcome.started_at)
-        .unwrap_or_else(chrono::Utc::now);
+    let started_at = remote_build_started_at(&state, job_id).await;
     record_remote_build_status(&state, &node.id, &status, started_at);
     if remote_build_is_terminal(&status.state) {
         crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
