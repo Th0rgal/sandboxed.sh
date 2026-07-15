@@ -154,6 +154,19 @@ fn has_delivery_evidence(output: &str) -> bool {
 
     let normalized = output.trim().to_ascii_lowercase();
     let legacy_completion = normalized.starts_with("i will mark this complete:");
+    let mut progress = normalized.as_str();
+    for prefix in ["acknowledged", "okay", "ok", "sure", "understood", "got it"] {
+        if let Some(rest) = progress.strip_prefix(prefix)
+            && rest
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_ascii_punctuation() || c.is_whitespace())
+        {
+            progress =
+                rest.trim_start_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace());
+            break;
+        }
+    }
     let future_intent = [
         "i'll",
         "i will",
@@ -166,7 +179,7 @@ fn has_delivery_evidence(output: &str) -> bool {
         "take a look",
     ]
     .iter()
-    .any(|phrase| normalized.contains(phrase));
+    .any(|phrase| progress.starts_with(phrase));
 
     legacy_completion || !future_intent
 }
@@ -767,6 +780,18 @@ mod tests {
         assert_eq!(
             classify_outcome(None, true, "I'll inspect it and get started."),
             BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Updated the API will now reject invalid input; verified cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Completed work on the parser."),
+            BoardTaskOutcome::Success
         );
         assert_eq!(
             classify_outcome(
