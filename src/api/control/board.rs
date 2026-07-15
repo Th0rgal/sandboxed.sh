@@ -202,6 +202,10 @@ fn has_delivery_evidence(output: &str) -> bool {
     let explicit_future_intent = [
         "i'll",
         "i will",
+        "we'll",
+        "we will",
+        "will ",
+        "going to",
         "get started",
         "start on",
         "inspect it",
@@ -229,7 +233,64 @@ fn has_delivery_evidence(output: &str) -> bool {
         .iter()
         .any(|marker| progress.contains(marker));
 
-    !(explicit_future_intent || begin_intent || work_on_intent)
+    if explicit_future_intent || begin_intent || work_on_intent {
+        return false;
+    }
+
+    // Legacy workers did not yet emit `DELIVERED:`, but still need positive
+    // completion evidence. A blacklist-only fallback turns arbitrary chatter
+    // (thanks, acknowledgements, partial observations) into Success and can
+    // unblock dependent tasks without any delivered work.
+    const COMPLETION_PREFIXES: [&str; 22] = [
+        "added",
+        "analyzed",
+        "changed",
+        "completed",
+        "confirmed",
+        "created",
+        "documented",
+        "done",
+        "finished",
+        "fixed",
+        "found",
+        "implemented",
+        "merged",
+        "proved",
+        "pushed",
+        "refactored",
+        "removed",
+        "repaired",
+        "resolved",
+        "reviewed",
+        "updated",
+        "verified",
+    ];
+    const COMPLETION_MARKERS: [&str; 18] = [
+        " is complete",
+        " are complete",
+        " was completed",
+        " were completed",
+        " has been completed",
+        " have been completed",
+        " test passes",
+        " tests pass",
+        " build passes",
+        " build succeeded",
+        " pr merged",
+        " commit pushed",
+        " fixed",
+        " implemented",
+        " resolved",
+        " updated",
+        " verified with",
+        " verified by",
+    ];
+    COMPLETION_PREFIXES
+        .iter()
+        .any(|prefix| progress.starts_with(prefix))
+        || COMPLETION_MARKERS
+            .iter()
+            .any(|marker| progress.contains(marker))
 }
 
 /// Head+tail truncation that keeps the final summary (workers put their
@@ -839,6 +900,14 @@ mod tests {
         );
         assert_eq!(
             classify_outcome(None, true, "OK."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "Thanks, I have the context."),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(None, true, "I inspected the parser."),
             BoardTaskOutcome::Failed
         );
         assert_eq!(
