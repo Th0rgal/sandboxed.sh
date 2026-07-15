@@ -186,6 +186,18 @@ fn indexed_mission_directory_is_collectible(
             .is_some_and(|entry| is_gc_eligible_status(&entry.status) && entry.updated_at < cutoff)
 }
 
+fn phase_one_index_allows_collection(
+    index: &MissionIndex,
+    mission_short: &str,
+    workspace_id: uuid::Uuid,
+    cutoff: DateTime<Utc>,
+) -> bool {
+    index.complete
+        && index.by_short.get(mission_short).is_some_and(|entries| {
+            indexed_mission_directory_is_collectible(entries, workspace_id, cutoff, true)
+        })
+}
+
 /// Read one persisted SQLite mission store without booting a session.
 fn index_store_file_blocking(
     path: &std::path::Path,
@@ -668,14 +680,8 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
                     continue;
                 }
                 let short = mission.id.simple().to_string()[..8].to_string();
-                if mission_index.by_short.get(&short).is_some_and(|entries| {
-                    !indexed_mission_directory_is_collectible(
-                        entries,
-                        workspace_id,
-                        cutoff,
-                        mission_index.complete,
-                    )
-                }) {
+                if !phase_one_index_allows_collection(&mission_index, &short, workspace_id, cutoff)
+                {
                     tracing::debug!(
                         mission_id = %mission.id,
                         workspace_id = %workspace_id,
@@ -1022,6 +1028,17 @@ mod tests {
             workspace_id,
             now - chrono::Duration::days(7),
             false,
+        ));
+
+        let incomplete_empty = MissionIndex {
+            by_short: std::collections::HashMap::new(),
+            complete: false,
+        };
+        assert!(!phase_one_index_allows_collection(
+            &incomplete_empty,
+            "deadbeef",
+            workspace_id,
+            now - chrono::Duration::days(7),
         ));
     }
 
