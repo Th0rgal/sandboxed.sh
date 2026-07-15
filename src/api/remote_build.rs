@@ -745,6 +745,41 @@ async fn get_remote_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    fn handle(node_id: &str, job_id: Uuid) -> crate::remote_node::job_ledger::JobHandle {
+        crate::remote_node::job_ledger::JobHandle {
+            mission_id: Uuid::new_v4(),
+            node_id: node_id.to_string(),
+            job_id,
+            started_at: chrono::Utc::now(),
+            kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
+        }
+    }
+
+    #[test]
+    fn unmatched_tentative_reservation_reaches_double_capacity_ceiling() {
+        let heartbeat_job = Uuid::new_v4();
+        let tentative_job = Uuid::new_v4();
+        let handles = vec![handle("node-a", tentative_job)];
+        let visible = HashMap::from([("node-a".to_string(), HashSet::from([heartbeat_job]))]);
+
+        let reservations = reservations_for_unreported_handles(handles, &visible);
+
+        // Capacity is one and the heartbeat already reports one active job.
+        // The different tentative job must remain a reservation, bringing the
+        // effective load to the 2x-capacity ceiling and blocking placement.
+        assert_eq!(reservations, HashMap::from([("node-a".to_string(), 1)]));
+    }
+
+    #[test]
+    fn heartbeat_visible_ledger_job_is_counted_once() {
+        let job_id = Uuid::new_v4();
+        let handles = vec![handle("node-a", job_id)];
+        let visible = HashMap::from([("node-a".to_string(), HashSet::from([job_id]))]);
+
+        assert!(reservations_for_unreported_handles(handles, &visible).is_empty());
+    }
 
     #[test]
     fn reservations_exclude_jobs_already_visible_in_heartbeat() {
