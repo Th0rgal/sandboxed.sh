@@ -284,8 +284,12 @@ Configure your mission:
    - **Claude Code**: use a raw model ID (e.g., `claude-opus-4-7`)
    - **Codex**: use a raw model ID (e.g., `gpt-5.5` or `gpt-5.3-codex`)
    - **Gemini**: use a raw model ID (e.g., `gemini-3.1-pro-preview`)
-   - **Grok**: use a raw model ID (e.g., `grok-4.5`)
-   - **OpenCode**: use `provider/model` (e.g., `openai/gpt-5.5`)
+   - **Grok**: use the canonical raw CLI model ID `grok-4.5`; availability is
+     account- and region-dependent (including in the EU), so confirm with
+     `grok models` if the CLI rejects it
+   - **OpenCode**: use `provider/model` (e.g., `xai/grok-4.5` with an xAI API
+     key, or `openai/gpt-5.5`); the official xAI API aliases
+     `xai/grok-4.5-latest` and `xai/grok-build-latest` are also accepted
    - **Model effort**: set effort separately (`low`, `medium`, `high`, `xhigh`) instead of encoding it in the model ID
 
 4. **Config Profile** - Override settings (optional):
