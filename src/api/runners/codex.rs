@@ -973,10 +973,16 @@ pub async fn run_codex_turn(
     // Create Codex backend
     let backend = CodexBackend::with_config_and_workspace(codex_config, workspace_exec);
 
+    // Keep generated config and Codex state in the mission directory, but run
+    // the agent from an explicitly configured project checkout when present.
+    // Verity's lean-lsp MCP uses the same LEAN_PROJECT_PATH, so this keeps
+    // Codex file tools and Lean requests on one mounted project tree.
+    let codex_work_dir = crate::workspace::configured_project_dir(workspace, mission_work_dir);
+
     // Create session
     let session = match backend
         .create_session(SessionConfig {
-            directory: mission_work_dir.to_string_lossy().to_string(),
+            directory: codex_work_dir.to_string_lossy().to_string(),
             title: Some(format!("Mission {}", mission_id)),
             model: resolved_model.clone(),
             agent: agent.map(|s| s.to_string()),
