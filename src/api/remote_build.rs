@@ -275,9 +275,18 @@ async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
 }
 
 fn reconcile_heartbeat_visible_jobs(
-    ledger_counts: HashMap<String, u32>,
-    _heartbeat_job_counts: &HashMap<String, u32>,
+    mut ledger_counts: HashMap<String, u32>,
+    heartbeat_job_counts: &HashMap<String, u32>,
 ) -> HashMap<String, u32> {
+    ledger_counts.retain(|node_id, ledger_count| {
+        *ledger_count = ledger_count.saturating_sub(
+            heartbeat_job_counts
+                .get(node_id)
+                .copied()
+                .unwrap_or_default(),
+        );
+        *ledger_count > 0
+    });
     ledger_counts
 }
 
