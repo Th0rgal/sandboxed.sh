@@ -977,3 +977,42 @@ async fn unmount_all_under(root: &Path) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::scope_wrapped_nspawn_command;
+    use std::collections::HashMap;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    const SYSTEMD_SERVICE_ENV_VARS: &[&str] = &[
+        "MEMORY_PRESSURE_WATCH",
+        "MEMORY_PRESSURE_WRITE",
+        "NOTIFY_SOCKET",
+        "WATCHDOG_USEC",
+        "WATCHDOG_PID",
+        "LISTEN_FDS",
+        "LISTEN_PID",
+        "LISTEN_FDNAMES",
+    ];
+
+    #[test]
+    fn headless_nspawn_command_uses_pipe_console_and_scrubs_service_environment() {
+        let command = scope_wrapped_nspawn_command(Path::new("/tmp/workspace"), &HashMap::new());
+        let command = command.as_std();
+
+        assert!(command
+            .get_args()
+            .any(|arg| arg == OsStr::new("--console=pipe")));
+        for name in SYSTEMD_SERVICE_ENV_VARS {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == OsStr::new(name))
+                    .map(|(_, value)| value),
+                Some(None),
+                "{name} must be explicitly removed"
+            );
+        }
+    }
+}
