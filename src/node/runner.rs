@@ -59,6 +59,7 @@ struct QueuedJob {
 pub struct JobRunner {
     store: JobStore,
     work_root: PathBuf,
+    capacity: u32,
     max_job_secs: u64,
     tx: mpsc::UnboundedSender<QueuedJob>,
     max_queued: u32,
@@ -104,6 +105,7 @@ impl JobRunner {
         let runner = Arc::new(Self {
             store,
             work_root,
+            capacity: capacity.max(1),
             max_job_secs: max_job_secs.max(1),
             tx,
             max_queued: u32::try_from(max_queued).unwrap_or(u32::MAX),
@@ -317,6 +319,7 @@ impl JobRunner {
                     &self.work_root,
                     &log_path,
                     &job.payload,
+                    self.capacity,
                     self.max_job_secs,
                     token,
                 )

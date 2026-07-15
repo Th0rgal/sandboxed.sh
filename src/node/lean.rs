@@ -328,6 +328,18 @@ fn lean_concurrency_env(
     effective
 }
 
+/// Divide the node's usable CPU affinity among the number of jobs that its
+/// admission controller can run concurrently. The node may be idle when a
+/// single job starts, but budgeting for the configured worst case prevents a
+/// second job from multiplying Lean/Lake fan-out beyond the host capacity.
+fn per_job_parallelism(available_parallelism: usize, capacity: u32) -> usize {
+    available_parallelism
+        .max(1)
+        .checked_div(capacity.max(1) as usize)
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// Derive the default lake cache key from the build cwd: sha256 over the
 /// contents of `lean-toolchain` and `lake-manifest.json` (whichever exist).
 /// `None` when neither file is present (no cache slot is used then).
@@ -724,6 +736,7 @@ pub async fn execute_lean_build(
     work_root: &Path,
     log_path: &Path,
     payload: &JobPayload,
+    node_capacity: u32,
     max_job_secs: u64,
     token: &CancellationToken,
 ) -> anyhow::Result<LeanBuildResult> {
@@ -808,7 +821,7 @@ pub async fn execute_lean_build(
         .unwrap_or(1);
     for (key, value) in lean_concurrency_env(
         env,
-        available_parallelism,
+        per_job_parallelism(available_parallelism, node_capacity),
         command.first().is_some_and(|c| c == "lake"),
     ) {
         cmd.env(key, value);
@@ -1088,6 +1101,26 @@ mod tests {
             Some("20")
         );
         assert_eq!(direct_lean.get("LAKE_JOBS").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn per_job_parallelism_respects_node_admission_capacity() {
+        assert_eq!(per_job_parallelism(8, 1), 8);
+        assert_eq!(per_job_parallelism(8, 2), 4);
+        assert_eq!(per_job_parallelism(20, 3), 6);
+        assert_eq!(per_job_parallelism(2, 8), 1);
+        assert_eq!(per_job_parallelism(0, 0), 1);
+
+        let two_job_defaults =
+            lean_concurrency_env(&HashMap::new(), per_job_parallelism(8, 2), true);
+        assert_eq!(
+            two_job_defaults.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            two_job_defaults.get("LAKE_JOBS").map(String::as_str),
+            Some("4")
+        );
     }
 
     #[test]
