@@ -14,14 +14,16 @@ import sqlite3
 import sys
 
 ACTIVE = {"active", "pending", "waiting_background"}
+TERMINAL = {"completed", "acknowledged", "failed", "interrupted", "blocked", "not_feasible"}
 
 
 def iso_time(value):
     if not value:
         return None
     try:
-        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=dt.timezone.utc) if parsed.tzinfo is None else parsed
+    except (AttributeError, ValueError):
         return None
 
 
@@ -132,6 +134,8 @@ def inventory(root, index, index_complete, cutoff):
         mission = mission_for_path(path, root, index)
         mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
         active = bool(mission and mission["status"] in ACTIVE)
+        terminal = bool(mission and mission["status"] in TERMINAL)
+        mission_updated_at = iso_time(mission["updated_at"]) if mission else None
         # Only a terminal, attributed mission directory is ever proposed.
         # Caches, worktrees, images, and unattributed directories remain
         # inventory-only even when old: an operator must establish ownership
@@ -140,8 +144,9 @@ def inventory(root, index, index_complete, cutoff):
             kind == "mission_dir"
             and index_complete
             and mission
-            and not active
-            and mtime < cutoff
+            and terminal
+            and mission_updated_at is not None
+            and mission_updated_at < cutoff
         )
         if active:
             reason = "active_mission_protected"
@@ -151,6 +156,10 @@ def inventory(root, index, index_complete, cutoff):
             reason = "mission_attribution_incomplete"
         elif not mission:
             reason = "unattributed_requires_owner_approval"
+        elif not terminal:
+            reason = "non_terminal_mission_protected"
+        elif mission_updated_at is None:
+            reason = "mission_timestamp_invalid"
         elif eligible:
             reason = "terminal_mission_past_retention"
         else:
