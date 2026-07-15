@@ -1487,7 +1487,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_tool_is_reconciled_exactly_once_without_replay() {
+    fn unresolved_tool_after_resume_is_an_explicit_transport_failure() {
         let mut translator = AppServerEventTranslator::default();
         let started = translator.handle_notification(
             "item/started",
@@ -1509,14 +1509,15 @@ mod tests {
 
         let interrupted = translator.pending_tool_ids();
         let reconciled = translator.reconcile_interrupted_tools(&interrupted);
+        assert!(reconciled
+            .iter()
+            .all(|event| !matches!(event, ExecutionEvent::ToolResult { .. })));
         assert!(matches!(
             reconciled.as_slice(),
-            [ExecutionEvent::ToolResult { id, name, result }]
-                if id == "tool-1"
-                    && name == "write_file"
-                    && result.get("status").and_then(|v| v.as_str())
-                        == Some("infra_transport_interrupted")
-                    && result.get("command_replayed").and_then(|v| v.as_bool()) == Some(false)
+            [ExecutionEvent::Error { message }]
+                if message.contains("transport")
+                    && message.contains("tool-1")
+                    && message.contains("write_file")
         ));
         assert!(translator.pending_tool_ids().is_empty());
         assert!(translator
@@ -1554,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_real_completion_wins_over_synthetic_reconciliation() {
+    fn resumed_real_completion_closes_pending_tool_exactly_once() {
         let mut translator = AppServerEventTranslator::default();
         let params = json!({
             "item": {
@@ -1582,6 +1583,8 @@ mod tests {
         assert!(translator
             .reconcile_interrupted_tools(&interrupted)
             .is_empty());
+        let duplicate = translator.handle_notification("item/completed", &params, false);
+        assert!(duplicate.events.is_empty());
     }
 
     #[test]
