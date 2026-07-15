@@ -824,6 +824,20 @@ fn configured_project_dir_with_nspawn(
     fallback: &Path,
     uses_nspawn: bool,
 ) -> PathBuf {
+    // An explicit mission working directory (most importantly an
+    // orchestrator-owned git worktree) is authoritative. Only replace the
+    // generated per-mission state directory; otherwise every worker would be
+    // redirected back to the shared LEAN_PROJECT_PATH checkout.
+    let generated_workspaces = workspaces_root_for(&workspace.path);
+    let is_generated_mission_dir = fallback.parent() == Some(generated_workspaces.as_path())
+        && fallback
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("mission-"));
+    if !is_generated_mission_dir {
+        return fallback.to_path_buf();
+    }
+
     let Some(project) = workspace
         .env_vars
         .get("LEAN_PROJECT_PATH")
@@ -834,6 +848,19 @@ fn configured_project_dir_with_nspawn(
     };
 
     let configured = Path::new(project);
+    if configured.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        tracing::warn!(
+            workspace = %workspace.name,
+            project_path = %project,
+            "Ignoring project path containing relative traversal components"
+        );
+        return fallback.to_path_buf();
+    }
     let candidate = if workspace.workspace_type == WorkspaceType::Container && uses_nspawn {
         workspace
             .path
@@ -842,17 +869,21 @@ fn configured_project_dir_with_nspawn(
         configured.to_path_buf()
     };
 
-    if candidate.starts_with(&workspace.path) {
-        candidate
-    } else {
-        tracing::warn!(
-            workspace = %workspace.name,
-            project_path = %project,
-            workspace_root = %workspace.path.display(),
-            "Ignoring project path outside selected workspace"
-        );
-        fallback.to_path_buf()
+    let canonical_root = std::fs::canonicalize(&workspace.path);
+    let canonical_candidate = std::fs::canonicalize(&candidate);
+    if let (Ok(root), Ok(candidate)) = (canonical_root, canonical_candidate) {
+        if candidate.starts_with(&root) {
+            return candidate;
+        }
     }
+
+    tracing::warn!(
+        workspace = %workspace.name,
+        project_path = %project,
+        workspace_root = %workspace.path.display(),
+        "Ignoring missing project path or path outside selected workspace"
+    );
+    fallback.to_path_buf()
 }
 
 /// Workspace directory for a task under a specific workspace root.
@@ -3686,10 +3717,67 @@ mod tests {
             "/workspace/verity/base".to_string(),
         );
         let mission_dir = root.path().join("workspaces/mission-deadbeef");
+        std::fs::create_dir_all(root.path().join("workspace/verity/base")).unwrap();
 
         assert_eq!(
             configured_project_dir_with_nspawn(&workspace, &mission_dir, true),
-            root.path().join("workspace/verity/base")
+            std::fs::canonicalize(root.path().join("workspace/verity/base")).unwrap()
+        );
+    }
+
+    #[test]
+    fn configured_project_path_preserves_explicit_worker_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let mut workspace =
+            Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+        workspace.env_vars.insert(
+            "LEAN_PROJECT_PATH".to_string(),
+            "/workspace/verity/base".to_string(),
+        );
+        let worker = root.path().join("workspace/verity/worktrees/proof-2164");
+
+        assert_eq!(
+            configured_project_dir_with_nspawn(&workspace, &worker, true),
+            worker
+        );
+    }
+
+    #[test]
+    fn configured_project_path_rejects_parent_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let mut workspace =
+            Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+        workspace
+            .env_vars
+            .insert("LEAN_PROJECT_PATH".to_string(), "/../tmp".to_string());
+        let mission_dir = root.path().join("workspaces/mission-deadbeef");
+
+        assert_eq!(
+            configured_project_dir_with_nspawn(&workspace, &mission_dir, true),
+            mission_dir
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_project_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut workspace =
+            Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+        workspace.env_vars.insert(
+            "LEAN_PROJECT_PATH".to_string(),
+            "/workspace/verity/base".to_string(),
+        );
+        std::fs::create_dir_all(root.path().join("workspace/verity")).unwrap();
+        symlink(outside.path(), root.path().join("workspace/verity/base")).unwrap();
+        let mission_dir = root.path().join("workspaces/mission-deadbeef");
+
+        assert_eq!(
+            configured_project_dir_with_nspawn(&workspace, &mission_dir, true),
+            mission_dir
         );
     }
 
