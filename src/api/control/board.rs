@@ -131,7 +131,54 @@ pub fn classify_outcome(
     }) {
         return BoardTaskOutcome::Blocked;
     }
-    BoardTaskOutcome::Success
+    if has_delivery_evidence(trimmed) {
+        BoardTaskOutcome::Success
+    } else {
+        BoardTaskOutcome::Failed
+    }
+}
+
+/// Require evidence that the worker delivered, rather than merely promising to
+/// start. New workers emit `DELIVERED:`; legacy/free-form completion summaries
+/// remain valid unless the whole short message is shaped like an acknowledgement
+/// plus future intent. Thus terse reports such as "Fixed the parser." still pass.
+fn has_delivery_evidence(output: &str) -> bool {
+    if output.lines().any(|line| {
+        line.trim_start()
+            .to_ascii_uppercase()
+            .starts_with("DELIVERED:")
+    }) {
+        return true;
+    }
+
+    let normalized = output.trim().to_ascii_lowercase();
+    let acknowledgement = [
+        "acknowledged",
+        "okay",
+        "ok,",
+        "sure",
+        "understood",
+        "got it",
+        "i'll",
+        "i will",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix));
+    let future_intent = [
+        "i'll",
+        "i will",
+        "get started",
+        "start on",
+        "inspect it",
+        "look into",
+        "work on",
+        "begin",
+        "take a look",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase));
+
+    !(normalized.chars().count() <= 600 && acknowledgement && future_intent)
 }
 
 /// Head+tail truncation that keeps the final summary (workers put their
@@ -153,8 +200,9 @@ fn worker_contract(task: &BoardTask) -> String {
          of boss mission {boss}.\n\
          - Work autonomously until the success condition in the task is met and verified.\n\
          - Do NOT end your turn to report progress; partial updates are wasted.\n\
-         - End your turn ONLY when: (a) the task is done and verified — finish with a short \
-         summary of what changed and how you verified it; or (b) you are genuinely stuck — \
+         - End your turn ONLY when: (a) the task is done and verified — finish with a line \
+         starting `DELIVERED:` followed by a short summary of what changed and how you \
+         verified it; or (b) you are genuinely stuck — \
          finish with a line starting `BLOCKED:` plus the obstacle, what you tried, and ONE \
          specific question.\n\
          - Never widen scope beyond the task.",
@@ -679,18 +727,23 @@ mod tests {
     #[test]
     fn classify_blocked_and_failed() {
         assert_ne!(
-            classify_outcome(
-                None,
-                true,
-                "Acknowledged. I'll inspect it and get started."
-            ),
+            classify_outcome(None, true, "Acknowledged. I'll inspect it and get started."),
             BoardTaskOutcome::Success
         );
         assert_eq!(
             classify_outcome(
                 Some(TerminalReason::TurnComplete),
                 true,
-                "All done, verified."
+                "DELIVERED: Fixed the settle path; verified with cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        // Legacy/free-form completion reports remain accepted.
+        assert_eq!(
+            classify_outcome(
+                None,
+                true,
+                "Fixed the settle path and added regression tests."
             ),
             BoardTaskOutcome::Success
         );
@@ -733,6 +786,24 @@ mod tests {
             classify_outcome(Some(TerminalReason::Completed), true, "done"),
             BoardTaskOutcome::Success
         );
+    }
+
+    #[test]
+    fn live_and_zombie_settle_use_the_same_delivery_rule() {
+        let outputs = [
+            "Acknowledged. I'll inspect it and get started.",
+            "DELIVERED: Fixed the defect and verified the regression test.",
+            "Fixed the defect.",
+            "BLOCKED: missing credentials.",
+            "",
+            "Error: harness failed",
+        ];
+
+        for output in outputs {
+            let live = classify_outcome(Some(TerminalReason::TurnComplete), true, output);
+            let zombie = classify_outcome(None, true, output);
+            assert_eq!(live, zombie, "paths disagreed for {output:?}");
+        }
     }
 
     #[test]
