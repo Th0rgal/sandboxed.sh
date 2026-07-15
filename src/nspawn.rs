@@ -11,6 +11,24 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+pub(crate) const SYSTEMD_SERVICE_ENV_VARS: &[&str] = &[
+    "MEMORY_PRESSURE_WATCH",
+    "MEMORY_PRESSURE_WRITE",
+    "NOTIFY_SOCKET",
+    "WATCHDOG_USEC",
+    "WATCHDOG_PID",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "LISTEN_FDNAMES",
+];
+
+/// Prevent systemd service-manager state from leaking into a child process.
+pub(crate) fn scrub_systemd_service_environment(command: &mut Command) {
+    for name in SYSTEMD_SERVICE_ENV_VARS {
+        command.env_remove(name);
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum NspawnError {
     #[error("Failed to create container directory: {0}")]
@@ -557,14 +575,16 @@ fn scope_wrapped_nspawn_command(path: &Path, env: &HashMap<String, String>) -> C
     let token =
         crate::workspace_exec::machine_name_for_path(path).unwrap_or_else(|| "unknown".to_string());
     let unit = format!("sandboxed-exec-{}-{}", token, uuid::Uuid::new_v4().simple());
-    if let Some(scope_args) = caps.scope_run_args(&unit) {
+    let mut command = if let Some(scope_args) = caps.scope_run_args(&unit) {
         let mut c = Command::new("systemd-run");
         c.args(&scope_args);
         c.arg("systemd-nspawn");
         c
     } else {
         Command::new("systemd-nspawn")
-    }
+    };
+    scrub_systemd_service_environment(&mut command);
+    command
 }
 
 /// Execute a command inside a container using systemd-nspawn.
@@ -985,16 +1005,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    const SYSTEMD_SERVICE_ENV_VARS: &[&str] = &[
-        "MEMORY_PRESSURE_WATCH",
-        "MEMORY_PRESSURE_WRITE",
-        "NOTIFY_SOCKET",
-        "WATCHDOG_USEC",
-        "WATCHDOG_PID",
-        "LISTEN_FDS",
-        "LISTEN_PID",
-        "LISTEN_FDNAMES",
-    ];
+    use super::SYSTEMD_SERVICE_ENV_VARS;
 
     #[test]
     fn headless_nspawn_command_uses_pipe_console_and_scrubs_service_environment() {
