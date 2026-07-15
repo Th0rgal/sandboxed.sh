@@ -252,13 +252,33 @@ async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
             for handle in handles {
                 *reservations.entry(handle.node_id).or_insert(0) += 1;
             }
-            reservations
+            let heartbeat_job_counts = reservations
+                .keys()
+                .filter_map(|node_id| {
+                    state.fleet.get(node_id).and_then(|status| {
+                        status.last_heartbeat.map(|heartbeat| {
+                            (
+                                node_id.clone(),
+                                heartbeat.active_jobs.saturating_add(heartbeat.queued_jobs),
+                            )
+                        })
+                    })
+                })
+                .collect();
+            reconcile_heartbeat_visible_jobs(reservations, &heartbeat_job_counts)
         }
         Err(error) => {
             tracing::warn!(?error, "remote job reservations could not be loaded");
             HashMap::new()
         }
     }
+}
+
+fn reconcile_heartbeat_visible_jobs(
+    ledger_counts: HashMap<String, u32>,
+    _heartbeat_job_counts: &HashMap<String, u32>,
+) -> HashMap<String, u32> {
+    ledger_counts
 }
 
 /// Resolve the target node: explicit id or capacity-aware auto placement.
@@ -716,6 +736,17 @@ async fn get_remote_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reservations_exclude_jobs_already_visible_in_heartbeat() {
+        let ledger = HashMap::from([("node-a".to_string(), 2), ("node-b".to_string(), 2)]);
+        let visible = HashMap::from([("node-a".to_string(), 1), ("node-b".to_string(), 3)]);
+
+        assert_eq!(
+            reconcile_heartbeat_visible_jobs(ledger, &visible),
+            HashMap::from([("node-a".to_string(), 1)])
+        );
+    }
 
     #[cfg(unix)]
     fn run_remote_build_wrapper_with_http_status(status: u16) -> std::process::ExitStatus {

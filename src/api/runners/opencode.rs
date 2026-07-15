@@ -583,20 +583,12 @@ pub async fn run_opencode_turn(
 
     // Ensure OpenCode's install directory is available in PATH.
     {
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let bun_bins = "/root/.bun/bin:/root/.cache/.bun/bin";
-        let mut path_parts = Vec::new();
-        if !current_path.contains("/root/.bun/bin") {
-            path_parts.push(bun_bins.to_string());
-        }
-        path_parts.push(current_path);
-        // Append a dedicated bin subdirectory (not the workspace root) so
-        // `telegram-action` is findable as a bare command without letting
-        // arbitrary repo files shadow system binaries.
-        if telegram_action_helpers_enabled {
-            path_parts.push(format!("{}/.sandboxed-sh-bin", work_dir_arg));
-        }
-        env.insert("PATH".to_string(), path_parts.join(":"));
+        let path = opencode_path(
+            env.get("PATH").map(String::as_str),
+            &work_dir_arg,
+            telegram_action_helpers_enabled,
+        );
+        env.insert("PATH".to_string(), path);
     }
 
     let opencode_auth =
@@ -2089,4 +2081,40 @@ pub async fn run_opencode_turn(
     let _ = std::fs::remove_file(&prompt_file_host);
 
     result
+}
+
+fn opencode_path(
+    _mission_path: Option<&str>,
+    work_dir_arg: &str,
+    telegram_action_helpers_enabled: bool,
+) -> String {
+    let process_path = std::env::var("PATH").unwrap_or_default();
+    let current_path = process_path.as_str();
+    let bun_bins = "/root/.bun/bin:/root/.cache/.bun/bin";
+    let mut path_parts = Vec::new();
+    if !current_path.contains("/root/.bun/bin") {
+        path_parts.push(bun_bins.to_string());
+    }
+    path_parts.push(current_path.to_string());
+    if telegram_action_helpers_enabled {
+        path_parts.push(format!("{work_dir_arg}/.sandboxed-sh-bin"));
+    }
+    path_parts.join(":")
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::opencode_path;
+
+    #[test]
+    fn opencode_path_preserves_mission_path_prepends() {
+        let path = opencode_path(
+            Some("/mission/.sandboxed-sh/bin:/usr/bin"),
+            "/mission",
+            true,
+        );
+
+        assert!(path.contains("/mission/.sandboxed-sh/bin:/usr/bin"));
+        assert!(path.ends_with("/mission/.sandboxed-sh-bin"));
+    }
 }
