@@ -128,7 +128,7 @@ fn legacy_scope_is_reapable(
 }
 
 /// List all `sandboxed-exec-*.scope` unit names currently known to systemd.
-pub(crate) async fn list_exec_scope_units() -> Vec<String> {
+pub(crate) async fn try_list_exec_scope_units() -> Result<Vec<String>, String> {
     let output = Command::new("systemctl")
         .args([
             "list-units",
@@ -138,16 +138,36 @@ pub(crate) async fn list_exec_scope_units() -> Vec<String> {
             "sandboxed-exec-*.scope",
         ])
         .output()
-        .await;
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&output.stdout)
+        .await
+        .map_err(|err| format!("systemctl list-units failed: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl list-units exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let units: Vec<String> = stdout
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .filter(|unit| unit.starts_with("sandboxed-exec-") && unit.ends_with(".scope"))
         .map(|s| s.to_string())
-        .collect()
+        .collect();
+    if !stdout.trim().is_empty() && units.is_empty() {
+        return Err("systemctl list-units returned no parseable exec scopes".to_string());
+    }
+    Ok(units)
+}
+
+pub(crate) async fn list_exec_scope_units() -> Vec<String> {
+    match try_list_exec_scope_units().await {
+        Ok(units) => units,
+        Err(err) => {
+            tracing::warn!(%err, "could not list exec scopes");
+            Vec::new()
+        }
+    }
 }
 
 async fn stop_unit(unit: &str, reason: &str) -> bool {
