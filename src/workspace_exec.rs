@@ -575,7 +575,13 @@ fn persistent_nspawn_command(scope_args: Option<&[String]>) -> Command {
         Command::new("systemd-nspawn")
     };
     nspawn::scrub_systemd_service_environment(&mut command);
-    command.arg("--console=pipe");
+    // This leader outlives the API process and has no interactive console.
+    // `--console=pipe` continuously wakes on the closed/null stdin after the
+    // launcher is restarted, making each otherwise-idle workspace consume a
+    // large fraction of one CPU. A passive PTY keeps the container detached
+    // without forwarding or polling console file descriptors. One-shot
+    // nspawn commands continue to use pipe mode so their output is captured.
+    command.arg("--console=passive");
     command
 }
 
@@ -735,13 +741,17 @@ mod tests {
     }
 
     #[test]
-    fn persistent_nspawn_boot_scrubs_service_environment() {
+    fn persistent_nspawn_boot_uses_passive_console_and_scrubs_service_environment() {
         let command = persistent_nspawn_command(Some(&["--scope".to_string()]));
         assert!(command
             .as_std()
             .get_args()
             .any(|arg| arg == OsStr::new("systemd-nspawn")));
         assert!(command
+            .as_std()
+            .get_args()
+            .any(|arg| arg == OsStr::new("--console=passive")));
+        assert!(!command
             .as_std()
             .get_args()
             .any(|arg| arg == OsStr::new("--console=pipe")));
