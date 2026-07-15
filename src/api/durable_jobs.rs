@@ -23,6 +23,7 @@ use tokio::process::{Child, Command};
 use uuid::Uuid;
 
 use super::{auth::AuthUser, control::control_for_user, routes::AppState};
+use crate::api::mission_store::MissionStore;
 use crate::workspace::WorkspaceType;
 use crate::workspace_exec::WorkspaceExec;
 
@@ -188,26 +189,29 @@ async fn authorize_job(
     }
 
     // Backward compatibility for jobs created before owner_user_id existed.
+    let control = control_for_user(state, user).await;
+    authorize_legacy_job(&control.mission_store, job).await
+}
+
+async fn authorize_legacy_job(
+    mission_store: &Arc<dyn MissionStore>,
+    job: &DurableJob,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let mission_id = job.started_by_mission_id.ok_or_else(|| {
         err(
             StatusCode::FORBIDDEN,
             "legacy durable job has no caller ownership metadata",
         )
     })?;
-    let workspace_id = job.workspace_id.ok_or_else(|| {
-        err(
-            StatusCode::FORBIDDEN,
-            "legacy durable job has no workspace ownership metadata",
-        )
-    })?;
-    let control = control_for_user(state, user).await;
-    let mission = control
-        .mission_store
+    let mission = mission_store
         .get_mission(mission_id)
         .await
         .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .ok_or_else(|| err(StatusCode::FORBIDDEN, "durable job belongs to another user"))?;
-    if mission.workspace_id != workspace_id {
+    if job
+        .workspace_id
+        .is_some_and(|workspace_id| mission.workspace_id != workspace_id)
+    {
         return Err(err(
             StatusCode::FORBIDDEN,
             "durable job belongs to another user",
@@ -838,6 +842,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::mission_store::SqliteMissionStore;
 
     fn test_job(status: DurableJobStatus) -> DurableJob {
         let now = Utc::now();
@@ -1024,6 +1029,44 @@ mod tests {
         assert!(terminal_for_mission(dir.path(), job.id, mission_id)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn legacy_job_without_workspace_uses_owning_mission() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner_store: Arc<dyn MissionStore> = Arc::new(
+            SqliteMissionStore::new(dir.path().to_path_buf(), "owner")
+                .await
+                .unwrap(),
+        );
+        let other_store: Arc<dyn MissionStore> = Arc::new(
+            SqliteMissionStore::new(dir.path().to_path_buf(), "other")
+                .await
+                .unwrap(),
+        );
+        let mission = owner_store
+            .create_mission(Some("legacy owner"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let mut job = test_job(DurableJobStatus::Running);
+        job.started_by_mission_id = Some(mission.id);
+        let registry_dir = dir
+            .path()
+            .join(".sandboxed-sh/durable-jobs")
+            .join(job.id.to_string());
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("job.json"),
+            serde_json::to_vec(&job).unwrap(),
+        )
+        .unwrap();
+        let persisted: DurableJob =
+            serde_json::from_slice(&std::fs::read(registry_dir.join("job.json")).unwrap()).unwrap();
+
+        assert!(authorize_legacy_job(&owner_store, &persisted).await.is_ok());
+        assert!(authorize_legacy_job(&other_store, &persisted)
+            .await
+            .is_err());
     }
 
     #[test]

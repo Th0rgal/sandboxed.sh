@@ -657,10 +657,15 @@ CREATE TABLE IF NOT EXISTS board_tasks (
     model_override TEXT,
     model_effort TEXT,
     working_directory TEXT,
+    repository TEXT,
+    branch TEXT,
     depends_on TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'pending',
     outcome TEXT,
     worker_mission_id TEXT,
+    prior_worker_mission_id TEXT,
+    prior_outcome TEXT,
+    prior_result_digest TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
     result_digest TEXT,
     notes TEXT,
@@ -1232,6 +1237,40 @@ impl SqliteMissionStore {
     /// CREATE TABLE IF NOT EXISTS doesn't add columns to existing tables,
     /// so we need to handle schema changes manually.
     fn run_migrations(conn: &Connection) -> Result<(), String> {
+        for (column, ty) in [
+            ("repository", "TEXT"),
+            ("branch", "TEXT"),
+            ("prior_worker_mission_id", "TEXT"),
+            ("prior_outcome", "TEXT"),
+            ("prior_result_digest", "TEXT"),
+        ] {
+            let exists = conn
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('board_tasks') WHERE name = '{column}'"
+                ))
+                .map_err(|e| format!("Failed to check board_tasks.{column}: {e}"))?
+                .exists([])
+                .map_err(|e| format!("Failed to query board_tasks schema: {e}"))?;
+            if !exists {
+                tracing::info!(column, "Running migration: adding board task column");
+                match conn.execute(
+                    &format!("ALTER TABLE board_tasks ADD COLUMN {column} {ty}"),
+                    [],
+                ) {
+                    Ok(_) => {}
+                    Err(error) if error.to_string().contains("duplicate column") => {
+                        tracing::debug!(
+                            column,
+                            "board task column already exists after concurrent migration"
+                        );
+                    }
+                    Err(error) => {
+                        return Err(format!("Failed to add board_tasks.{column}: {error}"));
+                    }
+                }
+            }
+        }
+
         // Check if 'backend' column exists in missions table
         let has_backend_column: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'backend'")
@@ -10021,7 +10060,7 @@ impl MissionStore for SqliteMissionStore {
                         conn.execute(
                             "UPDATE board_tasks SET title = ?1, prompt = ?2, backend = ?3, \
                              model_override = ?4, model_effort = ?5, working_directory = ?6, \
-                             depends_on = ?7, updated_at = ?8 WHERE id = ?9",
+                             repository = ?7, branch = ?8, depends_on = ?9, updated_at = ?10 WHERE id = ?11",
                             params![
                                 t.title,
                                 t.prompt,
@@ -10029,6 +10068,8 @@ impl MissionStore for SqliteMissionStore {
                                 t.model_override,
                                 t.model_effort,
                                 t.working_directory,
+                                t.repository,
+                                t.branch,
                                 depends_on_json,
                                 now,
                                 id,
@@ -10042,9 +10083,9 @@ impl MissionStore for SqliteMissionStore {
                         let id = Uuid::new_v4().to_string();
                         conn.execute(
                             "INSERT INTO board_tasks (id, boss_mission_id, task_key, title, prompt, \
-                             backend, model_override, model_effort, working_directory, depends_on, \
+                             backend, model_override, model_effort, working_directory, repository, branch, depends_on, \
                              status, attempts, created_at, updated_at) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', 0, ?11, ?11)",
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'pending', 0, ?13, ?13)",
                             params![
                                 id,
                                 boss_mission_id.to_string(),
@@ -10055,6 +10096,8 @@ impl MissionStore for SqliteMissionStore {
                                 t.model_override,
                                 t.model_effort,
                                 t.working_directory,
+                                t.repository,
+                                t.branch,
                                 depends_on_json,
                                 now,
                             ],
@@ -10173,9 +10216,10 @@ impl MissionStore for SqliteMissionStore {
             let updated = conn
                 .execute(
                     "UPDATE board_tasks SET task_key = ?1, title = ?2, prompt = ?3, backend = ?4, \
-                     model_override = ?5, model_effort = ?6, working_directory = ?7, depends_on = ?8, \
-                     status = ?9, outcome = ?10, worker_mission_id = ?11, attempts = ?12, \
-                     result_digest = ?13, notes = ?14, updated_at = ?15 WHERE id = ?16",
+                     model_override = ?5, model_effort = ?6, working_directory = ?7, repository = ?8, \
+                     branch = ?9, depends_on = ?10, status = ?11, outcome = ?12, worker_mission_id = ?13, \
+                     prior_worker_mission_id = ?14, prior_outcome = ?15, prior_result_digest = ?16, \
+                     attempts = ?17, result_digest = ?18, notes = ?19, updated_at = ?20 WHERE id = ?21",
                     params![
                         t.task_key,
                         t.title,
@@ -10184,10 +10228,15 @@ impl MissionStore for SqliteMissionStore {
                         t.model_override,
                         t.model_effort,
                         t.working_directory,
+                        t.repository,
+                        t.branch,
                         depends_on_json,
                         t.status.to_string(),
                         t.outcome.map(|o| o.to_string()),
                         t.worker_mission_id.map(|id| id.to_string()),
+                        t.prior_worker_mission_id.map(|id| id.to_string()),
+                        t.prior_outcome.map(|o| o.to_string()),
+                        t.prior_result_digest,
                         t.attempts as i64,
                         t.result_digest,
                         t.notes,
@@ -10209,17 +10258,20 @@ impl MissionStore for SqliteMissionStore {
 /// Column list shared by every board task SELECT so `parse_board_task_row`
 /// indices stay in sync.
 const BOARD_TASK_COLUMNS: &str = "id, boss_mission_id, task_key, title, prompt, backend, \
-    model_override, model_effort, working_directory, depends_on, status, outcome, \
-    worker_mission_id, attempts, result_digest, notes, created_at, updated_at";
+    model_override, model_effort, working_directory, repository, branch, depends_on, status, outcome, \
+    worker_mission_id, prior_worker_mission_id, prior_outcome, prior_result_digest, attempts, \
+    result_digest, notes, created_at, updated_at";
 
 fn parse_board_task_row(row: &rusqlite::Row<'_>) -> Result<BoardTask, rusqlite::Error> {
     let id: String = row.get(0)?;
     let boss_mission_id: String = row.get(1)?;
-    let depends_on_json: String = row.get(9)?;
-    let status_str: String = row.get(10)?;
-    let outcome_str: Option<String> = row.get(11)?;
-    let worker_mission_id: Option<String> = row.get(12)?;
-    let attempts: i64 = row.get(13)?;
+    let depends_on_json: String = row.get(11)?;
+    let status_str: String = row.get(12)?;
+    let outcome_str: Option<String> = row.get(13)?;
+    let worker_mission_id: Option<String> = row.get(14)?;
+    let prior_worker_mission_id: Option<String> = row.get(15)?;
+    let prior_outcome: Option<String> = row.get(16)?;
+    let attempts: i64 = row.get(18)?;
     Ok(BoardTask {
         id: Uuid::parse_str(&id)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
@@ -10232,15 +10284,20 @@ fn parse_board_task_row(row: &rusqlite::Row<'_>) -> Result<BoardTask, rusqlite::
         model_override: row.get(6)?,
         model_effort: row.get(7)?,
         working_directory: row.get(8)?,
+        repository: row.get(9)?,
+        branch: row.get(10)?,
         depends_on: serde_json::from_str(&depends_on_json).unwrap_or_default(),
         status: BoardTaskStatus::parse(&status_str).unwrap_or(BoardTaskStatus::Pending),
         outcome: outcome_str.as_deref().and_then(BoardTaskOutcome::parse),
         worker_mission_id: worker_mission_id.and_then(|s| Uuid::parse_str(&s).ok()),
+        prior_worker_mission_id: prior_worker_mission_id.and_then(|s| Uuid::parse_str(&s).ok()),
+        prior_outcome: prior_outcome.as_deref().and_then(BoardTaskOutcome::parse),
+        prior_result_digest: row.get(17)?,
         attempts: attempts as u32,
-        result_digest: row.get(14)?,
-        notes: row.get(15)?,
-        created_at: row.get(16)?,
-        updated_at: row.get(17)?,
+        result_digest: row.get(19)?,
+        notes: row.get(20)?,
+        created_at: row.get(21)?,
+        updated_at: row.get(22)?,
     })
 }
 
@@ -11894,6 +11951,16 @@ mod tests {
                 .ok();
             conn.execute("ALTER TABLE missions DROP COLUMN next_check_at", [])
                 .ok();
+            for column in [
+                "repository",
+                "branch",
+                "prior_worker_mission_id",
+                "prior_outcome",
+                "prior_result_digest",
+            ] {
+                conn.execute(&format!("ALTER TABLE board_tasks DROP COLUMN {column}"), [])
+                    .expect("drop board task column for migration race");
+            }
         }
 
         // Two concurrent initializations on the SAME db file — both must succeed.
@@ -11936,6 +12003,23 @@ mod tests {
                 exists,
                 "{} column must exist after concurrent migration",
                 col
+            );
+        }
+        for col in [
+            "repository",
+            "branch",
+            "prior_worker_mission_id",
+            "prior_outcome",
+            "prior_result_digest",
+        ] {
+            let exists: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('board_tasks') WHERE name = ?1")
+                .unwrap()
+                .exists([col])
+                .unwrap();
+            assert!(
+                exists,
+                "{col} board_tasks column must survive concurrent migration"
             );
         }
     }
@@ -14648,6 +14732,8 @@ mod tests {
             model_override: Some("gpt-5.5".to_string()),
             model_effort: Some("high".to_string()),
             working_directory: Some("/workspaces/x/wt-1".to_string()),
+            repository: Some("Th0rgal/sandboxed.sh".to_string()),
+            branch: Some("agent/test".to_string()),
             depends_on: deps.into_iter().map(String::from).collect(),
         };
 
@@ -14658,6 +14744,8 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].status, BoardTaskStatus::Pending);
         assert_eq!(tasks[1].depends_on, vec!["t1".to_string()]);
+        assert_eq!(tasks[0].repository.as_deref(), Some("Th0rgal/sandboxed.sh"));
+        assert_eq!(tasks[0].branch.as_deref(), Some("agent/test"));
 
         // Active boards includes our boss.
         let active = store.list_active_board_missions().await.expect("active");

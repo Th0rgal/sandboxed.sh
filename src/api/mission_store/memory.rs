@@ -610,6 +610,8 @@ impl MissionStore for InMemoryMissionStore {
                         bt.model_override = t.model_override;
                         bt.model_effort = t.model_effort;
                         bt.working_directory = t.working_directory;
+                        bt.repository = t.repository;
+                        bt.branch = t.branch;
                         bt.depends_on = t.depends_on;
                         bt.updated_at = now.clone();
                     }
@@ -626,10 +628,15 @@ impl MissionStore for InMemoryMissionStore {
                         model_override: t.model_override,
                         model_effort: t.model_effort,
                         working_directory: t.working_directory,
+                        repository: t.repository,
+                        branch: t.branch,
                         depends_on: t.depends_on,
                         status: BoardTaskStatus::Pending,
                         outcome: None,
                         worker_mission_id: None,
+                        prior_worker_mission_id: None,
+                        prior_outcome: None,
+                        prior_result_digest: None,
                         attempts: 0,
                         result_digest: None,
                         notes: None,

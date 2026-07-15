@@ -34,6 +34,10 @@ pub struct JobHandle {
     pub node_id: String,
     pub job_id: Uuid,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// When the node acceptance response was observed. Tentative and legacy
+    /// handles keep this empty and must remain conservatively reserved.
+    #[serde(default)]
+    pub accepted_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub kind: JobHandleKind,
 }
@@ -116,6 +120,7 @@ mod tests {
             node_id: "node-a".to_string(),
             job_id,
             started_at: chrono::Utc::now(),
+            accepted_at: Some(chrono::Utc::now()),
             kind: JobHandleKind::Mission,
         };
 
@@ -139,6 +144,7 @@ mod tests {
                 node_id: "node-a".to_string(),
                 job_id: Uuid::new_v4(),
                 started_at: chrono::Utc::now(),
+                accepted_at: Some(chrono::Utc::now()),
                 kind: JobHandleKind::Mission,
             },
         )
@@ -158,6 +164,7 @@ mod tests {
         let handle: JobHandle = serde_json::from_value(raw).unwrap();
 
         assert_eq!(handle.kind, JobHandleKind::Mission);
+        assert_eq!(handle.accepted_at, None);
     }
 
     #[test]
@@ -185,11 +192,13 @@ mod tests {
             node_id: "node-a".to_string(),
             job_id,
             started_at: chrono::Utc::now(),
+            accepted_at: None,
             kind: JobHandleKind::Tentative,
         };
         record(dir.path(), handle.clone()).await.unwrap();
 
         handle.kind = JobHandleKind::Mission;
+        handle.accepted_at = Some(chrono::Utc::now());
         record(dir.path(), handle).await.unwrap();
 
         let handles = load_result(dir.path()).await.unwrap();

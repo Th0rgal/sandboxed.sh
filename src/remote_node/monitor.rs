@@ -37,6 +37,10 @@ pub struct CachedNodeStatus {
     pub last_heartbeat: Option<NodeHeartbeat>,
     /// When the last successful heartbeat was received.
     pub last_seen: Option<DateTime<Utc>>,
+    /// When the request producing the last successful heartbeat started.
+    /// Reservations created after this instant cannot safely be assumed to
+    /// be represented by that heartbeat payload.
+    pub last_probe_started_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
 }
 
@@ -97,6 +101,15 @@ impl FleetMonitor {
 
     /// Record a successful heartbeat probe.
     pub fn record_heartbeat(&self, node_id: &str, heartbeat: NodeHeartbeat) {
+        self.record_heartbeat_for_probe(node_id, heartbeat, Utc::now());
+    }
+
+    pub fn record_heartbeat_for_probe(
+        &self,
+        node_id: &str,
+        heartbeat: NodeHeartbeat,
+        probe_started_at: DateTime<Utc>,
+    ) {
         let (status, misses) = status_after_probe(0, true);
         let mut statuses = self.statuses.write().unwrap_or_else(|e| e.into_inner());
         statuses.insert(
@@ -107,6 +120,7 @@ impl FleetMonitor {
                 consecutive_misses: misses,
                 last_heartbeat: Some(heartbeat),
                 last_seen: Some(Utc::now()),
+                last_probe_started_at: Some(probe_started_at),
                 last_error: None,
             },
         );
@@ -124,6 +138,7 @@ impl FleetMonitor {
                 consecutive_misses: 0,
                 last_heartbeat: None,
                 last_seen: None,
+                last_probe_started_at: None,
                 last_error: None,
             });
         let (status, misses) = status_after_probe(entry.consecutive_misses, false);
@@ -460,10 +475,15 @@ pub async fn probe_node(fleet: &FleetMonitor, client: &RemoteNodeClient, node: &
         .ok()
         .filter(|token| !token.trim().is_empty());
     match token {
-        Some(token) => match client.heartbeat(node, &token).await {
-            Ok(heartbeat) => fleet.record_heartbeat(&node.id, heartbeat),
-            Err(err) => fleet.record_miss(&node.id, err.to_string()),
-        },
+        Some(token) => {
+            let probe_started_at = Utc::now();
+            match client.heartbeat(node, &token).await {
+                Ok(heartbeat) => {
+                    fleet.record_heartbeat_for_probe(&node.id, heartbeat, probe_started_at)
+                }
+                Err(err) => fleet.record_miss(&node.id, err.to_string()),
+            }
+        }
         None => fleet.record_miss(&node.id, format!("missing token env {}", node.token_env)),
     }
 }
@@ -617,6 +637,7 @@ mod tests {
             consecutive_misses: 0,
             last_heartbeat: Some(heartbeat),
             last_seen: Some(Utc::now()),
+            last_probe_started_at: Some(Utc::now()),
             last_error: None,
         }
     }
