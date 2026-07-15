@@ -1265,8 +1265,7 @@ case "$url" in
         ;;
     *)
         if [ "$REMOTE_BUILD_TEST_POLL_MODE" = "persist-fail" ]; then
-            rm -rf "$REMOTE_BUILD_TEST_STATE_DIR"
-            printf 'not-a-directory' > "$REMOTE_BUILD_TEST_STATE_DIR"
+            chmod 500 "$REMOTE_BUILD_TEST_STATE_DIR"
         fi
         count=0
         [ ! -f "$REMOTE_BUILD_TEST_SUBMIT_COUNT" ] || count=$(cat "$REMOTE_BUILD_TEST_SUBMIT_COUNT")
@@ -1416,6 +1415,25 @@ esac
         );
         assert!(String::from_utf8_lossy(&persistence_failed.stderr)
             .contains("failed to persist its receipt"));
+        let persistence_retry = run("success");
+        assert_eq!(persistence_retry.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&persistence_retry.stderr)
+            .contains("previous submission stopped"));
+        assert_eq!(
+            std::fs::read_to_string(&submit_count).unwrap(),
+            "2",
+            "the accepted persistence-failure submission must block an identical retry"
+        );
+        let forced_after_reconciliation = command("success")
+            .env("REMOTE_BUILD_FORCE_NEW", "1")
+            .output()
+            .expect("force a new build after explicit reconciliation");
+        assert!(
+            forced_after_reconciliation.status.success(),
+            "explicitly forced build failed: {}",
+            String::from_utf8_lossy(&forced_after_reconciliation.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "3");
 
         for entry in std::fs::read_dir(&state).expect("read state before ambiguous submission") {
             let path = entry.expect("read state entry").path();
