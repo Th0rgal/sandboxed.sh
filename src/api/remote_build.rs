@@ -1124,6 +1124,135 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_resumes_an_interrupted_async_job_without_resubmitting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create wrapper test directory");
+        let repo = temp.path().join("repo");
+        let bin = temp.path().join("bin");
+        let state = temp.path().join("state");
+        let submit_count = temp.path().join("submit-count");
+        std::fs::create_dir_all(&repo).expect("create test repo");
+        std::fs::create_dir_all(&bin).expect("create fake bin directory");
+
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "Remote Build Test"]);
+        git(&["config", "user.email", "remote-build@example.invalid"]);
+        std::fs::write(repo.join("README.md"), "test\n").expect("write tracked file");
+        git(&["add", "README.md"]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "test",
+        ]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ]);
+
+        let fake_curl = bin.join("curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+output=""
+url=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) shift; output="$1" ;;
+        http://*) url="$1" ;;
+    esac
+    shift
+done
+case "$url" in
+    */api/remote-build/*)
+        if [ "$REMOTE_BUILD_TEST_POLL_MODE" = "fail" ]; then
+            exit 7
+        fi
+        printf '{"job_id":"11111111-1111-1111-1111-111111111111","mission_id":"%s","state":"succeeded","exit_code":0,"created_at":"2026-07-15T20:00:00Z","started_at":"2026-07-15T20:00:01Z","finished_at":"2026-07-15T20:00:03Z","error":null,"log_tail":"remote ok\\n","artifacts":[]}' "$REMOTE_BUILD_TEST_MISSION_ID" > "$output"
+        printf '200'
+        ;;
+    *)
+        count=0
+        [ ! -f "$REMOTE_BUILD_TEST_SUBMIT_COUNT" ] || count=$(cat "$REMOTE_BUILD_TEST_SUBMIT_COUNT")
+        count=$((count + 1))
+        printf '%s' "$count" > "$REMOTE_BUILD_TEST_SUBMIT_COUNT"
+        printf '{"job_id":"11111111-1111-1111-1111-111111111111","node_id":"test-node"}' > "$output"
+        printf '202'
+        ;;
+esac
+"#,
+        )
+        .expect("write fake curl");
+        let mut permissions = std::fs::metadata(&fake_curl)
+            .expect("stat fake curl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_curl, permissions).expect("make fake curl executable");
+
+        let mission_id = Uuid::new_v4().to_string();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = |poll_mode: &str| {
+            std::process::Command::new("bash")
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/scripts/remote-lean-build"
+                ))
+                .current_dir(&repo)
+                .env("PATH", &path)
+                .env(
+                    "REMOTE_BUILD_URL",
+                    "http://example.invalid/api/remote-build",
+                )
+                .env("REMOTE_BUILD_TOKEN", "test-token")
+                .env("REMOTE_BUILD_MISSION_ID", &mission_id)
+                .env("REMOTE_BUILD_STATE_DIR", &state)
+                .env("REMOTE_BUILD_POLL_SECS", "1")
+                .env("REMOTE_BUILD_CLIENT_TIMEOUT_SECS", "1")
+                .env("REMOTE_BUILD_TEST_POLL_MODE", poll_mode)
+                .env("REMOTE_BUILD_TEST_MISSION_ID", &mission_id)
+                .env("REMOTE_BUILD_TEST_SUBMIT_COUNT", &submit_count)
+                .output()
+                .expect("run remote-build wrapper")
+        };
+
+        let interrupted = run("fail");
+        assert_eq!(interrupted.status.code(), Some(75));
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
+
+        let resumed = run("success");
+        assert!(
+            resumed.status.success(),
+            "resume failed: {}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
+        assert!(String::from_utf8_lossy(&resumed.stderr).contains("resuming job"));
+        assert_eq!(String::from_utf8_lossy(&resumed.stdout), "remote ok\n");
+    }
+
     #[test]
     fn failed_auto_placement_reprobes_every_cache_state() {
         assert!(should_reprobe_after_placement_failure(None));

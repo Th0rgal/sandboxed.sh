@@ -39,8 +39,9 @@ Supported now:
   `remote_requirements` labels) picks the least-loaded eligible node from the
   fleet cache and fails closed with a per-node exclusion report
 - `POST /api/remote-build`: an in-workspace, capability-token-authenticated
-  endpoint that dispatches a `lean_build` job (auto-placed by default) and
-  waits for the result — used by the `remote-lean-build` wrapper
+  endpoint that dispatches a `lean_build` job (auto-placed by default). The
+  wrapper submits asynchronously and polls the mission-scoped status endpoint
+  so interrupted clients can resume the same immutable job.
 - dispatch failures fail closed: the mission is marked failed and the API
   returns an error
 - future `not_before` scheduling with `remote_node_id` is rejected for now so
@@ -402,9 +403,14 @@ remote-lean-build lake build Verity
 It derives `repo` (`git remote get-url origin`), `commit`
 (`git rev-parse HEAD`) and `cwd_rel` (`git rev-parse --show-prefix`),
 refuses a dirty tree (exit 2 — the node builds a pinned commit, so
-uncommitted changes would be silently ignored), POSTs to
+uncommitted changes would be silently ignored), submits asynchronously to
 `$REMOTE_BUILD_URL` with `$REMOTE_BUILD_TOKEN`/`$REMOTE_BUILD_MISSION_ID`,
-prints the remote log tail, and exits with the remote build's exit code. On
+persists the returned job/node receipt under
+`${XDG_STATE_HOME:-$HOME/.local/state}/sandboxed-sh/remote-builds/`, then polls
+the mission-authenticated status endpoint. Running the same immutable command
+after a client/tool interruption resumes the recorded job instead of
+submitting a duplicate. It prints the remote log tail and exits with the remote
+build's exit code. On
 HTTP 503 (placement failure, fleet down, feature off) it prints the reason
 and exits 75 (`EX_TEMPFAIL`) so scripts can fall back to a local build:
 
@@ -413,7 +419,9 @@ remote-lean-build || { [ $? -eq 75 ] && lake build; }
 ```
 
 Optional: `REMOTE_BUILD_TIMEOUT_SECS` forwards a job timeout (clamped by the
-node's `SANDBOXED_NODE_MAX_JOB_SECS`).
+node's `SANDBOXED_NODE_MAX_JOB_SECS`). `REMOTE_BUILD_STATE_DIR` overrides the
+receipt directory. `REMOTE_BUILD_FORCE_NEW=1` deliberately bypasses a live
+matching receipt and should be reserved for operator-directed retries.
 
 Workspace configuration can pin the placement policy without exposing node
 credentials:
