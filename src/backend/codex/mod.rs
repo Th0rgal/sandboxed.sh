@@ -840,10 +840,15 @@ impl AppServerEventTranslator {
                 "codex app-server transport failure: pending tool call {} ({}) remained unresolved after thread/resume; the command was not replayed",
                 descriptor.id, descriptor.name
             );
-            // Close the lifecycle for downstream accounting without claiming
-            // that the tool succeeded or failed remotely. The execution
-            // outcome is explicitly unknown and the turn still receives a
-            // fatal Error event immediately afterwards.
+            // Surface the fatal error while the downstream runner still sees
+            // the tool as pending. Otherwise an existing assistant text can
+            // suppress the error after ToolResult clears `pending_tools` and
+            // incorrectly turn an unknown execution outcome into success.
+            events.push(ExecutionEvent::Error {
+                message: message.clone(),
+            });
+            // Then close the lifecycle for downstream accounting without
+            // claiming that the tool succeeded or failed remotely.
             events.push(ExecutionEvent::ToolResult {
                 id: descriptor.id.clone(),
                 name: descriptor.name.clone(),
@@ -854,7 +859,6 @@ impl AppServerEventTranslator {
                     "error": message,
                 }),
             });
-            events.push(ExecutionEvent::Error { message });
         }
         events
     }
@@ -1567,8 +1571,8 @@ mod tests {
         assert!(matches!(
             reconciled.as_slice(),
             [
-                ExecutionEvent::ToolResult { id, name, result },
-                ExecutionEvent::Error { message }
+                ExecutionEvent::Error { message },
+                ExecutionEvent::ToolResult { id, name, result }
             ]
                 if id == "tool-1"
                     && name == "write_file"
@@ -1608,8 +1612,8 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [
-                ExecutionEvent::ToolResult { id, name, result },
-                ExecutionEvent::Error { message }
+                ExecutionEvent::Error { message },
+                ExecutionEvent::ToolResult { id, name, result }
             ]
                 if id == "tool-terminal"
                     && name == "bash"
