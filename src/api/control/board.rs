@@ -145,6 +145,7 @@ pub fn classify_outcome(
 fn has_delivery_evidence(output: &str) -> bool {
     if output.lines().any(|line| {
         line.trim_start()
+            .trim_start_matches("**")
             .to_ascii_uppercase()
             .starts_with("DELIVERED:")
     }) {
@@ -737,6 +738,14 @@ mod tests {
                 Some(TerminalReason::TurnComplete),
                 true,
                 "DELIVERED: Fixed the settle path; verified with cargo test."
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                Some(TerminalReason::TurnComplete),
+                true,
+                "**DELIVERED:** Fixed the settle path; verified with cargo test."
             ),
             BoardTaskOutcome::Success
         );
