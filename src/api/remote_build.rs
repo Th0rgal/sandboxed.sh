@@ -250,22 +250,15 @@ async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
         Ok(handles) => {
             let mut reservations = HashMap::new();
             for handle in handles {
-                *reservations.entry(handle.node_id).or_insert(0) += 1;
+                let heartbeat_seen_at = state
+                    .fleet
+                    .get(&handle.node_id)
+                    .and_then(|status| status.last_seen);
+                if heartbeat_cannot_reflect(handle.started_at, heartbeat_seen_at) {
+                    *reservations.entry(handle.node_id).or_insert(0) += 1;
+                }
             }
-            let heartbeat_job_counts = reservations
-                .keys()
-                .filter_map(|node_id| {
-                    state.fleet.get(node_id).and_then(|status| {
-                        status.last_heartbeat.map(|heartbeat| {
-                            (
-                                node_id.clone(),
-                                heartbeat.active_jobs.saturating_add(heartbeat.queued_jobs),
-                            )
-                        })
-                    })
-                })
-                .collect();
-            reconcile_heartbeat_visible_jobs(reservations, &heartbeat_job_counts)
+            reservations
         }
         Err(error) => {
             tracing::warn!(?error, "remote job reservations could not be loaded");
@@ -274,20 +267,11 @@ async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
     }
 }
 
-fn reconcile_heartbeat_visible_jobs(
-    mut ledger_counts: HashMap<String, u32>,
-    heartbeat_job_counts: &HashMap<String, u32>,
-) -> HashMap<String, u32> {
-    ledger_counts.retain(|node_id, ledger_count| {
-        *ledger_count = ledger_count.saturating_sub(
-            heartbeat_job_counts
-                .get(node_id)
-                .copied()
-                .unwrap_or_default(),
-        );
-        *ledger_count > 0
-    });
-    ledger_counts
+fn heartbeat_cannot_reflect(
+    handle_started_at: chrono::DateTime<chrono::Utc>,
+    heartbeat_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    heartbeat_seen_at.is_none_or(|seen_at| handle_started_at > seen_at)
 }
 
 /// Resolve the target node: explicit id or capacity-aware auto placement.
@@ -747,14 +731,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reservations_exclude_jobs_already_visible_in_heartbeat() {
-        let ledger = HashMap::from([("node-a".to_string(), 2), ("node-b".to_string(), 2)]);
-        let visible = HashMap::from([("node-a".to_string(), 1), ("node-b".to_string(), 3)]);
+    fn reservations_only_include_jobs_newer_than_the_heartbeat() {
+        let heartbeat_seen_at = chrono::Utc::now();
 
-        assert_eq!(
-            reconcile_heartbeat_visible_jobs(ledger, &visible),
-            HashMap::from([("node-a".to_string(), 1)])
-        );
+        assert!(!heartbeat_cannot_reflect(
+            heartbeat_seen_at - chrono::Duration::seconds(1),
+            Some(heartbeat_seen_at)
+        ));
+        assert!(heartbeat_cannot_reflect(
+            heartbeat_seen_at + chrono::Duration::seconds(1),
+            Some(heartbeat_seen_at)
+        ));
+        assert!(heartbeat_cannot_reflect(heartbeat_seen_at, None));
     }
 
     #[cfg(unix)]
