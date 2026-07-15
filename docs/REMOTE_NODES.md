@@ -261,6 +261,10 @@ Validation (node-side, before anything runs):
   `lake build ...` and `lean ...`. The service environment is cleared before
   execution so node bearer/signing secrets are not inherited by build code.
 - `env` keys must be within `SANDBOXED_NODE_ENV_ALLOWLIST`.
+- When the payload omits `LEAN_NUM_THREADS` or `LAKE_JOBS`, the node defaults
+  each missing key to its usable logical-CPU count (`available_parallelism`,
+  including OS affinity/cgroup caps). Explicit allowlisted payload values take
+  precedence independently for each key.
 - `timeout_secs` is clamped to `SANDBOXED_NODE_MAX_JOB_SECS`.
 
 Execution model:
