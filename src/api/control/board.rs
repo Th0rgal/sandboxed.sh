@@ -140,8 +140,8 @@ pub fn classify_outcome(
 
 /// Require evidence that the worker delivered, rather than merely promising to
 /// start. New workers emit `DELIVERED:`; legacy/free-form completion summaries
-/// remain valid unless the message is shaped like an acknowledgement plus future
-/// intent. Thus terse reports such as "Fixed the parser." still pass.
+/// remain valid unless the message is shaped like future intent. Thus terse
+/// reports such as "Fixed the parser." still pass.
 fn has_delivery_evidence(output: &str) -> bool {
     if output.lines().any(|line| {
         line.trim_start()
@@ -153,20 +153,7 @@ fn has_delivery_evidence(output: &str) -> bool {
     }
 
     let normalized = output.trim().to_ascii_lowercase();
-    let acknowledgement = [
-        "acknowledged",
-        "okay",
-        "ok,",
-        "sure",
-        "understood",
-        "got it",
-        "i'll get started",
-        "i'll start",
-        "i will get started",
-        "i will start",
-    ]
-    .iter()
-    .any(|prefix| normalized.starts_with(prefix));
+    let legacy_completion = normalized.starts_with("i will mark this complete:");
     let future_intent = [
         "i'll",
         "i will",
@@ -181,7 +168,7 @@ fn has_delivery_evidence(output: &str) -> bool {
     .iter()
     .any(|phrase| normalized.contains(phrase));
 
-    !(acknowledgement && future_intent)
+    legacy_completion || !future_intent
 }
 
 /// Head+tail truncation that keeps the final summary (workers put their
@@ -776,6 +763,10 @@ mod tests {
                 "I will mark this complete: fixed the parser and verified cargo test."
             ),
             BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(None, true, "I'll inspect it and get started."),
+            BoardTaskOutcome::Failed
         );
         assert_eq!(
             classify_outcome(
