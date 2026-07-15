@@ -280,19 +280,41 @@ pub fn lean_runtime_ready(work_root: &Path) -> bool {
 }
 
 /// Add Lean/Lake concurrency defaults derived from the node process's usable
-/// parallelism. `available_parallelism` accounts for OS affinity and cgroup
-/// limits, so operator-imposed CPU caps remain authoritative. Payload values
-/// are copied last and therefore always win, including independently setting
-/// only one of the two knobs.
+/// parallelism. Lake starts several Lean processes and each Lean process may
+/// use several threads, so assigning the full CPU count to both knobs would
+/// multiply rather than divide the node's CPU budget.
+///
+/// `available_parallelism` accounts for OS affinity and cgroup limits. A
+/// payload may still override either or both values; when it supplies only one
+/// knob, the missing one is derived from the remaining CPU budget.
 fn lean_concurrency_env(
     payload_env: &HashMap<String, String>,
     available_parallelism: usize,
 ) -> HashMap<String, String> {
-    let default = available_parallelism.max(1).to_string();
-    let mut effective = HashMap::from([
-        ("LEAN_NUM_THREADS".to_string(), default.clone()),
-        ("LAKE_JOBS".to_string(), default),
-    ]);
+    const MAX_DEFAULT_LAKE_JOBS: usize = 4;
+
+    fn positive_value(env: &HashMap<String, String>, key: &str) -> Option<usize> {
+        env.get(key)
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+    }
+
+    let budget = available_parallelism.max(1);
+    let explicit_threads = payload_env.contains_key("LEAN_NUM_THREADS");
+    let explicit_lake_jobs = payload_env.contains_key("LAKE_JOBS");
+    let mut effective = HashMap::new();
+
+    if !explicit_lake_jobs {
+        let thread_cost = positive_value(payload_env, "LEAN_NUM_THREADS").unwrap_or(1);
+        let jobs = (budget / thread_cost).clamp(1, MAX_DEFAULT_LAKE_JOBS);
+        effective.insert("LAKE_JOBS".to_string(), jobs.to_string());
+    }
+    if !explicit_threads {
+        let lake_cost = positive_value(payload_env, "LAKE_JOBS")
+            .unwrap_or_else(|| budget.min(MAX_DEFAULT_LAKE_JOBS));
+        let threads = (budget / lake_cost).max(1);
+        effective.insert("LEAN_NUM_THREADS".to_string(), threads.to_string());
+    }
     effective.extend(payload_env.clone());
     effective
 }
@@ -996,9 +1018,9 @@ mod tests {
         let defaults = lean_concurrency_env(&HashMap::new(), 12);
         assert_eq!(
             defaults.get("LEAN_NUM_THREADS").map(String::as_str),
-            Some("12")
+            Some("3")
         );
-        assert_eq!(defaults.get("LAKE_JOBS").map(String::as_str), Some("12"));
+        assert_eq!(defaults.get("LAKE_JOBS").map(String::as_str), Some("4"));
 
         let explicit = HashMap::from([
             ("LEAN_NUM_THREADS".to_string(), "3".to_string()),
@@ -1019,10 +1041,7 @@ mod tests {
             only_threads.get("LEAN_NUM_THREADS").map(String::as_str),
             Some("7")
         );
-        assert_eq!(
-            only_threads.get("LAKE_JOBS").map(String::as_str),
-            Some("12")
-        );
+        assert_eq!(only_threads.get("LAKE_JOBS").map(String::as_str), Some("1"));
 
         let only_lake = lean_concurrency_env(
             &HashMap::from([("LAKE_JOBS".to_string(), "9".to_string())]),
@@ -1030,9 +1049,23 @@ mod tests {
         );
         assert_eq!(
             only_lake.get("LEAN_NUM_THREADS").map(String::as_str),
-            Some("12")
+            Some("1")
         );
         assert_eq!(only_lake.get("LAKE_JOBS").map(String::as_str), Some("9"));
+
+        let dgx_defaults = lean_concurrency_env(&HashMap::new(), 20);
+        assert_eq!(
+            dgx_defaults.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(dgx_defaults.get("LAKE_JOBS").map(String::as_str), Some("4"));
+
+        let single_core = lean_concurrency_env(&HashMap::new(), 1);
+        assert_eq!(
+            single_core.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(single_core.get("LAKE_JOBS").map(String::as_str), Some("1"));
     }
 
     #[test]
