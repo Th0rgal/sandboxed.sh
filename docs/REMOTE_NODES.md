@@ -143,6 +143,10 @@ Wants=network-online.target
 
 [Service]
 EnvironmentFile=/etc/sandboxed-node.env
+# Replace 999 with `id -u sandboxed-node` on this host. System-unit `%U`
+# expands to the system manager (root), not to the account named by `User=`.
+Environment=XDG_RUNTIME_DIR=/run/user/999
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/999/bus
 ExecStart=/usr/local/bin/sandboxed-node
 Restart=always
 RestartSec=5
@@ -151,10 +155,10 @@ Group=sandboxed-node
 WorkingDirectory=/var/lib/sandboxed-node
 NoNewPrivileges=true
 PrivateTmp=true
-# Keep home state immutable while leaving the runner's user-bus socket visible.
-# ProtectHome=true/tmpfs would require a BindReadOnlyPaths entry containing the
-# numeric sandboxed-node UID; %U is not that UID in a system unit.
-ProtectHome=read-only
+# Hide every host home and runtime directory, then expose only the runner's
+# user-manager runtime. Replace 999 with `id -u sandboxed-node` here too.
+ProtectHome=tmpfs
+BindReadOnlyPaths=/run/user/999
 ProtectSystem=strict
 ReadWritePaths=/var/lib/sandboxed-node
 ProtectKernelTunables=true
@@ -176,9 +180,11 @@ process-group cleanup and logs any failed scope stop.
 
 The runner derives `/run/user/<effective-uid>` itself. Do not put
 `XDG_RUNTIME_DIR=/run/user/%U` in a system unit: `%U` describes the systemd
-manager user there (normally root), not the account named by `User=`. An
-explicit, correct `XDG_RUNTIME_DIR` remains supported, but a stale or
-inaccessible value is ignored in favour of the effective-UID path.
+manager user there (normally root), not the account named by `User=`. Use the
+numeric result of `id -u sandboxed-node` for both explicit paths in the unit.
+A stale or inaccessible configured value is ignored in favour of the
+effective-UID path, but the matching `BindReadOnlyPaths` is still required when
+`ProtectHome=tmpfs` hides `/run/user`.
 Lean/Lake builds execute repository-controlled code, so running this service as
 root is unsupported; the argv allowlist is defense in depth, not a sandbox.
 The binary refuses UID 0 by default; `SANDBOXED_NODE_ALLOW_ROOT=1` is available
