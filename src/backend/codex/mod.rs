@@ -446,6 +446,11 @@ async fn send_message_streaming_app_server(
                             );
                         }
                         let _ = tx.send(ExecutionEvent::Cancelled).await;
+                        // Cancellation is terminal for this driver/session.
+                        // Mark it explicitly so the durable tool-call journal
+                        // is removed below instead of retaining command
+                        // arguments for a turn that will never be resumed.
+                        terminal = true;
                         break 'outer;
                     }
                     msg = inbound.recv() => match msg {
