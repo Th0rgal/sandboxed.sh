@@ -244,8 +244,15 @@ fn executable_file(path: &Path) -> bool {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
+        use std::os::unix::ffi::OsStrExt;
+
+        let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `path` is a live, NUL-terminated C string. `access` has no
+        // additional pointer or lifetime requirements and only probes access
+        // for the current process identity (the sandboxed-node service user).
+        unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
     }
     #[cfg(not(unix))]
     {
@@ -1471,6 +1478,8 @@ mod tests {
         let lake = bin.join("lake");
         std::fs::write(&lake, b"#!/bin/sh\n").unwrap();
 
+        assert!(!lean_runtime_ready_with_path(dir.path(), None));
+        std::fs::set_permissions(&lake, std::fs::Permissions::from_mode(0o001)).unwrap();
         assert!(!lean_runtime_ready_with_path(dir.path(), None));
         std::fs::set_permissions(&lake, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(lean_runtime_ready_with_path(dir.path(), None));
