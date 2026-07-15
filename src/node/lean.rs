@@ -234,6 +234,24 @@ fn cache_env(work_root: &Path) -> Vec<(String, String)> {
     ]
 }
 
+/// Add Lean/Lake concurrency defaults derived from the node process's usable
+/// parallelism. `available_parallelism` accounts for OS affinity and cgroup
+/// limits, so operator-imposed CPU caps remain authoritative. Payload values
+/// are copied last and therefore always win, including independently setting
+/// only one of the two knobs.
+fn lean_concurrency_env(
+    payload_env: &HashMap<String, String>,
+    available_parallelism: usize,
+) -> HashMap<String, String> {
+    let default = available_parallelism.max(1).to_string();
+    let mut effective = HashMap::from([
+        ("LEAN_NUM_THREADS".to_string(), default.clone()),
+        ("LAKE_JOBS".to_string(), default),
+    ]);
+    effective.extend(payload_env.clone());
+    effective
+}
+
 /// Derive the default lake cache key from the build cwd: sha256 over the
 /// contents of `lean-toolchain` and `lake-manifest.json` (whichever exist).
 /// `None` when neither file is present (no cache slot is used then).
@@ -702,7 +720,10 @@ pub async fn execute_lean_build(
     for (key, value) in cache_env(work_root) {
         cmd.env(key, value);
     }
-    for (key, value) in env {
+    let available_parallelism = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    for (key, value) in lean_concurrency_env(env, available_parallelism) {
         cmd.env(key, value);
     }
     let limit_secs = clamp_timeout(*timeout_secs, max_job_secs);
@@ -915,6 +936,24 @@ mod tests {
 
     fn allowlist() -> Vec<String> {
         parse_env_allowlist(DEFAULT_ENV_ALLOWLIST)
+    }
+
+    #[test]
+    fn concurrency_env_uses_capability_defaults_and_preserves_explicit_values() {
+        let defaults = lean_concurrency_env(&HashMap::new(), 12);
+        assert_eq!(defaults.get("LEAN_NUM_THREADS").map(String::as_str), Some("12"));
+        assert_eq!(defaults.get("LAKE_JOBS").map(String::as_str), Some("12"));
+
+        let explicit = HashMap::from([
+            ("LEAN_NUM_THREADS".to_string(), "3".to_string()),
+            ("LAKE_JOBS".to_string(), "5".to_string()),
+        ]);
+        let overridden = lean_concurrency_env(&explicit, 12);
+        assert_eq!(
+            overridden.get("LEAN_NUM_THREADS").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(overridden.get("LAKE_JOBS").map(String::as_str), Some("5"));
     }
 
     #[test]
