@@ -250,11 +250,22 @@ async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
         Ok(handles) => {
             let mut reservations = HashMap::new();
             for handle in handles {
-                let heartbeat_started_at = state
-                    .fleet
-                    .get(&handle.node_id)
+                let cached = state.fleet.get(&handle.node_id);
+                let heartbeat_started_at = cached
+                    .as_ref()
                     .and_then(|status| status.last_probe_started_at);
-                if handle_needs_reservation(&handle, heartbeat_started_at) {
+                let heartbeat_has_job_counters = cached
+                    .as_ref()
+                    .and_then(|status| status.last_heartbeat.as_ref())
+                    .is_some_and(|heartbeat| {
+                        heartbeat.protocol_version
+                            >= crate::remote_node::protocol::NODE_PROTOCOL_VERSION
+                    });
+                if handle_needs_reservation(
+                    &handle,
+                    heartbeat_started_at,
+                    heartbeat_has_job_counters,
+                ) {
                     *reservations.entry(handle.node_id).or_insert(0) += 1;
                 }
             }
@@ -277,7 +288,11 @@ fn heartbeat_cannot_reflect(
 fn handle_needs_reservation(
     handle: &crate::remote_node::job_ledger::JobHandle,
     heartbeat_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    heartbeat_has_job_counters: bool,
 ) -> bool {
+    if !heartbeat_has_job_counters {
+        return true;
+    }
     handle
         .accepted_at
         .is_none_or(|accepted_at| heartbeat_cannot_reflect(accepted_at, heartbeat_started_at))
@@ -770,17 +785,25 @@ mod tests {
 
         assert!(handle_needs_reservation(
             &handle,
-            Some(now + chrono::Duration::seconds(1))
+            Some(now + chrono::Duration::seconds(1)),
+            true,
         ));
 
         handle.accepted_at = Some(now + chrono::Duration::seconds(2));
         assert!(handle_needs_reservation(
             &handle,
-            Some(now + chrono::Duration::seconds(1))
+            Some(now + chrono::Duration::seconds(1)),
+            true,
         ));
         assert!(!handle_needs_reservation(
             &handle,
-            Some(now + chrono::Duration::seconds(3))
+            Some(now + chrono::Duration::seconds(3)),
+            true,
+        ));
+        assert!(handle_needs_reservation(
+            &handle,
+            Some(now + chrono::Duration::seconds(3)),
+            false,
         ));
     }
 
