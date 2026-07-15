@@ -1740,6 +1740,20 @@ impl OrchestratorMcp {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        // Auto-detect once for the whole batch. Creating the first worktree
+        // adds another `.git` entry under the workspace, so resolving again
+        // for a later task would make an originally unambiguous checkout look
+        // ambiguous and fall back to the workspace root.
+        let implicit_worktree_repo = params
+            .tasks
+            .iter()
+            .any(|spec| {
+                spec.worktree
+                    .as_ref()
+                    .is_some_and(|worktree| worktree.repo_path.is_none())
+            })
+            .then(|| resolve_repo_path(None));
+
         let mut registered = Vec::with_capacity(params.tasks.len());
         let mut worktrees_created = Vec::new();
         for spec in params.tasks {
@@ -1762,10 +1776,13 @@ impl OrchestratorMcp {
             // Resolve an implicit repository before adding the worktree. Once the
             // worktree exists, auto-detection may see both checkouts and fall back
             // to the workspace root, which is not useful to the host scheduler.
-            let resolved_worktree_repo = spec
-                .worktree
-                .as_ref()
-                .map(|wt| resolve_repo_path(wt.repo_path.as_deref()));
+            let resolved_worktree_repo = spec.worktree.as_ref().map(|wt| {
+                wt.repo_path.clone().unwrap_or_else(|| {
+                    implicit_worktree_repo
+                        .clone()
+                        .expect("implicit worktree repository was resolved before the batch")
+                })
+            });
             let working_directory = if let Some(wt) = &spec.worktree {
                 self.create_worktree(CreateWorktreeParams {
                     path: wt.path.clone(),
