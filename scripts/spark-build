@@ -1,0 +1,87 @@
+#!/bin/sh
+# spark-build CMD... — offload a build to the DGX Spark via the host
+# /api/spark/offload endpoint. Pure offloader: it does NOT fall back to a
+# local build. Exit codes:
+#   0..89, 92..255 = the remote build's own exit code (propagate to caller)
+#   90             = offload not configured / cwd outside workspace (caller may
+#                    fall back to a local build)
+#   91             = offload infrastructure error (HTTP/network; caller may
+#                    fall back to a local build)
+# Requires SPARK_OFFLOAD_{URL,TOKEN,MISSION_ID} and SPARK_WORKSPACE_{HOST,GUEST}_DIR
+# (injected by the backend when the workspace has spark_offload enabled).
+set -u
+
+if [ -z "${SPARK_OFFLOAD_URL:-}" ] || [ -z "${SPARK_OFFLOAD_TOKEN:-}" ] || \
+   [ -z "${SPARK_OFFLOAD_MISSION_ID:-}" ] || [ -z "${SPARK_WORKSPACE_HOST_DIR:-}" ] || \
+   [ -z "${SPARK_WORKSPACE_GUEST_DIR:-}" ]; then
+  echo "spark-build: offload not configured (missing SPARK_OFFLOAD_* env)" >&2
+  exit 90
+fi
+[ "$#" -ge 1 ] || { echo "spark-build: no command given" >&2; exit 2; }
+
+# Derive the build's workspace root + rel from the ACTUAL cwd, not from the
+# injected own *_DIR. Orchestrator fleets build in per-PR git worktrees under the
+# BOSS mission's dir (mission-<boss>/wk-NNNN), so a worker's cwd is under its
+# parent's workspace, not its own (vestigial) dir. We keep our own MISSION_ID +
+# TOKEN for auth; the offload endpoint authorizes a worker's token for an
+# ancestor mission's dir. The workspaces root is the parent of our injected
+# guest/host dirs (both are "<root>/mission-<own>").
+guest_root="$(dirname "${SPARK_WORKSPACE_GUEST_DIR%/}")"
+host_root="$(dirname "${SPARK_WORKSPACE_HOST_DIR%/}")"
+pwd_abs="$(pwd -P)"
+case "$pwd_abs/" in
+  "$guest_root"/mission-*/) : ;;
+  "$guest_root"/mission-*/*) : ;;
+  *)
+    echo "spark-build: cwd $pwd_abs is outside a workspace under $guest_root" >&2
+    exit 90
+    ;;
+esac
+sub="${pwd_abs#"$guest_root"/}"          # mission-<X>/wk-2019  OR  mission-<X>
+ws_name="${sub%%/*}"                      # mission-<X>
+case "$ws_name" in
+  mission-*) : ;;
+  *) echo "spark-build: cannot derive workspace from $pwd_abs" >&2; exit 90 ;;
+esac
+rel="${sub#"$ws_name"}"                   # /wk-2019  OR  (empty)
+rel="${rel#/}"                            # wk-2019   OR  (empty)
+host_dir="$host_root/$ws_name"           # <root>/mission-<X>
+
+SPARK_HOST_DIR="$host_dir" SPARK_REL="$rel" SPARK_CMD="$*" python3 - <<'PY'
+import json, os, sys, urllib.request, urllib.error
+url   = os.environ["SPARK_OFFLOAD_URL"]
+body  = json.dumps({
+    "mission_id": os.environ["SPARK_OFFLOAD_MISSION_ID"],
+    "host_dir":   os.environ["SPARK_HOST_DIR"],
+    "rel":        os.environ.get("SPARK_REL", ""),
+    "cmd":        os.environ["SPARK_CMD"],
+    "priority":   os.environ.get("SPARK_OFFLOAD_PRIORITY", "P0"),  # arbiter accepts P0|P1 only
+}).encode()
+req = urllib.request.Request(url, data=body, method="POST", headers={
+    "Authorization": "Bearer " + os.environ["SPARK_OFFLOAD_TOKEN"],
+    "Content-Type":  "application/json",
+})
+sys.stderr.write("spark-build: offloading to DGX Spark (host_dir=%r rel=%r cmd=%r)\n"
+                 % (os.environ["SPARK_HOST_DIR"], os.environ.get("SPARK_REL", ""), os.environ["SPARK_CMD"]))
+try:
+    # Covers rsync-up + remote build + rsync-back; host caps the build at ~60min.
+    with urllib.request.urlopen(req, timeout=7200) as r:
+        data = json.load(r)
+except urllib.error.HTTPError as e:
+    detail = e.read().decode("utf-8", "replace")[:800]
+    sys.stderr.write("spark-build: offload HTTP %s: %s\n" % (e.code, detail))
+    sys.exit(91)
+except Exception as e:
+    sys.stderr.write("spark-build: offload error: %s\n" % e)
+    sys.exit(91)
+log = data.get("log", "") or ""
+sys.stdout.write(log)
+if not log.endswith("\n"):
+    sys.stdout.write("\n")
+rc = int(data.get("exit_code", -1))
+sys.stderr.write("spark-build: remote build finished (exit=%d)\n" % rc)
+# Map remote exit code into the propagate range; never collide with 90/91.
+if rc in (90, 91) or rc < 0:
+    rc = 1
+sys.exit(rc & 0xff)
+PY
