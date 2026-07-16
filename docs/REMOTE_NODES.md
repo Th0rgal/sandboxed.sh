@@ -316,18 +316,15 @@ Execution model:
 - Builds run with shared caches: `ELAN_HOME=<workdir>/caches/elan`,
   `XDG_CACHE_HOME=<workdir>/caches/xdg`, `HOME=<workdir>/caches/home`, and
   `<workdir>/caches/elan/bin` prepended to `PATH`.
-- Lake dependency cache: `cache_key` defaults to a digest of the build cwd's
-  `lean-toolchain` + `lake-manifest.json`, then is namespaced by repository,
-  build cwd, and command. Before a cold build only
-  `<workdir>/caches/lake/<key>/packages/` is copied without hardlinks into the
-  manifest's configured `packagesDir` (which must be a clean relative path
-  below `lakeDir` and must not overlap the root `buildDir`); after a successful
-  build only that dependency tree is refreshed through a temp dir and atomic
-  rename under a per-key flock. Because Lake 4.24 does not normally persist the
-  evaluated root `buildDir` in `lake-manifest.json`, dependency restore/sync is
-  conservatively skipped unless the manifest explicitly contains `buildDir`.
-  This keeps dynamic lakefile layouts cold rather than risking cross-commit
-  root outputs. No other entry under `lakeDir` is shared.
+- Lake dependency cache: the copy/sync machinery is isolated, namespaced, and
+  lock-protected, but restore and sync currently fail closed. Lake 4.24 does
+  not persist an authoritative evaluated root `buildDir` in
+  `lake-manifest.json`; checked-in manifest fields can also be stale or disagree
+  with a dynamic lakefile. The node therefore never trusts manifest-only layout
+  assertions and keeps repository `.lake` trees cold until a trusted Lake
+  configuration query is implemented. Shared Elan/XDG/Home caches remain
+  enabled, so toolchains and downloads are still reused without sharing root
+  build artifacts across commits.
 - `artifacts` patterns are resolved relative to the checkout root after a
   successful build: exact relative paths, or `*` within a single path
   segment (never across `/`); `..` and absolute paths are rejected. Each

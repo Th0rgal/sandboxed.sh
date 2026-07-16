@@ -2,18 +2,17 @@
 //!
 //! A lean-build job carries only a git source (repo + pinned commit), a
 //! constrained argv (`lake build`/`lean`), and artifact patterns. The node
-//! materializes a content-addressed checkout, restores shared elan/lake
-//! caches, runs the build, syncs the lake cache back on success, and records
-//! artifact digests. No workspace sync with core, no shell interpretation of
-//! the payload.
+//! materializes a content-addressed checkout, restores trusted shared runtime
+//! caches, runs the build, and records artifact digests. Lake dependency-cache
+//! plumbing fails closed until the evaluated package layout can be attested.
+//! No workspace sync with core, no shell interpretation of the payload.
 //!
 //! Layout under `SANDBOXED_NODE_WORK_DIR`:
 //! - `checkouts/<sha256(repo)[..16]>/<commit>/` — immutable-ish checkouts
 //! - `caches/elan/` (`ELAN_HOME`), `caches/xdg/` (`XDG_CACHE_HOME`),
 //!   `caches/home/` (`HOME`) — shared toolchain caches
-//! - `caches/lake/<cache_key>/packages/` — normalized dependency-only Lake
-//!   cache slots, copied into the manifest's configured `packagesDir` before a
-//!   build and refreshed after success; root-project outputs are never shared.
+//! - `caches/lake/<cache_key>/packages/` — reserved dependency-only Lake cache
+//!   slots; restore/sync is disabled while package layout is unverified.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -362,65 +361,17 @@ pub fn derive_cache_key(build_cwd: &Path) -> Option<String> {
     Some(hex::encode(hasher.finalize()))
 }
 
-/// Resolve Lake's configured dependency directory from the manifest without
-/// executing repository code. Both paths must be clean, relative, and the
-/// packages directory must remain below Lake's own directory so cache I/O
-/// cannot escape into root-project or host paths.
-fn configured_lake_cache_paths(build_cwd: &Path) -> Option<(PathBuf, PathBuf)> {
-    let manifest_path = build_cwd.join("lake-manifest.json");
-    let manifest = match std::fs::read(&manifest_path) {
-        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).ok()?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
-        Err(_) => return None,
-    };
-    let lake_rel = Path::new(
-        manifest
-            .get("lakeDir")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(".lake"),
-    );
-    let packages_rel = Path::new(
-        manifest
-            .get("packagesDir")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(".lake/packages"),
-    );
-    // Lake 4.24's manifest normally records lakeDir/packagesDir but does not
-    // record the root package's buildDir.  Falling back to `.lake/build` is
-    // unsafe: a dynamic lakefile can put root outputs below packagesDir, and
-    // sync-back would then persist those outputs across commits.  Cache only
-    // when a producer has explicitly recorded buildDir in the manifest.  This
-    // deliberately turns an unknown layout into a cold build until the node
-    // can query Lake's evaluated package configuration safely.
-    let build_rel = Path::new(
-        manifest
-            .get("buildDir")
-            .and_then(serde_json::Value::as_str)?,
-    );
-    let is_clean_relative = |path: &Path| {
-        !path.as_os_str().is_empty()
-            && !path.is_absolute()
-            && path
-                .components()
-                .all(|component| matches!(component, Component::Normal(_)))
-    };
-    if !is_clean_relative(lake_rel)
-        || !is_clean_relative(packages_rel)
-        || !is_clean_relative(build_rel)
-    {
-        return None;
-    }
-    let package_suffix = packages_rel.strip_prefix(lake_rel).ok()?;
-    if package_suffix.as_os_str().is_empty() {
-        return None;
-    }
-    // Lake's root build directory is commit-specific. If a manifest (or a
-    // future manifest version) points the dependency tree at the same path or
-    // an ancestor/descendant, caching it would persist root `.olean` files.
-    if packages_rel.starts_with(build_rel) || build_rel.starts_with(packages_rel) {
-        return None;
-    }
-    Some((build_cwd.join(lake_rel), build_cwd.join(packages_rel)))
+/// Return dependency-cache paths only after Lake's *evaluated* root package
+/// layout has been attested by the node.
+///
+/// `lake-manifest.json` is repository content and does not authoritatively
+/// describe `buildDir`: a checked-in or stale field can disagree with a
+/// dynamic lakefile. Trusting it could copy root `.olean` files through a
+/// directory presented as `packagesDir`, making a later commit falsely pass.
+/// Until the node has a trusted Lake configuration query, fail closed and keep
+/// these builds cold. Shared Elan/XDG/Home caches remain enabled.
+fn configured_lake_cache_paths(_build_cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    None
 }
 
 /// Namespace a dependency cache key by the project and requested build. A
@@ -1749,19 +1700,11 @@ mod tests {
     }
 
     #[test]
-    fn lake_cache_paths_follow_manifest_packages_dir_and_reject_escapes() {
+    fn lake_dependency_cache_rejects_unverified_manifest_layouts() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("lake-manifest.json"),
-            br#"{"lakeDir":".lake","packagesDir":".lake/deps","buildDir":".lake/build"}"#,
-        )
-        .unwrap();
-
-        let (lake_dir, packages_dir) = configured_lake_cache_paths(dir.path()).unwrap();
-        assert_eq!(lake_dir, dir.path().join(".lake"));
-        assert_eq!(packages_dir, dir.path().join(".lake/deps"));
-
         for manifest in [
+            br#"{"lakeDir":".lake","packagesDir":".lake/deps","buildDir":".lake/build"}"#
+                .as_slice(),
             br#"{"lakeDir":".lake","packagesDir":".lake/deps"}"#.as_slice(),
             br#"{"lakeDir":".lake","packagesDir":"../deps"}"#.as_slice(),
             br#"{"lakeDir":".lake","packagesDir":"deps"}"#.as_slice(),
