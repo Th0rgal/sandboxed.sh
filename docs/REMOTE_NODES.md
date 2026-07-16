@@ -316,12 +316,14 @@ Execution model:
 - Builds run with shared caches: `ELAN_HOME=<workdir>/caches/elan`,
   `XDG_CACHE_HOME=<workdir>/caches/xdg`, `HOME=<workdir>/caches/home`, and
   `<workdir>/caches/elan/bin` prepended to `PATH`.
-- Lake cache: `cache_key` defaults to a digest of the build cwd's
-  `lean-toolchain` + `lake-manifest.json`. Before a cold build the slot
-  `<workdir>/caches/lake/<key>/` is hardlink-copied (`cp -al`) into
-  `<cwd>/.lake`; after a successful build the slot is refreshed the same way
-  (tmp dir + atomic rename, under a per-key flock). Accepted caveat: mtime
-  drift may cause partial rebuilds, never wrong artifacts.
+- Lake dependency cache: `cache_key` defaults to a digest of the build cwd's
+  `lean-toolchain` + `lake-manifest.json`, then is namespaced by repository,
+  build cwd, and command. Before a cold build the slot
+  `<workdir>/caches/lake/<key>/` is copied without hardlinks into
+  `<cwd>/.lake`; after a successful build it is refreshed through a temp dir
+  and atomic rename under a per-key flock. Root-project `.lake/build` outputs
+  are removed both on restore and before persistence, so every commit rebuilds
+  its own sources while dependency outputs under `.lake/packages` stay warm.
 - `artifacts` patterns are resolved relative to the checkout root after a
   successful build: exact relative paths, or `*` within a single path
   segment (never across `/`); `..` and absolute paths are rejected. Each
