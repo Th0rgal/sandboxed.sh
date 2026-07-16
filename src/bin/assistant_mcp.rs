@@ -102,6 +102,7 @@ struct MissionEventsParams {
     since_seq: Option<i64>,
     /// Page backwards: return the newest `limit` events with sequence below
     /// this value (ascending order). Takes precedence over `since_seq`.
+    /// When neither cursor is provided, the MCP defaults to the newest page.
     #[serde(default)]
     before_seq: Option<i64>,
 }
@@ -382,6 +383,28 @@ fn default_limit() -> usize {
 
 fn default_event_limit() -> usize {
     40
+}
+
+fn mission_events_path(
+    id: Uuid,
+    limit: usize,
+    view: &str,
+    before_seq: Option<i64>,
+    since_seq: Option<i64>,
+) -> String {
+    let mut path =
+        format!("/api/control/missions/{id}/events?limit={limit}&view={view}&include_counts=false");
+    if let Some(before_seq) = before_seq {
+        path.push_str(&format!("&before_seq={before_seq}"));
+    } else if let Some(since_seq) = since_seq {
+        path.push_str(&format!("&since_seq={since_seq}"));
+    } else {
+        // The public events endpoint intentionally starts at the oldest row
+        // when no cursor is supplied. Hermes uses this bounded tool for live
+        // reconciliation, so its useful default is the newest page.
+        path.push_str(&format!("&before_seq={}", i64::MAX));
+    }
+    path
 }
 
 fn insert_optional<T: Serialize>(
@@ -778,13 +801,13 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_mission_events".to_string(),
-                description: "Fetch persisted mission events, usually with view='transcript' for chat history or view='all' for debugging.".to_string(),
+                description: "Fetch persisted mission events. Without a cursor, returns the newest bounded page in ascending order; use before_seq to page backwards or since_seq for deltas.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
                     "properties": {
                         "mission_id": {"type": "string"},
-                        "limit": {"type": "integer", "description": "Maximum events to return, default 40."},
+                        "limit": {"type": "integer", "description": "Maximum events to return, default 40 newest events."},
                         "view": {"type": "string", "enum": ["transcript", "trace", "history", "all"]},
                         "since_seq": {"type": "integer", "description": "Return events with sequence greater than this value."},
                         "before_seq": {"type": "integer", "description": "Page backwards: return the newest events with sequence below this value (takes precedence over since_seq)."}
@@ -1183,14 +1206,7 @@ impl AssistantMcp {
                 ))
             }
         };
-        let mut path = format!(
-            "/api/control/missions/{id}/events?limit={limit}&view={view}&include_counts=false"
-        );
-        if let Some(before_seq) = params.before_seq {
-            path.push_str(&format!("&before_seq={before_seq}"));
-        } else if let Some(since_seq) = params.since_seq {
-            path.push_str(&format!("&since_seq={since_seq}"));
-        }
+        let path = mission_events_path(id, limit, view, params.before_seq, params.since_seq);
         let response = self.api_get(&path).await?;
         if !response.status().is_success() {
             return Err(format!(
@@ -2843,6 +2859,21 @@ mod tests {
                 .unwrap()
                 .contains(&json!("confirm")));
         }
+    }
+
+    #[test]
+    fn mission_events_default_to_the_newest_bounded_page() {
+        let id = Uuid::nil();
+        let newest = mission_events_path(id, 40, "all", None, None);
+        assert!(newest.ends_with(&format!("&before_seq={}", i64::MAX)));
+
+        let delta = mission_events_path(id, 40, "all", None, Some(17));
+        assert!(delta.ends_with("&since_seq=17"));
+        assert!(!delta.contains("before_seq"));
+
+        let backwards = mission_events_path(id, 40, "all", Some(99), Some(17));
+        assert!(backwards.ends_with("&before_seq=99"));
+        assert!(!backwards.contains("since_seq"));
     }
 
     #[test]
