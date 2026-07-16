@@ -7255,13 +7255,32 @@ fn copy_host_executable_into_container(
 }
 
 fn parse_cli_semver(output: &str) -> Option<(u64, u64, u64)> {
+    parse_cli_version(output).map(|version| version.semver)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedCliVersion {
+    semver: (u64, u64, u64),
+    install_version: String,
+}
+
+fn parse_cli_version(output: &str) -> Option<ParsedCliVersion> {
     output.split_whitespace().find_map(|word| {
         let candidate = word.trim_start_matches(['v', 'V']);
+        if !candidate
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+        {
+            return None;
+        }
         let mut parts = candidate.split(['.', '-', '+']);
         let major = parts.next()?.parse().ok()?;
         let minor = parts.next()?.parse().ok()?;
         let patch = parts.next()?.parse().ok()?;
-        Some((major, minor, patch))
+        Some(ParsedCliVersion {
+            semver: (major, minor, patch),
+            install_version: candidate.to_string(),
+        })
     })
 }
 
@@ -7277,8 +7296,8 @@ enum CopiedOpenCodeProbe {
 /// a PATH lookup) as proof that a host-native binary can run in an nspawn
 /// rootfs.
 fn classify_copied_opencode_probe(
-    host_version: (u64, u64, u64),
-    copied_version: Option<(u64, u64, u64)>,
+    host_version: &ParsedCliVersion,
+    copied_version: Option<&ParsedCliVersion>,
 ) -> CopiedOpenCodeProbe {
     match copied_version {
         Some(version) if version == host_version => CopiedOpenCodeProbe::MatchesHost,
@@ -7287,14 +7306,14 @@ fn classify_copied_opencode_probe(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ContainerOpenCodeSync {
     NotNeeded,
     Copied,
-    NeedsContainerInstall { host_version: (u64, u64, u64) },
+    NeedsContainerInstall { host_version: ParsedCliVersion },
 }
 
-async fn host_cli_version(program: &std::path::Path) -> Option<(u64, u64, u64)> {
+async fn host_cli_version(program: &std::path::Path) -> Option<ParsedCliVersion> {
     let output = tokio::process::Command::new(program)
         .arg("--version")
         .output()
@@ -7308,14 +7327,14 @@ async fn host_cli_version(program: &std::path::Path) -> Option<(u64, u64, u64)> 
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    parse_cli_semver(&combined)
+    parse_cli_version(&combined)
 }
 
 async fn workspace_cli_version(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     program: &str,
-) -> Option<(u64, u64, u64)> {
+) -> Option<ParsedCliVersion> {
     let output = workspace_exec
         .output(cwd, program, &["--version".to_string()], HashMap::new())
         .await
@@ -7328,7 +7347,7 @@ async fn workspace_cli_version(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    parse_cli_semver(&combined)
+    parse_cli_version(&combined)
 }
 
 /// Keep a container's managed OpenCode CLI identical to the backend host CLI.
@@ -7368,13 +7387,13 @@ async fn sync_container_opencode_from_host(
         None
     };
 
-    if container_version == Some(host_version) {
+    if container_version.as_ref() == Some(&host_version) {
         return Ok(ContainerOpenCodeSync::NotNeeded);
     }
 
     let installed = copy_host_executable_into_container(&workspace_exec.workspace, &host_opencode)?;
     let installed_version = workspace_cli_version(workspace_exec, cwd, &installed).await;
-    if classify_copied_opencode_probe(host_version, installed_version)
+    if classify_copied_opencode_probe(&host_version, installed_version.as_ref())
         != CopiedOpenCodeProbe::MatchesHost
     {
         // A host-native OpenCode can be dynamically linked against libraries
@@ -7500,8 +7519,8 @@ pub(crate) async fn ensure_opencode_cli_available(
     args.push("-lc".to_string());
     // Use explicit /root path for container workspaces since $HOME may not be set in nspawn
     // Try both /root and $HOME to cover both container and host workspaces
-    let installer_flags = if let Some((major, minor, patch)) = fallback_host_version {
-        format!("--version {major}.{minor}.{patch} --no-modify-path")
+    let installer_flags = if let Some(version) = &fallback_host_version {
+        format!("--version {} --no-modify-path", version.install_version)
     } else {
         "--no-modify-path".to_string()
     };
@@ -7541,7 +7560,7 @@ pub(crate) async fn ensure_opencode_cli_available(
     if let Some(host_version) = fallback_host_version {
         let installed_version =
             workspace_cli_version(workspace_exec, cwd, "/usr/local/bin/opencode").await;
-        if installed_version != Some(host_version) {
+        if installed_version.as_ref() != Some(&host_version) {
             return Err(format!(
                 "OpenCode install completed but '/usr/local/bin/opencode --version' returned {:?}, expected {:?}.",
                 installed_version, host_version
@@ -8498,7 +8517,7 @@ mod tests {
         is_tool_call_only_output, opencode_goal_terminal_status,
         opencode_idle_timeout_result_message, opencode_output_needs_fallback,
         opencode_session_exists_in_data_home, opencode_session_token_from_line,
-        overlay_opencode_auth, parse_cli_semver, parse_opencode_goal_objective,
+        overlay_opencode_auth, parse_cli_semver, parse_cli_version, parse_opencode_goal_objective,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, preferred_opencode_bin_dir, prepend_unique_path_entry,
         record_codex_error_message, replace_filepath_artifact_with_tool_output,
@@ -11493,12 +11512,19 @@ mod tests {
             parse_cli_semver("opencode version v1.17.18-beta.2"),
             Some((1, 17, 18))
         );
+        assert_eq!(
+            parse_cli_version("opencode version v1.17.18-beta.2")
+                .expect("parsed version")
+                .install_version,
+            "1.17.18-beta.2"
+        );
     }
 
     #[test]
     fn parse_cli_semver_rejects_incomplete_or_unrelated_output() {
         assert_eq!(parse_cli_semver("opencode 1.17"), None);
         assert_eq!(parse_cli_semver("version unknown"), None);
+        assert_eq!(parse_cli_semver("1.17.18-beta;echo"), None);
     }
 
     #[test]
@@ -11506,24 +11532,30 @@ mod tests {
         // Captured from the backend host's native OpenCode CLI. A bare semver
         // is the normal output shape, not an installer error.
         let host = parse_cli_semver("1.17.18\n").expect("host OpenCode semver");
+        let host_version = parse_cli_version("1.17.18\n").expect("host OpenCode version");
+        let copied_version = parse_cli_version("1.17.18\n").expect("copied OpenCode version");
+        assert_eq!(host, host_version.semver,);
         assert_eq!(
-            classify_copied_opencode_probe(host, parse_cli_semver("1.17.18\n")),
+            classify_copied_opencode_probe(&host_version, Some(&copied_version)),
             CopiedOpenCodeProbe::MatchesHost
         );
     }
 
     #[test]
     fn copied_opencode_probe_requires_container_install_for_mismatch_or_failure() {
-        let host = (1, 17, 18);
+        let host = parse_cli_version("1.17.18-beta.2").expect("host OpenCode version");
+        let stable = parse_cli_version("opencode version v1.17.18").expect("stable version");
+        let older = parse_cli_version("opencode version v1.16.9-beta.1").expect("older version");
         assert_eq!(
-            classify_copied_opencode_probe(
-                host,
-                parse_cli_semver("opencode version v1.16.9-beta.1"),
-            ),
+            classify_copied_opencode_probe(&host, Some(&stable)),
             CopiedOpenCodeProbe::DifferentVersion
         );
         assert_eq!(
-            classify_copied_opencode_probe(host, parse_cli_semver("not found")),
+            classify_copied_opencode_probe(&host, Some(&older)),
+            CopiedOpenCodeProbe::DifferentVersion
+        );
+        assert_eq!(
+            classify_copied_opencode_probe(&host, parse_cli_version("not found").as_ref()),
             CopiedOpenCodeProbe::Unavailable
         );
     }
