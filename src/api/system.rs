@@ -792,15 +792,9 @@ async fn get_assistant_mcp_info() -> ComponentInfo {
 }
 
 async fn get_hermes_assistant_info(config: &crate::config::Config) -> ComponentInfo {
-    let expected_service = format!("{}.service", assistant_runtime_name(config));
-    let fallback_service = if expected_service == "hermes-assistant-dev.service" {
-        "hermes-assistant.service"
-    } else {
-        "hermes-assistant-dev.service"
-    };
-
-    for service_name in [expected_service.as_str(), fallback_service] {
-        if let Some(info) = get_systemd_service_component("hermes_assistant", service_name).await {
+    for runtime_name in assistant_runtime_candidates(config) {
+        let service_name = format!("{runtime_name}.service");
+        if let Some(info) = get_systemd_service_component("hermes_assistant", &service_name).await {
             return info;
         }
     }
@@ -1111,6 +1105,16 @@ fn assistant_runtime_name(config: &crate::config::Config) -> &'static str {
     }
 }
 
+fn assistant_runtime_candidates(config: &crate::config::Config) -> [&'static str; 2] {
+    let expected = assistant_runtime_name(config);
+    let fallback = if expected == "hermes-assistant-dev" {
+        "hermes-assistant"
+    } else {
+        "hermes-assistant-dev"
+    };
+    [expected, fallback]
+}
+
 fn local_api_url(config: &crate::config::Config) -> String {
     format!("http://127.0.0.1:{}", config.port)
 }
@@ -1344,6 +1348,9 @@ ExecStart=/usr/local/bin/hermes gateway --accept-hooks run
 Restart=always
 RestartSec=5
 TimeoutStopSec=240
+# Signal only the gateway during its graceful drain. Its MCP/tool children must
+# remain available until Hermes finishes or the timeout escalates to SIGKILL.
+KillMode=mixed
 NoNewPrivileges=true
 PrivateTmp=true
 
@@ -1351,6 +1358,78 @@ PrivateTmp=true
 WantedBy=multi-user.target
 "#
     )
+}
+
+const HERMES_SERVICE_DRAIN_DROP_IN: &str = "[Service]\nKillMode=mixed\n";
+
+/// Migrate an already-installed Hermes service to the same drain-safe process
+/// policy used by newly generated units.
+///
+/// A regular systemd stop signals every process in the service cgroup when the
+/// default `KillMode=control-group` is in effect. That kills `assistant-mcp`
+/// while the Hermes gateway is still draining an in-flight controller turn.
+/// Installing a drop-in is deliberately narrower than re-running adoption: it
+/// preserves the existing Hermes environment, plugins, credentials, and unit
+/// customizations.
+pub async fn reconcile_hermes_service_drain_policy(
+    config: &crate::config::Config,
+) -> Result<bool, String> {
+    let mut changed = false;
+    let mut needs_reload = false;
+    for runtime_name in assistant_runtime_candidates(config) {
+        let service_name = format!("{runtime_name}.service");
+        let service_path = format!("/etc/systemd/system/{service_name}");
+        if !tokio::fs::try_exists(&service_path)
+            .await
+            .map_err(|e| format!("failed to inspect {service_path}: {e}"))?
+        {
+            continue;
+        }
+
+        let drop_in_dir = format!("/etc/systemd/system/{service_name}.d");
+        let drop_in_path = format!("{drop_in_dir}/60-sandboxed-drain.conf");
+        let drop_in_is_current = tokio::fs::read_to_string(&drop_in_path)
+            .await
+            .ok()
+            .as_deref()
+            == Some(HERMES_SERVICE_DRAIN_DROP_IN);
+
+        if !drop_in_is_current {
+            tokio::fs::create_dir_all(&drop_in_dir)
+                .await
+                .map_err(|e| format!("failed to create {drop_in_dir}: {e}"))?;
+            write_private_file(&drop_in_path, HERMES_SERVICE_DRAIN_DROP_IN).await?;
+            changed = true;
+        }
+
+        // Checking systemd's effective value makes a failed daemon-reload
+        // self-healing. The drop-in may already be on disk from a previous
+        // attempt, but an old manager configuration still reports the default
+        // control-group policy and therefore triggers another reload.
+        let effective_kill_mode = run_host_command(
+            "systemctl",
+            &["show", "--property=KillMode", "--value", &service_name],
+        )
+        .await;
+        match effective_kill_mode {
+            Ok(mode) => needs_reload |= mode.trim() != "mixed",
+            Err(err) => {
+                // An installed unit may not be known to the manager yet. A
+                // daemon-reload is the recovery path, so do not fail before
+                // giving it a chance to discover the unit and drop-in.
+                tracing::warn!(
+                    service = %service_name,
+                    %err,
+                    "Could not inspect Hermes drain policy; forcing daemon-reload"
+                );
+                needs_reload = true;
+            }
+        }
+    }
+    if changed || needs_reload {
+        run_host_command("systemctl", &["daemon-reload"]).await?;
+    }
+    Ok(changed || needs_reload)
 }
 
 async fn run_host_command(program: &str, args: &[&str]) -> Result<String, String> {
@@ -4756,10 +4835,11 @@ fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::conve
 mod tests {
     use super::{
         evaluate_debounce, evaluate_deploy_request, expand_hermes_env_refs, extract_version_token,
-        hermes_config_base_url, hermes_config_model_label, hermes_config_yaml,
+        hermes_config_base_url, hermes_config_model_label, hermes_config_yaml, hermes_service_unit,
         hermes_uses_native_codex, is_safe_repo_path, normalize_repo_path, prune_deploy_backups,
         sandboxed_service_name_from_path, select_repo_path, systemd_service_component_from_states,
         ComponentStatus, DebounceDecision, DeployRefusal, DEPLOY_DEBOUNCE_SECS,
+        HERMES_SERVICE_DRAIN_DROP_IN,
     };
 
     #[test]
@@ -4796,6 +4876,20 @@ mod tests {
                 "generated Hermes config missing {tool}"
             );
         }
+    }
+
+    #[test]
+    fn generated_hermes_service_keeps_mcp_children_alive_during_drain() {
+        let unit = hermes_service_unit(
+            "hermes-assistant",
+            "/etc/sandboxed-sh/hermes-assistant.env",
+            "sandboxed-sh-prod.service",
+        );
+
+        assert!(unit.contains("TimeoutStopSec=240\n"));
+        assert!(unit.contains("KillMode=mixed\n"));
+        assert!(!unit.contains("KillMode=control-group"));
+        assert_eq!(HERMES_SERVICE_DRAIN_DROP_IN, "[Service]\nKillMode=mixed\n");
     }
 
     #[tokio::test]

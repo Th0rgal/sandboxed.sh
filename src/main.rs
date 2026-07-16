@@ -36,6 +36,14 @@ async fn async_main() -> anyhow::Result<()> {
             .as_deref()
             .unwrap_or("(opencode default)")
     );
+    match api::system::reconcile_hermes_service_drain_policy(&config).await {
+        Ok(true) => info!("Migrated Hermes service to drain-safe mixed kill mode"),
+        Ok(false) => {}
+        Err(error) => warn!(
+            "Could not reconcile Hermes service drain policy: {}. Existing Hermes configuration was left unchanged.",
+            error
+        ),
+    }
     let context_root = config
         .context
         .context_dir(&config.working_dir.to_string_lossy());

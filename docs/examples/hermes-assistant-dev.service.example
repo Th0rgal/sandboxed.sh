@@ -16,8 +16,14 @@ ExecStart=/usr/local/bin/hermes gateway --accept-hooks run
 Restart=always
 RestartSec=5
 TimeoutStopSec=240
+# Keep MCP/tool children alive while the gateway drains active turns. systemd
+# still SIGKILLs the complete cgroup if the stop timeout expires.
+KillMode=mixed
 NoNewPrivileges=true
 PrivateTmp=true
+
+# Existing installations are migrated by sandboxed.sh at startup through
+# hermes-assistant*.service.d/60-sandboxed-drain.conf; no re-adoption is needed.
 
 [Install]
 WantedBy=multi-user.target
