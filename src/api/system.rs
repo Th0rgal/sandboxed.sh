@@ -1375,6 +1375,7 @@ pub async fn reconcile_hermes_service_drain_policy(
     config: &crate::config::Config,
 ) -> Result<bool, String> {
     let mut changed = false;
+    let mut needs_reload = false;
     for runtime_name in assistant_runtime_candidates(config) {
         let service_name = format!("{runtime_name}.service");
         let service_path = format!("/etc/systemd/system/{service_name}");
@@ -1387,25 +1388,35 @@ pub async fn reconcile_hermes_service_drain_policy(
 
         let drop_in_dir = format!("/etc/systemd/system/{service_name}.d");
         let drop_in_path = format!("{drop_in_dir}/60-sandboxed-drain.conf");
-        if tokio::fs::read_to_string(&drop_in_path)
+        let drop_in_is_current = tokio::fs::read_to_string(&drop_in_path)
             .await
             .ok()
             .as_deref()
-            == Some(HERMES_SERVICE_DRAIN_DROP_IN)
-        {
-            continue;
+            == Some(HERMES_SERVICE_DRAIN_DROP_IN);
+
+        if !drop_in_is_current {
+            tokio::fs::create_dir_all(&drop_in_dir)
+                .await
+                .map_err(|e| format!("failed to create {drop_in_dir}: {e}"))?;
+            write_private_file(&drop_in_path, HERMES_SERVICE_DRAIN_DROP_IN).await?;
+            changed = true;
         }
 
-        tokio::fs::create_dir_all(&drop_in_dir)
-            .await
-            .map_err(|e| format!("failed to create {drop_in_dir}: {e}"))?;
-        write_private_file(&drop_in_path, HERMES_SERVICE_DRAIN_DROP_IN).await?;
-        changed = true;
+        // Checking systemd's effective value makes a failed daemon-reload
+        // self-healing. The drop-in may already be on disk from a previous
+        // attempt, but an old manager configuration still reports the default
+        // control-group policy and therefore triggers another reload.
+        let effective_kill_mode = run_host_command(
+            "systemctl",
+            &["show", "--property=KillMode", "--value", &service_name],
+        )
+        .await?;
+        needs_reload |= effective_kill_mode.trim() != "mixed";
     }
-    if changed {
+    if changed || needs_reload {
         run_host_command("systemctl", &["daemon-reload"]).await?;
     }
-    Ok(changed)
+    Ok(changed || needs_reload)
 }
 
 async fn run_host_command(program: &str, args: &[&str]) -> Result<String, String> {
