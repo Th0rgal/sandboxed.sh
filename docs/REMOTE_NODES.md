@@ -350,12 +350,23 @@ A node is eligible when all of the following hold:
 - `mem_available` ≥ `REMOTE_NODE_MIN_MEM_GB` (default 8)
 - `active_jobs + queued_jobs + active_leases + core reservations < 2 * capacity_total`
 
-Eligible nodes are ranked least-loaded first (ties broken by most available
-memory). When no node qualifies the request **fails closed** with every
+Eligible nodes are ranked by immediate capacity, specialization, and normalized
+utilization. Ordinary CPU/Lean jobs prefer non-GPU nodes while those nodes have
+an immediate slot, preserving GPU runners for inference. A free GPU node is
+still selected before queueing behind a saturated CPU node, and an explicit
+`"gpu"` requirement selects only GPU-capable nodes. Within a tier, lower
+`(active + queued + leases + reservations) / capacity_total` wins, with
+available memory and stable node id as tie-breakers. When no node qualifies the
+request **fails closed** with every
 configured node listed alongside its exclusion reason (offline / missing
 label X / low disk / low memory / busy), e.g.
 `no eligible remote node (babylon: low disk (12 GiB available, 20 GiB
 required); nippur: missing label 'lean')`.
+
+Hermes receives the same live capacity through the assistant MCP
+`get_compute_fleet` tool. Controllers should call it before parallel dispatch,
+then independently verify actual distribution from the returned remote job
+receipts; declared capacity is not placement evidence.
 
 ## POST /api/remote-build
 

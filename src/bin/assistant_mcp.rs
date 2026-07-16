@@ -902,6 +902,11 @@ impl AssistantMcp {
                 }),
             },
             ToolDefinition {
+                name: "get_compute_fleet".to_string(),
+                description: "Get a compact live view of sandboxed.sh compute capacity: remote node health, labels, Lean readiness/toolchains, available slots, active/queued jobs, and recent placement receipts. Use this before dispatching parallel compute or choosing a remote validation node. Ordinary CPU/Lean work should prefer non-GPU nodes while they have immediate capacity; request the gpu label only for GPU work.".to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
                 name: "list_workspaces".to_string(),
                 description: "List sandboxed.sh workspaces so new missions can target the right environment.".to_string(),
                 input_schema: json!({"type": "object", "properties": {}}),
@@ -1432,6 +1437,20 @@ impl AssistantMcp {
             return Err(format!("Failed to cancel mission: {text}"));
         }
         Ok(json!({ "success": true, "cancelled": id.to_string() }))
+    }
+
+    async fn get_compute_fleet(&self) -> Result<Value, String> {
+        let response = self.api_get("/api/remote-nodes").await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to get compute fleet ({status}): {text}"));
+        }
+        let fleet: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("Failed to parse compute fleet: {error}"))?;
+        Ok(compact_compute_fleet(&fleet))
     }
 
     async fn list_workspaces(&self) -> Result<Value, String> {
@@ -1968,6 +1987,7 @@ impl AssistantMcp {
                     .map_err(|error| format!("Invalid params: {error}"))?;
                 self.cancel_mission(params).await
             }
+            "get_compute_fleet" => self.get_compute_fleet().await,
             "list_workspaces" => self.list_workspaces().await,
             "get_workspace" => {
                 let params: WorkspaceIdParams = serde_json::from_value(arguments)
@@ -2091,6 +2111,84 @@ fn resolve_default_workspace_id(explicit_workspace_id: Option<String>) -> Option
         .or_else(|| std::env::var("HERMES_DEFAULT_WORKSPACE_ID").ok())
         .or_else(|| std::env::var("ASSISTANT_DEFAULT_WORKSPACE_ID").ok())
         .filter(|value| !value.trim().is_empty())
+}
+
+fn compact_compute_fleet(fleet: &Value) -> Value {
+    let nodes = fleet
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let compact_nodes: Vec<Value> = nodes
+        .iter()
+        .map(|node| {
+            json!({
+                "id": node.get("id").cloned().unwrap_or(Value::Null),
+                "status": node.get("status").cloned().unwrap_or(Value::Null),
+                "labels": node.get("labels").cloned().unwrap_or_else(|| json!([])),
+                "capacity_total": node.get("capacity_total").cloned().unwrap_or(Value::Null),
+                "capacity_available": node.get("capacity_available").cloned().unwrap_or(Value::Null),
+                "active_jobs": node.get("active_jobs").cloned().unwrap_or(Value::Null),
+                "queued_jobs": node.get("queued_jobs").cloned().unwrap_or(Value::Null),
+                "cpu_total": node.get("cpu_total").cloned().unwrap_or(Value::Null),
+                "mem_available_bytes": node.get("mem_available_bytes").cloned().unwrap_or(Value::Null),
+                "disk_available_bytes": node.get("disk_available_bytes").cloned().unwrap_or(Value::Null),
+                "cached_toolchains": node.get("cached_toolchains").cloned().unwrap_or_else(|| json!([])),
+                "lean_runtime_ready": node.get("lean_runtime_ready").cloned().unwrap_or(Value::Null),
+                "error": node.get("error").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+
+    let online = nodes
+        .iter()
+        .filter(|node| node.get("status").and_then(Value::as_str) == Some("online"));
+    let online_nodes = online.clone().count();
+    let lean_nodes: Vec<&Value> = online
+        .filter(|node| {
+            node.get("lean_runtime_ready").and_then(Value::as_bool) != Some(false)
+                && node
+                    .get("labels")
+                    .and_then(Value::as_array)
+                    .is_some_and(|labels| labels.iter().any(|label| label.as_str() == Some("lean")))
+        })
+        .collect();
+    let lean_slots_total = lean_nodes
+        .iter()
+        .filter_map(|node| node.get("capacity_total").and_then(Value::as_u64))
+        .sum::<u64>();
+    let lean_slots_available = lean_nodes
+        .iter()
+        .filter_map(|node| node.get("capacity_available").and_then(Value::as_u64))
+        .sum::<u64>();
+    let active_jobs = nodes
+        .iter()
+        .filter_map(|node| node.get("active_jobs").and_then(Value::as_u64))
+        .sum::<u64>();
+    let queued_jobs = nodes
+        .iter()
+        .filter_map(|node| node.get("queued_jobs").and_then(Value::as_u64))
+        .sum::<u64>();
+
+    json!({
+        "enabled": fleet.get("enabled").cloned().unwrap_or(Value::Bool(false)),
+        "summary": {
+            "nodes_total": nodes.len(),
+            "nodes_online": online_nodes,
+            "lean_nodes_online": lean_nodes.len(),
+            "lean_slots_total": lean_slots_total,
+            "lean_slots_available": lean_slots_available,
+            "active_remote_jobs": active_jobs,
+            "queued_remote_jobs": queued_jobs,
+        },
+        "placement_policy": {
+            "ordinary_cpu_work": "prefer online non-GPU nodes with immediate capacity, then lowest normalized utilization",
+            "gpu_work": "request the gpu label explicitly",
+            "parallel_clean_builds": "use distinct missions and verify distinct node/job/head receipts",
+        },
+        "nodes": compact_nodes,
+        "recent_jobs": fleet.get("recent_jobs").cloned().unwrap_or_else(|| json!([])),
+    })
 }
 
 fn compact_mission_summary(mission: Value) -> Value {
@@ -2830,6 +2928,7 @@ mod tests {
     fn workspace_management_tools_are_exposed_with_destructive_confirmations() {
         let tools = AssistantMcp::tools();
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert!(names.contains(&"get_compute_fleet"));
         for expected in [
             "get_workspace",
             "create_workspace",
@@ -2859,6 +2958,71 @@ mod tests {
                 .unwrap()
                 .contains(&json!("confirm")));
         }
+    }
+
+    #[test]
+    fn compute_fleet_summary_is_compact_and_capacity_aware() {
+        let raw = json!({
+            "enabled": true,
+            "nodes": [
+                {
+                    "id": "cpu",
+                    "status": "online",
+                    "labels": ["lean"],
+                    "capacity_total": 2,
+                    "capacity_available": 1,
+                    "active_jobs": 1,
+                    "queued_jobs": 0,
+                    "cpu_total": 8,
+                    "mem_available_bytes": 32_u64 << 30,
+                    "disk_available_bytes": 100_u64 << 30,
+                    "cached_toolchains": ["leanprover--lean4---v4.24.0"],
+                    "lean_runtime_ready": true,
+                    "base_url": "must-not-leak"
+                },
+                {
+                    "id": "general",
+                    "status": "online",
+                    "labels": ["general"],
+                    "capacity_total": 1,
+                    "capacity_available": 1,
+                    "active_jobs": 0,
+                    "queued_jobs": 0,
+                    "lean_runtime_ready": false
+                },
+                {
+                    "id": "gpu-only",
+                    "status": "online",
+                    "labels": ["gpu"],
+                    "capacity_total": 4,
+                    "capacity_available": 4,
+                    "active_jobs": 0,
+                    "queued_jobs": 0,
+                    "lean_runtime_ready": true,
+                    "error": "probe degraded"
+                },
+                {
+                    "id": "legacy-lean",
+                    "status": "online",
+                    "labels": ["lean"],
+                    "capacity_total": 1,
+                    "capacity_available": 1,
+                    "active_jobs": 0,
+                    "queued_jobs": 0
+                }
+            ],
+            "recent_jobs": [{"job_id": "job", "node_id": "cpu", "state": "succeeded"}]
+        });
+
+        let compact = compact_compute_fleet(&raw);
+        assert_eq!(compact["summary"]["nodes_online"], 4);
+        assert_eq!(compact["summary"]["lean_nodes_online"], 2);
+        assert_eq!(compact["summary"]["lean_slots_total"], 3);
+        assert_eq!(compact["summary"]["lean_slots_available"], 2);
+        assert_eq!(compact["summary"]["active_remote_jobs"], 1);
+        assert!(compact["nodes"][0].get("base_url").is_none());
+        assert_eq!(compact["nodes"][2]["error"], "probe degraded");
+        assert_eq!(compact["recent_jobs"][0]["node_id"], "cpu");
     }
 
     #[test]

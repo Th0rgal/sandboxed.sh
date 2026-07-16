@@ -278,7 +278,15 @@ pub fn select_node_auto_with_reservations(
     reservations: &HashMap<String, u32>,
 ) -> Result<String, PlacementError> {
     let mut reasons: Vec<(String, String)> = Vec::new();
-    let mut eligible: Vec<(u32, u64, String)> = Vec::new(); // (load, mem_avail, id)
+    // (queued, specialized, load, capacity, mem_avail, id)
+    //
+    // `specialized` keeps scarce GPU runners available for inference while a
+    // normal CPU runner still has an immediate slot. It is deliberately sorted
+    // after `queued`: an idle GPU runner is still better than queueing behind a
+    // saturated CPU-only node. Within the same tier, normalized utilization
+    // lets two-slot nodes consume their second slot before one-slot nodes are
+    // overloaded.
+    let mut eligible: Vec<(bool, bool, u32, u32, u64, String)> = Vec::new();
     for node in nodes {
         let cached = statuses.get(&node.id);
         let status = cached
@@ -351,13 +359,30 @@ pub fn select_node_auto_with_reservations(
             ));
             continue;
         }
-        eligible.push((load, heartbeat.mem_available_bytes, node.id.clone()));
+        let queued = load >= heartbeat.capacity_total;
+        let specialized = labels.iter().any(|label| label == "gpu")
+            && !requirements.iter().any(|requirement| requirement == "gpu");
+        eligible.push((
+            queued,
+            specialized,
+            load,
+            heartbeat.capacity_total.max(1),
+            heartbeat.mem_available_bytes,
+            node.id.clone(),
+        ));
     }
-    eligible.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    eligible.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cmp(&b.1))
+            // Compare load/capacity without floating point.
+            .then((a.2 as u64 * b.3 as u64).cmp(&(b.2 as u64 * a.3 as u64)))
+            .then(b.4.cmp(&a.4))
+            .then(a.5.cmp(&b.5))
+    });
     eligible
         .into_iter()
         .next()
-        .map(|(_, _, id)| id)
+        .map(|(_, _, _, _, _, id)| id)
         .ok_or(PlacementError { reasons })
 }
 
@@ -779,6 +804,73 @@ mod tests {
         let picked =
             select_node_auto(&[node_config("e")], &statuses, &[], 20 * GIB, 8 * GIB).unwrap();
         assert_eq!(picked, "e");
+    }
+
+    #[test]
+    fn placement_reserves_idle_gpu_for_inference_when_cpu_capacity_exists() {
+        let nodes = vec![node_config("cpu"), node_config("gpu")];
+        let statuses = HashMap::from([
+            (
+                "cpu".to_string(),
+                cached_online("cpu", &["lean"], 100, 16, 1, 0, 0),
+            ),
+            (
+                "gpu".to_string(),
+                cached_online("gpu", &["lean", "gpu", "high-memory"], 100, 128, 1, 0, 0),
+            ),
+        ]);
+
+        let picked =
+            select_node_auto(&nodes, &statuses, &["lean".to_string()], 20 * GIB, 8 * GIB).unwrap();
+        assert_eq!(picked, "cpu");
+
+        let picked = select_node_auto(
+            &nodes,
+            &statuses,
+            &["lean".to_string(), "gpu".to_string()],
+            20 * GIB,
+            8 * GIB,
+        )
+        .unwrap();
+        assert_eq!(picked, "gpu");
+    }
+
+    #[test]
+    fn placement_uses_idle_gpu_before_queueing_on_saturated_cpu() {
+        let nodes = vec![node_config("cpu"), node_config("gpu")];
+        let statuses = HashMap::from([
+            (
+                "cpu".to_string(),
+                cached_online("cpu", &["lean"], 100, 16, 1, 1, 0),
+            ),
+            (
+                "gpu".to_string(),
+                cached_online("gpu", &["lean", "gpu"], 100, 128, 1, 0, 0),
+            ),
+        ]);
+
+        let picked =
+            select_node_auto(&nodes, &statuses, &["lean".to_string()], 20 * GIB, 8 * GIB).unwrap();
+        assert_eq!(picked, "gpu");
+    }
+
+    #[test]
+    fn placement_prefers_lower_normalized_utilization() {
+        let nodes = vec![node_config("single"), node_config("double")];
+        let statuses = HashMap::from([
+            (
+                "single".to_string(),
+                cached_online("single", &["lean"], 100, 64, 1, 1, 0),
+            ),
+            (
+                "double".to_string(),
+                cached_online("double", &["lean"], 100, 32, 2, 1, 0),
+            ),
+        ]);
+
+        let picked =
+            select_node_auto(&nodes, &statuses, &["lean".to_string()], 20 * GIB, 8 * GIB).unwrap();
+        assert_eq!(picked, "double");
     }
 
     #[test]

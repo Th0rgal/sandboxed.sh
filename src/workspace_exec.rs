@@ -984,12 +984,17 @@ mod tests {
 
     #[test]
     fn nspawn_cmdline_directory_supports_short_and_long_forms() {
+        let assistant = nspawn_directory_from_cmdline(
+            b"/usr/bin/systemd-nspawn\0-D\0/var/lib/containers/assistant\0--quiet\0",
+        );
+        let assistant_benchmark = nspawn_directory_from_cmdline(
+            b"/usr/bin/systemd-nspawn\0-D\0/var/lib/containers/assistant-benchmark\0--quiet\0",
+        );
         assert_eq!(
-            nspawn_directory_from_cmdline(
-                b"/usr/bin/systemd-nspawn\0-D\0/var/lib/containers/assistant\0--quiet\0"
-            ),
+            assistant,
             Some(PathBuf::from("/var/lib/containers/assistant"))
         );
+        assert_ne!(assistant, assistant_benchmark);
         assert_eq!(
             nspawn_directory_from_cmdline(
                 b"systemd-nspawn\0--directory=/root/.sandboxed-sh/containers/assistant\0"
@@ -1490,45 +1495,12 @@ impl WorkspaceExec {
     }
 
     async fn running_container_leader(&self) -> Option<String> {
-        // Patched: discover the leader via pgrep instead of machinectl.
-        // Inside the docker entrypoint (Caddy as PID 1) machinectl refuses
-        // to operate, and machined cannot create cgroup scopes without
-        // systemd as PID 1, so we run nspawn with --register=no and locate
-        // the leader by scanning for `systemd-nspawn -D <workspace path>`.
-        let mut paths = vec![self.workspace.path.to_string_lossy().into_owned()];
-        if let Ok(canonical) = self.workspace.path.canonicalize() {
-            let canonical = canonical.to_string_lossy().into_owned();
-            if !paths.iter().any(|path| path == &canonical) {
-                paths.push(canonical);
-            }
-        }
-
-        let mut nspawn_pid = None;
-        for path in paths {
-            let output = Command::new("pgrep")
-                .args(["-f", &format!("systemd-nspawn.*-D {}", path)])
-                .output()
-                .await
-                .ok()?;
-            if output.status.success() {
-                nspawn_pid = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .next()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                if nspawn_pid.is_some() {
-                    break;
-                }
-            }
-        }
-        // Multiple API services can refer to the same container through
-        // different symlinked roots (for example prod and dev). pgrep only
-        // sees the spelling used by the service that started nspawn, so fall
-        // back to canonicalizing every live nspawn `-D` argument before
-        // deciding that no durable leader exists. Starting a second nspawn on
-        // the same root otherwise waits and eventually fails as "tree busy".
-        let nspawn_pid =
-            nspawn_pid.or_else(|| find_nspawn_pid_by_canonical_root(&self.workspace.path))?;
+        // `pgrep -f "... -D <path>"` is unsafe here: a workspace named
+        // `verity` also matches a simultaneously booting `verity-benchmark`
+        // container. Parse the NUL-delimited argv of every live nspawn and
+        // compare its canonical `-D` directory exactly instead. This also
+        // handles prod/dev aliases that spell the same root through symlinks.
+        let nspawn_pid = find_nspawn_pid_by_canonical_root(&self.workspace.path)?;
         let child_pids = Command::new("pgrep")
             .args(["-P", &nspawn_pid])
             .output()

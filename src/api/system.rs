@@ -1221,6 +1221,7 @@ mcp_servers:
         - get_mission_events
         - get_mission_health
         - get_mission_diagnostics
+        - get_compute_fleet
         - start_mission
         - send_message_to_mission
         - ask_mission
