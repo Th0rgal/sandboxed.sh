@@ -369,6 +369,12 @@ pub struct AIProvider {
     /// and apply shared cooldowns across them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organization_id: Option<String>,
+    /// SHA-256 fingerprint of an OAuth refresh token that the provider has
+    /// permanently rejected. Persisted so a service restart cannot briefly
+    /// present a revoked account as connected again. This is deliberately a
+    /// one-way fingerprint rather than another copy of the credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_oauth_refresh_fingerprint: Option<String>,
     /// Connection status (populated at runtime)
     #[serde(skip)]
     pub status: ProviderStatus,
@@ -414,6 +420,7 @@ impl AIProvider {
             is_default: false,
             account_email: None,
             organization_id: None,
+            rejected_oauth_refresh_fingerprint: None,
             status: ProviderStatus::Unknown,
             created_at: now,
             updated_at: now,
@@ -575,7 +582,18 @@ impl AIProviderStore {
 
         {
             let mut providers = self.providers.write().await;
-            if providers.contains_key(&id) {
+            if let Some(existing) = providers.get(&id) {
+                let existing_refresh = existing
+                    .oauth
+                    .as_ref()
+                    .map(|oauth| oauth.refresh_token.as_str());
+                let replacement_refresh = provider
+                    .oauth
+                    .as_ref()
+                    .map(|oauth| oauth.refresh_token.as_str());
+                if existing_refresh != replacement_refresh {
+                    provider.rejected_oauth_refresh_fingerprint = None;
+                }
                 // If setting as default, unset others
                 if provider.is_default {
                     for p in providers.values_mut() {
@@ -655,6 +673,7 @@ impl AIProviderStore {
 
         if let Some(provider) = providers.get_mut(&id) {
             provider.oauth = Some(credentials);
+            provider.rejected_oauth_refresh_fingerprint = None;
             provider.status = ProviderStatus::Connected;
             provider.updated_at = chrono::Utc::now();
             let updated = provider.clone();
@@ -668,6 +687,27 @@ impl AIProviderStore {
         } else {
             None
         }
+    }
+
+    /// Persist or clear the fingerprint of a permanently rejected OAuth
+    /// refresh token without retaining an additional plaintext credential.
+    pub async fn set_rejected_oauth_refresh_fingerprint(
+        &self,
+        id: Uuid,
+        fingerprint: Option<String>,
+    ) -> Option<AIProvider> {
+        let mut providers = self.providers.write().await;
+        let provider = providers.get_mut(&id)?;
+        provider.rejected_oauth_refresh_fingerprint = fingerprint;
+        provider.updated_at = chrono::Utc::now();
+        let updated = provider.clone();
+        drop(providers);
+
+        if let Err(e) = self.save_to_disk().await {
+            tracing::error!("Failed to save AI providers to disk: {}", e);
+        }
+
+        Some(updated)
     }
 
     /// Update the provider's recorded organization ID (no-op when unchanged).
