@@ -467,8 +467,9 @@ mod oauth_deadletter_tests {
 #[cfg(test)]
 mod grok_oauth_tests {
     use super::{
-        get_xai_api_key_for_grok, grok_auth_expires_at_millis, grok_cli_reconcile_due,
-        parse_grok_device_auth_line, GROK_CLI_RECONCILE_INTERVAL,
+        build_response_from_store, get_xai_api_key_for_grok, grok_auth_expires_at_millis,
+        grok_cli_reconcile_due, oauth_refresh_clear_dead, oauth_refresh_mark_token_dead,
+        parse_grok_device_auth_line, ProviderStatusResponse, GROK_CLI_RECONCILE_INTERVAL,
     };
     use crate::ai_providers::{AIProvider, OAuthCredentials, ProviderType};
     use std::time::{Duration as StdDuration, Instant};
@@ -566,6 +567,39 @@ mod grok_oauth_tests {
         .expect("write providers");
 
         assert_eq!(get_xai_api_key_for_grok(temp.path()), None);
+    }
+
+    #[test]
+    fn rejected_grok_refresh_token_requires_reconnect_even_before_access_expiry() {
+        let mut provider = AIProvider::new(ProviderType::Xai, "xAI OAuth".to_string());
+        provider.oauth = Some(OAuthCredentials {
+            access_token: "access-token".to_string(),
+            refresh_token: "revoked-refresh-token".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000,
+        });
+        oauth_refresh_mark_token_dead(provider.id, "revoked-refresh-token");
+
+        let response = build_response_from_store(&provider);
+
+        assert!(matches!(
+            response.status,
+            ProviderStatusResponse::NeedsReauth { .. }
+        ));
+        oauth_refresh_clear_dead(provider.id);
+    }
+
+    #[test]
+    fn fresh_grok_oauth_token_remains_connected() {
+        let mut provider = AIProvider::new(ProviderType::Xai, "xAI OAuth".to_string());
+        provider.oauth = Some(OAuthCredentials {
+            access_token: "access-token".to_string(),
+            refresh_token: "fresh-refresh-token".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000,
+        });
+
+        let response = build_response_from_store(&provider);
+
+        assert!(matches!(response.status, ProviderStatusResponse::Connected));
     }
 }
 
@@ -3236,7 +3270,19 @@ fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> Prov
         .oauth
         .as_ref()
         .is_some_and(|oauth| oauth_token_expired(oauth.expires_at));
-    let status = if pt == ProviderType::Xai && has_oauth && !has_api_key && oauth_expired {
+    let oauth_refresh_rejected = provider
+        .oauth
+        .as_ref()
+        .is_some_and(|oauth| oauth_refresh_token_is_dead(provider.id, &oauth.refresh_token));
+    let status = if has_oauth && !has_api_key && oauth_refresh_rejected {
+        ProviderStatusResponse::NeedsReauth {
+            reason: format!(
+                "{} OAuth refresh token was rejected; reconnect the provider",
+                pt.display_name()
+            ),
+            auth_url: None,
+        }
+    } else if pt == ProviderType::Xai && has_oauth && !has_api_key && oauth_expired {
         ProviderStatusResponse::NeedsReauth {
             reason: "xAI OAuth token expired; reconnect Grok Build".to_string(),
             auth_url: None,
@@ -7366,13 +7412,19 @@ async fn get_provider_usage(
                     .unwrap()
                     .insert("status".to_string(), serde_json::json!("connected"));
             } else if let Some(ref o) = oauth {
-                if oauth_token_expired(o.expires_at) {
+                let refresh_rejected = provider_uuid
+                    .is_some_and(|uuid| oauth_refresh_token_is_dead(uuid, &o.refresh_token));
+                if refresh_rejected || oauth_token_expired(o.expires_at) {
                     info.as_object_mut()
                         .unwrap()
                         .insert("status".to_string(), serde_json::json!("needs_reauth"));
                     info.as_object_mut().unwrap().insert(
                         "error".to_string(),
-                        serde_json::json!("xAI OAuth token expired; reconnect Grok Build"),
+                        serde_json::json!(if refresh_rejected {
+                            "xAI OAuth refresh token was rejected; reconnect Grok Build"
+                        } else {
+                            "xAI OAuth token expired; reconnect Grok Build"
+                        }),
                     );
                 } else {
                     info.as_object_mut()
