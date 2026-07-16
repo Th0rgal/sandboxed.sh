@@ -2146,7 +2146,7 @@ fn compact_compute_fleet(fleet: &Value) -> Value {
     let online_nodes = online.clone().count();
     let lean_nodes: Vec<&Value> = online
         .filter(|node| {
-            node.get("lean_runtime_ready").and_then(Value::as_bool) == Some(true)
+            node.get("lean_runtime_ready").and_then(Value::as_bool) != Some(false)
                 && node
                     .get("labels")
                     .and_then(Value::as_array)
@@ -3000,16 +3000,25 @@ mod tests {
                     "queued_jobs": 0,
                     "lean_runtime_ready": true,
                     "error": "probe degraded"
+                },
+                {
+                    "id": "legacy-lean",
+                    "status": "online",
+                    "labels": ["lean"],
+                    "capacity_total": 1,
+                    "capacity_available": 1,
+                    "active_jobs": 0,
+                    "queued_jobs": 0
                 }
             ],
             "recent_jobs": [{"job_id": "job", "node_id": "cpu", "state": "succeeded"}]
         });
 
         let compact = compact_compute_fleet(&raw);
-        assert_eq!(compact["summary"]["nodes_online"], 3);
-        assert_eq!(compact["summary"]["lean_nodes_online"], 1);
-        assert_eq!(compact["summary"]["lean_slots_total"], 2);
-        assert_eq!(compact["summary"]["lean_slots_available"], 1);
+        assert_eq!(compact["summary"]["nodes_online"], 4);
+        assert_eq!(compact["summary"]["lean_nodes_online"], 2);
+        assert_eq!(compact["summary"]["lean_slots_total"], 3);
+        assert_eq!(compact["summary"]["lean_slots_available"], 2);
         assert_eq!(compact["summary"]["active_remote_jobs"], 1);
         assert!(compact["nodes"][0].get("base_url").is_none());
         assert_eq!(compact["nodes"][2]["error"], "probe degraded");
