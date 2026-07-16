@@ -42,6 +42,15 @@ _spark_eligible() {
   # live in the boss mission's dir, e.g. mission-<boss>/wk-NNNN). spark-build
   # re-derives the real workspace root + rel from cwd; the endpoint authorizes a
   # worker's token for an ancestor mission's dir.
+  #
+  # Deliberately NOT eligible: builds from a configured project checkout
+  # (LEAN_PROJECT_PATH, e.g. /workspace/verity/base) that lives outside the
+  # mission dirs. The offload endpoint rsyncs artifacts BACK into host_dir, so
+  # its write-back authorization is scoped to <root>/workspaces/mission-* on
+  # purpose; widening it to shared checkouts would let one mission's token
+  # write into a tree other missions build from. Those builds keep the local
+  # flock gate below — per compute-placement policy they are the bounded dirty
+  # lane anyway, and clean validation goes through remote-lean-build instead.
   _guest_root="$(dirname "${SPARK_WORKSPACE_GUEST_DIR%/}")"
   case "$(pwd -P)/" in
     "${_guest_root}"/mission-*/)  return 0 ;;
