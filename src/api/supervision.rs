@@ -28,6 +28,7 @@ use uuid::Uuid;
 use super::control::MissionStatus;
 #[allow(unused_imports)]
 use super::control::*;
+use super::mission_runner::TOOL_CALL_STALL_GRACE_SECS;
 use super::mission_store::MissionStore;
 
 mod bg_autoresume;
@@ -313,8 +314,9 @@ pub(crate) async fn ack_promotion_loop(
     }
 }
 
-fn inactivity_is_cancellable(seconds_since_activity: u64, tool_subprocess_alive: bool) -> bool {
-    seconds_since_activity >= STUCK_SECONDS && !tool_subprocess_alive
+fn inactivity_is_cancellable(seconds_since_activity: u64, tool_call_in_flight: bool) -> bool {
+    seconds_since_activity >= STUCK_SECONDS
+        && (!tool_call_in_flight || seconds_since_activity >= TOOL_CALL_STALL_GRACE_SECS)
 }
 
 pub(crate) async fn stuck_mission_watchdog_loop(
@@ -398,16 +400,14 @@ pub(crate) async fn stuck_mission_watchdog_loop(
             if info.seconds_since_activity < STUCK_SECONDS {
                 continue;
             }
-            if !inactivity_is_cancellable(info.seconds_since_activity, info.tool_subprocess_alive) {
-                // Model events are quiet while a harness tool executes. The
-                // runner tracks the ToolCall/ToolResult pair explicitly, so a
-                // live `lake build` (or any other long command) is progress,
-                // not an idle agent. Command/tool timeouts remain responsible
-                // for genuinely hung subprocesses.
+            if !inactivity_is_cancellable(info.seconds_since_activity, info.tool_call_in_flight) {
+                // Model events are quiet while a harness tool executes. An
+                // unmatched ToolCall protects normal long builds, but only for
+                // a bounded grace because some harnesses omit ToolResult.
                 tracing::debug!(
                     mission_id = %info.mission_id,
                     seconds_since_activity = info.seconds_since_activity,
-                    "Stuck-mission watchdog: skipping mission with a live tool subprocess"
+                    "Stuck-mission watchdog: applying bounded in-flight tool grace"
                 );
                 continue;
             }
@@ -705,5 +705,10 @@ mod tests {
     #[test]
     fn inactivity_watchdog_preserves_live_tool_past_threshold() {
         assert!(!inactivity_is_cancellable(STUCK_SECONDS * 4, true));
+    }
+
+    #[test]
+    fn inactivity_watchdog_eventually_cancels_stale_tool_hint() {
+        assert!(inactivity_is_cancellable(TOOL_CALL_STALL_GRACE_SECS, true));
     }
 }

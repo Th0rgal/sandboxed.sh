@@ -14393,7 +14393,7 @@ async fn control_actor_loop(
                                 } else {
                                     super::mission_runner::MissionRunState::Running
                                 };
-                                let tool_subprocess_alive = main_runner_active_tool_calls
+                                let tool_call_in_flight = main_runner_active_tool_calls
                                     .load(std::sync::atomic::Ordering::Relaxed)
                                     > 0;
                                 running_list.push(super::mission_runner::RunningMissionInfo {
@@ -14402,11 +14402,11 @@ async fn control_actor_loop(
                                     queue_len: queue.len(),
                                     history_len: history.len(),
                                     seconds_since_activity,
-                                    tool_subprocess_alive,
+                                    tool_call_in_flight,
                                     health: super::mission_runner::running_health(
                                         mission_state,
                                         seconds_since_activity,
-                                        tool_subprocess_alive,
+                                        tool_call_in_flight,
                                     ),
                                     expected_deliverables: 0,
                                     current_activity: main_runner_activity.clone(),
