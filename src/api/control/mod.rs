@@ -5269,36 +5269,55 @@ fn is_fable_model(model: Option<&str>) -> bool {
 /// Fable is a research lane for mathematical hypothesis generation. A fleet
 /// controller must never hand it repository integration authority: an earlier
 /// cross-project routing incident sent a Beal review+merge mandate to Fable.
+///
+/// Real integration mandates carry a repository *mutation verb* (merge, push,
+/// rebase, commit). Broad research vocabulary must NOT trip the guard — a
+/// bag-of-words check on tokens like "review", "integration", or "conflict"
+/// rejected authorized Fable focus-brainstorm missions whose prompts merely
+/// mentioned reviewing literature or integration by parts (2026-07-17).
+/// Two refinements keep the guard tight without those false positives:
+/// past-participle status mentions ("PR #1 remains merged") are not mandates,
+/// and a locally negated verb ("do not push", "stop before commit",
+/// "merging is forbidden") is an explicit prohibition, not a mandate.
 fn fable_mandate_requests_integration(intent: Option<&str>, prompt: Option<&str>) -> bool {
+    const MUTATION_VERBS: [&str; 8] = [
+        "merge",
+        "merging",
+        "rebase",
+        "rebasing",
+        "push",
+        "pushing",
+        "commit",
+        "committing",
+    ];
+    const NEGATORS_BEFORE: [&str; 9] = [
+        "not", "never", "no", "without", "dont", "cannot", "cant", "forbid", "before",
+    ];
+    const NEGATORS_AFTER: [&str; 4] = ["prohibited", "forbidden", "banned", "disallowed"];
+
     let normalized = format!(
         "{} {}",
         intent.unwrap_or_default(),
         prompt.unwrap_or_default()
     )
     .to_ascii_lowercase();
-    let tokens: std::collections::HashSet<&str> = normalized
+    let words: Vec<&str> = normalized
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .collect();
-    [
-        "review",
-        "reviewer",
-        "merge",
-        "merging",
-        "merged",
-        "rebase",
-        "rebasing",
-        "commit",
-        "committing",
-        "push",
-        "pushing",
-        "conflict",
-        "conflicts",
-        "integration",
-        "integrate",
-    ]
-    .iter()
-    .any(|token| tokens.contains(token))
+    words.iter().enumerate().any(|(i, word)| {
+        if !MUTATION_VERBS.contains(word) {
+            return false;
+        }
+        let negated_before = words[i.saturating_sub(3)..i]
+            .iter()
+            .any(|prev| NEGATORS_BEFORE.contains(prev));
+        let after_end = (i + 4).min(words.len());
+        let negated_after = words[(i + 1).min(words.len())..after_end]
+            .iter()
+            .any(|next| NEGATORS_AFTER.contains(next));
+        !(negated_before || negated_after)
+    })
 }
 
 static PR_WRITER_CREATE_LOCK: std::sync::LazyLock<Mutex<()>> =
@@ -23214,6 +23233,48 @@ And the report:
         assert!(!fable_mandate_requests_integration(
             Some("hypothesis_generation"),
             Some("Explore mathematical hypotheses for the Beal conjecture")
+        ));
+    }
+
+    #[test]
+    fn fable_allows_research_vocabulary_without_mutation_mandates() {
+        // Research prompts legitimately mention reviewing literature,
+        // integration (by parts), and conflicting evidence.
+        assert!(!fable_mandate_requests_integration(
+            Some("focus_brainstorm"),
+            Some(
+                "Review the prior literature, weigh conflicting evidence, and \
+                 explore integration by parts approaches for the cofactor bound"
+            )
+        ));
+        // Status mentions of merged PRs are context, not mandates.
+        assert!(!fable_mandate_requests_integration(
+            None,
+            Some("Context: PR #1 was merged yesterday and remains the baseline")
+        ));
+        // Explicit prohibitions are the opposite of a mandate.
+        assert!(!fable_mandate_requests_integration(
+            None,
+            Some(
+                "Produce a prioritized focus plan as proposals only; do not \
+                 commit or push anything; merging is forbidden; stop before commit"
+            )
+        ));
+    }
+
+    #[test]
+    fn fable_still_rejects_mutation_mandates() {
+        assert!(fable_mandate_requests_integration(
+            None,
+            Some("Merge research/br-18 into main once green")
+        ));
+        assert!(fable_mandate_requests_integration(
+            None,
+            Some("Then commit and push the results to the branch")
+        ));
+        assert!(fable_mandate_requests_integration(
+            None,
+            Some("Rebase the branch onto main")
         ));
     }
 
