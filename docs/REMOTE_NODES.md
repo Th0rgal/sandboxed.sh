@@ -321,10 +321,11 @@ Execution model:
   build cwd, and command. Before a cold build only
   `<workdir>/caches/lake/<key>/packages/` is copied without hardlinks into the
   manifest's configured `packagesDir` (which must be a clean relative path
-  below `lakeDir`); after a successful build only that dependency tree is
-  refreshed through a temp dir and atomic rename under a per-key flock. No
-  other entry under `lakeDir` is shared, so default or custom root-project build
-  directories are rebuilt per commit while dependencies stay warm.
+  below `lakeDir` and must not overlap the root `buildDir`); after a successful
+  build only that dependency tree is refreshed through a temp dir and atomic
+  rename under a per-key flock. No other entry under `lakeDir` is shared, so
+  default or custom root-project build directories are rebuilt per commit while
+  dependencies stay warm.
 - `artifacts` patterns are resolved relative to the checkout root after a
   successful build: exact relative paths, or `*` within a single path
   segment (never across `/`); `..` and absolute paths are rejected. Each

@@ -385,6 +385,12 @@ fn configured_lake_cache_paths(build_cwd: &Path) -> Option<(PathBuf, PathBuf)> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or(".lake/packages"),
     );
+    let build_rel = Path::new(
+        manifest
+            .get("buildDir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(".lake/build"),
+    );
     let is_clean_relative = |path: &Path| {
         !path.as_os_str().is_empty()
             && !path.is_absolute()
@@ -392,11 +398,20 @@ fn configured_lake_cache_paths(build_cwd: &Path) -> Option<(PathBuf, PathBuf)> {
                 .components()
                 .all(|component| matches!(component, Component::Normal(_)))
     };
-    if !is_clean_relative(lake_rel) || !is_clean_relative(packages_rel) {
+    if !is_clean_relative(lake_rel)
+        || !is_clean_relative(packages_rel)
+        || !is_clean_relative(build_rel)
+    {
         return None;
     }
     let package_suffix = packages_rel.strip_prefix(lake_rel).ok()?;
     if package_suffix.as_os_str().is_empty() {
+        return None;
+    }
+    // Lake's root build directory is commit-specific. If a manifest (or a
+    // future manifest version) points the dependency tree at the same path or
+    // an ancestor/descendant, caching it would persist root `.olean` files.
+    if packages_rel.starts_with(build_rel) || build_rel.starts_with(packages_rel) {
         return None;
     }
     Some((build_cwd.join(lake_rel), build_cwd.join(packages_rel)))
@@ -1745,6 +1760,10 @@ mod tests {
             br#"{"lakeDir":".lake","packagesDir":"deps"}"#.as_slice(),
             br#"{"lakeDir":".lake","packagesDir":".lake"}"#.as_slice(),
             br#"{"lakeDir":"/tmp/lake","packagesDir":"/tmp/lake/deps"}"#.as_slice(),
+            br#"{"lakeDir":".lake","packagesDir":".lake/build"}"#.as_slice(),
+            br#"{"lakeDir":".lake","packagesDir":".lake/build/deps"}"#.as_slice(),
+            br#"{"lakeDir":".lake","packagesDir":".lake/deps","buildDir":".lake/deps/root"}"#
+                .as_slice(),
         ] {
             std::fs::write(dir.path().join("lake-manifest.json"), manifest).unwrap();
             assert!(configured_lake_cache_paths(dir.path()).is_none());
