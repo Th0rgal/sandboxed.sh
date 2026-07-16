@@ -68,6 +68,24 @@ fn oauth_refresh_mark_token_dead(account_id: uuid::Uuid, token: &str) {
     }
 }
 
+fn oauth_refresh_token_fingerprint(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn provider_refresh_token_is_rejected(provider: &crate::ai_providers::AIProvider) -> bool {
+    match (
+        provider.rejected_oauth_refresh_fingerprint.as_deref(),
+        provider.oauth.as_ref(),
+    ) {
+        (Some(rejected), Some(oauth)) => {
+            rejected == oauth_refresh_token_fingerprint(&oauth.refresh_token)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn oauth_refresh_clear_dead(account_id: uuid::Uuid) {
     if let Ok(mut m) = OAUTH_REFRESH_DEADLETTER.lock() {
         m.remove(&account_id);
@@ -467,8 +485,10 @@ mod oauth_deadletter_tests {
 #[cfg(test)]
 mod grok_oauth_tests {
     use super::{
-        get_xai_api_key_for_grok, grok_auth_expires_at_millis, grok_cli_reconcile_due,
-        parse_grok_device_auth_line, GROK_CLI_RECONCILE_INTERVAL,
+        build_response_from_store, get_xai_api_key_for_grok, grok_auth_expires_at_millis,
+        grok_cli_reconcile_due, oauth_refresh_clear_dead, oauth_refresh_mark_token_dead,
+        oauth_refresh_token_fingerprint, parse_grok_device_auth_line, ProviderStatusResponse,
+        GROK_CLI_RECONCILE_INTERVAL,
     };
     use crate::ai_providers::{AIProvider, OAuthCredentials, ProviderType};
     use std::time::{Duration as StdDuration, Instant};
@@ -566,6 +586,61 @@ mod grok_oauth_tests {
         .expect("write providers");
 
         assert_eq!(get_xai_api_key_for_grok(temp.path()), None);
+    }
+
+    #[test]
+    fn rejected_grok_refresh_token_requires_reconnect_even_before_access_expiry() {
+        let mut provider = AIProvider::new(ProviderType::Xai, "xAI OAuth".to_string());
+        provider.oauth = Some(OAuthCredentials {
+            access_token: "access-token".to_string(),
+            refresh_token: "revoked-refresh-token".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000,
+        });
+        oauth_refresh_mark_token_dead(provider.id, "revoked-refresh-token");
+
+        let response = build_response_from_store(&provider);
+
+        assert!(matches!(
+            response.status,
+            ProviderStatusResponse::NeedsReauth { .. }
+        ));
+        oauth_refresh_clear_dead(provider.id);
+    }
+
+    #[test]
+    fn fresh_grok_oauth_token_remains_connected() {
+        let mut provider = AIProvider::new(ProviderType::Xai, "xAI OAuth".to_string());
+        provider.oauth = Some(OAuthCredentials {
+            access_token: "access-token".to_string(),
+            refresh_token: "fresh-refresh-token".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000,
+        });
+
+        let response = build_response_from_store(&provider);
+
+        assert!(matches!(response.status, ProviderStatusResponse::Connected));
+    }
+
+    #[test]
+    fn rejected_grok_refresh_fingerprint_survives_store_serialization() {
+        let mut provider = AIProvider::new(ProviderType::Xai, "xAI OAuth".to_string());
+        provider.oauth = Some(OAuthCredentials {
+            access_token: "access-token".to_string(),
+            refresh_token: "revoked-refresh-token".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000,
+        });
+        provider.rejected_oauth_refresh_fingerprint =
+            Some(oauth_refresh_token_fingerprint("revoked-refresh-token"));
+        let serialized = serde_json::to_string(&provider).expect("serialize provider");
+        assert_eq!(serialized.matches("revoked-refresh-token").count(), 1);
+        let restored: AIProvider = serde_json::from_str(&serialized).expect("restore provider");
+
+        let response = build_response_from_store(&restored);
+
+        assert!(matches!(
+            response.status,
+            ProviderStatusResponse::NeedsReauth { .. }
+        ));
     }
 }
 
@@ -3236,7 +3311,20 @@ fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> Prov
         .oauth
         .as_ref()
         .is_some_and(|oauth| oauth_token_expired(oauth.expires_at));
-    let status = if pt == ProviderType::Xai && has_oauth && !has_api_key && oauth_expired {
+    let oauth_refresh_rejected = provider_refresh_token_is_rejected(provider)
+        || provider
+            .oauth
+            .as_ref()
+            .is_some_and(|oauth| oauth_refresh_token_is_dead(provider.id, &oauth.refresh_token));
+    let status = if has_oauth && !has_api_key && oauth_refresh_rejected {
+        ProviderStatusResponse::NeedsReauth {
+            reason: format!(
+                "{} OAuth refresh token was rejected; reconnect the provider",
+                pt.display_name()
+            ),
+            auth_url: None,
+        }
+    } else if pt == ProviderType::Xai && has_oauth && !has_api_key && oauth_expired {
         ProviderStatusResponse::NeedsReauth {
             reason: "xAI OAuth token expired; reconnect Grok Build".to_string(),
             auth_url: None,
@@ -6391,113 +6479,124 @@ async fn get_provider_usage(
     // Resolve provider credentials: check AIProviderStore first, then OpenCode auth.
     // `provider_uuid` is `Some` when the credentials live in AIProviderStore and we
     // can persist a refreshed OAuth back into that specific record.
-    let (provider_type, api_key_opt, oauth, account_email, provider_name, provider_uuid) =
-        if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
-            // UUID lookup for custom providers
-            let provider = state
-                .ai_providers
-                .get(uuid)
-                .await
-                .ok_or((StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+    let (
+        provider_type,
+        api_key_opt,
+        oauth,
+        account_email,
+        provider_name,
+        provider_uuid,
+        provider_refresh_rejected,
+    ) = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        // UUID lookup for custom providers
+        let provider = state
+            .ai_providers
+            .get(uuid)
+            .await
+            .ok_or((StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+        let refresh_rejected = provider_refresh_token_is_rejected(&provider);
+        (
+            provider.provider_type,
+            provider.api_key.clone(),
+            provider.oauth.clone(),
+            provider.account_email.clone(),
+            provider.name.clone(),
+            Some(uuid),
+            refresh_rejected,
+        )
+    } else if let Some(pt) = ProviderType::from_id(&id) {
+        // Try AIProviderStore first
+        if let Some(provider) = state.ai_providers.get_by_type(pt).await {
+            let refresh_rejected = provider_refresh_token_is_rejected(&provider);
             (
                 provider.provider_type,
                 provider.api_key.clone(),
                 provider.oauth.clone(),
                 provider.account_email.clone(),
                 provider.name.clone(),
-                Some(uuid),
+                Some(provider.id),
+                refresh_rejected,
             )
-        } else if let Some(pt) = ProviderType::from_id(&id) {
-            // Try AIProviderStore first
-            if let Some(provider) = state.ai_providers.get_by_type(pt).await {
-                (
-                    provider.provider_type,
-                    provider.api_key.clone(),
-                    provider.oauth.clone(),
-                    provider.account_email.clone(),
-                    provider.name.clone(),
-                    Some(provider.id),
-                )
-            } else {
-                // Fall back to OpenCode auth: check both central auth.json
-                // and per-provider auth files (~/.opencode/auth/{provider}.json)
-                let auth = read_opencode_auth().map_err(internal_error)?;
-                let accounts_state = read_provider_accounts_state(&state.config.working_dir);
-                let account_email = accounts_state.get(pt.id()).cloned();
-
-                // Collect all auth entries: central + per-provider file
-                let mut auth_entries: Vec<&serde_json::Value> = opencode_auth_keys(pt)
-                    .into_iter()
-                    .filter_map(|key| auth.get(key))
-                    .collect();
-                // Also read per-provider auth file
-                let provider_auth_path = get_opencode_provider_auth_path(pt);
-                let provider_auth_value: Option<serde_json::Value> = if provider_auth_path.exists()
-                {
-                    std::fs::read_to_string(&provider_auth_path)
-                        .ok()
-                        .and_then(|c| serde_json::from_str(&c).ok())
-                } else {
-                    None
-                };
-                if let Some(ref pav) = provider_auth_value {
-                    auth_entries.push(pav);
-                }
-
-                let api_key = auth_entries.iter().find_map(|v| {
-                    v.get("key")
-                        .or_else(|| v.get("api_key"))
-                        .or_else(|| v.get("apiKey"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                });
-
-                let oauth_creds = auth_entries.iter().find_map(|entry| {
-                    let access = entry
-                        .get("access")
-                        .or_else(|| entry.get("access_token"))
-                        .and_then(|v| v.as_str())?;
-                    let refresh = entry
-                        .get("refresh")
-                        .or_else(|| entry.get("refresh_token"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let expires_at = entry
-                        .get("expires")
-                        .or_else(|| entry.get("expires_at"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    Some(crate::ai_providers::OAuthCredentials {
-                        access_token: access.to_string(),
-                        refresh_token: refresh,
-                        expires_at,
-                    })
-                });
-
-                if api_key.is_none() && oauth_creds.is_none() {
-                    return Ok(Json(serde_json::json!({
-                        "provider_type": pt.id(),
-                        "provider_name": pt.display_name(),
-                        "error": "No credentials found"
-                    })));
-                }
-
-                (
-                    pt,
-                    api_key,
-                    oauth_creds,
-                    account_email,
-                    pt.display_name().to_string(),
-                    None,
-                )
-            }
         } else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!("Invalid provider ID: {}", id),
-            ));
-        };
+            // Fall back to OpenCode auth: check both central auth.json
+            // and per-provider auth files (~/.opencode/auth/{provider}.json)
+            let auth = read_opencode_auth().map_err(internal_error)?;
+            let accounts_state = read_provider_accounts_state(&state.config.working_dir);
+            let account_email = accounts_state.get(pt.id()).cloned();
+
+            // Collect all auth entries: central + per-provider file
+            let mut auth_entries: Vec<&serde_json::Value> = opencode_auth_keys(pt)
+                .into_iter()
+                .filter_map(|key| auth.get(key))
+                .collect();
+            // Also read per-provider auth file
+            let provider_auth_path = get_opencode_provider_auth_path(pt);
+            let provider_auth_value: Option<serde_json::Value> = if provider_auth_path.exists() {
+                std::fs::read_to_string(&provider_auth_path)
+                    .ok()
+                    .and_then(|c| serde_json::from_str(&c).ok())
+            } else {
+                None
+            };
+            if let Some(ref pav) = provider_auth_value {
+                auth_entries.push(pav);
+            }
+
+            let api_key = auth_entries.iter().find_map(|v| {
+                v.get("key")
+                    .or_else(|| v.get("api_key"))
+                    .or_else(|| v.get("apiKey"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+
+            let oauth_creds = auth_entries.iter().find_map(|entry| {
+                let access = entry
+                    .get("access")
+                    .or_else(|| entry.get("access_token"))
+                    .and_then(|v| v.as_str())?;
+                let refresh = entry
+                    .get("refresh")
+                    .or_else(|| entry.get("refresh_token"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let expires_at = entry
+                    .get("expires")
+                    .or_else(|| entry.get("expires_at"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                Some(crate::ai_providers::OAuthCredentials {
+                    access_token: access.to_string(),
+                    refresh_token: refresh,
+                    expires_at,
+                })
+            });
+
+            if api_key.is_none() && oauth_creds.is_none() {
+                return Ok(Json(serde_json::json!({
+                    "provider_type": pt.id(),
+                    "provider_name": pt.display_name(),
+                    "error": "No credentials found"
+                })));
+            }
+
+            (
+                pt,
+                api_key,
+                oauth_creds,
+                account_email,
+                pt.display_name().to_string(),
+                None,
+                false,
+            )
+        }
+    } else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Invalid provider ID: {}", id),
+        ));
+    };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -7366,13 +7465,20 @@ async fn get_provider_usage(
                     .unwrap()
                     .insert("status".to_string(), serde_json::json!("connected"));
             } else if let Some(ref o) = oauth {
-                if oauth_token_expired(o.expires_at) {
+                let refresh_rejected = provider_refresh_rejected
+                    || provider_uuid
+                        .is_some_and(|uuid| oauth_refresh_token_is_dead(uuid, &o.refresh_token));
+                if refresh_rejected || oauth_token_expired(o.expires_at) {
                     info.as_object_mut()
                         .unwrap()
                         .insert("status".to_string(), serde_json::json!("needs_reauth"));
                     info.as_object_mut().unwrap().insert(
                         "error".to_string(),
-                        serde_json::json!("xAI OAuth token expired; reconnect Grok Build"),
+                        serde_json::json!(if refresh_rejected {
+                            "xAI OAuth refresh token was rejected; reconnect Grok Build"
+                        } else {
+                            "xAI OAuth token expired; reconnect Grok Build"
+                        }),
                     );
                 } else {
                     info.as_object_mut()
@@ -10054,7 +10160,18 @@ pub async fn refresh_store_account_oauth_locked(
 
     // Re-read the freshest credentials now that we're serialized — a concurrent
     // refresh may have just rotated the token while we waited on the gate.
-    let current_oauth = ai_providers.get(account_id).await.and_then(|p| p.oauth);
+    let current_provider = ai_providers.get(account_id).await;
+    let persistent_rejection = current_provider
+        .as_ref()
+        .is_some_and(provider_refresh_token_is_rejected);
+    let current_oauth = current_provider.and_then(|p| p.oauth);
+
+    if persistent_rejection {
+        return Err(OAuthRefreshError::InvalidGrant(
+            "invalid_grant (persisted): refresh token previously rejected; re-auth required"
+                .to_string(),
+        ));
+    }
 
     // Double-checked: if a concurrent refresh already produced a still-valid
     // access token, reuse it instead of consuming the (now-rotated) refresh
@@ -10080,6 +10197,12 @@ pub async fn refresh_store_account_oauth_locked(
     // (the re-read value above differs from the dead one) or any refresh
     // succeeds. Surface a permanent-looking error so callers log at debug.
     if oauth_refresh_token_is_dead(account_id, &refresh_token) {
+        let _ = ai_providers
+            .set_rejected_oauth_refresh_fingerprint(
+                account_id,
+                Some(oauth_refresh_token_fingerprint(&refresh_token)),
+            )
+            .await;
         return Err(OAuthRefreshError::InvalidGrant(
             "invalid_grant (cached): refresh token previously rejected; re-auth required"
                 .to_string(),
@@ -10105,6 +10228,12 @@ pub async fn refresh_store_account_oauth_locked(
                 // ~2-min cycle skips the doomed retry until re-auth.
                 if matches!(e, OAuthRefreshError::InvalidGrant(_)) {
                     oauth_refresh_mark_token_dead(account_id, &refresh_token);
+                    let _ = ai_providers
+                        .set_rejected_oauth_refresh_fingerprint(
+                            account_id,
+                            Some(oauth_refresh_token_fingerprint(&refresh_token)),
+                        )
+                        .await;
                 }
                 return Err(e);
             }

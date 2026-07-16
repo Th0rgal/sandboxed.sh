@@ -33,6 +33,7 @@ import { cn } from '@/lib/utils';
 import { AddProviderModal } from '@/components/ui/add-provider-modal';
 import {
   ReconnectProviderModal,
+  providerShouldShowReconnect,
   providerSupportsOAuthReconnect,
 } from '@/components/ui/reconnect-provider-modal';
 import { AsyncButton } from '@/components/ui/async-button';
@@ -775,12 +776,16 @@ export default function ProvidersPage() {
                   !!cachedUsage?.error ||
                   (typeof cachedUsage?.status === 'string' &&
                     !['connected', 'ok'].includes(cachedUsage.status));
-                const effectiveStatus = usageIndicatesDisconnected
-                  ? 'error'
-                  : provider.status.type;
+                const cachedAuthStatus =
+                  cachedUsage?.status === 'needs_auth' || cachedUsage?.status === 'needs_reauth'
+                    ? cachedUsage.status
+                    : null;
+                const effectiveStatus = cachedAuthStatus ?? (
+                  usageIndicatesDisconnected ? 'error' : provider.status.type
+                );
                 const statusColor = effectiveStatus === 'connected'
                   ? 'bg-emerald-400'
-                  : effectiveStatus === 'needs_auth'
+                  : effectiveStatus === 'needs_auth' || effectiveStatus === 'needs_reauth'
                   ? 'bg-amber-400'
                   : 'bg-red-400';
                 const statusTitle = usageIndicatesDisconnected
@@ -943,7 +948,7 @@ export default function ProvidersPage() {
                                 )}
                               </button>
                             )}
-                            {(effectiveStatus === 'needs_auth' || effectiveStatus === 'needs_reauth' || effectiveStatus === 'error') && (
+                            {providerShouldShowReconnect(provider, effectiveStatus) && (
                               <button
                                 onClick={() => handleAuthenticate(provider)}
                                 disabled={authenticatingProviderId === provider.id}
@@ -954,7 +959,9 @@ export default function ProvidersPage() {
                                     : 'text-red-400 hover:text-red-300'
                                 )}
                                 title={
-                                  effectiveStatus === 'needs_auth'
+                                  providerSupportsOAuthReconnect(provider) && effectiveStatus === 'connected'
+                                    ? 'Reconnect OAuth account'
+                                    : effectiveStatus === 'needs_auth'
                                     ? 'Connect'
                                     : effectiveStatus === 'needs_reauth'
                                     ? 'Reconnect'
