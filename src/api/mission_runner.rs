@@ -7254,6 +7254,27 @@ fn copy_host_executable_into_container(
     Ok(format!("/usr/local/bin/{}", name))
 }
 
+fn remove_container_usr_local_bin(
+    workspace: &crate::workspace::Workspace,
+    name: &str,
+) -> Result<(), String> {
+    let path = workspace
+        .path
+        .join("usr")
+        .join("local")
+        .join("bin")
+        .join(name);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "Failed to remove rejected container executable {}: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
 fn parse_cli_semver(output: &str) -> Option<(u64, u64, u64)> {
     output.split_whitespace().find_map(|word| {
         let candidate = word.trim_start_matches(['v', 'V']);
@@ -7386,6 +7407,7 @@ async fn sync_container_opencode_from_host(
             copied_version = ?installed_version,
             "Copied OpenCode did not pass the explicit container version probe; using container installer fallback"
         );
+        remove_container_usr_local_bin(&workspace_exec.workspace, "opencode")?;
         return Ok(ContainerOpenCodeSync::NeedsContainerInstall);
     }
 
@@ -7531,7 +7553,17 @@ pub(crate) async fn ensure_opencode_cli_available(
         return Err(format!("OpenCode install failed: {}", message));
     }
 
-    if !opencode_binary_available(workspace_exec, cwd).await {
+    if force_container_install {
+        if workspace_cli_version(workspace_exec, cwd, "/usr/local/bin/opencode")
+            .await
+            .is_none()
+        {
+            return Err(
+                "OpenCode install completed but '/usr/local/bin/opencode --version' did not succeed."
+                    .to_string(),
+            );
+        }
+    } else if !opencode_binary_available(workspace_exec, cwd).await {
         return Err(
             "OpenCode install completed but 'opencode' is still not available in workspace PATH."
                 .to_string(),
