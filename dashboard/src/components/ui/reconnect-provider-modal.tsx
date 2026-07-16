@@ -46,6 +46,18 @@ export function providerSupportsOAuthReconnect(provider: AIProvider): boolean {
   );
 }
 
+export function providerShouldShowReconnect(
+  provider: AIProvider,
+  effectiveStatus: AIProvider['status']['type']
+): boolean {
+  return (
+    providerSupportsOAuthReconnect(provider) ||
+    effectiveStatus === 'needs_auth' ||
+    effectiveStatus === 'needs_reauth' ||
+    effectiveStatus === 'error'
+  );
+}
+
 interface ReconnectProviderModalProps {
   provider: AIProvider | null;
   open: boolean;
