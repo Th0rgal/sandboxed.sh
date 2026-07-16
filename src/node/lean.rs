@@ -743,11 +743,32 @@ async fn remove_path_if_exists(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Require a cache root to be a real directory, not a symlink. Checking only
+/// `Path::is_dir` follows symlinks; a repository-controlled `.lake` symlink
+/// would then let later cleanup resolve `build` outside the checkout/cache.
+async fn require_real_directory(path: &Path, label: &str) -> anyhow::Result<bool> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("{label} must not be a symlink: {}", path.display());
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!("{label} is not a directory: {}", path.display());
+    }
+    Ok(true)
+}
+
 /// Restore shared Lake dependencies while discarding root-project outputs.
 /// Root `.lake/build` artifacts are commit-specific; restoring them across
 /// commits can make Lake trust a future-dated stale `.olean` and skip changed
 /// source. Dependency builds under `.lake/packages` remain warm.
 async fn restore_lake_dependency_cache(slot: &Path, lake_dir: &Path) -> anyhow::Result<()> {
+    if !require_real_directory(slot, "lake cache slot").await? {
+        return Ok(());
+    }
     isolated_copy(slot, lake_dir).await?;
     remove_path_if_exists(&lake_dir.join("build")).await
 }
@@ -887,7 +908,7 @@ pub async fn execute_lean_build(
 
 /// Replace the lake cache slot for `key` with the contents of `lake_dir`.
 async fn sync_lake_cache_back(work_root: &Path, key: &str, lake_dir: &Path) -> anyhow::Result<()> {
-    if !lake_dir.is_dir() {
+    if !require_real_directory(lake_dir, "project .lake").await? {
         return Ok(());
     }
     let slot = lake_cache_slot(work_root, key);
@@ -1617,6 +1638,28 @@ mod tests {
 
         assert!(!restored.join("build").exists());
         assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"safe");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lake_cache_sync_rejects_symlinked_lake_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let work_root = dir.path().join("work");
+        let lake_dir = dir.path().join("lake-link");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join("build")).unwrap();
+        std::fs::write(outside.join("build/keep"), b"safe").unwrap();
+        symlink(&outside, &lake_dir).unwrap();
+
+        let error = sync_lake_cache_back(&work_root, "test-key", &lake_dir)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("must not be a symlink"));
+        assert_eq!(std::fs::read(outside.join("build/keep")).unwrap(), b"safe");
+        assert!(!lake_cache_slot(&work_root, "test-key").exists());
     }
 
     #[tokio::test]
