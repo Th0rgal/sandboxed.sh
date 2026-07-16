@@ -458,7 +458,7 @@ pub enum ControlCommand {
         /// the caller's "stalled" observation and the actor processing
         /// this command. User-initiated cancels pass `None`.
         min_idle: Option<std::time::Duration>,
-        respond: oneshot::Sender<Result<(), String>>,
+        respond: oneshot::Sender<Result<CancelMissionOutcome, String>>,
     },
     /// Pause a mission (FLEET-004). Stops any in-flight runner (main or
     /// parallel) for the mission, then sets its status to `Paused`. Unlike
@@ -504,6 +504,15 @@ pub enum ControlCommand {
         mission_id: Option<Uuid>,
         respond: oneshot::Sender<usize>, // number of messages cleared
     },
+}
+
+/// Whether a conditional cancellation actually reached the runner. Background
+/// watchdogs must not overwrite mission state when the actor declined a stale
+/// cancellation because activity resumed in the meantime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelMissionOutcome {
+    Cancelled,
+    SkippedRecentlyActive,
 }
 
 // ==================== Mission Types ====================

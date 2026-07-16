@@ -13656,6 +13656,8 @@ async fn control_actor_loop(
                                 main_runner_last_activity = std::time::Instant::now();
                                 main_runner_activity = None;
                                 main_runner_subtasks.clear();
+                                main_runner_active_tool_calls
+                                    .store(0, std::sync::atomic::Ordering::Relaxed);
                                 let user_id_for_turn = session_user_id.clone();
                                 running = Some(tokio::spawn(async move {
                                     let result = run_single_control_turn(
@@ -14117,7 +14119,9 @@ async fn control_actor_loop(
                                         threshold_secs = min_idle.as_secs(),
                                         "Skipping watchdog/cleanup cancel: mission resumed activity before cancel was processed"
                                     );
-                                    let _ = respond.send(Ok(()));
+                                    let _ = respond.send(Ok(
+                                        CancelMissionOutcome::SkippedRecentlyActive,
+                                    ));
                                     continue;
                                 }
                             }
@@ -14202,7 +14206,7 @@ async fn control_actor_loop(
                             .await;
                             // Cascade cancel child missions
                             cancel_child_missions(mission_id, &mission_store, &mut parallel_runners, &events_tx, &config.working_dir).await;
-                            let _ = respond.send(Ok(()));
+                            let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
                         } else {
                             // Check if this is the currently executing mission
                             // Use running_mission_id (the actual mission being executed)
@@ -14233,7 +14237,7 @@ async fn control_actor_loop(
                                     // Sending both causes duplicate UI messages.
                                     // Cascade cancel child missions
                                     cancel_child_missions(mission_id, &mission_store, &mut parallel_runners, &events_tx, &config.working_dir).await;
-                                    let _ = respond.send(Ok(()));
+                                    let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
                                 } else {
                                     let _ = respond.send(Err("Mission not currently executing".to_string()));
                                 }
@@ -14251,7 +14255,7 @@ async fn control_actor_loop(
                                         || mission.status.is_terminal()
                                         || mission.status == MissionStatus::Acknowledged =>
                                     {
-                                        let _ = respond.send(Ok(()));
+                                        let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
                                     }
                                     Ok(Some(_)) => {
                                         let update = mission_store
@@ -14288,7 +14292,7 @@ async fn control_actor_loop(
                                             &config.working_dir,
                                         )
                                         .await;
-                                        let _ = respond.send(Ok(()));
+                                        let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
                                     }
                                     Ok(None) => {
                                         let _ = respond.send(Err(format!(
@@ -14391,18 +14395,20 @@ async fn control_actor_loop(
                                 } else {
                                     super::mission_runner::MissionRunState::Running
                                 };
+                                let tool_call_in_flight = main_runner_active_tool_calls
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    > 0;
                                 running_list.push(super::mission_runner::RunningMissionInfo {
                                     mission_id,
                                     state: state_label.to_string(),
                                     queue_len: queue.len(),
                                     history_len: history.len(),
                                     seconds_since_activity,
+                                    tool_call_in_flight,
                                     health: super::mission_runner::running_health(
                                         mission_state,
                                         seconds_since_activity,
-                                        main_runner_active_tool_calls
-                                            .load(std::sync::atomic::Ordering::Relaxed)
-                                            > 0,
+                                        tool_call_in_flight,
                                     ),
                                     expected_deliverables: 0,
                                     current_activity: main_runner_activity.clone(),
@@ -14709,6 +14715,8 @@ async fn control_actor_loop(
                                         main_runner_last_activity = std::time::Instant::now();
                                         main_runner_activity = None;
                                         main_runner_subtasks.clear();
+                                        main_runner_active_tool_calls
+                                            .store(0, std::sync::atomic::Ordering::Relaxed);
                                         let user_id_for_turn = session_user_id.clone();
                                         running = Some(tokio::spawn(async move {
                                             let result = run_single_control_turn(
@@ -15122,6 +15130,8 @@ async fn control_actor_loop(
                     running_cancel = None;
                     running_mission_id = None;
                     main_runner_activity = None;
+                    main_runner_active_tool_calls
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                     // Runner cleared itself; cancel the force-clear watchdog.
                     runner_force_clear_deadline = None;
                     let mut completed_terminal_reason = None;
@@ -15511,6 +15521,8 @@ async fn control_actor_loop(
                     main_runner_last_activity = std::time::Instant::now();
                     main_runner_activity = None;
                     main_runner_subtasks.clear();
+                    main_runner_active_tool_calls
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                     let user_id_for_turn = session_user_id.clone();
                     running = Some(tokio::spawn(async move {
                         let result = run_single_control_turn(
@@ -15979,6 +15991,8 @@ async fn control_actor_loop(
                 running_cancel = None;
                 running_mission_id = None;
                 main_runner_activity = None;
+                main_runner_active_tool_calls
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
                 runner_force_clear_deadline = None;
                 if let Some(mid) = stuck_mid {
                     // Mark mission as Interrupted so it stays resumable.

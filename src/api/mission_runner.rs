@@ -2431,6 +2431,11 @@ pub enum MissionRunState {
 
 const STALL_WARN_SECS: u64 = 120;
 const STALL_SEVERE_SECS: u64 = 300;
+/// An unmatched ToolCall is only evidence that a tool *may* still be running.
+/// Some harnesses omit ToolResult events, so this hint must not suppress
+/// severe-stall handling forever. One hour accommodates large local builds
+/// while bounding stale counter damage.
+pub(crate) const TOOL_CALL_STALL_GRACE_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -2459,26 +2464,24 @@ pub enum MissionHealth {
 
 /// Classify how long a turn has been quiet.
 ///
-/// `tool_subprocess_alive` reports whether the worker is currently inside a
-/// tool call (e.g. `Bash` running `lake build` / `make check`).  Long tool
-/// subprocesses are expected to produce ~zero model tokens for many minutes;
-/// without this signal the watchdog would mark them as Severe-stalled at
-/// 5 minutes and terminate the mission mid-build (issue: workers tripped
-/// killed during honest subprocess work).
+/// `tool_call_in_flight` reports an unmatched harness ToolCall (e.g. `Bash`
+/// running `lake build` / `make check`). Long calls can produce ~zero model
+/// tokens for many minutes. It is a hint rather than OS-process proof because
+/// some harnesses omit ToolResult events, so its protection is time-bounded.
 ///
 /// Rule:
 ///   Severe ⇔ (seconds_since_activity > STALL_SEVERE_SECS)
-///              AND no live tool subprocess.
+///              AND no recent in-flight tool hint.
 ///
 /// When a tool is in flight we degrade Severe to Warning so the operator
 /// still sees the mission is quiet, but the auto-terminate watchdog
 /// (which only fires on Severe) does not interrupt the build.
 fn stall_severity(
     seconds_since_activity: u64,
-    tool_subprocess_alive: bool,
+    tool_call_in_flight: bool,
 ) -> Option<MissionStallSeverity> {
     if seconds_since_activity > STALL_SEVERE_SECS {
-        if tool_subprocess_alive {
+        if tool_call_in_flight && seconds_since_activity < TOOL_CALL_STALL_GRACE_SECS {
             // Long-running tool: keep the user informed via Warning, but
             // do not escalate to Severe (which would trip the watchdog).
             Some(MissionStallSeverity::Warning)
@@ -2495,13 +2498,13 @@ fn stall_severity(
 pub fn running_health(
     state: MissionRunState,
     seconds_since_activity: u64,
-    tool_subprocess_alive: bool,
+    tool_call_in_flight: bool,
 ) -> MissionHealth {
     if matches!(
         state,
         MissionRunState::Running | MissionRunState::WaitingForTool
     ) {
-        if let Some(severity) = stall_severity(seconds_since_activity, tool_subprocess_alive) {
+        if let Some(severity) = stall_severity(seconds_since_activity, tool_call_in_flight) {
             return MissionHealth::Stalled {
                 seconds_since_activity,
                 last_state: format!("{:?}", state),
@@ -2721,6 +2724,14 @@ impl MissionRunner {
         self.last_activity = Instant::now();
     }
 
+    /// Clear turn-scoped tool hints before a runner is reused. Some harnesses
+    /// can omit a terminal ToolResult, so the counter must not survive into a
+    /// later queued turn and incorrectly extend its watchdog grace period.
+    fn reset_turn_tool_calls(&self) {
+        self.active_tool_calls
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Check the health of this mission.
     pub async fn check_health(&self) -> MissionHealth {
         let seconds_since = self.last_activity.elapsed().as_secs();
@@ -2841,6 +2852,7 @@ impl MissionRunner {
             None => return false,
         };
 
+        self.reset_turn_tool_calls();
         self.state = MissionRunState::Running;
 
         let cancel = CancellationToken::new();
@@ -2929,6 +2941,10 @@ impl MissionRunner {
 
         // Check if handle is finished
         if handle.is_finished() {
+            // A completed or panicked turn can leave an unmatched ToolCall in
+            // harnesses that omit ToolResult events. Never expose that stale
+            // hint while queued or carry it into the next turn.
+            self.reset_turn_tool_calls();
             match handle.await {
                 Ok(result) => {
                     self.touch(); // Update last activity
@@ -8218,6 +8234,9 @@ pub struct RunningMissionInfo {
     pub queue_len: usize,
     pub history_len: usize,
     pub seconds_since_activity: u64,
+    /// The harness emitted a ToolCall without a matching ToolResult yet. This
+    /// is time-bounded stall evidence, not proof that an OS process is alive.
+    pub tool_call_in_flight: bool,
     pub health: MissionHealth,
     pub expected_deliverables: usize,
     /// Current activity label (e.g., "Reading: main.rs")
@@ -8232,6 +8251,10 @@ pub struct RunningMissionInfo {
 impl From<&MissionRunner> for RunningMissionInfo {
     fn from(runner: &MissionRunner) -> Self {
         let seconds_since_activity = runner.last_activity.elapsed().as_secs();
+        let tool_call_in_flight = runner
+            .active_tool_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0;
         Self {
             mission_id: runner.mission_id,
             state: match runner.state {
@@ -8243,14 +8266,8 @@ impl From<&MissionRunner> for RunningMissionInfo {
             queue_len: runner.queue.len(),
             history_len: runner.history.len(),
             seconds_since_activity,
-            health: running_health(
-                runner.state,
-                seconds_since_activity,
-                runner
-                    .active_tool_calls
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    > 0,
-            ),
+            tool_call_in_flight,
+            health: running_health(runner.state, seconds_since_activity, tool_call_in_flight),
             expected_deliverables: runner.deliverables.deliverables.len(),
             current_activity: runner.current_activity.clone(),
             subtask_total: runner.subtasks.len(),
@@ -8438,7 +8455,7 @@ mod tests {
         ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
         ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
         OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
-        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS, TOOL_CALL_STALL_GRACE_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -10426,11 +10443,17 @@ mod tests {
     }
 
     #[test]
-    fn stall_severity_no_severe_when_tool_alive_even_at_extreme_quiet() {
-        // 30 minutes of silence with a live subprocess (e.g. a long
-        // `make check`) is still classified as Warning, never Severe.
+    fn stall_severity_grants_long_tool_call_a_bounded_warning_window() {
+        // 30 minutes of silence after a ToolCall (e.g. a long `make check`)
+        // remains Warning and does not interrupt a healthy large build.
         let result = stall_severity(STALL_SEVERE_SECS * 6, true).unwrap();
         assert!(matches!(result, MissionStallSeverity::Warning));
+    }
+
+    #[test]
+    fn stall_severity_does_not_trust_unmatched_tool_call_forever() {
+        let result = stall_severity(TOOL_CALL_STALL_GRACE_SECS, true).unwrap();
+        assert!(matches!(result, MissionStallSeverity::Severe));
     }
 
     #[test]
