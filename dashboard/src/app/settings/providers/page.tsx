@@ -776,9 +776,13 @@ export default function ProvidersPage() {
                   !!cachedUsage?.error ||
                   (typeof cachedUsage?.status === 'string' &&
                     !['connected', 'ok'].includes(cachedUsage.status));
-                const effectiveStatus = usageIndicatesDisconnected
-                  ? 'error'
-                  : provider.status.type;
+                const cachedAuthStatus =
+                  cachedUsage?.status === 'needs_auth' || cachedUsage?.status === 'needs_reauth'
+                    ? cachedUsage.status
+                    : null;
+                const effectiveStatus = cachedAuthStatus ?? (
+                  usageIndicatesDisconnected ? 'error' : provider.status.type
+                );
                 const statusColor = effectiveStatus === 'connected'
                   ? 'bg-emerald-400'
                   : effectiveStatus === 'needs_auth' || effectiveStatus === 'needs_reauth'
