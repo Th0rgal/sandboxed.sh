@@ -38,7 +38,10 @@ use crate::library::env_crypto::strip_encrypted_tags;
 use crate::library::LibraryStore;
 use crate::mcp::{McpRegistry, McpScope, McpServerConfig, McpTransport};
 use crate::nspawn::{self, NspawnDistro};
-use crate::util::{env_var_bool, home_dir, strip_jsonc_comments, AI_PROVIDERS_PATH};
+use crate::util::{
+    current_service_companion_binary_path, env_var_bool, home_dir, strip_jsonc_comments,
+    AI_PROVIDERS_PATH,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Workspace Types
@@ -2956,6 +2959,12 @@ fn find_host_binary(name: &str, working_dir: &Path) -> Option<PathBuf> {
         if candidate.exists() {
             return Some(candidate);
         }
+    }
+
+    if let Some(scoped) =
+        current_service_companion_binary_path(name).filter(|candidate| candidate.exists())
+    {
+        return Some(scoped);
     }
 
     if let Ok(path_var) = std::env::var("PATH") {

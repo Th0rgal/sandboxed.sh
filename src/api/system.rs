@@ -27,7 +27,7 @@ use super::auth::AuthUser;
 use super::control::{self, MissionStatus};
 use super::mission_store::Mission;
 use super::routes::AppState;
-use crate::util::home_dir;
+use crate::util::{current_service_companion_binary_path, home_dir, service_companion_binary_path};
 use crate::workspace::{Workspace, WorkspaceStatus, WorkspaceType};
 
 /// Git remote used for sandboxed.sh self-updates
@@ -2056,6 +2056,11 @@ async fn adopt_hermes_assistant(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let home_channel = choose_telegram_home_channel(&channel.allowed_chat_ids, &chat_mappings);
+    let assistant_mcp_command = current_service_companion_binary_path("assistant-mcp")
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/bin/assistant-mcp"))
+        .to_string_lossy()
+        .to_string();
 
     run_host_command("install", &["-d", "-m", "0755", "/etc/sandboxed-sh"])
         .await
@@ -2103,7 +2108,10 @@ async fn adopt_hermes_assistant(
     if req.allow_all_users {
         env.push_str("GATEWAY_ALLOW_ALL_USERS=true\n");
     }
-    env.push_str("HERMES_ASSISTANT_MCP_COMMAND=/usr/local/bin/assistant-mcp\n");
+    env.push_str(&env_line(
+        "HERMES_ASSISTANT_MCP_COMMAND",
+        &assistant_mcp_command,
+    ));
 
     // Preserve remote access (desktop proxy mode) across adoptions: keep the
     // existing API_SERVER_KEY so connected desktop apps don't break.
@@ -2135,7 +2143,7 @@ async fn adopt_hermes_assistant(
             &model,
             &format!("{api_url}/v1"),
             &proxy_key,
-            "/usr/local/bin/assistant-mcp",
+            &assistant_mcp_command,
             &api_url,
             &jwt_secret,
             &user_id,
@@ -2550,6 +2558,11 @@ async fn which_grok() -> Option<String> {
 
 /// Find the path to the Hermes assistant MCP connector.
 async fn which_assistant_mcp() -> Option<String> {
+    if let Some(path) = current_service_companion_binary_path("assistant-mcp") {
+        if path.exists() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
     which_binary("assistant-mcp", &["/usr/local/bin/assistant-mcp"]).await
 }
 
@@ -3130,7 +3143,9 @@ fn stream_sandboxed_update(
         // Also install MCP binaries if they were built
         for mcp_bin in ["workspace-mcp", "desktop-mcp", "assistant-mcp"] {
             let mcp_src = format!("{}/target/debug/{}", repo_path.display(), mcp_bin);
-            let mcp_dest = format!("/usr/local/bin/{}", mcp_bin);
+            let mcp_dest = service_companion_binary_path(&current_exe, mcp_bin)
+                .to_string_lossy()
+                .to_string();
             if std::path::Path::new(&mcp_src).exists() {
                 let _ = Command::new("install")
                     .args(["-m", "0755", &mcp_src, &mcp_dest])
@@ -3524,19 +3539,26 @@ fn stream_deploy(
         const ASSISTANT_MCP_CARGO_BIN: &str = "assistant-mcp";
         const PALOMA_CARGO_BIN: &str = "palomactl";
         let install_dest_main = current_exe.to_string_lossy().to_string();
-        // Match the MCP install location: same dir as the main binary, fixed name.
-        let install_dest_mcp = current_exe
-            .parent()
-            .map(|p| p.join(MCP_CARGO_BIN).to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("/usr/local/bin/{}", MCP_CARGO_BIN));
-        let install_dest_assistant_mcp = current_exe
-            .parent()
-            .map(|p| p.join(ASSISTANT_MCP_CARGO_BIN).to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("/usr/local/bin/{}", ASSISTANT_MCP_CARGO_BIN));
-        let install_dest_paloma = std::env::var("PALOMACTL_INSTALL_PATH")
-            .ok()
-            .filter(|path| !path.trim().is_empty())
-            .unwrap_or_else(|| {
+        // Production owns the historical unsuffixed companion paths consumed
+        // by Hermes. Dev/staging services install suffixed companions so their
+        // deploys cannot replace production MCP or palomactl binaries.
+        let install_dest_mcp = service_companion_binary_path(&current_exe, MCP_CARGO_BIN)
+            .to_string_lossy()
+            .to_string();
+        let install_dest_assistant_mcp =
+            service_companion_binary_path(&current_exe, ASSISTANT_MCP_CARGO_BIN)
+                .to_string_lossy()
+                .to_string();
+        let scoped_paloma = service_companion_binary_path(&current_exe, PALOMA_CARGO_BIN);
+        let install_dest_paloma = if scoped_paloma.file_name().and_then(|v| v.to_str())
+            != Some(PALOMA_CARGO_BIN)
+        {
+            scoped_paloma.to_string_lossy().to_string()
+        } else {
+            std::env::var("PALOMACTL_INSTALL_PATH")
+                .ok()
+                .filter(|path| !path.trim().is_empty())
+                .unwrap_or_else(|| {
                 let hermes_bin = std::path::Path::new("/var/lib/hermes-assistant/bin");
                 let wrapper = hermes_bin.join("palomactl-wrapper");
                 let real = hermes_bin.join("palomactl.real");
@@ -3551,7 +3573,8 @@ fn stream_deploy(
                 } else {
                     "/usr/local/bin/palomactl".to_string()
                 }
-            });
+            })
+        };
 
         if !req.skip_build {
             yield sse("log", format!("Building {} + {} + {} + {} (cargo build, debug)", MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN, PALOMA_CARGO_BIN), Some(25));

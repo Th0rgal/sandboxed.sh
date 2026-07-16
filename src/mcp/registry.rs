@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::config::McpConfigStore;
 use super::types::*;
+use crate::util::current_service_companion_binary_path;
 
 /// MCP protocol version we support
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -78,8 +79,12 @@ fn is_builtin_workspace_mcp(config: &McpServerConfig, working_dir: &Path) -> boo
     }
 
     let command_path = Path::new(command);
+    let scoped_workspace_mcp = current_service_companion_binary_path("workspace-mcp");
     command == "workspace-mcp"
         || command_path == Path::new("/usr/local/bin/workspace-mcp")
+        || scoped_workspace_mcp
+            .as_deref()
+            .is_some_and(|path| command_path == path)
         || command_path == working_dir.join("target/release/workspace-mcp")
         || command_path == working_dir.join("target/debug/workspace-mcp")
 }
@@ -263,6 +268,10 @@ impl McpRegistry {
                 release.to_string_lossy().to_string()
             } else if debug.exists() {
                 debug.to_string_lossy().to_string()
+            } else if let Some(scoped) = current_service_companion_binary_path("orchestrator-mcp")
+                .filter(|path| path.exists())
+            {
+                scoped.to_string_lossy().to_string()
             } else {
                 "orchestrator-mcp".to_string()
             }
@@ -344,6 +353,11 @@ impl McpRegistry {
             let debug = working_dir.join("target").join("debug").join(name);
             if debug.exists() {
                 return Some(debug.to_string_lossy().to_string());
+            }
+            if let Some(scoped) =
+                current_service_companion_binary_path(name).filter(|path| path.exists())
+            {
+                return Some(scoped.to_string_lossy().to_string());
             }
             None
         }

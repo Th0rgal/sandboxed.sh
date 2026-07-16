@@ -41,6 +41,11 @@ Hermes gotchas:
 
 - After a prod deploy, `systemctl restart hermes-assistant` so the gateway
   respawns the freshly installed `/usr/local/bin/assistant-mcp`.
+- Companion binaries are environment-scoped: production owns the historical
+  unsuffixed paths (`assistant-mcp`, `orchestrator-mcp`, `palomactl`), while
+  `sandboxed-sh-dev` installs `*-dev`. Never copy a dev MCP over an unsuffixed
+  production path; doing so changes Hermes production tooling without a prod
+  deploy.
 - When testing the WS handshake with curl, force `--http1.1` — ALPN negotiates
   h2, which has no `Upgrade` header, and the resulting 401 is a red herring.
 - When rotating the `hsk_` key, update `API_SERVER_KEY`,

@@ -55,6 +55,40 @@ pub fn home_dir() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
 }
 
+/// Return the install path for a companion binary owned by one sandboxed.sh
+/// service environment.
+///
+/// Production keeps the historical unsuffixed paths (`assistant-mcp`,
+/// `orchestrator-mcp`, ...), because the production Hermes service consumes
+/// them directly. Non-production binaries such as `sandboxed-sh-dev` use
+/// suffixed companions (`assistant-mcp-dev`). This prevents a dev deployment
+/// from silently replacing the tools used by production.
+pub fn service_companion_binary_path(
+    current_exe: &std::path::Path,
+    binary: &str,
+) -> std::path::PathBuf {
+    let parent = current_exe
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/usr/local/bin"));
+    let service_suffix = current_exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("sandboxed-sh-"))
+        .filter(|suffix| !suffix.is_empty() && *suffix != "prod");
+
+    match service_suffix {
+        Some(suffix) => parent.join(format!("{binary}-{suffix}")),
+        None => parent.join(binary),
+    }
+}
+
+/// Resolve a companion path for the currently running sandboxed.sh binary.
+pub fn current_service_companion_binary_path(binary: &str) -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .map(|exe| service_companion_binary_path(&exe, binary))
+}
+
 /// Read an environment variable, returning `Some(trimmed)` only when the
 /// variable is set *and* non-empty after trimming whitespace. Callers that
 /// chain several aliases via `or_else` need this to skip templated blank
@@ -477,6 +511,38 @@ mod tests {
         let result = build_history_context(&history, 10000);
         assert!(result.contains("USER: hello"));
         assert!(result.contains("ASSISTANT: world"));
+    }
+
+    #[test]
+    fn companion_binaries_are_isolated_outside_production() {
+        assert_eq!(
+            service_companion_binary_path(
+                std::path::Path::new("/usr/local/bin/sandboxed-sh-prod"),
+                "assistant-mcp",
+            ),
+            std::path::PathBuf::from("/usr/local/bin/assistant-mcp")
+        );
+        assert_eq!(
+            service_companion_binary_path(
+                std::path::Path::new("/usr/local/bin/sandboxed-sh-dev"),
+                "assistant-mcp",
+            ),
+            std::path::PathBuf::from("/usr/local/bin/assistant-mcp-dev")
+        );
+        assert_eq!(
+            service_companion_binary_path(
+                std::path::Path::new("/opt/bin/sandboxed-sh-staging"),
+                "orchestrator-mcp",
+            ),
+            std::path::PathBuf::from("/opt/bin/orchestrator-mcp-staging")
+        );
+        assert_eq!(
+            service_companion_binary_path(
+                std::path::Path::new("/usr/local/bin/sandboxed-sh"),
+                "palomactl",
+            ),
+            std::path::PathBuf::from("/usr/local/bin/palomactl")
+        );
     }
 
     #[test]
