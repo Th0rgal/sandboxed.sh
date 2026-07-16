@@ -323,9 +323,11 @@ Execution model:
   manifest's configured `packagesDir` (which must be a clean relative path
   below `lakeDir` and must not overlap the root `buildDir`); after a successful
   build only that dependency tree is refreshed through a temp dir and atomic
-  rename under a per-key flock. No other entry under `lakeDir` is shared, so
-  default or custom root-project build directories are rebuilt per commit while
-  dependencies stay warm.
+  rename under a per-key flock. Because Lake 4.24 does not normally persist the
+  evaluated root `buildDir` in `lake-manifest.json`, dependency restore/sync is
+  conservatively skipped unless the manifest explicitly contains `buildDir`.
+  This keeps dynamic lakefile layouts cold rather than risking cross-commit
+  root outputs. No other entry under `lakeDir` is shared.
 - `artifacts` patterns are resolved relative to the checkout root after a
   successful build: exact relative paths, or `*` within a single path
   segment (never across `/`); `..` and absolute paths are rejected. Each

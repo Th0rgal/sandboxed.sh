@@ -385,11 +385,17 @@ fn configured_lake_cache_paths(build_cwd: &Path) -> Option<(PathBuf, PathBuf)> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or(".lake/packages"),
     );
+    // Lake 4.24's manifest normally records lakeDir/packagesDir but does not
+    // record the root package's buildDir.  Falling back to `.lake/build` is
+    // unsafe: a dynamic lakefile can put root outputs below packagesDir, and
+    // sync-back would then persist those outputs across commits.  Cache only
+    // when a producer has explicitly recorded buildDir in the manifest.  This
+    // deliberately turns an unknown layout into a cold build until the node
+    // can query Lake's evaluated package configuration safely.
     let build_rel = Path::new(
         manifest
             .get("buildDir")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(".lake/build"),
+            .and_then(serde_json::Value::as_str)?,
     );
     let is_clean_relative = |path: &Path| {
         !path.as_os_str().is_empty()
@@ -1747,7 +1753,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("lake-manifest.json"),
-            br#"{"lakeDir":".lake","packagesDir":".lake/deps"}"#,
+            br#"{"lakeDir":".lake","packagesDir":".lake/deps","buildDir":".lake/build"}"#,
         )
         .unwrap();
 
@@ -1756,6 +1762,7 @@ mod tests {
         assert_eq!(packages_dir, dir.path().join(".lake/deps"));
 
         for manifest in [
+            br#"{"lakeDir":".lake","packagesDir":".lake/deps"}"#.as_slice(),
             br#"{"lakeDir":".lake","packagesDir":"../deps"}"#.as_slice(),
             br#"{"lakeDir":".lake","packagesDir":"deps"}"#.as_slice(),
             br#"{"lakeDir":".lake","packagesDir":".lake"}"#.as_slice(),
