@@ -7254,6 +7254,7 @@ fn copy_host_executable_into_container(
     Ok(format!("/usr/local/bin/{}", name))
 }
 
+#[cfg(test)]
 fn parse_cli_semver(output: &str) -> Option<(u64, u64, u64)> {
     parse_cli_version(output).map(|version| version.semver)
 }

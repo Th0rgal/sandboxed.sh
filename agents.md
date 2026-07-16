@@ -181,6 +181,10 @@ Gotchas:
   GPU nodes for inference while ordinary CPU/Lean nodes have immediate slots,
   then balances by normalized utilization. Only terminal node/job/head receipts
   prove that work was actually distributed.
+- **Dev/prod companion binaries are isolated**: production uses unsuffixed MCP
+  and palomactl paths; non-production services use a service suffix (for
+  example `assistant-mcp-dev`). A dev deploy must never replace Hermes's
+  production connector.
 - Agents are loaded from OpenCode built-ins and native `.opencode/agents/*.md` files.
 - Per-workspace execution eliminates host-to-container network issues.
 - For remote workspaces, SSH execution keeps bash/tooling on the remote host.
