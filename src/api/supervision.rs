@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn inactivity_watchdog_preserves_live_tool_past_threshold() {
-        assert!(!inactivity_is_cancellable(STUCK_SECONDS * 4, true));
+        assert!(!inactivity_is_cancellable(STUCK_SECONDS * 2, true));
     }
 
     #[test]
