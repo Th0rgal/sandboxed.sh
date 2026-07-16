@@ -13656,6 +13656,8 @@ async fn control_actor_loop(
                                 main_runner_last_activity = std::time::Instant::now();
                                 main_runner_activity = None;
                                 main_runner_subtasks.clear();
+                                main_runner_active_tool_calls
+                                    .store(0, std::sync::atomic::Ordering::Relaxed);
                                 let user_id_for_turn = session_user_id.clone();
                                 running = Some(tokio::spawn(async move {
                                     let result = run_single_control_turn(
@@ -14713,6 +14715,8 @@ async fn control_actor_loop(
                                         main_runner_last_activity = std::time::Instant::now();
                                         main_runner_activity = None;
                                         main_runner_subtasks.clear();
+                                        main_runner_active_tool_calls
+                                            .store(0, std::sync::atomic::Ordering::Relaxed);
                                         let user_id_for_turn = session_user_id.clone();
                                         running = Some(tokio::spawn(async move {
                                             let result = run_single_control_turn(
@@ -15126,6 +15130,8 @@ async fn control_actor_loop(
                     running_cancel = None;
                     running_mission_id = None;
                     main_runner_activity = None;
+                    main_runner_active_tool_calls
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                     // Runner cleared itself; cancel the force-clear watchdog.
                     runner_force_clear_deadline = None;
                     let mut completed_terminal_reason = None;
@@ -15515,6 +15521,8 @@ async fn control_actor_loop(
                     main_runner_last_activity = std::time::Instant::now();
                     main_runner_activity = None;
                     main_runner_subtasks.clear();
+                    main_runner_active_tool_calls
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                     let user_id_for_turn = session_user_id.clone();
                     running = Some(tokio::spawn(async move {
                         let result = run_single_control_turn(
@@ -15983,6 +15991,8 @@ async fn control_actor_loop(
                 running_cancel = None;
                 running_mission_id = None;
                 main_runner_activity = None;
+                main_runner_active_tool_calls
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
                 runner_force_clear_deadline = None;
                 if let Some(mid) = stuck_mid {
                     // Mark mission as Interrupted so it stays resumable.
