@@ -3198,6 +3198,78 @@ fn stream_sandboxed_update(
         const MAIN_CARGO_BIN: &str = "sandboxed-sh";
         let src = format!("{}/target/debug/{}", repo_path.display(), MAIN_CARGO_BIN);
 
+        let companion_plans: Vec<(&str, String, String)> = [
+            "workspace-mcp",
+            "desktop-mcp",
+            "assistant-mcp",
+        ]
+        .into_iter()
+        .map(|binary| {
+            (
+                binary,
+                format!("{}/target/debug/{}", repo_path.display(), binary),
+                service_companion_binary_path(&current_exe, binary)
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        })
+        .collect();
+        for (_, source, _) in &companion_plans {
+            if !std::path::Path::new(source).exists() {
+                yield sse("error", format!("Build artifact missing: {}", source), None);
+                let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
+                return;
+            }
+        }
+
+        let rollback_tag = format!("self-update-{}", chrono::Utc::now().timestamp_millis());
+        let main_backup = format!("{}.pre-deploy-{}", install_dest, rollback_tag);
+        let main_rollback = match prepare_deploy_backup(&install_dest, &main_backup).await {
+            Ok(rollback) => rollback,
+            Err(error) => {
+                yield sse("error", error, None);
+                let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
+                return;
+            }
+        };
+        let mut companion_rollbacks = Vec::new();
+        for (_, _, destination) in &companion_plans {
+            let backup = format!("{}.pre-deploy-{}", destination, rollback_tag);
+            match prepare_deploy_backup(destination, &backup).await {
+                Ok(rollback) => companion_rollbacks.push((destination.clone(), backup, rollback)),
+                Err(error) => {
+                    for (rollback_dest, rollback_backup, rollback) in &companion_rollbacks {
+                        rollback_deployed_binary(rollback_dest, rollback_backup, rollback).await;
+                    }
+                    yield sse("error", error, None);
+                    let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
+                    return;
+                }
+            }
+        }
+
+        // Install companions first and the main binary last. If any step
+        // fails, restore the entire generation before restarting the service.
+        for (binary, source, destination) in &companion_plans {
+            let install = Command::new("install")
+                .args(["-m", "0755", source, destination])
+                .output()
+                .await;
+            let install_error = match install {
+                Ok(output) if output.status.success() => None,
+                Ok(output) => Some(String::from_utf8_lossy(&output.stderr).to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(error) = install_error {
+                for (rollback_dest, rollback_backup, rollback) in &companion_rollbacks {
+                    rollback_deployed_binary(rollback_dest, rollback_backup, rollback).await;
+                }
+                yield sse("error", format!("Failed to install {}: {}", binary, error), None);
+                let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
+                return;
+            }
+        }
+
         let install_result = if versioned_install {
             install_versioned_binary_as(
                 repo_path,
@@ -3225,45 +3297,21 @@ fn stream_sandboxed_update(
         match install_result {
             Ok(()) => {}
             Err(msg) => {
+                rollback_deployed_binary(&install_dest, &main_backup, &main_rollback).await;
+                for (rollback_dest, rollback_backup, rollback) in &companion_rollbacks {
+                    rollback_deployed_binary(rollback_dest, rollback_backup, rollback).await;
+                }
                 yield sse("error", format!("Failed to install binary: {}", msg), None);
                 let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
                 return;
             }
         }
 
-        // Also install MCP binaries if they were built
-        for mcp_bin in ["workspace-mcp", "desktop-mcp", "assistant-mcp"] {
-            let mcp_src = format!("{}/target/debug/{}", repo_path.display(), mcp_bin);
-            let mcp_dest = service_companion_binary_path(&current_exe, mcp_bin)
-                .to_string_lossy()
-                .to_string();
-            if !std::path::Path::new(&mcp_src).exists() {
-                yield sse("error", format!("Build artifact missing: {}", mcp_src), None);
-                let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
-                return;
-            }
-            let install = Command::new("install")
-                .args(["-m", "0755", &mcp_src, &mcp_dest])
-                .output()
-                .await;
-            match install {
-                Ok(output) if output.status.success() => {}
-                Ok(output) => {
-                    yield sse("error", format!("Failed to install {}: {}", mcp_bin, String::from_utf8_lossy(&output.stderr)), None);
-                    let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
-                    return;
-                }
-                Err(error) => {
-                    yield sse("error", format!("Failed to run installer for {}: {}", mcp_bin, error), None);
-                    let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
-                    return;
-                }
-            }
-        }
-
-        let assistant_mcp_dest = service_companion_binary_path(&current_exe, "assistant-mcp")
-            .to_string_lossy()
-            .to_string();
+        let assistant_mcp_dest = companion_plans
+            .iter()
+            .find(|(binary, _, _)| *binary == "assistant-mcp")
+            .map(|(_, _, destination)| destination.clone())
+            .expect("assistant-mcp plan");
         let hermes_runtime = assistant_runtime_name(&state.config);
         match migrate_hermes_assistant_mcp_command(hermes_runtime, &assistant_mcp_dest).await {
             Ok(true) => {
@@ -3271,10 +3319,24 @@ fn stream_sandboxed_update(
             }
             Ok(false) => {}
             Err(error) => {
+                rollback_deployed_binary(&install_dest, &main_backup, &main_rollback).await;
+                for (rollback_dest, rollback_backup, rollback) in &companion_rollbacks {
+                    rollback_deployed_binary(rollback_dest, rollback_backup, rollback).await;
+                }
                 yield sse("error", format!("Hermes MCP command migration failed: {}", error), None);
                 let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
                 return;
             }
+        }
+
+        // The generation is now complete. Retain the same bounded rollback
+        // history as the regular deploy endpoint; self-update used to leave a
+        // full copy of every binary behind on each successful run.
+        let keep = deploy_backup_keep();
+        for destination in std::iter::once(&install_dest)
+            .chain(companion_plans.iter().map(|(_, _, destination)| destination))
+        {
+            let _ = prune_deploy_backups(destination, keep).await;
         }
 
         // Send restart event before restarting - the SSE connection will drop when the
