@@ -582,30 +582,27 @@ impl AIProviderStore {
 
         {
             let mut providers = self.providers.write().await;
-            if let Some(existing) = providers.get(&id) {
-                let existing_refresh = existing
-                    .oauth
-                    .as_ref()
-                    .map(|oauth| oauth.refresh_token.as_str());
-                let replacement_refresh = provider
-                    .oauth
-                    .as_ref()
-                    .map(|oauth| oauth.refresh_token.as_str());
-                if existing_refresh != replacement_refresh {
-                    provider.rejected_oauth_refresh_fingerprint = None;
-                }
-                // If setting as default, unset others
-                if provider.is_default {
-                    for p in providers.values_mut() {
-                        if p.id != id {
-                            p.is_default = false;
-                        }
+            let existing = providers.get(&id)?;
+            let existing_refresh = existing
+                .oauth
+                .as_ref()
+                .map(|oauth| oauth.refresh_token.as_str());
+            let replacement_refresh = provider
+                .oauth
+                .as_ref()
+                .map(|oauth| oauth.refresh_token.as_str());
+            if existing_refresh != replacement_refresh {
+                provider.rejected_oauth_refresh_fingerprint = None;
+            }
+            // If setting as default, unset others
+            if provider.is_default {
+                for p in providers.values_mut() {
+                    if p.id != id {
+                        p.is_default = false;
                     }
                 }
-                providers.insert(id, provider.clone());
-            } else {
-                return None;
             }
+            providers.insert(id, provider.clone());
         }
 
         if let Err(e) = self.save_to_disk().await {
