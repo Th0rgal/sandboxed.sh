@@ -209,6 +209,7 @@ pub(crate) async fn cleanup_stale_active_missions_once(
                 // which is the common case for stale missions, and we
                 // ignore that error.
                 let (tx, rx) = oneshot::channel();
+                let mut cancellation_skipped = false;
                 if cmd_tx
                     .send(ControlCommand::CancelMission {
                         mission_id: mission.id,
@@ -218,7 +219,17 @@ pub(crate) async fn cleanup_stale_active_missions_once(
                     .await
                     .is_ok()
                 {
-                    let _ = rx.await;
+                    cancellation_skipped = matches!(
+                        rx.await,
+                        Ok(Ok(CancelMissionOutcome::SkippedRecentlyActive))
+                    );
+                }
+                if cancellation_skipped {
+                    tracing::info!(
+                        mission_id = %mission.id,
+                        "Stale cleanup: mission resumed activity; leaving it active"
+                    );
+                    continue;
                 }
 
                 if let Err(e) = mission_store
@@ -420,7 +431,7 @@ pub(crate) async fn stuck_mission_watchdog_loop(
                 info.seconds_since_activity
             );
             let (cancel_tx, cancel_rx) = oneshot::channel();
-            if cmd_tx
+            let cancelled = if cmd_tx
                 .send(ControlCommand::CancelMission {
                     mission_id: info.mission_id,
                     min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
@@ -429,7 +440,16 @@ pub(crate) async fn stuck_mission_watchdog_loop(
                 .await
                 .is_ok()
             {
-                let _ = cancel_rx.await;
+                matches!(cancel_rx.await, Ok(Ok(CancelMissionOutcome::Cancelled)))
+            } else {
+                false
+            };
+            if !cancelled {
+                tracing::info!(
+                    mission_id = %info.mission_id,
+                    "Stuck-mission watchdog: cancellation was skipped or not acknowledged"
+                );
+                continue;
             }
             if let Err(e) = mission_store
                 .update_mission_status_with_reason(

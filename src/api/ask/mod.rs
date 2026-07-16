@@ -1181,7 +1181,7 @@ async fn cancel_working_agent(turn: &AskTurn) -> Result<(), String> {
         .await
         .map_err(|_| "the control session is unavailable".to_string())?;
     match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
-        Ok(Ok(result)) => result,
+        Ok(Ok(result)) => result.map(|_| ()),
         Ok(Err(_)) => Err("the control session dropped the request".to_string()),
         Err(_) => Err("timed out waiting for the cancellation to be acknowledged".to_string()),
     }

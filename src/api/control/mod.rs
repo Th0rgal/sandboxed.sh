@@ -14117,7 +14117,9 @@ async fn control_actor_loop(
                                         threshold_secs = min_idle.as_secs(),
                                         "Skipping watchdog/cleanup cancel: mission resumed activity before cancel was processed"
                                     );
-                                    let _ = respond.send(Ok(()));
+                                    let _ = respond.send(Ok(
+                                        CancelMissionOutcome::SkippedRecentlyActive,
+                                    ));
                                     continue;
                                 }
                             }
@@ -14202,7 +14204,7 @@ async fn control_actor_loop(
                             .await;
                             // Cascade cancel child missions
                             cancel_child_missions(mission_id, &mission_store, &mut parallel_runners, &events_tx, &config.working_dir).await;
-                            let _ = respond.send(Ok(()));
+                            let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
                         } else {
                             // Check if this is the currently executing mission
                             // Use running_mission_id (the actual mission being executed)
@@ -14233,7 +14235,7 @@ async fn control_actor_loop(
                                     // Sending both causes duplicate UI messages.
                                     // Cascade cancel child missions
                                     cancel_child_missions(mission_id, &mission_store, &mut parallel_runners, &events_tx, &config.working_dir).await;
-                                    let _ = respond.send(Ok(()));
+                                    let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
                                 } else {
                                     let _ = respond.send(Err("Mission not currently executing".to_string()));
                                 }
@@ -14251,7 +14253,7 @@ async fn control_actor_loop(
                                         || mission.status.is_terminal()
                                         || mission.status == MissionStatus::Acknowledged =>
                                     {
-                                        let _ = respond.send(Ok(()));
+                                        let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
                                     }
                                     Ok(Some(_)) => {
                                         let update = mission_store
@@ -14288,7 +14290,7 @@ async fn control_actor_loop(
                                             &config.working_dir,
                                         )
                                         .await;
-                                        let _ = respond.send(Ok(()));
+                                        let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
                                     }
                                     Ok(None) => {
                                         let _ = respond.send(Err(format!(
