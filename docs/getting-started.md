@@ -52,6 +52,10 @@ Notes:
 - Use `--skip-proxy` to run harness streaming smoke only.
 - Use `--skip-mission` to run proxy smoke only.
 - Use `--help` to see all options.
+- For an OpenCode container bootstrap change, include a direct-output canary
+  using the intended `provider/model` override. Confirm both the persisted
+  mission event past CLI bootstrap and the returned model text; do not use a
+  native provider backend as a substitute.
 
 ## Optional: Deferred Queue Mode for Proxy Routing
 
