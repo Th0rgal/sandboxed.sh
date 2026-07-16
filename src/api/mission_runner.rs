@@ -2724,6 +2724,14 @@ impl MissionRunner {
         self.last_activity = Instant::now();
     }
 
+    /// Clear turn-scoped tool hints before a runner is reused. Some harnesses
+    /// can omit a terminal ToolResult, so the counter must not survive into a
+    /// later queued turn and incorrectly extend its watchdog grace period.
+    fn reset_turn_tool_calls(&self) {
+        self.active_tool_calls
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Check the health of this mission.
     pub async fn check_health(&self) -> MissionHealth {
         let seconds_since = self.last_activity.elapsed().as_secs();
@@ -2844,6 +2852,7 @@ impl MissionRunner {
             None => return false,
         };
 
+        self.reset_turn_tool_calls();
         self.state = MissionRunState::Running;
 
         let cancel = CancellationToken::new();
@@ -2932,6 +2941,10 @@ impl MissionRunner {
 
         // Check if handle is finished
         if handle.is_finished() {
+            // A completed or panicked turn can leave an unmatched ToolCall in
+            // harnesses that omit ToolResult events. Never expose that stale
+            // hint while queued or carry it into the next turn.
+            self.reset_turn_tool_calls();
             match handle.await {
                 Ok(result) => {
                     self.touch(); // Update last activity
