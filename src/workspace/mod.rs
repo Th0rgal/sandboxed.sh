@@ -2108,24 +2108,43 @@ async fn install_remote_build_wrapper(
     workspace: &Workspace,
     mission_id: Uuid,
 ) -> anyhow::Result<()> {
-    let destination = if workspace.workspace_type == WorkspaceType::Container
-        && !is_container_fallback(workspace)
-    {
-        workspace.path.join("usr/local/bin/remote-lean-build")
-    } else {
-        remote_build_wrapper_path(workspace, mission_id)
-    };
-    if let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    // All three build wrappers ship with the repo and are (re)installed at
+    // mission spawn: `remote-lean-build` (remote-node dispatch), `lean-slot`
+    // (host-wide Lean gate that transparently offloads to the Spark when the
+    // workspace opted in), and `spark-build` (the raw Spark offloader that
+    // `lean-slot` shells out to). Previously `lean-slot`/`spark-build` were
+    // hand-copied into container rootfs and drifted per workspace.
+    const WRAPPERS: [(&str, &[u8]); 3] = [
+        (
+            "remote-lean-build",
+            include_bytes!("../../scripts/remote-lean-build"),
+        ),
+        ("lean-slot", include_bytes!("../../scripts/lean-slot")),
+        ("spark-build", include_bytes!("../../scripts/spark-build")),
+    ];
+    for (name, contents) in WRAPPERS {
+        let destination = if workspace.workspace_type == WorkspaceType::Container
+            && !is_container_fallback(workspace)
+        {
+            workspace.path.join("usr/local/bin").join(name)
+        } else {
+            remote_build_wrapper_path(workspace, mission_id)
+                .parent()
+                .expect("wrapper path has a bin dir parent")
+                .join(name)
+        };
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let tmp = destination.with_extension(format!("tmp-{}-{mission_id}", std::process::id()));
+        tokio::fs::write(&tmp, contents).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).await?;
+        }
+        tokio::fs::rename(&tmp, &destination).await?;
     }
-    let tmp = destination.with_extension(format!("tmp-{}-{mission_id}", std::process::id()));
-    tokio::fs::write(&tmp, include_bytes!("../../scripts/remote-lean-build")).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).await?;
-    }
-    tokio::fs::rename(&tmp, &destination).await?;
     Ok(())
 }
 

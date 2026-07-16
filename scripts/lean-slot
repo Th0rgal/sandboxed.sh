@@ -1,0 +1,71 @@
+#!/bin/sh
+# lean-slot — host-wide gate for heavy Lean work (lake build, REPL start),
+# with optional transparent offload to the DGX Spark.
+# Usage: lean-slot lake build Verity ...   (waits up to 45 min for a local slot)
+#
+# If the workspace has spark_offload enabled (SPARK_OFFLOAD_* injected) and the
+# mission is allowlisted (see SPARK_OFFLOAD_ALLOW), the build is shipped to the
+# Spark via `spark-build` and consumes NO local slot. If offload isn't
+# configured/allowed, or the offload infrastructure is unreachable, we fall back
+# to the original local flock gate below (identical to pre-offload behavior).
+#
+# SPARK_OFFLOAD_ALLOW: comma-separated mission-id (full or 8-char prefix)
+# allowlist. Empty/unset here defaults to a single mission for the initial
+# controlled rollout. Set SPARK_OFFLOAD_ALLOW="" in the environment to allow
+# every offload-enabled mission (full fleet).
+set -u
+
+# --- rollout gate ---
+# Defaults to a single mission for a controlled rollout. To arm a mission, set
+# this to its id (or set SPARK_OFFLOAD_ALLOW="" in the env to arm the whole
+# fleet — safe now that the offload rsync is rel-scoped to the build subtree and
+# the endpoint authorizes each mission's token only for its own / an ancestor's
+# workspace dir).
+SPARK_OFFLOAD_ALLOW="${SPARK_OFFLOAD_ALLOW-}"
+
+_spark_eligible() {
+  [ -n "${SPARK_OFFLOAD_URL:-}" ]          || return 1
+  [ -n "${SPARK_OFFLOAD_MISSION_ID:-}" ]   || return 1
+  [ -n "${SPARK_WORKSPACE_GUEST_DIR:-}" ]  || return 1
+  # Allowlist (empty = allow all offload-enabled missions).
+  if [ -n "${SPARK_OFFLOAD_ALLOW}" ]; then
+    _mid="${SPARK_OFFLOAD_MISSION_ID}"
+    _short="$(printf %s "$_mid" | cut -c1-8)"
+    case ",${SPARK_OFFLOAD_ALLOW}," in
+      *",${_mid},"*)   : ;;
+      *",${_short},"*) : ;;
+      *) return 1 ;;
+    esac
+  fi
+  # Offload builds invoked from inside ANY workspace tree under the workspaces
+  # root: the mission's own dir, OR a shared fleet dir (orchestrator worktrees
+  # live in the boss mission's dir, e.g. mission-<boss>/wk-NNNN). spark-build
+  # re-derives the real workspace root + rel from cwd; the endpoint authorizes a
+  # worker's token for an ancestor mission's dir.
+  _guest_root="$(dirname "${SPARK_WORKSPACE_GUEST_DIR%/}")"
+  case "$(pwd -P)/" in
+    "${_guest_root}"/mission-*/)  return 0 ;;
+    "${_guest_root}"/mission-*/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if _spark_eligible; then
+  spark-build "$@"
+  rc=$?
+  # 90/91 = offload not available -> fall through to the local gate.
+  if [ "$rc" -ne 90 ] && [ "$rc" -ne 91 ]; then
+    exit "$rc"
+  fi
+  echo "lean-slot: spark offload unavailable (rc=$rc); building locally" >&2
+fi
+
+# --- original local concurrency gate: heavy Lean concurrency kept at 2 ---
+for i in 0 1; do
+  exec 9>"/tmp/lean-slot-$i.lock"
+  if flock -n 9; then exec "$@"; fi
+  exec 9>&-
+done
+exec 9>"/tmp/lean-slot-0.lock"
+flock -w 2700 9 || { echo "lean-slot: no slot after 45min" >&2; exit 75; }
+exec "$@"
