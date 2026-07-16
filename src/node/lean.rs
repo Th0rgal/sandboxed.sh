@@ -784,6 +784,36 @@ async fn require_real_directory(path: &Path, label: &str) -> anyhow::Result<bool
     Ok(true)
 }
 
+/// Validate every component of a directory path below a trusted lexical root.
+/// Checking only the final path follows symlinked parents such as
+/// `.lake/nested -> /outside`, which would let cache sync read outside Lake.
+async fn require_real_directory_tree(
+    root: &Path,
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<bool> {
+    if path == root || !path.starts_with(root) {
+        anyhow::bail!("{label} must be below {}", root.display());
+    }
+    if !require_real_directory(root, label).await? {
+        return Ok(false);
+    }
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| anyhow::anyhow!("{label} must be below {}", root.display()))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            anyhow::bail!("{label} contains an invalid path component");
+        };
+        current.push(part);
+        if !require_real_directory(&current, label).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Restore only shared Lake dependencies. Every other top-level `.lake` entry
 /// belongs to the root project and is commit-specific (including custom Lake
 /// `buildDir` values), so copying the whole directory can make Lake trust a
@@ -975,13 +1005,7 @@ async fn sync_lake_cache_back(
     lake_dir: &Path,
     packages_dir: &Path,
 ) -> anyhow::Result<()> {
-    if !require_real_directory(lake_dir, "project .lake").await? {
-        return Ok(());
-    }
-    if packages_dir == lake_dir || !packages_dir.starts_with(lake_dir) {
-        anyhow::bail!("configured packages directory must be below lake directory");
-    }
-    if !require_real_directory(packages_dir, "project Lake packages").await? {
+    if !require_real_directory_tree(lake_dir, packages_dir, "project Lake packages").await? {
         return Ok(());
     }
     let slot = lake_cache_slot(work_root, key);
@@ -1787,6 +1811,30 @@ mod tests {
 
         assert!(error.to_string().contains("must not be a symlink"));
         assert_eq!(std::fs::read(outside.join("build/keep")).unwrap(), b"safe");
+        assert!(!lake_cache_slot(&work_root, "test-key").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lake_cache_sync_rejects_symlinked_packages_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let work_root = dir.path().join("work");
+        let lake_dir = dir.path().join("lake");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&lake_dir).unwrap();
+        std::fs::create_dir_all(outside.join("deps")).unwrap();
+        std::fs::write(outside.join("deps/keep"), b"safe").unwrap();
+        symlink(&outside, lake_dir.join("nested")).unwrap();
+        let packages_dir = lake_dir.join("nested/deps");
+
+        let error = sync_lake_cache_back(&work_root, "test-key", &lake_dir, &packages_dir)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("must not be a symlink"));
+        assert_eq!(std::fs::read(outside.join("deps/keep")).unwrap(), b"safe");
         assert!(!lake_cache_slot(&work_root, "test-key").exists());
     }
 
