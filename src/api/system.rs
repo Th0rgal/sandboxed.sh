@@ -2141,7 +2141,6 @@ async fn adopt_hermes_assistant(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let home_channel = choose_telegram_home_channel(&channel.allowed_chat_ids, &chat_mappings);
     let assistant_mcp_command = current_service_companion_binary_path("assistant-mcp")
-        .filter(|path| path.exists())
         .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/bin/assistant-mcp"))
         .to_string_lossy()
         .to_string();
@@ -3170,8 +3169,8 @@ fn stream_sandboxed_update(
                 return;
             }
         };
-        let exe_name = current_exe.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let service_name = format!("{}.service", exe_name);
+        let installed_name = current_exe.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let service_name = format!("{}.service", installed_name);
         let install_dest = current_exe.to_string_lossy().to_string();
 
         yield sse("log", format!("Installing binary to {} (service: {})...", install_dest, service_name), Some(75));
@@ -3196,10 +3195,18 @@ fn stream_sandboxed_update(
             .output()
             .await;
 
-        let src = format!("{}/target/debug/{}", repo_path.display(), exe_name);
+        const MAIN_CARGO_BIN: &str = "sandboxed-sh";
+        let src = format!("{}/target/debug/{}", repo_path.display(), MAIN_CARGO_BIN);
 
         let install_result = if versioned_install {
-            install_versioned_binary(repo_path, &exe_name, &latest_tag, &install_dest).await
+            install_versioned_binary_as(
+                repo_path,
+                MAIN_CARGO_BIN,
+                &installed_name,
+                &latest_tag,
+                &install_dest,
+            )
+            .await
         } else {
             // Legacy path: write straight to `install_dest`. Keep until the
             // operator opts into versioned installs.
@@ -4105,15 +4112,6 @@ async fn prune_deploy_backups(dest: &str, keep: usize) -> (Vec<String>, u64) {
 /// On first run against an existing real-file install, the live binary at
 /// `install_dest` is moved aside into `versions/legacy/<exe>` and the
 /// symlink is created. After that, every deploy is just step 3.
-async fn install_versioned_binary(
-    repo_path: &std::path::Path,
-    exe_name: &str,
-    tag: &str,
-    install_dest: &str,
-) -> Result<(), String> {
-    install_versioned_binary_as(repo_path, exe_name, exe_name, tag, install_dest).await
-}
-
 async fn install_versioned_binary_as(
     repo_path: &std::path::Path,
     source_name: &str,
