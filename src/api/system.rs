@@ -1410,8 +1410,21 @@ pub async fn reconcile_hermes_service_drain_policy(
             "systemctl",
             &["show", "--property=KillMode", "--value", &service_name],
         )
-        .await?;
-        needs_reload |= effective_kill_mode.trim() != "mixed";
+        .await;
+        match effective_kill_mode {
+            Ok(mode) => needs_reload |= mode.trim() != "mixed",
+            Err(err) => {
+                // An installed unit may not be known to the manager yet. A
+                // daemon-reload is the recovery path, so do not fail before
+                // giving it a chance to discover the unit and drop-in.
+                tracing::warn!(
+                    service = %service_name,
+                    %err,
+                    "Could not inspect Hermes drain policy; forcing daemon-reload"
+                );
+                needs_reload = true;
+            }
+        }
     }
     if changed || needs_reload {
         run_host_command("systemctl", &["daemon-reload"]).await?;
