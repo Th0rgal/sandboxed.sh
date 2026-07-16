@@ -302,6 +302,10 @@ pub(crate) async fn ack_promotion_loop(
     }
 }
 
+fn inactivity_is_cancellable(seconds_since_activity: u64, tool_subprocess_alive: bool) -> bool {
+    seconds_since_activity >= STUCK_SECONDS && !tool_subprocess_alive
+}
+
 pub(crate) async fn stuck_mission_watchdog_loop(
     mission_store: Arc<dyn MissionStore>,
     cmd_tx: mpsc::Sender<ControlCommand>,
@@ -380,62 +384,76 @@ pub(crate) async fn stuck_mission_watchdog_loop(
         // threshold. Cancel via the actor (clean shutdown) and mark
         // the row Interrupted.
         for info in &running_list {
-            if info.seconds_since_activity >= STUCK_SECONDS {
-                // A mission parked on a frontend tool (e.g. AskUserQuestion) is
-                // intentionally silent: its harness is killed while it awaits a
-                // human answer, so it emits no activity. Do not count that as a
-                // stall — humans routinely take longer than the threshold to
-                // reply. The wait is cleared the moment the answer arrives (or
-                // the mission is cancelled), so this can't pin a dead mission.
-                if tool_hub.is_waiting_for_input(info.mission_id) {
-                    tracing::debug!(
-                        mission_id = %info.mission_id,
-                        seconds_since_activity = info.seconds_since_activity,
-                        "Stuck-mission watchdog: skipping mission blocked on user input"
-                    );
-                    continue;
-                }
-                tracing::warn!(
-                    "Stuck-mission watchdog: cancelling {} after {}s of inactivity",
-                    info.mission_id,
-                    info.seconds_since_activity
-                );
-                let (cancel_tx, cancel_rx) = oneshot::channel();
-                if cmd_tx
-                    .send(ControlCommand::CancelMission {
-                        mission_id: info.mission_id,
-                        min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
-                        respond: cancel_tx,
-                    })
-                    .await
-                    .is_ok()
-                {
-                    let _ = cancel_rx.await;
-                }
-                if let Err(e) = mission_store
-                    .update_mission_status_with_reason(
-                        info.mission_id,
-                        MissionStatus::Interrupted,
-                        Some("watchdog_stalled"),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "Stuck-mission watchdog: status update failed for {}: {}",
-                        info.mission_id,
-                        e
-                    );
-                    continue;
-                }
-                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                    mission_id: info.mission_id,
-                    status: MissionStatus::Interrupted,
-                    summary: Some(format!(
-                        "Interrupted: no agent activity for {}s (>{}s threshold)",
-                        info.seconds_since_activity, STUCK_SECONDS
-                    )),
-                });
+            if info.seconds_since_activity < STUCK_SECONDS {
+                continue;
             }
+            if !inactivity_is_cancellable(info.seconds_since_activity, info.tool_subprocess_alive) {
+                // Model events are quiet while a harness tool executes. The
+                // runner tracks the ToolCall/ToolResult pair explicitly, so a
+                // live `lake build` (or any other long command) is progress,
+                // not an idle agent. Command/tool timeouts remain responsible
+                // for genuinely hung subprocesses.
+                tracing::debug!(
+                    mission_id = %info.mission_id,
+                    seconds_since_activity = info.seconds_since_activity,
+                    "Stuck-mission watchdog: skipping mission with a live tool subprocess"
+                );
+                continue;
+            }
+            // A mission parked on a frontend tool (e.g. AskUserQuestion) is
+            // intentionally silent: its harness is killed while it awaits a
+            // human answer, so it emits no activity. Do not count that as a
+            // stall — humans routinely take longer than the threshold to
+            // reply. The wait is cleared the moment the answer arrives (or
+            // the mission is cancelled), so this can't pin a dead mission.
+            if tool_hub.is_waiting_for_input(info.mission_id) {
+                tracing::debug!(
+                    mission_id = %info.mission_id,
+                    seconds_since_activity = info.seconds_since_activity,
+                    "Stuck-mission watchdog: skipping mission blocked on user input"
+                );
+                continue;
+            }
+            tracing::warn!(
+                "Stuck-mission watchdog: cancelling {} after {}s of inactivity",
+                info.mission_id,
+                info.seconds_since_activity
+            );
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            if cmd_tx
+                .send(ControlCommand::CancelMission {
+                    mission_id: info.mission_id,
+                    min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
+                    respond: cancel_tx,
+                })
+                .await
+                .is_ok()
+            {
+                let _ = cancel_rx.await;
+            }
+            if let Err(e) = mission_store
+                .update_mission_status_with_reason(
+                    info.mission_id,
+                    MissionStatus::Interrupted,
+                    Some("watchdog_stalled"),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Stuck-mission watchdog: status update failed for {}: {}",
+                    info.mission_id,
+                    e
+                );
+                continue;
+            }
+            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                mission_id: info.mission_id,
+                status: MissionStatus::Interrupted,
+                summary: Some(format!(
+                    "Interrupted: no agent activity for {}s (>{}s threshold)",
+                    info.seconds_since_activity, STUCK_SECONDS
+                )),
+            });
         }
 
         // Case 2 — Active in DB, not in actor's running list at all.
@@ -652,5 +670,20 @@ pub(crate) async fn stale_mission_cleanup_loop(
     loop {
         tokio::time::sleep(check_interval).await;
         cleanup_stale_active_missions_once(&mission_store, stale_hours, &events_tx, &cmd_tx).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactivity_watchdog_cancels_idle_runner_at_threshold() {
+        assert!(inactivity_is_cancellable(STUCK_SECONDS, false));
+    }
+
+    #[test]
+    fn inactivity_watchdog_preserves_live_tool_past_threshold() {
+        assert!(!inactivity_is_cancellable(STUCK_SECONDS * 4, true));
     }
 }

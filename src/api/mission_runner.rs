@@ -8218,6 +8218,9 @@ pub struct RunningMissionInfo {
     pub queue_len: usize,
     pub history_len: usize,
     pub seconds_since_activity: u64,
+    /// A harness tool call is still in flight. Long-running builds can be
+    /// silent at the model-event layer while their subprocess is healthy.
+    pub tool_subprocess_alive: bool,
     pub health: MissionHealth,
     pub expected_deliverables: usize,
     /// Current activity label (e.g., "Reading: main.rs")
@@ -8232,6 +8235,10 @@ pub struct RunningMissionInfo {
 impl From<&MissionRunner> for RunningMissionInfo {
     fn from(runner: &MissionRunner) -> Self {
         let seconds_since_activity = runner.last_activity.elapsed().as_secs();
+        let tool_subprocess_alive = runner
+            .active_tool_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0;
         Self {
             mission_id: runner.mission_id,
             state: match runner.state {
@@ -8243,14 +8250,8 @@ impl From<&MissionRunner> for RunningMissionInfo {
             queue_len: runner.queue.len(),
             history_len: runner.history.len(),
             seconds_since_activity,
-            health: running_health(
-                runner.state,
-                seconds_since_activity,
-                runner
-                    .active_tool_calls
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    > 0,
-            ),
+            tool_subprocess_alive,
+            health: running_health(runner.state, seconds_since_activity, tool_subprocess_alive),
             expected_deliverables: runner.deliverables.deliverables.len(),
             current_activity: runner.current_activity.clone(),
             subtask_total: runner.subtasks.len(),
