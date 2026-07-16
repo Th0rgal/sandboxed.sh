@@ -617,8 +617,12 @@ mod tests {
             mission_id,
             node_id: state.node_id.clone(),
             lease_token: create_lease_token(&claims, &state.shared_token).expect("lease token"),
-            command: "sleep 1".to_string(),
+            command: "while [ ! -e release ]; do sleep 0.01; done".to_string(),
         };
+        let mission_dir = work_root.path().join(mission_id.to_string());
+        tokio::fs::create_dir_all(&mission_dir)
+            .await
+            .expect("mission dir");
 
         let running = tokio::spawn(execute(
             State(Arc::clone(&state)),
@@ -635,6 +639,9 @@ mod tests {
 
         let rejected = execute(State(Arc::clone(&state)), headers, Json(request())).await;
         assert_eq!(rejected.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        tokio::fs::write(mission_dir.join("release"), b"")
+            .await
+            .expect("release running command");
         let _ = running
             .await
             .expect("execute task")

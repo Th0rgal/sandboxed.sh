@@ -176,6 +176,11 @@ Gotchas:
 
 - **No central OpenCode server needed**: Missions spawn per-workspace CLI
   processes.
+- **Compute placement is observable**: Hermes/controllers should call
+  `get_compute_fleet` before parallel dispatch. Auto placement preserves idle
+  GPU nodes for inference while ordinary CPU/Lean nodes have immediate slots,
+  then balances by normalized utilization. Only terminal node/job/head receipts
+  prove that work was actually distributed.
 - Agents are loaded from OpenCode built-ins and native `.opencode/agents/*.md` files.
 - Per-workspace execution eliminates host-to-container network issues.
 - For remote workspaces, SSH execution keeps bash/tooling on the remote host.
