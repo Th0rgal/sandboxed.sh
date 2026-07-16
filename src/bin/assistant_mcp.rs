@@ -2135,7 +2135,7 @@ fn compact_compute_fleet(fleet: &Value) -> Value {
                 "disk_available_bytes": node.get("disk_available_bytes").cloned().unwrap_or(Value::Null),
                 "cached_toolchains": node.get("cached_toolchains").cloned().unwrap_or_else(|| json!([])),
                 "lean_runtime_ready": node.get("lean_runtime_ready").cloned().unwrap_or(Value::Null),
-                "last_error": node.get("last_error").cloned().unwrap_or(Value::Null),
+                "error": node.get("error").cloned().unwrap_or(Value::Null),
             })
         })
         .collect();
@@ -2145,7 +2145,13 @@ fn compact_compute_fleet(fleet: &Value) -> Value {
         .filter(|node| node.get("status").and_then(Value::as_str) == Some("online"));
     let online_nodes = online.clone().count();
     let lean_nodes: Vec<&Value> = online
-        .filter(|node| node.get("lean_runtime_ready").and_then(Value::as_bool) == Some(true))
+        .filter(|node| {
+            node.get("lean_runtime_ready").and_then(Value::as_bool) == Some(true)
+                && node
+                    .get("labels")
+                    .and_then(Value::as_array)
+                    .is_some_and(|labels| labels.iter().any(|label| label.as_str() == Some("lean")))
+        })
         .collect();
     let lean_slots_total = lean_nodes
         .iter()
@@ -2983,18 +2989,30 @@ mod tests {
                     "active_jobs": 0,
                     "queued_jobs": 0,
                     "lean_runtime_ready": false
+                },
+                {
+                    "id": "gpu-only",
+                    "status": "online",
+                    "labels": ["gpu"],
+                    "capacity_total": 4,
+                    "capacity_available": 4,
+                    "active_jobs": 0,
+                    "queued_jobs": 0,
+                    "lean_runtime_ready": true,
+                    "error": "probe degraded"
                 }
             ],
             "recent_jobs": [{"job_id": "job", "node_id": "cpu", "state": "succeeded"}]
         });
 
         let compact = compact_compute_fleet(&raw);
-        assert_eq!(compact["summary"]["nodes_online"], 2);
+        assert_eq!(compact["summary"]["nodes_online"], 3);
         assert_eq!(compact["summary"]["lean_nodes_online"], 1);
         assert_eq!(compact["summary"]["lean_slots_total"], 2);
         assert_eq!(compact["summary"]["lean_slots_available"], 1);
         assert_eq!(compact["summary"]["active_remote_jobs"], 1);
         assert!(compact["nodes"][0].get("base_url").is_none());
+        assert_eq!(compact["nodes"][2]["error"], "probe degraded");
         assert_eq!(compact["recent_jobs"][0]["node_id"], "cpu");
     }
 
