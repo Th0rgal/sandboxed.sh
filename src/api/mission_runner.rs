@@ -7265,6 +7265,35 @@ fn parse_cli_semver(output: &str) -> Option<(u64, u64, u64)> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopiedOpenCodeProbe {
+    MatchesHost,
+    Unavailable,
+    DifferentVersion,
+}
+
+/// Classify a copied OpenCode binary using only the version output collected
+/// from its explicit path.  In particular, do not treat an executable bit (or
+/// a PATH lookup) as proof that a host-native binary can run in an nspawn
+/// rootfs.
+fn classify_copied_opencode_probe(
+    host_version: (u64, u64, u64),
+    copied_version: Option<(u64, u64, u64)>,
+) -> CopiedOpenCodeProbe {
+    match copied_version {
+        Some(version) if version == host_version => CopiedOpenCodeProbe::MatchesHost,
+        Some(_) => CopiedOpenCodeProbe::DifferentVersion,
+        None => CopiedOpenCodeProbe::Unavailable,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerOpenCodeSync {
+    NotNeeded,
+    Copied,
+    NeedsContainerInstall,
+}
+
 async fn host_cli_version(program: &std::path::Path) -> Option<(u64, u64, u64)> {
     let output = tokio::process::Command::new(program)
         .arg("--version")
@@ -7313,23 +7342,23 @@ async fn workspace_cli_version(
 async fn sync_container_opencode_from_host(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
-) -> Result<Option<String>, String> {
+) -> Result<ContainerOpenCodeSync, String> {
     if !should_sync_container_opencode(
         workspace_exec.workspace.workspace_type == WorkspaceType::Container,
         workspace::use_nspawn_for_workspace(&workspace_exec.workspace),
     ) {
-        return Ok(None);
+        return Ok(ContainerOpenCodeSync::NotNeeded);
     }
 
     let Some(host_opencode) = resolve_host_executable("opencode") else {
-        return Ok(None);
+        return Ok(ContainerOpenCodeSync::NotNeeded);
     };
     let Some(host_version) = host_cli_version(&host_opencode).await else {
         tracing::warn!(
             host_path = %host_opencode.display(),
             "Could not determine host OpenCode version; leaving container CLI unchanged"
         );
-        return Ok(None);
+        return Ok(ContainerOpenCodeSync::NotNeeded);
     };
 
     let container_program = "/usr/local/bin/opencode";
@@ -7340,16 +7369,24 @@ async fn sync_container_opencode_from_host(
     };
 
     if container_version == Some(host_version) {
-        return Ok(None);
+        return Ok(ContainerOpenCodeSync::NotNeeded);
     }
 
     let installed = copy_host_executable_into_container(&workspace_exec.workspace, &host_opencode)?;
     let installed_version = workspace_cli_version(workspace_exec, cwd, &installed).await;
-    if installed_version != Some(host_version) {
-        return Err(format!(
-            "Copied host OpenCode {:?} into container, but version probe returned {:?}",
-            host_version, installed_version
-        ));
+    if classify_copied_opencode_probe(host_version, installed_version)
+        != CopiedOpenCodeProbe::MatchesHost
+    {
+        // A host-native OpenCode can be dynamically linked against libraries
+        // unavailable in an older container rootfs.  It is not safe to accept
+        // that copied file merely because it exists, but failing here also
+        // prevents the container-native installer fallback below.
+        tracing::warn!(
+            host_version = ?host_version,
+            copied_version = ?installed_version,
+            "Copied OpenCode did not pass the explicit container version probe; using container installer fallback"
+        );
+        return Ok(ContainerOpenCodeSync::NeedsContainerInstall);
     }
 
     tracing::info!(
@@ -7359,7 +7396,7 @@ async fn sync_container_opencode_from_host(
         new_version = ?host_version,
         "Synchronized host OpenCode CLI into container"
     );
-    Ok(Some(installed))
+    Ok(ContainerOpenCodeSync::Copied)
 }
 
 async fn resolve_opencode_installer_fetcher(
@@ -7435,9 +7472,12 @@ pub(crate) async fn ensure_opencode_cli_available(
     // stale container CLIs that could not load plugins installed from `latest`.
     // Synchronize from the managed host installation before accepting the
     // container binary.
-    sync_container_opencode_from_host(workspace_exec, cwd).await?;
+    let force_container_install = matches!(
+        sync_container_opencode_from_host(workspace_exec, cwd).await?,
+        ContainerOpenCodeSync::NeedsContainerInstall
+    );
 
-    if opencode_binary_available(workspace_exec, cwd).await {
+    if !force_container_install && opencode_binary_available(workspace_exec, cwd).await {
         return Ok(());
     }
 
@@ -8421,10 +8461,11 @@ fn cleanup_old_debug_files(
 mod tests {
     use super::{
         actual_cost_cents_from_total_cost_usd, apply_terminal_result_text, bind_command_params,
-        claudecode_idle_timeout_for_state, claudecode_incomplete_turn_message,
-        claudecode_malformed_startup_message, claudecode_pre_turn_transport_message,
-        claudecode_resume_current_session_message, claudecode_transport_failure_data,
-        claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
+        classify_copied_opencode_probe, claudecode_idle_timeout_for_state,
+        claudecode_incomplete_turn_message, claudecode_malformed_startup_message,
+        claudecode_pre_turn_transport_message, claudecode_resume_current_session_message,
+        claudecode_transport_failure_data, claudecode_transport_failure_stage,
+        claudecode_transport_failure_stage_for_incomplete_turn,
         claudecode_transport_recovery_strategy, clear_codex_account_cooldown,
         codex_account_cooldown_remaining, codex_chatgpt_fallback_for_result,
         codex_chatgpt_fallback_model, codex_cooldown_for_reason, codex_error_message_to_surface,
@@ -8453,8 +8494,8 @@ mod tests {
         text_buffer_stream_looks_degenerate, thinking_overlaps_visible_answer, tls_error_hint,
         truncate_garbled_output, use_thinking_only_fallback, utf8_safe_prefix,
         ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
+        ClaudeTurnWaitState, CopiedOpenCodeProbe, MissionHealth, MissionRunState,
+        MissionStallSeverity, OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
         CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS, TOOL_CALL_STALL_GRACE_SECS,
     };
     use super::{
@@ -11442,6 +11483,33 @@ mod tests {
     fn parse_cli_semver_rejects_incomplete_or_unrelated_output() {
         assert_eq!(parse_cli_semver("opencode 1.17"), None);
         assert_eq!(parse_cli_semver("version unknown"), None);
+    }
+
+    #[test]
+    fn copied_opencode_probe_accepts_current_native_cli_output() {
+        // Captured from the backend host's native OpenCode CLI. A bare semver
+        // is the normal output shape, not an installer error.
+        let host = parse_cli_semver("1.17.18\n").expect("host OpenCode semver");
+        assert_eq!(
+            classify_copied_opencode_probe(host, parse_cli_semver("1.17.18\n")),
+            CopiedOpenCodeProbe::MatchesHost
+        );
+    }
+
+    #[test]
+    fn copied_opencode_probe_requires_container_install_for_mismatch_or_failure() {
+        let host = (1, 17, 18);
+        assert_eq!(
+            classify_copied_opencode_probe(
+                host,
+                parse_cli_semver("opencode version v1.16.9-beta.1"),
+            ),
+            CopiedOpenCodeProbe::DifferentVersion
+        );
+        assert_eq!(
+            classify_copied_opencode_probe(host, parse_cli_semver("not found")),
+            CopiedOpenCodeProbe::Unavailable
+        );
     }
 
     #[test]
