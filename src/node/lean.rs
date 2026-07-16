@@ -11,13 +11,13 @@
 //! - `checkouts/<sha256(repo)[..16]>/<commit>/` — immutable-ish checkouts
 //! - `caches/elan/` (`ELAN_HOME`), `caches/xdg/` (`XDG_CACHE_HOME`),
 //!   `caches/home/` (`HOME`) — shared toolchain caches
-//! - `caches/lake/<cache_key>/packages/` — dependency-only Lake cache slots,
-//!   copied into `<build cwd>/.lake/packages` before a build and refreshed
-//!   after a successful one; root-project `.lake` outputs are never shared.
+//! - `caches/lake/<cache_key>/packages/` — normalized dependency-only Lake
+//!   cache slots, copied into the manifest's configured `packagesDir` before a
+//!   build and refreshed after success; root-project outputs are never shared.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use fs2::FileExt;
@@ -360,6 +360,46 @@ pub fn derive_cache_key(build_cwd: &Path) -> Option<String> {
         hasher.update(bytes);
     }
     Some(hex::encode(hasher.finalize()))
+}
+
+/// Resolve Lake's configured dependency directory from the manifest without
+/// executing repository code. Both paths must be clean, relative, and the
+/// packages directory must remain below Lake's own directory so cache I/O
+/// cannot escape into root-project or host paths.
+fn configured_lake_cache_paths(build_cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let manifest_path = build_cwd.join("lake-manifest.json");
+    let manifest = match std::fs::read(&manifest_path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).ok()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+        Err(_) => return None,
+    };
+    let lake_rel = Path::new(
+        manifest
+            .get("lakeDir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(".lake"),
+    );
+    let packages_rel = Path::new(
+        manifest
+            .get("packagesDir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(".lake/packages"),
+    );
+    let is_clean_relative = |path: &Path| {
+        !path.as_os_str().is_empty()
+            && !path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+    };
+    if !is_clean_relative(lake_rel) || !is_clean_relative(packages_rel) {
+        return None;
+    }
+    let package_suffix = packages_rel.strip_prefix(lake_rel).ok()?;
+    if package_suffix.as_os_str().is_empty() {
+        return None;
+    }
+    Some((build_cwd.join(lake_rel), build_cwd.join(packages_rel)))
 }
 
 /// Namespace a dependency cache key by the project and requested build. A
@@ -748,7 +788,11 @@ async fn require_real_directory(path: &Path, label: &str) -> anyhow::Result<bool
 /// belongs to the root project and is commit-specific (including custom Lake
 /// `buildDir` values), so copying the whole directory can make Lake trust a
 /// stale `.olean` and skip changed source.
-async fn restore_lake_dependency_cache(slot: &Path, lake_dir: &Path) -> anyhow::Result<()> {
+async fn restore_lake_dependency_cache(
+    slot: &Path,
+    lake_dir: &Path,
+    packages_dir: &Path,
+) -> anyhow::Result<()> {
     if !require_real_directory(slot, "lake cache slot").await? {
         return Ok(());
     }
@@ -764,8 +808,14 @@ async fn restore_lake_dependency_cache(slot: &Path, lake_dir: &Path) -> anyhow::
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    tokio::fs::create_dir_all(lake_dir).await?;
-    if let Err(error) = isolated_copy(&packages, &lake_dir.join("packages")).await {
+    let Some(packages_parent) = packages_dir.parent() else {
+        anyhow::bail!("configured packages directory has no parent");
+    };
+    if packages_dir == lake_dir || !packages_dir.starts_with(lake_dir) {
+        anyhow::bail!("configured packages directory must be below lake directory");
+    }
+    tokio::fs::create_dir_all(packages_parent).await?;
+    if let Err(error) = isolated_copy(&packages, packages_dir).await {
         let _ = tokio::fs::remove_dir_all(lake_dir).await;
         return Err(error);
     }
@@ -834,8 +884,8 @@ pub async fn execute_lean_build(
         anyhow::bail!("cwd_rel '{rel_clean}' does not exist in the checkout");
     }
 
-    // Lake dependency-cache restore: copy only the slot's packages into
-    // `<cwd>/.lake/packages` when the checkout has no .lake yet.
+    // Lake dependency-cache restore: copy only the slot's packages into the
+    // manifest's configured packagesDir when the checkout has no lakeDir yet.
     // Slot mutation is guarded by a per-key flock (shared across commits with
     // the same toolchain+manifest).
     let effective_cache_key = cache_key
@@ -845,15 +895,20 @@ pub async fn execute_lean_build(
         .map(|key| project_cache_key(&key, source, rel_clean, command));
     if let Some(key) = effective_cache_key.as_deref() {
         let slot = lake_cache_slot(work_root, key);
-        let lake_dir = build_cwd.join(".lake");
-        let lake_dir_is_absent = tokio::fs::symlink_metadata(&lake_dir)
-            .await
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-        if lake_dir_is_absent && slot.is_dir() {
-            let _cache_lock = FileLock::acquire(slot.with_extension("lock")).await?;
-            if let Err(err) = restore_lake_dependency_cache(&slot, &lake_dir).await {
-                tracing::warn!("lake cache restore failed (continuing cold): {err}");
+        if let Some((lake_dir, packages_dir)) = configured_lake_cache_paths(&build_cwd) {
+            let lake_dir_is_absent = tokio::fs::symlink_metadata(&lake_dir)
+                .await
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if lake_dir_is_absent && slot.is_dir() {
+                let _cache_lock = FileLock::acquire(slot.with_extension("lock")).await?;
+                if let Err(err) =
+                    restore_lake_dependency_cache(&slot, &lake_dir, &packages_dir).await
+                {
+                    tracing::warn!("lake cache restore failed (continuing cold): {err}");
+                }
             }
+        } else {
+            tracing::warn!("lake cache restore skipped: invalid lakeDir/packagesDir");
         }
     }
 
@@ -886,8 +941,14 @@ pub async fn execute_lean_build(
         // Sync the lake cache back: copy into a tmp slot, then swap
         // it in under the per-key flock so readers never see a partial slot.
         if let Some(key) = effective_cache_key.as_deref() {
-            if let Err(err) = sync_lake_cache_back(work_root, key, &build_cwd.join(".lake")).await {
-                tracing::warn!("lake cache sync-back failed: {err}");
+            if let Some((lake_dir, packages_dir)) = configured_lake_cache_paths(&build_cwd) {
+                if let Err(err) =
+                    sync_lake_cache_back(work_root, key, &lake_dir, &packages_dir).await
+                {
+                    tracing::warn!("lake cache sync-back failed: {err}");
+                }
+            } else {
+                tracing::warn!("lake cache sync-back skipped: invalid lakeDir/packagesDir");
             }
         }
         if !artifacts.is_empty() {
@@ -908,12 +969,19 @@ pub async fn execute_lean_build(
 }
 
 /// Replace the Lake cache slot for `key` with dependency packages only.
-async fn sync_lake_cache_back(work_root: &Path, key: &str, lake_dir: &Path) -> anyhow::Result<()> {
+async fn sync_lake_cache_back(
+    work_root: &Path,
+    key: &str,
+    lake_dir: &Path,
+    packages_dir: &Path,
+) -> anyhow::Result<()> {
     if !require_real_directory(lake_dir, "project .lake").await? {
         return Ok(());
     }
-    let packages = lake_dir.join("packages");
-    if !require_real_directory(&packages, "project .lake/packages").await? {
+    if packages_dir == lake_dir || !packages_dir.starts_with(lake_dir) {
+        anyhow::bail!("configured packages directory must be below lake directory");
+    }
+    if !require_real_directory(packages_dir, "project Lake packages").await? {
         return Ok(());
     }
     let slot = lake_cache_slot(work_root, key);
@@ -924,7 +992,7 @@ async fn sync_lake_cache_back(work_root: &Path, key: &str, lake_dir: &Path) -> a
     let _cache_lock = FileLock::acquire(slot.with_extension("lock")).await?;
     let tmp = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&tmp).await?;
-    if let Err(err) = isolated_copy(&packages, &tmp.join("packages")).await {
+    if let Err(err) = isolated_copy(packages_dir, &tmp.join("packages")).await {
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         return Err(err);
     }
@@ -1593,6 +1661,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lake_cache_paths_follow_manifest_packages_dir_and_reject_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lake-manifest.json"),
+            br#"{"lakeDir":".lake","packagesDir":".lake/deps"}"#,
+        )
+        .unwrap();
+
+        let (lake_dir, packages_dir) = configured_lake_cache_paths(dir.path()).unwrap();
+        assert_eq!(lake_dir, dir.path().join(".lake"));
+        assert_eq!(packages_dir, dir.path().join(".lake/deps"));
+
+        for manifest in [
+            br#"{"lakeDir":".lake","packagesDir":"../deps"}"#.as_slice(),
+            br#"{"lakeDir":".lake","packagesDir":"deps"}"#.as_slice(),
+            br#"{"lakeDir":".lake","packagesDir":".lake"}"#.as_slice(),
+            br#"{"lakeDir":"/tmp/lake","packagesDir":"/tmp/lake/deps"}"#.as_slice(),
+        ] {
+            std::fs::write(dir.path().join("lake-manifest.json"), manifest).unwrap();
+            assert!(configured_lake_cache_paths(dir.path()).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn lake_cache_round_trip_supports_custom_packages_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let work_root = dir.path().join("work");
+        let source_lake = dir.path().join("source/.lake");
+        let source_packages = source_lake.join("deps");
+        std::fs::create_dir_all(source_packages.join("mathlib")).unwrap();
+        std::fs::write(source_packages.join("mathlib/cache.bin"), b"dependency").unwrap();
+
+        sync_lake_cache_back(&work_root, "custom-key", &source_lake, &source_packages)
+            .await
+            .unwrap();
+
+        let restored_lake = dir.path().join("restored/.lake");
+        let restored_packages = restored_lake.join("deps");
+        restore_lake_dependency_cache(
+            &lake_cache_slot(&work_root, "custom-key"),
+            &restored_lake,
+            &restored_packages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(restored_packages.join("mathlib/cache.bin")).unwrap(),
+            b"dependency"
+        );
+        assert!(!restored_lake.join("packages").exists());
+    }
+
     #[tokio::test]
     async fn lake_cache_restore_keeps_dependencies_but_drops_root_outputs() {
         let dir = tempfile::tempdir().unwrap();
@@ -1607,7 +1728,7 @@ mod tests {
         )
         .unwrap();
 
-        restore_lake_dependency_cache(&slot, &restored)
+        restore_lake_dependency_cache(&slot, &restored, &restored.join("packages"))
             .await
             .unwrap();
 
@@ -1634,7 +1755,7 @@ mod tests {
         std::fs::write(outside.join("keep"), b"safe").unwrap();
         symlink(&outside, slot.join("build")).unwrap();
 
-        restore_lake_dependency_cache(&slot, &restored)
+        restore_lake_dependency_cache(&slot, &restored, &restored.join("packages"))
             .await
             .unwrap();
 
@@ -1655,9 +1776,14 @@ mod tests {
         std::fs::write(outside.join("build/keep"), b"safe").unwrap();
         symlink(&outside, &lake_dir).unwrap();
 
-        let error = sync_lake_cache_back(&work_root, "test-key", &lake_dir)
-            .await
-            .unwrap_err();
+        let error = sync_lake_cache_back(
+            &work_root,
+            "test-key",
+            &lake_dir,
+            &lake_dir.join("packages"),
+        )
+        .await
+        .unwrap_err();
 
         assert!(error.to_string().contains("must not be a symlink"));
         assert_eq!(std::fs::read(outside.join("build/keep")).unwrap(), b"safe");
@@ -1684,9 +1810,14 @@ mod tests {
         )
         .unwrap();
 
-        sync_lake_cache_back(&work_root, "test-key", &lake_dir)
-            .await
-            .unwrap();
+        sync_lake_cache_back(
+            &work_root,
+            "test-key",
+            &lake_dir,
+            &lake_dir.join("packages"),
+        )
+        .await
+        .unwrap();
 
         let slot = lake_cache_slot(&work_root, "test-key");
         assert!(!slot.join("build").exists());
