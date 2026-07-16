@@ -7254,27 +7254,6 @@ fn copy_host_executable_into_container(
     Ok(format!("/usr/local/bin/{}", name))
 }
 
-fn remove_container_usr_local_bin(
-    workspace: &crate::workspace::Workspace,
-    name: &str,
-) -> Result<(), String> {
-    let path = workspace
-        .path
-        .join("usr")
-        .join("local")
-        .join("bin")
-        .join(name);
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!(
-            "Failed to remove rejected container executable {}: {}",
-            path.display(),
-            e
-        )),
-    }
-}
-
 fn parse_cli_semver(output: &str) -> Option<(u64, u64, u64)> {
     output.split_whitespace().find_map(|word| {
         let candidate = word.trim_start_matches(['v', 'V']);
@@ -7312,7 +7291,7 @@ fn classify_copied_opencode_probe(
 enum ContainerOpenCodeSync {
     NotNeeded,
     Copied,
-    NeedsContainerInstall,
+    NeedsContainerInstall { host_version: (u64, u64, u64) },
 }
 
 async fn host_cli_version(program: &std::path::Path) -> Option<(u64, u64, u64)> {
@@ -7407,8 +7386,7 @@ async fn sync_container_opencode_from_host(
             copied_version = ?installed_version,
             "Copied OpenCode did not pass the explicit container version probe; using container installer fallback"
         );
-        remove_container_usr_local_bin(&workspace_exec.workspace, "opencode")?;
-        return Ok(ContainerOpenCodeSync::NeedsContainerInstall);
+        return Ok(ContainerOpenCodeSync::NeedsContainerInstall { host_version });
     }
 
     tracing::info!(
@@ -7494,10 +7472,12 @@ pub(crate) async fn ensure_opencode_cli_available(
     // stale container CLIs that could not load plugins installed from `latest`.
     // Synchronize from the managed host installation before accepting the
     // container binary.
-    let force_container_install = matches!(
-        sync_container_opencode_from_host(workspace_exec, cwd).await?,
-        ContainerOpenCodeSync::NeedsContainerInstall
-    );
+    let sync_result = sync_container_opencode_from_host(workspace_exec, cwd).await?;
+    let fallback_host_version = match sync_result {
+        ContainerOpenCodeSync::NeedsContainerInstall { host_version } => Some(host_version),
+        ContainerOpenCodeSync::NotNeeded | ContainerOpenCodeSync::Copied => None,
+    };
+    let force_container_install = fallback_host_version.is_some();
 
     if !force_container_install && opencode_binary_available(workspace_exec, cwd).await {
         return Ok(());
@@ -7520,13 +7500,18 @@ pub(crate) async fn ensure_opencode_cli_available(
     args.push("-lc".to_string());
     // Use explicit /root path for container workspaces since $HOME may not be set in nspawn
     // Try both /root and $HOME to cover both container and host workspaces
+    let installer_flags = if let Some((major, minor, patch)) = fallback_host_version {
+        format!("--version {major}.{minor}.{patch} --no-modify-path")
+    } else {
+        "--no-modify-path".to_string()
+    };
     args.push(
         format!(
-            "{} | bash -s -- --no-modify-path \
+            "{} | bash -s -- {} \
         && for bindir in /root/.opencode/bin \"$HOME/.opencode/bin\"; do \
             if [ -x \"$bindir/opencode\" ]; then install -m 0755 \"$bindir/opencode\" /usr/local/bin/opencode && break; fi; \
         done"
-            , fetcher
+            , fetcher, installer_flags
         ),
     );
     let output = workspace_exec
@@ -7553,15 +7538,14 @@ pub(crate) async fn ensure_opencode_cli_available(
         return Err(format!("OpenCode install failed: {}", message));
     }
 
-    if force_container_install {
-        if workspace_cli_version(workspace_exec, cwd, "/usr/local/bin/opencode")
-            .await
-            .is_none()
-        {
-            return Err(
-                "OpenCode install completed but '/usr/local/bin/opencode --version' did not succeed."
-                    .to_string(),
-            );
+    if let Some(host_version) = fallback_host_version {
+        let installed_version =
+            workspace_cli_version(workspace_exec, cwd, "/usr/local/bin/opencode").await;
+        if installed_version != Some(host_version) {
+            return Err(format!(
+                "OpenCode install completed but '/usr/local/bin/opencode --version' returned {:?}, expected {:?}.",
+                installed_version, host_version
+            ));
         }
     } else if !opencode_binary_available(workspace_exec, cwd).await {
         return Err(
