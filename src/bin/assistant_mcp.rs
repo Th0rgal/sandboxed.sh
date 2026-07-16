@@ -760,7 +760,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_mission".to_string(),
-                description: "Get one mission by UUID (full record incl. history — heavy; prefer get_mission_digest for status checks).".to_string(),
+                description: "Compatibility alias for the compact ~2KB mission digest. It never returns the full history; use get_mission_events with a bounded limit for transcript or trace details.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -1145,15 +1145,11 @@ impl AssistantMcp {
     }
 
     async fn get_mission(&self, params: MissionIdParams) -> Result<Value, String> {
-        let id = parse_uuid(&params.mission_id)?;
-        let response = self.api_get(&format!("/api/control/missions/{id}")).await?;
-        if !response.status().is_success() {
-            return Err(format!("Mission not found: {}", response.status()));
-        }
-        response
-            .json()
-            .await
-            .map_err(|error| format!("Failed to parse mission: {error}"))
+        // Keep the legacy tool name safe for autonomous controllers. Models
+        // routinely chose `get_mission` despite its former "heavy" warning,
+        // pulling entire transcripts into every reconciliation tick. Detailed
+        // history remains available through the bounded/paginated events tool.
+        self.get_mission_digest(params).await
     }
 
     async fn get_mission_digest(&self, params: MissionIdParams) -> Result<Value, String> {
