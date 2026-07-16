@@ -814,12 +814,49 @@ async fn require_real_directory_tree(
     Ok(true)
 }
 
+/// Before creating a cache destination, require every existing ancestor below
+/// the checkout root to be a real directory. Once a component is absent, all
+/// deeper components are necessarily absent too and may be created safely.
+async fn require_safe_directory_creation_path(
+    root: &Path,
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<()> {
+    if path == root || !path.starts_with(root) {
+        anyhow::bail!("{label} must be below {}", root.display());
+    }
+    if !require_real_directory(root, label).await? {
+        anyhow::bail!("{label} root does not exist: {}", root.display());
+    }
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| anyhow::anyhow!("{label} must be below {}", root.display()))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            anyhow::bail!("{label} contains an invalid path component");
+        };
+        current.push(part);
+        match tokio::fs::symlink_metadata(&current).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("{label} must not contain a symlink: {}", current.display());
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => anyhow::bail!("{label} is not a directory: {}", current.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 /// Restore only shared Lake dependencies. Every other top-level `.lake` entry
 /// belongs to the root project and is commit-specific (including custom Lake
 /// `buildDir` values), so copying the whole directory can make Lake trust a
 /// stale `.olean` and skip changed source.
 async fn restore_lake_dependency_cache(
     slot: &Path,
+    build_cwd: &Path,
     lake_dir: &Path,
     packages_dir: &Path,
 ) -> anyhow::Result<()> {
@@ -844,6 +881,7 @@ async fn restore_lake_dependency_cache(
     if packages_dir == lake_dir || !packages_dir.starts_with(lake_dir) {
         anyhow::bail!("configured packages directory must be below lake directory");
     }
+    require_safe_directory_creation_path(build_cwd, packages_dir, "Lake cache destination").await?;
     tokio::fs::create_dir_all(packages_parent).await?;
     if let Err(error) = isolated_copy(&packages, packages_dir).await {
         let _ = tokio::fs::remove_dir_all(lake_dir).await;
@@ -932,7 +970,7 @@ pub async fn execute_lean_build(
             if lake_dir_is_absent && slot.is_dir() {
                 let _cache_lock = FileLock::acquire(slot.with_extension("lock")).await?;
                 if let Err(err) =
-                    restore_lake_dependency_cache(&slot, &lake_dir, &packages_dir).await
+                    restore_lake_dependency_cache(&slot, &build_cwd, &lake_dir, &packages_dir).await
                 {
                     tracing::warn!("lake cache restore failed (continuing cold): {err}");
                 }
@@ -973,7 +1011,7 @@ pub async fn execute_lean_build(
         if let Some(key) = effective_cache_key.as_deref() {
             if let Some((lake_dir, packages_dir)) = configured_lake_cache_paths(&build_cwd) {
                 if let Err(err) =
-                    sync_lake_cache_back(work_root, key, &lake_dir, &packages_dir).await
+                    sync_lake_cache_back(work_root, key, &build_cwd, &lake_dir, &packages_dir).await
                 {
                     tracing::warn!("lake cache sync-back failed: {err}");
                 }
@@ -1002,10 +1040,14 @@ pub async fn execute_lean_build(
 async fn sync_lake_cache_back(
     work_root: &Path,
     key: &str,
+    build_cwd: &Path,
     lake_dir: &Path,
     packages_dir: &Path,
 ) -> anyhow::Result<()> {
-    if !require_real_directory_tree(lake_dir, packages_dir, "project Lake packages").await? {
+    if packages_dir == lake_dir || !packages_dir.starts_with(lake_dir) {
+        anyhow::bail!("configured packages directory must be below lake directory");
+    }
+    if !require_real_directory_tree(build_cwd, packages_dir, "project Lake packages").await? {
         return Ok(());
     }
     let slot = lake_cache_slot(work_root, key);
@@ -1718,14 +1760,23 @@ mod tests {
         std::fs::create_dir_all(source_packages.join("mathlib")).unwrap();
         std::fs::write(source_packages.join("mathlib/cache.bin"), b"dependency").unwrap();
 
-        sync_lake_cache_back(&work_root, "custom-key", &source_lake, &source_packages)
-            .await
-            .unwrap();
+        sync_lake_cache_back(
+            &work_root,
+            "custom-key",
+            &dir.path().join("source"),
+            &source_lake,
+            &source_packages,
+        )
+        .await
+        .unwrap();
 
-        let restored_lake = dir.path().join("restored/.lake");
+        let restored_root = dir.path().join("restored");
+        std::fs::create_dir_all(&restored_root).unwrap();
+        let restored_lake = restored_root.join(".lake");
         let restored_packages = restored_lake.join("deps");
         restore_lake_dependency_cache(
             &lake_cache_slot(&work_root, "custom-key"),
+            &restored_root,
             &restored_lake,
             &restored_packages,
         )
@@ -1752,7 +1803,7 @@ mod tests {
         )
         .unwrap();
 
-        restore_lake_dependency_cache(&slot, &restored, &restored.join("packages"))
+        restore_lake_dependency_cache(&slot, dir.path(), &restored, &restored.join("packages"))
             .await
             .unwrap();
 
@@ -1779,12 +1830,38 @@ mod tests {
         std::fs::write(outside.join("keep"), b"safe").unwrap();
         symlink(&outside, slot.join("build")).unwrap();
 
-        restore_lake_dependency_cache(&slot, &restored, &restored.join("packages"))
+        restore_lake_dependency_cache(&slot, dir.path(), &restored, &restored.join("packages"))
             .await
             .unwrap();
 
         assert!(!restored.join("build").exists());
         assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"safe");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lake_cache_restore_rejects_symlinked_lake_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        let slot = dir.path().join("slot");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(slot.join("packages/mathlib")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"safe").unwrap();
+        symlink(&outside, checkout.join("link")).unwrap();
+        let lake_dir = checkout.join("link/.lake");
+        let packages_dir = lake_dir.join("deps");
+
+        let error = restore_lake_dependency_cache(&slot, &checkout, &lake_dir, &packages_dir)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("must not contain a symlink"));
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"safe");
+        assert!(!outside.join(".lake").exists());
     }
 
     #[cfg(unix)]
@@ -1803,6 +1880,7 @@ mod tests {
         let error = sync_lake_cache_back(
             &work_root,
             "test-key",
+            dir.path(),
             &lake_dir,
             &lake_dir.join("packages"),
         )
@@ -1829,9 +1907,10 @@ mod tests {
         symlink(&outside, lake_dir.join("nested")).unwrap();
         let packages_dir = lake_dir.join("nested/deps");
 
-        let error = sync_lake_cache_back(&work_root, "test-key", &lake_dir, &packages_dir)
-            .await
-            .unwrap_err();
+        let error =
+            sync_lake_cache_back(&work_root, "test-key", dir.path(), &lake_dir, &packages_dir)
+                .await
+                .unwrap_err();
 
         assert!(error.to_string().contains("must not be a symlink"));
         assert_eq!(std::fs::read(outside.join("deps/keep")).unwrap(), b"safe");
@@ -1861,6 +1940,7 @@ mod tests {
         sync_lake_cache_back(
             &work_root,
             "test-key",
+            dir.path(),
             &lake_dir,
             &lake_dir.join("packages"),
         )
