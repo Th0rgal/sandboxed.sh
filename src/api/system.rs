@@ -27,7 +27,10 @@ use super::auth::AuthUser;
 use super::control::{self, MissionStatus};
 use super::mission_store::Mission;
 use super::routes::AppState;
-use crate::util::{current_service_companion_binary_path, home_dir, service_companion_binary_path};
+use crate::util::{
+    current_sandboxed_service_binary_path, current_service_companion_binary_path, home_dir,
+    service_binary_path_for_unit, service_companion_binary_path,
+};
 use crate::workspace::{Workspace, WorkspaceStatus, WorkspaceType};
 
 /// Git remote used for sandboxed.sh self-updates
@@ -1576,6 +1579,68 @@ fn upsert_env_lines(contents: &str, updates: &[(&str, &str)]) -> String {
     out
 }
 
+fn upsert_hermes_mcp_command(contents: &str, command: &str) -> String {
+    let mut output = String::new();
+    let mut in_sandboxed_assistant = false;
+    let mut replaced = false;
+
+    for line in contents.lines() {
+        if line == "  sandboxed_assistant:" {
+            in_sandboxed_assistant = true;
+        } else if in_sandboxed_assistant
+            && line.starts_with("  ")
+            && !line.starts_with("    ")
+            && !line.trim().is_empty()
+        {
+            in_sandboxed_assistant = false;
+        }
+
+        if in_sandboxed_assistant && line.starts_with("    command:") {
+            output.push_str("    command: ");
+            output.push_str(&yaml_squote(command));
+            output.push('\n');
+            replaced = true;
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+
+    if replaced {
+        output
+    } else {
+        contents.to_string()
+    }
+}
+
+/// Keep already-adopted Hermes installations on the companion binary owned
+/// by this sandboxed.sh environment. This migration runs on every deploy so a
+/// dev service cannot keep spawning the historical production connector.
+async fn migrate_hermes_assistant_mcp_command(
+    runtime_name: &str,
+    command: &str,
+) -> Result<bool, String> {
+    let mut touched = false;
+    let updates = [("HERMES_ASSISTANT_MCP_COMMAND", command)];
+    for env_path in hermes_env_paths(runtime_name) {
+        let Ok(contents) = tokio::fs::read_to_string(&env_path).await else {
+            continue;
+        };
+        write_private_file(&env_path, &upsert_env_lines(&contents, &updates)).await?;
+        touched = true;
+    }
+
+    let config_path = format!("/var/lib/{runtime_name}/config.yaml");
+    if let Ok(contents) = tokio::fs::read_to_string(&config_path).await {
+        let updated = upsert_hermes_mcp_command(&contents, command);
+        if updated != contents {
+            write_private_file(&config_path, &updated).await?;
+            touched = true;
+        }
+    }
+    Ok(touched)
+}
+
 fn generate_hermes_remote_key() -> String {
     format!("hsk_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
@@ -3079,10 +3144,10 @@ fn stream_sandboxed_update(
 
         // Detect the current binary path and derive the service name from it.
         // e.g. /usr/local/bin/sandboxed-sh-prod → service sandboxed-sh-prod.service
-        let current_exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                yield sse("error", format!("Failed to detect current binary path: {}", e), None);
+        let current_exe = match current_sandboxed_service_binary_path() {
+            Some(path) => path,
+            None => {
+                yield sse("error", "Failed to detect current service binary path", None);
                 return;
             }
         };
@@ -3468,6 +3533,26 @@ fn current_sandboxed_service_name() -> Result<String, String> {
     })
 }
 
+async fn prepare_deploy_backup(destination: &str, backup: &str) -> Result<bool, String> {
+    if !std::path::Path::new(destination).exists() {
+        return Ok(false);
+    }
+    tokio::fs::copy(destination, backup)
+        .await
+        .map_err(|error| format!("failed to back up {destination} to {backup}: {error}"))?;
+    Ok(true)
+}
+
+async fn rollback_deployed_binary(destination: &str, backup: &str, had_backup: bool) {
+    if had_backup {
+        let _ = tokio::fs::rename(backup, destination).await;
+    } else {
+        // This deploy created the destination for the first time. Leaving it
+        // behind after rolling the service back would mix binary generations.
+        let _ = tokio::fs::remove_file(destination).await;
+    }
+}
+
 /// The actual deploy stream — git checkout (optional), build (optional),
 /// versioned install, then a detached `systemctl restart`. Mirrors
 /// `stream_sandboxed_update` but skips the "stop service first" step so the
@@ -3524,13 +3609,14 @@ fn stream_deploy(
             }
         }
 
-        let current_exe = match std::env::current_exe() {
+        let resolved_exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
                 yield sse("error", format!("Failed to detect current binary path: {}", e), None);
                 return;
             }
         };
+        let current_exe = service_binary_path_for_unit(&resolved_exe, &service_name);
         // The cargo bin name is always `sandboxed-sh` regardless of how we
         // rename it on install (e.g. `sandboxed-sh-prod` or `sandboxed-sh-dev`).
         // Same for MCP binaries.
@@ -3659,9 +3745,13 @@ fn stream_deploy(
         // convention, so we match it.
         yield sse("log", format!("Installing {} → {}", src_main.display(), install_dest_main), Some(75));
         let bkp_main = format!("{}.pre-deploy-{}", install_dest_main, sha);
-        if std::path::Path::new(&install_dest_main).exists() {
-            let _ = tokio::fs::copy(&install_dest_main, &bkp_main).await;
-        }
+        let backed_main = match prepare_deploy_backup(&install_dest_main, &bkp_main).await {
+            Ok(backed) => backed,
+            Err(error) => {
+                yield sse("error", error, None);
+                return;
+            }
+        };
         let install_main = Command::new("install")
             .args([
                 "-m", "0755",
@@ -3673,10 +3763,12 @@ fn stream_deploy(
         match install_main {
             Ok(o) if o.status.success() => {}
             Ok(o) => {
+                rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
                 yield sse("error", format!("Install of main binary failed: {}", String::from_utf8_lossy(&o.stderr)), None);
                 return;
             }
             Err(e) => {
+                rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
                 yield sse("error", format!("install command error: {}", e), None);
                 return;
             }
@@ -3684,9 +3776,14 @@ fn stream_deploy(
 
         yield sse("log", format!("Installing {} → {}", src_mcp.display(), install_dest_mcp), Some(82));
         let bkp_mcp = format!("{}.pre-deploy-{}", install_dest_mcp, sha);
-        if std::path::Path::new(&install_dest_mcp).exists() {
-            let _ = tokio::fs::copy(&install_dest_mcp, &bkp_mcp).await;
-        }
+        let backed_mcp = match prepare_deploy_backup(&install_dest_mcp, &bkp_mcp).await {
+            Ok(backed) => backed,
+            Err(error) => {
+                rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
+                yield sse("error", error, None);
+                return;
+            }
+        };
         let install_mcp = Command::new("install")
             .args([
                 "-m", "0755",
@@ -3701,12 +3798,14 @@ fn stream_deploy(
                 // Roll back the main binary swap before bailing — leaving
                 // the main binary swapped without its matching MCP is the
                 // worst possible half-applied state.
-                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                rollback_deployed_binary(&install_dest_mcp, &bkp_mcp, backed_mcp).await;
+                rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
                 yield sse("error", format!("Install of orchestrator-mcp failed (main binary rolled back): {}", String::from_utf8_lossy(&o.stderr)), None);
                 return;
             }
             Err(e) => {
-                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                rollback_deployed_binary(&install_dest_mcp, &bkp_mcp, backed_mcp).await;
+                rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
                 yield sse("error", format!("install command error (main rolled back): {}", e), None);
                 return;
             }
@@ -3714,9 +3813,16 @@ fn stream_deploy(
 
         yield sse("log", format!("Installing {} → {}", src_assistant_mcp.display(), install_dest_assistant_mcp), Some(85));
         let bkp_assistant_mcp = format!("{}.pre-deploy-{}", install_dest_assistant_mcp, sha);
-        if std::path::Path::new(&install_dest_assistant_mcp).exists() {
-            let _ = tokio::fs::copy(&install_dest_assistant_mcp, &bkp_assistant_mcp).await;
-        }
+        let backed_assistant_mcp =
+            match prepare_deploy_backup(&install_dest_assistant_mcp, &bkp_assistant_mcp).await {
+                Ok(backed) => backed,
+                Err(error) => {
+                    rollback_deployed_binary(&install_dest_mcp, &bkp_mcp, backed_mcp).await;
+                    rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
+                    yield sse("error", error, None);
+                    return;
+                }
+            };
         let install_assistant_mcp = Command::new("install")
             .args([
                 "-m", "0755",
@@ -3728,14 +3834,16 @@ fn stream_deploy(
         match install_assistant_mcp {
             Ok(o) if o.status.success() => {}
             Ok(o) => {
-                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
-                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
+                rollback_deployed_binary(&install_dest_assistant_mcp, &bkp_assistant_mcp, backed_assistant_mcp).await;
+                rollback_deployed_binary(&install_dest_mcp, &bkp_mcp, backed_mcp).await;
+                rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
                 yield sse("error", format!("Install of assistant-mcp failed (main/orchestrator binaries rolled back): {}", String::from_utf8_lossy(&o.stderr)), None);
                 return;
             }
             Err(e) => {
-                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
-                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
+                rollback_deployed_binary(&install_dest_assistant_mcp, &bkp_assistant_mcp, backed_assistant_mcp).await;
+                rollback_deployed_binary(&install_dest_mcp, &bkp_mcp, backed_mcp).await;
+                rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
                 yield sse("error", format!("install command error for assistant-mcp (main/orchestrator rolled back): {}", e), None);
                 return;
             }
@@ -3743,9 +3851,16 @@ fn stream_deploy(
 
         yield sse("log", format!("Installing {} → {}", src_paloma.display(), install_dest_paloma), Some(87));
         let bkp_paloma = format!("{}.pre-deploy-{}", install_dest_paloma, sha);
-        if std::path::Path::new(&install_dest_paloma).exists() {
-            let _ = tokio::fs::copy(&install_dest_paloma, &bkp_paloma).await;
-        }
+        let backed_paloma = match prepare_deploy_backup(&install_dest_paloma, &bkp_paloma).await {
+            Ok(backed) => backed,
+            Err(error) => {
+                rollback_deployed_binary(&install_dest_assistant_mcp, &bkp_assistant_mcp, backed_assistant_mcp).await;
+                rollback_deployed_binary(&install_dest_mcp, &bkp_mcp, backed_mcp).await;
+                rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
+                yield sse("error", error, None);
+                return;
+            }
+        };
         let install_paloma = Command::new("install")
             .args([
                 "-m", "0755",
@@ -3757,17 +3872,35 @@ fn stream_deploy(
         match install_paloma {
             Ok(o) if o.status.success() => {}
             Ok(o) => {
-                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
-                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
-                let _ = tokio::fs::rename(&bkp_assistant_mcp, &install_dest_assistant_mcp).await;
+                rollback_deployed_binary(&install_dest_paloma, &bkp_paloma, backed_paloma).await;
+                rollback_deployed_binary(&install_dest_assistant_mcp, &bkp_assistant_mcp, backed_assistant_mcp).await;
+                rollback_deployed_binary(&install_dest_mcp, &bkp_mcp, backed_mcp).await;
+                rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
                 yield sse("error", format!("Install of palomactl failed (service binaries rolled back): {}", String::from_utf8_lossy(&o.stderr)), None);
                 return;
             }
             Err(e) => {
-                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
-                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
-                let _ = tokio::fs::rename(&bkp_assistant_mcp, &install_dest_assistant_mcp).await;
+                rollback_deployed_binary(&install_dest_paloma, &bkp_paloma, backed_paloma).await;
+                rollback_deployed_binary(&install_dest_assistant_mcp, &bkp_assistant_mcp, backed_assistant_mcp).await;
+                rollback_deployed_binary(&install_dest_mcp, &bkp_mcp, backed_mcp).await;
+                rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
                 yield sse("error", format!("install command error for palomactl (service binaries rolled back): {}", e), None);
+                return;
+            }
+        }
+
+        let hermes_runtime = assistant_runtime_name(&state.config);
+        match migrate_hermes_assistant_mcp_command(hermes_runtime, &install_dest_assistant_mcp).await {
+            Ok(true) => {
+                yield sse("log", format!("Migrated {} to {}", hermes_runtime, install_dest_assistant_mcp), Some(88));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                rollback_deployed_binary(&install_dest_paloma, &bkp_paloma, backed_paloma).await;
+                rollback_deployed_binary(&install_dest_assistant_mcp, &bkp_assistant_mcp, backed_assistant_mcp).await;
+                rollback_deployed_binary(&install_dest_mcp, &bkp_mcp, backed_mcp).await;
+                rollback_deployed_binary(&install_dest_main, &bkp_main, backed_main).await;
+                yield sse("error", format!("Hermes MCP command migration failed; service binaries rolled back: {}", error), None);
                 return;
             }
         }
@@ -4860,8 +4993,9 @@ mod tests {
     use super::{
         evaluate_debounce, evaluate_deploy_request, expand_hermes_env_refs, extract_version_token,
         hermes_config_base_url, hermes_config_model_label, hermes_config_yaml, hermes_service_unit,
-        hermes_uses_native_codex, is_safe_repo_path, normalize_repo_path, prune_deploy_backups,
-        sandboxed_service_name_from_path, select_repo_path, systemd_service_component_from_states,
+        hermes_uses_native_codex, is_safe_repo_path, normalize_repo_path, prepare_deploy_backup,
+        prune_deploy_backups, rollback_deployed_binary, sandboxed_service_name_from_path,
+        select_repo_path, systemd_service_component_from_states, upsert_hermes_mcp_command,
         ComponentStatus, DebounceDecision, DeployRefusal, DEPLOY_DEBOUNCE_SECS,
         HERMES_SERVICE_DRAIN_DROP_IN,
     };
@@ -4900,6 +5034,38 @@ mod tests {
                 "generated Hermes config missing {tool}"
             );
         }
+    }
+
+    #[test]
+    fn hermes_mcp_command_migration_only_updates_sandboxed_assistant() {
+        let yaml = "mcp_servers:\n  other:\n    command: '/usr/bin/other'\n  sandboxed_assistant:\n    command: '/usr/local/bin/assistant-mcp'\n    timeout: 600\nmodel:\n  default: test\n";
+        let updated = upsert_hermes_mcp_command(yaml, "/usr/local/bin/assistant-mcp-dev");
+        assert!(updated.contains("other:\n    command: '/usr/bin/other'"));
+        assert!(updated
+            .contains("sandboxed_assistant:\n    command: '/usr/local/bin/assistant-mcp-dev'"));
+        assert!(!updated.contains("command: '/usr/local/bin/assistant-mcp'\n"));
+    }
+
+    #[tokio::test]
+    async fn deploy_rollback_removes_first_install_and_restores_existing_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("assistant-mcp-dev");
+        let backup = dir.path().join("assistant-mcp-dev.pre-deploy-test");
+        let destination = destination.to_string_lossy().to_string();
+        let backup = backup.to_string_lossy().to_string();
+
+        let had_backup = prepare_deploy_backup(&destination, &backup).await.unwrap();
+        assert!(!had_backup);
+        tokio::fs::write(&destination, b"new").await.unwrap();
+        rollback_deployed_binary(&destination, &backup, had_backup).await;
+        assert!(!std::path::Path::new(&destination).exists());
+
+        tokio::fs::write(&destination, b"old").await.unwrap();
+        let had_backup = prepare_deploy_backup(&destination, &backup).await.unwrap();
+        assert!(had_backup);
+        tokio::fs::write(&destination, b"new").await.unwrap();
+        rollback_deployed_binary(&destination, &backup, had_backup).await;
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"old");
     }
 
     #[test]

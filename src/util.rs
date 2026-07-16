@@ -82,11 +82,70 @@ pub fn service_companion_binary_path(
     }
 }
 
+/// Return the directory that owns the live service symlink/binary.
+///
+/// `current_exe()` resolves symlinks. With versioned installs that produces a
+/// path such as `/usr/local/bin/versions/<sha>/sandboxed-sh`, while companions
+/// must remain beside the stable `/usr/local/bin/sandboxed-sh-dev` entrypoint.
+fn service_install_dir(current_exe: &std::path::Path) -> std::path::PathBuf {
+    for ancestor in current_exe.ancestors() {
+        if ancestor.file_name().and_then(|name| name.to_str()) == Some("versions") {
+            if let Some(parent) = ancestor.parent() {
+                return parent.to_path_buf();
+            }
+        }
+    }
+    current_exe
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/usr/local/bin"))
+        .to_path_buf()
+}
+
+/// Resolve the stable service entrypoint from a systemd unit name.
+pub fn service_binary_path_for_unit(
+    current_exe: &std::path::Path,
+    service_name: &str,
+) -> std::path::PathBuf {
+    let binary_name = service_name.trim_end_matches(".service");
+    service_install_dir(current_exe).join(binary_name)
+}
+
+/// Resolve the stable entrypoint of the currently running sandboxed.sh
+/// service without trusting `current_exe()` to preserve a symlink suffix.
+pub fn current_sandboxed_service_binary_path() -> Option<std::path::PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+
+    if let Some(argv0) = std::env::args_os().next() {
+        let argv0 = std::path::PathBuf::from(argv0);
+        if argv0
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("sandboxed-sh"))
+        {
+            if argv0.is_absolute() {
+                return Some(argv0);
+            }
+            return Some(service_install_dir(&current_exe).join(argv0));
+        }
+    }
+
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
+        if let Some(service_name) = cgroup
+            .lines()
+            .flat_map(|line| line.rsplit('/'))
+            .find(|part| part.starts_with("sandboxed-sh") && part.ends_with(".service"))
+        {
+            return Some(service_binary_path_for_unit(&current_exe, service_name));
+        }
+    }
+
+    Some(current_exe)
+}
+
 /// Resolve a companion path for the currently running sandboxed.sh binary.
 pub fn current_service_companion_binary_path(binary: &str) -> Option<std::path::PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .map(|exe| service_companion_binary_path(&exe, binary))
+    current_sandboxed_service_binary_path()
+        .map(|service_path| service_companion_binary_path(&service_path, binary))
 }
 
 /// Read an environment variable, returning `Some(trimmed)` only when the
@@ -542,6 +601,13 @@ mod tests {
                 "palomactl",
             ),
             std::path::PathBuf::from("/usr/local/bin/palomactl")
+        );
+        assert_eq!(
+            service_binary_path_for_unit(
+                std::path::Path::new("/usr/local/bin/versions/0123456789ab/sandboxed-sh",),
+                "sandboxed-sh-dev.service",
+            ),
+            std::path::PathBuf::from("/usr/local/bin/sandboxed-sh-dev")
         );
     }
 
