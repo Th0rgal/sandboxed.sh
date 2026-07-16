@@ -3237,11 +3237,43 @@ fn stream_sandboxed_update(
             let mcp_dest = service_companion_binary_path(&current_exe, mcp_bin)
                 .to_string_lossy()
                 .to_string();
-            if std::path::Path::new(&mcp_src).exists() {
-                let _ = Command::new("install")
-                    .args(["-m", "0755", &mcp_src, &mcp_dest])
-                    .output()
-                    .await;
+            if !std::path::Path::new(&mcp_src).exists() {
+                yield sse("error", format!("Build artifact missing: {}", mcp_src), None);
+                let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
+                return;
+            }
+            let install = Command::new("install")
+                .args(["-m", "0755", &mcp_src, &mcp_dest])
+                .output()
+                .await;
+            match install {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    yield sse("error", format!("Failed to install {}: {}", mcp_bin, String::from_utf8_lossy(&output.stderr)), None);
+                    let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
+                    return;
+                }
+                Err(error) => {
+                    yield sse("error", format!("Failed to run installer for {}: {}", mcp_bin, error), None);
+                    let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
+                    return;
+                }
+            }
+        }
+
+        let assistant_mcp_dest = service_companion_binary_path(&current_exe, "assistant-mcp")
+            .to_string_lossy()
+            .to_string();
+        let hermes_runtime = assistant_runtime_name(&state.config);
+        match migrate_hermes_assistant_mcp_command(hermes_runtime, &assistant_mcp_dest).await {
+            Ok(true) => {
+                yield sse("log", format!("Migrated {} to {}", hermes_runtime, assistant_mcp_dest), Some(95));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                yield sse("error", format!("Hermes MCP command migration failed: {}", error), None);
+                let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
+                return;
             }
         }
 
