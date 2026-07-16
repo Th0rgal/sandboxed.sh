@@ -66,6 +66,11 @@ Tools:
 - `get_mission`
 - `get_mission_digest`
 - `get_mission_events`
+
+`get_mission` and `get_mission_digest` both return the compact mission digest.
+Use bounded `get_mission_events` pages when transcript or trace details are
+actually required; full histories are not injected by the status tools.
+
 - `get_mission_health` — diagnose stalls/loops/errors + a one-line recommendation
 - `get_mission_diagnostics` — tool-call timeline, repeated calls, error events
 - `start_mission`

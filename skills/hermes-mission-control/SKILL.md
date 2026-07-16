@@ -136,10 +136,13 @@ you tried last so you don't repeat a failed intervention.
 
 ## Tools
 
-- `list_active_missions`, `list_missions`, `get_mission` — find and inspect missions
+- `list_active_missions`, `list_missions` — find missions with bounded filters
+- `get_mission`, `get_mission_digest` — compact mission status aliases; neither
+  returns the full transcript
 - `get_mission_health` — **start here**: diagnosis + recommendation
 - `get_mission_diagnostics` — deep tool/error timeline when health flags trouble
-- `get_mission_events` — raw transcript/trace when you need exact wording
+- `get_mission_events` — bounded/paginated transcript or trace when you need
+  exact wording
 - `send_message_to_mission` — send a hint / nudge to a mission
 - `update_mission_settings` — switch backend/model/effort/agent (between turns)
 - `resume_mission` — restart interrupted/blocked/failed, optionally with a hint
