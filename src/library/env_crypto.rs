@@ -468,6 +468,20 @@ pub fn decrypt_content_tags(key: &[u8; KEY_LENGTH], content: &str) -> Result<Str
         // Reconstruct the full encrypted value for decryption
         let encrypted_value = full_match.as_str();
 
+        // A payload that is not even base64 is not a real secret: library
+        // content legitimately contains literal `<encrypted v="N">…</encrypted>`
+        // examples (the env-crypto Python utils' own docstrings, fixtures, and
+        // source regex). Rewriting those to <encrypted-failed> corrupted the
+        // synced files and warned twice per mission spawn. Leave such blocks
+        // untouched; only a well-formed ciphertext that fails AES decryption
+        // is a genuine broken secret worth flagging.
+        if BASE64.decode(ciphertext_b64).is_err() {
+            tracing::debug!(
+                "Skipping encrypted-looking block with non-base64 payload (doc/fixture)"
+            );
+            continue;
+        }
+
         // Try to decrypt, but handle failure gracefully
         let display_tag = match decrypt_value(key, encrypted_value) {
             Ok(plaintext) => {
@@ -908,5 +922,26 @@ export API_KEY=another-secret
         // Step 3->4: Strip for deployment
         let deployed = strip_encrypted_tags(&displayed);
         assert_eq!(deployed, "Key: my-secret-api-key");
+    }
+    #[test]
+    fn content_scan_leaves_non_base64_fixture_blocks_untouched() {
+        let key = [7u8; KEY_LENGTH];
+        let content = r#"docs: <encrypted v="1">BASE64(nonce||ciphertext)</encrypted> and fixture <encrypted v="1">abc123</encrypted>"#;
+        let out = decrypt_content_tags(&key, content).expect("scan succeeds");
+        assert_eq!(out, content);
+    }
+
+    #[test]
+    fn content_scan_still_flags_valid_b64_with_wrong_key() {
+        let key_a = [1u8; KEY_LENGTH];
+        let key_b = [2u8; KEY_LENGTH];
+        let secret = encrypt_value(&key_a, "s3cret").expect("encrypt");
+        let content = format!("KEY={}", secret);
+        let out = decrypt_content_tags(&key_b, &content).expect("scan succeeds");
+        assert!(
+            out.contains("<encrypted-failed"),
+            "wrong-key block must be flagged: {}",
+            out
+        );
     }
 }
