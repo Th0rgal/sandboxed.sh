@@ -1492,6 +1492,37 @@ pub fn get_api_key_for_provider(
     None
 }
 
+/// Resolve an actual Anthropic API key for `/v1/models`.
+///
+/// Claude subscription OAuth access tokens are valid for Claude Code's bearer
+/// flow but Anthropic's model catalog expects `x-api-key`. Passing an OAuth
+/// access token there produces a harmless but noisy 401 every refresh cycle.
+/// Store/API-key credentials take precedence; file and environment lookup is
+/// retained, while OAuth-only store records are deliberately excluded.
+fn get_enabled_store_api_key(
+    provider_type: ProviderType,
+    ai_providers: &[crate::ai_providers::AIProvider],
+) -> Option<String> {
+    ai_providers
+        .iter()
+        .find(|provider| {
+            provider.provider_type == provider_type
+                && provider.enabled
+                && provider
+                    .api_key
+                    .as_ref()
+                    .is_some_and(|key| !key.trim().is_empty())
+        })
+        .and_then(|provider| provider.api_key.clone())
+}
+
+fn get_anthropic_models_api_key(
+    ai_providers: &[crate::ai_providers::AIProvider],
+) -> Option<String> {
+    get_enabled_store_api_key(ProviderType::Anthropic, ai_providers)
+        .or_else(|| get_api_key_for_provider(ProviderType::Anthropic, &[]))
+}
+
 /// Fetch model lists from all supported provider APIs concurrently.
 ///
 /// Returns a map of provider ID -> fetched models. Providers that fail
@@ -1665,7 +1696,7 @@ pub async fn fetch_model_catalog(
     ];
 
     // Resolve API keys for all targets + Anthropic
-    let anthropic_key = get_api_key_for_provider(ProviderType::Anthropic, &providers_list);
+    let anthropic_key = get_anthropic_models_api_key(&providers_list);
     let target_keys: Vec<(FetchTarget, Option<String>)> = targets
         .into_iter()
         .map(|t| {
@@ -2444,6 +2475,29 @@ mod tests {
             .models
             .iter()
             .any(|model| model.id == "claude-opus-4-7"));
+    }
+
+    #[test]
+    fn anthropic_catalog_key_ignores_oauth_only_store_accounts() {
+        let mut oauth =
+            crate::ai_providers::AIProvider::new(ProviderType::Anthropic, "OAuth".into());
+        oauth.oauth = Some(crate::ai_providers::OAuthCredentials {
+            access_token: "oauth-access-token".into(),
+            refresh_token: "oauth-refresh-token".into(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 60_000,
+        });
+        assert_eq!(
+            get_enabled_store_api_key(ProviderType::Anthropic, &[oauth]),
+            None
+        );
+
+        let mut api =
+            crate::ai_providers::AIProvider::new(ProviderType::Anthropic, "API key".into());
+        api.api_key = Some("sk-ant-api-key".into());
+        assert_eq!(
+            get_enabled_store_api_key(ProviderType::Anthropic, &[api]).as_deref(),
+            Some("sk-ant-api-key")
+        );
     }
 
     #[test]

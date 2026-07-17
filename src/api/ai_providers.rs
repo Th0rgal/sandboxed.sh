@@ -385,6 +385,9 @@ fn read_grok_auth_entry() -> Option<serde_json::Value> {
             continue;
         };
         if let Some(entry) = auth.get(GROK_OAUTH_CLIENT_KEY) {
+            if entry.get("auth_mode").and_then(|value| value.as_str()) == Some("oauth") {
+                continue;
+            }
             return Some(entry.clone());
         }
     }
@@ -464,7 +467,9 @@ fn parse_grok_device_auth_line(line: &str) -> (Option<String>, Option<String>) {
 mod oauth_deadletter_tests {
     use super::{
         oauth_refresh_clear_dead, oauth_refresh_mark_token_dead, oauth_refresh_token_is_dead,
+        should_adopt_anthropic_tier, OAuthTokenEntry,
     };
+    use crate::ai_providers::OAuthCredentials;
 
     #[test]
     fn deadletter_blocks_same_token_until_rotated_or_cleared() {
@@ -480,6 +485,47 @@ mod oauth_deadletter_tests {
         oauth_refresh_clear_dead(acct);
         assert!(!oauth_refresh_token_is_dead(acct, "tok-A"));
     }
+
+    #[test]
+    fn tier_adoption_requires_a_different_live_generation() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let store = OAuthCredentials {
+            access_token: "access-old".into(),
+            refresh_token: "refresh-old".into(),
+            expires_at: now + 10 * 60_000,
+        };
+        let newer = OAuthTokenEntry {
+            access_token: "access-new".into(),
+            refresh_token: "refresh-new".into(),
+            expires_at: now + 20 * 60_000,
+        };
+        assert!(should_adopt_anthropic_tier(&store, &newer, false));
+
+        let same_generation = OAuthTokenEntry {
+            access_token: "access-old".into(),
+            refresh_token: "refresh-old".into(),
+            expires_at: now + 20 * 60_000,
+        };
+        assert!(!should_adopt_anthropic_tier(&store, &same_generation, true));
+
+        let rejected_store_with_equal_expiry = OAuthTokenEntry {
+            access_token: "access-recovered".into(),
+            refresh_token: "refresh-recovered".into(),
+            expires_at: store.expires_at,
+        };
+        assert!(should_adopt_anthropic_tier(
+            &store,
+            &rejected_store_with_equal_expiry,
+            true
+        ));
+
+        let expired = OAuthTokenEntry {
+            access_token: "access-expired".into(),
+            refresh_token: "refresh-expired".into(),
+            expires_at: now - 1,
+        };
+        assert!(!should_adopt_anthropic_tier(&store, &expired, true));
+    }
 }
 
 #[cfg(test)]
@@ -487,8 +533,9 @@ mod grok_oauth_tests {
     use super::{
         build_response_from_store, get_xai_api_key_for_grok, grok_auth_expires_at_millis,
         grok_cli_reconcile_due, oauth_refresh_clear_dead, oauth_refresh_mark_token_dead,
-        oauth_refresh_token_fingerprint, parse_grok_device_auth_line, ProviderStatusResponse,
-        GROK_CLI_RECONCILE_INTERVAL,
+        oauth_refresh_token_fingerprint, parse_grok_device_auth_line,
+        remove_legacy_grok_oauth_entry, ProviderStatusResponse, GROK_CLI_RECONCILE_INTERVAL,
+        GROK_OAUTH_CLIENT_KEY,
     };
     use crate::ai_providers::{AIProvider, OAuthCredentials, ProviderType};
     use std::time::{Duration as StdDuration, Instant};
@@ -529,6 +576,51 @@ mod grok_oauth_tests {
         });
 
         assert_eq!(grok_auth_expires_at_millis(&entry), 1779172231759);
+    }
+
+    #[test]
+    fn removes_only_sandboxed_legacy_grok_auth_entry() {
+        let mut legacy = serde_json::json!({
+            GROK_OAUTH_CLIENT_KEY: {
+                "auth_mode": "oauth",
+                "key": "legacy-access",
+                "refresh_token": "legacy-refresh"
+            },
+            "unrelated": {
+                "auth_mode": "api_key",
+                "key": "preserve-me"
+            }
+        })
+        .as_object()
+        .cloned()
+        .expect("auth object");
+        assert!(remove_legacy_grok_oauth_entry(&mut legacy));
+        assert!(!legacy.contains_key(GROK_OAUTH_CLIENT_KEY));
+        assert_eq!(
+            legacy
+                .get("unrelated")
+                .and_then(|entry| entry.get("key"))
+                .and_then(|value| value.as_str()),
+            Some("preserve-me")
+        );
+
+        let mut current = serde_json::json!({
+            GROK_OAUTH_CLIENT_KEY: {
+                "auth_mode": "oidc",
+                "key": "native-token"
+            }
+        })
+        .as_object()
+        .cloned()
+        .expect("auth object");
+        assert!(!remove_legacy_grok_oauth_entry(&mut current));
+        assert_eq!(
+            current
+                .get(GROK_OAUTH_CLIENT_KEY)
+                .and_then(|entry| entry.get("key"))
+                .and_then(|value| value.as_str()),
+            Some("native-token")
+        );
     }
 
     #[test]
@@ -3731,8 +3823,8 @@ fn sync_to_opencode_auth(
     }
 
     if matches!(provider_type, ProviderType::Xai) {
-        if let Err(e) = write_grok_oauth_auth_file(refresh_token, access_token, expires_at) {
-            tracing::error!("Failed to write Grok OAuth auth file: {}", e);
+        if let Err(e) = remove_legacy_grok_oauth_auth_entries() {
+            tracing::warn!("Failed to remove obsolete Grok OAuth auth entry: {}", e);
         }
     }
 
@@ -3751,68 +3843,52 @@ fn sync_to_opencode_auth(
     Ok(())
 }
 
-pub(crate) fn write_grok_oauth_auth_file(
-    refresh_token: &str,
-    access_token: &str,
-    expires_at: i64,
-) -> Result<(), String> {
-    let expires_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(expires_at)
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+fn remove_legacy_grok_oauth_entry(auth: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    let generated_legacy_entry = auth
+        .get(GROK_OAUTH_CLIENT_KEY)
+        .and_then(|value| value.as_object())
+        .and_then(|entry| entry.get("auth_mode"))
+        .and_then(|value| value.as_str())
+        == Some("oauth");
+    if generated_legacy_entry {
+        auth.remove(GROK_OAUTH_CLIENT_KEY);
+    }
+    generated_legacy_entry
+}
 
+/// Remove the legacy Grok credential entry written by older Sandboxed.sh
+/// releases.
+///
+/// Grok CLI 0.2.93 no longer accepts `auth_mode: "oauth"` (and rejects the
+/// token as a legacy WebLogin credential). Sandboxed missions authenticate
+/// non-interactively through the runner's `XAI_API_KEY` environment, so
+/// materializing this incompatible file only breaks native CLI state. Preserve
+/// every CLI-owned entry and remove only our uniquely identifiable old shape.
+pub(crate) fn remove_legacy_grok_oauth_auth_entries() -> Result<(), String> {
     let mut last_error = None;
     for auth_path in grok_auth_paths() {
-        let mut auth = if auth_path.exists() {
-            match std::fs::read_to_string(&auth_path)
-                .ok()
-                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-                .and_then(|value| value.as_object().cloned())
-            {
-                Some(auth) => auth,
-                None => serde_json::Map::new(),
-            }
-        } else {
-            serde_json::Map::new()
-        };
-
-        let mut entry = auth
-            .get(GROK_OAUTH_CLIENT_KEY)
+        if !auth_path.exists() {
+            continue;
+        }
+        let mut auth = match std::fs::read_to_string(&auth_path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
             .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        entry.insert(
-            "auth_mode".to_string(),
-            serde_json::Value::String("oauth".to_string()),
-        );
-        entry.insert(
-            "oidc_client_id".to_string(),
-            serde_json::Value::String(GROK_OAUTH_CLIENT_ID.to_string()),
-        );
-        entry.insert(
-            "oidc_issuer".to_string(),
-            serde_json::Value::String("https://auth.x.ai".to_string()),
-        );
-        entry.insert(
-            "key".to_string(),
-            serde_json::Value::String(access_token.to_string()),
-        );
-        entry.insert(
-            "refresh_token".to_string(),
-            serde_json::Value::String(refresh_token.to_string()),
-        );
-        entry.insert(
-            "expires_at".to_string(),
-            serde_json::Value::String(expires_at.clone()),
-        );
-        auth.insert(
-            GROK_OAUTH_CLIENT_KEY.to_string(),
-            serde_json::Value::Object(entry),
-        );
+        {
+            Some(auth) => auth,
+            None => {
+                tracing::warn!(
+                    path = %auth_path.display(),
+                    "Leaving unreadable Grok auth file untouched"
+                );
+                continue;
+            }
+        };
+        if !remove_legacy_grok_oauth_entry(&mut auth) {
+            continue;
+        }
 
         let write_result = (|| -> Result<(), String> {
-            if let Some(parent) = auth_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create Grok auth directory: {}", e))?;
-            }
             let contents = serde_json::to_string_pretty(&serde_json::Value::Object(auth))
                 .map_err(|e| format!("Failed to serialize Grok auth: {}", e))?;
             std::fs::write(&auth_path, contents)
@@ -6145,6 +6221,11 @@ async fn list_providers(
     // Keep the xAI provider's stored token in sync with the Grok CLI's own
     // refreshed auth file so it doesn't show a false "needs reauth".
     maybe_reconcile_xai_store_from_grok_cli(&state.ai_providers).await;
+
+    // Claude Code may have rotated Anthropic's single-use refresh token in the
+    // shared tiers since the last background cycle. Reconcile before deriving
+    // UI health so a live harness credential is never shown as disconnected.
+    reconcile_anthropic_store_from_tiers(&state.ai_providers).await;
 
     // All providers live in AIProviderStore now
     let store_providers = state.ai_providers.list().await;
@@ -10068,6 +10149,74 @@ pub async fn refresh_oauth_token_with_lock(
     // _lock is dropped here, releasing the file lock
 }
 
+/// Return whether the shared Anthropic tier is a safe recovery candidate for a
+/// stale store generation.
+fn should_adopt_anthropic_tier(
+    store: &crate::ai_providers::OAuthCredentials,
+    tier: &OAuthTokenEntry,
+    store_token_rejected: bool,
+) -> bool {
+    !tier.refresh_token.trim().is_empty()
+        && tier.refresh_token != store.refresh_token
+        && !oauth_token_expired(tier.expires_at)
+        && (tier.expires_at > store.expires_at || store_token_rejected)
+}
+
+/// Adopt the live shared-tier Anthropic token into the store when ownership is
+/// unambiguous.
+///
+/// Anthropic refresh tokens are single-use. Claude Code can rotate the shared
+/// credential tiers before the store-backed account observes the sidecar, so
+/// the dashboard and on-demand usage endpoint must not keep treating the stale
+/// store generation as authoritative. We only infer ownership when exactly one
+/// enabled OAuth account exists. Multi-account installations are reconciled by
+/// the old-token sidecar, which attributes a rotation without guessing.
+pub async fn reconcile_anthropic_store_from_tiers(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+) -> u32 {
+    let accounts: Vec<_> = ai_providers
+        .get_all_by_type(ProviderType::Anthropic)
+        .await
+        .into_iter()
+        .filter(|account| account.enabled && account.oauth.is_some())
+        .collect();
+    let [account] = accounts.as_slice() else {
+        return 0;
+    };
+    let Some(store_oauth) = account.oauth.as_ref() else {
+        return 0;
+    };
+    let Some(tier) = read_oauth_token_entry(ProviderType::Anthropic) else {
+        return 0;
+    };
+    let store_token_rejected = provider_refresh_token_is_rejected(account);
+    if !should_adopt_anthropic_tier(store_oauth, &tier, store_token_rejected) {
+        return 0;
+    }
+
+    let rotation = crate::api::oauth_reconcile::PendingRotation {
+        provider: "anthropic".to_string(),
+        old_refresh_token: store_oauth.refresh_token.clone(),
+        new_refresh_token: tier.refresh_token.clone(),
+        new_access_token: tier.access_token.clone(),
+        expires_at: tier.expires_at,
+    };
+    if crate::api::oauth_reconcile::apply_rotation(ai_providers, ProviderType::Anthropic, &rotation)
+        .await
+        .is_some()
+    {
+        tracing::info!(
+            account_id = %account.id,
+            new_expires_at = tier.expires_at,
+            store_token_rejected,
+            "Adopted live shared-tier Anthropic OAuth token into store"
+        );
+        1
+    } else {
+        0
+    }
+}
+
 /// Refresh OAuth tokens for **store-backed** accounts (AIProviderStore) of
 /// `provider_type` that expire within `refresh_threshold_ms`, writing the new
 /// tokens back to the store (and credential tiers).
@@ -10084,9 +10233,12 @@ pub async fn refresh_due_store_oauth(
 ) -> (u32, u32) {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut found = 0u32;
-    let mut refreshed = 0u32;
+    let mut refreshed = if provider_type == ProviderType::Anthropic {
+        reconcile_anthropic_store_from_tiers(ai_providers).await
+    } else {
+        0
+    };
     let accounts = ai_providers.get_all_by_type(provider_type).await;
-    let single_account = accounts.len() == 1;
     for account in accounts {
         let Some(oauth) = account.oauth.as_ref() else {
             continue;
@@ -10095,51 +10247,6 @@ pub async fn refresh_due_store_oauth(
             continue;
         }
         found += 1;
-
-        // Adopt-before-refresh (Anthropic): mission harnesses rotate the shared
-        // credential tiers mid-run, making the tier token the ONLY live member
-        // of the rotating family — refreshing our (older) copy would revoke it,
-        // the recurring split-brain of 2026-07-16/17. When the freshest tier
-        // entry differs and is strictly fresher, adopt it into this record
-        // instead of refreshing, and lift any cached invalid_grant. Guarded to
-        // the unambiguous cases: a single store account of this type, or a
-        // record whose own token is already recorded dead (that record IS the
-        // tier owner that lost the rotation race; a secondary account's token
-        // is not part of the tier family and refreshes independently).
-        if provider_type == ProviderType::Anthropic {
-            if let Some(tier) = read_oauth_token_entry(provider_type) {
-                let record_dead = oauth_refresh_token_is_dead(account.id, &oauth.refresh_token)
-                    || account.rejected_oauth_refresh_fingerprint.is_some();
-                if !tier.refresh_token.trim().is_empty()
-                    && tier.refresh_token != oauth.refresh_token
-                    && tier.expires_at > oauth.expires_at
-                    && (single_account || record_dead)
-                {
-                    let adopted = crate::api::oauth_reconcile::apply_rotation(
-                        ai_providers,
-                        provider_type,
-                        &crate::api::oauth_reconcile::PendingRotation {
-                            provider: "anthropic".to_string(),
-                            old_refresh_token: oauth.refresh_token.clone(),
-                            new_refresh_token: tier.refresh_token.clone(),
-                            new_access_token: tier.access_token.clone(),
-                            expires_at: tier.expires_at,
-                        },
-                    )
-                    .await;
-                    if adopted.is_some() {
-                        refreshed += 1;
-                        tracing::info!(
-                            provider = ?provider_type,
-                            account_id = %account.id,
-                            new_expires_at = tier.expires_at,
-                            "Adopted fresher tier OAuth token into store record (skipping refresh)"
-                        );
-                        continue;
-                    }
-                }
-            }
-        }
 
         if oauth.expires_at - now_ms > refresh_threshold_ms {
             continue;
@@ -10205,6 +10312,13 @@ pub async fn refresh_store_account_oauth_locked(
     let gate = oauth_refresh_gate(provider_type);
     let _gate = gate.lock().await;
     let _lock = acquire_oauth_refresh_lock(provider_type).ok();
+
+    // Heal an out-of-band Claude Code rotation before consulting a persisted
+    // invalid_grant. This makes the usage endpoint and other on-demand callers
+    // recover immediately instead of waiting for the periodic refresher.
+    if provider_type == ProviderType::Anthropic {
+        reconcile_anthropic_store_from_tiers(ai_providers).await;
+    }
 
     // Re-read the freshest credentials now that we're serialized — a concurrent
     // refresh may have just rotated the token while we waited on the gate.
