@@ -10085,7 +10085,9 @@ pub async fn refresh_due_store_oauth(
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut found = 0u32;
     let mut refreshed = 0u32;
-    for account in ai_providers.get_all_by_type(provider_type).await {
+    let accounts = ai_providers.get_all_by_type(provider_type).await;
+    let single_account = accounts.len() == 1;
+    for account in accounts {
         let Some(oauth) = account.oauth.as_ref() else {
             continue;
         };
@@ -10093,6 +10095,52 @@ pub async fn refresh_due_store_oauth(
             continue;
         }
         found += 1;
+
+        // Adopt-before-refresh (Anthropic): mission harnesses rotate the shared
+        // credential tiers mid-run, making the tier token the ONLY live member
+        // of the rotating family — refreshing our (older) copy would revoke it,
+        // the recurring split-brain of 2026-07-16/17. When the freshest tier
+        // entry differs and is strictly fresher, adopt it into this record
+        // instead of refreshing, and lift any cached invalid_grant. Guarded to
+        // the unambiguous cases: a single store account of this type, or a
+        // record whose own token is already recorded dead (that record IS the
+        // tier owner that lost the rotation race; a secondary account's token
+        // is not part of the tier family and refreshes independently).
+        if provider_type == ProviderType::Anthropic {
+            if let Some(tier) = read_oauth_token_entry(provider_type) {
+                let record_dead = oauth_refresh_token_is_dead(account.id, &oauth.refresh_token)
+                    || account.rejected_oauth_refresh_fingerprint.is_some();
+                if !tier.refresh_token.trim().is_empty()
+                    && tier.refresh_token != oauth.refresh_token
+                    && tier.expires_at > oauth.expires_at
+                    && (single_account || record_dead)
+                {
+                    let adopted = crate::api::oauth_reconcile::apply_rotation(
+                        ai_providers,
+                        provider_type,
+                        &crate::api::oauth_reconcile::PendingRotation {
+                            provider: "anthropic".to_string(),
+                            old_refresh_token: oauth.refresh_token.clone(),
+                            new_refresh_token: tier.refresh_token.clone(),
+                            new_access_token: tier.access_token.clone(),
+                            expires_at: tier.expires_at,
+                        },
+                    )
+                    .await;
+                    if adopted.is_some() {
+                        refreshed += 1;
+                        tracing::info!(
+                            provider = ?provider_type,
+                            account_id = %account.id,
+                            new_expires_at = tier.expires_at,
+                            "Adopted fresher tier OAuth token into store record (skipping refresh)"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
         if oauth.expires_at - now_ms > refresh_threshold_ms {
             continue;
         }
