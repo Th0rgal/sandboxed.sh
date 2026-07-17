@@ -89,117 +89,6 @@ async fn ensure_grok_cli_available(
     }
 }
 
-async fn sync_grok_oauth_auth_file(
-    workspace_exec: &WorkspaceExec,
-    cwd: &std::path::Path,
-) -> Result<bool, String> {
-    let auth_path = std::path::PathBuf::from(crate::util::home_dir())
-        .join(".grok")
-        .join("auth.json");
-    if !auth_path.is_file() {
-        return Ok(false);
-    }
-
-    let auth_json = tokio::fs::read_to_string(&auth_path)
-        .await
-        .map_err(|e| format!("Failed to read Grok auth file: {}", e))?;
-    if auth_json.trim().is_empty() {
-        return Ok(false);
-    }
-
-    let source_expires_at = grok_auth_file_expires_at(&auth_json);
-    if crate::api::ai_providers::oauth_token_expired(source_expires_at) {
-        return Err(
-            "Host Grok auth file is expired; reconnect xAI or refresh OAuth before syncing"
-                .to_string(),
-        );
-    }
-    let existing_output = workspace_exec
-        .output(
-            cwd,
-            "/bin/sh",
-            &[
-                "-lc".to_string(),
-                "test -s \"${HOME:-/root}/.grok/auth.json\" && cat \"${HOME:-/root}/.grok/auth.json\""
-                    .to_string(),
-            ],
-            HashMap::new(),
-        )
-        .await
-        .map_err(|e| format!("Failed to inspect workspace Grok auth file: {}", e))?;
-    if existing_output.status.success() {
-        let existing_json = String::from_utf8_lossy(&existing_output.stdout);
-        let existing_expires_at = grok_auth_file_expires_at(&existing_json);
-        if existing_expires_at >= source_expires_at {
-            tracing::debug!(
-                source_expires_at,
-                existing_expires_at,
-                "Skipping Grok auth sync because workspace auth is at least as fresh"
-            );
-            return Ok(false);
-        }
-    }
-
-    let encoded = {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(auth_json.as_bytes())
-    };
-    let output = workspace_exec
-        .output(
-            cwd,
-            "/bin/sh",
-            &[
-                "-lc".to_string(),
-                format!(
-                    "mkdir -p \"${{HOME:-/root}}/.grok\" && printf %s '{}' | base64 -d > \"${{HOME:-/root}}/.grok/auth.json\" && chmod 600 \"${{HOME:-/root}}/.grok/auth.json\"",
-                    encoded
-                ),
-            ],
-            HashMap::new(),
-        )
-        .await
-        .map_err(|e| format!("Failed to sync Grok auth file: {}", e))?;
-    if output.status.success() {
-        Ok(true)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Err(format!(
-            "Failed to sync Grok auth file into workspace: {}{}{}",
-            stderr.trim(),
-            if stderr.trim().is_empty() || stdout.trim().is_empty() {
-                ""
-            } else {
-                " | "
-            },
-            stdout.trim()
-        ))
-    }
-}
-
-fn grok_auth_file_expires_at(contents: &str) -> i64 {
-    const GROK_OAUTH_CLIENT_KEY: &str = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828";
-
-    serde_json::from_str::<serde_json::Value>(contents)
-        .ok()
-        .and_then(|auth| auth.get(GROK_OAUTH_CLIENT_KEY).cloned())
-        .and_then(|entry| {
-            entry.get("expires_at").and_then(|value| {
-                if let Some(expires_at) = value.as_i64() {
-                    return Some(expires_at);
-                }
-                let text = value.as_str()?.trim();
-                if let Ok(expires_at) = text.parse::<i64>() {
-                    return Some(expires_at);
-                }
-                chrono::DateTime::parse_from_rfc3339(text)
-                    .ok()
-                    .map(|dt| dt.timestamp_millis())
-            })
-        })
-        .unwrap_or(0)
-}
-
 fn grok_event_is_reasoning_type(value: &serde_json::Value) -> bool {
     value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
         let lower = t.to_ascii_lowercase();
@@ -445,8 +334,6 @@ pub(crate) fn grok_stdout_line_requests_interactive_login(line: &str) -> bool {
 /// `XAI_API_KEY` (key > OAuth access token > ambient env). Shared by the
 /// streaming-json and ACP turn paths.
 async fn prepare_grok_auth_env(
-    workspace_exec: &WorkspaceExec,
-    work_dir: &std::path::Path,
     app_working_dir: &std::path::Path,
     mission_id: Uuid,
 ) -> Result<HashMap<String, String>, AgentResult> {
@@ -492,22 +379,19 @@ async fn prepare_grok_auth_env(
             }
         } else {
             oauth_access_token = Some(entry.access_token.clone());
-            if let Err(err) = crate::api::ai_providers::write_grok_oauth_auth_file(
-                &entry.refresh_token,
-                &entry.access_token,
-                entry.expires_at,
-            ) {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    error = %err,
-                    "Failed to materialize fresh xAI OAuth token into Grok auth file"
-                );
-            }
         }
     }
 
-    if let Err(err) = sync_grok_oauth_auth_file(workspace_exec, work_dir).await {
-        tracing::warn!(mission_id = %mission_id, error = %err, "Failed to sync Grok OAuth auth file");
+    // Grok CLI 0.2.93 rejects the legacy `auth_mode: "oauth"` shape older
+    // Sandboxed versions generated. The runner authenticates with an explicit
+    // environment key below, so never copy or overwrite the CLI's native auth
+    // file; just remove our obsolete entry when present.
+    if let Err(err) = crate::api::ai_providers::remove_legacy_grok_oauth_auth_entries() {
+        tracing::warn!(
+            mission_id = %mission_id,
+            error = %err,
+            "Failed to remove obsolete Grok OAuth auth entry"
+        );
     }
 
     // Authenticate the Grok CLI non-interactively via XAI_API_KEY. Priority:
@@ -727,11 +611,10 @@ async fn run_grok_streaming_json_turn(
     // capture the freshest one here and inject it below. Without it the CLI
     // falls back to an interactive browser sign-in that never completes in a
     // headless mission — the run then hangs forever ("Agent is working").
-    let env =
-        match prepare_grok_auth_env(&workspace_exec, work_dir, app_working_dir, mission_id).await {
-            Ok(env) => env,
-            Err(result) => return result,
-        };
+    let env = match prepare_grok_auth_env(app_working_dir, mission_id).await {
+        Ok(env) => env,
+        Err(result) => return result,
+    };
 
     let mut child = match workspace_exec
         .spawn_streaming(work_dir, &cli_path, &args, env)
@@ -1144,13 +1027,12 @@ async fn run_grok_acp_turn(
         .await
         .map_err(|e| format!("grok CLI unavailable: {e}"))?;
 
-    let env =
-        match prepare_grok_auth_env(&workspace_exec, work_dir, app_working_dir, mission_id).await {
-            Ok(env) => env,
-            // Auth failures are terminal for BOTH paths — surface them directly
-            // instead of falling back into the same failure.
-            Err(result) => return Ok(result),
-        };
+    let env = match prepare_grok_auth_env(app_working_dir, mission_id).await {
+        Ok(env) => env,
+        // Auth failures are terminal for BOTH paths — surface them directly
+        // instead of falling back into the same failure.
+        Err(result) => return Ok(result),
+    };
 
     // `grok agent stdio` accepts no further flags (verified: it rejects
     // --no-auto-update). cwd comes from spawn_streaming's working dir and
