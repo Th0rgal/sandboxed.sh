@@ -5290,6 +5290,24 @@ fn fable_mandate_requests_integration(intent: Option<&str>, prompt: Option<&str>
         "commit",
         "committing",
     ];
+    // Declared research scope: controllers that explicitly tag the mission as
+    // hypothesis/brainstorm work (proposal-only by construction) get a
+    // narrower guard. Research prompts unavoidably contain "commit" as a noun
+    // ("baseline commit <sha>") and "push" as an idiom ("axes to push"), which
+    // kept rejecting authorized Beal focus-brainstorms even after the verb
+    // rework (2026-07-17). Blatant integration verbs (merge/rebase) still
+    // reject regardless of the declared intent.
+    const RESEARCH_INTENT_MARKERS: [&str; 3] = ["hypothesis", "brainstorm", "research"];
+    const HARD_VERBS: [&str; 4] = ["merge", "merging", "rebase", "rebasing"];
+    let intent_norm = intent.unwrap_or_default().to_ascii_lowercase();
+    let declared_research = RESEARCH_INTENT_MARKERS
+        .iter()
+        .any(|marker| intent_norm.contains(marker));
+    let verbs: &[&str] = if declared_research {
+        &HARD_VERBS
+    } else {
+        &MUTATION_VERBS
+    };
     const NEGATORS_BEFORE: [&str; 9] = [
         "not", "never", "no", "without", "dont", "cannot", "cant", "forbid", "before",
     ];
@@ -5306,7 +5324,7 @@ fn fable_mandate_requests_integration(intent: Option<&str>, prompt: Option<&str>
         .filter(|token| !token.is_empty())
         .collect();
     words.iter().enumerate().any(|(i, word)| {
-        if !MUTATION_VERBS.contains(word) {
+        if !verbs.contains(word) {
             return false;
         }
         let negated_before = words[i.saturating_sub(3)..i]
@@ -23259,6 +23277,28 @@ And the report:
                 "Produce a prioritized focus plan as proposals only; do not \
                  commit or push anything; merging is forbidden; stop before commit"
             )
+        ));
+    }
+
+    #[test]
+    fn fable_research_intent_tolerates_commit_nouns_and_push_idioms() {
+        // Declared hypothesis/brainstorm scope: baseline-commit references and
+        // "axes to push" idioms must not reject (the 2026-07-17 regression).
+        assert!(!fable_mandate_requests_integration(
+            Some("hypothesis_generation"),
+            Some(
+                "Baseline is main at commit d83704e0; decide which frontier axes to push or pause"
+            )
+        ));
+        // ...but blatant integration verbs still reject even with the intent.
+        assert!(fable_mandate_requests_integration(
+            Some("hypothesis_generation"),
+            Some("Then merge the branch into main")
+        ));
+        // Without a research intent, commit/push mandates keep rejecting.
+        assert!(fable_mandate_requests_integration(
+            Some("repair"),
+            Some("Fix the lemma, then commit and push")
         ));
     }
 
