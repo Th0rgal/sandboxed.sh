@@ -140,6 +140,17 @@ fn jsonrpc_error(id: Option<serde_json::Value>, code: i32, message: &str) -> Res
     .into_response()
 }
 
+/// ACP's HTTP MCP-server variant requires a `headers` array even when the
+/// endpoint needs no headers.
+fn http_mcp_server_descriptor(url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "http",
+        "name": "grok-cli-bridge-tools",
+        "url": url,
+        "headers": [],
+    })
+}
+
 /// The ephemeral MCP server's single JSON-RPC endpoint. Suspends `tools/call`
 /// until the bridge resumes it.
 async fn mcp_handler(
@@ -713,11 +724,7 @@ impl BridgeBackend for AcpMcpBackend {
                     "method": "session/new",
                     "params": {
                         "cwd": cwd,
-                        "mcpServers": [{
-                            "type": "http",
-                            "name": "grok-cli-bridge-tools",
-                            "url": mcp_url,
-                        }]
+                        "mcpServers": [http_mcp_server_descriptor(&mcp_url)]
                     }
                 }),
             )
@@ -807,6 +814,14 @@ impl BridgeBackend for AcpMcpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_mcp_descriptor_includes_required_empty_headers() {
+        let descriptor = http_mcp_server_descriptor("http://127.0.0.1:1234/");
+        assert_eq!(descriptor["type"], "http");
+        assert_eq!(descriptor["url"], "http://127.0.0.1:1234/");
+        assert_eq!(descriptor["headers"], serde_json::json!([]));
+    }
 
     #[tokio::test]
     async fn startup_guard_aborts_server_task_on_early_return() {
