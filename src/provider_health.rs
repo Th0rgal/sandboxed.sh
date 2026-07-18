@@ -1391,7 +1391,14 @@ impl ModelChainStore {
                 );
                 let credential_is_oauth_token =
                     account.api_key.is_none() && oauth_is_fresh && provider_oauth_is_proxy_routable;
-                let entry_has_oauth = credential_is_oauth_token || google_oauth_routable;
+                let xai_oauth_cli_proxy_routable =
+                    matches!(provider_type, crate::ai_providers::ProviderType::Xai)
+                        && account.api_key.is_none()
+                        && oauth_is_fresh
+                        && crate::api::ai_providers::xai_cli_proxy_account_available();
+                let entry_has_oauth = credential_is_oauth_token
+                    || google_oauth_routable
+                    || xai_oauth_cli_proxy_routable;
                 let entry_has_api_key = routed_api_key.is_some();
                 resolved.push(ResolvedEntry {
                     provider_id: entry.provider_id.clone(),
@@ -1673,7 +1680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_chain_does_not_treat_xai_oauth_as_proxy_api_key() {
+    async fn resolve_chain_never_treats_xai_oauth_as_api_key() {
         let mut xai = AIProvider::new(ProviderType::Xai, "xAI Grok OAuth".to_string());
         xai.oauth = Some(OAuthCredentials {
             access_token: "grok-oauth-token".to_string(),
@@ -1700,15 +1707,19 @@ mod tests {
             resolved[0].api_key.is_none(),
             "Grok Build OAuth must not be forwarded as XAI_API_KEY"
         );
-        assert!(
-            !resolved[0].has_oauth,
-            "xAI OAuth is CLI-only for this router path"
+        let cli_proxy_available = crate::api::ai_providers::xai_cli_proxy_account_available();
+        assert_eq!(
+            resolved[0].has_oauth, cli_proxy_available,
+            "xAI OAuth must be marked routable only through CLIProxyAPI"
         );
-        assert!(!crate::api::proxy::has_routable_proxy_credentials(
-            ProviderType::Xai,
-            resolved[0].api_key.is_some(),
-            resolved[0].has_oauth
-        ));
+        assert_eq!(
+            crate::api::proxy::has_routable_proxy_credentials(
+                ProviderType::Xai,
+                resolved[0].api_key.is_some(),
+                resolved[0].has_oauth
+            ),
+            cli_proxy_available
+        );
     }
 
     #[tokio::test]

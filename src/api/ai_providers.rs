@@ -532,10 +532,10 @@ mod oauth_deadletter_tests {
 mod grok_oauth_tests {
     use super::{
         build_response_from_store, get_xai_api_key_for_grok, grok_auth_expires_at_millis,
-        grok_cli_reconcile_due, oauth_refresh_clear_dead, oauth_refresh_mark_token_dead,
-        oauth_refresh_token_fingerprint, parse_grok_device_auth_line,
-        remove_legacy_grok_oauth_entry, ProviderStatusResponse, GROK_CLI_RECONCILE_INTERVAL,
-        GROK_OAUTH_CLIENT_KEY,
+        grok_cli_reconcile_due, has_refreshable_cli_proxy_account_in_dirs,
+        oauth_refresh_clear_dead, oauth_refresh_mark_token_dead, oauth_refresh_token_fingerprint,
+        parse_grok_device_auth_line, remove_legacy_grok_oauth_entry, ProviderStatusResponse,
+        GROK_CLI_RECONCILE_INTERVAL, GROK_OAUTH_CLIENT_KEY,
     };
     use crate::ai_providers::{AIProvider, OAuthCredentials, ProviderType};
     use std::time::{Duration as StdDuration, Instant};
@@ -678,6 +678,47 @@ mod grok_oauth_tests {
         .expect("write providers");
 
         assert_eq!(get_xai_api_key_for_grok(temp.path()), None);
+    }
+
+    #[test]
+    fn cli_proxy_xai_account_requires_both_oauth_tokens() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_dir = temp.path().join("auth");
+        std::fs::create_dir_all(&auth_dir).expect("auth dir");
+
+        std::fs::write(
+            auth_dir.join("xai-thomas.json"),
+            serde_json::json!({
+                "type": "xai",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expired": "2020-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .expect("write xai auth");
+
+        assert!(has_refreshable_cli_proxy_account_in_dirs(
+            std::slice::from_ref(&auth_dir),
+            "xai-",
+            "xai"
+        ));
+
+        std::fs::write(
+            auth_dir.join("xai-thomas.json"),
+            serde_json::json!({
+                "type": "xai",
+                "access_token": "access"
+            })
+            .to_string(),
+        )
+        .expect("rewrite xai auth");
+
+        assert!(!has_refreshable_cli_proxy_account_in_dirs(
+            std::slice::from_ref(&auth_dir),
+            "xai-",
+            "xai"
+        ));
     }
 
     #[test]
@@ -1163,6 +1204,28 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
         });
     }
 
+    // xAI subscription OAuth is likewise owned by CLI Proxy API. The OAuth
+    // access token is valid for Grok Build's Responses transport, not for the
+    // public API-key chat endpoint Sandboxed.sh would otherwise call. Expose a
+    // synthetic account only when CLIProxyAPI has a refreshable xAI credential
+    // on disk; the proxy then owns token refresh and protocol translation.
+    let xai_disabled = get_provider_config_entry(&opencode_config, ProviderType::Xai)
+        .and_then(|e| e.enabled)
+        == Some(false);
+    if !seen_types.contains(&ProviderType::Xai)
+        && !xai_disabled
+        && xai_cli_proxy_account_available()
+    {
+        accounts.push(crate::provider_health::StandardAccount {
+            account_id: crate::provider_health::stable_provider_uuid("xai-cli-proxy"),
+            provider_type: ProviderType::Xai,
+            api_key: None,
+            has_oauth: true,
+            base_url: None,
+            oauth_expires_at: Some(i64::MAX),
+        });
+    }
+
     accounts
 }
 
@@ -1204,7 +1267,7 @@ fn has_fresh_cli_proxy_account_of_type(file_prefix: &str, type_tag: &str) -> boo
 
     let now = chrono::Utc::now();
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -1277,6 +1340,80 @@ pub(crate) fn openai_cli_proxy_account_available() -> bool {
     }
 
     has_fresh_cli_proxy_codex_account()
+}
+
+/// True when CLI Proxy API has an xAI OAuth credential it can use or refresh.
+///
+/// Unlike direct xAI routing, this never forwards the OAuth access token as an
+/// API key. Sandboxed.sh authenticates only to the loopback proxy; CLIProxyAPI
+/// owns the xAI credential and refreshes it with the official Grok CLI client.
+pub(crate) fn xai_cli_proxy_account_available() -> bool {
+    if env_var_bool("CLAUDE_CODE_DISABLE_CLI_PROXY", false) {
+        return false;
+    }
+
+    has_refreshable_cli_proxy_account_of_type("xai-", "xai")
+}
+
+fn has_refreshable_cli_proxy_account_of_type(file_prefix: &str, type_tag: &str) -> bool {
+    let mut dirs = Vec::new();
+    if let Ok(dir) = std::env::var("CLI_PROXY_AUTH_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            dirs.push(std::path::PathBuf::from(trimmed));
+        }
+    }
+    dirs.push(std::path::PathBuf::from("/root/.cli-proxy-api"));
+
+    has_refreshable_cli_proxy_account_in_dirs(&dirs, file_prefix, type_tag)
+}
+
+fn has_refreshable_cli_proxy_account_in_dirs(
+    dirs: &[std::path::PathBuf],
+    file_prefix: &str,
+    type_tag: &str,
+) -> bool {
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with(file_prefix) && name.ends_with(".json")) {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                continue;
+            };
+            if value
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || value.get("type").and_then(|v| v.as_str()) != Some(type_tag)
+            {
+                continue;
+            }
+            let has_access = value
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_refresh = value
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if has_access && has_refresh {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Create AI provider routes.
