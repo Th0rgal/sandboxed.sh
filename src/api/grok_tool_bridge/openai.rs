@@ -90,10 +90,16 @@ pub fn content_text(content: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// True when a request carries at least one `role: "tool"` message — i.e. it is
-/// a continuation that must resume an existing Grok session, not open a new one.
+/// True when the request ends with the tool-result block for its most recent
+/// assistant `tool_calls` turn.
+///
+/// Historical tool messages do not make a later user turn a continuation: once
+/// an assistant has completed that earlier round, a new user message must open
+/// a fresh Grok session with the full transcript.
 pub fn is_continuation(req: &BridgeChatRequest) -> bool {
-    req.messages.iter().any(|m| m.role == "tool")
+    req.messages
+        .last()
+        .is_some_and(|message| message.role == "tool")
 }
 
 /// The text prompt for a fresh turn: a truthful, **role-labeled transcript of
@@ -277,6 +283,29 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].tool_call_id, "call_1");
         assert_eq!(results[0].content, "sunny");
+    }
+
+    #[test]
+    fn completed_historical_tool_round_is_a_fresh_turn() {
+        let fresh = req(serde_json::json!({
+            "model": "grok-cli/grok-4.5",
+            "messages": [
+                { "role": "user", "content": "weather?" },
+                { "role": "assistant", "tool_calls": [
+                    { "id": "call_1", "type": "function",
+                      "function": { "name": "get_weather", "arguments": "{}" } }
+                ]},
+                { "role": "tool", "tool_call_id": "call_1", "content": "sunny" },
+                { "role": "assistant", "content": "It is sunny." },
+                { "role": "user", "content": "What about tomorrow?" }
+            ]
+        }));
+
+        assert!(!is_continuation(&fresh));
+        assert_eq!(
+            initial_prompt(&fresh).unwrap(),
+            "User: weather?\n\nAssistant: It is sunny.\n\nUser: What about tomorrow?"
+        );
     }
 
     #[test]

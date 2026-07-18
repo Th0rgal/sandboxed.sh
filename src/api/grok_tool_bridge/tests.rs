@@ -420,10 +420,16 @@ async fn expired_session_is_reaped_and_shut_down() {
     assert_eq!(resp1["choices"][0]["finish_reason"], "tool_calls");
     assert_eq!(reg.len(), 1);
 
-    // After the TTL elapses, reaping deterministically tears the abandoned
-    // session down (awaited shutdown) rather than leaking it.
+    // After the TTL elapses, even a request rejected before backend dispatch
+    // must reap and tear down the abandoned session.
     tokio::time::sleep(Duration::from_millis(10)).await;
-    super::reap_expired(&reg).await;
+    let rejected = req(serde_json::json!({
+        "model": "grok-cli/grok-4.5",
+        "messages": [{ "role": "user", "content": "unsupported request" }],
+        "stream": true
+    }));
+    let err = process_request(&backend, &reg, rejected).await.unwrap_err();
+    assert!(err.message.contains("streaming is not supported"));
     assert_eq!(reg.len(), 0, "expired session reaped");
     assert_eq!(
         transcript.lock().unwrap().shutdowns,

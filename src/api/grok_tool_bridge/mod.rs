@@ -116,6 +116,11 @@ pub(crate) async fn process_request(
     registry: &SessionRegistry,
     req: BridgeChatRequest,
 ) -> Result<serde_json::Value, BridgeError> {
+    // Deterministically reap sessions idle past the TTL before validating this
+    // request. Even a malformed/unsupported request is useful traffic for
+    // reclaiming abandoned Grok children and ephemeral MCP servers.
+    reap_expired(registry).await;
+
     // Streaming is explicitly rejected — never silently downgraded to a
     // non-streaming body a streaming client would mis-parse.
     if req.stream.unwrap_or(false) {
@@ -123,11 +128,6 @@ pub(crate) async fn process_request(
             "streaming is not supported by the grok-cli bridge; retry with stream=false",
         ));
     }
-
-    // Deterministically reap sessions idle past the TTL, awaiting their
-    // teardown, before doing anything else — an abandoned tool-call session must
-    // never leak its Grok child / ephemeral MCP server.
-    reap_expired(registry).await;
 
     if openai::is_continuation(&req) {
         continue_turn(registry, req).await

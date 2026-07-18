@@ -90,6 +90,38 @@ struct McpState {
     tool_tx: mpsc::UnboundedSender<InboundToolCall>,
 }
 
+/// Owns the ephemeral MCP server during startup. Any early return cancels and
+/// aborts it; once the conversation is fully constructed, ownership is
+/// transferred into [`AcpConversation`].
+struct StartupTaskGuard {
+    cancel: CancellationToken,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl StartupTaskGuard {
+    fn new(cancel: CancellationToken, handle: JoinHandle<()>) -> Self {
+        Self {
+            cancel,
+            handle: Some(handle),
+        }
+    }
+
+    fn into_handle(mut self) -> JoinHandle<()> {
+        self.handle
+            .take()
+            .expect("startup task guard must own a handle")
+    }
+}
+
+impl Drop for StartupTaskGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.cancel.cancel();
+            handle.abort();
+        }
+    }
+}
+
 fn jsonrpc_result(id: Option<serde_json::Value>, result: serde_json::Value) -> Response {
     Json(serde_json::json!({
         "jsonrpc": "2.0",
@@ -136,6 +168,13 @@ async fn mcp_handler(
                 .to_string();
             if name.is_empty() {
                 return jsonrpc_error(id, -32602, "tools/call missing tool name");
+            }
+            if !state
+                .tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+            {
+                return jsonrpc_error(id, -32602, "tools/call references an unadvertised tool");
             }
             let arguments = req
                 .pointer("/params/arguments")
@@ -606,6 +645,7 @@ impl BridgeBackend for AcpMcpBackend {
                 .with_graceful_shutdown(async move { mcp_cancel.cancelled().await })
                 .await;
         });
+        let mcp_guard = StartupTaskGuard::new(cancel.clone(), mcp_handle);
         let mcp_url = format!("http://{addr}/");
 
         // 2. Spawn `grok agent stdio` on the host with non-interactive auth.
@@ -728,7 +768,6 @@ impl BridgeBackend for AcpMcpBackend {
                 cancel.cancel();
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                mcp_handle.abort();
                 if let Some(handle) = stderr_handle {
                     handle.abort();
                 }
@@ -754,7 +793,7 @@ impl BridgeBackend for AcpMcpBackend {
             child,
             cancel,
             driver_handle: Some(driver_handle),
-            mcp_handle: Some(mcp_handle),
+            mcp_handle: Some(mcp_guard.into_handle()),
             stderr_handle,
             tool_rx,
             done_rx,
@@ -768,6 +807,22 @@ impl BridgeBackend for AcpMcpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_guard_aborts_server_task_on_early_return() {
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            task_cancel.cancelled().await;
+        });
+        let abort_handle = handle.abort_handle();
+
+        drop(StartupTaskGuard::new(cancel.clone(), handle));
+
+        assert!(cancel.is_cancelled());
+        tokio::task::yield_now().await;
+        assert!(abort_handle.is_finished());
+    }
 
     #[test]
     fn deny_permission_selects_reject_option_when_offered() {

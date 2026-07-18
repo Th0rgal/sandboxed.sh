@@ -49,18 +49,36 @@ pub fn connected_account_available(working_dir: &Path) -> bool {
 
 /// Resolve the `grok` CLI binary: an explicit override path, or a `grok`
 /// executable somewhere on `PATH`. Returns `None` when nothing is found.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn resolve_grok_cli() -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var("SANDBOXED_SH_GROK_CLI_PATH") {
         let explicit = explicit.trim();
         if !explicit.is_empty() {
             let path = PathBuf::from(explicit);
-            return path.is_file().then_some(path);
+            return is_executable_file(&path).then_some(path);
         }
     }
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var)
         .map(|dir| dir.join("grok"))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable_file(candidate))
 }
 
 /// Whether the `grok` CLI is resolvable on this host. A real, bounded health
@@ -122,6 +140,26 @@ pub fn probe(working_dir: &Path) -> Capability {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_probe_requires_an_executable_file() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grok");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"#!/bin/sh\n")
+            .unwrap();
+
+        assert!(!is_executable_file(&path));
+        let mut permissions = path.metadata().unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        assert!(is_executable_file(&path));
+    }
 
     #[test]
     fn model_ids_are_distinct_from_api_key_route() {
