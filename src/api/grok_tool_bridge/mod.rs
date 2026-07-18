@@ -142,7 +142,7 @@ async fn fresh_turn(
     req: BridgeChatRequest,
 ) -> Result<serde_json::Value, BridgeError> {
     let prompt = openai::initial_prompt(&req)?;
-    let tools = req.tools.clone().unwrap_or_default();
+    let tools = openai::effective_tools(&req)?;
     let tools_mcp = openai::tools_to_mcp(&tools)?;
     let input = PromptInput {
         prompt,

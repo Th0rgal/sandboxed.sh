@@ -209,6 +209,25 @@ async fn streaming_is_rejected_not_downgraded() {
 }
 
 #[tokio::test]
+async fn tool_choice_none_never_exposes_caller_tools() {
+    let backend = FakeBackend::new(vec![ScriptedTurn::Complete("no tools".into())]);
+    let transcript = backend.transcript();
+    let reg = registry();
+    let request = req(serde_json::json!({
+        "model": "grok-cli/grok-4.5",
+        "messages": [{ "role": "user", "content": "answer without tools" }],
+        "tools": [{ "type": "function", "function": { "name": "must_not_be_visible" } }],
+        "tool_choice": "none"
+    }));
+
+    process_request(&backend, &reg, request).await.unwrap();
+    assert!(
+        transcript.lock().unwrap().opened_with_tools.is_empty(),
+        "tool_choice=none must not expose tools to Grok"
+    );
+}
+
+#[tokio::test]
 async fn orphan_tool_result_without_assistant_echo_is_rejected() {
     let backend = FakeBackend::new(vec![ScriptedTurn::Complete("x".into())]);
     let reg = registry();
@@ -436,6 +455,36 @@ async fn expired_session_is_reaped_and_shut_down() {
         1,
         "reaped session was shut down, not leaked"
     );
+}
+
+#[tokio::test]
+async fn parked_session_expires_without_followup_traffic() {
+    let backend = FakeBackend::new(vec![
+        ScriptedTurn::ToolCalls(vec![("t".into(), serde_json::json!({}))]),
+        ScriptedTurn::Complete("done".into()),
+    ]);
+    let transcript = backend.transcript();
+    let reg = SessionRegistry::new(Duration::from_millis(10));
+
+    let first = req(serde_json::json!({
+        "model": "grok-cli/grok-4.5",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "tools": [{ "type": "function", "function": { "name": "t" } }]
+    }));
+    let response = process_request(&backend, &reg, first).await.unwrap();
+    assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(reg.len(), 1);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if reg.len() == 0 && transcript.lock().unwrap().shutdowns == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("parked session should expire without another request");
 }
 
 #[test]

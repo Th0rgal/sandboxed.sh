@@ -10,7 +10,7 @@
 //! closed instead of double-driving one Grok child.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::error::BridgeError;
@@ -28,18 +28,19 @@ struct Slot {
     last_active: Instant,
 }
 
+#[derive(Clone)]
 pub struct SessionRegistry {
-    slots: Mutex<HashMap<String, Slot>>,
+    slots: Arc<Mutex<HashMap<String, Slot>>>,
     /// openai_call_id → conversation_id.
-    index: Mutex<HashMap<String, String>>,
+    index: Arc<Mutex<HashMap<String, String>>>,
     ttl: Duration,
 }
 
 impl SessionRegistry {
     pub fn new(ttl: Duration) -> Self {
         Self {
-            slots: Mutex::new(HashMap::new()),
-            index: Mutex::new(HashMap::new()),
+            slots: Arc::new(Mutex::new(HashMap::new())),
+            index: Arc::new(Mutex::new(HashMap::new())),
             ttl,
         }
     }
@@ -47,9 +48,8 @@ impl SessionRegistry {
     /// Park a conversation and index it by its pending call ids. Returns the
     /// conversation id (opaque; not exposed to callers).
     ///
-    /// Expired-session reaping is done by the caller (`reap_expired`) in an
-    /// async context so evicted sessions can be shut down and awaited; `park`
-    /// itself never silently drops a live conversation.
+    /// Starts an independent expiry task so an abandoned session is reclaimed
+    /// even if no later bridge request arrives.
     pub fn park(&self, parked: ParkedSession) -> String {
         let conversation_id = uuid::Uuid::new_v4().to_string();
         {
@@ -65,7 +65,33 @@ impl SessionRegistry {
                 last_active: Instant::now(),
             },
         );
+        let registry = self.clone();
+        let expiry_id = conversation_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(registry.ttl).await;
+            if let Some(mut expired) = registry.take_expired(&expiry_id) {
+                expired.conversation.shutdown().await;
+            }
+        });
         conversation_id
+    }
+
+    /// Remove one session only if its TTL has elapsed. Used by the per-session
+    /// expiry task; returns ownership so shutdown happens asynchronously and
+    /// outside registry locks.
+    fn take_expired(&self, conversation_id: &str) -> Option<ParkedSession> {
+        let expired = self
+            .slots
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .is_some_and(|slot| slot.last_active.elapsed() >= self.ttl);
+        if !expired {
+            return None;
+        }
+        let slot = self.slots.lock().unwrap().remove(conversation_id)?;
+        self.drop_index_for(&slot.parked.pending);
+        Some(slot.parked)
     }
 
     /// Remove and return the session addressed by any one of `call_ids`,
@@ -145,9 +171,8 @@ impl SessionRegistry {
                 .collect()
         };
         for id in expired_ids {
-            if let Some(slot) = self.slots.lock().unwrap().remove(&id) {
-                self.drop_index_for(&slot.parked.pending);
-                evicted.push(slot.parked);
+            if let Some(parked) = self.take_expired(&id) {
+                evicted.push(parked);
             }
         }
         evicted
@@ -259,6 +284,10 @@ mod tests {
             .take_for_call_ids(&["call_1".to_string()])
             .err()
             .unwrap();
-        assert!(err.message.contains("expired"));
+        assert!(
+            err.message.contains("expired") || err.message.contains("no active Grok session"),
+            "unexpected session-state error: {}",
+            err.message
+        );
     }
 }

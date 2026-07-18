@@ -17,6 +17,8 @@ pub struct BridgeChatRequest {
     #[serde(default)]
     pub tools: Option<Vec<ToolDef>>,
     #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
     pub stream: Option<bool>,
 }
 
@@ -236,6 +238,41 @@ pub fn tools_to_mcp(tools: &[ToolDef]) -> Result<Vec<serde_json::Value>, BridgeE
     Ok(out)
 }
 
+/// Apply the OpenAI `tool_choice` contract to the tools exposed to Grok.
+///
+/// The connected CLI supports optional caller tools but does not expose a
+/// trustworthy force-tool control. We can therefore implement `auto` and
+/// `none` exactly, while `required` and a named forced function must fail
+/// closed instead of silently weakening the caller's constraint.
+pub fn effective_tools(req: &BridgeChatRequest) -> Result<Vec<ToolDef>, BridgeError> {
+    let tools = req.tools.clone().unwrap_or_default();
+    match req.tool_choice.as_ref() {
+        None => Ok(tools),
+        Some(serde_json::Value::String(mode)) if mode == "auto" => Ok(tools),
+        Some(serde_json::Value::String(mode)) if mode == "none" => Ok(Vec::new()),
+        Some(serde_json::Value::String(mode)) if mode == "required" => {
+            Err(BridgeError::invalid_request(
+                "tool_choice='required' is not supported by the grok-cli bridge",
+            ))
+        }
+        Some(serde_json::Value::Object(choice))
+            if choice.get("type").and_then(|v| v.as_str()) == Some("function") =>
+        {
+            let name = choice
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("<missing>");
+            Err(BridgeError::invalid_request(format!(
+                "forced tool_choice for function '{name}' is not supported by the grok-cli bridge"
+            )))
+        }
+        Some(_) => Err(BridgeError::invalid_request(
+            "invalid tool_choice for the grok-cli bridge",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,5 +439,47 @@ mod tests {
         ]))
         .unwrap();
         assert!(tools_to_mcp(&dupes).is_err());
+    }
+
+    #[test]
+    fn tool_choice_none_hides_tools_and_auto_keeps_them() {
+        let none = req(serde_json::json!({
+            "model": "grok-cli/grok-4.5",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "tools": [{ "type": "function", "function": { "name": "dangerous" } }],
+            "tool_choice": "none"
+        }));
+        assert!(effective_tools(&none).unwrap().is_empty());
+
+        let auto = req(serde_json::json!({
+            "model": "grok-cli/grok-4.5",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "tools": [{ "type": "function", "function": { "name": "safe" } }],
+            "tool_choice": "auto"
+        }));
+        assert_eq!(effective_tools(&auto).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forced_tool_choices_fail_closed() {
+        let required = req(serde_json::json!({
+            "model": "grok-cli/grok-4.5",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "tools": [{ "type": "function", "function": { "name": "lookup" } }],
+            "tool_choice": "required"
+        }));
+        assert!(effective_tools(&required).is_err());
+
+        let named = req(serde_json::json!({
+            "model": "grok-cli/grok-4.5",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "tools": [{ "type": "function", "function": { "name": "lookup" } }],
+            "tool_choice": {
+                "type": "function",
+                "function": { "name": "lookup" }
+            }
+        }));
+        let err = effective_tools(&named).unwrap_err();
+        assert!(err.message.contains("lookup"));
     }
 }
