@@ -336,6 +336,21 @@ async fn list_models(
         direct_models,
         chrono::Utc::now().timestamp(),
     );
+    // Grok connected-account tool bridge: advertised only when its capability
+    // gate passes (feature flag + connected account + operator-verified live
+    // transport). Default-off, so it never appears until explicitly enabled.
+    if let Some(bridge_model) = super::grok_tool_bridge::advertised_model(&state.config.working_dir)
+    {
+        if seen.insert(bridge_model.to_string()) {
+            data.push(ModelObject {
+                id: bridge_model.to_string(),
+                object: "model",
+                created: chrono::Utc::now().timestamp(),
+                owned_by: "sandboxed",
+            });
+        }
+    }
+
     data.sort_by(|a, b| a.id.cmp(&b.id));
     Json(ModelsResponse {
         object: "list",
@@ -396,6 +411,10 @@ fn append_direct_models_to_proxy_models(
             owned_by: "sandboxed",
         });
     }
+}
+
+fn should_use_grok_bridge(requested_model: &str, exact_chain_exists: bool) -> bool {
+    super::grok_tool_bridge::is_bridge_model(requested_model) && !exact_chain_exists
 }
 
 async fn get_deferred_request(
@@ -644,6 +663,28 @@ pub(crate) async fn chat_completions_inner(
         crate::api::proxy_liveness::note_activity(id);
     }
 
+    let exact_chain_exists = state.chain_store.get(&requested_model).await.is_some();
+
+    // 1b. Grok connected-account tool bridge. An existing exact-name routing
+    // chain takes precedence for backwards compatibility: this model id was not
+    // historically reserved, and the model catalog also lists chains first.
+    // Otherwise the ACP↔MCP bridge owns the id and, when not provisioned,
+    // replies with a truthful configuration error.
+    if should_use_grok_bridge(&requested_model, exact_chain_exists) {
+        let handled =
+            super::grok_tool_bridge::handle_chat_completion(&state.config.working_dir, &body).await;
+        if let Some(usage) = handled.usage {
+            record_proxy_usage(
+                &state,
+                &usage.model,
+                usage.input_tokens,
+                usage.output_tokens,
+            )
+            .await;
+        }
+        return handled.response;
+    }
+
     // 2. Resolve the requested model to chain entries:
     //    (a) A known chain id — exact, or "builtin/{model}" (the
     //        @ai-sdk/openai-compatible adapter strips the provider prefix, so
@@ -658,7 +699,7 @@ pub(crate) async fn chat_completions_inner(
     //    Anything else errors — no silent fallback, so typos surface.
     let standard_accounts = super::ai_providers::read_standard_accounts(&state.config.working_dir);
 
-    let resolved_chain_id = if state.chain_store.get(&requested_model).await.is_some() {
+    let resolved_chain_id = if exact_chain_exists {
         Some(requested_model.clone())
     } else {
         let prefixed = format!("builtin/{}", requested_model);
@@ -5126,6 +5167,13 @@ mod tests {
         // Empty halves.
         assert!(parse_direct_model_entry("xai/").is_none());
         assert!(parse_direct_model_entry("/grok-4.5").is_none());
+    }
+
+    #[test]
+    fn exact_chain_takes_precedence_over_grok_bridge_model_id() {
+        assert!(should_use_grok_bridge("grok-cli/grok-4.5", false));
+        assert!(!should_use_grok_bridge("grok-cli/grok-4.5", true));
+        assert!(!should_use_grok_bridge("xai/grok-4.5", false));
     }
 
     #[test]
