@@ -226,6 +226,13 @@ pub(crate) fn has_routable_proxy_credentials(
             has_api_key
                 || (has_oauth && crate::api::ai_providers::openai_cli_proxy_account_available())
         }
+        // Grok Build OAuth is not a public xAI API key. It is routable only
+        // through CLIProxyAPI, which owns the credential and translates the
+        // OpenAI-compatible request to xAI's Responses transport.
+        ProviderType::Xai => {
+            has_api_key
+                || (has_oauth && crate::api::ai_providers::xai_cli_proxy_account_available())
+        }
         ProviderType::Google => has_api_key || has_oauth,
         _ => has_api_key,
     }
@@ -829,6 +836,10 @@ pub(crate) async fn chat_completions_inner(
             && entry.has_oauth
             && entry.api_key.is_none()
             && crate::api::ai_providers::openai_cli_proxy_account_available();
+        let use_xai_oauth_cli_proxy_adapter = provider_type == ProviderType::Xai
+            && entry.has_oauth
+            && entry.api_key.is_none()
+            && crate::api::ai_providers::xai_cli_proxy_account_available();
         let use_google_oauth_adapter = provider_type == ProviderType::Google && entry.has_oauth;
         let (url, upstream_body, extra_headers) = if use_anthropic_oauth_cli_proxy_adapter {
             let upstream_body = match rewrite_model_for_anthropic_cli_proxy(&body, &entry.model_id)
@@ -846,6 +857,20 @@ pub(crate) async fn chat_completions_inner(
                 build_cli_proxy_headers(),
             )
         } else if use_openai_oauth_cli_proxy_adapter {
+            let upstream_body = match rewrite_model(&body, &entry.model_id) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("Failed to rewrite model in request body: {}", e);
+                    server_error_count += 1;
+                    continue;
+                }
+            };
+            (
+                cli_proxy_chat_completions_url(),
+                upstream_body,
+                build_cli_proxy_headers(),
+            )
+        } else if use_xai_oauth_cli_proxy_adapter {
             let upstream_body = match rewrite_model(&body, &entry.model_id) {
                 Ok(b) => b,
                 Err(e) => {
@@ -980,6 +1005,7 @@ pub(crate) async fn chat_completions_inner(
             && !use_anthropic_adapter
             && !use_anthropic_oauth_cli_proxy_adapter
             && !use_openai_oauth_cli_proxy_adapter
+            && !use_xai_oauth_cli_proxy_adapter
         {
             if let Some(api_key) = &entry.api_key {
                 upstream_req = upstream_req.header("Authorization", format!("Bearer {}", api_key));
