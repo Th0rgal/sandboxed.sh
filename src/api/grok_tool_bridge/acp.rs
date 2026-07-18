@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -88,6 +88,8 @@ struct McpState {
     tools: Vec<serde_json::Value>,
     /// Channel to hand suspended calls to the bridge coordination loop.
     tool_tx: mpsc::UnboundedSender<InboundToolCall>,
+    /// Per-session bearer value required by every request to this endpoint.
+    bearer_value: String,
 }
 
 /// Owns the ephemeral MCP server during startup. Any early return cancels and
@@ -140,14 +142,18 @@ fn jsonrpc_error(id: Option<serde_json::Value>, code: i32, message: &str) -> Res
     .into_response()
 }
 
-/// ACP's HTTP MCP-server variant requires a `headers` array even when the
-/// endpoint needs no headers.
-fn http_mcp_server_descriptor(url: &str) -> serde_json::Value {
+/// ACP's HTTP MCP-server variant requires a `headers` array. The bearer secret
+/// prevents unrelated same-host processes from injecting caller tool calls
+/// into the live session.
+fn http_mcp_server_descriptor(url: &str, bearer_value: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "http",
         "name": "grok-cli-bridge-tools",
         "url": url,
-        "headers": [],
+        "headers": [{
+            "name": "Authorization",
+            "value": bearer_value,
+        }],
     })
 }
 
@@ -155,8 +161,17 @@ fn http_mcp_server_descriptor(url: &str) -> serde_json::Value {
 /// until the bridge resumes it.
 async fn mcp_handler(
     State(state): State<Arc<McpState>>,
+    headers: HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> Response {
+    if headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        != Some(state.bearer_value.as_str())
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     match method {
@@ -635,9 +650,11 @@ impl BridgeBackend for AcpMcpBackend {
         // 1. Start the ephemeral MCP server before the ACP handshake — the CLI
         //    connects to it (initialize / tools/list) during `session/new`.
         let (tool_tx, tool_rx) = mpsc::unbounded_channel::<InboundToolCall>();
+        let mcp_bearer_value = format!("Bearer {}", uuid::Uuid::new_v4().simple());
         let mcp_state = Arc::new(McpState {
             tools: input.tools_mcp.clone(),
             tool_tx,
+            bearer_value: mcp_bearer_value.clone(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -724,7 +741,7 @@ impl BridgeBackend for AcpMcpBackend {
                     "method": "session/new",
                     "params": {
                         "cwd": cwd,
-                        "mcpServers": [http_mcp_server_descriptor(&mcp_url)]
+                        "mcpServers": [http_mcp_server_descriptor(&mcp_url, &mcp_bearer_value)]
                     }
                 }),
             )
@@ -816,11 +833,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_mcp_descriptor_includes_required_empty_headers() {
-        let descriptor = http_mcp_server_descriptor("http://127.0.0.1:1234/");
+    fn http_mcp_descriptor_includes_session_authorization() {
+        let descriptor = http_mcp_server_descriptor("http://127.0.0.1:1234/", "Bearer test-secret");
         assert_eq!(descriptor["type"], "http");
         assert_eq!(descriptor["url"], "http://127.0.0.1:1234/");
-        assert_eq!(descriptor["headers"], serde_json::json!([]));
+        assert_eq!(
+            descriptor["headers"],
+            serde_json::json!([{
+                "name": "Authorization",
+                "value": "Bearer test-secret",
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_endpoint_rejects_missing_or_wrong_session_authorization() {
+        let (tool_tx, _tool_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(McpState {
+            tools: Vec::new(),
+            tool_tx,
+            bearer_value: "Bearer expected-secret".to_string(),
+        });
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+        });
+
+        let missing = mcp_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let mut wrong_headers = HeaderMap::new();
+        wrong_headers.insert(
+            header::AUTHORIZATION,
+            "Bearer wrong-secret".parse().unwrap(),
+        );
+        let wrong = mcp_handler(State(state.clone()), wrong_headers, Json(request.clone())).await;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        let mut valid_headers = HeaderMap::new();
+        valid_headers.insert(
+            header::AUTHORIZATION,
+            "Bearer expected-secret".parse().unwrap(),
+        );
+        let valid = mcp_handler(State(state), valid_headers, Json(request)).await;
+        assert_eq!(valid.status(), StatusCode::OK);
     }
 
     #[tokio::test]
