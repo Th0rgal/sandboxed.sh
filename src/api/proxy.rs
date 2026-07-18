@@ -665,8 +665,18 @@ pub(crate) async fn chat_completions_inner(
     // provisioned the bridge itself replies with a truthful configuration
     // error (see grok_tool_bridge::capability).
     if super::grok_tool_bridge::is_bridge_model(&requested_model) {
-        return super::grok_tool_bridge::handle_chat_completion(&state.config.working_dir, &body)
+        let handled =
+            super::grok_tool_bridge::handle_chat_completion(&state.config.working_dir, &body).await;
+        if let Some(usage) = handled.usage {
+            record_proxy_usage(
+                &state,
+                &usage.model,
+                usage.input_tokens,
+                usage.output_tokens,
+            )
             .await;
+        }
+        return handled.response;
     }
 
     // 2. Resolve the requested model to chain entries:

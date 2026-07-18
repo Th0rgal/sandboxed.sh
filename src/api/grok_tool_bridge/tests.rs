@@ -496,3 +496,23 @@ fn bridge_model_routing() {
     assert!(!is_bridge_model("xai/grok-4.5"));
     assert!(!is_bridge_model("claude-opus-4-8"));
 }
+
+#[test]
+fn successful_response_usage_is_available_to_proxy_accounting() {
+    let response = serde_json::json!({
+        "model": "grok-4.5",
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 7,
+            "total_tokens": 19
+        }
+    });
+    let usage = super::recorded_usage(&response).expect("usage should be extracted");
+    assert_eq!(usage.model, "grok-4.5");
+    assert_eq!(usage.input_tokens, 12);
+    assert_eq!(usage.output_tokens, 7);
+    assert!(super::recorded_usage(&serde_json::json!({
+        "model": "grok-4.5"
+    }))
+    .is_none());
+}

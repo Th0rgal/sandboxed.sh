@@ -35,6 +35,20 @@ use openai::BridgeChatRequest;
 use registry::{ParkedSession, SessionRegistry};
 use transport::{BridgeBackend, BridgeConversation, PromptInput, TurnOutcome};
 
+/// Usage metadata extracted from a successful bridge response for the proxy's
+/// shared accounting store.
+pub struct BridgeRecordedUsage {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// The HTTP response plus any real usage the bridge reported.
+pub struct HandledBridgeCompletion {
+    pub response: Response,
+    pub usage: Option<BridgeRecordedUsage>,
+}
+
 /// Idle lifetime of a suspended tool-call session before it is reclaimed.
 const SESSION_TTL: Duration = Duration::from_secs(300);
 
@@ -72,12 +86,15 @@ pub fn advertised_model(working_dir: &std::path::Path) -> Option<&'static str> {
 
 /// Proxy entry point. Parses the body, enforces the capability gate, and drives
 /// the live backend. Converts every outcome to an OpenAI-shaped response.
-pub async fn handle_chat_completion(working_dir: &std::path::Path, body: &[u8]) -> Response {
+pub async fn handle_chat_completion(
+    working_dir: &std::path::Path,
+    body: &[u8],
+) -> HandledBridgeCompletion {
     let req: BridgeChatRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return bridge_error_response(BridgeError::invalid_request(format!(
-                "invalid request body: {e}"
+            return handled_response(bridge_error_response(BridgeError::invalid_request(
+                format!("invalid request body: {e}"),
             )));
         }
     };
@@ -85,17 +102,43 @@ pub async fn handle_chat_completion(working_dir: &std::path::Path, body: &[u8]) 
     let cap = capability::probe(working_dir);
     if !cap.advertise {
         // Fail closed with a truthful configuration error — never a fake turn.
-        return bridge_error_response(BridgeError::provider_configuration(format!(
-            "the grok-cli connected-account bridge is not available: {}",
-            cap.reason
+        return handled_response(bridge_error_response(BridgeError::provider_configuration(
+            format!(
+                "the grok-cli connected-account bridge is not available: {}",
+                cap.reason
+            ),
         )));
     }
 
     let backend = acp::AcpMcpBackend::new(working_dir.to_path_buf());
     match process_request(&backend, registry(), req).await {
-        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(err) => bridge_error_response(err),
+        Ok(value) => HandledBridgeCompletion {
+            usage: recorded_usage(&value),
+            response: (StatusCode::OK, Json(value)).into_response(),
+        },
+        Err(err) => handled_response(bridge_error_response(err)),
     }
+}
+
+fn handled_response(response: Response) -> HandledBridgeCompletion {
+    HandledBridgeCompletion {
+        response,
+        usage: None,
+    }
+}
+
+fn recorded_usage(value: &serde_json::Value) -> Option<BridgeRecordedUsage> {
+    let usage = value.get("usage")?;
+    let input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64())?;
+    let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64())?;
+    if input_tokens == 0 && output_tokens == 0 {
+        return None;
+    }
+    Some(BridgeRecordedUsage {
+        model: value.get("model")?.as_str()?.to_string(),
+        input_tokens,
+        output_tokens,
+    })
 }
 
 fn bridge_error_response(err: BridgeError) -> Response {

@@ -110,15 +110,16 @@ pub fn is_continuation(req: &BridgeChatRequest) -> bool {
 /// Each fresh turn opens a brand-new Grok session with no memory of prior
 /// requests, so we must forward the full history — dropping the assistant turns
 /// (as an earlier version did) would corrupt a normal multi-turn OpenAI chat.
-/// Messages are rendered `System:`/`User:`/`Assistant:` in order; non-text
-/// parts (images) and empty messages are skipped. Fails closed if there is no
-/// user or system content to send at all.
+/// Messages are rendered `System:`/`Developer:`/`User:`/`Assistant:` in order;
+/// non-text parts (images) and empty messages are skipped. Fails closed if
+/// there is no instruction or user content to send at all.
 pub fn initial_prompt(req: &BridgeChatRequest) -> Result<String, BridgeError> {
     let mut lines: Vec<String> = Vec::new();
-    let mut has_user_or_system = false;
+    let mut has_instruction_or_user = false;
     for msg in &req.messages {
         let label = match msg.role.as_str() {
             "system" => "System",
+            "developer" => "Developer",
             "user" => "User",
             "assistant" => "Assistant",
             // Tool/other roles do not appear in a fresh (non-continuation) turn.
@@ -128,14 +129,14 @@ pub fn initial_prompt(req: &BridgeChatRequest) -> Result<String, BridgeError> {
         if text.trim().is_empty() {
             continue;
         }
-        if msg.role == "system" || msg.role == "user" {
-            has_user_or_system = true;
+        if matches!(msg.role.as_str(), "system" | "developer" | "user") {
+            has_instruction_or_user = true;
         }
         lines.push(format!("{label}: {text}"));
     }
-    if !has_user_or_system {
+    if !has_instruction_or_user {
         return Err(BridgeError::invalid_request(
-            "no user or system message content to prompt Grok with",
+            "no user, developer, or system message content to prompt Grok with",
         ));
     }
     Ok(lines.join("\n\n"))
@@ -359,6 +360,21 @@ mod tests {
         assert_eq!(
             initial_prompt(&multi).unwrap(),
             "System: be terse\n\nUser: hi\n\nAssistant: hello\n\nUser: who are you?"
+        );
+    }
+
+    #[test]
+    fn initial_prompt_preserves_developer_instructions() {
+        let request = req(serde_json::json!({
+            "model": "grok-cli/grok-4.5",
+            "messages": [
+                { "role": "developer", "content": "Never reveal secrets." },
+                { "role": "user", "content": "hello" }
+            ]
+        }));
+        assert_eq!(
+            initial_prompt(&request).unwrap(),
+            "Developer: Never reveal secrets.\n\nUser: hello"
         );
     }
 
