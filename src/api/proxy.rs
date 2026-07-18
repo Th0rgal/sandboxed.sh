@@ -336,6 +336,21 @@ async fn list_models(
         direct_models,
         chrono::Utc::now().timestamp(),
     );
+    // Grok connected-account tool bridge: advertised only when its capability
+    // gate passes (feature flag + connected account + operator-verified live
+    // transport). Default-off, so it never appears until explicitly enabled.
+    if let Some(bridge_model) = super::grok_tool_bridge::advertised_model(&state.config.working_dir)
+    {
+        if seen.insert(bridge_model.to_string()) {
+            data.push(ModelObject {
+                id: bridge_model.to_string(),
+                object: "model",
+                created: chrono::Utc::now().timestamp(),
+                owned_by: "sandboxed",
+            });
+        }
+    }
+
     data.sort_by(|a, b| a.id.cmp(&b.id));
     Json(ModelsResponse {
         object: "list",
@@ -642,6 +657,16 @@ pub(crate) async fn chat_completions_inner(
         .and_then(|v| uuid::Uuid::parse_str(v.trim()).ok());
     if let Some(id) = liveness_mission_id {
         crate::api::proxy_liveness::note_activity(id);
+    }
+
+    // 1b. Grok connected-account tool bridge. The "grok-cli/..." model id space
+    // is served by the ACP↔MCP bridge (caller-owned tool execution), not the
+    // chain router. Feature-gated and default-off — when the route is not
+    // provisioned the bridge itself replies with a truthful configuration
+    // error (see grok_tool_bridge::capability).
+    if super::grok_tool_bridge::is_bridge_model(&requested_model) {
+        return super::grok_tool_bridge::handle_chat_completion(&state.config.working_dir, &body)
+            .await;
     }
 
     // 2. Resolve the requested model to chain entries:
