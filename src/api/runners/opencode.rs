@@ -352,12 +352,12 @@ pub async fn run_opencode_turn(
         escaped
     };
 
-    let opencode_model = resolved_model.as_deref().unwrap_or("builtin/fast");
+    let opencode_model = opencode_model_argument(resolved_model.as_deref());
     if opencode_model.starts_with("builtin/") {
         ensure_opencode_provider_for_model(
             &opencode_config_dir_host,
             app_working_dir,
-            opencode_model,
+            opencode_model.as_ref(),
             &workspace_host_ip,
             Some(&mission_id.to_string()),
         );
@@ -367,7 +367,7 @@ pub async fn run_opencode_turn(
     inner_cmd.push_str("#!/bin/sh\n");
     inner_cmd.push_str(&shell_escape(&cli_runner));
     inner_cmd.push_str(" run --format json --model ");
-    inner_cmd.push_str(&shell_escape(opencode_model));
+    inner_cmd.push_str(&shell_escape(opencode_model.as_ref()));
     if let Some(a) = agent {
         inner_cmd.push_str(" --agent ");
         inner_cmd.push_str(&shell_escape(a));
@@ -2083,6 +2083,19 @@ pub async fn run_opencode_turn(
     result
 }
 
+/// OpenCode treats the first path segment as its provider id and sends only
+/// the remainder as the upstream model. Route the exact Grok CLI bridge model
+/// through the existing `builtin` provider so the proxy receives the complete
+/// `grok-cli/grok-4.5` chain id instead of the ambiguous bare `grok-4.5`.
+fn opencode_model_argument(model: Option<&str>) -> Cow<'_, str> {
+    let model = model.unwrap_or("builtin/fast");
+    if crate::api::grok_tool_bridge::is_bridge_model(model) {
+        Cow::Owned(format!("builtin/{model}"))
+    } else {
+        Cow::Borrowed(model)
+    }
+}
+
 fn opencode_path(
     mission_path: Option<&str>,
     work_dir_arg: &str,
@@ -2104,7 +2117,24 @@ fn opencode_path(
 
 #[cfg(test)]
 mod path_tests {
-    use super::opencode_path;
+    use super::{opencode_model_argument, opencode_path};
+
+    #[test]
+    fn grok_cli_model_keeps_its_full_proxy_chain_id() {
+        assert_eq!(
+            opencode_model_argument(Some("grok-cli/grok-4.5")),
+            "builtin/grok-cli/grok-4.5"
+        );
+        assert_eq!(
+            opencode_model_argument(Some("builtin/smart")),
+            "builtin/smart"
+        );
+        assert_eq!(
+            opencode_model_argument(Some("xai/grok-4.5")),
+            "xai/grok-4.5"
+        );
+        assert_eq!(opencode_model_argument(None), "builtin/fast");
+    }
 
     #[test]
     fn opencode_path_preserves_mission_path_prepends() {
