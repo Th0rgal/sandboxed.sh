@@ -413,6 +413,10 @@ fn append_direct_models_to_proxy_models(
     }
 }
 
+fn should_use_grok_bridge(requested_model: &str, exact_chain_exists: bool) -> bool {
+    super::grok_tool_bridge::is_bridge_model(requested_model) && !exact_chain_exists
+}
+
 async fn get_deferred_request(
     State(state): State<Arc<super::routes::AppState>>,
     headers: HeaderMap,
@@ -659,12 +663,14 @@ pub(crate) async fn chat_completions_inner(
         crate::api::proxy_liveness::note_activity(id);
     }
 
-    // 1b. Grok connected-account tool bridge. The "grok-cli/..." model id space
-    // is served by the ACP↔MCP bridge (caller-owned tool execution), not the
-    // chain router. Feature-gated and default-off — when the route is not
-    // provisioned the bridge itself replies with a truthful configuration
-    // error (see grok_tool_bridge::capability).
-    if super::grok_tool_bridge::is_bridge_model(&requested_model) {
+    let exact_chain_exists = state.chain_store.get(&requested_model).await.is_some();
+
+    // 1b. Grok connected-account tool bridge. An existing exact-name routing
+    // chain takes precedence for backwards compatibility: this model id was not
+    // historically reserved, and the model catalog also lists chains first.
+    // Otherwise the ACP↔MCP bridge owns the id and, when not provisioned,
+    // replies with a truthful configuration error.
+    if should_use_grok_bridge(&requested_model, exact_chain_exists) {
         let handled =
             super::grok_tool_bridge::handle_chat_completion(&state.config.working_dir, &body).await;
         if let Some(usage) = handled.usage {
@@ -693,7 +699,7 @@ pub(crate) async fn chat_completions_inner(
     //    Anything else errors — no silent fallback, so typos surface.
     let standard_accounts = super::ai_providers::read_standard_accounts(&state.config.working_dir);
 
-    let resolved_chain_id = if state.chain_store.get(&requested_model).await.is_some() {
+    let resolved_chain_id = if exact_chain_exists {
         Some(requested_model.clone())
     } else {
         let prefixed = format!("builtin/{}", requested_model);
@@ -5161,6 +5167,13 @@ mod tests {
         // Empty halves.
         assert!(parse_direct_model_entry("xai/").is_none());
         assert!(parse_direct_model_entry("/grok-4.5").is_none());
+    }
+
+    #[test]
+    fn exact_chain_takes_precedence_over_grok_bridge_model_id() {
+        assert!(should_use_grok_bridge("grok-cli/grok-4.5", false));
+        assert!(!should_use_grok_bridge("grok-cli/grok-4.5", true));
+        assert!(!should_use_grok_bridge("xai/grok-4.5", false));
     }
 
     #[test]
