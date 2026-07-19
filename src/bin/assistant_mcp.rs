@@ -902,6 +902,15 @@ impl AssistantMcp {
                 }),
             },
             ToolDefinition {
+                name: "acknowledge_mission".to_string(),
+                description: "Acknowledge a mission only after independently verifying its terminal result. This is the safe host-authenticated replacement for asking a workspace container to use the service JWT. It accepts only awaiting_user missions whose awaiting_kind is ack; decision waits and live missions are refused.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id"],
+                    "properties": {"mission_id": {"type": "string"}}
+                }),
+            },
+            ToolDefinition {
                 name: "get_compute_fleet".to_string(),
                 description: "Get a compact live view of sandboxed.sh compute capacity: remote node health, labels, Lean readiness/toolchains, available slots, active/queued jobs, and recent placement receipts. Use this before dispatching parallel compute or choosing a remote validation node. Ordinary CPU/Lean work should prefer non-GPU nodes while they have immediate capacity; request the gpu label only for GPU work.".to_string(),
                 input_schema: json!({"type": "object", "properties": {}}),
@@ -1437,6 +1446,49 @@ impl AssistantMcp {
             return Err(format!("Failed to cancel mission: {text}"));
         }
         Ok(json!({ "success": true, "cancelled": id.to_string() }))
+    }
+
+    async fn acknowledge_mission(&self, params: MissionIdParams) -> Result<Value, String> {
+        let id = parse_uuid(&params.mission_id)?;
+        let response = self
+            .api_get(&format!("/api/control/missions/{id}/digest"))
+            .await?;
+        let digest = Self::response_value(response, "Read mission before ACK").await?;
+        if !mission_requires_acknowledgement(&digest)? {
+            return Ok(json!({
+                "success": true,
+                "acknowledged": id.to_string(),
+                "already_acknowledged": true,
+            }));
+        }
+
+        let response = self
+            .api_post(
+                &format!("/api/control/missions/{id}/status"),
+                json!({"status": "acknowledged"}),
+            )
+            .await?;
+        Self::response_value(response, "Acknowledge mission").await?;
+
+        // The status mutation response is only an operation envelope. Re-read
+        // the mission so controllers never mistake a successful HTTP response
+        // for a confirmed state transition.
+        let response = self
+            .api_get(&format!("/api/control/missions/{id}/digest"))
+            .await?;
+        let digest = Self::response_value(response, "Verify mission ACK").await?;
+        let mission = digest.get("mission").unwrap_or(&digest);
+        if mission.get("status").and_then(Value::as_str) != Some("acknowledged") {
+            return Err(
+                "Mission ACK mutation succeeded but readback is not acknowledged".to_string(),
+            );
+        }
+
+        Ok(json!({
+            "success": true,
+            "acknowledged": id.to_string(),
+            "already_acknowledged": false,
+        }))
     }
 
     async fn get_compute_fleet(&self) -> Result<Value, String> {
@@ -1986,6 +2038,11 @@ impl AssistantMcp {
                 let params: MissionIdParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
                 self.cancel_mission(params).await
+            }
+            "acknowledge_mission" => {
+                let params: MissionIdParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.acknowledge_mission(params).await
             }
             "get_compute_fleet" => self.get_compute_fleet().await,
             "list_workspaces" => self.list_workspaces().await,
@@ -2598,6 +2655,30 @@ async fn main() {
     }
 }
 
+/// Return true when a mission is an ACK-only wait that may transition to
+/// `acknowledged`, false when it is already acknowledged, and reject every
+/// live or decision-bearing state.
+fn mission_requires_acknowledgement(digest: &Value) -> Result<bool, String> {
+    let mission = digest.get("mission").unwrap_or(digest);
+    let status = mission
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Mission digest did not include a status".to_string())?;
+    if status == "acknowledged" {
+        return Ok(false);
+    }
+
+    let awaiting_kind = mission.get("awaiting_kind").and_then(Value::as_str);
+    if status == "awaiting_user" && awaiting_kind == Some("ack") {
+        return Ok(true);
+    }
+
+    Err(format!(
+        "Mission cannot be ACKed from status={status}, awaiting_kind={}",
+        awaiting_kind.unwrap_or("none")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3038,6 +3119,38 @@ mod tests {
         let backwards = mission_events_path(id, 40, "all", Some(99), Some(17));
         assert!(backwards.ends_with("&before_seq=99"));
         assert!(!backwards.contains("since_seq"));
+    }
+
+    #[test]
+    fn mission_acknowledgement_accepts_only_ack_waits_and_is_idempotent() {
+        assert_eq!(
+            mission_requires_acknowledgement(&json!({
+                "status": "awaiting_user",
+                "awaiting_kind": "ack"
+            }))
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            mission_requires_acknowledgement(&json!({
+                "mission": {
+                    "status": "acknowledged",
+                    "awaiting_kind": null
+                }
+            }))
+            .unwrap(),
+            false
+        );
+        assert!(mission_requires_acknowledgement(&json!({
+            "status": "awaiting_user",
+            "awaiting_kind": "decision"
+        }))
+        .is_err());
+        assert!(mission_requires_acknowledgement(&json!({
+            "status": "active",
+            "awaiting_kind": null
+        }))
+        .is_err());
     }
 
     #[test]
