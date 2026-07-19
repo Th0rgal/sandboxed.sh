@@ -466,10 +466,24 @@ fn parse_grok_device_auth_line(line: &str) -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod oauth_deadletter_tests {
     use super::{
-        oauth_refresh_clear_dead, oauth_refresh_mark_token_dead, oauth_refresh_token_is_dead,
-        should_adopt_anthropic_tier, OAuthTokenEntry,
+        newer_matching_openai_tier_credentials, oauth_refresh_clear_dead,
+        oauth_refresh_mark_token_dead, oauth_refresh_token_is_dead, should_adopt_anthropic_tier,
+        OAuthTokenEntry,
     };
     use crate::ai_providers::OAuthCredentials;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    fn openai_access_token(account_id: &str) -> String {
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id
+            }
+        });
+        format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        )
+    }
 
     #[test]
     fn deadletter_blocks_same_token_until_rotated_or_cleared() {
@@ -525,6 +539,38 @@ mod oauth_deadletter_tests {
             expires_at: now - 1,
         };
         assert!(!should_adopt_anthropic_tier(&store, &expired, true));
+    }
+
+    #[test]
+    fn openai_tier_adoption_requires_same_account_and_newer_live_token() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let store = OAuthCredentials {
+            access_token: openai_access_token("acct-a"),
+            refresh_token: "refresh-old".into(),
+            expires_at: now - 1,
+        };
+        let matching = OAuthTokenEntry {
+            access_token: openai_access_token("acct-a"),
+            refresh_token: "refresh-new".into(),
+            expires_at: now + 20 * 60_000,
+        };
+
+        let adopted = newer_matching_openai_tier_credentials(&store, &matching).unwrap();
+        assert_eq!(adopted.access_token, matching.access_token);
+        assert_eq!(adopted.refresh_token, matching.refresh_token);
+        assert_eq!(adopted.expires_at, matching.expires_at);
+
+        let other_account = OAuthTokenEntry {
+            access_token: openai_access_token("acct-b"),
+            ..matching.clone()
+        };
+        assert!(newer_matching_openai_tier_credentials(&store, &other_account).is_none());
+
+        let older = OAuthTokenEntry {
+            expires_at: store.expires_at,
+            ..matching
+        };
+        assert!(newer_matching_openai_tier_credentials(&store, &older).is_none());
     }
 }
 
@@ -6700,7 +6746,7 @@ async fn get_provider_usage(
     let (
         provider_type,
         api_key_opt,
-        oauth,
+        mut oauth,
         account_email,
         provider_name,
         provider_uuid,
@@ -6815,6 +6861,35 @@ async fn get_provider_usage(
             format!("Invalid provider ID: {}", id),
         ));
     };
+
+    // Codex can refresh its shared OAuth credential tier independently from
+    // ai_providers.json. Reconcile the selected OpenAI provider before probing
+    // usage so an expired store copy cannot hide a live Codex account behind a
+    // false `needs_reauth` status.
+    if provider_type == ProviderType::OpenAI {
+        if let (Some(uuid), Some(store_oauth), Some(tier)) = (
+            provider_uuid,
+            oauth.as_ref(),
+            read_oauth_token_entry(ProviderType::OpenAI),
+        ) {
+            if let Some(reconciled) = newer_matching_openai_tier_credentials(store_oauth, &tier) {
+                if state
+                    .ai_providers
+                    .set_oauth_credentials(uuid, reconciled.clone())
+                    .await
+                    .is_some()
+                {
+                    tracing::info!(
+                        provider_id = %uuid,
+                        old_expires_at = store_oauth.expires_at,
+                        new_expires_at = reconciled.expires_at,
+                        "Adopted live shared-tier OpenAI OAuth token into provider store"
+                    );
+                    oauth = Some(reconciled);
+                }
+            }
+        }
+    }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -10297,6 +10372,36 @@ fn should_adopt_anthropic_tier(
         && tier.refresh_token != store.refresh_token
         && !oauth_token_expired(tier.expires_at)
         && (tier.expires_at > store.expires_at || store_token_rejected)
+}
+
+/// Return a newer shared-tier OpenAI credential only when both JWTs belong to
+/// the same ChatGPT account.
+///
+/// The shared Codex tier represents one selected account while the provider
+/// store may contain several logins. Account identity must therefore match
+/// before adopting a token; expiry alone is not sufficient.
+fn newer_matching_openai_tier_credentials(
+    store: &crate::ai_providers::OAuthCredentials,
+    tier: &OAuthTokenEntry,
+) -> Option<crate::ai_providers::OAuthCredentials> {
+    if tier.refresh_token.trim().is_empty()
+        || oauth_token_expired(tier.expires_at)
+        || tier.expires_at <= store.expires_at
+    {
+        return None;
+    }
+
+    let store_account_id = extract_chatgpt_account_id(&store.access_token)?;
+    let tier_account_id = extract_chatgpt_account_id(&tier.access_token)?;
+    if store_account_id != tier_account_id {
+        return None;
+    }
+
+    Some(crate::ai_providers::OAuthCredentials {
+        access_token: tier.access_token.clone(),
+        refresh_token: tier.refresh_token.clone(),
+        expires_at: tier.expires_at,
+    })
 }
 
 /// Adopt the live shared-tier Anthropic token into the store when ownership is
