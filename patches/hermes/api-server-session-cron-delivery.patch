@@ -1,0 +1,121 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index c595707..9e25672 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1523,6 +1523 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+-    try:
+-        config = load_gateway_config()
+-    except Exception as e:
+-        msg = f"failed to load gateway config: {e}"
+-        logger.error("Job '%s': %s", job["id"], msg)
+-        return msg
++    config = None
+@@ -1536,0 +1532,45 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
++        # API-server sessions (WebUI/Desktop) do not have a live messaging
++        # adapter once the originating HTTP turn has ended.  Their durable
++        # delivery surface is the persisted session transcript itself.  The
++        # API adapter binds chat_id to the concrete session_id, so an
++        # origin-scoped cron can safely append its result to that exact
++        # conversation without falling back to a configured home platform
++        # such as Telegram.
++        if str(platform_name).lower() == "api_server":
++            db = None
++            try:
++                from hermes_state import SessionDB
++
++                db = SessionDB()
++                session = db.get_session(str(chat_id))
++                if not session or str(session.get("source") or "") != "api_server":
++                    raise ValueError(
++                        f"API session '{chat_id}' does not exist or is not an api_server session"
++                    )
++                db.append_message(
++                    session_id=str(chat_id),
++                    role="assistant",
++                    content=content,
++                )
++                logger.info(
++                    "Job '%s': appended durable delivery to API session %s",
++                    job.get("id", "?"),
++                    chat_id,
++                )
++            except Exception as e:
++                msg = f"API session delivery failed for '{chat_id}': {e}"
++                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
++                delivery_errors.append(msg)
++            finally:
++                if db is not None:
++                    db.close()
++            continue
++
++        if config is None:
++            try:
++                config = load_gateway_config()
++            except Exception as e:
++                msg = f"failed to load gateway config: {e}"
++                logger.error("Job '%s': %s", job["id"], msg)
++                return msg
++
+diff --git a/tests/cron/test_scheduler.py b/tests/cron/test_scheduler.py
+index f5317bf..2554de3 100644
+--- a/tests/cron/test_scheduler.py
++++ b/tests/cron/test_scheduler.py
+@@ -4041,0 +4042,58 @@ class TestDeliverResultLiveAdapterUnconfirmed:
++class TestDeliverApiServerOrigin:
++    def test_appends_result_to_origin_session(self, tmp_path, monkeypatch):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setenv("HOME", str(tmp_path))
++
++        from hermes_state import SessionDB
++
++        db = SessionDB()
++        db.create_session("api-session-1", "api_server")
++        db.append_message("api-session-1", role="user", content="Watch the build")
++        db.append_message(
++            "api-session-1",
++            role="assistant",
++            content="I will report back when it finishes.",
++        )
++        db.close()
++
++        job = {
++            "id": "desktop-watch",
++            "name": "Desktop build watcher",
++            "deliver": "origin",
++            "origin": {
++                "platform": "api_server",
++                "chat_id": "api-session-1",
++            },
++        }
++
++        assert _deliver_result(job, "The build finished successfully.") is None
++
++        db = SessionDB()
++        messages = db.get_messages("api-session-1")
++        db.close()
++        assert messages[-1]["role"] == "assistant"
++        assert messages[-1]["content"] == "The build finished successfully."
++
++    def test_rejects_non_api_session_target(self, tmp_path, monkeypatch):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setenv("HOME", str(tmp_path))
++
++        from hermes_state import SessionDB
++
++        db = SessionDB()
++        db.create_session("telegram-session", "telegram")
++        db.close()
++
++        job = {
++            "id": "bad-target",
++            "deliver": "origin",
++            "origin": {
++                "platform": "api_server",
++                "chat_id": "telegram-session",
++            },
++        }
++        result = _deliver_result(job, "Must not cross session types.")
++        assert result is not None
++        assert "not an api_server session" in result
++
++
