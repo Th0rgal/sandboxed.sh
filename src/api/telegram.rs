@@ -3666,6 +3666,7 @@ async fn resolve_or_create_mission(
             parent_mission_id: None,
             working_directory: None,
             scheduling: Default::default(),
+            requires_local_disk: true,
             respond: tx,
         })
         .await;
