@@ -391,6 +391,16 @@ impl Workspace {
         {
             m.insert("REMOTE_BUILD_TIMEOUT_SECS".to_string(), timeout.to_string());
         }
+        if let Some(estimated_disk_gb) = remote_config
+            .and_then(|config| config.get("estimated_disk_gb"))
+            .and_then(|value| value.as_u64())
+            .filter(|value| *value > 0)
+        {
+            m.insert(
+                "REMOTE_BUILD_ESTIMATED_DISK_GB".to_string(),
+                estimated_disk_gb.to_string(),
+            );
+        }
         let wrapper = remote_build_wrapper_path(self, mission_id);
         m.insert(
             "REMOTE_BUILD_COMMAND".to_string(),

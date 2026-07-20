@@ -158,6 +158,8 @@ struct StartMissionParams {
     desired_state: Option<String>,
     #[serde(default)]
     next_check_at: Option<String>,
+    #[serde(default)]
+    estimated_disk_gib: Option<u64>,
 }
 
 fn native_backend_from_agent(agent: Option<&str>) -> Option<String> {
@@ -862,7 +864,8 @@ impl AssistantMcp {
                         "writer": {"type": "boolean", "description": "Whether this mission may modify the associated PR branch. Concurrent writers for one PR are rejected."},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "desired_state": {"type": "string", "description": "Track state, e.g. waiting_ci / waiting_review / blocked_external."},
-                        "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."}
+                        "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."},
+                        "estimated_disk_gib": {"type": "integer", "minimum": 1, "maximum": 512, "description": "Expected peak local scratch use. Set this for Lean/build-heavy missions; omit for small/no-build work."}
                     }
                 }),
             },
@@ -1333,6 +1336,7 @@ impl AssistantMcp {
             "tags": params.tags,
             "desired_state": params.desired_state,
             "next_check_at": params.next_check_at,
+            "estimated_disk_gib": params.estimated_disk_gib,
         });
         let response = self.api_post("/api/control/missions", body).await?;
         if !response.status().is_success() {
@@ -3123,24 +3127,18 @@ mod tests {
 
     #[test]
     fn mission_acknowledgement_accepts_only_ack_waits_and_is_idempotent() {
-        assert_eq!(
-            mission_requires_acknowledgement(&json!({
-                "status": "awaiting_user",
-                "awaiting_kind": "ack"
-            }))
-            .unwrap(),
-            true
-        );
-        assert_eq!(
-            mission_requires_acknowledgement(&json!({
-                "mission": {
-                    "status": "acknowledged",
-                    "awaiting_kind": null
-                }
-            }))
-            .unwrap(),
-            false
-        );
+        assert!(mission_requires_acknowledgement(&json!({
+            "status": "awaiting_user",
+            "awaiting_kind": "ack"
+        }))
+        .unwrap());
+        assert!(!mission_requires_acknowledgement(&json!({
+            "mission": {
+                "status": "acknowledged",
+                "awaiting_kind": null
+            }
+        }))
+        .unwrap());
         assert!(mission_requires_acknowledgement(&json!({
             "status": "awaiting_user",
             "awaiting_kind": "decision"

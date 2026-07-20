@@ -359,7 +359,7 @@ async fn submit_job(
             "lease is scoped to a different job".to_string(),
         ));
     }
-    validate_job_payload(&request.payload)
+    validate_job_payload(&request.payload, &state.work_root)
         .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
     if state
         .jobs
@@ -393,11 +393,15 @@ async fn submit_job(
     ))
 }
 
-fn validate_job_payload(payload: &sandboxed_sh::remote_node::JobPayload) -> Result<(), String> {
+fn validate_job_payload(
+    payload: &sandboxed_sh::remote_node::JobPayload,
+    work_root: &Path,
+) -> Result<(), String> {
     if let sandboxed_sh::remote_node::JobPayload::LeanBuild {
         source,
         cwd_rel,
         command,
+        estimated_disk_bytes,
         env,
         ..
     } = payload
@@ -408,6 +412,10 @@ fn validate_job_payload(payload: &sandboxed_sh::remote_node::JobPayload) -> Resu
             command,
             env,
             &sandboxed_sh::node::lean::env_allowlist_from_env(),
+        )?;
+        sandboxed_sh::node::lean::validate_disk_admission(
+            work_root,
+            estimated_disk_bytes.unwrap_or_default(),
         )?;
     }
     Ok(())
@@ -758,10 +766,12 @@ mod tests {
                     source: sandboxed_sh::remote_node::JobSource {
                         repo: "/node/local/repo".to_string(),
                         commit: "a".repeat(40),
+                        bundle: None,
                     },
                     cwd_rel: None,
                     command: vec!["lake".to_string(), "build".to_string()],
                     timeout_secs: None,
+                    estimated_disk_bytes: None,
                     cache_key: None,
                     artifacts: vec![],
                     env: Default::default(),

@@ -4262,6 +4262,21 @@ fn disk_admission_refusal() -> Option<String> {
     }
 }
 
+fn disk_estimate_refusal(
+    available_bytes: u64,
+    estimated_gib: u64,
+    reserve_gib: u64,
+) -> Option<String> {
+    let required_gib = estimated_gib.saturating_add(reserve_gib);
+    (available_bytes < required_gib.saturating_mul(1 << 30)).then(|| {
+        format!(
+            "mission needs an estimated {estimated_gib} GiB scratch plus a {reserve_gib} GiB \
+             emergency floor, but only {} GiB is free; select a remote node or free space",
+            available_bytes / (1 << 30)
+        )
+    })
+}
+
 pub async fn fleet_health(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -5108,6 +5123,11 @@ pub struct CreateMissionRequest {
     /// background poll loop finalizes it when the job completes. Default
     /// false keeps the synchronous blocking `/execute` path unchanged.
     pub remote_async: Option<bool>,
+    /// Expected peak local scratch consumption in GiB. Small/no-build missions
+    /// may omit it; disk-heavy missions should set it so warn-level operation
+    /// can continue without admitting work that would cross the emergency
+    /// reserve.
+    pub estimated_disk_gib: Option<u64>,
     /// Catch-all for unrecognized request fields. Serde ignores unknown fields
     /// by default, which has repeatedly hidden client bugs (a `prompt` sent
     /// before the field existed, a mistyped `target_mission_id`). Captured
@@ -5905,6 +5925,7 @@ pub async fn create_mission(
         remote_requirements: None,
         remote_command: None,
         remote_async: None,
+        estimated_disk_gib: None,
         extra: Default::default(),
     });
 
@@ -6085,7 +6106,39 @@ pub async fn create_mission(
     // Writer creation is checked once before actor creation and again while
     // tagging the returned mission. Never hold this mutex while waiting on the
     // control actor: actor commands also acquire it when resuming writers.
-    let normalized_request_tags = normalize_mission_tags(req.tags.as_deref());
+    if let Some(estimated_gib) = req.estimated_disk_gib {
+        if estimated_gib == 0 || estimated_gib > 512 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "estimated_disk_gib must be between 1 and 512".to_string(),
+            ));
+        }
+        if req
+            .remote_node_id
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            let (used, total, _) = crate::api::monitoring::current_disk_usage();
+            let reserve_gib = std::env::var("MISSION_DISK_EMERGENCY_RESERVE_GB")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .unwrap_or(64);
+            if let Some(reason) =
+                disk_estimate_refusal(total.saturating_sub(used), estimated_gib, reserve_gib)
+            {
+                return Err((StatusCode::INSUFFICIENT_STORAGE, reason));
+            }
+        }
+    }
+    let mut normalized_request_tags = normalize_mission_tags(req.tags.as_deref());
+    if let Some(estimated_gib) = req.estimated_disk_gib {
+        let tag = format!("disk-estimate-gib:{estimated_gib}");
+        let tags = normalized_request_tags.get_or_insert_with(Vec::new);
+        if !tags.iter().any(|existing| existing == &tag) {
+            tags.push(tag);
+        }
+    }
     let request_is_writer = requested_pr_writer(
         req.writer,
         normalized_request_tags.as_deref(),
@@ -6643,6 +6696,7 @@ async fn dispatch_remote_job(
             job_id,
             started_at: submit_started_at,
             accepted_at: None,
+            disk_reservation_bytes: 0,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
         },
     )
@@ -6687,6 +6741,7 @@ async fn dispatch_remote_job(
             job_id,
             started_at: submit_started_at,
             accepted_at: Some(chrono::Utc::now()),
+            disk_reservation_bytes: 0,
             kind: crate::remote_node::job_ledger::JobHandleKind::Mission,
         },
     )
@@ -9007,6 +9062,7 @@ pub async fn clone_mission(
         remote_requirements: None,
         remote_command: None,
         remote_async: None,
+        estimated_disk_gib: None,
         extra: Default::default(),
     };
 
@@ -19908,6 +19964,15 @@ mod tests {
         let guard = METADATA_REFRESH_TEST_LOCK.lock().await;
         reset_metadata_refresh_test_state();
         guard
+    }
+
+    #[test]
+    fn disk_estimate_preserves_emergency_free_space() {
+        assert!(disk_estimate_refusal(100 << 30, 20, 64).is_none());
+        let refusal = disk_estimate_refusal(80 << 30, 20, 64).unwrap();
+        assert!(refusal.contains("20 GiB scratch"));
+        assert!(refusal.contains("64 GiB"));
+        assert!(refusal.contains("80 GiB is free"));
     }
 
     fn reset_metadata_refresh_test_state() {

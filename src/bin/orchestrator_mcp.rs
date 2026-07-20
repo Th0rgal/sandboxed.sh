@@ -116,6 +116,10 @@ struct CreateWorkerParams {
     config_profile: Option<String>,
     #[serde(default)]
     working_directory: Option<String>,
+    /// Expected peak local scratch use. Heavy build missions should set this;
+    /// small/no-build missions may omit it.
+    #[serde(default)]
+    estimated_disk_gib: Option<u64>,
     /// Workspace to spawn the worker in. If omitted, the worker inherits the
     /// boss mission's workspace so it sees the same container, mounts, and
     /// installed tooling. Pass `"00000000-0000-0000-0000-000000000000"` to
@@ -731,6 +735,12 @@ impl OrchestratorMcp {
                             "type": "string",
                             "description": "Working directory for the worker (e.g. a git worktree path). If omitted, uses the boss mission's repo directory."
                         },
+                        "estimated_disk_gib": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 512,
+                            "description": "Expected peak local scratch use for disk-aware admission."
+                        },
                         "workspace_id": {
                             "type": "string",
                             "description": "Workspace UUID to spawn the worker in. Defaults to the boss's workspace so the worker inherits the same container, mounts, and installed tooling. Pass the nil UUID to force the host workspace."
@@ -763,6 +773,7 @@ impl OrchestratorMcp {
                                     "agent": { "type": "string" },
                                     "config_profile": { "type": "string" },
                                     "working_directory": { "type": "string" },
+                                    "estimated_disk_gib": { "type": "integer", "minimum": 1, "maximum": 512 },
                                     "workspace_id": { "type": "string" },
                                     "prompt": { "type": "string" }
                                 }
@@ -1147,6 +1158,7 @@ impl OrchestratorMcp {
             "config_profile": params.config_profile,
             "parent_mission_id": self.mission_id.to_string(),
             "working_directory": params.working_directory,
+            "estimated_disk_gib": params.estimated_disk_gib,
             "workspace_id": workspace_id,
             // Atomic create+start: the API stores the prompt as the mission's
             // deferred goal and the scheduler dispatches it once capacity

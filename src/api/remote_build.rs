@@ -30,8 +30,8 @@ use uuid::Uuid;
 use super::routes::AppState;
 use crate::remote_node::{
     ArtifactEntry, DispatchOutcome, JobPayload, JobSource, LeaseClaims, NodeJobStatus,
-    RemoteNodeClient, RemoteNodeConfig, RemoteNodeError, RemoteNodeStatus, SubmitJobRequest,
-    SCOPE_JOB_SUBMIT,
+    RemoteNodeClient, RemoteNodeConfig, RemoteNodeError, RemoteNodeStatus, SourceBundle,
+    SubmitJobRequest, SCOPE_JOB_SUBMIT,
 };
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -43,6 +43,32 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// Client-side cap on a waited build: poll every 3s for at most 2 hours.
 const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const WAIT_MAX_POLLS: u32 = 2 * 60 * 60 / 3;
+const GIB: u64 = 1 << 30;
+const DEFAULT_ESTIMATED_DISK_GB: u64 = 12;
+const MAX_ESTIMATED_DISK_GB: u64 = 512;
+const DEFAULT_NODE_MIN_DISK_GB: u64 = 20;
+const DEFAULT_NODE_DISK_EMERGENCY_GB: u64 = 10;
+
+fn env_gib(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+        .saturating_mul(GIB)
+}
+
+fn default_estimated_disk_bytes() -> u64 {
+    env_gib("REMOTE_BUILD_ESTIMATED_DISK_GB", DEFAULT_ESTIMATED_DISK_GB)
+}
+
+fn required_node_disk_bytes(estimated_disk_bytes: u64) -> u64 {
+    env_gib("REMOTE_NODE_MIN_DISK_GB", DEFAULT_NODE_MIN_DISK_GB).max(
+        estimated_disk_bytes.saturating_add(env_gib(
+            "REMOTE_NODE_DISK_EMERGENCY_GB",
+            DEFAULT_NODE_DISK_EMERGENCY_GB,
+        )),
+    )
+}
 
 /// Secret used to sign the per-mission remote-build capability token. Same
 /// source as the spark-offload token (`src/api/spark.rs`).
@@ -250,6 +276,10 @@ pub struct RemoteBuildRequest {
     pub repo: String,
     /// Full 40-char lowercase hex commit SHA.
     pub commit: String,
+    /// Optional, bounded source overlay whose hashes are verified by the node
+    /// before it is applied over the pinned commit.
+    #[serde(default)]
+    pub source_bundle: Option<SourceBundle>,
     /// Build cwd relative to the checkout root.
     #[serde(default)]
     pub cwd_rel: Option<String>,
@@ -257,6 +287,10 @@ pub struct RemoteBuildRequest {
     pub command: Vec<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Expected peak scratch use. Defaults to 12 GiB and is reserved during
+    /// placement so simultaneous cold builds cannot overcommit one node.
+    #[serde(default = "default_estimated_disk_bytes")]
+    pub estimated_disk_bytes: u64,
     /// Node label requirements for auto placement.
     #[serde(default = "default_requirements")]
     pub requirements: Vec<String>,
@@ -302,11 +336,22 @@ fn placement_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
+#[derive(Default)]
+struct CoreReservations {
+    jobs: HashMap<String, u32>,
+    disk_bytes: HashMap<String, u64>,
+}
+
+async fn core_side_reservations(state: &AppState) -> Result<CoreReservations, String> {
     match crate::remote_node::job_ledger::load(&state.config.working_dir).await {
         Ok(handles) => {
-            let mut reservations = HashMap::new();
+            let mut reservations = CoreReservations::default();
             for handle in handles {
+                let disk = reservations
+                    .disk_bytes
+                    .entry(handle.node_id.clone())
+                    .or_insert(0);
+                *disk = disk.saturating_add(handle.disk_reservation_bytes);
                 let cached = state.fleet.get(&handle.node_id);
                 let heartbeat_started_at = cached
                     .as_ref()
@@ -315,24 +360,26 @@ async fn core_side_reservations(state: &AppState) -> HashMap<String, u32> {
                     .as_ref()
                     .and_then(|status| status.last_heartbeat.as_ref())
                     .is_some_and(|heartbeat| {
-                        heartbeat.protocol_version
-                            >= crate::remote_node::protocol::NODE_PROTOCOL_VERSION
+                        heartbeat_protocol_has_job_counters(heartbeat.protocol_version)
                     });
                 if handle_needs_reservation(
                     &handle,
                     heartbeat_started_at,
                     heartbeat_has_job_counters,
                 ) {
-                    *reservations.entry(handle.node_id).or_insert(0) += 1;
+                    *reservations.jobs.entry(handle.node_id).or_insert(0) += 1;
                 }
             }
-            reservations
+            Ok(reservations)
         }
-        Err(error) => {
-            tracing::warn!(?error, "remote job reservations could not be loaded");
-            HashMap::new()
-        }
+        Err(error) => Err(format!(
+            "remote job reservations could not be loaded; disk-aware placement fails closed: {error}"
+        )),
     }
+}
+
+fn heartbeat_protocol_has_job_counters(protocol_version: u32) -> bool {
+    protocol_version >= crate::remote_node::protocol::NODE_JOB_COUNTER_PROTOCOL_VERSION
 }
 
 fn heartbeat_cannot_reflect(
@@ -362,6 +409,8 @@ async fn resolve_node(
     state: &AppState,
     node_id: &str,
     requirements: &[String],
+    min_disk_bytes: u64,
+    min_protocol_version: u32,
 ) -> Result<RemoteNodeConfig, (StatusCode, String)> {
     let settings = &state.config.remote_nodes;
     if !settings.enabled || settings.nodes.is_empty() {
@@ -371,10 +420,19 @@ async fn resolve_node(
         ));
     }
     if node_id.eq_ignore_ascii_case("auto") {
-        let reservations = core_side_reservations(state).await;
+        let reservations = core_side_reservations(state)
+            .await
+            .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
         let first = state
             .fleet
-            .place_auto_with_reservations(settings, requirements, &reservations);
+            .place_auto_with_protocol_and_resource_reservations(
+                settings,
+                requirements,
+                min_disk_bytes,
+                min_protocol_version,
+                &reservations.jobs,
+                &reservations.disk_bytes,
+            );
         let picked = match first {
             Ok(picked) => picked,
             Err(initial_err) => {
@@ -403,10 +461,19 @@ async fn resolve_node(
                         .map(|node| crate::remote_node::probe_node(&state.fleet, &client, node)),
                 )
                 .await;
-                let reservations = core_side_reservations(state).await;
+                let reservations = core_side_reservations(state)
+                    .await
+                    .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
                 state
                     .fleet
-                    .place_auto_with_reservations(settings, requirements, &reservations)
+                    .place_auto_with_protocol_and_resource_reservations(
+                        settings,
+                        requirements,
+                        min_disk_bytes,
+                        min_protocol_version,
+                        &reservations.jobs,
+                        &reservations.disk_bytes,
+                    )
                     .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?
             }
         };
@@ -419,6 +486,40 @@ async fn resolve_node(
         StatusCode::BAD_REQUEST,
         format!("remote node '{node_id}' is not configured"),
     ))?;
+    let reservations = core_side_reservations(state)
+        .await
+        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
+    let cached = state.fleet.get(&node.id).ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("remote node '{}' has no heartbeat data", node.id),
+    ))?;
+    let heartbeat = cached.last_heartbeat.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("remote node '{}' has no heartbeat data", node.id),
+    ))?;
+    if heartbeat.protocol_version < min_protocol_version {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "remote node '{}' reports protocol v{}; v{} is required",
+                node.id, heartbeat.protocol_version, min_protocol_version
+            ),
+        ));
+    }
+    let reserved = reservations.disk_bytes.get(&node.id).copied().unwrap_or(0);
+    let effective = heartbeat.disk_available_bytes.saturating_sub(reserved);
+    if effective < min_disk_bytes {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "remote node '{}' has {} GiB effective free after {} GiB reserved; {} GiB required",
+                node.id,
+                effective / GIB,
+                reserved / GIB,
+                min_disk_bytes / GIB
+            ),
+        ));
+    }
     Ok(node)
 }
 
@@ -591,6 +692,24 @@ async fn submit_remote_build(
     if req.command.is_empty() {
         return (StatusCode::BAD_REQUEST, "command argv required").into_response();
     }
+    let max_estimated_disk_bytes =
+        env_gib("REMOTE_BUILD_MAX_ESTIMATED_DISK_GB", MAX_ESTIMATED_DISK_GB);
+    if req.estimated_disk_bytes == 0 || req.estimated_disk_bytes > max_estimated_disk_bytes {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "estimated_disk_bytes must be between 1 and {} GiB",
+                max_estimated_disk_bytes / GIB
+            ),
+        )
+            .into_response();
+    }
+    let min_disk_bytes = required_node_disk_bytes(req.estimated_disk_bytes);
+    let min_protocol_version = if req.source_bundle.is_some() {
+        crate::remote_node::protocol::NODE_PROTOCOL_VERSION
+    } else {
+        1
+    };
     // Every endpoint payload is a declarative Lean build. Callers may add
     // placement labels, but may not remove the runtime readiness gate by
     // sending an empty or unrelated requirements list.
@@ -604,7 +723,15 @@ async fn submit_remote_build(
     // Serialize placement through tentative-handle persistence. Otherwise a
     // burst can select the same idle node before its next heartbeat.
     let placement_guard = placement_lock().lock().await;
-    let node = match resolve_node(&state, &req.node_id, &requirements).await {
+    let node = match resolve_node(
+        &state,
+        &req.node_id,
+        &requirements,
+        min_disk_bytes,
+        min_protocol_version,
+    )
+    .await
+    {
         Ok(node) => node,
         Err((status, message)) => return (status, message).into_response(),
     };
@@ -633,10 +760,12 @@ async fn submit_remote_build(
             source: JobSource {
                 repo: req.repo.clone(),
                 commit: req.commit.clone(),
+                bundle: req.source_bundle.clone(),
             },
             cwd_rel: req.cwd_rel.clone(),
             command: req.command.clone(),
             timeout_secs: req.timeout_secs,
+            estimated_disk_bytes: Some(req.estimated_disk_bytes),
             cache_key: None,
             artifacts: req.artifacts.clone(),
             env: Default::default(),
@@ -653,6 +782,7 @@ async fn submit_remote_build(
             job_id,
             started_at,
             accepted_at: None,
+            disk_reservation_bytes: req.estimated_disk_bytes,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
         },
     )
@@ -726,6 +856,7 @@ async fn submit_remote_build(
             job_id,
             started_at,
             accepted_at: Some(chrono::Utc::now()),
+            disk_reservation_bytes: req.estimated_disk_bytes,
             kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
         },
     )
@@ -927,6 +1058,13 @@ mod tests {
     }
 
     #[test]
+    fn v2_heartbeats_still_cover_job_count_reservations() {
+        assert!(!heartbeat_protocol_has_job_counters(1));
+        assert!(heartbeat_protocol_has_job_counters(2));
+        assert!(heartbeat_protocol_has_job_counters(3));
+    }
+
+    #[test]
     fn tentative_handle_stays_reserved_across_overlapping_probe() {
         let now = chrono::Utc::now();
         let mut handle = crate::remote_node::job_ledger::JobHandle {
@@ -935,6 +1073,7 @@ mod tests {
             job_id: Uuid::new_v4(),
             started_at: now,
             accepted_at: None,
+            disk_reservation_bytes: 12 * GIB,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
         };
 
@@ -1123,6 +1262,8 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         assert_eq!(req.requirements, vec!["lean".to_string()]);
         assert_eq!(req.cwd_rel, None);
         assert_eq!(req.timeout_secs, None);
+        assert_eq!(req.estimated_disk_bytes, 12 * GIB);
+        assert!(req.source_bundle.is_none());
         assert!(req.artifacts.is_empty());
 
         let req: RemoteBuildRequest = serde_json::from_value(serde_json::json!({
@@ -1263,6 +1404,130 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             run_remote_build_wrapper_with_submit_result(0, 7).code(),
             Some(75),
             "a pre-connect failure is safe for local fallback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_sends_dirty_sources_as_a_hashed_bounded_bundle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let bin = temp.path().join("bin");
+        let capture = temp.path().join("request.json");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(repo.join("Theory")).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "Remote Build Test"]);
+        git(&["config", "user.email", "remote-build@example.invalid"]);
+        std::fs::write(repo.join("Theory/Proof.lean"), "old\n").unwrap();
+        git(&["add", "Theory/Proof.lean"]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "baseline",
+        ]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ]);
+        std::fs::write(repo.join("Theory/Proof.lean"), "new proof\n").unwrap();
+        std::fs::write(repo.join("Theory/Witness.lean"), "new witness\n").unwrap();
+
+        let fake_curl = bin.join("curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+output=""
+data=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) shift; output="$1" ;;
+        --data-binary) shift; data="$1" ;;
+    esac
+    shift
+done
+cp "${data#@}" "$REMOTE_BUILD_TEST_CAPTURE"
+printf 'unavailable' > "$output"
+printf '503'
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_curl).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_curl, permissions).unwrap();
+
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = std::process::Command::new("bash")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/remote-lean-build"
+            ))
+            .current_dir(repo.join("Theory"))
+            .env("PATH", path)
+            .env(
+                "REMOTE_BUILD_URL",
+                "http://example.invalid/api/remote-build",
+            )
+            .env("REMOTE_BUILD_TOKEN", "test-token")
+            .env("REMOTE_BUILD_MISSION_ID", Uuid::new_v4().to_string())
+            .env("REMOTE_BUILD_TEST_CAPTURE", &capture)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(75));
+
+        let request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+        assert_eq!(
+            request
+                .get("estimated_disk_bytes")
+                .and_then(serde_json::Value::as_u64),
+            Some(12 * GIB)
+        );
+        let bundle = request.get("source_bundle").unwrap();
+        let files = bundle.get("files").unwrap().as_array().unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.get("path").unwrap().as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Theory/Proof.lean", "Theory/Witness.lean"]
+        );
+        let manifest = files
+            .iter()
+            .map(|file| {
+                (
+                    file.get("path").unwrap().as_str().unwrap().to_string(),
+                    file.get("sha256").unwrap().as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bundle.get("manifest_sha256").unwrap().as_str().unwrap(),
+            crate::node::lean::bundle_manifest_sha256(&manifest)
         );
     }
 
@@ -1435,8 +1700,6 @@ esac
             Some("11111111-1111-1111-1111-111111111111")
         );
 
-        std::fs::write(repo.join("DIRTY-WORKTREE"), "changed after submit\n")
-            .expect("dirty checkout after accepted build");
         let resumed = run("success");
         assert!(
             resumed.status.success(),
@@ -1457,8 +1720,6 @@ esac
         assert!(String::from_utf8_lossy(&replayed.stderr).contains("replaying terminal job"));
         assert_eq!(String::from_utf8_lossy(&replayed.stdout), "remote ok\n");
 
-        std::fs::remove_file(repo.join("DIRTY-WORKTREE"))
-            .expect("restore clean checkout before new submission");
         for receipt in std::fs::read_dir(&state).expect("read receipts before persistence failure")
         {
             std::fs::remove_file(receipt.expect("read receipt entry").path())

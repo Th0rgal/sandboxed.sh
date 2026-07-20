@@ -9,7 +9,7 @@ It never receives a dashboard JWT or broad API token.
 
 Supported now:
 
-- core lists configured nodes and reports cached fleet status (heartbeat v2:
+- core lists configured nodes and reports cached fleet status (heartbeat v3:
   capacity, labels, CPU/memory/disk figures, job counts)
 - a background fleet monitor polls every node's `/heartbeat` on an interval
   (`REMOTE_NODE_MONITOR_SECS`, default 15s, `0` disables) and derives per-node
@@ -125,12 +125,14 @@ To rotate a node token with zero downtime:
    and restart/redeploy core.
 3. Remove `SANDBOXED_NODE_TOKEN_PREVIOUS` on the node and restart it.
 
-### Heartbeat v2
+### Heartbeat v3
 
 `GET /heartbeat` returns the v1 fields (`node_id`, `online`, `capacity_total`,
 `capacity_available`, `active_leases`, `version`) plus:
 
-- `protocol_version` (currently `2`; core treats a missing field as `1`)
+- `protocol_version` (currently `3`; core treats a missing field as `1`).
+  Version 3 is required for source-bundle jobs so a rolling deployment can
+  never silently drop a dirty overlay on an older node.
 - `labels` (from `SANDBOXED_NODE_LABELS`)
 - `cpu_total` (logical cores)
 - `mem_total_bytes` / `mem_available_bytes`
@@ -145,8 +147,9 @@ To rotate a node token with zero downtime:
 `capacity_available` is a snapshot of the shared semaphore, so it already
 accounts for work admitted through either `/execute` or `/jobs`.
 
-All new fields are serde-default-tolerant in both directions, so mixed-version
-core/node fleets keep working during upgrades.
+New fields are serde-default-tolerant in both directions. Features whose
+semantics an older node would silently ignore are additionally gated by the
+reported protocol version.
 
 Minimal systemd unit:
 
@@ -218,9 +221,13 @@ Node env vars for lean-build jobs:
   payload may set (default `LEAN_NUM_THREADS,LAKE_JOBS`); anything else is
   rejected before the build starts.
 - `SANDBOXED_NODE_MIN_FREE_GB` — free-space floor (default 10 GiB) for the
-  node's cache GC: every 30 minutes, when the work-dir filesystem drops below
-  it, checkout dirs then lake cache slots are LRU-deleted (by dir mtime)
-  until the threshold is met.
+  node's admission and cache GC. A build is rejected unless its declared
+  scratch estimate fits above this floor. Every 30 minutes, when the work-dir
+  filesystem drops below it, checkout dirs then lake cache slots are
+  LRU-deleted (by dir mtime) until the threshold is met.
+- `SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES` — maximum decoded size of a local
+  source overlay (default 1 MiB; at most 256 regular files). Paths, per-file
+  hashes and the manifest hash are verified before any file is applied.
 - `SANDBOXED_NODE_GIT_SSH_KEY` — path to an SSH key used for git fetches
   (`GIT_SSH_COMMAND="ssh -i <key> -o IdentitiesOnly=yes -o
   StrictHostKeyChecking=accept-new"`); unset = default git auth.
@@ -346,7 +353,9 @@ A node is eligible when all of the following hold:
 - cached status is `online`
 - its labels (heartbeat, falling back to static config) cover every
   requirement
-- `disk_available` ≥ `REMOTE_NODE_MIN_DISK_GB` (default 20)
+- effective disk after non-terminal reservations is at least the greater of
+  `REMOTE_NODE_MIN_DISK_GB` (default 20) and the request's scratch estimate
+  plus `REMOTE_NODE_DISK_EMERGENCY_GB` (default 10)
 - `mem_available` ≥ `REMOTE_NODE_MIN_MEM_GB` (default 8)
 - `active_jobs + queued_jobs + active_leases + core reservations < 2 * capacity_total`
 
@@ -359,9 +368,7 @@ still selected before queueing behind a saturated CPU node, and an explicit
 available memory and stable node id as tie-breakers. When no node qualifies the
 request **fails closed** with every
 configured node listed alongside its exclusion reason (offline / missing
-label X / low disk / low memory / busy), e.g.
-`no eligible remote node (babylon: low disk (12 GiB available, 20 GiB
-required); nippur: missing label 'lean')`.
+label X / low disk after reservations / low memory / busy).
 
 Hermes receives the same live capacity through the assistant MCP
 `get_compute_fleet` tool. Controllers should call it before parallel dispatch,
