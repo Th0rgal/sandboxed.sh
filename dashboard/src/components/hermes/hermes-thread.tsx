@@ -192,9 +192,14 @@ export function HermesThread({ className }: { className?: string }) {
   const newSession = useCallback(() => {
     genRef.current += 1;
     abortRef.current?.abort();
+    abortRef.current = null;
+    streamAssistantIdRef.current = null;
+    streamThinkingIdRef.current = null;
     setSessionId(null);
     setItems([]);
     setError(null);
+    setLoading(false);
+    setHistoryLoading(false);
     setShowSessions(false);
   }, []);
 
@@ -460,12 +465,36 @@ export function HermesThread({ className }: { className?: string }) {
         )}
         {!historyLoading && items.length === 0 && (
           <div className="mt-16 text-center">
-            <p className="text-sm text-white/60">Talk to Hermes</p>
+            <p className="text-sm text-white/60">What should Hermes handle?</p>
             <p className="mx-auto mt-1 max-w-sm text-xs text-white/35">
               Your assistant can start missions, check on running ones and
               answer questions about your fleet. Mission IDs it mentions become
               clickable.
             </p>
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              <button
+                type="button"
+                onClick={() =>
+                  setInput(
+                    "Review the missions that need my attention and recommend the next action for each.",
+                  )
+                }
+                className="rounded-lg border border-white/[0.07] bg-white/[0.03] px-3 py-1.5 text-xs text-white/55 transition-colors hover:bg-white/[0.06] hover:text-white/80"
+              >
+                Review attention
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setInput(
+                    "Summarize the active missions, their latest progress, and anything currently blocked.",
+                  )
+                }
+                className="rounded-lg border border-white/[0.07] bg-white/[0.03] px-3 py-1.5 text-xs text-white/55 transition-colors hover:bg-white/[0.06] hover:text-white/80"
+              >
+                Summarize active work
+              </button>
+            </div>
           </div>
         )}
         {items.map((item) => (
@@ -477,7 +506,10 @@ export function HermesThread({ className }: { className?: string }) {
           </div>
         )}
         {error && (
-          <p className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+          <p
+            role="alert"
+            className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-xs text-red-300"
+          >
             {error}
           </p>
         )}
@@ -485,6 +517,17 @@ export function HermesThread({ className }: { className?: string }) {
 
       {/* Composer — same row grammar as the Ask panel composer */}
       <div className="border-t border-white/[0.06] px-6 py-3">
+        {error && input.trim() && !loading && (
+          <div className="mb-2 flex justify-end">
+            <button
+              type="button"
+              onClick={() => void send()}
+              className="rounded-md border border-red-400/20 bg-red-400/10 px-2 py-1 text-[11px] font-medium text-red-200 transition-colors hover:bg-red-400/15"
+            >
+              Retry
+            </button>
+          </div>
+        )}
         <div className="flex items-center gap-2 rounded-xl border border-[rgb(var(--foreground)/0.08)] bg-[rgb(var(--foreground)/0.03)] px-3.5 py-2 transition-[border-color] duration-150 ease-out focus-within:border-indigo-400/50">
           <textarea
             ref={textareaRef}

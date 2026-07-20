@@ -7,7 +7,7 @@
  * `/api/control/alerts`.
  */
 
-import { apiDel, apiFetch, apiGet, apiPatch, apiPost } from "./core";
+import { apiDel, apiFetch, apiGet, apiPatch } from "./core";
 
 const HERMES_PROXY = "/api/assistant/hermes";
 
@@ -50,12 +50,22 @@ export async function listHermesSessions(limit = 50): Promise<HermesSession[]> {
 }
 
 export async function createHermesSession(title?: string): Promise<HermesSession> {
-  const res = await apiPost<{ session: HermesSession }>(
-    `${HERMES_PROXY}/api/sessions`,
-    title ? { title } : {},
-    "Failed to create Hermes session",
-  );
-  return res.session;
+  const res = await apiFetch(`${HERMES_PROXY}/api/sessions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(title ? { title } : {}),
+  });
+  if (!res.ok) {
+    const detail = await responseErrorDetail(res);
+    throw new Error(
+      `Could not start a Hermes conversation (${res.status})${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  const payload = (await res.json()) as { session?: HermesSession };
+  if (!payload.session) {
+    throw new Error("Hermes created a conversation without returning it");
+  }
+  return payload.session;
 }
 
 export async function getHermesSessionMessages(
@@ -129,11 +139,14 @@ export async function hermesChatStream(
       signal,
     },
   );
-  if (!res.ok || !res.body) {
-    handlers.onError(
-      res.ok ? "No response stream" : `Hermes chat failed (${res.status})`,
+  if (!res.ok) {
+    const detail = await responseErrorDetail(res);
+    throw new Error(
+      `Hermes chat failed (${res.status})${detail ? `: ${detail}` : ""}`,
     );
-    return;
+  }
+  if (!res.body) {
+    throw new Error("Hermes chat returned no response stream");
   }
 
   const reader = res.body.getReader();
@@ -196,6 +209,10 @@ export async function hermesChatStream(
     const { done, value } = await reader.read();
     if (done) break;
     buf += decoder.decode(value, { stream: true });
+    // Normalize before frame splitting. Hermes is normally behind nginx,
+    // which can preserve upstream CRLF line endings and can split `\r\n`
+    // across transport chunks.
+    buf = buf.replace(/\r\n/g, "\n");
     let sep: number;
     while ((sep = buf.indexOf("\n\n")) >= 0) {
       handleFrame(buf.slice(0, sep));
@@ -207,6 +224,21 @@ export async function hermesChatStream(
   if (!sawTerminal) {
     handlers.onError("Stream ended before completion");
   }
+}
+
+async function responseErrorDetail(res: Response): Promise<string> {
+  const contentType = res.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    const payload = await res.json().catch(() => null);
+    if (payload && typeof payload === "object") {
+      const detail = "detail" in payload ? payload.detail : undefined;
+      const message = "message" in payload ? payload.message : undefined;
+      if (typeof detail === "string" && detail.trim()) return detail.trim();
+      if (typeof message === "string" && message.trim()) return message.trim();
+    }
+    return "";
+  }
+  return (await res.text().catch(() => "")).trim();
 }
 
 // ---------------------------------------------------------------------------
