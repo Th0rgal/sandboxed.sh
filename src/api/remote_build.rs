@@ -360,8 +360,7 @@ async fn core_side_reservations(state: &AppState) -> Result<CoreReservations, St
                     .as_ref()
                     .and_then(|status| status.last_heartbeat.as_ref())
                     .is_some_and(|heartbeat| {
-                        heartbeat.protocol_version
-                            >= crate::remote_node::protocol::NODE_PROTOCOL_VERSION
+                        heartbeat_protocol_has_job_counters(heartbeat.protocol_version)
                     });
                 if handle_needs_reservation(
                     &handle,
@@ -377,6 +376,10 @@ async fn core_side_reservations(state: &AppState) -> Result<CoreReservations, St
             "remote job reservations could not be loaded; disk-aware placement fails closed: {error}"
         )),
     }
+}
+
+fn heartbeat_protocol_has_job_counters(protocol_version: u32) -> bool {
+    protocol_version >= crate::remote_node::protocol::NODE_JOB_COUNTER_PROTOCOL_VERSION
 }
 
 fn heartbeat_cannot_reflect(
@@ -1052,6 +1055,13 @@ mod tests {
             Some(heartbeat_started_at)
         ));
         assert!(heartbeat_cannot_reflect(heartbeat_started_at, None));
+    }
+
+    #[test]
+    fn v2_heartbeats_still_cover_job_count_reservations() {
+        assert!(!heartbeat_protocol_has_job_counters(1));
+        assert!(heartbeat_protocol_has_job_counters(2));
+        assert!(heartbeat_protocol_has_job_counters(3));
     }
 
     #[test]

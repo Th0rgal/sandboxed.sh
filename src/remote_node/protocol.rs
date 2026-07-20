@@ -16,6 +16,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Current node protocol version reported by heartbeats.
 pub const NODE_PROTOCOL_VERSION: u32 = 3;
+/// First protocol that reports `active_jobs` and `queued_jobs` in heartbeats.
+pub const NODE_JOB_COUNTER_PROTOCOL_VERSION: u32 = 2;
 
 /// Lease scope for the synchronous `/execute` path.
 pub const SCOPE_MISSION_EXECUTE: &str = "mission:execute";
