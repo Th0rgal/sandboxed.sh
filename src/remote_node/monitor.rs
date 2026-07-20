@@ -314,6 +314,7 @@ pub fn select_node_auto_with_resource_reservations(
 
 /// Resource-aware placement with a minimum wire-protocol capability. This is
 /// required for payload features old nodes would otherwise ignore.
+#[allow(clippy::too_many_arguments)] // Pure placement inputs stay explicit for auditability.
 pub fn select_node_auto_with_protocol_and_resource_reservations(
     nodes: &[RemoteNodeConfig],
     statuses: &HashMap<String, CachedNodeStatus>,

@@ -3127,24 +3127,18 @@ mod tests {
 
     #[test]
     fn mission_acknowledgement_accepts_only_ack_waits_and_is_idempotent() {
-        assert_eq!(
-            mission_requires_acknowledgement(&json!({
-                "status": "awaiting_user",
-                "awaiting_kind": "ack"
-            }))
-            .unwrap(),
-            true
-        );
-        assert_eq!(
-            mission_requires_acknowledgement(&json!({
-                "mission": {
-                    "status": "acknowledged",
-                    "awaiting_kind": null
-                }
-            }))
-            .unwrap(),
-            false
-        );
+        assert!(mission_requires_acknowledgement(&json!({
+            "status": "awaiting_user",
+            "awaiting_kind": "ack"
+        }))
+        .unwrap());
+        assert!(!mission_requires_acknowledgement(&json!({
+            "mission": {
+                "status": "acknowledged",
+                "awaiting_kind": null
+            }
+        }))
+        .unwrap());
         assert!(mission_requires_acknowledgement(&json!({
             "status": "awaiting_user",
             "awaiting_kind": "decision"
