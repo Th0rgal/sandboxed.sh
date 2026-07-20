@@ -51,9 +51,12 @@ req = {
     "command": command,
     "wait": False,
 }
+repo_root = pathlib.Path(
+    subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+).resolve()
 
 def git_paths(*args):
-    raw = subprocess.check_output(["git", *args])
+    raw = subprocess.check_output(["git", "-C", str(repo_root), *args])
     return [item.decode("utf-8") for item in raw.split(b"\0") if item]
 
 deleted = git_paths("diff", "--name-only", "-z", "--diff-filter=DR", "HEAD")
@@ -63,7 +66,7 @@ if deleted:
         + ", ".join(deleted[:8])
     )
 tracked = git_paths("diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "HEAD")
-untracked = git_paths("ls-files", "--others", "--exclude-standard", "-z")
+untracked = git_paths("ls-files", "--full-name", "--others", "--exclude-standard", "-z")
 untracked_source = [
     path for path in untracked
     if path.endswith(".lean")
@@ -102,7 +105,7 @@ for rel in paths:
         )
     ):
         raise SystemExit(f"unsafe source bundle path: {rel!r}")
-    path = pathlib.Path(rel)
+    path = repo_root / rel
     if path.is_symlink() or not path.is_file():
         raise SystemExit(f"source bundle path must be a regular file, not a symlink: {rel}")
     data = path.read_bytes()

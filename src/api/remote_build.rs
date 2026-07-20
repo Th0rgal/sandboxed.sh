@@ -1408,6 +1408,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         let capture = temp.path().join("request.json");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(repo.join("Theory")).unwrap();
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
                 .args(args)
@@ -1423,8 +1424,8 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         git(&["init", "--quiet"]);
         git(&["config", "user.name", "Remote Build Test"]);
         git(&["config", "user.email", "remote-build@example.invalid"]);
-        std::fs::write(repo.join("Proof.lean"), "old\n").unwrap();
-        git(&["add", "Proof.lean"]);
+        std::fs::write(repo.join("Theory/Proof.lean"), "old\n").unwrap();
+        git(&["add", "Theory/Proof.lean"]);
         git(&[
             "-c",
             "commit.gpgsign=false",
@@ -1439,8 +1440,8 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             "origin",
             "https://example.invalid/repo.git",
         ]);
-        std::fs::write(repo.join("Proof.lean"), "new proof\n").unwrap();
-        std::fs::write(repo.join("Witness.lean"), "new witness\n").unwrap();
+        std::fs::write(repo.join("Theory/Proof.lean"), "new proof\n").unwrap();
+        std::fs::write(repo.join("Theory/Witness.lean"), "new witness\n").unwrap();
 
         let fake_curl = bin.join("curl");
         std::fs::write(
@@ -1475,7 +1476,7 @@ printf '503'
                 env!("CARGO_MANIFEST_DIR"),
                 "/scripts/remote-lean-build"
             ))
-            .current_dir(&repo)
+            .current_dir(repo.join("Theory"))
             .env("PATH", path)
             .env(
                 "REMOTE_BUILD_URL",
@@ -1503,7 +1504,7 @@ printf '503'
                 .iter()
                 .map(|file| file.get("path").unwrap().as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["Proof.lean", "Witness.lean"]
+            vec!["Theory/Proof.lean", "Theory/Witness.lean"]
         );
         let manifest = files
             .iter()
