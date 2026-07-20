@@ -9,7 +9,7 @@ It never receives a dashboard JWT or broad API token.
 
 Supported now:
 
-- core lists configured nodes and reports cached fleet status (heartbeat v2:
+- core lists configured nodes and reports cached fleet status (heartbeat v3:
   capacity, labels, CPU/memory/disk figures, job counts)
 - a background fleet monitor polls every node's `/heartbeat` on an interval
   (`REMOTE_NODE_MONITOR_SECS`, default 15s, `0` disables) and derives per-node
@@ -125,12 +125,14 @@ To rotate a node token with zero downtime:
    and restart/redeploy core.
 3. Remove `SANDBOXED_NODE_TOKEN_PREVIOUS` on the node and restart it.
 
-### Heartbeat v2
+### Heartbeat v3
 
 `GET /heartbeat` returns the v1 fields (`node_id`, `online`, `capacity_total`,
 `capacity_available`, `active_leases`, `version`) plus:
 
-- `protocol_version` (currently `2`; core treats a missing field as `1`)
+- `protocol_version` (currently `3`; core treats a missing field as `1`).
+  Version 3 is required for source-bundle jobs so a rolling deployment can
+  never silently drop a dirty overlay on an older node.
 - `labels` (from `SANDBOXED_NODE_LABELS`)
 - `cpu_total` (logical cores)
 - `mem_total_bytes` / `mem_available_bytes`
@@ -145,8 +147,9 @@ To rotate a node token with zero downtime:
 `capacity_available` is a snapshot of the shared semaphore, so it already
 accounts for work admitted through either `/execute` or `/jobs`.
 
-All new fields are serde-default-tolerant in both directions, so mixed-version
-core/node fleets keep working during upgrades.
+New fields are serde-default-tolerant in both directions. Features whose
+semantics an older node would silently ignore are additionally gated by the
+reported protocol version.
 
 Minimal systemd unit:
 

@@ -407,6 +407,7 @@ async fn resolve_node(
     node_id: &str,
     requirements: &[String],
     min_disk_bytes: u64,
+    min_protocol_version: u32,
 ) -> Result<RemoteNodeConfig, (StatusCode, String)> {
     let settings = &state.config.remote_nodes;
     if !settings.enabled || settings.nodes.is_empty() {
@@ -419,13 +420,16 @@ async fn resolve_node(
         let reservations = core_side_reservations(state)
             .await
             .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
-        let first = state.fleet.place_auto_with_resource_reservations(
-            settings,
-            requirements,
-            min_disk_bytes,
-            &reservations.jobs,
-            &reservations.disk_bytes,
-        );
+        let first = state
+            .fleet
+            .place_auto_with_protocol_and_resource_reservations(
+                settings,
+                requirements,
+                min_disk_bytes,
+                min_protocol_version,
+                &reservations.jobs,
+                &reservations.disk_bytes,
+            );
         let picked = match first {
             Ok(picked) => picked,
             Err(initial_err) => {
@@ -459,10 +463,11 @@ async fn resolve_node(
                     .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
                 state
                     .fleet
-                    .place_auto_with_resource_reservations(
+                    .place_auto_with_protocol_and_resource_reservations(
                         settings,
                         requirements,
                         min_disk_bytes,
+                        min_protocol_version,
                         &reservations.jobs,
                         &reservations.disk_bytes,
                     )
@@ -489,6 +494,15 @@ async fn resolve_node(
         StatusCode::SERVICE_UNAVAILABLE,
         format!("remote node '{}' has no heartbeat data", node.id),
     ))?;
+    if heartbeat.protocol_version < min_protocol_version {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "remote node '{}' reports protocol v{}; v{} is required",
+                node.id, heartbeat.protocol_version, min_protocol_version
+            ),
+        ));
+    }
     let reserved = reservations.disk_bytes.get(&node.id).copied().unwrap_or(0);
     let effective = heartbeat.disk_available_bytes.saturating_sub(reserved);
     if effective < min_disk_bytes {
@@ -688,6 +702,11 @@ async fn submit_remote_build(
             .into_response();
     }
     let min_disk_bytes = required_node_disk_bytes(req.estimated_disk_bytes);
+    let min_protocol_version = if req.source_bundle.is_some() {
+        crate::remote_node::protocol::NODE_PROTOCOL_VERSION
+    } else {
+        1
+    };
     // Every endpoint payload is a declarative Lean build. Callers may add
     // placement labels, but may not remove the runtime readiness gate by
     // sending an empty or unrelated requirements list.
@@ -701,7 +720,15 @@ async fn submit_remote_build(
     // Serialize placement through tentative-handle persistence. Otherwise a
     // burst can select the same idle node before its next heartbeat.
     let placement_guard = placement_lock().lock().await;
-    let node = match resolve_node(&state, &req.node_id, &requirements, min_disk_bytes).await {
+    let node = match resolve_node(
+        &state,
+        &req.node_id,
+        &requirements,
+        min_disk_bytes,
+        min_protocol_version,
+    )
+    .await
+    {
         Ok(node) => node,
         Err((status, message)) => return (status, message).into_response(),
     };

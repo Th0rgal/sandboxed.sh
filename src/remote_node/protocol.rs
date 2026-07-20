@@ -14,8 +14,8 @@ use super::RemoteNodeError;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Protocol version reported by heartbeat v2 nodes.
-pub const NODE_PROTOCOL_VERSION: u32 = 2;
+/// Current node protocol version reported by heartbeats.
+pub const NODE_PROTOCOL_VERSION: u32 = 3;
 
 /// Lease scope for the synchronous `/execute` path.
 pub const SCOPE_MISSION_EXECUTE: &str = "mission:execute";

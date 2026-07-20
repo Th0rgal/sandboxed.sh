@@ -300,6 +300,30 @@ pub fn select_node_auto_with_resource_reservations(
     reservations: &HashMap<String, u32>,
     disk_reservations: &HashMap<String, u64>,
 ) -> Result<String, PlacementError> {
+    select_node_auto_with_protocol_and_resource_reservations(
+        nodes,
+        statuses,
+        requirements,
+        min_disk_bytes,
+        min_mem_bytes,
+        1,
+        reservations,
+        disk_reservations,
+    )
+}
+
+/// Resource-aware placement with a minimum wire-protocol capability. This is
+/// required for payload features old nodes would otherwise ignore.
+pub fn select_node_auto_with_protocol_and_resource_reservations(
+    nodes: &[RemoteNodeConfig],
+    statuses: &HashMap<String, CachedNodeStatus>,
+    requirements: &[String],
+    min_disk_bytes: u64,
+    min_mem_bytes: u64,
+    min_protocol_version: u32,
+    reservations: &HashMap<String, u32>,
+    disk_reservations: &HashMap<String, u64>,
+) -> Result<String, PlacementError> {
     let mut reasons: Vec<(String, String)> = Vec::new();
     // (queued, specialized, load, capacity, mem_avail, id)
     //
@@ -323,6 +347,16 @@ pub fn select_node_auto_with_resource_reservations(
             reasons.push((node.id.clone(), "no heartbeat data".to_string()));
             continue;
         };
+        if heartbeat.protocol_version < min_protocol_version {
+            reasons.push((
+                node.id.clone(),
+                format!(
+                    "protocol v{} is below required v{}",
+                    heartbeat.protocol_version, min_protocol_version
+                ),
+            ));
+            continue;
+        }
         if requirements.iter().any(|requirement| requirement == "lean")
             && heartbeat.lean_runtime_ready == Some(false)
         {
@@ -454,13 +488,35 @@ impl FleetMonitor {
         reservations: &HashMap<String, u32>,
         disk_reservations: &HashMap<String, u64>,
     ) -> Result<String, PlacementError> {
+        self.place_auto_with_protocol_and_resource_reservations(
+            settings,
+            requirements,
+            min_disk_bytes,
+            1,
+            reservations,
+            disk_reservations,
+        )
+    }
+
+    /// Like [`Self::place_auto_with_resource_reservations`], requiring a
+    /// minimum node protocol for semantic payload features.
+    pub fn place_auto_with_protocol_and_resource_reservations(
+        &self,
+        settings: &RemoteNodeSettings,
+        requirements: &[String],
+        min_disk_bytes: u64,
+        min_protocol_version: u32,
+        reservations: &HashMap<String, u32>,
+        disk_reservations: &HashMap<String, u64>,
+    ) -> Result<String, PlacementError> {
         let statuses = self.statuses.read().unwrap_or_else(|e| e.into_inner());
-        select_node_auto_with_resource_reservations(
+        select_node_auto_with_protocol_and_resource_reservations(
             &settings.nodes,
             &statuses,
             requirements,
             min_disk_bytes,
             env_gb_bytes("REMOTE_NODE_MIN_MEM_GB", DEFAULT_MIN_MEM_GB),
+            min_protocol_version,
             reservations,
             disk_reservations,
         )
@@ -709,7 +765,7 @@ mod tests {
             "capacity_available": capacity.saturating_sub(active),
             "active_leases": 0,
             "version": "test",
-            "protocol_version": 2,
+            "protocol_version": crate::remote_node::protocol::NODE_PROTOCOL_VERSION,
             "labels": labels,
             "mem_available_bytes": mem_gb * (1u64 << 30),
             "disk_available_bytes": disk_gb * (1u64 << 30),
@@ -1029,6 +1085,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.reasons[0].1.contains("85 GiB reserved"));
+    }
+
+    #[test]
+    fn placement_rejects_nodes_below_a_required_protocol() {
+        let node = node_config("old");
+        let mut status = cached_online("old", &["lean"], 100, 32, 2, 0, 0);
+        status.last_heartbeat.as_mut().unwrap().protocol_version = 2;
+        let statuses = HashMap::from([("old".to_string(), status)]);
+        let error = select_node_auto_with_protocol_and_resource_reservations(
+            &[node],
+            &statuses,
+            &["lean".to_string()],
+            20 * GIB,
+            8 * GIB,
+            3,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(error.reasons[0].1.contains("protocol v2"));
+        assert!(error.reasons[0].1.contains("required v3"));
     }
 
     #[test]
