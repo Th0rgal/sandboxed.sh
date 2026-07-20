@@ -43,3 +43,19 @@ been reviewed and backed up; it is deliberately off by default.
 Resource limits are separate from retention. Use `GET
 /api/workspaces/:id/resources` to inspect effective memory/swap/CPU limits and
 matching live scopes before changing a workspace shared by concurrent missions.
+
+## Admission and continuity
+
+Disk warning is not a portfolio-wide stop. Small/no-build controller, review,
+Fable and source-analysis lanes remain eligible at warn level. A local
+disk-heavy mission should set `estimated_disk_gib`; the API rejects only that
+mission when its estimate would cross `MISSION_DISK_EMERGENCY_RESERVE_GB`
+(default 64 GiB). Critical level still rejects all new local missions.
+
+Lean builds should use `remote-lean-build`. The wrapper can ship modified and
+untracked regular source files as a bounded, content-hashed overlay on top of a
+pinned commit; deletion, rename, symlink, `.git`, `.lake`, traversal and
+oversized overlays fail closed. Remote placement reserves the declared scratch
+estimate, while runners reuse content-addressed checkouts and dependency-only
+Lake cache slots. This lets a dirty proof lane continue on a roomy node without
+duplicating a fresh Mathlib tree on the production host.

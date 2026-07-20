@@ -16,7 +16,7 @@
 #
 # Exit codes:
 #   remote build's exit code on success/failure of the build itself
-#   2   dirty working tree (commit or stash first — the node builds a pinned commit)
+#   2   unsupported local deletion/symlink or oversized source overlay
 #   75  remote build unavailable (EX_TEMPFAIL: placement failed / nodes down /
 #       not configured) — fall back to a local build
 set -u
@@ -38,8 +38,9 @@ cwd_rel="$(git rev-parse --show-prefix)"; cwd_rel="${cwd_rel%/}"
 # Build argv: everything passed on the command line, default `lake build`.
 if [ "$#" -eq 0 ]; then set -- lake build; fi
 
-body="$(python3 - "$REMOTE_BUILD_MISSION_ID" "$REMOTE_BUILD_TOKEN" "$repo" "$commit" "$cwd_rel" "$@" <<'PY'
-import json, sys, os
+request_file="$(mktemp)" || die "cannot create temporary request file" 75
+python3 - "$REMOTE_BUILD_MISSION_ID" "$REMOTE_BUILD_TOKEN" "$repo" "$commit" "$cwd_rel" "$@" > "$request_file" <<'PY'
+import base64, hashlib, json, os, pathlib, subprocess, sys
 mission_id, token, repo, commit, cwd_rel = sys.argv[1:6]
 command = sys.argv[6:]
 req = {
@@ -50,11 +51,92 @@ req = {
     "command": command,
     "wait": False,
 }
+
+def git_paths(*args):
+    raw = subprocess.check_output(["git", *args])
+    return [item.decode("utf-8") for item in raw.split(b"\0") if item]
+
+deleted = git_paths("diff", "--name-only", "-z", "--diff-filter=DR", "HEAD")
+if deleted:
+    raise SystemExit(
+        "remote source bundles do not encode deletions or renames; commit/stash these paths first: "
+        + ", ".join(deleted[:8])
+    )
+tracked = git_paths("diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "HEAD")
+untracked = git_paths("ls-files", "--others", "--exclude-standard", "-z")
+untracked_source = [
+    path for path in untracked
+    if path.endswith(".lean")
+    or pathlib.PurePosixPath(path).name in {
+        "lakefile.toml", "lake-manifest.json", "lean-toolchain"
+    }
+]
+ignored_untracked = sorted(set(untracked) - set(untracked_source))
+if ignored_untracked:
+    print(
+        "remote-lean-build: ignoring untracked non-Lean files: "
+        + ", ".join(ignored_untracked[:8]),
+        file=sys.stderr,
+    )
+paths = sorted(set(tracked + untracked_source))
+max_files = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_FILES", "256"))
+max_bytes = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES", str(1 << 20)))
+if max_files <= 0 or max_bytes <= 0:
+    raise SystemExit("remote source bundle limits must be positive integers")
+if len(paths) > max_files:
+    raise SystemExit(f"source bundle has {len(paths)} files; maximum is {max_files}")
+files = []
+total = 0
+manifest = hashlib.sha256(b"sandboxed-source-bundle-v1\n")
+for rel in paths:
+    components = rel.split("/")
+    if (
+        not rel
+        or any(
+            not component
+            or component == ".."
+            or component.startswith("-")
+            or component in {".git", ".lake"}
+            or any(not (ch.isascii() and (ch.isalnum() or ch in "_.-")) for ch in component)
+            for component in components
+        )
+    ):
+        raise SystemExit(f"unsafe source bundle path: {rel!r}")
+    path = pathlib.Path(rel)
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"source bundle path must be a regular file, not a symlink: {rel}")
+    data = path.read_bytes()
+    total += len(data)
+    if total > max_bytes:
+        raise SystemExit(f"source bundle is {total} bytes; maximum is {max_bytes}")
+    digest = hashlib.sha256(data).hexdigest()
+    manifest.update(rel.encode())
+    manifest.update(b"\0")
+    manifest.update(digest.encode())
+    manifest.update(b"\n")
+    files.append({
+        "path": rel,
+        "sha256": digest,
+        "data_base64": base64.b64encode(data).decode("ascii"),
+    })
+if files:
+    req["source_bundle"] = {
+        "manifest_sha256": manifest.hexdigest(),
+        "files": files,
+    }
 if cwd_rel:
     req["cwd_rel"] = cwd_rel
 timeout = os.environ.get("REMOTE_BUILD_TIMEOUT_SECS")
 if timeout:
     req["timeout_secs"] = int(timeout)
+estimate_bytes = os.environ.get("REMOTE_BUILD_ESTIMATED_DISK_BYTES")
+if estimate_bytes:
+    estimate = int(estimate_bytes)
+else:
+    estimate = int(os.environ.get("REMOTE_BUILD_ESTIMATED_DISK_GB", "12")) * (1 << 30)
+if estimate <= 0:
+    raise SystemExit("remote build disk estimate must be positive")
+req["estimated_disk_bytes"] = estimate
 node_id = os.environ.get("REMOTE_BUILD_NODE_ID", "auto").strip()
 if node_id:
     req["node_id"] = node_id
@@ -70,11 +152,15 @@ if not isinstance(requirements, list) or not all(
 req["requirements"] = requirements
 print(json.dumps(req))
 PY
-)" || die "failed to encode request"
+encode_status=$?
+if [ "$encode_status" -ne 0 ]; then
+    rm -f "$request_file"
+    die "failed to encode request" 2
+fi
 
-request_key="$(python3 - "$body" "$REMOTE_BUILD_URL" <<'PY'
+request_key="$(python3 - "$request_file" "$REMOTE_BUILD_URL" <<'PY'
 import hashlib, json, sys
-request = json.loads(sys.argv[1])
+request = json.load(open(sys.argv[1]))
 request.pop("token", None)
 request.pop("wait", None)
 fingerprint = {"endpoint": sys.argv[2], "request": request}
@@ -114,7 +200,7 @@ release_submit_lock() {
 }
 cleanup() {
     release_submit_lock
-    rm -f "$response_file"
+    rm -f "$response_file" "$request_file"
 }
 trap cleanup EXIT
 
@@ -231,13 +317,16 @@ fi
 
 persist_ambiguous_receipt() {
     reason="$1"
-    python3 - "$state_file" "$body" "$reason" <<'PY'
+    python3 - "$state_file" "$request_file" "$reason" <<'PY'
 import json, os, sys, tempfile
-path, raw_request, reason = sys.argv[1:]
-request = json.loads(raw_request)
+path, request_path, reason = sys.argv[1:]
+request = json.load(open(request_path))
 request.pop("token", None)
 request.pop("repo", None)
 request.pop("wait", None)
+bundle = request.pop("source_bundle", None)
+if bundle:
+    request["source_bundle_sha256"] = bundle.get("manifest_sha256")
 request.update({"state": "ambiguous", "submit_outcome": reason})
 fd, tmp = tempfile.mkstemp(prefix=".remote-build-", dir=os.path.dirname(path))
 try:
@@ -252,12 +341,6 @@ PY
 }
 
 if [ -z "$job_id" ]; then
-    # The node fetches a pinned commit; uncommitted changes would silently not
-    # be part of a new remote build. An existing receipt remains resumable after
-    # the checkout changes because its immutable request was already accepted.
-    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-        die "working tree is dirty; commit (and push) your changes before submitting a new build" 2
-    fi
     # Pre-create the durable blocker while no remote request has been made.
     # Cleanup removes it on known pre-acceptance outcomes; ambiguous/accepted
     # failures retain it so a dead owner PID can never permit a duplicate job.
@@ -267,7 +350,7 @@ if [ -z "$job_id" ]; then
     http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
         -H 'Content-Type: application/json' \
         --max-time "$submit_timeout_secs" \
-        -d "$body" "$REMOTE_BUILD_URL")"
+        --data-binary "@$request_file" "$REMOTE_BUILD_URL")"
     curl_status=$?
     if [ "$curl_status" -ne 0 ]; then
         case "$curl_status" in
@@ -320,13 +403,16 @@ print(job, node, sep="\t")
 PY
     ) || die "invalid remote-build submit response"
 
-    python3 - "$state_file" "$body" "$job_id" "$node_id" <<'PY'
+    python3 - "$state_file" "$request_file" "$job_id" "$node_id" <<'PY'
 import json, os, sys, tempfile
-path, raw_request, job_id, node_id = sys.argv[1:]
-request = json.loads(raw_request)
+path, request_path, job_id, node_id = sys.argv[1:]
+request = json.load(open(request_path))
 request.pop("token", None)
 request.pop("repo", None)
 request.pop("wait", None)
+bundle = request.pop("source_bundle", None)
+if bundle:
+    request["source_bundle_sha256"] = bundle.get("manifest_sha256")
 request.update({"job_id": job_id, "node_id": node_id, "state": "submitted"})
 fd, tmp = tempfile.mkstemp(prefix=".remote-build-", dir=os.path.dirname(path))
 try:

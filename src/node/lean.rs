@@ -19,13 +19,15 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use super::job_store::JobState;
 use super::runner::{clamp_timeout, run_logged_command, CommandEnvironment};
-use crate::remote_node::{ArtifactEntry, JobPayload, JobSource};
+use crate::remote_node::{ArtifactEntry, JobPayload, JobSource, SourceBundle};
 
 /// Default allowlist for lean-build env keys
 /// (`SANDBOXED_NODE_ENV_ALLOWLIST` overrides, comma-separated).
@@ -37,6 +39,8 @@ pub const ALLOWED_COMMANDS: [&str; 2] = ["lake", "lean"];
 /// Default node GC threshold: keep at least this many GiB free on the
 /// filesystem backing the work dir (`SANDBOXED_NODE_MIN_FREE_GB` overrides).
 const DEFAULT_MIN_FREE_GB: u64 = 10;
+const DEFAULT_MAX_SOURCE_BUNDLE_BYTES: u64 = 1 << 20;
+const MAX_SOURCE_BUNDLE_FILES: usize = 256;
 
 /// Interval between node-side cache GC passes.
 const GC_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -100,6 +104,88 @@ pub fn rel_path_is_safe(rel_clean: &str) -> bool {
         })
 }
 
+fn source_bundle_max_bytes() -> u64 {
+    std::env::var("SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_MAX_SOURCE_BUNDLE_BYTES)
+}
+
+fn bundle_path_is_safe(path: &str) -> bool {
+    rel_path_is_safe(path)
+        && !path.is_empty()
+        && !path
+            .split('/')
+            .any(|component| matches!(component, ".git" | ".lake"))
+}
+
+pub(crate) fn bundle_manifest_sha256(files: &[(String, String)]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sandboxed-source-bundle-v1\n");
+    for (path, sha256) in files {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(sha256.as_bytes());
+        hasher.update(b"\n");
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn validate_source_bundle(bundle: &SourceBundle) -> Result<u64, String> {
+    if bundle.files.is_empty() {
+        return Err("source.bundle.files must not be empty".to_string());
+    }
+    if bundle.files.len() > MAX_SOURCE_BUNDLE_FILES {
+        return Err(format!(
+            "source bundle has {} files; maximum is {MAX_SOURCE_BUNDLE_FILES}",
+            bundle.files.len()
+        ));
+    }
+    let mut manifest_files = Vec::with_capacity(bundle.files.len());
+    let mut previous: Option<&str> = None;
+    let mut total = 0_u64;
+    for file in &bundle.files {
+        if !bundle_path_is_safe(&file.path) {
+            return Err(format!("unsafe source bundle path '{}'", file.path));
+        }
+        if previous.is_some_and(|prior| prior >= file.path.as_str()) {
+            return Err("source bundle paths must be unique and sorted".to_string());
+        }
+        previous = Some(&file.path);
+        if file.sha256.len() != 64
+            || !file
+                .sha256
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+        {
+            return Err(format!("invalid source bundle sha256 for '{}'", file.path));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&file.data_base64)
+            .map_err(|_| format!("invalid source bundle base64 for '{}'", file.path))?;
+        total = total.saturating_add(bytes.len() as u64);
+        if total > source_bundle_max_bytes() {
+            return Err(format!(
+                "source bundle is {total} bytes; maximum is {}",
+                source_bundle_max_bytes()
+            ));
+        }
+        if hex::encode(Sha256::digest(&bytes)) != file.sha256 {
+            return Err(format!(
+                "source bundle content hash mismatch for '{}'",
+                file.path
+            ));
+        }
+        manifest_files.push((file.path.clone(), file.sha256.clone()));
+    }
+    let expected = bundle_manifest_sha256(&manifest_files);
+    if expected != bundle.manifest_sha256 {
+        return Err("source bundle manifest hash mismatch".to_string());
+    }
+    Ok(total)
+}
+
 /// Only remote fetch sources: git happily fetches local paths and file://
 /// URLs, which would let a remote-build token holder exfiltrate node-local
 /// git data into a checkout.
@@ -144,6 +230,9 @@ pub fn validate_lean_build(
             source.commit
         ));
     }
+    if let Some(bundle) = &source.bundle {
+        validate_source_bundle(bundle)?;
+    }
     let rel_clean = cwd_rel.unwrap_or("").trim_matches('/');
     if !rel_path_is_safe(rel_clean) {
         return Err(format!("invalid cwd_rel '{rel_clean}'"));
@@ -180,6 +269,23 @@ pub fn validate_lean_build(
                 allowlist.join(",")
             ));
         }
+    }
+    Ok(())
+}
+
+/// Reject a build if its estimated peak plus the emergency floor cannot fit
+/// on the filesystem backing the node work root.
+pub fn validate_disk_admission(work_root: &Path, estimated_disk_bytes: u64) -> Result<(), String> {
+    let available = fs2::available_space(work_root)
+        .map_err(|error| format!("cannot stat node work dir disk space: {error}"))?;
+    let required = estimated_disk_bytes.saturating_add(min_free_bytes());
+    if available < required {
+        return Err(format!(
+            "insufficient node disk: {} GiB available, {} GiB estimated plus {} GiB emergency floor",
+            available / (1 << 30),
+            estimated_disk_bytes / (1 << 30),
+            min_free_bytes() / (1 << 30)
+        ));
     }
     Ok(())
 }
@@ -721,12 +827,14 @@ async fn ensure_checkout(
 /// hardlinks would let one checkout corrupt the shared slot or another build.
 /// `dest` must not exist.
 async fn isolated_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
-    let output = tokio::process::Command::new("cp")
-        .arg("-a")
-        .arg(src)
-        .arg(dest)
-        .output()
-        .await?;
+    let mut command = tokio::process::Command::new("cp");
+    command.arg("-a");
+    // Linux runners use CoW reflinks when the backing filesystem supports
+    // them, avoiding another physical Mathlib tree while preserving mutation
+    // isolation. `auto` falls back to an ordinary copy on ext4 and similar.
+    #[cfg(target_os = "linux")]
+    command.arg("--reflink=auto");
+    let output = command.arg(src).arg(dest).output().await?;
     if !output.status.success() {
         anyhow::bail!(
             "cp -a {} -> {} failed: {}",
@@ -822,6 +930,67 @@ async fn require_safe_directory_creation_path(
     Ok(())
 }
 
+async fn apply_source_bundle(
+    checkout: &Path,
+    bundle: &SourceBundle,
+    log_path: &Path,
+) -> anyhow::Result<()> {
+    let total_bytes = validate_source_bundle(bundle).map_err(|error| anyhow::anyhow!("{error}"))?;
+    for file in &bundle.files {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&file.data_base64)
+            .map_err(|_| anyhow::anyhow!("invalid bundle base64 for '{}'", file.path))?;
+        let destination = checkout.join(&file.path);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("bundle path '{}' has no parent", file.path))?;
+        if parent != checkout {
+            require_safe_directory_creation_path(checkout, parent, "source bundle destination")
+                .await?;
+        }
+        tokio::fs::create_dir_all(parent).await?;
+        match tokio::fs::symlink_metadata(&destination).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "source bundle destination must not be a symlink: {}",
+                    destination.display()
+                );
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                anyhow::bail!(
+                    "source bundle destination is a directory: {}",
+                    destination.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let tmp = parent.join(format!(".source-bundle-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&tmp, &bytes).await?;
+        if let Err(error) = tokio::fs::rename(&tmp, &destination).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(error.into());
+        }
+    }
+    let mut log = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .await?;
+    log.write_all(
+        format!(
+            "source bundle verified sha256={} files={} bytes={}\n",
+            bundle.manifest_sha256,
+            bundle.files.len(),
+            total_bytes
+        )
+        .as_bytes(),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Restore only shared Lake dependencies. Every other top-level `.lake` entry
 /// belongs to the root project and is commit-specific (including custom Lake
 /// `buildDir` values), so copying the whole directory can make Lake trust a
@@ -882,6 +1051,7 @@ pub async fn execute_lean_build(
         cwd_rel,
         command,
         timeout_secs,
+        estimated_disk_bytes,
         cache_key,
         artifacts,
         env,
@@ -893,6 +1063,8 @@ pub async fn execute_lean_build(
     let allowlist = env_allowlist_from_env();
     validate_lean_build(source, cwd_rel.as_deref(), command, env, &allowlist)
         .map_err(|e| anyhow::anyhow!("invalid lean_build payload: {e}"))?;
+    validate_disk_admission(work_root, estimated_disk_bytes.unwrap_or_default())
+        .map_err(|e| anyhow::anyhow!("disk admission failed: {e}"))?;
 
     // Serialize builds of the same (repo, commit): one flock guards both the
     // checkout materialization and the build itself, so two jobs never run
@@ -913,6 +1085,9 @@ pub async fn execute_lean_build(
     )
     .await?;
     run_git_step(&["clean", "-ffdx"], &checkout, log_path, token).await?;
+    if let Some(bundle) = &source.bundle {
+        apply_source_bundle(&checkout, bundle, log_path).await?;
+    }
 
     let rel_clean = cwd_rel.as_deref().unwrap_or("").trim_matches('/');
     let build_cwd = if rel_clean.is_empty() {
@@ -1193,11 +1368,24 @@ mod tests {
         JobSource {
             repo: "https://github.com/example/verity.git".to_string(),
             commit: commit.to_string(),
+            bundle: None,
         }
     }
 
     fn allowlist() -> Vec<String> {
         parse_env_allowlist(DEFAULT_ENV_ALLOWLIST)
+    }
+
+    fn source_bundle(path: &str, contents: &[u8]) -> SourceBundle {
+        let sha256 = hex::encode(Sha256::digest(contents));
+        SourceBundle {
+            manifest_sha256: bundle_manifest_sha256(&[(path.to_string(), sha256.clone())]),
+            files: vec![crate::remote_node::SourceBundleFile {
+                path: path.to_string(),
+                sha256,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(contents),
+            }],
+        }
     }
 
     #[test]
@@ -1318,6 +1506,73 @@ mod tests {
     }
 
     #[test]
+    fn validation_accepts_a_verified_source_bundle_and_rejects_tampering() {
+        let mut bundled_source = source(&"a".repeat(40));
+        bundled_source.bundle = Some(source_bundle(
+            "Beal/Proof.lean",
+            b"theorem ok : True := by trivial\n",
+        ));
+        assert!(validate_lean_build(
+            &bundled_source,
+            None,
+            &["lake".to_string(), "build".to_string()],
+            &HashMap::new(),
+            &allowlist(),
+        )
+        .is_ok());
+
+        let bundle = bundled_source.bundle.as_mut().unwrap();
+        bundle.files[0].data_base64 = base64::engine::general_purpose::STANDARD.encode(b"tampered");
+        assert!(validate_lean_build(
+            &bundled_source,
+            None,
+            &["lake".to_string(), "build".to_string()],
+            &HashMap::new(),
+            &allowlist(),
+        )
+        .unwrap_err()
+        .contains("content hash mismatch"));
+
+        let mut unsafe_source = source(&"a".repeat(40));
+        unsafe_source.bundle = Some(source_bundle(".lake/build/poison", b"x"));
+        assert!(validate_lean_build(
+            &unsafe_source,
+            None,
+            &["lake".to_string(), "build".to_string()],
+            &HashMap::new(),
+            &allowlist(),
+        )
+        .unwrap_err()
+        .contains("unsafe source bundle path"));
+    }
+
+    #[tokio::test]
+    async fn source_bundle_application_is_atomic_and_emits_a_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let log = temp.path().join("job.log");
+        tokio::fs::create_dir_all(checkout.join("Beal"))
+            .await
+            .unwrap();
+        tokio::fs::write(checkout.join("Beal/Proof.lean"), b"old")
+            .await
+            .unwrap();
+        let bundle = source_bundle("Beal/Proof.lean", b"new proof\n");
+
+        apply_source_bundle(&checkout, &bundle, &log).await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read(checkout.join("Beal/Proof.lean"))
+                .await
+                .unwrap(),
+            b"new proof\n"
+        );
+        let receipt = tokio::fs::read_to_string(log).await.unwrap();
+        assert!(receipt.contains(&bundle.manifest_sha256));
+        assert!(receipt.contains("files=1 bytes=10"));
+    }
+
+    #[test]
     fn validation_rejects_local_repo_sources() {
         for bad in [
             "/srv/git/private.git",
@@ -1332,6 +1587,7 @@ mod tests {
                     &JobSource {
                         repo: bad.to_string(),
                         commit: "a".repeat(40),
+                        bundle: None,
                     },
                     None,
                     &["lake".to_string(), "build".to_string()],
@@ -1352,6 +1608,7 @@ mod tests {
                     &JobSource {
                         repo: good.to_string(),
                         commit: "a".repeat(40),
+                        bundle: None,
                     },
                     None,
                     &["lake".to_string(), "build".to_string()],
@@ -1543,14 +1800,17 @@ mod tests {
         let source_a = JobSource {
             repo: "https://example.com/a.git".to_string(),
             commit: "a".repeat(40),
+            bundle: None,
         };
         let source_a_next_commit = JobSource {
             repo: source_a.repo.clone(),
             commit: "b".repeat(40),
+            bundle: None,
         };
         let source_b = JobSource {
             repo: "https://example.com/b.git".to_string(),
             commit: "a".repeat(40),
+            bundle: None,
         };
         let build = vec!["lake".to_string(), "build".to_string(), "A".to_string()];
         let build_b = vec!["lake".to_string(), "build".to_string(), "B".to_string()];

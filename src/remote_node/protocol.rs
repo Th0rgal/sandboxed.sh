@@ -125,6 +125,24 @@ pub struct JobSource {
     /// Full 40-char lowercase hex commit SHA. Branch names are rejected so a
     /// job always builds a pinned, reproducible tree.
     pub commit: String,
+    /// Optional bounded overlay applied after resetting the pinned checkout.
+    /// This lets a local-only proof source run remotely without creating or
+    /// pushing a Git commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<SourceBundle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceBundleFile {
+    pub path: String,
+    pub sha256: String,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceBundle {
+    pub manifest_sha256: String,
+    pub files: Vec<SourceBundleFile>,
 }
 
 /// One artifact produced by a build job, relative to the checkout root.
@@ -168,6 +186,10 @@ pub enum JobPayload {
         /// `SANDBOXED_NODE_MAX_JOB_SECS`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_secs: Option<u64>,
+        /// Expected peak scratch consumption. Node and core admission reserve
+        /// this capacity before accepting the job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimated_disk_bytes: Option<u64>,
         /// Lake cache slot key. Defaults to a digest of the checkout's
         /// `lean-toolchain` + `lake-manifest.json` contents.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -464,10 +486,12 @@ mod tests {
             source: JobSource {
                 repo: "https://github.com/example/verity.git".to_string(),
                 commit: "a".repeat(40),
+                bundle: None,
             },
             cwd_rel: Some("morpho-verity".to_string()),
             command: vec!["lake".to_string(), "build".to_string()],
             timeout_secs: Some(3600),
+            estimated_disk_bytes: Some(12 << 30),
             cache_key: Some("abc123".to_string()),
             artifacts: vec![".lake/build/lib/*".to_string()],
             env: [("LEAN_NUM_THREADS".to_string(), "4".to_string())]
@@ -491,6 +515,7 @@ mod tests {
             JobPayload::LeanBuild {
                 cwd_rel,
                 timeout_secs,
+                estimated_disk_bytes,
                 cache_key,
                 artifacts,
                 env,
@@ -498,6 +523,7 @@ mod tests {
             } => {
                 assert_eq!(cwd_rel, None);
                 assert_eq!(timeout_secs, None);
+                assert_eq!(estimated_disk_bytes, None);
                 assert_eq!(cache_key, None);
                 assert!(artifacts.is_empty());
                 assert!(env.is_empty());

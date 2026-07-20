@@ -277,6 +277,29 @@ pub fn select_node_auto_with_reservations(
     min_mem_bytes: u64,
     reservations: &HashMap<String, u32>,
 ) -> Result<String, PlacementError> {
+    select_node_auto_with_resource_reservations(
+        nodes,
+        statuses,
+        requirements,
+        min_disk_bytes,
+        min_mem_bytes,
+        reservations,
+        &HashMap::new(),
+    )
+}
+
+/// Capacity-aware placement with both in-flight job-count reservations and
+/// future scratch-space reservations that heartbeat free-space figures cannot
+/// yet reflect.
+pub fn select_node_auto_with_resource_reservations(
+    nodes: &[RemoteNodeConfig],
+    statuses: &HashMap<String, CachedNodeStatus>,
+    requirements: &[String],
+    min_disk_bytes: u64,
+    min_mem_bytes: u64,
+    reservations: &HashMap<String, u32>,
+    disk_reservations: &HashMap<String, u64>,
+) -> Result<String, PlacementError> {
     let mut reasons: Vec<(String, String)> = Vec::new();
     // (queued, specialized, load, capacity, mem_avail, id)
     //
@@ -320,13 +343,16 @@ pub fn select_node_auto_with_reservations(
             reasons.push((node.id.clone(), format!("missing label '{missing}'")));
             continue;
         }
-        if heartbeat.disk_available_bytes < min_disk_bytes {
+        let disk_reserved = disk_reservations.get(&node.id).copied().unwrap_or(0);
+        let effective_disk_available = heartbeat.disk_available_bytes.saturating_sub(disk_reserved);
+        if effective_disk_available < min_disk_bytes {
             reasons.push((
                 node.id.clone(),
                 format!(
-                    "low disk ({} GiB available, {} GiB required)",
-                    heartbeat.disk_available_bytes / (1 << 30),
-                    min_disk_bytes / (1 << 30)
+                    "low disk ({} GiB effective available after {} GiB reserved, {} GiB required)",
+                    effective_disk_available / (1 << 30),
+                    disk_reserved / (1 << 30),
+                    min_disk_bytes / (1 << 30),
                 ),
             ));
             continue;
@@ -415,6 +441,28 @@ impl FleetMonitor {
             env_gb_bytes("REMOTE_NODE_MIN_DISK_GB", DEFAULT_MIN_DISK_GB),
             env_gb_bytes("REMOTE_NODE_MIN_MEM_GB", DEFAULT_MIN_MEM_GB),
             reservations,
+        )
+    }
+
+    /// Like [`Self::place_auto_with_reservations`], with an explicit disk
+    /// admission floor and scratch reservations for non-terminal jobs.
+    pub fn place_auto_with_resource_reservations(
+        &self,
+        settings: &RemoteNodeSettings,
+        requirements: &[String],
+        min_disk_bytes: u64,
+        reservations: &HashMap<String, u32>,
+        disk_reservations: &HashMap<String, u64>,
+    ) -> Result<String, PlacementError> {
+        let statuses = self.statuses.read().unwrap_or_else(|e| e.into_inner());
+        select_node_auto_with_resource_reservations(
+            &settings.nodes,
+            &statuses,
+            requirements,
+            min_disk_bytes,
+            env_gb_bytes("REMOTE_NODE_MIN_MEM_GB", DEFAULT_MIN_MEM_GB),
+            reservations,
+            disk_reservations,
         )
     }
 }
@@ -942,6 +990,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(picked, "b");
+    }
+
+    #[test]
+    fn placement_subtracts_nonterminal_disk_reservations() {
+        let nodes = vec![node_config("a"), node_config("b")];
+        let statuses = HashMap::from([
+            (
+                "a".to_string(),
+                cached_online("a", &["lean"], 100, 64, 4, 0, 0),
+            ),
+            (
+                "b".to_string(),
+                cached_online("b", &["lean"], 40, 32, 4, 0, 0),
+            ),
+        ]);
+        let disk_reservations = HashMap::from([("a".to_string(), 85 * GIB)]);
+        let picked = select_node_auto_with_resource_reservations(
+            &nodes,
+            &statuses,
+            &["lean".to_string()],
+            20 * GIB,
+            8 * GIB,
+            &HashMap::new(),
+            &disk_reservations,
+        )
+        .unwrap();
+        assert_eq!(picked, "b");
+
+        let error = select_node_auto_with_resource_reservations(
+            &[node_config("a")],
+            &statuses,
+            &["lean".to_string()],
+            20 * GIB,
+            8 * GIB,
+            &HashMap::new(),
+            &disk_reservations,
+        )
+        .unwrap_err();
+        assert!(error.reasons[0].1.contains("85 GiB reserved"));
     }
 
     #[test]

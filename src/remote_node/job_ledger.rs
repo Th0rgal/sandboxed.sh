@@ -38,6 +38,10 @@ pub struct JobHandle {
     /// handles keep this empty and must remain conservatively reserved.
     #[serde(default)]
     pub accepted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Scratch capacity reserved for this job until it reaches terminal state.
+    /// Older ledgers deserialize this as zero.
+    #[serde(default)]
+    pub disk_reservation_bytes: u64,
     #[serde(default)]
     pub kind: JobHandleKind,
 }
@@ -121,6 +125,7 @@ mod tests {
             job_id,
             started_at: chrono::Utc::now(),
             accepted_at: Some(chrono::Utc::now()),
+            disk_reservation_bytes: 0,
             kind: JobHandleKind::Mission,
         };
 
@@ -145,6 +150,7 @@ mod tests {
                 job_id: Uuid::new_v4(),
                 started_at: chrono::Utc::now(),
                 accepted_at: Some(chrono::Utc::now()),
+                disk_reservation_bytes: 0,
                 kind: JobHandleKind::Mission,
             },
         )
@@ -193,6 +199,7 @@ mod tests {
             job_id,
             started_at: chrono::Utc::now(),
             accepted_at: None,
+            disk_reservation_bytes: 0,
             kind: JobHandleKind::Tentative,
         };
         record(dir.path(), handle.clone()).await.unwrap();

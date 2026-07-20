@@ -218,9 +218,13 @@ Node env vars for lean-build jobs:
   payload may set (default `LEAN_NUM_THREADS,LAKE_JOBS`); anything else is
   rejected before the build starts.
 - `SANDBOXED_NODE_MIN_FREE_GB` — free-space floor (default 10 GiB) for the
-  node's cache GC: every 30 minutes, when the work-dir filesystem drops below
-  it, checkout dirs then lake cache slots are LRU-deleted (by dir mtime)
-  until the threshold is met.
+  node's admission and cache GC. A build is rejected unless its declared
+  scratch estimate fits above this floor. Every 30 minutes, when the work-dir
+  filesystem drops below it, checkout dirs then lake cache slots are
+  LRU-deleted (by dir mtime) until the threshold is met.
+- `SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES` — maximum decoded size of a local
+  source overlay (default 1 MiB; at most 256 regular files). Paths, per-file
+  hashes and the manifest hash are verified before any file is applied.
 - `SANDBOXED_NODE_GIT_SSH_KEY` — path to an SSH key used for git fetches
   (`GIT_SSH_COMMAND="ssh -i <key> -o IdentitiesOnly=yes -o
   StrictHostKeyChecking=accept-new"`); unset = default git auth.
@@ -346,7 +350,9 @@ A node is eligible when all of the following hold:
 - cached status is `online`
 - its labels (heartbeat, falling back to static config) cover every
   requirement
-- `disk_available` ≥ `REMOTE_NODE_MIN_DISK_GB` (default 20)
+- effective disk after non-terminal reservations is at least the greater of
+  `REMOTE_NODE_MIN_DISK_GB` (default 20) and the request's scratch estimate
+  plus `REMOTE_NODE_DISK_EMERGENCY_GB` (default 10)
 - `mem_available` ≥ `REMOTE_NODE_MIN_MEM_GB` (default 8)
 - `active_jobs + queued_jobs + active_leases + core reservations < 2 * capacity_total`
 
@@ -359,9 +365,7 @@ still selected before queueing behind a saturated CPU node, and an explicit
 available memory and stable node id as tie-breakers. When no node qualifies the
 request **fails closed** with every
 configured node listed alongside its exclusion reason (offline / missing
-label X / low disk / low memory / busy), e.g.
-`no eligible remote node (babylon: low disk (12 GiB available, 20 GiB
-required); nippur: missing label 'lean')`.
+label X / low disk after reservations / low memory / busy).
 
 Hermes receives the same live capacity through the assistant MCP
 `get_compute_fleet` tool. Controllers should call it before parallel dispatch,
