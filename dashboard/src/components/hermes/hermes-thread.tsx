@@ -20,6 +20,7 @@ import {
   getHermesSessionMessages,
   hermesChatStream,
   listHermesSessions,
+  type HermesMessage,
   type HermesSession,
 } from "@/lib/api";
 import { LazyMarkdownContent } from "@/components/markdown-content";
@@ -35,10 +36,50 @@ interface ChatItem {
   toolStatus?: "running" | "done" | "failed";
 }
 
+const TRANSCRIPT_POLL_MS = 5_000;
+
 let nextLocalId = 0;
 function localId(prefix: string): string {
   nextLocalId += 1;
   return `${prefix}-${nextLocalId}`;
+}
+
+function persistedRows(messages: HermesMessage[]): ChatItem[] {
+  const rows: ChatItem[] = [];
+  for (const message of messages) {
+    const id =
+      message.id == null
+        ? localId("hist")
+        : `persisted-${String(message.id)}`;
+    if (message.role === "user" || message.role === "assistant") {
+      const content = (message.content ?? "").trim();
+      if (content) rows.push({ id, role: message.role, content });
+    } else if (message.role === "tool") {
+      rows.push({
+        id,
+        role: "tool",
+        content: (message.content ?? "").trim(),
+        toolName: message.tool_name ?? undefined,
+        toolStatus: "done",
+      });
+    }
+  }
+  return rows;
+}
+
+function sameTranscript(left: ChatItem[], right: ChatItem[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((item, index) => {
+      const other = right[index];
+      return (
+        item.role === other?.role &&
+        item.content === other.content &&
+        item.toolName === other.toolName &&
+        item.toolStatus === other.toolStatus
+      );
+    })
+  );
 }
 
 export function HermesThread({ className }: { className?: string }) {
@@ -104,24 +145,7 @@ export function HermesThread({ className }: { className?: string }) {
     try {
       const messages = await getHermesSessionMessages(id);
       if (genRef.current !== gen) return;
-      const rows: ChatItem[] = [];
-      for (const m of messages) {
-        if (m.role === "user" || m.role === "assistant") {
-          const content = (m.content ?? "").trim();
-          if (content) {
-            rows.push({ id: localId("hist"), role: m.role, content });
-          }
-        } else if (m.role === "tool") {
-          rows.push({
-            id: localId("hist"),
-            role: "tool",
-            content: (m.content ?? "").trim(),
-            toolName: m.tool_name ?? undefined,
-            toolStatus: "done",
-          });
-        }
-      }
-      setItems(rows);
+      setItems(persistedRows(messages));
     } catch (e) {
       if (genRef.current === gen) {
         setError(e instanceof Error ? e.message : "Failed to load session");
@@ -130,6 +154,40 @@ export function HermesThread({ className }: { className?: string }) {
       if (genRef.current === gen) setHistoryLoading(false);
     }
   }, []);
+
+  // Cron/callback delivery for Desktop sessions is persisted after the
+  // originating HTTP stream has ended. Refresh the active transcript so those
+  // durable assistant turns appear in the same conversation without requiring
+  // a manual session switch or page reload.
+  useEffect(() => {
+    if (!sessionId || loading || historyLoading) return;
+
+    let cancelled = false;
+    const refreshTranscript = async () => {
+      if (document.visibilityState === "hidden") return;
+      try {
+        const messages = await getHermesSessionMessages(sessionId);
+        if (cancelled) return;
+        const rows = persistedRows(messages);
+        setItems((current) => {
+          if (sameTranscript(current, rows)) return current;
+          return rows;
+        });
+      } catch {
+        // Background refresh is best-effort. Explicit session loads and sends
+        // still surface errors through the normal UI.
+      }
+    };
+
+    const timer = window.setInterval(
+      () => void refreshTranscript(),
+      TRANSCRIPT_POLL_MS,
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [historyLoading, loading, sessionId]);
 
   const newSession = useCallback(() => {
     genRef.current += 1;
