@@ -1932,6 +1932,22 @@ pub async fn hermes_remote_proxy(
 
 pub const HERMES_CHAT_PROXY_PATH: &str = "/api/assistant/hermes";
 
+fn sanitize_hermes_chat_proxy_headers(headers: &mut axum::http::HeaderMap) {
+    for header in [
+        axum::http::header::HOST,
+        axum::http::header::CONTENT_LENGTH,
+        axum::http::header::CONNECTION,
+        axum::http::header::TRANSFER_ENCODING,
+        // Hermes applies browser-origin CSRF checks to mutating session
+        // routes. This is a trusted server-to-server hop protected by the
+        // dashboard JWT, so forwarding the browser origin makes valid writes
+        // look like cross-origin requests to the loopback-only upstream.
+        axum::http::header::ORIGIN,
+    ] {
+        headers.remove(header);
+    }
+}
+
 /// Dashboard-authenticated proxy for the Hermes session/chat API
 /// (`/api/assistant/hermes/*` → `http://127.0.0.1:<api-server-port>`).
 ///
@@ -1979,14 +1995,7 @@ pub async fn hermes_chat_proxy(
 
     let method = req.method().clone();
     let mut headers = req.headers().clone();
-    for hop in [
-        axum::http::header::HOST,
-        axum::http::header::CONTENT_LENGTH,
-        axum::http::header::CONNECTION,
-        axum::http::header::TRANSFER_ENCODING,
-    ] {
-        headers.remove(hop);
-    }
+    sanitize_hermes_chat_proxy_headers(&mut headers);
     // Swap the dashboard JWT for the Hermes bearer.
     match axum::http::HeaderValue::from_str(&format!("Bearer {key}")) {
         Ok(value) => {
@@ -5165,10 +5174,32 @@ mod tests {
         hermes_config_base_url, hermes_config_model_label, hermes_config_yaml, hermes_service_unit,
         hermes_uses_native_codex, install_versioned_binary_as, is_safe_repo_path,
         normalize_repo_path, prepare_deploy_backup, prune_deploy_backups, rollback_deployed_binary,
-        sandboxed_service_name_from_path, select_repo_path, systemd_service_component_from_states,
-        upsert_hermes_mcp_command, ComponentStatus, DebounceDecision, DeployRefusal,
-        DeployRollback, DEPLOY_DEBOUNCE_SECS, HERMES_SERVICE_DRAIN_DROP_IN,
+        sandboxed_service_name_from_path, sanitize_hermes_chat_proxy_headers, select_repo_path,
+        systemd_service_component_from_states, upsert_hermes_mcp_command, ComponentStatus,
+        DebounceDecision, DeployRefusal, DeployRollback, DEPLOY_DEBOUNCE_SECS,
+        HERMES_SERVICE_DRAIN_DROP_IN,
     };
+
+    #[test]
+    fn hermes_chat_proxy_removes_browser_origin_but_keeps_application_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://localhost:3001"),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        sanitize_hermes_chat_proxy_headers(&mut headers);
+
+        assert!(!headers.contains_key(axum::http::header::ORIGIN));
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_TYPE),
+            Some(&axum::http::HeaderValue::from_static("application/json"))
+        );
+    }
 
     #[test]
     fn generated_hermes_config_allows_long_ask_turns_and_workspace_management() {
