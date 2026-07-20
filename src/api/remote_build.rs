@@ -342,7 +342,7 @@ struct CoreReservations {
     disk_bytes: HashMap<String, u64>,
 }
 
-async fn core_side_reservations(state: &AppState) -> CoreReservations {
+async fn core_side_reservations(state: &AppState) -> Result<CoreReservations, String> {
     match crate::remote_node::job_ledger::load(&state.config.working_dir).await {
         Ok(handles) => {
             let mut reservations = CoreReservations::default();
@@ -371,12 +371,11 @@ async fn core_side_reservations(state: &AppState) -> CoreReservations {
                     *reservations.jobs.entry(handle.node_id).or_insert(0) += 1;
                 }
             }
-            reservations
+            Ok(reservations)
         }
-        Err(error) => {
-            tracing::warn!(?error, "remote job reservations could not be loaded");
-            CoreReservations::default()
-        }
+        Err(error) => Err(format!(
+            "remote job reservations could not be loaded; disk-aware placement fails closed: {error}"
+        )),
     }
 }
 
@@ -417,7 +416,9 @@ async fn resolve_node(
         ));
     }
     if node_id.eq_ignore_ascii_case("auto") {
-        let reservations = core_side_reservations(state).await;
+        let reservations = core_side_reservations(state)
+            .await
+            .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
         let first = state.fleet.place_auto_with_resource_reservations(
             settings,
             requirements,
@@ -453,7 +454,9 @@ async fn resolve_node(
                         .map(|node| crate::remote_node::probe_node(&state.fleet, &client, node)),
                 )
                 .await;
-                let reservations = core_side_reservations(state).await;
+                let reservations = core_side_reservations(state)
+                    .await
+                    .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
                 state
                     .fleet
                     .place_auto_with_resource_reservations(
@@ -475,7 +478,9 @@ async fn resolve_node(
         StatusCode::BAD_REQUEST,
         format!("remote node '{node_id}' is not configured"),
     ))?;
-    let reservations = core_side_reservations(state).await;
+    let reservations = core_side_reservations(state)
+        .await
+        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
     let cached = state.fleet.get(&node.id).ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         format!("remote node '{}' has no heartbeat data", node.id),
