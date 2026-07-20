@@ -418,6 +418,9 @@ pub enum ControlCommand {
         working_directory: Option<String>,
         /// FLEET-001 scheduling metadata (priority, not_before, deadline).
         scheduling: crate::api::mission_store::MissionScheduling,
+        /// Whether creation consumes the API host's local scratch space.
+        /// Remote-node missions bypass the host disk-pressure gate.
+        requires_local_disk: bool,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Update mission status

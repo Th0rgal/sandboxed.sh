@@ -4235,8 +4235,8 @@ pub struct FleetHealth {
 }
 
 /// Admission preflight: `Some(reason)` when new missions must be refused
-/// because the root filesystem is critically full. `DISK_ADMISSION_ENABLED=0`
-/// is the escape hatch. Warn level admits but logs.
+/// because the root filesystem is critically full, or is at warn level while
+/// `DISK_ADMISSION_AT_WARN=1`. `DISK_ADMISSION_ENABLED=0` is the escape hatch.
 fn disk_admission_refusal() -> Option<String> {
     let enabled = std::env::var("DISK_ADMISSION_ENABLED")
         .map(|v| v.trim() != "0" && !v.trim().eq_ignore_ascii_case("false"))
@@ -4251,6 +4251,18 @@ fn disk_admission_refusal() -> Option<String> {
              Free space or raise DISK_CRITICAL_PCT, then retry.",
             total.saturating_sub(used) / (1024 * 1024 * 1024)
         )),
+        crate::api::monitoring::DiskHealthLevel::Warn
+            if std::env::var("DISK_ADMISSION_AT_WARN")
+                .map(|value| value.trim() == "1" || value.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false) =>
+        {
+            Some(format!(
+                "mission creation refused: disk above the admission warning threshold \
+                 ({percent:.1}% used, {} GB free). Wait for workspace GC, select a remote \
+                 node, or free space.",
+                total.saturating_sub(used) / (1024 * 1024 * 1024)
+            ))
+        }
         crate::api::monitoring::DiskHealthLevel::Warn => {
             tracing::warn!(
                 disk_percent = percent,
@@ -6106,19 +6118,29 @@ pub async fn create_mission(
     // Writer creation is checked once before actor creation and again while
     // tagging the returned mission. Never hold this mutex while waiting on the
     // control actor: actor commands also acquire it when resuming writers.
-    if let Some(estimated_gib) = req.estimated_disk_gib {
+    let local_mission = req
+        .remote_node_id
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty);
+    let effective_estimated_disk_gib = req.estimated_disk_gib.or_else(|| {
+        local_mission
+            .then(|| {
+                std::env::var("MISSION_DISK_DEFAULT_ESTIMATE_GIB")
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+                    .filter(|estimate| (1..=512).contains(estimate))
+            })
+            .flatten()
+    });
+    if let Some(estimated_gib) = effective_estimated_disk_gib {
         if estimated_gib == 0 || estimated_gib > 512 {
             return Err((
                 StatusCode::BAD_REQUEST,
                 "estimated_disk_gib must be between 1 and 512".to_string(),
             ));
         }
-        if req
-            .remote_node_id
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
+        if local_mission {
             let (used, total, _) = crate::api::monitoring::current_disk_usage();
             let reserve_gib = std::env::var("MISSION_DISK_EMERGENCY_RESERVE_GB")
                 .ok()
@@ -6132,7 +6154,7 @@ pub async fn create_mission(
         }
     }
     let mut normalized_request_tags = normalize_mission_tags(req.tags.as_deref());
-    if let Some(estimated_gib) = req.estimated_disk_gib {
+    if let Some(estimated_gib) = effective_estimated_disk_gib {
         let tag = format!("disk-estimate-gib:{estimated_gib}");
         let tags = normalized_request_tags.get_or_insert_with(Vec::new);
         if !tags.iter().any(|existing| existing == &tag) {
@@ -6282,6 +6304,7 @@ pub async fn create_mission(
                 not_before: req.not_before.map(|t| t.to_rfc3339()),
                 deadline: req.deadline.map(|t| t.to_rfc3339()),
             },
+            requires_local_disk: local_mission,
             respond: tx,
         })
         .await
@@ -13859,15 +13882,17 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, scheduling, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, scheduling, requires_local_disk, respond } => {
                         // Disk preflight: refuse new missions when the root
                         // filesystem is critically full instead of letting
                         // workers die mid-flight on ENOSPC. Actor-level so
                         // the HTTP, Ask and Telegram entrypoints are all
                         // covered by this single gate.
-                        if let Some(refusal) = disk_admission_refusal() {
-                            let _ = respond.send(Err(refusal));
-                            continue;
+                        if requires_local_disk {
+                            if let Some(refusal) = disk_admission_refusal() {
+                                let _ = respond.send(Err(refusal));
+                                continue;
+                            }
                         }
                         // First persist current mission history
                         persist_mission_history(

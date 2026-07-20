@@ -68,6 +68,13 @@ async fn run_loop(state: Arc<AppState>) {
         let recovered = alerted_level != DiskHealthLevel::Ok
             && percent < monitoring::disk_warn_pct() - RECOVERY_MARGIN_PCT;
 
+        if level != DiskHealthLevel::Ok {
+            let gc_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                super::mission_workspace_gc::run_pressure_sweep(&gc_state).await;
+            });
+        }
+
         if level != DiskHealthLevel::Ok && (escalated || repeat_due) {
             let free_gb = total.saturating_sub(used) / (1024 * 1024 * 1024);
             let message = format!(

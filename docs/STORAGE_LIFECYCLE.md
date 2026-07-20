@@ -37,8 +37,11 @@ The background mission-directory retention sweep is also dry-run by default.
 With cleanup enabled in Settings, it emits structured `mission GC audit` logs
 with `action=would_remove`, ownership identifiers, size, path, and reason. It
 will execute only if an operator explicitly sets `WORKSPACE_GC_EXECUTE=1` on
-the service and restarts it. Do not set that flag until the candidate report has
-been reviewed and backed up; it is deliberately off by default.
+the service and restarts it. The default retention is one day for terminal
+missions and seven days for AwaitingUser/Paused missions. The normal sweep is
+hourly unless `WORKSPACE_GC_INTERVAL_MINUTES` is set. While disk pressure is at
+Warn or Critical, the disk watcher requests the same configured sweep every
+five minutes; a shared lock prevents overlapping scans.
 
 Resource limits are separate from retention. Use `GET
 /api/workspaces/:id/resources` to inspect effective memory/swap/CPU limits and
@@ -46,11 +49,33 @@ matching live scopes before changing a workspace shared by concurrent missions.
 
 ## Admission and continuity
 
-Disk warning is not a portfolio-wide stop. Small/no-build controller, review,
-Fable and source-analysis lanes remain eligible at warn level. A local
-disk-heavy mission should set `estimated_disk_gib`; the API rejects only that
-mission when its estimate would cross `MISSION_DISK_EMERGENCY_RESERVE_GB`
-(default 64 GiB). Critical level still rejects all new local missions.
+By default, disk warning is not a portfolio-wide stop. Set
+`DISK_ADMISSION_AT_WARN=1` on build-heavy hosts to refuse all new missions at
+Warn instead of waiting for Critical. A local disk-heavy mission should set
+`estimated_disk_gib`; the API rejects it when its estimate would cross
+`MISSION_DISK_EMERGENCY_RESERVE_GB` (default 64 GiB).
+`MISSION_DISK_DEFAULT_ESTIMATE_GIB` supplies a fail-safe estimate when a local
+request omits one. Critical level always rejects all new local missions.
+
+For a high-churn Lean/build host, a deliberately aggressive profile is:
+
+```bash
+DISK_WARN_PCT=80
+DISK_CRITICAL_PCT=88
+DISK_ADMISSION_AT_WARN=1
+MISSION_DISK_EMERGENCY_RESERVE_GB=200
+MISSION_DISK_DEFAULT_ESTIMATE_GIB=64
+WORKSPACE_GC_EXECUTE=1
+WORKSPACE_GC_INTERVAL_MINUTES=10
+```
+
+Host-level caches and harness logs are outside the mission ownership model.
+Install `scripts/storage_hard_cleanup.sh --apply` from an hourly systemd timer
+on dedicated build hosts. It removes expired mission-store backups, old
+OpenCode logs, reconstructible OpenCode cache entries, Hermes staging and
+quarantine content, truncates oversized harness logs, and caps the journal.
+Its retention and size controls are environment-configurable; run it without
+`--apply` for an inventory.
 
 Lean builds should use `remote-lean-build`. The wrapper can ship modified and
 untracked regular source files as a bounded, content-hashed overlay on top of a

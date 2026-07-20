@@ -26,14 +26,11 @@ use super::control::MissionStatus;
 use super::routes::AppState;
 use crate::workspace;
 
-/// How often the GC wakes up to scan for collectible workspaces.
-const TICK_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
-
 /// Default retention when no value is configured in settings.
-pub const DEFAULT_RETENTION_DAYS: u32 = 7;
+pub const DEFAULT_RETENTION_DAYS: u32 = 1;
 
 /// Default long-stop retention for AwaitingUser/Paused mission dirs.
-pub const DEFAULT_STOPPED_RETENTION_DAYS: u32 = 30;
+pub const DEFAULT_STOPPED_RETENTION_DAYS: u32 = 7;
 
 /// Page size for `list_missions` pagination — keeps the scan bounded in
 /// memory even when a session has thousands of missions.
@@ -44,6 +41,20 @@ const LIST_PAGE_SIZE: usize = 200;
 /// and prevents a configuration migration from deleting historical work.
 const EXECUTE_ENV: &str = "WORKSPACE_GC_EXECUTE";
 
+fn tick_interval() -> Duration {
+    let minutes = std::env::var("WORKSPACE_GC_INTERVAL_MINUTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|minutes| (1..=24 * 60).contains(minutes))
+        .unwrap_or(60);
+    Duration::from_secs(minutes * 60)
+}
+
+fn sweep_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Spawn the background GC loop. Safe to call once at server start.
 pub fn spawn(state: Arc<AppState>) {
     tokio::spawn(async move {
@@ -52,41 +63,61 @@ pub fn spawn(state: Arc<AppState>) {
 }
 
 async fn run_loop(state: Arc<AppState>) {
-    let mut interval = tokio::time::interval(TICK_INTERVAL);
+    let mut interval = tokio::time::interval(tick_interval());
     // First tick fires immediately; skip it so we don't run on the same
     // hot-path tick that's still booting telegram/openroute/etc.
     interval.tick().await;
     loop {
         interval.tick().await;
-        let started = std::time::Instant::now();
-        let settings = read_settings(&state).await;
-        if !settings.enabled {
-            tracing::trace!("mission workspace GC disabled");
-            continue;
-        }
-        let now = Utc::now();
-        let params = SweepParams {
-            cutoff: now - chrono::Duration::days(settings.days as i64),
-            stopped_cutoff: now - chrono::Duration::days(settings.stopped_days as i64),
-            orphans_enabled: settings.orphans_enabled,
-            dry_run: !gc_execution_enabled(),
-        };
-        let report = run_once(&state, &params).await;
-        tracing::info!(
-            removed = report.removed,
-            proposed = report.proposed,
-            orphans_removed = report.orphans_removed,
-            stopped_removed = report.stopped_removed,
-            errors = report.errors,
-            scanned = report.scanned,
-            bytes_freed = report.bytes_freed,
-            duration_ms = started.elapsed().as_millis() as u64,
-            retention_days = settings.days,
-            stopped_retention_days = settings.stopped_days,
-            dry_run = params.dry_run,
-            "mission workspace GC sweep finished",
-        );
+        run_configured_sweep(&state, "scheduled").await;
     }
+}
+
+/// Run the normal configured sweep immediately when the disk watcher observes
+/// pressure. The shared try-lock keeps a five-minute pressure watcher from
+/// piling up behind a slow scheduled scan.
+pub(crate) async fn run_pressure_sweep(state: &Arc<AppState>) {
+    if !gc_execution_enabled() {
+        tracing::trace!("mission workspace GC pressure sweep skipped in dry-run mode");
+        return;
+    }
+    run_configured_sweep(state, "disk-pressure").await;
+}
+
+async fn run_configured_sweep(state: &Arc<AppState>, trigger: &'static str) {
+    let settings = read_settings(state).await;
+    if !settings.enabled {
+        tracing::trace!(trigger, "mission workspace GC disabled");
+        return;
+    }
+    let Ok(_guard) = sweep_lock().try_lock() else {
+        tracing::debug!(trigger, "mission workspace GC sweep already running");
+        return;
+    };
+    let started = std::time::Instant::now();
+    let now = Utc::now();
+    let params = SweepParams {
+        cutoff: now - chrono::Duration::days(settings.days as i64),
+        stopped_cutoff: now - chrono::Duration::days(settings.stopped_days as i64),
+        orphans_enabled: settings.orphans_enabled,
+        dry_run: !gc_execution_enabled(),
+    };
+    let report = run_once(state, &params).await;
+    tracing::info!(
+        trigger,
+        removed = report.removed,
+        proposed = report.proposed,
+        orphans_removed = report.orphans_removed,
+        stopped_removed = report.stopped_removed,
+        errors = report.errors,
+        scanned = report.scanned,
+        bytes_freed = report.bytes_freed,
+        duration_ms = started.elapsed().as_millis() as u64,
+        retention_days = settings.days,
+        stopped_retention_days = settings.stopped_days,
+        dry_run = params.dry_run,
+        "mission workspace GC sweep finished",
+    );
 }
 
 fn gc_execution_enabled() -> bool {
