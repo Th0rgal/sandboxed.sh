@@ -689,9 +689,17 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
 
         if let Some(pid) = job.pid {
             if !process_owned_by_job(&job, pid) {
-                job.status = DurableJobStatus::Unknown;
-                job.updated_at = Utc::now();
-                job = write_job(state, &job).await.unwrap_or(job);
+                // systemd-run may need a brief moment to attach the payload
+                // to its transient scope, and very short commands can exit
+                // just before their wrapper atomically publishes exit.json.
+                // Keep the persisted start lease provisional during that
+                // bounded window instead of returning a false `unknown`.
+                let now = Utc::now();
+                if (now - job.created_at).num_seconds() >= PIDLESS_START_GRACE_SECS {
+                    job.status = DurableJobStatus::Unknown;
+                    job.updated_at = now;
+                    job = write_job(state, &job).await.unwrap_or(job);
+                }
             } else {
                 let now = Utc::now();
                 if job.deadline_at.is_some_and(|deadline| deadline <= now) {
