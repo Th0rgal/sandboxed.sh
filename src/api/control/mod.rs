@@ -5426,16 +5426,20 @@ fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Opti
         if !WRITER_VERBS.contains(word) {
             return false;
         }
-        let negated_before = words[index.saturating_sub(3)..index]
-            .iter()
-            .any(|prior| NEGATORS_BEFORE.contains(prior));
+        let negated_immediately = index > 0 && NEGATORS_BEFORE.contains(&words[index - 1]);
+        let coordinated_negation = (index.saturating_sub(4)..index).any(|negator_index| {
+            NEGATORS_BEFORE.contains(&words[negator_index])
+                && words[(negator_index + 1)..index].iter().all(|between| {
+                    WRITER_VERBS.contains(between) || matches!(*between, "and" | "or")
+                })
+        });
         let stopped_before =
             index >= 2 && words[index - 2] == "stop" && words[index - 1] == "before";
         let after_end = (index + 4).min(words.len());
         let negated_after = words[(index + 1).min(words.len())..after_end]
             .iter()
             .any(|next| NEGATORS_AFTER.contains(next));
-        !(negated_before || stopped_before || negated_after)
+        !(negated_immediately || coordinated_negation || stopped_before || negated_after)
     })
 }
 
@@ -20012,6 +20016,11 @@ mod tests {
             None,
             None,
             Some("Run tests before committing to the branch")
+        ));
+        assert!(inferred_pr_writer(
+            None,
+            None,
+            Some("No tests required; fix the failing branch")
         ));
         assert!(!inferred_pr_writer(
             None,
