@@ -677,6 +677,7 @@ fn dispatch_board_outbox_item(
         Ok(()) => {
             let store = Arc::clone(mission_store);
             let inflight = Arc::clone(inflight);
+            let release_tx = cmd_tx.clone();
             tokio::spawn(async move {
                 match rx.await {
                     Ok(UserMessageAck::Queued | UserMessageAck::Delivered) => {
@@ -690,10 +691,17 @@ fn dispatch_board_outbox_item(
                             Err(error) => {
                                 tracing::warn!(target = %target_mission_id, %idempotency_key,
                                     "board: accepted delivery acknowledgement failed: {error}");
+                                inflight
+                                    .lock()
+                                    .expect("board outbox lock")
+                                    .remove(&delivery_id);
                             }
                         }
                     }
                     Ok(UserMessageAck::Dropped) => {
+                        let _ = release_tx
+                            .send(ControlCommand::ReleaseUserMessageId { id: delivery_id })
+                            .await;
                         inflight
                             .lock()
                             .expect("board outbox lock")
@@ -705,6 +713,9 @@ fn dispatch_board_outbox_item(
                         );
                     }
                     Ok(UserMessageAck::Rejected(reason)) => {
+                        let _ = release_tx
+                            .send(ControlCommand::ReleaseUserMessageId { id: delivery_id })
+                            .await;
                         inflight
                             .lock()
                             .expect("board outbox lock")
@@ -717,6 +728,9 @@ fn dispatch_board_outbox_item(
                         );
                     }
                     Err(error) => {
+                        let _ = release_tx
+                            .send(ControlCommand::ReleaseUserMessageId { id: delivery_id })
+                            .await;
                         inflight
                             .lock()
                             .expect("board outbox lock")
@@ -1487,6 +1501,10 @@ mod tests {
         })
         .await
         .expect("dropped delivery released");
+        assert!(matches!(
+            cmd_rx.recv().await,
+            Some(ControlCommand::ReleaseUserMessageId { .. })
+        ));
         assert_eq!(store.list_pending_board_outbox(10).await.unwrap().len(), 1);
     }
 

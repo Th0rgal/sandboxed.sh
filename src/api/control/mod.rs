@@ -11924,10 +11924,6 @@ fn accept_user_message_id(accepted: &mut HashSet<Uuid>, id: Uuid) -> bool {
     accepted.insert(id)
 }
 
-fn retryable_duplicate_source(source: Option<&str>) -> bool {
-    source == Some("task-board")
-}
-
 fn mission_status_for_terminal_reason(
     reason: TerminalReason,
     complete_turn_without_follow_up: bool,
@@ -13282,8 +13278,7 @@ async fn control_actor_loop(
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
-                        let duplicate = !accept_user_message_id(&mut accepted_user_message_ids, id);
-                        if duplicate && !retryable_duplicate_source(source.as_deref()) {
+                        if !accept_user_message_id(&mut accepted_user_message_ids, id) {
                             let status_snapshot = status.read().await;
                             let _ = respond.send(if status_snapshot.state != ControlRunState::Idle {
                                 UserMessageAck::Queued
@@ -13291,10 +13286,6 @@ async fn control_actor_loop(
                                 UserMessageAck::Delivered
                             });
                             continue;
-                        }
-                        if duplicate {
-                            tracing::info!(message_id = %id,
-                                "Reprocessing pending durable board delivery after a prior non-acknowledgement");
                         }
 
                         // Smart routing: decide where to send this message based on target_mission_id
@@ -14227,6 +14218,9 @@ async fn control_actor_loop(
                             }
                         }
                         let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
+                    }
+                    ControlCommand::ReleaseUserMessageId { id } => {
+                        accepted_user_message_ids.remove(&id);
                     }
                     ControlCommand::ToolResult { tool_call_id, name, result, respond } => {
                         // Deliver to the tool hub. resolve() caches the result if
@@ -24764,9 +24758,6 @@ Investigate <service/> failures.
 
         assert!(accept_user_message_id(&mut accepted, message_id));
         assert!(!accept_user_message_id(&mut accepted, message_id));
-        assert!(retryable_duplicate_source(Some("task-board")));
-        assert!(!retryable_duplicate_source(Some("api:user")));
-        assert!(!retryable_duplicate_source(None));
     }
 
     fn assistant(content: &str) -> MissionHistoryEntry {

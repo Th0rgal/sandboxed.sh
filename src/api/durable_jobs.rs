@@ -591,11 +591,12 @@ fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
                 }
                 _ = heartbeat.tick() => {
                     if let Ok(mut job) = read_job(&state, id).await {
-                        if job.status != DurableJobStatus::Running { break; }
-                        let now = Utc::now();
-                        job.heartbeat_at = Some(now);
-                        job.updated_at = now;
-                        let _ = write_job(&state, &job).await;
+                        if job_accepts_heartbeat(&job.status) {
+                            let now = Utc::now();
+                            job.heartbeat_at = Some(now);
+                            job.updated_at = now;
+                            let _ = write_job(&state, &job).await;
+                        }
                     }
                 }
                 _ = tokio::time::sleep(deadline), if !deadline.is_zero() => {
@@ -638,6 +639,10 @@ fn job_has_liveness_evidence(
 
 fn retryable_pidless_receipt(job: &DurableJob) -> bool {
     job.status == DurableJobStatus::Unknown && job.pid.is_none()
+}
+
+fn job_accepts_heartbeat(status: &DurableJobStatus) -> bool {
+    *status == DurableJobStatus::Running
 }
 
 #[cfg(unix)]
@@ -1178,7 +1183,7 @@ pub async fn cancel_job(
         .map_err(|e| err(StatusCode::NOT_FOUND, e))?;
     authorize_job(&state, &user, &job).await?;
     job = refresh_job(&state, job).await;
-    if job.status == DurableJobStatus::Running {
+    if job_accepts_heartbeat(&job.status) {
         job.status = DurableJobStatus::Cancelled;
         job.updated_at = Utc::now();
         job = write_job(&state, &job)
@@ -1271,6 +1276,19 @@ mod tests {
         assert!(retryable_pidless_receipt(&job));
         job.pid = Some(123);
         assert!(!retryable_pidless_receipt(&job));
+    }
+
+    #[test]
+    fn terminal_jobs_stop_heartbeat_updates_without_stopping_the_watcher() {
+        assert!(job_accepts_heartbeat(&DurableJobStatus::Running));
+        for status in [
+            DurableJobStatus::Completed,
+            DurableJobStatus::Failed,
+            DurableJobStatus::Cancelled,
+            DurableJobStatus::Unknown,
+        ] {
+            assert!(!job_accepts_heartbeat(&status));
+        }
     }
 
     #[test]
