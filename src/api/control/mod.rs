@@ -5417,8 +5417,8 @@ fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Opti
         "update",
         "updating",
     ];
-    const NEGATORS_BEFORE: [&str; 9] = [
-        "not", "never", "no", "without", "dont", "cannot", "cant", "forbid", "before",
+    const NEGATORS_BEFORE: [&str; 8] = [
+        "not", "never", "no", "without", "dont", "cannot", "cant", "forbid",
     ];
     const NEGATORS_AFTER: [&str; 4] = ["prohibited", "forbidden", "banned", "disallowed"];
 
@@ -5429,11 +5429,13 @@ fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Opti
         let negated_before = words[index.saturating_sub(3)..index]
             .iter()
             .any(|prior| NEGATORS_BEFORE.contains(prior));
+        let stopped_before =
+            index >= 2 && words[index - 2] == "stop" && words[index - 1] == "before";
         let after_end = (index + 4).min(words.len());
         let negated_after = words[(index + 1).min(words.len())..after_end]
             .iter()
             .any(|next| NEGATORS_AFTER.contains(next));
-        !(negated_before || negated_after)
+        !(negated_before || stopped_before || negated_after)
     })
 }
 
@@ -20006,6 +20008,11 @@ mod tests {
         ] {
             assert!(!inferred_pr_writer(None, None, Some(prompt)), "{prompt}");
         }
+        assert!(inferred_pr_writer(
+            None,
+            None,
+            Some("Run tests before committing to the branch")
+        ));
         assert!(!inferred_pr_writer(
             None,
             Some("read_only_audit"),
