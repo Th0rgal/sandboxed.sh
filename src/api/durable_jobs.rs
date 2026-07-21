@@ -547,6 +547,13 @@ async fn read_job(state: &AppState, id: Uuid) -> Result<DurableJob, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("invalid durable job entry: {}", e))
 }
 
+async fn read_exit_record(job: &DurableJob) -> Option<ExitRecord> {
+    tokio::fs::read(&job.status_file)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ExitRecord>(&bytes).ok())
+}
+
 async fn write_terminal_job_state(
     state: &AppState,
     mut job: DurableJob,
@@ -617,10 +624,7 @@ fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
                 #[cfg(not(unix))]
                     let process_signal = None;
                     if let Ok(job) = read_job(&state, id).await {
-                        let recorded_exit = tokio::fs::read(&job.status_file)
-                            .await
-                            .ok()
-                            .and_then(|bytes| serde_json::from_slice::<ExitRecord>(&bytes).ok());
+                        let recorded_exit = read_exit_record(&job).await;
                         let exit = merge_process_exit_observation(
                             recorded_exit,
                             status.code(),
@@ -656,6 +660,29 @@ fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
                 _ = tokio::time::sleep(deadline), if !deadline.is_zero() => {
                     if let Ok(mut job) = read_job(&state, id).await {
                         if job.status == DurableJobStatus::Running {
+                            // The command may have finished just before the
+                            // deadline while this watcher was not scheduled.
+                            // Both select branches are then ready. Honor the
+                            // durable receipt before declaring a timeout so
+                            // randomized branch selection cannot misclassify
+                            // an on-time completion.
+                            if let Some(exit) = read_exit_record(&job).await {
+                                let status = terminal_status_for_exit(
+                                    &job,
+                                    exit.exit_code,
+                                    exit.finished_at,
+                                );
+                                let _ = write_terminal_job_state(
+                                    &state,
+                                    job,
+                                    status,
+                                    exit.exit_code,
+                                    exit.signal,
+                                    exit.finished_at,
+                                ).await;
+                                let _ = child.wait().await;
+                                break;
+                            }
                             job.status = deadline_terminal_status();
                             job.updated_at = Utc::now();
                             let _ = write_job(&state, &job).await;
@@ -872,23 +899,21 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
         job.status,
         DurableJobStatus::Running | DurableJobStatus::Unknown
     ) {
-        if let Ok(bytes) = tokio::fs::read(&job.status_file).await {
-            if let Ok(exit) = serde_json::from_slice::<ExitRecord>(&bytes) {
-                // The API can be offline while a durable command runs beyond
-                // its absolute deadline and later publishes a successful exit
-                // record. Classify the recorded finish time before accepting
-                // that success so restart recovery cannot erase a timeout.
-                let status = terminal_status_for_exit(&job, exit.exit_code, exit.finished_at);
-                return write_terminal_job_state(
-                    state,
-                    job,
-                    status,
-                    exit.exit_code,
-                    exit.signal,
-                    exit.finished_at,
-                )
-                .await;
-            }
+        if let Some(exit) = read_exit_record(&job).await {
+            // The API can be offline while a durable command runs beyond
+            // its absolute deadline and later publishes a successful exit
+            // record. Classify the recorded finish time before accepting
+            // that success so restart recovery cannot erase a timeout.
+            let status = terminal_status_for_exit(&job, exit.exit_code, exit.finished_at);
+            return write_terminal_job_state(
+                state,
+                job,
+                status,
+                exit.exit_code,
+                exit.signal,
+                exit.finished_at,
+            )
+            .await;
         }
 
         if !job.spawn_accepted {
