@@ -2883,12 +2883,21 @@ impl MissionRunner {
         self.inflight_message.as_ref()
     }
 
+    pub fn remove_inflight_message(&mut self, message_id: Uuid) -> bool {
+        if self.inflight_message.as_ref().map(|message| message.id) == Some(message_id) {
+            self.inflight_message = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn cancellation_requested(&self) -> bool {
         self.cancellation_requested
     }
 
     pub(crate) fn take_next_message_for_start(&mut self) -> Option<QueuedMessage> {
-        if self.is_running() || self.cancellation_requested {
+        if self.is_running() || self.cancellation_requested || self.inflight_message.is_some() {
             return None;
         }
         let message = self.queue.pop_front()?;
@@ -2929,9 +2938,16 @@ impl MissionRunner {
         current_mission: Arc<RwLock<Option<Uuid>>>,
         secrets: Option<Arc<SecretsStore>>,
     ) -> bool {
-        let msg = match self.take_next_message_for_start() {
-            Some(m) => m,
-            None => return false,
+        if self.is_running() || self.cancellation_requested {
+            return false;
+        }
+        let msg = if let Some(message) = self.inflight_message.clone() {
+            message
+        } else {
+            match self.take_next_message_for_start() {
+                Some(message) => message,
+                None => return false,
+            }
         };
 
         self.reset_turn_tool_calls();
@@ -12026,6 +12042,16 @@ mod tests {
         assert_eq!(
             runner.inflight_message().map(|message| message.id),
             Some(message_id)
+        );
+
+        let followup_id = Uuid::new_v4();
+        runner.queue_message(followup_id, "follow-up".to_string(), None, None);
+        assert!(runner.take_next_message_for_start().is_none());
+        assert_eq!(runner.queue.front().map(|message| message.id), Some(followup_id));
+        assert_eq!(
+            runner.inflight_message().map(|message| message.id),
+            Some(message_id),
+            "preparing another delivery must not overwrite the durable inflight marker"
         );
     }
 

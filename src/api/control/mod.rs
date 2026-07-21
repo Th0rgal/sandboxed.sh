@@ -13637,6 +13637,18 @@ async fn control_actor_loop(
                                 }
                                 let was_running = runner.is_running();
                                 runner.queue_message(id, content.clone(), msg_agent, source.clone());
+                                // For an idle runner, move the delivery into its durable
+                                // inflight slot before committing the queue snapshot. This
+                                // makes that commit the exact acceptance boundary: a restart
+                                // after it cannot replay work that was already handed to the
+                                // runner, even if the process starts immediately afterwards.
+                                if !was_running && runner.take_next_message_for_start().is_none() {
+                                    accepted_user_message_ids.remove(&id);
+                                    let _ = respond.send(UserMessageAck::Rejected(format!(
+                                        "mission {tid} delivery disappeared before persistence"
+                                    )));
+                                    continue;
+                                }
                                 let _ = events_tx.send(AgentEvent::UserMessage {
                                     id,
                                     content: content.clone(),
@@ -13672,6 +13684,7 @@ async fn control_actor_loop(
                                 {
                                     if let Some(runner) = parallel_runners.get_mut(&tid) {
                                         runner.remove_from_queue(id);
+                                        runner.remove_inflight_message(id);
                                     }
                                     accepted_user_message_ids.remove(&id);
                                     let _ = respond.send(UserMessageAck::Rejected(format!(
@@ -13700,6 +13713,7 @@ async fn control_actor_loop(
                                             resumable: true,
                                         });
                                         runner.remove_from_queue(id);
+                                        runner.remove_inflight_message(id);
                                         let _ = persist_control_queue_if_changed(
                                             &mission_store,
                                             &session_user_id,
@@ -13908,6 +13922,18 @@ async fn control_actor_loop(
                                             }
                                             // Queue the message
                                             runner.queue_message(id, content.clone(), msg_agent, source.clone());
+                                            // Stage the delivery as inflight before its first
+                                            // durable snapshot. start_next will consume this
+                                            // prepared slot rather than dequeueing it again.
+                                            if runner.take_next_message_for_start().is_none() {
+                                                accepted_user_message_ids.remove(&id);
+                                                let _ = respond.send(UserMessageAck::Rejected(
+                                                    format!(
+                                                        "mission {tid} delivery disappeared before persistence"
+                                                    ),
+                                                ));
+                                                continue;
+                                            }
                                             // Emit user message event
                                             let _ = events_tx.send(AgentEvent::UserMessage {
                                                 id,
@@ -13916,10 +13942,8 @@ async fn control_actor_loop(
                                                 mission_id: Some(tid),
                                                 source: source.clone(),
                                             });
-                                            // Journal the delivery while it is
-                                            // still queued. start_next moves it
-                                            // to inflight_message, which serializes
-                                            // identically until the turn finishes.
+                                            // Journal the prepared inflight delivery before
+                                            // acquiring the run or starting any process.
                                             parallel_runners.insert(tid, runner);
                                             if let Err(error) = persist_control_queue_if_changed(
                                                 &mission_store,
