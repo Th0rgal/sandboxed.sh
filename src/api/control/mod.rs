@@ -5392,9 +5392,13 @@ fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Opti
         "integrate",
         "integration",
         "rebase",
+        "rebasing",
         "merge",
+        "merging",
         "commit",
+        "committing",
         "push",
+        "pushing",
         "implement",
         "implementation",
         "update",
@@ -19956,6 +19960,14 @@ mod tests {
     #[test]
     fn pr_writer_inference_prefers_explicit_capability() {
         assert!(inferred_pr_writer(None, Some("integration_repair"), None));
+        for prompt in [
+            "Rebasing the branch onto main",
+            "Merging the approved changes",
+            "Committing the repair",
+            "Pushing the updated branch",
+        ] {
+            assert!(inferred_pr_writer(None, None, Some(prompt)), "{prompt}");
+        }
         assert!(!inferred_pr_writer(
             None,
             Some("read_only_audit"),
