@@ -2679,7 +2679,15 @@ pub struct MissionRunner {
     /// Once cancellation is requested, this runner must drain its current
     /// handle and be removed without starting queued or automated follow-ups.
     cancellation_requested: bool,
+
+    /// Absolute deadline after which a cancelled runner is force-aborted if
+    /// its harness ignores the cancellation token. Parallel runners own their
+    /// JoinHandle here, so the deadline must travel with the runner rather than
+    /// only being tracked by the control actor's main-runner state.
+    cancellation_force_clear_deadline: Option<Instant>,
 }
+
+const RUNNER_FORCE_CLEAR_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl MissionRunner {
     /// Create a new mission runner.
@@ -2722,6 +2730,7 @@ impl MissionRunner {
             background_tasks: HashMap::new(),
             durable_run: None,
             cancellation_requested: false,
+            cancellation_force_clear_deadline: None,
         }
     }
 
@@ -2873,10 +2882,45 @@ impl MissionRunner {
     /// Cancel the current execution.
     pub fn cancel(&mut self) {
         self.cancellation_requested = true;
+        self.cancellation_force_clear_deadline
+            .get_or_insert_with(|| Instant::now() + RUNNER_FORCE_CLEAR_GRACE);
         self.clear_queue();
         if let Some(token) = &self.cancel_token {
             token.cancel();
         }
+    }
+
+    /// Force-abort a cancelled turn once its grace period expires.
+    ///
+    /// Returns `true` when the runner should be removed from the actor's
+    /// registry. A handle which has already finished is left for the normal
+    /// completion path so its terminal result can still be recorded.
+    pub fn force_clear_cancelled_if_due(&mut self) -> bool {
+        if !self.cancellation_requested
+            || !self
+                .cancellation_force_clear_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return false;
+        }
+
+        if self
+            .running_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            return false;
+        }
+
+        if let Some(handle) = self.running_handle.take() {
+            handle.abort();
+        }
+        self.cancel_token = None;
+        self.inflight_message = None;
+        self.reset_turn_tool_calls();
+        self.state = MissionRunState::Finished;
+        self.cancellation_force_clear_deadline = None;
+        true
     }
 
     pub fn inflight_message(&self) -> Option<&QueuedMessage> {
@@ -3043,6 +3087,7 @@ impl MissionRunner {
 
         // Check if handle is finished
         if handle.is_finished() {
+            self.cancellation_force_clear_deadline = None;
             self.inflight_message = None;
             // A completed or panicked turn can leave an unmatched ToolCall in
             // harnesses that omit ToolResult events. Never expose that stale
@@ -12082,5 +12127,58 @@ mod tests {
         assert!(runner.cancellation_requested());
         assert!(runner.queue.is_empty());
         assert!(runner.take_next_message_for_start().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_parallel_runner_force_aborts_after_deadline() {
+        let mut runner = MissionRunner::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        runner.state = MissionRunState::Running;
+        runner.running_handle = Some(tokio::spawn(async {
+            std::future::pending::<(Uuid, String, AgentResult)>().await
+        }));
+
+        runner.cancel();
+        runner.cancellation_force_clear_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+
+        assert!(runner.force_clear_cancelled_if_due());
+        assert!(runner.running_handle.is_none());
+        assert!(matches!(runner.state, MissionRunState::Finished));
+        assert!(!runner.force_clear_cancelled_if_due());
+    }
+
+    #[test]
+    fn repeated_cancel_does_not_extend_force_clear_deadline() {
+        let mut runner = MissionRunner::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        runner.cancel();
+        let first_deadline = runner
+            .cancellation_force_clear_deadline
+            .expect("cancel should arm the deadline");
+        runner.cancel();
+
+        assert_eq!(
+            runner.cancellation_force_clear_deadline,
+            Some(first_deadline),
+            "an idempotent cancel retry must not postpone force-clear"
+        );
     }
 }

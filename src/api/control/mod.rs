@@ -12868,15 +12868,13 @@ async fn control_actor_loop(
 ) {
     // A process-local actor cannot reattach a harness JoinHandle after restart.
     // Close any inherited execution lease before accepting new work; durable
-    // workspace/remote jobs remain independently recoverable by job id.
+    // workspace/remote jobs remain independently recoverable by job id. Use
+    // the established server_shutdown reason so the startup recovery task
+    // below re-drives task-mode missions (assistant-mode missions remain idle).
     if let Ok(inherited_runs) = mission_store.list_active_mission_runs().await {
         for run in inherited_runs {
             let _ = mission_store
-                .finish_mission_run(
-                    run.run_id,
-                    run.generation,
-                    Some("actor_restart_process_ownership_unrecoverable"),
-                )
+                .finish_mission_run(run.run_id, run.generation, Some("server_shutdown"))
                 .await;
             if let Ok(Some(mission)) = mission_store.get_mission(run.mission_id).await {
                 if mission.status == MissionStatus::Active {
@@ -12884,7 +12882,7 @@ async fn control_actor_loop(
                         .update_mission_status_with_reason(
                             run.mission_id,
                             MissionStatus::Interrupted,
-                            Some("actor_restart_process_ownership_unrecoverable"),
+                            Some("server_shutdown"),
                         )
                         .await;
                 }
@@ -16534,6 +16532,64 @@ async fn control_actor_loop(
                 let mut completed_missions = Vec::new();
 
                 for (mission_id, runner) in parallel_runners.iter_mut() {
+                    if runner.force_clear_cancelled_if_due() {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            "Force-aborting stuck parallel runner after cancellation grace period"
+                        );
+                        runner
+                            .finish_durable_run(
+                                &mission_store,
+                                Some("force_killed_after_cancel_timeout"),
+                            )
+                            .await;
+                        if let Err(error) = mission_store
+                            .update_mission_status_with_reason(
+                                *mission_id,
+                                MissionStatus::Interrupted,
+                                Some("force_killed_after_cancel_timeout"),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                "Failed to mark force-cleared parallel mission interrupted: {error}"
+                            );
+                        } else {
+                            maybe_schedule_mission_metadata_refresh_for_status(
+                                &mission_store,
+                                &events_tx,
+                                *mission_id,
+                                MissionStatus::Interrupted,
+                            );
+                            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                mission_id: *mission_id,
+                                status: MissionStatus::Interrupted,
+                                summary: Some(
+                                    "Cancel timed out; force-aborted stuck parallel runner."
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                        if let Err(error) = mission_store
+                            .complete_running_executions_for_mission(
+                                *mission_id,
+                                false,
+                                Some(
+                                    "Force-aborted stuck parallel runner after cancel timed out"
+                                        .to_string(),
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                "Failed to complete parallel executions on force-clear: {error}"
+                            );
+                        }
+                        completed_missions.push(*mission_id);
+                        continue;
+                    }
                     if runner.check_finished() {
                         if let Some((_msg_id, _user_msg, mut result)) = runner.poll_completion().await {
                             maybe_recover_soft_llm_error(&mut result);
