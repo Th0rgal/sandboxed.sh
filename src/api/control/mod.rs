@@ -5379,18 +5379,31 @@ fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Opti
         prompt.unwrap_or_default()
     )
     .to_ascii_lowercase();
-    let tokens: HashSet<&str> = text
+    let words: Vec<&str> = text
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .collect();
-    [
+    let tokens: HashSet<&str> = words.iter().copied().collect();
+    let has_writer_noun = ["integration", "implementation"]
+        .iter()
+        .any(|token| tokens.contains(token));
+    if has_writer_noun {
+        return true;
+    }
+
+    const WRITER_VERBS: [&str; 24] = [
         "write",
+        "writing",
         "edit",
+        "editing",
         "fix",
+        "fixing",
         "repair",
+        "repairing",
         "resolve",
+        "resolving",
         "integrate",
-        "integration",
+        "integrating",
         "rebase",
         "rebasing",
         "merge",
@@ -5400,11 +5413,28 @@ fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Opti
         "push",
         "pushing",
         "implement",
-        "implementation",
+        "implementing",
         "update",
-    ]
-    .iter()
-    .any(|token| tokens.contains(token))
+        "updating",
+    ];
+    const NEGATORS_BEFORE: [&str; 9] = [
+        "not", "never", "no", "without", "dont", "cannot", "cant", "forbid", "before",
+    ];
+    const NEGATORS_AFTER: [&str; 4] = ["prohibited", "forbidden", "banned", "disallowed"];
+
+    words.iter().enumerate().any(|(index, word)| {
+        if !WRITER_VERBS.contains(word) {
+            return false;
+        }
+        let negated_before = words[index.saturating_sub(3)..index]
+            .iter()
+            .any(|prior| NEGATORS_BEFORE.contains(prior));
+        let after_end = (index + 4).min(words.len());
+        let negated_after = words[(index + 1).min(words.len())..after_end]
+            .iter()
+            .any(|next| NEGATORS_AFTER.contains(next));
+        !(negated_before || negated_after)
+    })
 }
 
 fn requested_pr_writer(
@@ -19967,6 +19997,14 @@ mod tests {
             "Pushing the updated branch",
         ] {
             assert!(inferred_pr_writer(None, None, Some(prompt)), "{prompt}");
+        }
+        for prompt in [
+            "Audit only; rebasing is forbidden",
+            "Do not commit or push the branch",
+            "Merging is prohibited",
+            "Stop before rebasing onto main",
+        ] {
+            assert!(!inferred_pr_writer(None, None, Some(prompt)), "{prompt}");
         }
         assert!(!inferred_pr_writer(
             None,
