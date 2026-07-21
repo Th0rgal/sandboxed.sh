@@ -2868,8 +2868,11 @@ pub struct QueuedMessage {
 
 /// Serialize the control session queue to a stable JSON snapshot for
 /// persistence across restarts (see `MissionStore::save_control_queue`).
-fn serialize_queue_snapshot(queue: &VecDeque<ControlQueueEntry>) -> String {
-    let items: Vec<QueuedMessage> = queue
+fn serialize_queue_snapshot(
+    queue: &VecDeque<ControlQueueEntry>,
+    parallel_runners: &std::collections::HashMap<Uuid, super::mission_runner::MissionRunner>,
+) -> String {
+    let mut items: Vec<QueuedMessage> = queue
         .iter()
         .map(|(id, content, agent, target_mid, source)| QueuedMessage {
             id: *id,
@@ -2879,6 +2882,17 @@ fn serialize_queue_snapshot(queue: &VecDeque<ControlQueueEntry>) -> String {
             source: source.clone(),
         })
         .collect();
+    let mut runners: Vec<_> = parallel_runners.iter().collect();
+    runners.sort_by_key(|(mission_id, _)| **mission_id);
+    for (mission_id, runner) in runners {
+        items.extend(runner.queue.iter().map(|message| QueuedMessage {
+            id: message.id,
+            content: message.content.clone(),
+            agent: message.agent.clone(),
+            mission_id: Some(*mission_id),
+            source: message.source.clone(),
+        }));
+    }
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -2895,9 +2909,10 @@ async fn persist_control_queue_if_changed(
     mission_store: &Arc<dyn MissionStore>,
     session_user_id: &str,
     queue: &VecDeque<ControlQueueEntry>,
+    parallel_runners: &std::collections::HashMap<Uuid, super::mission_runner::MissionRunner>,
     last_persisted: &mut String,
 ) {
-    let snapshot = serialize_queue_snapshot(queue);
+    let snapshot = serialize_queue_snapshot(queue, parallel_runners);
     if snapshot != *last_persisted {
         if let Err(e) = mission_store
             .save_control_queue(session_user_id, &snapshot)
@@ -12833,12 +12848,19 @@ async fn control_actor_loop(
             }
         }
     }
+    // Parallel mission runners - each runs independently. Their pending
+    // messages share the durable session queue snapshot with the main queue.
+    let mut parallel_runners: std::collections::HashMap<
+        Uuid,
+        super::mission_runner::MissionRunner,
+    > = std::collections::HashMap::new();
+
     // Snapshot of the queue as last written to the store; used to debounce
     // persistence so we only write to the DB when the queue actually changes.
     // When messages were restored, seed it with the stale on-disk snapshot so
     // the first loop-top persist overwrites it with the live queue.
     let mut last_persisted_queue: String = if restored_db_snapshot.is_empty() {
-        serialize_queue_snapshot(&queue)
+        serialize_queue_snapshot(&queue, &parallel_runners)
     } else {
         restored_db_snapshot
     };
@@ -12881,12 +12903,6 @@ async fn control_actor_loop(
     let mut runner_force_clear_deadline: Option<tokio::time::Instant> = None;
     const RUNNER_FORCE_CLEAR_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
-    // Parallel mission runners - each runs independently
-    let mut parallel_runners: std::collections::HashMap<
-        Uuid,
-        super::mission_runner::MissionRunner,
-    > = std::collections::HashMap::new();
-
     // Correlate Bash `tool_call_id` -> command string so that when the matching
     // `Bash` ToolResult carries a background-start marker we can record the
     // launched command in the background-task registry. Capped to avoid
@@ -12919,6 +12935,8 @@ async fn control_actor_loop(
     // Per-boss "wake outstanding" flags, coalescing board wakes across passes.
     let mut board_wake_state: std::collections::HashMap<Uuid, bool> =
         std::collections::HashMap::new();
+    let board_outbox_inflight: board::BoardOutboxInflight =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
     // Helper to extract file paths from text (for mission summaries)
     fn extract_file_paths(text: &str) -> Vec<String> {
@@ -13138,6 +13156,7 @@ async fn control_actor_loop(
             &mission_store,
             &session_user_id,
             &queue,
+            &parallel_runners,
             &mut last_persisted_queue,
         )
         .await;
@@ -13545,6 +13564,19 @@ async fn control_actor_loop(
                                             Arc::new(RwLock::new(Some(tid))),
                                             secrets.clone(),
                                         );
+                                    }
+                                    if was_running {
+                                        // Parallel-runner queues are part of the
+                                        // same durable session snapshot. Persist
+                                        // before acknowledging the board outbox.
+                                        persist_control_queue_if_changed(
+                                            &mission_store,
+                                            &session_user_id,
+                                            &queue,
+                                            &parallel_runners,
+                                            &mut last_persisted_queue,
+                                        )
+                                        .await;
                                     }
                                     let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                                     continue;
@@ -13986,6 +14018,17 @@ async fn control_actor_loop(
                             }
                         }
                         queue.push_back((id, content, msg_agent, target_mission_id, source.clone()));
+                        // `Queued` is an acceptance acknowledgement. Persist the
+                        // message before sending it so a crash cannot lose an
+                        // outbox delivery that its producer has already retired.
+                        persist_control_queue_if_changed(
+                            &mission_store,
+                            &session_user_id,
+                            &queue,
+                            &parallel_runners,
+                            &mut last_persisted_queue,
+                        )
+                        .await;
                         let status_mission_id = if running.is_some() {
                             running_mission_id
                         } else {
@@ -14015,6 +14058,7 @@ async fn control_actor_loop(
                                     &mission_store,
                                     &session_user_id,
                                     &queue,
+                                    &parallel_runners,
                                     &mut last_persisted_queue,
                                 )
                                 .await;
@@ -15217,6 +15261,7 @@ async fn control_actor_loop(
                                             &mission_store,
                                             &session_user_id,
                                             &queue,
+                                            &parallel_runners,
                                             &mut last_persisted_queue,
                                         )
                                         .await;
@@ -16032,6 +16077,7 @@ async fn control_actor_loop(
                         &mission_store,
                         &session_user_id,
                         &queue,
+                        &parallel_runners,
                         &mut last_persisted_queue,
                     )
                     .await;
@@ -16476,6 +16522,7 @@ async fn control_actor_loop(
                         &snapshot,
                         max_parallel,
                         &mut board_wake_state,
+                        &board_outbox_inflight,
                     )
                     .await;
                 }
@@ -24662,6 +24709,43 @@ Investigate <service/> failures.
 
         assert!(queue_has_pending_target_mission(&queue, mission_id));
         assert!(!queue_has_pending_target_mission(&queue, Uuid::new_v4()));
+    }
+
+    #[test]
+    fn queue_snapshot_includes_parallel_runner_messages() {
+        let main_mission = Uuid::new_v4();
+        let parallel_mission = Uuid::new_v4();
+        let main_queue = VecDeque::from([(
+            Uuid::new_v4(),
+            "main".to_string(),
+            None,
+            Some(main_mission),
+            Some("api:test".to_string()),
+        )]);
+        let mut runner = crate::api::mission_runner::MissionRunner::new(
+            parallel_mission,
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        runner.queue_message(
+            Uuid::new_v4(),
+            "parallel".to_string(),
+            None,
+            Some("task-board".to_string()),
+        );
+        let parallel = std::collections::HashMap::from([(parallel_mission, runner)]);
+
+        let snapshot = serialize_queue_snapshot(&main_queue, &parallel);
+        let messages: Vec<QueuedMessage> = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|message| {
+            message.content == "parallel" && message.mission_id == Some(parallel_mission)
+        }));
     }
 
     #[test]

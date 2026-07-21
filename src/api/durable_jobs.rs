@@ -624,34 +624,40 @@ fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-fn cgroup_contains_scope(cgroup: &str, scope_unit: &str) -> bool {
-    let expected = if scope_unit.ends_with(".scope") {
+fn job_has_liveness_evidence(
+    scope_unit: Option<&str>,
+    process_is_alive: bool,
+    scope_is_active: bool,
+) -> bool {
+    if scope_unit.is_some() {
+        scope_is_active
+    } else {
+        process_is_alive
+    }
+}
+
+#[cfg(unix)]
+fn scope_unit_is_active(scope_unit: &str) -> bool {
+    let unit = if scope_unit.ends_with(".scope") {
         scope_unit.to_string()
     } else {
         format!("{scope_unit}.scope")
     };
-    cgroup
-        .lines()
-        .flat_map(|line| {
-            line.rsplit_once(':')
-                .map(|(_, path)| path)
-                .unwrap_or(line)
-                .split('/')
-        })
-        .any(|component| component == expected)
+    std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", unit.as_str()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
 fn process_owned_by_job(job: &DurableJob, pid: u32) -> bool {
-    if !process_alive(pid) {
-        return false;
-    }
-    let Some(scope_unit) = job.scope_unit.as_deref() else {
-        return true;
-    };
-    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .ok()
-        .is_some_and(|cgroup| cgroup_contains_scope(&cgroup, scope_unit))
+    let scope_is_active = job.scope_unit.as_deref().is_some_and(scope_unit_is_active);
+    job_has_liveness_evidence(
+        job.scope_unit.as_deref(),
+        process_alive(pid),
+        scope_is_active,
+    )
 }
 
 #[cfg(not(unix))]
@@ -1319,18 +1325,19 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_scope_membership_requires_the_exact_unit() {
-        let cgroup = "1:name=systemd:/\n0::/missions.slice/sandboxed-durable-demo.scope\n";
-        assert!(cgroup_contains_scope(cgroup, "sandboxed-durable-demo"));
-        assert!(cgroup_contains_scope(
-            cgroup,
-            "sandboxed-durable-demo.scope"
+    fn scoped_liveness_uses_the_unit_instead_of_the_wrapper_pid() {
+        assert!(job_has_liveness_evidence(
+            Some("sandboxed-durable-demo"),
+            false,
+            true,
         ));
-        assert!(!cgroup_contains_scope(cgroup, "sandboxed-durable"));
-        assert!(!cgroup_contains_scope(
-            cgroup,
-            "sandboxed-durable-demo-other"
+        assert!(!job_has_liveness_evidence(
+            Some("sandboxed-durable-demo"),
+            true,
+            false,
         ));
+        assert!(job_has_liveness_evidence(None, true, false));
+        assert!(!job_has_liveness_evidence(None, false, true));
     }
 
     #[test]
