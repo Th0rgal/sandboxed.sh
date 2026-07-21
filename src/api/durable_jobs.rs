@@ -560,6 +560,14 @@ async fn read_exit_record(job: &DurableJob) -> Option<ExitRecord> {
         .and_then(|bytes| serde_json::from_slice::<ExitRecord>(&bytes).ok())
 }
 
+async fn read_started_pid(job: &DurableJob) -> Option<u32> {
+    tokio::fs::read(durable_started_file(job))
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<StartRecord>(&bytes).ok())
+        .map(|record| record.pid)
+}
+
 async fn write_terminal_job_state(
     state: &AppState,
     mut job: DurableJob,
@@ -720,6 +728,14 @@ fn job_has_liveness_evidence(
     } else {
         process_is_alive
     }
+}
+
+fn terminal_receipt_can_be_honored(
+    scope_unit: Option<&str>,
+    process_is_alive: bool,
+    scope_is_active: bool,
+) -> bool {
+    !job_has_liveness_evidence(scope_unit, process_is_alive, scope_is_active)
 }
 
 fn pidless_scope_is_live(scope_unit: Option<&str>, scope_is_active: bool) -> bool {
@@ -903,11 +919,26 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
         job.status,
         DurableJobStatus::Running | DurableJobStatus::Unknown
     ) {
-        if let Some(exit) = read_exit_record(&job).await {
+        let scope_is_active = job.scope_unit.as_deref().is_some_and(scope_unit_is_active);
+        let started_pid = read_started_pid(&job).await;
+        let direct_pid_is_live =
+            job.scope_unit.is_none() && job.pid.or(started_pid).is_some_and(process_alive);
+        let can_honor_terminal_receipt = terminal_receipt_can_be_honored(
+            job.scope_unit.as_deref(),
+            direct_pid_is_live,
+            scope_is_active,
+        );
+
+        if let Some(exit) = read_exit_record(&job)
+            .await
+            .filter(|_| can_honor_terminal_receipt)
+        {
             // The API can be offline while a durable command runs beyond
             // its absolute deadline and later publishes a successful exit
-            // record. Classify the recorded finish time before accepting
-            // that success so restart recovery cannot erase a timeout.
+            // record. Require the persisted process/scope to be gone before
+            // trusting it: the command inherits this path and may write an
+            // early receipt while it is still running. Then classify the
+            // recorded finish time so restart recovery cannot erase a timeout.
             let status = terminal_status_for_exit(&job, exit.exit_code, exit.finished_at);
             return write_terminal_job_state(
                 state,
@@ -922,14 +953,6 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
 
         if !job.spawn_accepted {
             let now = Utc::now();
-            let scope_is_active = job.scope_unit.as_deref().is_some_and(scope_unit_is_active);
-            let started_pid = tokio::fs::read(durable_started_file(&job))
-                .await
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<StartRecord>(&bytes).ok())
-                .map(|record| record.pid);
-            let direct_pid_is_live =
-                job.scope_unit.is_none() && started_pid.is_some_and(process_alive);
             if scope_is_active || direct_pid_is_live {
                 job.spawn_accepted = true;
                 job.status = DurableJobStatus::Running;
@@ -1751,6 +1774,22 @@ mod tests {
             false
         ));
         assert!(!pidless_scope_is_live(None, true));
+    }
+
+    #[test]
+    fn restart_refresh_does_not_honor_receipt_with_a_live_owner() {
+        assert!(!terminal_receipt_can_be_honored(None, true, false));
+        assert!(!terminal_receipt_can_be_honored(
+            Some("sandboxed-durable-demo"),
+            false,
+            true,
+        ));
+        assert!(terminal_receipt_can_be_honored(None, false, false));
+        assert!(terminal_receipt_can_be_honored(
+            Some("sandboxed-durable-demo"),
+            false,
+            false,
+        ));
     }
 
     #[test]
