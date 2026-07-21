@@ -609,22 +609,36 @@ fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
             tokio::select! {
                 status = child.wait() => {
                     let Ok(status) = status else { break };
+                #[cfg(unix)]
+                    let process_signal = {
+                        use std::os::unix::process::ExitStatusExt;
+                        status.signal()
+                    };
+                #[cfg(not(unix))]
+                    let process_signal = None;
                     if let Ok(job) = read_job(&state, id).await {
-                        let finished_at = Utc::now();
+                        let recorded_exit = tokio::fs::read(&job.status_file)
+                            .await
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<ExitRecord>(&bytes).ok());
+                        let exit = merge_process_exit_observation(
+                            recorded_exit,
+                            status.code(),
+                            process_signal,
+                            Utc::now(),
+                        );
                         let job_status = terminal_status_for_exit(
                             &job,
-                            status.code(),
-                            finished_at,
+                            exit.exit_code,
+                            exit.finished_at,
                         );
-                #[cfg(unix)]
-                        let signal = {
-                            use std::os::unix::process::ExitStatusExt;
-                            status.signal()
-                        };
-                #[cfg(not(unix))]
-                        let signal = None;
                         let _ = write_terminal_job_state(
-                            &state, job, job_status, status.code(), signal, finished_at,
+                            &state,
+                            job,
+                            job_status,
+                            exit.exit_code,
+                            exit.signal,
+                            exit.finished_at,
                         ).await;
                     }
                     break;
@@ -710,6 +724,26 @@ fn terminal_status_for_exit(
         DurableJobStatus::Completed
     } else {
         DurableJobStatus::Failed
+    }
+}
+
+fn merge_process_exit_observation(
+    recorded: Option<ExitRecord>,
+    process_exit_code: Option<i32>,
+    process_signal: Option<i32>,
+    observed_at: DateTime<Utc>,
+) -> ExitRecord {
+    match recorded {
+        Some(mut exit) => {
+            exit.exit_code = exit.exit_code.or(process_exit_code);
+            exit.signal = exit.signal.or(process_signal);
+            exit
+        }
+        None => ExitRecord {
+            exit_code: process_exit_code,
+            signal: process_signal,
+            finished_at: observed_at,
+        },
     }
 }
 
@@ -1523,6 +1557,31 @@ mod tests {
 
         assert_eq!(
             terminal_status_for_exit(&job, Some(0), deadline - chrono::Duration::seconds(1),),
+            DurableJobStatus::Completed
+        );
+    }
+
+    #[test]
+    fn live_watcher_prefers_recorded_finish_time_over_delayed_observation() {
+        let deadline = Utc::now();
+        let mut job = test_job(DurableJobStatus::Running);
+        job.deadline_at = Some(deadline);
+        let recorded = ExitRecord {
+            exit_code: Some(0),
+            signal: None,
+            finished_at: deadline - chrono::Duration::milliseconds(1),
+        };
+
+        let exit = merge_process_exit_observation(
+            Some(recorded),
+            Some(0),
+            None,
+            deadline + chrono::Duration::milliseconds(1),
+        );
+
+        assert!(exit.finished_at < deadline);
+        assert_eq!(
+            terminal_status_for_exit(&job, exit.exit_code, exit.finished_at),
             DurableJobStatus::Completed
         );
     }
