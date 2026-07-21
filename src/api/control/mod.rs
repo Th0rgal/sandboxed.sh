@@ -2864,6 +2864,27 @@ pub struct QueuedMessage {
     /// for snapshots written before this field existed.
     #[serde(default)]
     pub source: Option<String>,
+    /// The actor had already consumed this message into an executing parallel
+    /// turn when the snapshot was written. After restart it is a durable
+    /// idempotency marker, not work to replay: the inherited run is
+    /// interrupted and an explicit resume is required.
+    #[serde(default)]
+    pub inflight: bool,
+}
+
+fn partition_restored_control_messages(
+    items: Vec<QueuedMessage>,
+) -> (Vec<QueuedMessage>, Vec<QueuedMessage>) {
+    let mut pending = Vec::with_capacity(items.len());
+    let mut consumed = Vec::new();
+    for item in items {
+        if item.inflight {
+            consumed.push(item);
+        } else {
+            pending.push(item);
+        }
+    }
+    (pending, consumed)
 }
 
 /// Serialize the control session queue to a stable JSON snapshot for
@@ -2871,6 +2892,7 @@ pub struct QueuedMessage {
 fn serialize_queue_snapshot(
     queue: &VecDeque<ControlQueueEntry>,
     parallel_runners: &std::collections::HashMap<Uuid, super::mission_runner::MissionRunner>,
+    recovered_consumed: &HashMap<Uuid, QueuedMessage>,
 ) -> String {
     let mut items: Vec<QueuedMessage> = queue
         .iter()
@@ -2880,6 +2902,7 @@ fn serialize_queue_snapshot(
             agent: agent.clone(),
             mission_id: *target_mid,
             source: source.clone(),
+            inflight: false,
         })
         .collect();
     let mut runners: Vec<_> = parallel_runners.iter().collect();
@@ -2892,6 +2915,7 @@ fn serialize_queue_snapshot(
                 agent: message.agent.clone(),
                 mission_id: Some(*mission_id),
                 source: message.source.clone(),
+                inflight: true,
             });
         }
         items.extend(runner.queue.iter().map(|message| QueuedMessage {
@@ -2900,8 +2924,12 @@ fn serialize_queue_snapshot(
             agent: message.agent.clone(),
             mission_id: Some(*mission_id),
             source: message.source.clone(),
+            inflight: false,
         }));
     }
+    let mut consumed: Vec<_> = recovered_consumed.values().cloned().collect();
+    consumed.sort_by_key(|message| message.id);
+    items.extend(consumed);
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -2919,9 +2947,10 @@ async fn persist_control_queue_if_changed(
     session_user_id: &str,
     queue: &VecDeque<ControlQueueEntry>,
     parallel_runners: &std::collections::HashMap<Uuid, super::mission_runner::MissionRunner>,
+    recovered_consumed: &HashMap<Uuid, QueuedMessage>,
     last_persisted: &mut String,
 ) -> Result<(), String> {
-    let snapshot = serialize_queue_snapshot(queue, parallel_runners);
+    let snapshot = serialize_queue_snapshot(queue, parallel_runners, recovered_consumed);
     if snapshot != *last_persisted {
         if let Err(error) = mission_store
             .save_control_queue(session_user_id, &snapshot)
@@ -12874,12 +12903,18 @@ async fn control_actor_loop(
     // a client retry of the same id via `accept_user_message_id` (whichever
     // arrives first runs; the other is dropped), so nothing executes twice.
     let mut restored_db_snapshot = String::new();
+    let mut recovered_consumed_user_messages: HashMap<Uuid, QueuedMessage> = HashMap::new();
     if let Ok(payload) = mission_store.load_control_queue(&session_user_id).await {
         if !payload.trim().is_empty() {
             match serde_json::from_str::<Vec<QueuedMessage>>(&payload) {
                 Ok(items) => {
                     let count = items.len();
-                    for it in items {
+                    let (pending, consumed) = partition_restored_control_messages(items);
+                    let interrupted = consumed.len();
+                    recovered_consumed_user_messages
+                        .extend(consumed.into_iter().map(|message| (message.id, message)));
+                    let mut replayed = 0usize;
+                    for it in pending {
                         let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
                         if let Err(e) = self_cmd_tx.try_send(ControlCommand::UserMessage {
                             id: it.id,
@@ -12891,6 +12926,8 @@ async fn control_actor_loop(
                             respond: ack_tx,
                         }) {
                             tracing::warn!("Failed to re-queue restored control message: {e}");
+                        } else {
+                            replayed += 1;
                         }
                     }
                     if count > 0 {
@@ -12898,7 +12935,12 @@ async fn control_actor_loop(
                         // loop-top persist below rewrites the DB to the real
                         // (re-injected) state instead of leaving it stale.
                         restored_db_snapshot = payload;
-                        tracing::info!("Re-queued {count} message(s) from the previous session");
+                        tracing::info!(
+                            replayed,
+                            interrupted,
+                            total = count,
+                            "Recovered durable control messages from the previous session"
+                        );
                     }
                 }
                 Err(e) => tracing::warn!("Failed to parse persisted control queue: {e}"),
@@ -12917,7 +12959,7 @@ async fn control_actor_loop(
     // When messages were restored, seed it with the stale on-disk snapshot so
     // the first loop-top persist overwrites it with the live queue.
     let mut last_persisted_queue: String = if restored_db_snapshot.is_empty() {
-        serialize_queue_snapshot(&queue, &parallel_runners)
+        serialize_queue_snapshot(&queue, &parallel_runners, &recovered_consumed_user_messages)
     } else {
         restored_db_snapshot
     };
@@ -13214,6 +13256,7 @@ async fn control_actor_loop(
             &session_user_id,
             &queue,
             &parallel_runners,
+            &recovered_consumed_user_messages,
             &mut last_persisted_queue,
         )
         .await;
@@ -13335,6 +13378,15 @@ async fn control_actor_loop(
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
+                        if recovered_consumed_user_messages.contains_key(&id) {
+                            // The previous actor had already started this exact
+                            // deterministic delivery. Its run was interrupted
+                            // during startup recovery, so acknowledge the retry
+                            // without repeating side effects; the mission now
+                            // requires an explicit resume.
+                            let _ = respond.send(UserMessageAck::Delivered);
+                            continue;
+                        }
                         if !accept_user_message_id(&mut accepted_user_message_ids, id) {
                             let status_snapshot = status.read().await;
                             let _ = respond.send(if status_snapshot.state != ControlRunState::Idle {
@@ -13613,6 +13665,7 @@ async fn control_actor_loop(
                                     &session_user_id,
                                     &queue,
                                     &parallel_runners,
+                                    &recovered_consumed_user_messages,
                                     &mut last_persisted_queue,
                                 )
                                 .await
@@ -13652,6 +13705,7 @@ async fn control_actor_loop(
                                             &session_user_id,
                                             &queue,
                                             &parallel_runners,
+                                            &recovered_consumed_user_messages,
                                             &mut last_persisted_queue,
                                         )
                                         .await;
@@ -13872,6 +13926,7 @@ async fn control_actor_loop(
                                                 &session_user_id,
                                                 &queue,
                                                 &parallel_runners,
+                                                &recovered_consumed_user_messages,
                                                 &mut last_persisted_queue,
                                             )
                                             .await
@@ -13906,6 +13961,7 @@ async fn control_actor_loop(
                                                     &session_user_id,
                                                     &queue,
                                                     &parallel_runners,
+                                                    &recovered_consumed_user_messages,
                                                     &mut last_persisted_queue,
                                                 )
                                                 .await;
@@ -14158,6 +14214,7 @@ async fn control_actor_loop(
                             &session_user_id,
                             &queue,
                             &parallel_runners,
+                            &recovered_consumed_user_messages,
                             &mut last_persisted_queue,
                         )
                         .await
@@ -14199,6 +14256,7 @@ async fn control_actor_loop(
                                     &session_user_id,
                                     &queue,
                                     &parallel_runners,
+                                    &recovered_consumed_user_messages,
                                     &mut last_persisted_queue,
                                 )
                                 .await
@@ -14909,6 +14967,7 @@ async fn control_actor_loop(
                                 &session_user_id,
                                 &queue,
                                 &parallel_runners,
+                                &recovered_consumed_user_messages,
                                 &mut last_persisted_queue,
                             )
                             .await
@@ -15431,6 +15490,7 @@ async fn control_actor_loop(
                                             &session_user_id,
                                             &queue,
                                             &parallel_runners,
+                                            &recovered_consumed_user_messages,
                                             &mut last_persisted_queue,
                                         )
                                         .await
@@ -15658,6 +15718,7 @@ async fn control_actor_loop(
                                 agent: agent.clone(),
                                 mission_id: *target_mid,
                                 source: source.clone(),
+                                inflight: false,
                             })
                             .collect();
                         // Also collect queued messages from parallel runners
@@ -15669,6 +15730,7 @@ async fn control_actor_loop(
                                     agent: qm.agent.clone(),
                                     mission_id: Some(*mid),
                                     source: qm.source.clone(),
+                                    inflight: false,
                                 });
                             }
                         }
@@ -16260,6 +16322,7 @@ async fn control_actor_loop(
                         &session_user_id,
                         &queue,
                         &parallel_runners,
+                        &recovered_consumed_user_messages,
                         &mut last_persisted_queue,
                     )
                     .await
@@ -16303,6 +16366,7 @@ async fn control_actor_loop(
                                 &session_user_id,
                                 &queue,
                                 &parallel_runners,
+                                &recovered_consumed_user_messages,
                                 &mut last_persisted_queue,
                             )
                             .await
@@ -24998,14 +25062,56 @@ Investigate <service/> failures.
         assert!(runner.queue.is_empty());
         let parallel = std::collections::HashMap::from([(parallel_mission, runner)]);
 
-        let snapshot = serialize_queue_snapshot(&main_queue, &parallel);
+        let snapshot = serialize_queue_snapshot(&main_queue, &parallel, &HashMap::new());
         let messages: Vec<QueuedMessage> = serde_json::from_str(&snapshot).unwrap();
         assert_eq!(messages.len(), 2);
         assert!(messages.iter().any(|message| {
             message.id == parallel_message_id
                 && message.content == "parallel"
                 && message.mission_id == Some(parallel_mission)
+                && message.inflight
         }));
+        assert!(messages
+            .iter()
+            .any(|message| message.content == "main" && !message.inflight));
+    }
+
+    #[test]
+    fn restart_marks_inflight_parallel_messages_consumed_without_replay() {
+        let pending_id = Uuid::new_v4();
+        let inflight_id = Uuid::new_v4();
+        let (pending, consumed) = partition_restored_control_messages(vec![
+            QueuedMessage {
+                id: pending_id,
+                content: "not started".into(),
+                agent: None,
+                mission_id: Some(Uuid::new_v4()),
+                source: None,
+                inflight: false,
+            },
+            QueuedMessage {
+                id: inflight_id,
+                content: "already started".into(),
+                agent: None,
+                mission_id: Some(Uuid::new_v4()),
+                source: Some("task-board".into()),
+                inflight: true,
+            },
+        ]);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, pending_id);
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].id, inflight_id);
+        assert!(consumed[0].inflight);
+
+        let recovered = HashMap::from([(inflight_id, consumed[0].clone())]);
+        let snapshot = serialize_queue_snapshot(&VecDeque::new(), &HashMap::new(), &recovered);
+        let reparsed: Vec<QueuedMessage> = serde_json::from_str(&snapshot).unwrap();
+        let (replayed_again, consumed_again) = partition_restored_control_messages(reparsed);
+        assert!(replayed_again.is_empty());
+        assert_eq!(consumed_again.len(), 1);
+        assert_eq!(consumed_again[0].id, inflight_id);
     }
 
     #[test]

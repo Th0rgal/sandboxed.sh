@@ -283,7 +283,11 @@ fn durable_started_file(job: &DurableJob) -> PathBuf {
 }
 
 fn preparing_receipt_is_resubmittable(job: &DurableJob) -> bool {
-    !job.spawn_accepted && job.status == DurableJobStatus::Unknown
+    !job.spawn_accepted
+        && matches!(
+            job.status,
+            DurableJobStatus::Unknown | DurableJobStatus::Failed
+        )
 }
 
 async fn authorize_job(
@@ -1404,6 +1408,12 @@ mod tests {
         assert!(!preparing_receipt_is_resubmittable(&job));
         job.spawn_accepted = false;
         job.status = DurableJobStatus::Running;
+        assert!(!preparing_receipt_is_resubmittable(&job));
+
+        job.status = DurableJobStatus::Failed;
+        assert!(preparing_receipt_is_resubmittable(&job));
+
+        job.spawn_accepted = true;
         assert!(!preparing_receipt_is_resubmittable(&job));
     }
 
