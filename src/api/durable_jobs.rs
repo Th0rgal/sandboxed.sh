@@ -607,7 +607,7 @@ fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
                             let _ = write_job(&state, &job).await;
                             signal_job(&job, false).await;
                             tokio::time::sleep(std::time::Duration::from_secs(FORCE_CLEAR_SECS)).await;
-                            if job.pid.is_some_and(process_alive) {
+                            if job_requires_force_clear(&job) {
                                 signal_job(&job, true).await;
                             }
                         }
@@ -643,6 +643,20 @@ fn retryable_pidless_receipt(job: &DurableJob) -> bool {
 
 fn job_accepts_heartbeat(status: &DurableJobStatus) -> bool {
     *status == DurableJobStatus::Running
+}
+
+fn requires_force_clear(scope_unit: Option<&str>, process_is_alive: bool) -> bool {
+    // A systemd-run wrapper may exit before the payload in its transient
+    // scope. Force-signalling the named scope is idempotent, so always do it
+    // after the grace period even when the persisted wrapper PID is gone.
+    scope_unit.is_some() || process_is_alive
+}
+
+fn job_requires_force_clear(job: &DurableJob) -> bool {
+    requires_force_clear(
+        job.scope_unit.as_deref(),
+        job.pid.is_some_and(process_alive),
+    )
 }
 
 #[cfg(unix)]
@@ -770,7 +784,7 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
                     tokio::spawn(async move {
                         signal_job(&cancelling, false).await;
                         tokio::time::sleep(std::time::Duration::from_secs(FORCE_CLEAR_SECS)).await;
-                        if cancelling.pid.is_some_and(process_alive) {
+                        if job_requires_force_clear(&cancelling) {
                             signal_job(&cancelling, true).await;
                         }
                     });
@@ -1193,7 +1207,7 @@ pub async fn cancel_job(
         tokio::spawn(async move {
             signal_job(&cancelling, false).await;
             tokio::time::sleep(std::time::Duration::from_secs(FORCE_CLEAR_SECS)).await;
-            if cancelling.pid.is_some_and(process_alive) {
+            if job_requires_force_clear(&cancelling) {
                 signal_job(&cancelling, true).await;
             }
         });
@@ -1289,6 +1303,13 @@ mod tests {
         ] {
             assert!(!job_accepts_heartbeat(&status));
         }
+    }
+
+    #[test]
+    fn scoped_job_is_force_cleared_after_its_wrapper_pid_exits() {
+        assert!(requires_force_clear(Some("sandboxed-durable-demo"), false));
+        assert!(requires_force_clear(None, true));
+        assert!(!requires_force_clear(None, false));
     }
 
     #[test]
