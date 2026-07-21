@@ -801,6 +801,69 @@ fn outbox_payload(item: &BoardOutboxItem) -> Result<(Uuid, String), String> {
     Ok((target, content))
 }
 
+/// Revalidate a durable delivery against the current board and mission rows.
+///
+/// Outbox rows survive crashes by design, but the operator may cancel a board
+/// or a worker may finish before replay. Re-sending such a stale row through
+/// `UserMessage` would reactivate the terminal target. Store read failures keep
+/// the row pending for a later pass; conclusive state mismatches retire it.
+async fn board_outbox_replay_is_eligible(
+    mission_store: &Arc<dyn MissionStore>,
+    item: &BoardOutboxItem,
+    target: Uuid,
+) -> Result<bool, String> {
+    let Some(boss) = mission_store.get_mission(item.boss_mission_id).await? else {
+        return Ok(false);
+    };
+    if boss_status_is_terminal(boss.status) || boss.status == MissionStatus::Paused {
+        return Ok(false);
+    }
+
+    match item.delivery_kind.as_str() {
+        "spawn" | "retry" => {
+            let Some(task_id) = item.task_id else {
+                return Ok(false);
+            };
+            let Some(task) = mission_store.get_board_task(task_id).await? else {
+                return Ok(false);
+            };
+            if task.boss_mission_id != item.boss_mission_id
+                || task.status != BoardTaskStatus::Running
+                || task.worker_mission_id != Some(target)
+            {
+                return Ok(false);
+            }
+            let current_spawn_key = format!("board:{}:attempt:{}:spawn", task.id, task.attempts);
+            let current_retry_key = format!("board:{}:attempt:{}:retry", task.id, task.attempts);
+            if item.idempotency_key != current_spawn_key
+                && item.idempotency_key != current_retry_key
+            {
+                return Ok(false);
+            }
+            let Some(worker) = mission_store.get_mission(target).await? else {
+                return Ok(false);
+            };
+            // A board spawn delivery is the transition out of Pending. Any
+            // later presentation/terminal state proves this exact intent is
+            // stale or was already consumed before its acknowledgement landed.
+            Ok(worker.status == MissionStatus::Pending)
+        }
+        "controller_notification" => {
+            if item.task_id.is_some() || target != item.boss_mission_id {
+                return Ok(false);
+            }
+            let tasks = mission_store.list_board_tasks(item.boss_mission_id).await?;
+            let current_key = format!(
+                "board:{}:wake:{}",
+                item.boss_mission_id,
+                board_wake_revision(&tasks, &boss.history)
+            );
+            Ok(board_needs_attention(&tasks) && item.idempotency_key == current_key)
+        }
+        _ => Ok(false),
+    }
+}
+
 async fn replay_pending_board_outbox(
     mission_store: &Arc<dyn MissionStore>,
     cmd_tx: &mpsc::Sender<ControlCommand>,
@@ -822,6 +885,35 @@ async fn replay_pending_board_outbox(
                 continue;
             }
         };
+        match board_outbox_replay_is_eligible(mission_store, &item, target).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    target = %target,
+                    idempotency_key = %item.idempotency_key,
+                    delivery_kind = %item.delivery_kind,
+                    "board: retiring stale pending outbox delivery"
+                );
+                if let Err(error) = mission_store
+                    .acknowledge_board_outbox(&item.idempotency_key)
+                    .await
+                {
+                    tracing::warn!(
+                        idempotency_key = %item.idempotency_key,
+                        "board: failed to retire stale outbox delivery: {error}"
+                    );
+                }
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target = %target,
+                    idempotency_key = %item.idempotency_key,
+                    "board: could not revalidate pending outbox delivery: {error}"
+                );
+                continue;
+            }
+        }
         let _ = dispatch_board_outbox_item(
             mission_store,
             cmd_tx,
@@ -1541,6 +1633,179 @@ mod tests {
             Some(ControlCommand::ReleaseUserMessageId { .. })
         ));
         assert_eq!(store.list_pending_board_outbox(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replay_retires_wake_for_terminal_boss_without_dispatching() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let boss = store
+            .create_mission_with_parent(
+                Some("terminal boss"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create boss");
+        store
+            .upsert_board_tasks(
+                boss.id,
+                vec![NewBoardTask {
+                    task_key: "review".into(),
+                    title: "review".into(),
+                    prompt: "p".into(),
+                    backend: "codex".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("create task");
+        let mut task = store
+            .list_board_tasks(boss.id)
+            .await
+            .expect("list task")
+            .remove(0);
+        task.status = BoardTaskStatus::Settled;
+        store.save_board_task(&task).await.expect("settle task");
+
+        let key = format!("board:{}:wake:stale", boss.id);
+        store
+            .enqueue_board_outbox(BoardOutboxItem {
+                id: Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes()),
+                boss_mission_id: boss.id,
+                task_id: None,
+                delivery_kind: "controller_notification".into(),
+                idempotency_key: key,
+                payload: serde_json::json!({
+                    "target_mission_id": boss.id,
+                    "content": BOARD_WAKE_PROMPT,
+                }),
+                state: "pending".into(),
+                attempts: 0,
+                created_at: now_string(),
+                acknowledged_at: None,
+            })
+            .await
+            .expect("enqueue wake");
+        store
+            .update_mission_status(boss.id, MissionStatus::Interrupted)
+            .await
+            .expect("cancel boss");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let inflight: BoardOutboxInflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        replay_pending_board_outbox(&store, &cmd_tx, &inflight).await;
+
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "terminal boss must not be woken"
+        );
+        assert!(store
+            .list_pending_board_outbox(10)
+            .await
+            .expect("pending outbox")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_retires_spawn_for_acknowledged_worker_without_dispatching() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let boss = store
+            .create_mission_with_parent(
+                Some("live boss"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create boss");
+        let worker = store
+            .create_mission_with_parent(
+                Some("worker"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(boss.id),
+                None,
+            )
+            .await
+            .expect("create worker");
+        store
+            .upsert_board_tasks(
+                boss.id,
+                vec![NewBoardTask {
+                    task_key: "worker".into(),
+                    title: "worker".into(),
+                    prompt: "p".into(),
+                    backend: "codex".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("create task");
+        let mut task = store
+            .list_board_tasks(boss.id)
+            .await
+            .expect("list task")
+            .remove(0);
+        task.status = BoardTaskStatus::Running;
+        task.worker_mission_id = Some(worker.id);
+        task.attempts = 1;
+        store
+            .save_board_task(&task)
+            .await
+            .expect("save running task");
+        store
+            .update_mission_status(worker.id, MissionStatus::Acknowledged)
+            .await
+            .expect("acknowledge worker");
+
+        let key = format!("board:{}:attempt:1:spawn", task.id);
+        store
+            .enqueue_board_outbox(BoardOutboxItem {
+                id: Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes()),
+                boss_mission_id: boss.id,
+                task_id: Some(task.id),
+                delivery_kind: "spawn".into(),
+                idempotency_key: key,
+                payload: serde_json::json!({
+                    "target_mission_id": worker.id,
+                    "content": "do work",
+                }),
+                state: "pending".into(),
+                attempts: 0,
+                created_at: now_string(),
+                acknowledged_at: None,
+            })
+            .await
+            .expect("enqueue spawn");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let inflight: BoardOutboxInflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        replay_pending_board_outbox(&store, &cmd_tx, &inflight).await;
+
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "acknowledged worker must not be reactivated"
+        );
+        assert!(store
+            .list_pending_board_outbox(10)
+            .await
+            .expect("pending outbox")
+            .is_empty());
     }
 
     #[test]
