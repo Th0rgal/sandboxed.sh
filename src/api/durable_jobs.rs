@@ -833,7 +833,11 @@ pub async fn start_job(
         "SANDBOXED_SH_DURABLE_STATUS".to_string(),
         status_path_for_child,
     );
-    let shell_args = vec!["-lc".to_string(), wrapper];
+    // WorkspaceExec already provides the container login-shell boundary and
+    // changes to the translated cwd before it execs this shell. A second
+    // login shell can reset PWD to HOME (observed as `/` in nspawn), causing
+    // a requested repository build to run against the wrong tree.
+    let shell_args = vec!["-c".to_string(), wrapper];
     let child_result = match workspace {
         Some(workspace) => {
             WorkspaceExec::new(workspace)
