@@ -13727,6 +13727,38 @@ async fn control_actor_loop(
                                         let _ = respond.send(UserMessageAck::Rejected(error));
                                         continue;
                                     }
+                                    if let Err(error) = persist_control_queue_if_changed(
+                                        &mission_store,
+                                        &session_user_id,
+                                        &queue,
+                                        &parallel_runners,
+                                        &recovered_consumed_user_messages,
+                                        &mut last_persisted_queue,
+                                    )
+                                    .await
+                                    {
+                                        if let Some(runner) = parallel_runners.get_mut(&tid) {
+                                            runner
+                                                .finish_durable_run(
+                                                    &mission_store,
+                                                    Some("consumed_snapshot_persist_failed"),
+                                                )
+                                                .await;
+                                            runner.remove_inflight_message(id);
+                                        }
+                                        accepted_user_message_ids.remove(&id);
+                                        let _ = respond.send(UserMessageAck::Rejected(format!(
+                                            "failed to persist consumed parallel delivery: {error}"
+                                        )));
+                                        continue;
+                                    }
+                                    let Some(runner) = parallel_runners.get_mut(&tid) else {
+                                        accepted_user_message_ids.remove(&id);
+                                        let _ = respond.send(UserMessageAck::Rejected(format!(
+                                            "mission {tid} runner disappeared before start"
+                                        )));
+                                        continue;
+                                    };
                                     runner.start_next(
                                         config.clone(),
                                         Arc::clone(&root_agent),
@@ -13993,6 +14025,36 @@ async fn control_actor_loop(
                                                 let _ = respond.send(UserMessageAck::Rejected(error));
                                                 continue;
                                             }
+                                            if let Err(error) = persist_control_queue_if_changed(
+                                                &mission_store,
+                                                &session_user_id,
+                                                &queue,
+                                                &parallel_runners,
+                                                &recovered_consumed_user_messages,
+                                                &mut last_persisted_queue,
+                                            )
+                                            .await
+                                            {
+                                                if let Some(runner) = parallel_runners.get_mut(&tid) {
+                                                    runner
+                                                        .finish_durable_run(
+                                                            &mission_store,
+                                                            Some("consumed_snapshot_persist_failed"),
+                                                        )
+                                                        .await;
+                                                }
+                                                parallel_runners.remove(&tid);
+                                                accepted_user_message_ids.remove(&id);
+                                                let _ = respond.send(UserMessageAck::Rejected(
+                                                    format!(
+                                                        "failed to persist consumed parallel delivery: {error}"
+                                                    ),
+                                                ));
+                                                continue;
+                                            }
+                                            let runner = parallel_runners
+                                                .get_mut(&tid)
+                                                .expect("parallel runner persisted above");
                                             runner.start_next(
                                                 config.clone(),
                                                 Arc::clone(&root_agent),
@@ -14410,6 +14472,31 @@ async fn control_actor_loop(
                                     Err(error) => {
                                         running_cancel = None;
                                         running_mission_id = None;
+                                        // The queue dequeue was already persisted, but no
+                                        // run owns this delivery. Roll back the just-appended
+                                        // history entry and release the deterministic message
+                                        // id so the caller/outbox can retry it safely.
+                                        if history.last().is_some_and(|entry| {
+                                            entry.0 == "user" && entry.1 == msg
+                                        }) {
+                                            history.pop();
+                                            persist_mission_history_to(
+                                                &mission_store,
+                                                &events_tx,
+                                                msg_target_mid,
+                                                &history,
+                                            )
+                                            .await;
+                                        }
+                                        accepted_user_message_ids.remove(&mid);
+                                        set_and_emit_status(
+                                            &status,
+                                            &events_tx,
+                                            ControlRunState::Idle,
+                                            queue.len(),
+                                            msg_target_mid,
+                                        )
+                                        .await;
                                         let _ = respond.send(UserMessageAck::Rejected(error.clone()));
                                         let _ = events_tx.send(AgentEvent::Error {
                                             message: format!("Mission run lease rejected: {error}"),
