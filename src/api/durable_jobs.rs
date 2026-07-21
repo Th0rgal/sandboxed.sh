@@ -399,7 +399,12 @@ fn resolve_workspace_cwd(
             workspace_root.display()
         ));
     }
-    Ok(canonical_cwd)
+    // Keep the configured/logical workspace prefix after validating its
+    // canonical target. WorkspaceExec strips that prefix to derive the path
+    // inside a container. Returning the canonical target here breaks that
+    // mapping when the configured root is a stable symlink (as on dev), and
+    // silently turns every requested cwd into `/`.
+    Ok(cwd)
 }
 
 fn merge_job_for_write(current: Option<DurableJob>, mut next: DurableJob) -> DurableJob {
@@ -1144,7 +1149,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolved, mission.canonicalize().unwrap());
+        assert_eq!(resolved, mission);
     }
 
     #[test]
@@ -1152,6 +1157,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(resolve_workspace_cwd(dir.path(), WorkspaceType::Host, Some("/tmp")).is_err());
         assert!(resolve_workspace_cwd(dir.path(), WorkspaceType::Container, Some("../")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_cwd_preserves_symlink_root_after_escape_validation() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let canonical_root = parent.path().join("canonical");
+        let logical_root = parent.path().join("logical");
+        std::fs::create_dir_all(canonical_root.join("workspaces/repo")).unwrap();
+        symlink(&canonical_root, &logical_root).unwrap();
+
+        let cwd = resolve_workspace_cwd(
+            &logical_root,
+            WorkspaceType::Container,
+            Some("/workspaces/repo"),
+        )
+        .unwrap();
+
+        assert_eq!(cwd, logical_root.join("workspaces/repo"));
+        assert_ne!(cwd, canonical_root.join("workspaces/repo"));
     }
 
     #[test]
