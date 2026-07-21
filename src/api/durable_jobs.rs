@@ -579,6 +579,41 @@ fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+fn cgroup_contains_scope(cgroup: &str, scope_unit: &str) -> bool {
+    let expected = if scope_unit.ends_with(".scope") {
+        scope_unit.to_string()
+    } else {
+        format!("{scope_unit}.scope")
+    };
+    cgroup
+        .lines()
+        .flat_map(|line| {
+            line.rsplit_once(':')
+                .map(|(_, path)| path)
+                .unwrap_or(line)
+                .split('/')
+        })
+        .any(|component| component == expected)
+}
+
+#[cfg(unix)]
+fn process_owned_by_job(job: &DurableJob, pid: u32) -> bool {
+    if !process_alive(pid) {
+        return false;
+    }
+    let Some(scope_unit) = job.scope_unit.as_deref() else {
+        return true;
+    };
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()
+        .is_some_and(|cgroup| cgroup_contains_scope(&cgroup, scope_unit))
+}
+
+#[cfg(not(unix))]
+fn process_owned_by_job(_job: &DurableJob, _pid: u32) -> bool {
+    false
+}
+
 #[cfg(not(unix))]
 fn process_alive(_pid: u32) -> bool {
     false
@@ -653,10 +688,36 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
         }
 
         if let Some(pid) = job.pid {
-            if !process_alive(pid) {
+            if !process_owned_by_job(&job, pid) {
                 job.status = DurableJobStatus::Unknown;
                 job.updated_at = Utc::now();
                 job = write_job(state, &job).await.unwrap_or(job);
+            } else {
+                let now = Utc::now();
+                if job.deadline_at.is_some_and(|deadline| deadline <= now) {
+                    job.status = DurableJobStatus::Cancelled;
+                    job.updated_at = now;
+                    job = write_job(state, &job).await.unwrap_or(job);
+                    let cancelling = job.clone();
+                    tokio::spawn(async move {
+                        signal_job(&cancelling, false).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(FORCE_CLEAR_SECS)).await;
+                        if cancelling.pid.is_some_and(process_alive) {
+                            signal_job(&cancelling, true).await;
+                        }
+                    });
+                } else if job
+                    .heartbeat_at
+                    .is_none_or(|heartbeat| (now - heartbeat).num_seconds() >= 5)
+                {
+                    // The original child watcher is process-local. After an
+                    // API restart, a verified live PID in the persisted scope
+                    // is enough to reattach the lease and advance heartbeat
+                    // without resubmitting the underlying remote job.
+                    job.heartbeat_at = Some(now);
+                    job.updated_at = now;
+                    job = write_job(state, &job).await.unwrap_or(job);
+                }
             }
         }
     }
@@ -1100,6 +1161,21 @@ mod tests {
         assert_eq!(first, retry);
         assert_ne!(first, distinct);
         assert!(validated_idempotency_key(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn cgroup_scope_membership_requires_the_exact_unit() {
+        let cgroup = "1:name=systemd:/\n0::/missions.slice/sandboxed-durable-demo.scope\n";
+        assert!(cgroup_contains_scope(cgroup, "sandboxed-durable-demo"));
+        assert!(cgroup_contains_scope(
+            cgroup,
+            "sandboxed-durable-demo.scope"
+        ));
+        assert!(!cgroup_contains_scope(cgroup, "sandboxed-durable"));
+        assert!(!cgroup_contains_scope(
+            cgroup,
+            "sandboxed-durable-demo-other"
+        ));
     }
 
     #[test]
