@@ -602,7 +602,7 @@ fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
                 _ = tokio::time::sleep(deadline), if !deadline.is_zero() => {
                     if let Ok(mut job) = read_job(&state, id).await {
                         if job.status == DurableJobStatus::Running {
-                            job.status = DurableJobStatus::Failed;
+                            job.status = deadline_terminal_status();
                             job.updated_at = Utc::now();
                             let _ = write_job(&state, &job).await;
                             signal_job(&job, false).await;
@@ -643,6 +643,10 @@ fn retryable_pidless_receipt(job: &DurableJob) -> bool {
 
 fn job_accepts_heartbeat(status: &DurableJobStatus) -> bool {
     *status == DurableJobStatus::Running
+}
+
+fn deadline_terminal_status() -> DurableJobStatus {
+    DurableJobStatus::Failed
 }
 
 fn requires_force_clear(scope_unit: Option<&str>, process_is_alive: bool) -> bool {
@@ -777,7 +781,7 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
             } else {
                 let now = Utc::now();
                 if job.deadline_at.is_some_and(|deadline| deadline <= now) {
-                    job.status = DurableJobStatus::Cancelled;
+                    job.status = deadline_terminal_status();
                     job.updated_at = now;
                     job = write_job(state, &job).await.unwrap_or(job);
                     let cancelling = job.clone();
@@ -1310,6 +1314,11 @@ mod tests {
         assert!(requires_force_clear(Some("sandboxed-durable-demo"), false));
         assert!(requires_force_clear(None, true));
         assert!(!requires_force_clear(None, false));
+    }
+
+    #[test]
+    fn deadline_is_always_classified_as_failed() {
+        assert_eq!(deadline_terminal_status(), DurableJobStatus::Failed);
     }
 
     #[test]

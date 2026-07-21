@@ -2911,18 +2911,20 @@ async fn persist_control_queue_if_changed(
     queue: &VecDeque<ControlQueueEntry>,
     parallel_runners: &std::collections::HashMap<Uuid, super::mission_runner::MissionRunner>,
     last_persisted: &mut String,
-) {
+) -> Result<(), String> {
     let snapshot = serialize_queue_snapshot(queue, parallel_runners);
     if snapshot != *last_persisted {
-        if let Err(e) = mission_store
+        if let Err(error) = mission_store
             .save_control_queue(session_user_id, &snapshot)
             .await
         {
-            tracing::warn!("Failed to persist control queue: {e}");
+            tracing::warn!("Failed to persist control queue: {error}");
+            return Err(error);
         } else {
             *last_persisted = snapshot;
         }
     }
+    Ok(())
 }
 
 /// Tool result posted by the frontend for an interactive tool call.
@@ -13152,7 +13154,7 @@ async fn control_actor_loop(
         // during streaming, where the queue is usually unchanged). Each dequeue
         // site below also persists immediately so a popped message can't be
         // re-run after a crash (see `persist_control_queue_if_changed`).
-        persist_control_queue_if_changed(
+        let _ = persist_control_queue_if_changed(
             &mission_store,
             &session_user_id,
             &queue,
@@ -13569,7 +13571,7 @@ async fn control_actor_loop(
                                         // Parallel-runner queues are part of the
                                         // same durable session snapshot. Persist
                                         // before acknowledging the board outbox.
-                                        persist_control_queue_if_changed(
+                                        let persist_result = persist_control_queue_if_changed(
                                             &mission_store,
                                             &session_user_id,
                                             &queue,
@@ -13577,6 +13579,16 @@ async fn control_actor_loop(
                                             &mut last_persisted_queue,
                                         )
                                         .await;
+                                        if let Err(error) = persist_result {
+                                            if let Some(runner) = parallel_runners.get_mut(&tid) {
+                                                runner.remove_from_queue(id);
+                                            }
+                                            accepted_user_message_ids.remove(&id);
+                                            let _ = respond.send(UserMessageAck::Rejected(format!(
+                                                "failed to persist queued delivery: {error}"
+                                            )));
+                                            continue;
+                                        }
                                     }
                                     let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                                     continue;
@@ -14021,14 +14033,22 @@ async fn control_actor_loop(
                         // `Queued` is an acceptance acknowledgement. Persist the
                         // message before sending it so a crash cannot lose an
                         // outbox delivery that its producer has already retired.
-                        persist_control_queue_if_changed(
+                        if let Err(error) = persist_control_queue_if_changed(
                             &mission_store,
                             &session_user_id,
                             &queue,
                             &parallel_runners,
                             &mut last_persisted_queue,
                         )
-                        .await;
+                        .await
+                        {
+                            queue.retain(|(queued_id, ..)| *queued_id != id);
+                            accepted_user_message_ids.remove(&id);
+                            let _ = respond.send(UserMessageAck::Rejected(format!(
+                                "failed to persist queued delivery: {error}"
+                            )));
+                            continue;
+                        }
                         let status_mission_id = if running.is_some() {
                             running_mission_id
                         } else {
@@ -14054,7 +14074,7 @@ async fn control_actor_loop(
                             if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                                 // Persist the dequeue before the awaits that start
                                 // the run, so a crash here can't restore + re-run it.
-                                persist_control_queue_if_changed(
+                                let _ = persist_control_queue_if_changed(
                                     &mission_store,
                                     &session_user_id,
                                     &queue,
@@ -15260,7 +15280,7 @@ async fn control_actor_loop(
                                         // Persist the dequeue before the awaits that
                                         // start the run, so a crash here can't
                                         // restore + re-run it.
-                                        persist_control_queue_if_changed(
+                                        let _ = persist_control_queue_if_changed(
                                             &mission_store,
                                             &session_user_id,
                                             &queue,
@@ -16076,7 +16096,7 @@ async fn control_actor_loop(
                 if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                     // Persist the dequeue before the awaits that start the run, so
                     // a crash here can't restore + re-run it.
-                    persist_control_queue_if_changed(
+                    let _ = persist_control_queue_if_changed(
                         &mission_store,
                         &session_user_id,
                         &queue,
