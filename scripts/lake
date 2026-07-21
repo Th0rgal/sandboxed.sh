@@ -46,23 +46,48 @@ if [ "${SANDBOXED_REMOTE_EXECUTION:-0}" = "1" ]; then
   exec "$real_lake" "$@"
 fi
 
-heavy=0
+remote_heavy=0
+local_only_heavy=0
 unwrap_nested_lake=0
 case "${1:-}" in
-  build|test|check) heavy=1 ;;
+  build) remote_heavy=1 ;;
+  test|check) local_only_heavy=1 ;;
   env)
     case "${2:-}" in
-      lean) heavy=1 ;;
+      lean) local_only_heavy=1 ;;
       lake)
         case "${3:-}" in
-          build|test|check) heavy=1; unwrap_nested_lake=1 ;;
+          build) remote_heavy=1; unwrap_nested_lake=1 ;;
+          test|check) local_only_heavy=1; unwrap_nested_lake=1 ;;
         esac
         ;;
     esac
     ;;
 esac
 
-if [ "$heavy" -eq 0 ] || [ "$policy" = "local_allowed" ]; then
+# The core and runner are rolled independently. Standard verification verbs
+# require the expanded node validator; keep them off the wire until an
+# operator confirms the fleet has that binary. This avoids turning a rolling
+# deployment into a non-fallback HTTP 400 from an older runner.
+if [ "$local_only_heavy" -eq 1 ] && [ "${SANDBOXED_REMOTE_LAKE_VERIFY:-0}" = "1" ]; then
+  remote_heavy=1
+  local_only_heavy=0
+fi
+
+if [ "$local_only_heavy" -eq 1 ]; then
+  if [ "$policy" = "remote_required" ] && [ "${SANDBOXED_ALLOW_LOCAL_LEAN:-0}" != "1" ]; then
+    echo "sandboxed lake shim: remote_required verification needs the expanded sandboxed-node Lake protocol; local execution is blocked" >&2
+    exit 75
+  fi
+  if [ "$policy" = "remote_required" ]; then
+    echo "sandboxed lake shim: POLICY OVERRIDE SANDBOXED_ALLOW_LOCAL_LEAN=1; running verification locally" >&2
+  elif [ "$policy" = "remote_preferred" ]; then
+    echo "sandboxed lake shim: remote verification is not enabled for this fleet; using the local Lean slot" >&2
+  fi
+  exec lean-slot "$real_lake" "$@"
+fi
+
+if [ "$remote_heavy" -eq 0 ] || [ "$policy" = "local_allowed" ]; then
   exec "$real_lake" "$@"
 fi
 
