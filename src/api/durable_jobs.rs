@@ -637,6 +637,10 @@ fn job_has_liveness_evidence(
     }
 }
 
+fn pidless_scope_is_live(scope_unit: Option<&str>, scope_is_active: bool) -> bool {
+    scope_unit.is_some() && scope_is_active
+}
+
 fn job_accepts_heartbeat(status: &DurableJobStatus) -> bool {
     *status == DurableJobStatus::Running
 }
@@ -678,6 +682,11 @@ fn scope_unit_is_active(scope_unit: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn scope_unit_is_active(_scope_unit: &str) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -810,7 +819,16 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
             }
         } else {
             let now = Utc::now();
-            if (now - job.created_at).num_seconds() >= PIDLESS_START_GRACE_SECS {
+            let scope_is_active = job.scope_unit.as_deref().is_some_and(scope_unit_is_active);
+            if pidless_scope_is_live(job.scope_unit.as_deref(), scope_is_active) {
+                // The API may have restarted after the deterministic scope was
+                // launched but before its wrapper PID reached job.json. Reattach
+                // to that scope instead of terminalizing or resubmitting it.
+                job.status = DurableJobStatus::Running;
+                job.heartbeat_at = Some(now);
+                job.updated_at = now;
+                job = write_job(state, &job).await.unwrap_or(job);
+            } else if (now - job.created_at).num_seconds() >= PIDLESS_START_GRACE_SECS {
                 job.status = DurableJobStatus::Unknown;
                 job.updated_at = now;
                 job = write_job(state, &job).await.unwrap_or(job);
@@ -1415,6 +1433,12 @@ mod tests {
         ));
         assert!(job_has_liveness_evidence(None, true, false));
         assert!(!job_has_liveness_evidence(None, false, true));
+        assert!(pidless_scope_is_live(Some("sandboxed-durable-demo"), true));
+        assert!(!pidless_scope_is_live(
+            Some("sandboxed-durable-demo"),
+            false
+        ));
+        assert!(!pidless_scope_is_live(None, true));
     }
 
     #[test]
