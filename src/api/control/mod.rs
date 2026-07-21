@@ -14074,14 +14074,28 @@ async fn control_actor_loop(
                             if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                                 // Persist the dequeue before the awaits that start
                                 // the run, so a crash here can't restore + re-run it.
-                                let _ = persist_control_queue_if_changed(
+                                if let Err(error) = persist_control_queue_if_changed(
                                     &mission_store,
                                     &session_user_id,
                                     &queue,
                                     &parallel_runners,
                                     &mut last_persisted_queue,
                                 )
-                                .await;
+                                .await
+                                {
+                                    queue.push_front((
+                                        mid,
+                                        msg,
+                                        per_msg_agent,
+                                        msg_target_mid,
+                                        msg_source,
+                                    ));
+                                    let _ = respond.send(UserMessageAck::Queued);
+                                    tracing::warn!(
+                                        "Queued delivery retained because dequeue persistence failed: {error}"
+                                    );
+                                    continue;
+                                }
                                 set_and_emit_status(
                                     &status,
                                     &events_tx,
@@ -15276,18 +15290,31 @@ async fn control_actor_loop(
 
                                 // Start execution if not already running
                                 if running.is_none() {
-                                    if let Some((mid, msg, _per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
+                                    if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                                         // Persist the dequeue before the awaits that
                                         // start the run, so a crash here can't
                                         // restore + re-run it.
-                                        let _ = persist_control_queue_if_changed(
+                                        if let Err(error) = persist_control_queue_if_changed(
                                             &mission_store,
                                             &session_user_id,
                                             &queue,
                                             &parallel_runners,
                                             &mut last_persisted_queue,
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            queue.push_front((
+                                                mid,
+                                                msg,
+                                                per_msg_agent,
+                                                msg_target_mid,
+                                                msg_source,
+                                            ));
+                                            let _ = respond.send(Err(format!(
+                                                "Failed to persist resumed mission queue: {error}"
+                                            )));
+                                            continue;
+                                        }
                                         let target_mid = msg_target_mid.unwrap_or(mission_id);
                                         set_and_emit_status(
                                             &status,
@@ -16096,14 +16123,27 @@ async fn control_actor_loop(
                 if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                     // Persist the dequeue before the awaits that start the run, so
                     // a crash here can't restore + re-run it.
-                    let _ = persist_control_queue_if_changed(
+                    if let Err(error) = persist_control_queue_if_changed(
                         &mission_store,
                         &session_user_id,
                         &queue,
                         &parallel_runners,
                         &mut last_persisted_queue,
                     )
-                    .await;
+                    .await
+                    {
+                        queue.push_front((
+                            mid,
+                            msg,
+                            per_msg_agent,
+                            msg_target_mid,
+                            msg_source,
+                        ));
+                        tracing::warn!(
+                            "Queued delivery retained because dequeue persistence failed: {error}"
+                        );
+                        continue;
+                    }
                     set_and_emit_status(
                         &status,
                         &events_tx,
