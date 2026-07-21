@@ -2909,13 +2909,18 @@ fn serialize_queue_snapshot(
     runners.sort_by_key(|(mission_id, _)| **mission_id);
     for (mission_id, runner) in runners {
         if let Some(message) = runner.inflight_message() {
+            // `inflight_message` is also used as a prepared slot before
+            // `begin_mission_run` succeeds. Only a durable run proves the
+            // actor crossed the consumption boundary; a crash before that
+            // must replay the message instead of treating it as completed.
+            let durably_started = runner.durable_run.is_some();
             items.push(QueuedMessage {
                 id: message.id,
                 content: message.content.clone(),
                 agent: message.agent.clone(),
                 mission_id: Some(*mission_id),
                 source: message.source.clone(),
-                inflight: true,
+                inflight: durably_started,
             });
         }
         items.extend(runner.queue.iter().map(|message| QueuedMessage {
@@ -13635,11 +13640,9 @@ async fn control_actor_loop(
                                 }
                                 let was_running = runner.is_running();
                                 runner.queue_message(id, content.clone(), msg_agent, source.clone());
-                                // For an idle runner, move the delivery into its durable
-                                // inflight slot before committing the queue snapshot. This
-                                // makes that commit the exact acceptance boundary: a restart
-                                // after it cannot replay work that was already handed to the
-                                // runner, even if the process starts immediately afterwards.
+                                // For an idle runner, reserve its prepared slot. Queue
+                                // serialization deliberately keeps this replayable until
+                                // acquire_durable_run succeeds.
                                 if !was_running && runner.take_next_message_for_start().is_none() {
                                     accepted_user_message_ids.remove(&id);
                                     let _ = respond.send(UserMessageAck::Rejected(format!(
@@ -13666,10 +13669,9 @@ async fn control_actor_loop(
                                         mission_id: Some(tid),
                                     });
                                 }
-                                // Persist both queued and about-to-start parallel
-                                // deliveries before they can be acknowledged. A
-                                // running turn remains in the snapshot via the
-                                // runner's inflight_message until completion.
+                                // Persist queued and prepared parallel deliveries before
+                                // they can be acknowledged. Prepared work remains marked
+                                // pending until its durable run lease exists.
                                 if let Err(error) = persist_control_queue_if_changed(
                                     &mission_store,
                                     &session_user_id,
@@ -13920,9 +13922,9 @@ async fn control_actor_loop(
                                             }
                                             // Queue the message
                                             runner.queue_message(id, content.clone(), msg_agent, source.clone());
-                                            // Stage the delivery as inflight before its first
-                                            // durable snapshot. start_next will consume this
-                                            // prepared slot rather than dequeueing it again.
+                                            // Reserve the prepared slot before its first
+                                            // snapshot. Serialization keeps it replayable until
+                                            // a durable run exists; start_next consumes this slot.
                                             if runner.take_next_message_for_start().is_none() {
                                                 accepted_user_message_ids.remove(&id);
                                                 let _ = respond.send(UserMessageAck::Rejected(
@@ -13940,8 +13942,8 @@ async fn control_actor_loop(
                                                 mission_id: Some(tid),
                                                 source: source.clone(),
                                             });
-                                            // Journal the prepared inflight delivery before
-                                            // acquiring the run or starting any process.
+                                            // Journal the prepared delivery as replayable pending
+                                            // before acquiring the run or starting a process.
                                             parallel_runners.insert(tid, runner);
                                             if let Err(error) = persist_control_queue_if_changed(
                                                 &mission_store,
@@ -25109,7 +25111,7 @@ Investigate <service/> failures.
     }
 
     #[test]
-    fn queue_snapshot_includes_parallel_runner_messages() {
+    fn queue_snapshot_replays_prepared_parallel_message_until_run_exists() {
         let main_mission = Uuid::new_v4();
         let parallel_mission = Uuid::new_v4();
         let main_queue = VecDeque::from([(
@@ -25149,11 +25151,57 @@ Investigate <service/> failures.
             message.id == parallel_message_id
                 && message.content == "parallel"
                 && message.mission_id == Some(parallel_mission)
-                && message.inflight
+                && !message.inflight
         }));
         assert!(messages
             .iter()
             .any(|message| message.content == "main" && !message.inflight));
+    }
+
+    #[test]
+    fn queue_snapshot_marks_parallel_message_consumed_with_durable_run() {
+        let mission_id = Uuid::new_v4();
+        let mut runner = crate::api::mission_runner::MissionRunner::new(
+            mission_id,
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let message_id = Uuid::new_v4();
+        runner.queue_message(
+            message_id,
+            "parallel".into(),
+            None,
+            Some("task-board".into()),
+        );
+        runner
+            .take_next_message_for_start()
+            .expect("message should enter prepared slot");
+        runner.durable_run = Some(MissionRun {
+            run_id: Uuid::new_v4(),
+            mission_id,
+            generation: 1,
+            execution_state: MissionExecutionState::Running,
+            owner_actor_id: "control:test".into(),
+            scope_unit: None,
+            started_at: now_string(),
+            heartbeat_at: now_string(),
+            stopping_at: None,
+            ended_at: None,
+            terminal_reason: None,
+        });
+        let runners = std::collections::HashMap::from([(mission_id, runner)]);
+
+        let snapshot = serialize_queue_snapshot(&VecDeque::new(), &runners, &HashMap::new());
+        let messages: Vec<QueuedMessage> = serde_json::from_str(&snapshot).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, message_id);
+        assert!(messages[0].inflight);
     }
 
     #[test]
