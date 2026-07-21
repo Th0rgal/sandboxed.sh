@@ -18,6 +18,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
 use uuid::Uuid;
@@ -77,6 +78,10 @@ pub struct DurableJob {
     /// Retry key supplied by the caller. The job id is derived from this key.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Hash of every caller-controlled execution option. Environment values
+    /// are hashed rather than persisted so job receipts never expose secrets.
+    #[serde(default)]
+    pub request_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +143,46 @@ fn durable_job_id(user_id: &str, mission_id: Uuid, key: Option<&str>) -> Uuid {
             format!("sandboxed.sh/durable-job/{user_id}/{mission_id}/{key}").as_bytes(),
         ),
         None => Uuid::new_v4(),
+    }
+}
+
+fn durable_job_request_fingerprint(
+    command: &str,
+    cwd: &Path,
+    workspace_id: Uuid,
+    env: &std::collections::HashMap<String, String>,
+    timeout_secs: u64,
+    resource_class: Option<&str>,
+) -> String {
+    let mut env = env.iter().collect::<Vec<_>>();
+    env.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let payload = serde_json::to_vec(&(
+        command,
+        cwd.to_string_lossy(),
+        workspace_id,
+        env,
+        timeout_secs,
+        resource_class,
+    ))
+    .expect("durable job fingerprint payload is serializable");
+    hex::encode(Sha256::digest(payload))
+}
+
+fn job_matches_request(job: &DurableJob, request_fingerprint: &str) -> bool {
+    job.request_fingerprint.as_deref() == Some(request_fingerprint)
+}
+
+fn try_acquire_submission_claim(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -746,48 +791,6 @@ pub async fn start_job(
     let idempotency_key = validated_idempotency_key(req.idempotency_key.as_deref())
         .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
     let id = durable_job_id(&user.id, started_by_mission_id, idempotency_key.as_deref());
-    if idempotency_key.is_some() {
-        if let Ok(existing) = read_job(&state, id).await {
-            if existing.command != command || existing.workspace_id != req.workspace_id {
-                return Err(err(
-                    StatusCode::CONFLICT,
-                    "idempotency_key was already used with different job parameters",
-                ));
-            }
-            return Ok(Json(refresh_job(&state, existing).await));
-        }
-        tokio::fs::create_dir_all(job_dir(&state, id))
-            .await
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let claim = job_dir(&state, id).join("submission.claim");
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&claim)
-        {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                for _ in 0..40 {
-                    if let Ok(existing) = read_job(&state, id).await {
-                        if existing.command != command || existing.workspace_id != req.workspace_id
-                        {
-                            return Err(err(
-                                StatusCode::CONFLICT,
-                                "idempotency_key parameter mismatch",
-                            ));
-                        }
-                        return Ok(Json(refresh_job(&state, existing).await));
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                return Err(err(
-                    StatusCode::CONFLICT,
-                    "idempotent job submission is still being registered",
-                ));
-            }
-            Err(error) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
-        }
-    }
 
     let workspace = Some(state.workspaces.get(workspace_id).await.ok_or_else(|| {
         err(
@@ -795,7 +798,8 @@ pub async fn start_job(
             format!("workspace not found: {workspace_id}"),
         )
     })?);
-    let mut job_env = req.env;
+    let caller_env = req.env;
+    let mut job_env = caller_env.clone();
     if let Some(workspace) = workspace.as_ref() {
         // Durable jobs are the Hermes-facing path for long commands, so they
         // must receive the same compute-policy boundary as an agent runner.
@@ -826,10 +830,78 @@ pub async fn start_job(
     }
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
+    let timeout_secs = req
+        .timeout_secs
+        .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS)
+        .clamp(1, MAX_JOB_TIMEOUT_SECS);
+    let request_fingerprint = durable_job_request_fingerprint(
+        command,
+        &cwd,
+        workspace_id,
+        &caller_env,
+        timeout_secs,
+        req.resource_class.as_deref(),
+    );
+    if idempotency_key.is_some() {
+        if let Ok(existing) = read_job(&state, id).await {
+            if !job_matches_request(&existing, &request_fingerprint) {
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    "idempotency_key was already used with different job parameters",
+                ));
+            }
+            return Ok(Json(refresh_job(&state, existing).await));
+        }
+    }
+
     let dir = job_dir(&state, id);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // The lock, rather than file existence, owns the submission lease. A
+    // failed request drops the lock, so a later retry can reuse the same key;
+    // a concurrent request waits for the first job receipt instead of spawning
+    // a duplicate process.
+    let _submission_claim = if idempotency_key.is_some() {
+        let claim_path = dir.join("submission.claim");
+        match try_acquire_submission_claim(&claim_path)
+            .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        {
+            Some(claim) => {
+                // Close the race between the initial read and taking the lock.
+                if let Ok(existing) = read_job(&state, id).await {
+                    if !job_matches_request(&existing, &request_fingerprint) {
+                        return Err(err(
+                            StatusCode::CONFLICT,
+                            "idempotency_key was already used with different job parameters",
+                        ));
+                    }
+                    return Ok(Json(refresh_job(&state, existing).await));
+                }
+                Some(claim)
+            }
+            None => {
+                for _ in 0..40 {
+                    if let Ok(existing) = read_job(&state, id).await {
+                        if !job_matches_request(&existing, &request_fingerprint) {
+                            return Err(err(
+                                StatusCode::CONFLICT,
+                                "idempotency_key parameter mismatch",
+                            ));
+                        }
+                        return Ok(Json(refresh_job(&state, existing).await));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    "idempotent job submission is still being registered",
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let runtime_dir = workspace
         .as_ref()
         .map(|workspace| {
@@ -860,10 +932,6 @@ pub async fn start_job(
     let wrapper = durable_shell_wrapper(command);
 
     let now = Utc::now();
-    let timeout_secs = req
-        .timeout_secs
-        .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS)
-        .clamp(1, MAX_JOB_TIMEOUT_SECS);
     let mut job = DurableJob {
         id,
         command: command.to_string(),
@@ -889,6 +957,7 @@ pub async fn start_job(
         }),
         resource_class: req.resource_class,
         idempotency_key,
+        request_fingerprint: Some(request_fingerprint),
     };
     job = write_job(&state, &job)
         .await
@@ -1139,6 +1208,7 @@ mod tests {
             scope_unit: None,
             resource_class: None,
             idempotency_key: None,
+            request_fingerprint: None,
         }
     }
 
@@ -1166,6 +1236,88 @@ mod tests {
         assert_eq!(first, retry);
         assert_ne!(first, distinct);
         assert!(validated_idempotency_key(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn idempotency_fingerprint_covers_every_execution_option() {
+        let workspace_id = Uuid::new_v4();
+        let mut env = std::collections::HashMap::from([("MODE".to_string(), "one".to_string())]);
+        let base = durable_job_request_fingerprint(
+            "lake build",
+            Path::new("/workspaces/beal"),
+            workspace_id,
+            &env,
+            7_200,
+            Some("lean_heavy"),
+        );
+        assert_eq!(
+            base,
+            durable_job_request_fingerprint(
+                "lake build",
+                Path::new("/workspaces/beal"),
+                workspace_id,
+                &env,
+                7_200,
+                Some("lean_heavy"),
+            )
+        );
+        env.insert("MODE".to_string(), "two".to_string());
+        assert_ne!(
+            base,
+            durable_job_request_fingerprint(
+                "lake build",
+                Path::new("/workspaces/beal"),
+                workspace_id,
+                &env,
+                7_200,
+                Some("lean_heavy"),
+            )
+        );
+        assert_ne!(
+            base,
+            durable_job_request_fingerprint(
+                "lake build",
+                Path::new("/workspaces/verity"),
+                workspace_id,
+                &std::collections::HashMap::from([("MODE".to_string(), "one".to_string(),)]),
+                7_200,
+                Some("lean_heavy"),
+            )
+        );
+        assert_ne!(
+            base,
+            durable_job_request_fingerprint(
+                "lake build",
+                Path::new("/workspaces/beal"),
+                workspace_id,
+                &std::collections::HashMap::from([("MODE".to_string(), "one".to_string(),)]),
+                3_600,
+                Some("lean_heavy"),
+            )
+        );
+        assert_ne!(
+            base,
+            durable_job_request_fingerprint(
+                "lake build",
+                Path::new("/workspaces/beal"),
+                workspace_id,
+                &std::collections::HashMap::from([("MODE".to_string(), "one".to_string(),)]),
+                7_200,
+                Some("diagnostic"),
+            )
+        );
+    }
+
+    #[test]
+    fn failed_submission_claim_can_be_reacquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim_path = dir.path().join("submission.claim");
+        let first = try_acquire_submission_claim(&claim_path)
+            .unwrap()
+            .expect("first claim");
+        assert!(try_acquire_submission_claim(&claim_path).unwrap().is_none());
+        drop(first);
+        assert!(try_acquire_submission_claim(&claim_path).unwrap().is_some());
     }
 
     #[test]

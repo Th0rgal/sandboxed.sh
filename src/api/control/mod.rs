@@ -4272,6 +4272,26 @@ fn attach_execution_to_mission_value(
     value
 }
 
+fn is_user_wait_tool(tool_kind: &str) -> bool {
+    matches!(
+        tool_kind,
+        "request_user_input" | "AskUserQuestion" | "frontend_tool"
+    )
+}
+
+fn mission_heartbeat_state(
+    active_tool_calls: usize,
+    has_registered_user_wait: bool,
+) -> MissionExecutionState {
+    if has_registered_user_wait {
+        MissionExecutionState::WaitingUser
+    } else if active_tool_calls > 0 {
+        MissionExecutionState::WaitingTool
+    } else {
+        MissionExecutionState::Running
+    }
+}
+
 pub async fn list_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -13125,51 +13145,42 @@ async fn control_actor_loop(
             _ = execution_heartbeat.tick() => {
                 let mut leases = Vec::new();
                 if let Some(run) = running_run.clone() {
-                    let state = if main_runner_active_tool_calls
-                        .load(std::sync::atomic::Ordering::Relaxed) > 0
-                    {
-                        MissionExecutionState::WaitingTool
-                    } else {
-                        MissionExecutionState::Running
-                    };
-                    leases.push((run, state, main_runner_last_activity.elapsed().as_secs()));
+                    leases.push((
+                        run,
+                        main_runner_active_tool_calls
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        main_runner_last_activity.elapsed().as_secs(),
+                    ));
                 }
                 leases.extend(parallel_runners.values().filter_map(|runner| {
                     runner.durable_run.clone().map(|run| {
-                        let state = if runner.active_tool_calls
-                            .load(std::sync::atomic::Ordering::Relaxed) > 0
-                        {
-                            MissionExecutionState::WaitingTool
-                        } else {
-                            MissionExecutionState::Running
-                        };
-                        (run, state, runner.last_activity.elapsed().as_secs())
+                        (
+                            run,
+                            runner
+                                .active_tool_calls
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            runner.last_activity.elapsed().as_secs(),
+                        )
                     })
                 }));
-                for (run, state, idle_secs) in leases {
-                    match mission_store
-                        .heartbeat_mission_run(run.run_id, run.generation, state, None)
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => tracing::warn!(
-                            mission_id = %run.mission_id,
-                            run_id = %run.run_id,
-                            generation = run.generation,
-                            "Ignored heartbeat for stale mission run generation"
-                        ),
-                        Err(error) => tracing::warn!(
-                            mission_id = %run.mission_id,
-                            run_id = %run.run_id,
-                            "Failed to persist mission run heartbeat: {error}"
-                        ),
-                    }
+                for (run, active_tool_calls, idle_secs) in leases {
                     let mut live_registered_tools = 0usize;
+                    let mut has_registered_user_wait = false;
                     if let Ok(tools) = mission_store
                         .list_active_tool_executions(run.run_id)
                         .await
                     {
                         for tool in tools {
+                            if is_user_wait_tool(&tool.tool_kind) {
+                                // User-input tools remain live until their
+                                // matching result arrives. The generic 120s
+                                // provisional deadline must never reap a
+                                // mission merely because a human took longer
+                                // than two minutes to answer.
+                                has_registered_user_wait = true;
+                                live_registered_tools += 1;
+                                continue;
+                            }
                             let expired = chrono::DateTime::parse_from_rfc3339(
                                 &tool.deadline_at,
                             )
@@ -13191,6 +13202,27 @@ async fn control_actor_loop(
                                 live_registered_tools += 1;
                             }
                         }
+                    }
+                    let state = mission_heartbeat_state(
+                        active_tool_calls,
+                        has_registered_user_wait,
+                    );
+                    match mission_store
+                        .heartbeat_mission_run(run.run_id, run.generation, state, None)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            generation = run.generation,
+                            "Ignored heartbeat for stale mission run generation"
+                        ),
+                        Err(error) => tracing::warn!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            "Failed to persist mission run heartbeat: {error}"
+                        ),
                     }
                     if idle_secs >= 15 * 60
                         && state != MissionExecutionState::WaitingUser
@@ -16724,10 +16756,7 @@ async fn control_actor_loop(
                                 };
                                 if let Some(run) = durable_run {
                                     let now = chrono::Utc::now();
-                                    let waiting_state = if matches!(
-                                        name.as_str(),
-                                        "request_user_input" | "AskUserQuestion" | "frontend_tool"
-                                    ) {
+                                    let waiting_state = if is_user_wait_tool(name) {
                                         MissionExecutionState::WaitingUser
                                     } else {
                                         MissionExecutionState::WaitingTool
@@ -20597,6 +20626,26 @@ mod tests {
         assert!(refusal.contains("20 GiB scratch"));
         assert!(refusal.contains("64 GiB"));
         assert!(refusal.contains("80 GiB is free"));
+    }
+
+    #[test]
+    fn mission_heartbeat_preserves_registered_user_waits() {
+        assert!(is_user_wait_tool("request_user_input"));
+        assert!(is_user_wait_tool("AskUserQuestion"));
+        assert!(is_user_wait_tool("frontend_tool"));
+        assert!(!is_user_wait_tool("workspace_bash"));
+        assert_eq!(
+            mission_heartbeat_state(1, true),
+            MissionExecutionState::WaitingUser
+        );
+        assert_eq!(
+            mission_heartbeat_state(1, false),
+            MissionExecutionState::WaitingTool
+        );
+        assert_eq!(
+            mission_heartbeat_state(0, false),
+            MissionExecutionState::Running
+        );
     }
 
     fn reset_metadata_refresh_test_state() {
