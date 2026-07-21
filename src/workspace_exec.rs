@@ -120,6 +120,16 @@ fn ca_env_scrub_prelude() -> String {
     )
 }
 
+/// Re-prepend the server-installed build-policy wrapper directory after a
+/// login shell has processed its profile. Container profiles commonly put
+/// `/root/.elan/bin` first, which would otherwise bypass the `lake` shim even
+/// though the authoritative PATH was present in the process environment.
+fn compute_policy_path_prelude() -> &'static str {
+    "if [ -n \"${REMOTE_BUILD_COMMAND:-}\" ]; then \
+     __oa_policy_bin=${REMOTE_BUILD_COMMAND%/*}; \
+     PATH=$__oa_policy_bin:$PATH; export PATH; unset __oa_policy_bin; fi; "
+}
+
 fn environ_has_keepalive_marker(environ: &[u8]) -> bool {
     let expected = format!(
         "{}={}",
@@ -969,6 +979,7 @@ mod tests {
         let cmd = WorkspaceExec::build_shell_command_with_env("/w", "curl", &[], None);
         assert!(cmd.contains("SSL_CERT_FILE"));
         assert!(cmd.contains("NODE_EXTRA_CA_CERTS"));
+        assert!(cmd.contains("REMOTE_BUILD_COMMAND%/*"));
         assert!(cmd.trim_start().starts_with("for __oa_ca in"));
     }
 
@@ -1323,6 +1334,10 @@ impl WorkspaceExec {
         // HTTPS inside the container. Runs first so workspace-configured CA
         // vars re-exported below still win.
         cmd.push_str(&ca_env_scrub_prelude());
+        // `/bin/sh -lc` may replace PATH while reading the container profile.
+        // Restore only the non-secret wrapper directory here; the remaining
+        // environment stays out of the visible command line.
+        cmd.push_str(compute_policy_path_prelude());
 
         // Export env vars inside the shell command so they're available in the container.
         // Keys are validated to POSIX env var names (alphanumeric + underscore) to prevent

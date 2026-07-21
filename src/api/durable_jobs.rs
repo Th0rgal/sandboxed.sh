@@ -214,7 +214,7 @@ fn durable_shell_wrapper(command: &str) -> String {
     // `set -e; false` must terminate only this subshell so the parent can
     // always persist the restart-safe terminal record.
     format!(
-        "(\n{command}\n)\ncode=$?\nprintf '{{\"exit_code\":%s,\"signal\":null,\"finished_at\":\"%s\"}}\\n' \"$code\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$SANDBOXED_SH_DURABLE_STATUS\"\nexit \"$code\"\n"
+        "if [ -n \"${{REMOTE_BUILD_COMMAND:-}}\" ]; then\n  __oa_policy_bin=${{REMOTE_BUILD_COMMAND%/*}}\n  PATH=$__oa_policy_bin:$PATH\n  export PATH\n  unset __oa_policy_bin\nfi\n(\n{command}\n)\ncode=$?\nprintf '{{\"exit_code\":%s,\"signal\":null,\"finished_at\":\"%s\"}}\\n' \"$code\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$SANDBOXED_SH_DURABLE_STATUS\"\nexit \"$code\"\n"
     )
 }
 
@@ -1106,8 +1106,10 @@ mod tests {
     fn wrapper_records_failure_even_when_command_enables_errexit() {
         let dir = tempfile::tempdir().unwrap();
         let status_file = dir.path().join("exit.json");
+        let wrapper = durable_shell_wrapper("set -eu; false");
+        assert!(wrapper.contains("REMOTE_BUILD_COMMAND%/*"));
         let output = std::process::Command::new("/bin/sh")
-            .args(["-lc", &durable_shell_wrapper("set -eu; false")])
+            .args(["-lc", &wrapper])
             .env("SANDBOXED_SH_DURABLE_STATUS", &status_file)
             .output()
             .unwrap();
