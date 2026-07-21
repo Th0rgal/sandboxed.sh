@@ -12047,7 +12047,10 @@ mod tests {
         let followup_id = Uuid::new_v4();
         runner.queue_message(followup_id, "follow-up".to_string(), None, None);
         assert!(runner.take_next_message_for_start().is_none());
-        assert_eq!(runner.queue.front().map(|message| message.id), Some(followup_id));
+        assert_eq!(
+            runner.queue.front().map(|message| message.id),
+            Some(followup_id)
+        );
         assert_eq!(
             runner.inflight_message().map(|message| message.id),
             Some(message_id),
