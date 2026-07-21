@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::agents::TerminalReason;
 use crate::api::mission_store::{
     now_string, BoardOutboxItem, BoardTask, BoardTaskOutcome, BoardTaskRole, BoardTaskStatus,
-    MissionStore, TaskAttempt,
+    MissionHistoryEntry, MissionStore, TaskAttempt,
 };
 
 use super::{ControlCommand, MissionStatus, UserMessageAck};
@@ -630,6 +630,34 @@ fn board_needs_attention(tasks: &[BoardTask]) -> bool {
         .any(|t| matches!(t.status, BoardTaskStatus::Settled | BoardTaskStatus::Failed))
 }
 
+/// Stable revision for a controller wake. Board state alone is insufficient:
+/// an acknowledged outbox row remains durable after the boss consumes it. If
+/// the boss turn does not mutate any task, reusing the same task-only key would
+/// make the next wake look acknowledged without actually queueing a message.
+///
+/// Mission history advances when the boss starts consuming the wake, so it
+/// distinguishes successive controller turns while preserving the same key
+/// across retries/restarts before consumption.
+fn board_wake_revision(tasks: &[BoardTask], history: &[MissionHistoryEntry]) -> Uuid {
+    let latest_task_update = tasks
+        .iter()
+        .map(|task| task.updated_at.as_str())
+        .max()
+        .unwrap_or("empty");
+    let latest_history = history.last();
+    let revision_material = format!(
+        "{latest_task_update}\0{}\0{}\0{}",
+        history.len(),
+        latest_history
+            .map(|entry| entry.role.as_str())
+            .unwrap_or(""),
+        latest_history
+            .map(|entry| entry.content.as_str())
+            .unwrap_or("")
+    );
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, revision_material.as_bytes())
+}
+
 /// Generic, content-free wake delivered to a boss when its board changes.
 /// Deliberately mentions NO specific task or other board — the boss reacts to
 /// its OWN board state. If this ever reaches the wrong mission, that mission
@@ -997,7 +1025,15 @@ pub async fn scheduler_pass(
         // getting workers re-spawned and wake banners it can never act on.
         // Cancel its non-terminal tasks (+ live workers) and skip; next pass the
         // boss drops out entirely.
-        if let Ok(Some(boss)) = mission_store.get_mission(boss_id).await {
+        let boss = match mission_store.get_mission(boss_id).await {
+            Ok(boss) => boss,
+            Err(error) => {
+                tracing::warn!(boss = %boss_id,
+                    "board: failed to load boss mission for scheduling: {error}");
+                None
+            }
+        };
+        if let Some(boss) = boss.as_ref() {
             if boss_status_is_terminal(boss.status) {
                 cancel_dead_boss_board(mission_store, cmd_tx, boss_id, &tasks).await;
                 wake_state.remove(&boss_id);
@@ -1176,31 +1212,30 @@ pub async fn scheduler_pass(
         let needs = board_needs_attention(&fresh);
         if !needs {
             wake_state.insert(boss_id, false);
-        } else if !wake_state.get(&boss_id).copied().unwrap_or(false)
-            && durable_self_send(
-                mission_store,
-                cmd_tx,
-                outbox_inflight,
-                BoardDelivery {
-                    boss_mission_id: boss_id,
-                    task_id: None,
-                    target_mission_id: boss_id,
-                    delivery_kind: "controller_notification",
-                    idempotency_key: format!(
-                        "board:{boss_id}:wake:{}",
-                        fresh
-                            .iter()
-                            .map(|task| task.updated_at.as_str())
-                            .max()
-                            .unwrap_or("empty")
-                    ),
-                    content: BOARD_WAKE_PROMPT.to_string(),
-                },
-            )
-            .await
-        {
-            wake_state.insert(boss_id, true);
-            tracing::info!(boss = %boss_id, "board: sent wake (tasks awaiting decision)");
+        } else if !wake_state.get(&boss_id).copied().unwrap_or(false) {
+            if let Some(boss) = boss.as_ref() {
+                if durable_self_send(
+                    mission_store,
+                    cmd_tx,
+                    outbox_inflight,
+                    BoardDelivery {
+                        boss_mission_id: boss_id,
+                        task_id: None,
+                        target_mission_id: boss_id,
+                        delivery_kind: "controller_notification",
+                        idempotency_key: format!(
+                            "board:{boss_id}:wake:{}",
+                            board_wake_revision(&fresh, &boss.history)
+                        ),
+                        content: BOARD_WAKE_PROMPT.to_string(),
+                    },
+                )
+                .await
+                {
+                    wake_state.insert(boss_id, true);
+                    tracing::info!(boss = %boss_id, "board: sent wake (tasks awaiting decision)");
+                }
+            }
         }
     }
 }
@@ -1994,6 +2029,42 @@ mod tests {
             Some(BoardTaskOutcome::Success)
         )]));
         assert!(!board_needs_attention(&[]));
+    }
+
+    #[test]
+    fn wake_revision_reissues_after_boss_consumes_wake() {
+        let tasks = vec![mk(
+            "review",
+            &[],
+            BoardTaskStatus::Settled,
+            Some(BoardTaskOutcome::Success),
+        )];
+        let before = vec![MissionHistoryEntry {
+            role: "assistant".into(),
+            content: "Previous controller turn".into(),
+        }];
+
+        let initial = board_wake_revision(&tasks, &before);
+        assert_eq!(initial, board_wake_revision(&tasks, &before));
+
+        let mut after_consumption = before.clone();
+        after_consumption.push(MissionHistoryEntry {
+            role: "user".into(),
+            content: BOARD_WAKE_PROMPT.into(),
+        });
+        assert_ne!(
+            initial,
+            board_wake_revision(&tasks, &after_consumption),
+            "a consumed wake must permit a successor even when task timestamps are unchanged"
+        );
+
+        let mut changed_tasks = tasks.clone();
+        changed_tasks[0].updated_at = "2026-01-02T00:00:00Z".into();
+        assert_ne!(
+            initial,
+            board_wake_revision(&changed_tasks, &before),
+            "task state changes must continue to produce a fresh wake revision"
+        );
     }
 
     #[tokio::test]
