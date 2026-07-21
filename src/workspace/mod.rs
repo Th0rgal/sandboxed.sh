@@ -3928,6 +3928,42 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn nested_lake_build_is_normalized_without_duplicating_argv() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let real_lake = root.path().join("real-lake");
+        let remote_build = root.path().join("remote-lean-build");
+        std::fs::write(&real_lake, b"#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::write(&remote_build, b"#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n").unwrap();
+        for path in [&real_lake, &remote_build] {
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/lake"))
+            .args(["env", "lake", "build", "Target"])
+            .env("SANDBOXED_REAL_LAKE", &real_lake)
+            .env("SANDBOXED_COMPUTE_POLICY", "remote_required")
+            .env("PATH", root.path())
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "<lake>\n<build>\n<Target>\n"
+        );
+    }
+
     #[test]
     fn compute_policy_defaults_fail_closed_for_beal_and_verity() {
         let root = tempfile::tempdir().unwrap();

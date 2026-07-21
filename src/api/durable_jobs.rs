@@ -290,6 +290,14 @@ fn preparing_receipt_is_resubmittable(job: &DurableJob) -> bool {
         )
 }
 
+fn submission_receipt_is_final(job: &DurableJob) -> bool {
+    job.spawn_accepted
+        || matches!(
+            job.status,
+            DurableJobStatus::Completed | DurableJobStatus::Cancelled
+        )
+}
+
 async fn authorize_job(
     state: &Arc<AppState>,
     user: &AuthUser,
@@ -989,11 +997,10 @@ pub async fn start_job(
                 ));
             }
             let existing = refresh_job(&state, existing).await;
-            // Accepted receipts close the submission decision. A stale
-            // pre-spawn receipt is explicitly safe to retry because refresh
-            // found neither its deterministic scope nor its atomic start
-            // marker alive.
-            if !preparing_receipt_is_resubmittable(&existing) {
+            // Only accepted or conclusively terminal receipts close the
+            // submission decision. A Running receipt with spawn_accepted=false
+            // is still being registered and must be resolved under the claim.
+            if submission_receipt_is_final(&existing) {
                 return Ok(Json(existing));
             }
         }
@@ -1009,57 +1016,52 @@ pub async fn start_job(
     // a duplicate process.
     let _submission_claim = if idempotency_key.is_some() {
         let claim_path = dir.join("submission.claim");
-        match try_acquire_submission_claim(&claim_path)
-            .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        {
-            Some(claim) => {
-                // Close the race between the initial read and taking the lock.
-                if let Ok(existing) = read_job(&state, id).await {
-                    if !job_matches_request(&existing, &request_fingerprint) {
-                        return Err(err(
-                            StatusCode::CONFLICT,
-                            "idempotency_key was already used with different job parameters",
-                        ));
-                    }
-                    let existing = refresh_job(&state, existing).await;
-                    if !preparing_receipt_is_resubmittable(&existing) {
-                        return Ok(Json(existing));
-                    }
-                    tokio::fs::remove_file(job_file(&state, id))
-                        .await
-                        .map_err(|error| {
-                            err(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("failed to clear stale pre-spawn receipt: {error}"),
-                            )
-                        })?;
-                }
-                Some(claim)
+        let mut claim = None;
+        for _ in 0..40 {
+            claim = try_acquire_submission_claim(&claim_path)
+                .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            if claim.is_some() {
+                break;
             }
-            None => {
-                for _ in 0..40 {
-                    if let Ok(existing) = read_job(&state, id).await {
-                        if !job_matches_request(&existing, &request_fingerprint) {
-                            return Err(err(
-                                StatusCode::CONFLICT,
-                                "idempotency_key parameter mismatch",
-                            ));
-                        }
-                        let existing = refresh_job(&state, existing).await;
-                        if !preparing_receipt_is_resubmittable(&existing) {
-                            return Ok(Json(existing));
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        continue;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let claim = claim.ok_or_else(|| {
+            err(
+                StatusCode::CONFLICT,
+                "idempotent job submission is still being registered",
+            )
+        })?;
+
+        // Close the race between the initial read and taking the lock. A
+        // concurrent retry waits for the submitting request to release this
+        // claim; it never returns a provisional Running receipt as accepted.
+        if let Ok(existing) = read_job(&state, id).await {
+            if !job_matches_request(&existing, &request_fingerprint) {
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    "idempotency_key was already used with different job parameters",
+                ));
+            }
+            let existing = refresh_job(&state, existing).await;
+            if submission_receipt_is_final(&existing) {
+                return Ok(Json(existing));
+            }
+            if !preparing_receipt_is_resubmittable(&existing) {
                 return Err(err(
                     StatusCode::CONFLICT,
                     "idempotent job submission is still being registered",
                 ));
             }
+            tokio::fs::remove_file(job_file(&state, id))
+                .await
+                .map_err(|error| {
+                    err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to clear stale pre-spawn receipt: {error}"),
+                    )
+                })?;
         }
+        Some(claim)
     } else {
         None
     };
@@ -1420,15 +1422,26 @@ mod tests {
         let mut job = test_job(DurableJobStatus::Unknown);
         job.spawn_accepted = false;
         assert!(preparing_receipt_is_resubmittable(&job));
+        assert!(!submission_receipt_is_final(&job));
 
         job.spawn_accepted = true;
         assert!(!preparing_receipt_is_resubmittable(&job));
+        assert!(submission_receipt_is_final(&job));
         job.spawn_accepted = false;
         job.status = DurableJobStatus::Running;
         assert!(!preparing_receipt_is_resubmittable(&job));
+        assert!(
+            !submission_receipt_is_final(&job),
+            "a provisional Running receipt must not be returned as accepted"
+        );
 
         job.status = DurableJobStatus::Failed;
         assert!(preparing_receipt_is_resubmittable(&job));
+        assert!(!submission_receipt_is_final(&job));
+
+        job.status = DurableJobStatus::Completed;
+        assert!(!preparing_receipt_is_resubmittable(&job));
+        assert!(submission_receipt_is_final(&job));
 
         job.spawn_accepted = true;
         assert!(!preparing_receipt_is_resubmittable(&job));
