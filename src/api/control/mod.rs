@@ -4290,10 +4290,7 @@ fn attach_execution_to_mission_value(
 }
 
 fn is_user_wait_tool(tool_kind: &str) -> bool {
-    matches!(
-        tool_kind,
-        "request_user_input" | "AskUserQuestion" | "frontend_tool"
-    )
+    matches!(tool_kind, "request_user_input" | "frontend_tool") || is_interactive_ui_tool(tool_kind)
 }
 
 fn mission_heartbeat_state(
@@ -20743,6 +20740,8 @@ mod tests {
         assert!(is_user_wait_tool("request_user_input"));
         assert!(is_user_wait_tool("AskUserQuestion"));
         assert!(is_user_wait_tool("frontend_tool"));
+        assert!(is_user_wait_tool("question"));
+        assert!(is_user_wait_tool("ui_confirm"));
         assert!(!is_user_wait_tool("workspace_bash"));
         assert_eq!(
             mission_heartbeat_state(1, true),
