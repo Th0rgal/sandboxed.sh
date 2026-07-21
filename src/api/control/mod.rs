@@ -5379,11 +5379,17 @@ fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Opti
         prompt.unwrap_or_default()
     )
     .to_ascii_lowercase();
-    let words: Vec<&str> = text
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
+    let clauses: Vec<Vec<&str>> = text
+        .split([';', '.', '!', '?', '\n', '\r'])
+        .map(|clause| {
+            clause
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .filter(|token| !token.is_empty())
+                .collect()
+        })
+        .filter(|clause: &Vec<&str>| !clause.is_empty())
         .collect();
-    let tokens: HashSet<&str> = words.iter().copied().collect();
+    let tokens: HashSet<&str> = clauses.iter().flatten().copied().collect();
     let has_writer_noun = ["integration", "implementation"]
         .iter()
         .any(|token| tokens.contains(token));
@@ -5422,24 +5428,26 @@ fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Opti
     ];
     const NEGATORS_AFTER: [&str; 4] = ["prohibited", "forbidden", "banned", "disallowed"];
 
-    words.iter().enumerate().any(|(index, word)| {
-        if !WRITER_VERBS.contains(word) {
-            return false;
-        }
-        let negated_immediately = index > 0 && NEGATORS_BEFORE.contains(&words[index - 1]);
-        let coordinated_negation = (index.saturating_sub(4)..index).any(|negator_index| {
-            NEGATORS_BEFORE.contains(&words[negator_index])
-                && words[(negator_index + 1)..index].iter().all(|between| {
-                    WRITER_VERBS.contains(between) || matches!(*between, "and" | "or")
-                })
-        });
-        let stopped_before =
-            index >= 2 && words[index - 2] == "stop" && words[index - 1] == "before";
-        let after_end = (index + 4).min(words.len());
-        let negated_after = words[(index + 1).min(words.len())..after_end]
-            .iter()
-            .any(|next| NEGATORS_AFTER.contains(next));
-        !(negated_immediately || coordinated_negation || stopped_before || negated_after)
+    clauses.iter().any(|words| {
+        words.iter().enumerate().any(|(index, word)| {
+            if !WRITER_VERBS.contains(word) {
+                return false;
+            }
+            let negated_immediately = index > 0 && NEGATORS_BEFORE.contains(&words[index - 1]);
+            let coordinated_negation = (index.saturating_sub(4)..index).any(|negator_index| {
+                NEGATORS_BEFORE.contains(&words[negator_index])
+                    && words[(negator_index + 1)..index].iter().all(|between| {
+                        WRITER_VERBS.contains(between) || matches!(*between, "and" | "or")
+                    })
+            });
+            let stopped_before =
+                index >= 2 && words[index - 2] == "stop" && words[index - 1] == "before";
+            let after_end = (index + 4).min(words.len());
+            let negated_after = words[(index + 1).min(words.len())..after_end]
+                .iter()
+                .any(|next| NEGATORS_AFTER.contains(next));
+            !(negated_immediately || coordinated_negation || stopped_before || negated_after)
+        })
     })
 }
 
@@ -20021,6 +20029,11 @@ mod tests {
             None,
             None,
             Some("No tests required; fix the failing branch")
+        ));
+        assert!(inferred_pr_writer(
+            None,
+            None,
+            Some("Do not commit or push; fix the failing branch")
         ));
         assert!(!inferred_pr_writer(
             None,
