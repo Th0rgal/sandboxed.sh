@@ -2885,6 +2885,15 @@ fn serialize_queue_snapshot(
     let mut runners: Vec<_> = parallel_runners.iter().collect();
     runners.sort_by_key(|(mission_id, _)| **mission_id);
     for (mission_id, runner) in runners {
+        if let Some(message) = runner.inflight_message() {
+            items.push(QueuedMessage {
+                id: message.id,
+                content: message.content.clone(),
+                agent: message.agent.clone(),
+                mission_id: Some(*mission_id),
+                source: message.source.clone(),
+            });
+        }
         items.extend(runner.queue.iter().map(|message| QueuedMessage {
             id: message.id,
             content: message.content.clone(),
@@ -13560,64 +13569,85 @@ async fn control_actor_loop(
                                         continue;
                                     }
                                 }
-                                if let Some(runner) = parallel_runners.get_mut(&tid) {
-                                    let was_running = runner.is_running();
-                                    runner.queue_message(id, content.clone(), msg_agent, source.clone());
-                                    let _ = events_tx.send(AgentEvent::UserMessage {
-                                        id,
-                                        content: content.clone(),
-                                        queued: was_running,
+                                let Some(runner) = parallel_runners.get_mut(&tid) else {
+                                    accepted_user_message_ids.remove(&id);
+                                    let _ = respond.send(UserMessageAck::Rejected(format!(
+                                        "mission {tid} runner disappeared before queueing"
+                                    )));
+                                    continue;
+                                };
+                                if runner.cancellation_requested() {
+                                    accepted_user_message_ids.remove(&id);
+                                    let _ = respond.send(UserMessageAck::Rejected(format!(
+                                        "mission {tid} is stopping"
+                                    )));
+                                    continue;
+                                }
+                                let was_running = runner.is_running();
+                                runner.queue_message(id, content.clone(), msg_agent, source.clone());
+                                let _ = events_tx.send(AgentEvent::UserMessage {
+                                    id,
+                                    content: content.clone(),
+                                    queued: was_running,
+                                    mission_id: Some(tid),
+                                    source: source.clone(),
+                                });
+                                // Surface the parallel queue growth to all
+                                // clients (Status events otherwise only
+                                // carry the main queue length). Only when
+                                // the message actually stays queued —
+                                // otherwise start_next pops it right away.
+                                if was_running {
+                                    let _ = events_tx.send(AgentEvent::Status {
+                                        state: ControlRunState::Running,
+                                        queue_len: runner.queue.len(),
                                         mission_id: Some(tid),
-                                        source: source.clone(),
                                     });
-                                    // Surface the parallel queue growth to all
-                                    // clients (Status events otherwise only
-                                    // carry the main queue length). Only when
-                                    // the message actually stays queued —
-                                    // otherwise start_next pops it right away.
-                                    if was_running {
-                                        let _ = events_tx.send(AgentEvent::Status {
-                                            state: ControlRunState::Running,
-                                            queue_len: runner.queue.len(),
+                                }
+                                // Persist both queued and about-to-start parallel
+                                // deliveries before they can be acknowledged. A
+                                // running turn remains in the snapshot via the
+                                // runner's inflight_message until completion.
+                                if let Err(error) = persist_control_queue_if_changed(
+                                    &mission_store,
+                                    &session_user_id,
+                                    &queue,
+                                    &parallel_runners,
+                                    &mut last_persisted_queue,
+                                )
+                                .await
+                                {
+                                    if let Some(runner) = parallel_runners.get_mut(&tid) {
+                                        runner.remove_from_queue(id);
+                                    }
+                                    accepted_user_message_ids.remove(&id);
+                                    let _ = respond.send(UserMessageAck::Rejected(format!(
+                                        "failed to persist parallel delivery: {error}"
+                                    )));
+                                    continue;
+                                }
+                                if !was_running {
+                                    let Some(runner) = parallel_runners.get_mut(&tid) else {
+                                        accepted_user_message_ids.remove(&id);
+                                        let _ = respond.send(UserMessageAck::Rejected(format!(
+                                            "mission {tid} runner disappeared before start"
+                                        )));
+                                        continue;
+                                    };
+                                    if let Err(error) = runner
+                                        .acquire_durable_run(
+                                            &mission_store,
+                                            &format!("control:{session_user_id}"),
+                                        )
+                                        .await
+                                    {
+                                        let _ = events_tx.send(AgentEvent::Error {
+                                            message: format!("Mission run lease rejected: {error}"),
                                             mission_id: Some(tid),
+                                            resumable: true,
                                         });
-                                    }
-                                    // Try to start if not already running
-                                    if !runner.is_running() {
-                                        if let Err(error) = runner
-                                            .acquire_durable_run(
-                                                &mission_store,
-                                                &format!("control:{session_user_id}"),
-                                            )
-                                            .await
-                                        {
-                                            let _ = events_tx.send(AgentEvent::Error {
-                                                message: format!("Mission run lease rejected: {error}"),
-                                                mission_id: Some(tid),
-                                                resumable: true,
-                                            });
-                                            let _ = respond.send(UserMessageAck::Rejected(error));
-                                            continue;
-                                        }
-                                        runner.start_next(
-                                            config.clone(),
-                                            Arc::clone(&root_agent),
-                                            Arc::clone(&mcp),
-                                            Arc::clone(&workspaces),
-                                            library.clone(),
-                                            events_tx.clone(),
-                                            Arc::clone(&tool_hub),
-                                            Arc::clone(&status),
-                                            mission_cmd_tx.clone(),
-                                            Arc::new(RwLock::new(Some(tid))),
-                                            secrets.clone(),
-                                        );
-                                    }
-                                    if was_running {
-                                        // Parallel-runner queues are part of the
-                                        // same durable session snapshot. Persist
-                                        // before acknowledging the board outbox.
-                                        let persist_result = persist_control_queue_if_changed(
+                                        runner.remove_from_queue(id);
+                                        let _ = persist_control_queue_if_changed(
                                             &mission_store,
                                             &session_user_id,
                                             &queue,
@@ -13625,20 +13655,30 @@ async fn control_actor_loop(
                                             &mut last_persisted_queue,
                                         )
                                         .await;
-                                        if let Err(error) = persist_result {
-                                            if let Some(runner) = parallel_runners.get_mut(&tid) {
-                                                runner.remove_from_queue(id);
-                                            }
-                                            accepted_user_message_ids.remove(&id);
-                                            let _ = respond.send(UserMessageAck::Rejected(format!(
-                                                "failed to persist queued delivery: {error}"
-                                            )));
-                                            continue;
-                                        }
+                                        accepted_user_message_ids.remove(&id);
+                                        let _ = respond.send(UserMessageAck::Rejected(error));
+                                        continue;
                                     }
-                                    let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
-                                    continue;
+                                    runner.start_next(
+                                        config.clone(),
+                                        Arc::clone(&root_agent),
+                                        Arc::clone(&mcp),
+                                        Arc::clone(&workspaces),
+                                        library.clone(),
+                                        events_tx.clone(),
+                                        Arc::clone(&tool_hub),
+                                        Arc::clone(&status),
+                                        mission_cmd_tx.clone(),
+                                        Arc::new(RwLock::new(Some(tid))),
+                                        secrets.clone(),
+                                    );
                                 }
+                                // The durable snapshot, not process creation,
+                                // is the acceptance boundary. Report Queued even
+                                // when execution started immediately so outbox
+                                // retirement never depends on a volatile handle.
+                                let _ = respond.send(UserMessageAck::Queued);
+                                continue;
                             }
                         }
 
@@ -13822,7 +13862,32 @@ async fn control_actor_loop(
                                                 mission_id: Some(tid),
                                                 source: source.clone(),
                                             });
-                                            // Start execution
+                                            // Journal the delivery while it is
+                                            // still queued. start_next moves it
+                                            // to inflight_message, which serializes
+                                            // identically until the turn finishes.
+                                            parallel_runners.insert(tid, runner);
+                                            if let Err(error) = persist_control_queue_if_changed(
+                                                &mission_store,
+                                                &session_user_id,
+                                                &queue,
+                                                &parallel_runners,
+                                                &mut last_persisted_queue,
+                                            )
+                                            .await
+                                            {
+                                                parallel_runners.remove(&tid);
+                                                accepted_user_message_ids.remove(&id);
+                                                let _ = respond.send(UserMessageAck::Rejected(
+                                                    format!(
+                                                        "failed to persist parallel delivery: {error}"
+                                                    ),
+                                                ));
+                                                continue;
+                                            }
+                                            let runner = parallel_runners
+                                                .get_mut(&tid)
+                                                .expect("parallel runner inserted above");
                                             if let Err(error) = runner
                                                 .acquire_durable_run(
                                                     &mission_store,
@@ -13835,6 +13900,16 @@ async fn control_actor_loop(
                                                     mission_id: Some(tid),
                                                     resumable: true,
                                                 });
+                                                parallel_runners.remove(&tid);
+                                                let _ = persist_control_queue_if_changed(
+                                                    &mission_store,
+                                                    &session_user_id,
+                                                    &queue,
+                                                    &parallel_runners,
+                                                    &mut last_persisted_queue,
+                                                )
+                                                .await;
+                                                accepted_user_message_ids.remove(&id);
                                                 let _ = respond.send(UserMessageAck::Rejected(error));
                                                 continue;
                                             }
@@ -13852,8 +13927,7 @@ async fn control_actor_loop(
                                                 secrets.clone(),
                                             );
                                             tracing::info!("Auto-started mission {} in parallel", tid);
-                                            parallel_runners.insert(tid, runner);
-                                            let _ = respond.send(UserMessageAck::Delivered);
+                                            let _ = respond.send(UserMessageAck::Queued);
                                             continue;
                                         }
                                         Err(e) => {
@@ -14830,6 +14904,18 @@ async fn control_actor_loop(
                             });
                             // Cascade cancel child missions
                             cancel_child_missions(mission_id, &mission_store, &mut parallel_runners, &events_tx, &config.working_dir).await;
+                            if let Err(error) = persist_control_queue_if_changed(
+                                &mission_store,
+                                &session_user_id,
+                                &queue,
+                                &parallel_runners,
+                                &mut last_persisted_queue,
+                            )
+                            .await
+                            {
+                                tracing::warn!(mission_id = %mission_id,
+                                    "Failed to persist cleared queues after cancellation: {error}");
+                            }
                             let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
                         } else {
                             // Check if this is the currently executing mission
@@ -16484,6 +16570,7 @@ async fn control_actor_loop(
                                     | Some(TerminalReason::RateLimited)
                                     | Some(TerminalReason::CapacityLimited)
                             );
+                            let cancellation_requested = runner.cancellation_requested();
                             let was_queue_empty = runner.queue.is_empty();
                             // Grok /goal sentinel hook for the parallel-runner
                             // path. Same contract as the main-session hook
@@ -16501,7 +16588,10 @@ async fn control_actor_loop(
                                 )
                                 .await;
                             }
-                            if was_queue_empty && !is_transient_infra_failure {
+                            if was_queue_empty
+                                && !is_transient_infra_failure
+                                && !cancellation_requested
+                            {
                                 // Small delay so the UI can display the completion before restarting.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                 let messages = agent_finished_automation_messages(
@@ -24895,19 +24985,26 @@ Investigate <service/> failures.
             None,
             None,
         );
+        let parallel_message_id = Uuid::new_v4();
         runner.queue_message(
-            Uuid::new_v4(),
+            parallel_message_id,
             "parallel".to_string(),
             None,
             Some("task-board".to_string()),
         );
+        runner
+            .take_next_message_for_start()
+            .expect("parallel message should move to the in-flight slot");
+        assert!(runner.queue.is_empty());
         let parallel = std::collections::HashMap::from([(parallel_mission, runner)]);
 
         let snapshot = serialize_queue_snapshot(&main_queue, &parallel);
         let messages: Vec<QueuedMessage> = serde_json::from_str(&snapshot).unwrap();
         assert_eq!(messages.len(), 2);
         assert!(messages.iter().any(|message| {
-            message.content == "parallel" && message.mission_id == Some(parallel_mission)
+            message.id == parallel_message_id
+                && message.content == "parallel"
+                && message.mission_id == Some(parallel_mission)
         }));
     }
 

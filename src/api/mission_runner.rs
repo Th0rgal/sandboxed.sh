@@ -2613,6 +2613,12 @@ pub struct MissionRunner {
     /// Message queue for this mission
     pub queue: VecDeque<QueuedMessage>,
 
+    /// Message owned by the currently executing turn. Kept separately from
+    /// `queue` so the control actor can persist it until the turn completes;
+    /// after a restart it is safely replayed instead of being lost between
+    /// dequeue and history persistence.
+    inflight_message: Option<QueuedMessage>,
+
     /// Conversation history: (role, content)
     pub history: Vec<(String, String)>,
 
@@ -2669,6 +2675,10 @@ pub struct MissionRunner {
 
     /// Durable generation lease for the currently executing turn.
     pub durable_run: Option<crate::api::mission_store::MissionRun>,
+
+    /// Once cancellation is requested, this runner must drain its current
+    /// handle and be removed without starting queued or automated follow-ups.
+    cancellation_requested: bool,
 }
 
 impl MissionRunner {
@@ -2695,6 +2705,7 @@ impl MissionRunner {
             model_override,
             model_effort,
             queue: VecDeque::new(),
+            inflight_message: None,
             history: Vec::new(),
             cancel_token: None,
             running_handle: None,
@@ -2710,6 +2721,7 @@ impl MissionRunner {
             active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             background_tasks: HashMap::new(),
             durable_run: None,
+            cancellation_requested: false,
         }
     }
 
@@ -2860,9 +2872,28 @@ impl MissionRunner {
 
     /// Cancel the current execution.
     pub fn cancel(&mut self) {
+        self.cancellation_requested = true;
+        self.clear_queue();
         if let Some(token) = &self.cancel_token {
             token.cancel();
         }
+    }
+
+    pub fn inflight_message(&self) -> Option<&QueuedMessage> {
+        self.inflight_message.as_ref()
+    }
+
+    pub fn cancellation_requested(&self) -> bool {
+        self.cancellation_requested
+    }
+
+    pub(crate) fn take_next_message_for_start(&mut self) -> Option<QueuedMessage> {
+        if self.is_running() || self.cancellation_requested {
+            return None;
+        }
+        let message = self.queue.pop_front()?;
+        self.inflight_message = Some(message.clone());
+        Some(message)
     }
 
     /// Remove a specific message from the queue by ID.
@@ -2898,13 +2929,7 @@ impl MissionRunner {
         current_mission: Arc<RwLock<Option<Uuid>>>,
         secrets: Option<Arc<SecretsStore>>,
     ) -> bool {
-        // Don't start if already running
-        if self.is_running() {
-            return false;
-        }
-
-        // Get next message from queue
-        let msg = match self.queue.pop_front() {
+        let msg = match self.take_next_message_for_start() {
             Some(m) => m,
             None => return false,
         };
@@ -2998,6 +3023,7 @@ impl MissionRunner {
 
         // Check if handle is finished
         if handle.is_finished() {
+            self.inflight_message = None;
             // A completed or panicked turn can leave an unmatched ToolCall in
             // harnesses that omit ToolResult events. Never expose that stale
             // hint while queued or carry it into the next turn.
@@ -8611,7 +8637,7 @@ mod tests {
         text_buffer_stream_looks_degenerate, thinking_overlaps_visible_answer, tls_error_hint,
         truncate_garbled_output, use_thinking_only_fallback, utf8_safe_prefix,
         ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, CopiedOpenCodeProbe, MissionHealth, MissionRunState,
+        ClaudeTurnWaitState, CopiedOpenCodeProbe, MissionHealth, MissionRunState, MissionRunner,
         MissionStallSeverity, OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
         CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
@@ -11970,5 +11996,57 @@ mod tests {
         let mut s = String::from("Here is the plan: A, B, C. We should pick B. ");
         s.push_str(&"Yielding pending your choice. ".repeat(20));
         assert!(text_buffer_stream_looks_degenerate(&s, 4096, 40, 3));
+    }
+
+    #[test]
+    fn running_message_remains_durable_until_completion() {
+        let mut runner = MissionRunner::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let message_id = Uuid::new_v4();
+        runner.queue_message(
+            message_id,
+            "durable controller wake".to_string(),
+            None,
+            Some("task-board".to_string()),
+        );
+
+        let started = runner
+            .take_next_message_for_start()
+            .expect("queued message should start");
+        assert_eq!(started.id, message_id);
+        assert!(runner.queue.is_empty());
+        assert_eq!(
+            runner.inflight_message().map(|message| message.id),
+            Some(message_id)
+        );
+    }
+
+    #[test]
+    fn cancellation_clears_followups_and_prevents_restart() {
+        let mut runner = MissionRunner::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        runner.queue_message(Uuid::new_v4(), "queued follow-up".to_string(), None, None);
+
+        runner.cancel();
+
+        assert!(runner.cancellation_requested());
+        assert!(runner.queue.is_empty());
+        assert!(runner.take_next_message_for_start().is_none());
     }
 }
