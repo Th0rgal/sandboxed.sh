@@ -4,6 +4,7 @@ set -euo pipefail
 source_repo="${HERMES_SOURCE_REPO:-/usr/local/lib/hermes-agent}"
 dev_repo="${HERMES_DEV_REPO:-/usr/local/lib/hermes-agent-dev}"
 dev_unit="${HERMES_DEV_UNIT:-hermes-assistant-dev.service}"
+dev_home="${HERMES_DEV_HOME:-/var/lib/hermes-assistant-dev}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 dropin_source="${script_dir}/../deploy/systemd/hermes-assistant-dev-isolated.conf"
 dropin_dir="/etc/systemd/system/${dev_unit}.d"
@@ -32,6 +33,9 @@ git -C "${dev_repo}" checkout --detach "${source_revision}"
   cd "${dev_repo}"
   uv sync --frozen --no-dev
   .venv/bin/python -m py_compile hermes_state.py gateway/run.py cron/scheduler.py
+  .venv/bin/python "${script_dir}/configure_hermes_reliability.py" \
+    --home "${dev_home}" \
+    --assistant-mcp /usr/local/bin/assistant-mcp-dev
 )
 
 install -d -m 0755 "${dropin_dir}"
