@@ -747,17 +747,14 @@ pub async fn start_job(
         .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
     let id = durable_job_id(&user.id, started_by_mission_id, idempotency_key.as_deref());
     if idempotency_key.is_some() {
-        match read_job(&state, id).await {
-            Ok(existing) => {
-                if existing.command != command || existing.workspace_id != req.workspace_id {
-                    return Err(err(
-                        StatusCode::CONFLICT,
-                        "idempotency_key was already used with different job parameters",
-                    ));
-                }
-                return Ok(Json(refresh_job(&state, existing).await));
+        if let Ok(existing) = read_job(&state, id).await {
+            if existing.command != command || existing.workspace_id != req.workspace_id {
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    "idempotency_key was already used with different job parameters",
+                ));
             }
-            Err(_) => {}
+            return Ok(Json(refresh_job(&state, existing).await));
         }
         tokio::fs::create_dir_all(job_dir(&state, id))
             .await

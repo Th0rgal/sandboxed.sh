@@ -4262,9 +4262,11 @@ fn attach_execution_to_mission_value(
         );
         object.insert(
             "acknowledged_at".to_string(),
-            (mission.status == MissionStatus::Acknowledged)
-                .then(|| serde_json::Value::String(mission.updated_at.clone()))
-                .unwrap_or(serde_json::Value::Null),
+            if mission.status == MissionStatus::Acknowledged {
+                serde_json::Value::String(mission.updated_at.clone())
+            } else {
+                serde_json::Value::Null
+            },
         );
     }
     value

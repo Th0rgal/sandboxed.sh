@@ -15482,7 +15482,6 @@ mod tests {
             token_budget: Some(10_000),
             cost_budget_cents: Some(250),
             depends_on: deps.into_iter().map(String::from).collect(),
-            ..Default::default()
         };
 
         let tasks = store

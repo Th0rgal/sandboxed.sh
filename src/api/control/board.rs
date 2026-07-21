@@ -669,16 +669,28 @@ fn self_send_message(
     }
 }
 
-async fn durable_self_send(
-    mission_store: &Arc<dyn MissionStore>,
-    cmd_tx: &mpsc::Sender<ControlCommand>,
+struct BoardDelivery {
     boss_mission_id: Uuid,
     task_id: Option<Uuid>,
     target_mission_id: Uuid,
-    delivery_kind: &str,
+    delivery_kind: &'static str,
     idempotency_key: String,
     content: String,
+}
+
+async fn durable_self_send(
+    mission_store: &Arc<dyn MissionStore>,
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    delivery: BoardDelivery,
 ) -> bool {
+    let BoardDelivery {
+        boss_mission_id,
+        task_id,
+        target_mission_id,
+        delivery_kind,
+        idempotency_key,
+        content,
+    } = delivery;
     let delivery_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, idempotency_key.as_bytes());
     let item = BoardOutboxItem {
         id: delivery_id,
@@ -862,12 +874,17 @@ pub async fn scheduler_pass(
                         if durable_self_send(
                             mission_store,
                             cmd_tx,
-                            boss_id,
-                            Some(task.id),
-                            worker_id,
-                            "retry",
-                            format!("board:{}:attempt:{}:retry", task.id, task.attempts),
-                            prompt,
+                            BoardDelivery {
+                                boss_mission_id: boss_id,
+                                task_id: Some(task.id),
+                                target_mission_id: worker_id,
+                                delivery_kind: "retry",
+                                idempotency_key: format!(
+                                    "board:{}:attempt:{}:retry",
+                                    task.id, task.attempts
+                                ),
+                                content: prompt,
+                            },
                         )
                         .await
                         {
@@ -1002,19 +1019,21 @@ pub async fn scheduler_pass(
             && durable_self_send(
                 mission_store,
                 cmd_tx,
-                boss_id,
-                None,
-                boss_id,
-                "controller_notification",
-                format!(
-                    "board:{boss_id}:wake:{}",
-                    fresh
-                        .iter()
-                        .map(|task| task.updated_at.as_str())
-                        .max()
-                        .unwrap_or("empty")
-                ),
-                BOARD_WAKE_PROMPT.to_string(),
+                BoardDelivery {
+                    boss_mission_id: boss_id,
+                    task_id: None,
+                    target_mission_id: boss_id,
+                    delivery_kind: "controller_notification",
+                    idempotency_key: format!(
+                        "board:{boss_id}:wake:{}",
+                        fresh
+                            .iter()
+                            .map(|task| task.updated_at.as_str())
+                            .max()
+                            .unwrap_or("empty")
+                    ),
+                    content: BOARD_WAKE_PROMPT.to_string(),
+                },
             )
             .await
         {
@@ -1096,12 +1115,14 @@ async fn spawn_task_worker(
     if !durable_self_send(
         mission_store,
         cmd_tx,
-        t.boss_mission_id,
-        Some(t.id),
-        mission.id,
-        if t.attempts > 1 { "retry" } else { "spawn" },
-        delivery_key,
-        prompt,
+        BoardDelivery {
+            boss_mission_id: t.boss_mission_id,
+            task_id: Some(t.id),
+            target_mission_id: mission.id,
+            delivery_kind: if t.attempts > 1 { "retry" } else { "spawn" },
+            idempotency_key: delivery_key,
+            content: prompt,
+        },
     )
     .await
     {
