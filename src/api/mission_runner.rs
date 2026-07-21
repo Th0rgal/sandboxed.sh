@@ -2730,7 +2730,7 @@ impl MissionRunner {
         mission_store: &Arc<dyn crate::api::mission_store::MissionStore>,
         owner_actor_id: &str,
     ) -> Result<(), String> {
-        if self.is_running() || self.queue.is_empty() {
+        if self.is_running() || !self.has_startable_message() {
             return Ok(());
         }
         let run = mission_store
@@ -2881,6 +2881,10 @@ impl MissionRunner {
 
     pub fn inflight_message(&self) -> Option<&QueuedMessage> {
         self.inflight_message.as_ref()
+    }
+
+    fn has_startable_message(&self) -> bool {
+        self.inflight_message.is_some() || !self.queue.is_empty()
     }
 
     pub fn remove_inflight_message(&mut self, message_id: Uuid) -> bool {
@@ -12043,6 +12047,7 @@ mod tests {
             runner.inflight_message().map(|message| message.id),
             Some(message_id)
         );
+        assert!(runner.has_startable_message());
 
         let followup_id = Uuid::new_v4();
         runner.queue_message(followup_id, "follow-up".to_string(), None, None);

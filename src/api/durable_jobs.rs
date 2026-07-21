@@ -687,6 +687,29 @@ fn deadline_terminal_status() -> DurableJobStatus {
     DurableJobStatus::Failed
 }
 
+fn job_deadline_elapsed(job: &DurableJob, now: DateTime<Utc>) -> bool {
+    job.deadline_at.is_some_and(|deadline| deadline <= now)
+}
+
+async fn mark_job_deadline_exceeded(
+    state: &AppState,
+    mut job: DurableJob,
+    now: DateTime<Utc>,
+) -> DurableJob {
+    job.status = deadline_terminal_status();
+    job.updated_at = now;
+    job = write_job(state, &job).await.unwrap_or(job);
+    let cancelling = job.clone();
+    tokio::spawn(async move {
+        signal_job(&cancelling, false).await;
+        tokio::time::sleep(std::time::Duration::from_secs(FORCE_CLEAR_SECS)).await;
+        if job_requires_force_clear(&cancelling) {
+            signal_job(&cancelling, true).await;
+        }
+    });
+    job
+}
+
 fn requires_force_clear(scope_unit: Option<&str>, process_is_alive: bool) -> bool {
     // A systemd-run wrapper may exit before the payload in its transient
     // scope. Force-signalling the named scope is idempotent, so always do it
@@ -852,18 +875,8 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
                 }
             } else {
                 let now = Utc::now();
-                if job.deadline_at.is_some_and(|deadline| deadline <= now) {
-                    job.status = deadline_terminal_status();
-                    job.updated_at = now;
-                    job = write_job(state, &job).await.unwrap_or(job);
-                    let cancelling = job.clone();
-                    tokio::spawn(async move {
-                        signal_job(&cancelling, false).await;
-                        tokio::time::sleep(std::time::Duration::from_secs(FORCE_CLEAR_SECS)).await;
-                        if job_requires_force_clear(&cancelling) {
-                            signal_job(&cancelling, true).await;
-                        }
-                    });
+                if job_deadline_elapsed(&job, now) {
+                    job = mark_job_deadline_exceeded(state, job, now).await;
                 } else if job
                     .heartbeat_at
                     .is_none_or(|heartbeat| (now - heartbeat).num_seconds() >= 5)
@@ -881,13 +894,17 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
             let now = Utc::now();
             let scope_is_active = job.scope_unit.as_deref().is_some_and(scope_unit_is_active);
             if pidless_scope_is_live(job.scope_unit.as_deref(), scope_is_active) {
-                // The API may have restarted after the deterministic scope was
-                // launched but before its wrapper PID reached job.json. Reattach
-                // to that scope instead of terminalizing or resubmitting it.
-                job.status = DurableJobStatus::Running;
-                job.heartbeat_at = Some(now);
-                job.updated_at = now;
-                job = write_job(state, &job).await.unwrap_or(job);
+                if job_deadline_elapsed(&job, now) {
+                    job = mark_job_deadline_exceeded(state, job, now).await;
+                } else {
+                    // The API may have restarted after the deterministic scope was
+                    // launched but before its wrapper PID reached job.json. Reattach
+                    // to that scope instead of terminalizing or resubmitting it.
+                    job.status = DurableJobStatus::Running;
+                    job.heartbeat_at = Some(now);
+                    job.updated_at = now;
+                    job = write_job(state, &job).await.unwrap_or(job);
+                }
             } else if (now - job.created_at).num_seconds() >= PIDLESS_START_GRACE_SECS {
                 job.status = DurableJobStatus::Unknown;
                 job.updated_at = now;
@@ -1449,6 +1466,18 @@ mod tests {
     #[test]
     fn deadline_is_always_classified_as_failed() {
         assert_eq!(deadline_terminal_status(), DurableJobStatus::Failed);
+    }
+
+    #[test]
+    fn pidless_live_scope_still_obeys_its_absolute_deadline() {
+        let now = Utc::now();
+        let mut job = test_job(DurableJobStatus::Running);
+        job.pid = None;
+        job.scope_unit = Some("sandboxed-durable-demo".to_string());
+        job.deadline_at = Some(now - chrono::Duration::seconds(1));
+
+        assert!(pidless_scope_is_live(job.scope_unit.as_deref(), true));
+        assert!(job_deadline_elapsed(&job, now));
     }
 
     #[test]
