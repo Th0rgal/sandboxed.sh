@@ -4293,6 +4293,55 @@ fn is_user_wait_tool(tool_kind: &str) -> bool {
     matches!(tool_kind, "request_user_input" | "frontend_tool") || is_interactive_ui_tool(tool_kind)
 }
 
+const PROVISIONAL_TOOL_DEADLINE_SECS: i64 = 120;
+const MANAGED_SHELL_TOOL_DEADLINE_SECS: i64 = 10 * 60;
+const LONG_BUILD_TOOL_DEADLINE_SECS: i64 = 2 * 60 * 60;
+
+/// Return the absolute liveness window for a harness tool call.
+///
+/// Unknown protocol calls remain provisional for at most two minutes. Native
+/// harness shell tools are different: the harness emits the ToolResult only
+/// after its managed subprocess exits, so expiring their lease after two
+/// minutes would make a healthy synchronous command indistinguishable from an
+/// orphan. Keep ordinary shell work within the generic ten-minute ceiling and
+/// allow known build/verification commands the same two-hour ceiling as a
+/// durable workspace job.
+fn tool_execution_deadline_secs(tool_kind: &str, args: &serde_json::Value) -> i64 {
+    if !matches!(tool_kind, "Bash" | "bash" | "shell" | "Shell") {
+        return PROVISIONAL_TOOL_DEADLINE_SECS;
+    }
+
+    let command = args
+        .get("command")
+        .or_else(|| args.get("cmd"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let normalized = command
+        .split_whitespace()
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let is_long_build = [
+        "remote-lean-build",
+        "lake build",
+        "lake test",
+        "lake env lean",
+        "cargo build --release",
+        "cargo test --all",
+        "npm run build",
+        "bun run build",
+        "next build",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+
+    if is_long_build {
+        LONG_BUILD_TOOL_DEADLINE_SECS
+    } else {
+        MANAGED_SHELL_TOOL_DEADLINE_SECS
+    }
+}
+
 fn mission_heartbeat_state(
     active_tool_calls: usize,
     has_registered_user_wait: bool,
@@ -16883,10 +16932,11 @@ async fn control_actor_loop(
                                         state: MissionToolExecutionState::Provisional,
                                         started_at: now.to_rfc3339(),
                                         heartbeat_at: now.to_rfc3339(),
-                                        // An unmatched protocol event alone is
-                                        // evidence for at most 120 seconds.
-                                        deadline_at: (now + chrono::Duration::seconds(120))
-                                            .to_rfc3339(),
+                                        deadline_at: (now
+                                            + chrono::Duration::seconds(
+                                                tool_execution_deadline_secs(name, args),
+                                            ))
+                                        .to_rfc3339(),
                                         process_pid: None,
                                         durable_job_id: None,
                                         completed_at: None,
@@ -20754,6 +20804,32 @@ mod tests {
         assert_eq!(
             mission_heartbeat_state(0, false),
             MissionExecutionState::Running
+        );
+    }
+
+    #[test]
+    fn tool_execution_deadlines_are_bounded_by_tool_class() {
+        assert_eq!(
+            tool_execution_deadline_secs("Read", &serde_json::json!({"path": "README.md"})),
+            PROVISIONAL_TOOL_DEADLINE_SECS
+        );
+        assert_eq!(
+            tool_execution_deadline_secs("Bash", &serde_json::json!({"command": "git status"})),
+            MANAGED_SHELL_TOOL_DEADLINE_SECS
+        );
+        assert_eq!(
+            tool_execution_deadline_secs(
+                "bash",
+                &serde_json::json!({"command": "cd Verity && lake build"})
+            ),
+            LONG_BUILD_TOOL_DEADLINE_SECS
+        );
+        assert_eq!(
+            tool_execution_deadline_secs(
+                "Shell",
+                &serde_json::json!({"cmd": "remote-lean-build -- lake test"})
+            ),
+            LONG_BUILD_TOOL_DEADLINE_SECS
         );
     }
 

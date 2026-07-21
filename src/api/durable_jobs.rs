@@ -454,19 +454,23 @@ fn resolve_workspace_cwd(
 
 fn merge_job_for_write(current: Option<DurableJob>, mut next: DurableJob) -> DurableJob {
     if let Some(current) = current {
-        if matches!(
+        let current_is_terminal = matches!(
             current.status,
             DurableJobStatus::Completed | DurableJobStatus::Failed | DurableJobStatus::Cancelled
-        ) && !matches!(
+        );
+        let next_is_terminal = matches!(
             next.status,
             DurableJobStatus::Completed | DurableJobStatus::Failed | DurableJobStatus::Cancelled
-        ) {
+        );
+        if current_is_terminal && !next_is_terminal {
             return current;
         }
-        if current.status == DurableJobStatus::Cancelled
-            && next.status != DurableJobStatus::Cancelled
-        {
-            next.status = DurableJobStatus::Cancelled;
+        // A terminal observation is monotonic. In particular, a deadline
+        // transition to Failed must not be overwritten by a late watcher that
+        // observes the child exiting successfully after cancellation. Updates
+        // to metadata for the same terminal state remain allowed.
+        if current_is_terminal && next.status != current.status {
+            next.status = current.status;
         }
     }
     next
@@ -1542,6 +1546,31 @@ mod tests {
         let merged = merge_job_for_write(Some(current), next);
 
         assert_eq!(merged.status, DurableJobStatus::Cancelled);
+    }
+
+    #[test]
+    fn merge_job_for_write_preserves_failed_status_over_late_success() {
+        let current = test_job(DurableJobStatus::Failed);
+        let mut next = current.clone();
+        next.status = DurableJobStatus::Completed;
+        next.exit_code = Some(0);
+
+        let merged = merge_job_for_write(Some(current), next);
+
+        assert_eq!(merged.status, DurableJobStatus::Failed);
+        assert_eq!(merged.exit_code, Some(0));
+    }
+
+    #[test]
+    fn merge_job_for_write_allows_same_terminal_metadata_update() {
+        let current = test_job(DurableJobStatus::Failed);
+        let mut next = current.clone();
+        next.exit_code = Some(124);
+
+        let merged = merge_job_for_write(Some(current), next);
+
+        assert_eq!(merged.status, DurableJobStatus::Failed);
+        assert_eq!(merged.exit_code, Some(124));
     }
 
     #[tokio::test]
