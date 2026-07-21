@@ -876,6 +876,7 @@ async fn replay_pending_board_outbox(
             return;
         }
     };
+    let mut eligible = Vec::new();
     for item in pending {
         let (target, content) = match outbox_payload(&item) {
             Ok(payload) => payload,
@@ -886,7 +887,7 @@ async fn replay_pending_board_outbox(
             }
         };
         match board_outbox_replay_is_eligible(mission_store, &item, target).await {
-            Ok(true) => {}
+            Ok(true) => eligible.push((item, target, content)),
             Ok(false) => {
                 tracing::info!(
                     target = %target,
@@ -913,6 +914,39 @@ async fn replay_pending_board_outbox(
                 );
                 continue;
             }
+        }
+    }
+
+    // A zombie sweep may persist `:retry` while the original same-attempt
+    // `:spawn` row is still pending. Coalesce before sending anything: the
+    // actor cannot consume its own channel until this scheduler pass returns,
+    // so dispatching both would queue the task twice.
+    let retry_tasks: HashSet<Uuid> = eligible
+        .iter()
+        .filter(|(item, _, _)| item.idempotency_key.ends_with(":retry"))
+        .filter_map(|(item, _, _)| item.task_id)
+        .collect();
+    for (item, target, content) in eligible {
+        if item.idempotency_key.ends_with(":spawn")
+            && item
+                .task_id
+                .is_some_and(|task_id| retry_tasks.contains(&task_id))
+        {
+            tracing::info!(
+                target = %target,
+                idempotency_key = %item.idempotency_key,
+                "board: retiring spawn delivery superseded by same-attempt retry"
+            );
+            if let Err(error) = mission_store
+                .acknowledge_board_outbox(&item.idempotency_key)
+                .await
+            {
+                tracing::warn!(
+                    idempotency_key = %item.idempotency_key,
+                    "board: failed to retire superseded spawn delivery: {error}"
+                );
+            }
+            continue;
         }
         let _ = dispatch_board_outbox_item(
             mission_store,
@@ -949,6 +983,21 @@ async fn durable_self_send(
         idempotency_key,
         content,
     } = delivery;
+    if let Some(prefix) = idempotency_key.strip_suffix(":retry") {
+        let superseded_spawn_key = format!("{prefix}:spawn");
+        if let Err(error) = mission_store
+            .acknowledge_board_outbox(&superseded_spawn_key)
+            .await
+        {
+            tracing::warn!(
+                target = %target_mission_id,
+                %idempotency_key,
+                superseded = %superseded_spawn_key,
+                "board: refusing retry until its superseded spawn is retired: {error}"
+            );
+            return false;
+        }
+    }
     let delivery_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, idempotency_key.as_bytes());
     let item = BoardOutboxItem {
         id: delivery_id,
@@ -1806,6 +1855,112 @@ mod tests {
             .await
             .expect("pending outbox")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_coalesces_same_attempt_spawn_and_retry() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let boss = store
+            .create_mission_with_parent(
+                Some("live boss"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create boss");
+        let worker = store
+            .create_mission_with_parent(
+                Some("pending worker"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(boss.id),
+                None,
+            )
+            .await
+            .expect("create worker");
+        store
+            .upsert_board_tasks(
+                boss.id,
+                vec![NewBoardTask {
+                    task_key: "worker".into(),
+                    title: "worker".into(),
+                    prompt: "p".into(),
+                    backend: "codex".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("create task");
+        let mut task = store
+            .list_board_tasks(boss.id)
+            .await
+            .expect("list task")
+            .remove(0);
+        task.status = BoardTaskStatus::Running;
+        task.worker_mission_id = Some(worker.id);
+        task.attempts = 1;
+        store
+            .save_board_task(&task)
+            .await
+            .expect("save running task");
+
+        let spawn_key = format!("board:{}:attempt:1:spawn", task.id);
+        let retry_key = format!("board:{}:attempt:1:retry", task.id);
+        for (key, kind, content) in [
+            (&spawn_key, "spawn", "initial"),
+            (&retry_key, "retry", "re-kick"),
+        ] {
+            store
+                .enqueue_board_outbox(BoardOutboxItem {
+                    id: Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes()),
+                    boss_mission_id: boss.id,
+                    task_id: Some(task.id),
+                    delivery_kind: kind.into(),
+                    idempotency_key: key.clone(),
+                    payload: serde_json::json!({
+                        "target_mission_id": worker.id,
+                        "content": content,
+                    }),
+                    state: "pending".into(),
+                    attempts: 0,
+                    created_at: now_string(),
+                    acknowledged_at: None,
+                })
+                .await
+                .expect("enqueue delivery");
+        }
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(2);
+        let inflight: BoardOutboxInflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        replay_pending_board_outbox(&store, &cmd_tx, &inflight).await;
+
+        let ControlCommand::UserMessage { id, content, .. } =
+            cmd_rx.try_recv().expect("retry should dispatch")
+        else {
+            panic!("expected user message");
+        };
+        assert_eq!(id, Uuid::new_v5(&Uuid::NAMESPACE_OID, retry_key.as_bytes()));
+        assert_eq!(content, "re-kick");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "superseded spawn must not also dispatch"
+        );
+        let pending = store
+            .list_pending_board_outbox(10)
+            .await
+            .expect("pending outbox");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].idempotency_key, retry_key);
     }
 
     #[test]
