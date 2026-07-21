@@ -950,11 +950,9 @@ pub async fn start_job(
         stdout_log: stdout_log.to_string_lossy().to_string(),
         stderr_log: stderr_log.to_string_lossy().to_string(),
         status_file: status_file.to_string_lossy().to_string(),
-        scope_unit: workspace.as_ref().and_then(|workspace| {
-            WorkspaceExec::new(workspace.clone())
-                .machine_name()
-                .map(|machine| crate::workspace_exec::durable_scope_unit(&machine, id))
-        }),
+        scope_unit: workspace
+            .as_ref()
+            .and_then(|workspace| WorkspaceExec::new(workspace.clone()).durable_scope_unit(id)),
         resource_class: req.resource_class,
         idempotency_key,
         request_fingerprint: Some(request_fingerprint),

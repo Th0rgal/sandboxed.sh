@@ -316,6 +316,20 @@ pub fn durable_scope_unit(machine_name: &str, job_id: uuid::Uuid) -> String {
     format!("sandboxed-durable-{machine_name}-{}", job_id.simple())
 }
 
+fn durable_scope_unit_for_launch(
+    workspace_type: WorkspaceType,
+    uses_nspawn: bool,
+    caps: &MissionResourceCaps,
+    machine_name: Option<String>,
+    job_id: uuid::Uuid,
+) -> Option<String> {
+    if workspace_type == WorkspaceType::Container && uses_nspawn && !caps.is_disabled() {
+        machine_name.map(|machine| durable_scope_unit(&machine, job_id))
+    } else {
+        None
+    }
+}
+
 /// Recover the 8-hex mission short id from an exec scope unit name produced
 /// by [`exec_scope_unit`]. Parses from the END (`…-m<8hex>-<rand8>.scope`) so
 /// machine-name segments can never false-positive. Returns `None` for
@@ -601,12 +615,12 @@ mod tests {
 
     use super::{
         append_nsenter_target_root_arg, ca_env_scrub_prelude, durable_command_runs_on_api_host,
-        durable_scope_unit, environ_has_keepalive_marker, exec_scope_unit,
-        exec_scope_unit_for_mission, exec_unit_belongs_to_mission, machine_name_from_exec_unit,
-        mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
-        nspawn_directory_from_cmdline, persistent_nspawn_command, replace_command_env,
-        resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec, WorkspaceType,
-        CA_BUNDLE_ENV_VARS,
+        durable_scope_unit, durable_scope_unit_for_launch, environ_has_keepalive_marker,
+        exec_scope_unit, exec_scope_unit_for_mission, exec_unit_belongs_to_mission,
+        machine_name_from_exec_unit, mission_short_id_from_exec_unit, mission_tag_from_path,
+        normalize_container_path, nspawn_directory_from_cmdline, persistent_nspawn_command,
+        replace_command_env, resolv_conf_bind_args, synthesized_container_resolv_conf,
+        MissionResourceCaps, WorkspaceExec, WorkspaceType, CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
     use std::ffi::OsStr;
@@ -718,6 +732,42 @@ mod tests {
         );
         assert_eq!(mission_short_id_from_exec_unit(&unit), None);
         assert!(!unit.starts_with("sandboxed-exec-"));
+    }
+
+    #[test]
+    fn durable_scope_receipt_requires_an_actual_scope_wrapper() {
+        let id = uuid::Uuid::new_v4();
+        let machine = || Some("sandboxed-demo-deadbeef".to_string());
+        assert_eq!(
+            durable_scope_unit_for_launch(
+                WorkspaceType::Container,
+                true,
+                &MissionResourceCaps::default(),
+                machine(),
+                id,
+            ),
+            None
+        );
+        let caps = MissionResourceCaps {
+            cpu_weight: Some("100".to_string()),
+            ..Default::default()
+        };
+        assert!(durable_scope_unit_for_launch(
+            WorkspaceType::Container,
+            true,
+            &caps,
+            machine(),
+            id,
+        )
+        .is_some());
+        assert_eq!(
+            durable_scope_unit_for_launch(WorkspaceType::Host, true, &caps, machine(), id),
+            None
+        );
+        assert_eq!(
+            durable_scope_unit_for_launch(WorkspaceType::Container, false, &caps, machine(), id,),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1495,6 +1545,19 @@ impl WorkspaceExec {
         mission_resource_caps_from_env(&self.workspace.env_vars)
     }
 
+    /// Exact scope receipt for a durable launch. Host/fallback execution and
+    /// uncapped container execution do not use `systemd-run`, so advertising
+    /// a scope for those paths would make healthy PIDs fail ownership checks.
+    pub fn durable_scope_unit(&self, job_id: uuid::Uuid) -> Option<String> {
+        durable_scope_unit_for_launch(
+            self.workspace.workspace_type,
+            use_nspawn_for_workspace(&self.workspace),
+            &self.mission_resource_caps(),
+            self.machine_name(),
+            job_id,
+        )
+    }
+
     /// The boot scope unit name for this workspace's container, when one can
     /// be derived. Public so the API layer (live cap adjustment, memory
     /// stats, OOM watchdog) can address the same unit this module creates.
@@ -2031,9 +2094,7 @@ impl WorkspaceExec {
             use_nspawn_for_workspace(&self.workspace),
         )
         .then(|| env.clone());
-        let scope_unit = self
-            .machine_name()
-            .map(|machine| durable_scope_unit(&machine, durable_job_id));
+        let scope_unit = self.durable_scope_unit(durable_job_id);
         let mut cmd = self
             .build_command(
                 cwd,
