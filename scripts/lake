@@ -47,23 +47,28 @@ if [ "${SANDBOXED_REMOTE_EXECUTION:-0}" = "1" ]; then
 fi
 
 heavy=0
+unwrap_nested_lake=0
 case "${1:-}" in
   build|test|check) heavy=1 ;;
   env)
-    case "${2:-}" in lean|lake) heavy=1 ;; esac
+    case "${2:-}" in
+      lean) heavy=1 ;;
+      lake)
+        case "${3:-}" in
+          build|test|check) heavy=1; unwrap_nested_lake=1 ;;
+        esac
+        ;;
+    esac
     ;;
-esac
-
-# Operators can add project-specific verification verbs without replacing the
-# shim. Values are comma-separated first arguments.
-case ",${SANDBOXED_REMOTE_LAKE_COMMANDS:-}," in
-  *",${1:-},"*) heavy=1 ;;
 esac
 
 if [ "$heavy" -eq 0 ] || [ "$policy" = "local_allowed" ]; then
   exec "$real_lake" "$@"
 fi
 
+if [ "$unwrap_nested_lake" -eq 1 ]; then
+  shift 2
+fi
 remote-lean-build lake "$@"
 remote_status=$?
 if [ "$remote_status" -ne 75 ]; then

@@ -67,6 +67,11 @@ pub struct DurableJob {
     pub stdout_log: String,
     pub stderr_log: String,
     pub status_file: String,
+    /// False only while the server is preparing the process launch. Legacy
+    /// receipts default to true. A stale false receipt with no live scope or
+    /// start marker is safe for the same idempotency key to resubmit.
+    #[serde(default = "default_spawn_accepted")]
+    pub spawn_accepted: bool,
     /// Transient systemd scope owned by this durable job. It intentionally
     /// does not carry the launching mission's tag, so mission teardown cannot
     /// terminate it.
@@ -82,6 +87,10 @@ pub struct DurableJob {
     /// are hashed rather than persisted so job receipts never expose secrets.
     #[serde(default)]
     pub request_fingerprint: Option<String>,
+}
+
+fn default_spawn_accepted() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +220,12 @@ struct ExitRecord {
     finished_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct StartRecord {
+    pid: u32,
+    started_at: DateTime<Utc>,
+}
+
 fn err(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     (
         status,
@@ -259,8 +274,16 @@ fn durable_shell_wrapper(command: &str) -> String {
     // `set -e; false` must terminate only this subshell so the parent can
     // always persist the restart-safe terminal record.
     format!(
-        "if [ -n \"${{REMOTE_BUILD_COMMAND:-}}\" ]; then\n  __oa_policy_bin=${{REMOTE_BUILD_COMMAND%/*}}\n  PATH=$__oa_policy_bin:$PATH\n  export PATH\n  unset __oa_policy_bin\nfi\n(\n{command}\n)\ncode=$?\nprintf '{{\"exit_code\":%s,\"signal\":null,\"finished_at\":\"%s\"}}\\n' \"$code\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$SANDBOXED_SH_DURABLE_STATUS\"\nexit \"$code\"\n"
+        "if [ -n \"${{REMOTE_BUILD_COMMAND:-}}\" ]; then\n  __oa_policy_bin=${{REMOTE_BUILD_COMMAND%/*}}\n  PATH=$__oa_policy_bin:$PATH\n  export PATH\n  unset __oa_policy_bin\nfi\n__oa_started_tmp=\"${{SANDBOXED_SH_DURABLE_STARTED}}.tmp.$$\"\nprintf '{{\"pid\":%s,\"started_at\":\"%s\"}}\\n' \"$$\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$__oa_started_tmp\" || exit 125\nmv -f \"$__oa_started_tmp\" \"$SANDBOXED_SH_DURABLE_STARTED\" || exit 125\nunset __oa_started_tmp\n(\n{command}\n)\ncode=$?\nprintf '{{\"exit_code\":%s,\"signal\":null,\"finished_at\":\"%s\"}}\\n' \"$code\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$SANDBOXED_SH_DURABLE_STATUS\"\nexit \"$code\"\n"
     )
+}
+
+fn durable_started_file(job: &DurableJob) -> PathBuf {
+    Path::new(&job.status_file).with_file_name("started.json")
+}
+
+fn preparing_receipt_is_resubmittable(job: &DurableJob) -> bool {
+    !job.spawn_accepted && job.status == DurableJobStatus::Unknown
 }
 
 async fn authorize_job(
@@ -781,6 +804,35 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
             }
         }
 
+        if !job.spawn_accepted {
+            let now = Utc::now();
+            let scope_is_active = job.scope_unit.as_deref().is_some_and(scope_unit_is_active);
+            let started_pid = tokio::fs::read(durable_started_file(&job))
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<StartRecord>(&bytes).ok())
+                .map(|record| record.pid);
+            let direct_pid_is_live =
+                job.scope_unit.is_none() && started_pid.is_some_and(process_alive);
+            if scope_is_active || direct_pid_is_live {
+                job.spawn_accepted = true;
+                job.status = DurableJobStatus::Running;
+                if job.scope_unit.is_none() {
+                    job.pid = started_pid;
+                }
+                job.heartbeat_at = Some(now);
+                job.updated_at = now;
+                job = write_job(state, &job).await.unwrap_or(job);
+            } else {
+                if (now - job.created_at).num_seconds() >= PIDLESS_START_GRACE_SECS {
+                    job.status = DurableJobStatus::Unknown;
+                    job.updated_at = now;
+                    job = write_job(state, &job).await.unwrap_or(job);
+                }
+                return job;
+            }
+        }
+
         if let Some(pid) = job.pid {
             if !process_owned_by_job(&job, pid) {
                 // systemd-run may need a brief moment to attach the payload
@@ -916,10 +968,13 @@ pub async fn start_job(
                 ));
             }
             let existing = refresh_job(&state, existing).await;
-            // Any persisted receipt closes the submission decision. A pidless
-            // receipt may be the crash window after spawn but before PID
-            // persistence, so resubmitting it could duplicate live work.
-            return Ok(Json(existing));
+            // Accepted receipts close the submission decision. A stale
+            // pre-spawn receipt is explicitly safe to retry because refresh
+            // found neither its deterministic scope nor its atomic start
+            // marker alive.
+            if !preparing_receipt_is_resubmittable(&existing) {
+                return Ok(Json(existing));
+            }
         }
     }
 
@@ -946,7 +1001,17 @@ pub async fn start_job(
                         ));
                     }
                     let existing = refresh_job(&state, existing).await;
-                    return Ok(Json(existing));
+                    if !preparing_receipt_is_resubmittable(&existing) {
+                        return Ok(Json(existing));
+                    }
+                    tokio::fs::remove_file(job_file(&state, id))
+                        .await
+                        .map_err(|error| {
+                            err(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("failed to clear stale pre-spawn receipt: {error}"),
+                            )
+                        })?;
                 }
                 Some(claim)
             }
@@ -960,7 +1025,11 @@ pub async fn start_job(
                             ));
                         }
                         let existing = refresh_job(&state, existing).await;
-                        return Ok(Json(existing));
+                        if !preparing_receipt_is_resubmittable(&existing) {
+                            return Ok(Json(existing));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
@@ -988,6 +1057,11 @@ pub async fn start_job(
     let stdout_log = runtime_dir.join("stdout.log");
     let stderr_log = runtime_dir.join("stderr.log");
     let status_file = runtime_dir.join("exit.json");
+    let started_file = runtime_dir.join("started.json");
+    // A prior crashed pre-spawn attempt is resubmitted only while holding the
+    // submission claim and only after refresh proved it has no live owner.
+    let _ = tokio::fs::remove_file(&status_file).await;
+    let _ = tokio::fs::remove_file(&started_file).await;
 
     let stdout = std::fs::OpenOptions::new()
         .create(true)
@@ -1021,6 +1095,7 @@ pub async fn start_job(
         stdout_log: stdout_log.to_string_lossy().to_string(),
         stderr_log: stderr_log.to_string_lossy().to_string(),
         status_file: status_file.to_string_lossy().to_string(),
+        spawn_accepted: false,
         scope_unit: workspace
             .as_ref()
             .and_then(|workspace| WorkspaceExec::new(workspace.clone()).durable_scope_unit(id)),
@@ -1041,6 +1116,16 @@ pub async fn start_job(
     job_env.insert(
         "SANDBOXED_SH_DURABLE_STATUS".to_string(),
         status_path_for_child,
+    );
+    let started_path_for_child = workspace
+        .as_ref()
+        .map(|workspace| {
+            WorkspaceExec::new(workspace.clone()).translate_path_for_container(&started_file)
+        })
+        .unwrap_or_else(|| started_file.to_string_lossy().to_string());
+    job_env.insert(
+        "SANDBOXED_SH_DURABLE_STARTED".to_string(),
+        started_path_for_child,
     );
     // WorkspaceExec already provides the container login-shell boundary and
     // changes to the translated cwd before it execs this shell. A second
@@ -1093,6 +1178,7 @@ pub async fn start_job(
         }
     };
     job.pid = child.id();
+    job.spawn_accepted = true;
     job.updated_at = Utc::now();
     job = match write_job(&state, &job).await {
         Ok(job) => job,
@@ -1274,6 +1360,7 @@ mod tests {
             stdout_log: "/tmp/stdout.log".to_string(),
             stderr_log: "/tmp/stderr.log".to_string(),
             status_file: "/tmp/exit.json".to_string(),
+            spawn_accepted: true,
             scope_unit: None,
             resource_class: None,
             idempotency_key: None,
@@ -1305,6 +1392,19 @@ mod tests {
         assert_eq!(first, retry);
         assert_ne!(first, distinct);
         assert!(validated_idempotency_key(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn only_stale_pre_spawn_receipts_are_resubmittable() {
+        let mut job = test_job(DurableJobStatus::Unknown);
+        job.spawn_accepted = false;
+        assert!(preparing_receipt_is_resubmittable(&job));
+
+        job.spawn_accepted = true;
+        assert!(!preparing_receipt_is_resubmittable(&job));
+        job.spawn_accepted = false;
+        job.status = DurableJobStatus::Running;
+        assert!(!preparing_receipt_is_resubmittable(&job));
     }
 
     #[test]
@@ -1458,14 +1558,19 @@ mod tests {
     fn wrapper_records_failure_even_when_command_enables_errexit() {
         let dir = tempfile::tempdir().unwrap();
         let status_file = dir.path().join("exit.json");
+        let started_file = dir.path().join("started.json");
         let wrapper = durable_shell_wrapper("set -eu; false");
         assert!(wrapper.contains("REMOTE_BUILD_COMMAND%/*"));
         let output = std::process::Command::new("/bin/sh")
             .args(["-lc", &wrapper])
             .env("SANDBOXED_SH_DURABLE_STATUS", &status_file)
+            .env("SANDBOXED_SH_DURABLE_STARTED", &started_file)
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1));
+        let started: StartRecord =
+            serde_json::from_slice(&std::fs::read(started_file).unwrap()).unwrap();
+        assert!(started.pid > 0);
         let record: ExitRecord =
             serde_json::from_slice(&std::fs::read(status_file).unwrap()).unwrap();
         assert_eq!(record.exit_code, Some(1));

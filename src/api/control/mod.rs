@@ -16190,6 +16190,58 @@ async fn control_actor_loop(
                         );
                         continue;
                     }
+                    // Acquire the durable run before publishing the message as
+                    // started or appending it to history. If a stale run lease
+                    // rejects acquisition, retain the exact queued delivery so
+                    // an idempotent retry cannot be acknowledged without ever
+                    // executing its turn.
+                    let mission_id = msg_target_mid;
+                    running_run = match acquire_execution_run(
+                        &mission_store,
+                        mission_id,
+                        &format!("control:{session_user_id}"),
+                    )
+                    .await
+                    {
+                        Ok(run) => run,
+                        Err(error) => {
+                            queue.push_front((
+                                mid,
+                                msg,
+                                per_msg_agent,
+                                msg_target_mid,
+                                msg_source,
+                            ));
+                            if let Err(persist_error) = persist_control_queue_if_changed(
+                                &mission_store,
+                                &session_user_id,
+                                &queue,
+                                &parallel_runners,
+                                &mut last_persisted_queue,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "Failed to persist queued delivery after run lease rejection: {persist_error}"
+                                );
+                            }
+                            let _ = events_tx.send(AgentEvent::Error {
+                                message: format!("Mission run lease rejected: {error}"),
+                                mission_id,
+                                resumable: true,
+                            });
+                            set_and_emit_status(
+                                &status,
+                                &events_tx,
+                                ControlRunState::Idle,
+                                queue.len(),
+                                mission_id,
+                            )
+                            .await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                            continue;
+                        }
+                    };
                     set_and_emit_status(
                         &status,
                         &events_tx,
@@ -16226,9 +16278,9 @@ async fn control_actor_loop(
                     let tree_ref = Arc::clone(&current_tree);
                     let progress_ref = Arc::clone(&progress);
                     running_cancel = Some(cancel.clone());
-                    // Use the mission ID that was captured when message was queued
-                    // This prevents race conditions where current_mission changes between queueing and execution
-                    let mission_id = msg_target_mid;
+                    // Use the mission ID that was captured when message was queued.
+                    // This prevents races where current_mission changes between
+                    // queueing and execution.
                     let (workspace_id, model_override, model_effort, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
                         match mission_store.get_mission(mid).await {
                             Ok(Some(mission)) => (
@@ -16269,33 +16321,6 @@ async fn control_actor_loop(
                     main_runner_active_tool_calls
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                     let user_id_for_turn = session_user_id.clone();
-                    running_run = match acquire_execution_run(
-                        &mission_store,
-                        mission_id,
-                        &format!("control:{session_user_id}"),
-                    )
-                    .await
-                    {
-                        Ok(run) => run,
-                        Err(error) => {
-                            running_cancel = None;
-                            running_mission_id = None;
-                            let _ = events_tx.send(AgentEvent::Error {
-                                message: format!("Mission run lease rejected: {error}"),
-                                mission_id,
-                                resumable: true,
-                            });
-                            set_and_emit_status(
-                                &status,
-                                &events_tx,
-                                ControlRunState::Idle,
-                                queue.len(),
-                                mission_id,
-                            )
-                            .await;
-                            continue;
-                        }
-                    };
                     running = Some(tokio::spawn(async move {
                         let result = run_single_control_turn(
                             cfg,
