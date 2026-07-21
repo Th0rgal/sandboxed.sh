@@ -6,7 +6,7 @@
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 
 use axum::{
@@ -284,6 +284,7 @@ fn durable_started_file(job: &DurableJob) -> PathBuf {
 
 fn preparing_receipt_is_resubmittable(job: &DurableJob) -> bool {
     !job.spawn_accepted
+        && !failed_receipt_has_process_evidence(job)
         && matches!(
             job.status,
             DurableJobStatus::Unknown | DurableJobStatus::Failed
@@ -292,10 +293,15 @@ fn preparing_receipt_is_resubmittable(job: &DurableJob) -> bool {
 
 fn submission_receipt_is_final(job: &DurableJob) -> bool {
     job.spawn_accepted
+        || failed_receipt_has_process_evidence(job)
         || matches!(
             job.status,
             DurableJobStatus::Completed | DurableJobStatus::Cancelled
         )
+}
+
+fn failed_receipt_has_process_evidence(job: &DurableJob) -> bool {
+    job.status == DurableJobStatus::Failed && (job.exit_code.is_some() || job.signal.is_some())
 }
 
 async fn authorize_job(
@@ -566,11 +572,44 @@ async fn write_terminal_job_state(
         job = latest;
     }
 
+    // Reaching this function requires either an OS child-exit observation or
+    // the wrapper's durable terminal receipt. Both prove that spawn crossed
+    // the acceptance boundary even if the API crashed before persisting the
+    // normal post-spawn update. Preserve that proof so an idempotent retry
+    // cannot delete the receipt and submit the command again.
+    job.spawn_accepted = true;
     job.status = status;
     job.exit_code = exit_code;
     job.signal = signal;
     job.updated_at = updated_at;
     write_job(state, &job).await.unwrap_or(job)
+}
+
+async fn write_observed_child_exit(
+    state: &AppState,
+    job: DurableJob,
+    status: ExitStatus,
+) -> DurableJob {
+    #[cfg(unix)]
+    let process_signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let process_signal = None;
+    let recorded_exit = read_exit_record(&job).await;
+    let exit =
+        merge_process_exit_observation(recorded_exit, status.code(), process_signal, Utc::now());
+    let job_status = terminal_status_for_exit(&job, exit.exit_code, exit.finished_at);
+    write_terminal_job_state(
+        state,
+        job,
+        job_status,
+        exit.exit_code,
+        exit.signal,
+        exit.finished_at,
+    )
+    .await
 }
 
 async fn signal_job(job: &DurableJob, force: bool) {
@@ -616,34 +655,8 @@ fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
             tokio::select! {
                 status = child.wait() => {
                     let Ok(status) = status else { break };
-                #[cfg(unix)]
-                    let process_signal = {
-                        use std::os::unix::process::ExitStatusExt;
-                        status.signal()
-                    };
-                #[cfg(not(unix))]
-                    let process_signal = None;
                     if let Ok(job) = read_job(&state, id).await {
-                        let recorded_exit = read_exit_record(&job).await;
-                        let exit = merge_process_exit_observation(
-                            recorded_exit,
-                            status.code(),
-                            process_signal,
-                            Utc::now(),
-                        );
-                        let job_status = terminal_status_for_exit(
-                            &job,
-                            exit.exit_code,
-                            exit.finished_at,
-                        );
-                        let _ = write_terminal_job_state(
-                            &state,
-                            job,
-                            job_status,
-                            exit.exit_code,
-                            exit.signal,
-                            exit.finished_at,
-                        ).await;
+                        let _ = write_observed_child_exit(&state, job, status).await;
                     }
                     break;
                 }
@@ -661,26 +674,13 @@ fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
                     if let Ok(mut job) = read_job(&state, id).await {
                         if job.status == DurableJobStatus::Running {
                             // The command may have finished just before the
-                            // deadline while this watcher was not scheduled.
-                            // Both select branches are then ready. Honor the
-                            // durable receipt before declaring a timeout so
-                            // randomized branch selection cannot misclassify
-                            // an on-time completion.
-                            if let Some(exit) = read_exit_record(&job).await {
-                                let status = terminal_status_for_exit(
-                                    &job,
-                                    exit.exit_code,
-                                    exit.finished_at,
-                                );
-                                let _ = write_terminal_job_state(
-                                    &state,
-                                    job,
-                                    status,
-                                    exit.exit_code,
-                                    exit.signal,
-                                    exit.finished_at,
-                                ).await;
-                                let _ = child.wait().await;
+                            // deadline while this watcher was not scheduled,
+                            // making both select branches ready. Only honor a
+                            // durable receipt after the OS confirms the child
+                            // exited: the command inherits the receipt path and
+                            // could otherwise write it early, then keep running.
+                            if let Some(status) = confirmed_child_exit(child.try_wait()) {
+                                let _ = write_observed_child_exit(&state, job, status).await;
                                 break;
                             }
                             job.status = deadline_terminal_status();
@@ -699,6 +699,10 @@ fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
             }
         }
     });
+}
+
+fn confirmed_child_exit(observation: std::io::Result<Option<ExitStatus>>) -> Option<ExitStatus> {
+    observation.ok().flatten()
 }
 
 #[cfg(unix)]
@@ -1516,6 +1520,14 @@ mod tests {
         assert!(preparing_receipt_is_resubmittable(&job));
         assert!(!submission_receipt_is_final(&job));
 
+        job.exit_code = Some(1);
+        assert!(
+            !preparing_receipt_is_resubmittable(&job),
+            "a wrapper-recorded failure proves that spawn occurred"
+        );
+        assert!(submission_receipt_is_final(&job));
+        job.exit_code = None;
+
         job.status = DurableJobStatus::Completed;
         assert!(!preparing_receipt_is_resubmittable(&job));
         assert!(submission_receipt_is_final(&job));
@@ -1609,6 +1621,20 @@ mod tests {
             terminal_status_for_exit(&job, exit.exit_code, exit.finished_at),
             DurableJobStatus::Completed
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deadline_receipt_is_not_honored_while_child_is_still_running() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 10"])
+            .spawn()
+            .unwrap();
+
+        assert!(confirmed_child_exit(child.try_wait()).is_none());
+
+        child.kill().await.unwrap();
+        let _ = child.wait().await;
     }
 
     #[test]
