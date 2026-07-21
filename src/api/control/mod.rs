@@ -5370,6 +5370,30 @@ fn fable_mandate_requests_integration(intent: Option<&str>, prompt: Option<&str>
     })
 }
 
+/// Decide whether a Fable mission must be rejected at admission.
+///
+/// Fable may coordinate repository integration as an explicitly read-only
+/// orchestrator. In that mode the prompt necessarily discusses commits,
+/// pushes, rebases, and merges, so prompt vocabulary alone cannot distinguish
+/// orchestration from direct write authority. The structured `writer` field is
+/// the capability boundary: `writer=false` permits read-only orchestration,
+/// while `writer=true` is always invalid for Fable. Legacy requests that omit
+/// the field retain the historical prompt guard.
+fn fable_mandate_requires_rejection(
+    model: Option<&str>,
+    writer: Option<bool>,
+    intent: Option<&str>,
+    prompt: Option<&str>,
+) -> bool {
+    if !is_fable_model(model) {
+        return false;
+    }
+    if writer == Some(true) {
+        return true;
+    }
+    writer != Some(false) && fable_mandate_requests_integration(intent, prompt)
+}
+
 static PR_WRITER_CREATE_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
 
@@ -6105,12 +6129,15 @@ pub async fn create_mission(
         }
     }
 
-    if is_fable_model(model_override.as_deref())
-        && fable_mandate_requests_integration(req.intent.as_deref(), req.prompt.as_deref())
-    {
+    if fable_mandate_requires_rejection(
+        model_override.as_deref(),
+        req.writer,
+        req.intent.as_deref(),
+        req.prompt.as_deref(),
+    ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Fable is restricted to mathematical hypothesis generation and cannot receive review, commit, push, conflict-resolution, or merge mandates. Use Codex or Claude Opus for repository integration."
+            "Fable cannot receive repository write authority. Use writer=false for read-only orchestration, or use Codex or Claude Opus for repository integration."
                 .to_string(),
         ));
     }
@@ -23333,6 +23360,45 @@ And the report:
         assert!(fable_mandate_requests_integration(
             None,
             Some("Resolve the conflicts, commit, and push")
+        ));
+    }
+
+    #[test]
+    fn fable_admission_uses_explicit_writer_capability() {
+        let orchestration_prompt = Some(concat!(
+            "Coordinate the repair: delegate implementation to the designated Sol writer, then ",
+            "instruct that writer to commit, push, and merge after exact-head review",
+        ));
+
+        assert!(!fable_mandate_requires_rejection(
+            Some("claude-fable-5"),
+            Some(false),
+            Some("goal_orchestration"),
+            orchestration_prompt,
+        ));
+        assert!(fable_mandate_requires_rejection(
+            Some("claude-fable-5"),
+            None,
+            Some("goal_orchestration"),
+            orchestration_prompt,
+        ));
+        assert!(fable_mandate_requires_rejection(
+            Some("claude-fable-5"),
+            Some(true),
+            Some("hypothesis_generation"),
+            Some("Explore mathematical hypotheses"),
+        ));
+        assert!(!fable_mandate_requires_rejection(
+            Some("claude-fable-5"),
+            None,
+            Some("hypothesis_generation"),
+            Some("Explore mathematical hypotheses"),
+        ));
+        assert!(!fable_mandate_requires_rejection(
+            Some("claude-opus-4-7"),
+            Some(true),
+            Some("review_merge_pr"),
+            Some("Review and merge the PR"),
         ));
     }
 
