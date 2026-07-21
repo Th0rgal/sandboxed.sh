@@ -610,11 +610,12 @@ fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
                 status = child.wait() => {
                     let Ok(status) = status else { break };
                     if let Ok(job) = read_job(&state, id).await {
-                        let job_status = if status.success() {
-                            DurableJobStatus::Completed
-                        } else {
-                            DurableJobStatus::Failed
-                        };
+                        let finished_at = Utc::now();
+                        let job_status = terminal_status_for_exit(
+                            &job,
+                            status.code(),
+                            finished_at,
+                        );
                 #[cfg(unix)]
                         let signal = {
                             use std::os::unix::process::ExitStatusExt;
@@ -623,7 +624,7 @@ fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
                 #[cfg(not(unix))]
                         let signal = None;
                         let _ = write_terminal_job_state(
-                            &state, job, job_status, status.code(), signal, Utc::now(),
+                            &state, job, job_status, status.code(), signal, finished_at,
                         ).await;
                     }
                     break;
@@ -693,6 +694,23 @@ fn job_is_cancellable(status: &DurableJobStatus) -> bool {
 
 fn deadline_terminal_status() -> DurableJobStatus {
     DurableJobStatus::Failed
+}
+
+fn terminal_status_for_exit(
+    job: &DurableJob,
+    exit_code: Option<i32>,
+    finished_at: DateTime<Utc>,
+) -> DurableJobStatus {
+    if job
+        .deadline_at
+        .is_some_and(|deadline| finished_at >= deadline)
+    {
+        deadline_terminal_status()
+    } else if exit_code == Some(0) {
+        DurableJobStatus::Completed
+    } else {
+        DurableJobStatus::Failed
+    }
 }
 
 fn job_deadline_elapsed(job: &DurableJob, now: DateTime<Utc>) -> bool {
@@ -822,11 +840,11 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
     ) {
         if let Ok(bytes) = tokio::fs::read(&job.status_file).await {
             if let Ok(exit) = serde_json::from_slice::<ExitRecord>(&bytes) {
-                let status = if exit.exit_code == Some(0) {
-                    DurableJobStatus::Completed
-                } else {
-                    DurableJobStatus::Failed
-                };
+                // The API can be offline while a durable command runs beyond
+                // its absolute deadline and later publishes a successful exit
+                // record. Classify the recorded finish time before accepting
+                // that success so restart recovery cannot erase a timeout.
+                let status = terminal_status_for_exit(&job, exit.exit_code, exit.finished_at);
                 return write_terminal_job_state(
                     state,
                     job,
@@ -1479,6 +1497,34 @@ mod tests {
     #[test]
     fn deadline_is_always_classified_as_failed() {
         assert_eq!(deadline_terminal_status(), DurableJobStatus::Failed);
+    }
+
+    #[test]
+    fn successful_exit_after_deadline_remains_failed_during_restart_recovery() {
+        let deadline = Utc::now();
+        let mut job = test_job(DurableJobStatus::Running);
+        job.deadline_at = Some(deadline);
+
+        assert_eq!(
+            terminal_status_for_exit(&job, Some(0), deadline + chrono::Duration::seconds(1),),
+            DurableJobStatus::Failed
+        );
+        assert_eq!(
+            terminal_status_for_exit(&job, Some(0), deadline),
+            DurableJobStatus::Failed
+        );
+    }
+
+    #[test]
+    fn successful_exit_before_deadline_survives_late_restart_observation() {
+        let deadline = Utc::now();
+        let mut job = test_job(DurableJobStatus::Running);
+        job.deadline_at = Some(deadline);
+
+        assert_eq!(
+            terminal_status_for_exit(&job, Some(0), deadline - chrono::Duration::seconds(1),),
+            DurableJobStatus::Completed
+        );
     }
 
     #[test]
