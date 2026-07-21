@@ -1,21 +1,22 @@
 //! SQLite-based mission store with full event logging.
 
 use super::{
-    now_string, sanitize_filename, Automation, AutomationExecution, AwaitingKind, BoardTask,
-    BoardTaskOutcome, BoardTaskStatus, CommandSource, DailyUsageStats, ExecutionStatus,
-    FreshSession, HourlyUsageStats, Mission, MissionActivity, MissionHistoryEntry, MissionMode,
-    MissionProject, MissionProjectPatch, MissionScheduling, MissionStatus, MissionStatusCounts,
-    MissionStore, MissionSummary, ModelUsageStats, NewBoardTask, PalomaCooldownState,
-    PalomaDecision, PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig,
-    StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
-    TelegramActionExecutionStatus, TelegramAlert, TelegramAlertPreference, TelegramChannel,
-    TelegramChatMission, TelegramConversation, TelegramConversationMessage,
-    TelegramConversationMessageDirection, TelegramMissionInterestLevel,
-    TelegramMissionSubscription, TelegramScheduledMessage, TelegramScheduledMessageStatus,
-    TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
-    TelegramStructuredMemorySearchHit, TelegramUser, TelegramUserCursor, TelegramUserRole,
-    TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus,
-    ToolCallSummary, TriggerType, WebhookConfig,
+    now_string, sanitize_filename, Automation, AutomationExecution, AwaitingKind, BoardOutboxItem,
+    BoardProject, BoardTask, BoardTaskOutcome, BoardTaskRole, BoardTaskStatus, CommandSource,
+    DailyUsageStats, ExecutionStatus, FreshSession, HourlyUsageStats, Mission, MissionActivity,
+    MissionExecutionState, MissionHistoryEntry, MissionMode, MissionProject, MissionProjectPatch,
+    MissionRun, MissionScheduling, MissionStatus, MissionStatusCounts, MissionStore,
+    MissionSummary, MissionToolExecution, MissionToolExecutionState, ModelUsageStats, NewBoardTask,
+    PalomaCooldownState, PalomaDecision, PalomaMissionCard, PalomaSchedulerJob,
+    PalomaUserPreferences, RetryConfig, StopPolicy, StoredEvent, TaskAttempt,
+    TelegramActionExecution, TelegramActionExecutionKind, TelegramActionExecutionStatus,
+    TelegramAlert, TelegramAlertPreference, TelegramChannel, TelegramChatMission,
+    TelegramConversation, TelegramConversationMessage, TelegramConversationMessageDirection,
+    TelegramMissionInterestLevel, TelegramMissionSubscription, TelegramScheduledMessage,
+    TelegramScheduledMessageStatus, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
+    TelegramStructuredMemoryScope, TelegramStructuredMemorySearchHit, TelegramUser,
+    TelegramUserCursor, TelegramUserRole, TelegramWorkflow, TelegramWorkflowEvent,
+    TelegramWorkflowKind, TelegramWorkflowStatus, ToolCallSummary, TriggerType, WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo, TextOp};
 use async_trait::async_trait;
@@ -513,6 +514,48 @@ CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);
 CREATE INDEX IF NOT EXISTS idx_missions_status_updated ON missions(status, updated_at);
 
+CREATE TABLE IF NOT EXISTS mission_runs (
+    run_id TEXT PRIMARY KEY NOT NULL,
+    mission_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    execution_state TEXT NOT NULL,
+    owner_actor_id TEXT NOT NULL,
+    scope_unit TEXT,
+    started_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    stopping_at TEXT,
+    ended_at TEXT,
+    terminal_reason TEXT,
+    UNIQUE(mission_id, generation),
+    FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mission_runs_one_active
+ON mission_runs(mission_id) WHERE execution_state <> 'terminal';
+CREATE INDEX IF NOT EXISTS idx_mission_runs_active_heartbeat
+ON mission_runs(execution_state, heartbeat_at) WHERE execution_state <> 'terminal';
+
+CREATE TABLE IF NOT EXISTS mission_tool_executions (
+    tool_call_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    tool_kind TEXT NOT NULL,
+    state TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    deadline_at TEXT NOT NULL,
+    process_pid INTEGER,
+    durable_job_id TEXT,
+    completed_at TEXT,
+    exit_status INTEGER,
+    failure_class TEXT,
+    PRIMARY KEY(run_id, tool_call_id),
+    FOREIGN KEY (run_id) REFERENCES mission_runs(run_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_mission_tool_executions_active
+ON mission_tool_executions(run_id, state)
+WHERE state IN ('provisional', 'running');
+
 CREATE TABLE IF NOT EXISTS mission_trees (
     mission_id TEXT PRIMARY KEY NOT NULL,
     tree_json TEXT NOT NULL,
@@ -659,6 +702,14 @@ CREATE TABLE IF NOT EXISTS board_tasks (
     working_directory TEXT,
     repository TEXT,
     branch TEXT,
+    role TEXT NOT NULL DEFAULT 'worker',
+    acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+    verification_command TEXT,
+    design_domain TEXT,
+    declared_write_set TEXT NOT NULL DEFAULT '[]',
+    risk_class TEXT NOT NULL DEFAULT 'normal',
+    token_budget INTEGER,
+    cost_budget_cents INTEGER,
     depends_on TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'pending',
     outcome TEXT,
@@ -678,6 +729,54 @@ CREATE TABLE IF NOT EXISTS board_tasks (
 CREATE INDEX IF NOT EXISTS idx_board_tasks_boss ON board_tasks(boss_mission_id);
 CREATE INDEX IF NOT EXISTS idx_board_tasks_worker ON board_tasks(worker_mission_id);
 CREATE INDEX IF NOT EXISTS idx_board_tasks_status ON board_tasks(status);
+
+CREATE TABLE IF NOT EXISTS board_projects (
+    slug TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    specification_path TEXT NOT NULL,
+    specification_revision TEXT NOT NULL,
+    compute_policy TEXT NOT NULL,
+    budget_policy TEXT NOT NULL DEFAULT '{}',
+    active_controller_lease TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_attempts (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    mission_id TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    model TEXT,
+    role TEXT NOT NULL,
+    run_id TEXT,
+    commit_sha TEXT,
+    changed_files TEXT NOT NULL DEFAULT '[]',
+    verification_evidence TEXT NOT NULL DEFAULT '{}',
+    cost_cents INTEGER,
+    terminal_class TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(task_id, attempt_number),
+    FOREIGN KEY (task_id) REFERENCES board_tasks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_attempts_task ON task_attempts(task_id, attempt_number);
+
+CREATE TABLE IF NOT EXISTS board_outbox (
+    id TEXT PRIMARY KEY,
+    boss_mission_id TEXT NOT NULL,
+    task_id TEXT,
+    delivery_kind TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    acknowledged_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_board_outbox_pending ON board_outbox(state, created_at);
 
 -- Persisted control-session message queue (JSON snapshot) so pending queued
 -- messages survive a restart. Single row (the DB is already per-user).
@@ -1243,6 +1342,14 @@ impl SqliteMissionStore {
             ("prior_worker_mission_id", "TEXT"),
             ("prior_outcome", "TEXT"),
             ("prior_result_digest", "TEXT"),
+            ("role", "TEXT NOT NULL DEFAULT 'worker'"),
+            ("acceptance_criteria", "TEXT NOT NULL DEFAULT '[]'"),
+            ("verification_command", "TEXT"),
+            ("design_domain", "TEXT"),
+            ("declared_write_set", "TEXT NOT NULL DEFAULT '[]'"),
+            ("risk_class", "TEXT NOT NULL DEFAULT 'normal'"),
+            ("token_budget", "INTEGER"),
+            ("cost_budget_cents", "INTEGER"),
         ] {
             let exists = conn
                 .prepare(&format!(
@@ -2516,6 +2623,48 @@ fn status_to_string(status: MissionStatus) -> &'static str {
     }
 }
 
+fn parse_mission_run_row(row: &rusqlite::Row<'_>) -> Result<MissionRun, rusqlite::Error> {
+    let run_id: String = row.get(0)?;
+    let mission_id: String = row.get(1)?;
+    let state: String = row.get(3)?;
+    Ok(MissionRun {
+        run_id: parse_uuid_or_nil(&run_id),
+        mission_id: parse_uuid_or_nil(&mission_id),
+        generation: row.get::<_, i64>(2)?.max(0) as u64,
+        execution_state: MissionExecutionState::parse(&state)
+            .unwrap_or(MissionExecutionState::Terminal),
+        owner_actor_id: row.get(4)?,
+        scope_unit: row.get(5)?,
+        started_at: row.get(6)?,
+        heartbeat_at: row.get(7)?,
+        stopping_at: row.get(8)?,
+        ended_at: row.get(9)?,
+        terminal_reason: row.get(10)?,
+    })
+}
+
+fn parse_tool_execution_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<MissionToolExecution, rusqlite::Error> {
+    let run_id: String = row.get(1)?;
+    let state: String = row.get(3)?;
+    let durable_job_id: Option<String> = row.get(8)?;
+    Ok(MissionToolExecution {
+        tool_call_id: row.get(0)?,
+        run_id: parse_uuid_or_nil(&run_id),
+        tool_kind: row.get(2)?,
+        state: MissionToolExecutionState::parse(&state).unwrap_or(MissionToolExecutionState::Stale),
+        started_at: row.get(4)?,
+        heartbeat_at: row.get(5)?,
+        deadline_at: row.get(6)?,
+        process_pid: row.get::<_, Option<i64>>(7)?.map(|pid| pid.max(0) as u32),
+        durable_job_id: durable_job_id.and_then(|id| Uuid::parse_str(&id).ok()),
+        completed_at: row.get(9)?,
+        exit_status: row.get(10)?,
+        failure_class: row.get(11)?,
+    })
+}
+
 /// Serialize mission tags to a JSON array string for storage. `None` when empty
 /// (keeps the column NULL rather than `"[]"`).
 fn tags_to_json(tags: &[String]) -> Option<String> {
@@ -2821,6 +2970,277 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn begin_mission_run(
+        &self,
+        mission_id: Uuid,
+        owner_actor_id: &str,
+        scope_unit: Option<&str>,
+    ) -> Result<MissionRun, String> {
+        let conn = self.conn.clone();
+        let owner_actor_id = owner_actor_id.to_string();
+        let scope_unit = scope_unit.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            let mission_status = tx
+                .query_row(
+                    "SELECT status FROM missions WHERE id = ?1",
+                    params![mission_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some(mission_status) = mission_status else {
+                return Err(format!("mission not found: {mission_id}"));
+            };
+            if mission_status == "acknowledged" {
+                return Err(format!(
+                    "acknowledged mission {mission_id} cannot acquire a non-terminal run"
+                ));
+            }
+            if let Some(existing) = tx
+                .query_row(
+                    "SELECT run_id, mission_id, generation, execution_state, owner_actor_id, scope_unit, started_at, heartbeat_at, stopping_at, ended_at, terminal_reason
+                     FROM mission_runs WHERE mission_id = ?1 AND execution_state <> 'terminal'",
+                    params![mission_id.to_string()],
+                    parse_mission_run_row,
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+            {
+                return Err(format!(
+                    "mission {mission_id} already has non-terminal run {} generation {}",
+                    existing.run_id, existing.generation
+                ));
+            }
+            let generation = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(generation), 0) + 1 FROM mission_runs WHERE mission_id = ?1",
+                    params![mission_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| error.to_string())?
+                .max(1) as u64;
+            let now = now_string();
+            let run = MissionRun {
+                run_id: Uuid::new_v4(),
+                mission_id,
+                generation,
+                execution_state: MissionExecutionState::Starting,
+                owner_actor_id,
+                scope_unit,
+                started_at: now.clone(),
+                heartbeat_at: now,
+                stopping_at: None,
+                ended_at: None,
+                terminal_reason: None,
+            };
+            tx.execute(
+                "INSERT INTO mission_runs (run_id, mission_id, generation, execution_state, owner_actor_id, scope_unit, started_at, heartbeat_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    run.run_id.to_string(),
+                    run.mission_id.to_string(),
+                    run.generation as i64,
+                    run.execution_state.as_str(),
+                    run.owner_actor_id,
+                    run.scope_unit,
+                    run.started_at,
+                    run.heartbeat_at,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(run)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    async fn get_active_mission_run(&self, mission_id: Uuid) -> Result<Option<MissionRun>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT run_id, mission_id, generation, execution_state, owner_actor_id, scope_unit, started_at, heartbeat_at, stopping_at, ended_at, terminal_reason
+                 FROM mission_runs WHERE mission_id = ?1 AND execution_state <> 'terminal'",
+                params![mission_id.to_string()],
+                parse_mission_run_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    async fn list_active_mission_runs(&self) -> Result<Vec<MissionRun>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT run_id, mission_id, generation, execution_state, owner_actor_id, scope_unit, started_at, heartbeat_at, stopping_at, ended_at, terminal_reason
+                     FROM mission_runs WHERE execution_state <> 'terminal' ORDER BY started_at ASC",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([], parse_mission_run_row)
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    async fn heartbeat_mission_run(
+        &self,
+        run_id: Uuid,
+        generation: u64,
+        state: MissionExecutionState,
+        scope_unit: Option<&str>,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let now = now_string();
+        let scope_unit = scope_unit.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE mission_runs SET execution_state = ?1, heartbeat_at = ?2,
+                    scope_unit = COALESCE(?3, scope_unit),
+                    stopping_at = CASE WHEN ?1 = 'stopping' THEN COALESCE(stopping_at, ?2) ELSE stopping_at END
+                 WHERE run_id = ?4 AND generation = ?5 AND execution_state <> 'terminal'",
+                params![state.as_str(), now, scope_unit, run_id.to_string(), generation as i64],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    async fn finish_mission_run(
+        &self,
+        run_id: Uuid,
+        generation: u64,
+        terminal_reason: Option<&str>,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let now = now_string();
+        let terminal_reason = terminal_reason.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE mission_runs SET execution_state = 'terminal', heartbeat_at = ?1,
+                    ended_at = ?1, terminal_reason = ?2
+                 WHERE run_id = ?3 AND generation = ?4 AND execution_state <> 'terminal'",
+                params![now, terminal_reason, run_id.to_string(), generation as i64],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    async fn register_tool_execution(
+        &self,
+        execution: &MissionToolExecution,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let execution = execution.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO mission_tool_executions (tool_call_id, run_id, tool_kind, state, started_at, heartbeat_at, deadline_at, process_pid, durable_job_id, completed_at, exit_status, failure_class)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(run_id, tool_call_id) DO UPDATE SET
+                    tool_kind = excluded.tool_kind, state = excluded.state,
+                    heartbeat_at = excluded.heartbeat_at, deadline_at = excluded.deadline_at,
+                    process_pid = COALESCE(excluded.process_pid, process_pid),
+                    durable_job_id = COALESCE(excluded.durable_job_id, durable_job_id)",
+                params![
+                    execution.tool_call_id,
+                    execution.run_id.to_string(),
+                    execution.tool_kind,
+                    execution.state.as_str(),
+                    execution.started_at,
+                    execution.heartbeat_at,
+                    execution.deadline_at,
+                    execution.process_pid.map(i64::from),
+                    execution.durable_job_id.map(|id| id.to_string()),
+                    execution.completed_at,
+                    execution.exit_status,
+                    execution.failure_class,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    async fn finish_tool_execution(
+        &self,
+        run_id: Uuid,
+        tool_call_id: &str,
+        state: MissionToolExecutionState,
+        exit_status: Option<i32>,
+        failure_class: Option<&str>,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let tool_call_id = tool_call_id.to_string();
+        let failure_class = failure_class.map(str::to_string);
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE mission_tool_executions SET state = ?1, heartbeat_at = ?2,
+                    completed_at = ?2, exit_status = ?3, failure_class = ?4
+                 WHERE run_id = ?5 AND tool_call_id = ?6",
+                params![
+                    state.as_str(),
+                    now,
+                    exit_status,
+                    failure_class,
+                    run_id.to_string(),
+                    tool_call_id
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    async fn list_active_tool_executions(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<MissionToolExecution>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT tool_call_id, run_id, tool_kind, state, started_at, heartbeat_at, deadline_at, process_pid, durable_job_id, completed_at, exit_status, failure_class
+                     FROM mission_tool_executions WHERE run_id = ?1 AND state IN ('provisional', 'running') ORDER BY started_at ASC",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![run_id.to_string()], parse_tool_execution_row)
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
     async fn get_initial_user_message(&self, id: Uuid) -> Result<Option<String>, String> {
         let conn = self.conn.clone();
         let id_str = id.to_string();
@@ -3099,6 +3519,21 @@ impl MissionStore for SqliteMissionStore {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
+            if status == MissionStatus::Acknowledged {
+                let active_run = conn
+                    .query_row(
+                        "SELECT run_id FROM mission_runs WHERE mission_id = ?1 AND execution_state <> 'terminal' LIMIT 1",
+                        params![id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                if let Some(run_id) = active_run {
+                    return Err(format!(
+                        "mission {id} cannot be acknowledged while run {run_id} is non-terminal"
+                    ));
+                }
+            }
             // Read the old status before the UPDATE so we can decide whether
             // to invalidate the Paloma cooldown. Wiping cooldown on a
             // no-op status write (e.g. heartbeat that re-sets Active=Active)
@@ -3221,7 +3656,11 @@ impl MissionStore for SqliteMissionStore {
                         "SELECT id FROM missions
                          WHERE status = 'awaiting_user'
                            AND first_viewed_at IS NOT NULL
-                           AND first_viewed_at <= ?1",
+                           AND first_viewed_at <= ?1
+                           AND NOT EXISTS (
+                               SELECT 1 FROM mission_runs r
+                               WHERE r.mission_id = missions.id AND r.execution_state <> 'terminal'
+                           )",
                     )
                     .map_err(|e| e.to_string())?;
                 let rows = stmt
@@ -3239,7 +3678,11 @@ impl MissionStore for SqliteMissionStore {
                     "UPDATE missions SET status = 'acknowledged', updated_at = ?1
                      WHERE status = 'awaiting_user'
                        AND first_viewed_at IS NOT NULL
-                       AND first_viewed_at <= ?2",
+                       AND first_viewed_at <= ?2
+                       AND NOT EXISTS (
+                           SELECT 1 FROM mission_runs r
+                           WHERE r.mission_id = missions.id AND r.execution_state <> 'terminal'
+                       )",
                     params![&now, &cutoff],
                 )
                 .map_err(|e| e.to_string())?;
@@ -10060,7 +10503,10 @@ impl MissionStore for SqliteMissionStore {
                         conn.execute(
                             "UPDATE board_tasks SET title = ?1, prompt = ?2, backend = ?3, \
                              model_override = ?4, model_effort = ?5, working_directory = ?6, \
-                             repository = ?7, branch = ?8, depends_on = ?9, updated_at = ?10 WHERE id = ?11",
+                             repository = ?7, branch = ?8, role = ?9, acceptance_criteria = ?10, \
+                             verification_command = ?11, design_domain = ?12, declared_write_set = ?13, \
+                             risk_class = ?14, token_budget = ?15, cost_budget_cents = ?16, \
+                             depends_on = ?17, updated_at = ?18 WHERE id = ?19",
                             params![
                                 t.title,
                                 t.prompt,
@@ -10070,6 +10516,14 @@ impl MissionStore for SqliteMissionStore {
                                 t.working_directory,
                                 t.repository,
                                 t.branch,
+                                t.role.to_string(),
+                                serde_json::to_string(&t.acceptance_criteria).unwrap_or_else(|_| "[]".into()),
+                                t.verification_command,
+                                t.design_domain,
+                                serde_json::to_string(&t.declared_write_set).unwrap_or_else(|_| "[]".into()),
+                                t.risk_class,
+                                t.token_budget.map(|value| value as i64),
+                                t.cost_budget_cents,
                                 depends_on_json,
                                 now,
                                 id,
@@ -10083,9 +10537,11 @@ impl MissionStore for SqliteMissionStore {
                         let id = Uuid::new_v4().to_string();
                         conn.execute(
                             "INSERT INTO board_tasks (id, boss_mission_id, task_key, title, prompt, \
-                             backend, model_override, model_effort, working_directory, repository, branch, depends_on, \
-                             status, attempts, created_at, updated_at) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'pending', 0, ?13, ?13)",
+                             backend, model_override, model_effort, working_directory, repository, branch, \
+                             role, acceptance_criteria, verification_command, design_domain, declared_write_set, \
+                             risk_class, token_budget, cost_budget_cents, depends_on, status, attempts, created_at, updated_at) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                             ?15, ?16, ?17, ?18, ?19, ?20, 'pending', 0, ?21, ?21)",
                             params![
                                 id,
                                 boss_mission_id.to_string(),
@@ -10098,6 +10554,14 @@ impl MissionStore for SqliteMissionStore {
                                 t.working_directory,
                                 t.repository,
                                 t.branch,
+                                t.role.to_string(),
+                                serde_json::to_string(&t.acceptance_criteria).unwrap_or_else(|_| "[]".into()),
+                                t.verification_command,
+                                t.design_domain,
+                                serde_json::to_string(&t.declared_write_set).unwrap_or_else(|_| "[]".into()),
+                                t.risk_class,
+                                t.token_budget.map(|value| value as i64),
+                                t.cost_budget_cents,
                                 depends_on_json,
                                 now,
                             ],
@@ -10217,9 +10681,12 @@ impl MissionStore for SqliteMissionStore {
                 .execute(
                     "UPDATE board_tasks SET task_key = ?1, title = ?2, prompt = ?3, backend = ?4, \
                      model_override = ?5, model_effort = ?6, working_directory = ?7, repository = ?8, \
-                     branch = ?9, depends_on = ?10, status = ?11, outcome = ?12, worker_mission_id = ?13, \
-                     prior_worker_mission_id = ?14, prior_outcome = ?15, prior_result_digest = ?16, \
-                     attempts = ?17, result_digest = ?18, notes = ?19, updated_at = ?20 WHERE id = ?21",
+                     branch = ?9, role = ?10, acceptance_criteria = ?11, verification_command = ?12, \
+                     design_domain = ?13, declared_write_set = ?14, risk_class = ?15, token_budget = ?16, \
+                     cost_budget_cents = ?17, depends_on = ?18, status = ?19, outcome = ?20, \
+                     worker_mission_id = ?21, prior_worker_mission_id = ?22, prior_outcome = ?23, \
+                     prior_result_digest = ?24, attempts = ?25, result_digest = ?26, notes = ?27, \
+                     updated_at = ?28 WHERE id = ?29",
                     params![
                         t.task_key,
                         t.title,
@@ -10230,6 +10697,14 @@ impl MissionStore for SqliteMissionStore {
                         t.working_directory,
                         t.repository,
                         t.branch,
+                        t.role.to_string(),
+                        serde_json::to_string(&t.acceptance_criteria).unwrap_or_else(|_| "[]".into()),
+                        t.verification_command,
+                        t.design_domain,
+                        serde_json::to_string(&t.declared_write_set).unwrap_or_else(|_| "[]".into()),
+                        t.risk_class,
+                        t.token_budget.map(|value| value as i64),
+                        t.cost_budget_cents,
                         depends_on_json,
                         t.status.to_string(),
                         t.outcome.map(|o| o.to_string()),
@@ -10253,25 +10728,201 @@ impl MissionStore for SqliteMissionStore {
         .await
         .map_err(|e| format!("Task join error: {e}"))?
     }
+
+    async fn upsert_board_project(&self, project: BoardProject) -> Result<BoardProject, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let now = now_string();
+            let budget = serde_json::to_string(&project.budget_policy)
+                .map_err(|error| format!("Failed to serialize project budget: {error}"))?;
+            conn.execute(
+                "INSERT INTO board_projects (slug, repository, workspace_id, specification_path, \
+                 specification_revision, compute_policy, budget_policy, active_controller_lease, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9) \
+                 ON CONFLICT(slug) DO UPDATE SET repository = excluded.repository, workspace_id = excluded.workspace_id, \
+                 specification_path = excluded.specification_path, specification_revision = excluded.specification_revision, \
+                 compute_policy = excluded.compute_policy, budget_policy = excluded.budget_policy, \
+                 active_controller_lease = excluded.active_controller_lease, updated_at = excluded.updated_at",
+                params![
+                    project.slug,
+                    project.repository,
+                    project.workspace_id.to_string(),
+                    project.specification_path,
+                    project.specification_revision,
+                    project.compute_policy,
+                    budget,
+                    project.active_controller_lease,
+                    now,
+                ],
+            )
+            .map_err(|error| format!("Failed to upsert project: {error}"))?;
+            parse_board_project(
+                &conn,
+                &project.slug,
+            )
+            .map_err(|error| format!("Failed to read project: {error}"))?
+            .ok_or_else(|| "Project disappeared after upsert".to_string())
+        })
+        .await
+        .map_err(|error| format!("Task join error: {error}"))?
+    }
+
+    async fn get_board_project(&self, slug: &str) -> Result<Option<BoardProject>, String> {
+        let conn = self.conn.clone();
+        let slug = slug.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            parse_board_project(&conn, &slug).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("Task join error: {error}"))?
+    }
+
+    async fn create_task_attempt(&self, attempt: TaskAttempt) -> Result<TaskAttempt, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO task_attempts (id, task_id, attempt_number, mission_id, backend, model, role, \
+                 run_id, commit_sha, changed_files, verification_evidence, cost_cents, terminal_class, started_at, finished_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+                 ON CONFLICT(task_id, attempt_number) DO NOTHING",
+                params![
+                    attempt.id.to_string(), attempt.task_id.to_string(), attempt.attempt_number as i64,
+                    attempt.mission_id.to_string(), attempt.backend, attempt.model,
+                    attempt.role.to_string(), attempt.run_id.map(|id| id.to_string()), attempt.commit_sha,
+                    serde_json::to_string(&attempt.changed_files).unwrap_or_else(|_| "[]".into()),
+                    attempt.verification_evidence.to_string(), attempt.cost_cents,
+                    attempt.terminal_class, attempt.started_at, attempt.finished_at,
+                ],
+            ).map_err(|error| format!("Failed to create task attempt: {error}"))?;
+            conn.query_row(
+                "SELECT id, task_id, attempt_number, mission_id, backend, model, role, run_id, commit_sha, \
+                 changed_files, verification_evidence, cost_cents, terminal_class, started_at, finished_at \
+                 FROM task_attempts WHERE task_id = ?1 AND attempt_number = ?2",
+                params![attempt.task_id.to_string(), attempt.attempt_number as i64],
+                parse_task_attempt_row,
+            ).map_err(|error| format!("Failed to read task attempt: {error}"))
+        }).await.map_err(|error| format!("Task join error: {error}"))?
+    }
+
+    async fn finish_task_attempt(
+        &self,
+        task_id: Uuid,
+        attempt_number: u32,
+        terminal_class: &str,
+        commit_sha: Option<&str>,
+        changed_files: &[String],
+        verification_evidence: &serde_json::Value,
+        cost_cents: Option<i64>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let terminal_class = terminal_class.to_string();
+        let commit_sha = commit_sha.map(str::to_string);
+        let changed_files = serde_json::to_string(changed_files).map_err(|e| e.to_string())?;
+        let verification_evidence = verification_evidence.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let updated = conn.execute(
+                "UPDATE task_attempts SET terminal_class = ?1, commit_sha = ?2, changed_files = ?3, \
+                 verification_evidence = ?4, cost_cents = ?5, finished_at = ?6 \
+                 WHERE task_id = ?7 AND attempt_number = ?8",
+                params![terminal_class, commit_sha, changed_files, verification_evidence, cost_cents,
+                    now_string(), task_id.to_string(), attempt_number as i64],
+            ).map_err(|error| format!("Failed to finish task attempt: {error}"))?;
+            (updated > 0).then_some(()).ok_or_else(|| "Task attempt not found".to_string())
+        }).await.map_err(|error| format!("Task join error: {error}"))?
+    }
+
+    async fn list_task_attempts(&self, task_id: Uuid) -> Result<Vec<TaskAttempt>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut statement = conn.prepare(
+                "SELECT id, task_id, attempt_number, mission_id, backend, model, role, run_id, commit_sha, \
+                 changed_files, verification_evidence, cost_cents, terminal_class, started_at, finished_at \
+                 FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number"
+            ).map_err(|error| error.to_string())?;
+            let rows = statement.query_map(params![task_id.to_string()], parse_task_attempt_row)
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+            Ok(rows)
+        }).await.map_err(|error| format!("Task join error: {error}"))?
+    }
+
+    async fn enqueue_board_outbox(&self, item: BoardOutboxItem) -> Result<BoardOutboxItem, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO board_outbox (id, boss_mission_id, task_id, delivery_kind, idempotency_key, \
+                 payload, state, attempts, created_at, acknowledged_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(idempotency_key) DO NOTHING",
+                params![item.id.to_string(), item.boss_mission_id.to_string(), item.task_id.map(|id| id.to_string()),
+                    item.delivery_kind, item.idempotency_key, item.payload.to_string(), item.state,
+                    item.attempts as i64, item.created_at, item.acknowledged_at],
+            ).map_err(|error| format!("Failed to enqueue board delivery: {error}"))?;
+            conn.query_row(
+                "SELECT id, boss_mission_id, task_id, delivery_kind, idempotency_key, payload, state, attempts, \
+                 created_at, acknowledged_at FROM board_outbox WHERE idempotency_key = ?1",
+                params![item.idempotency_key], parse_board_outbox_row,
+            ).map_err(|error| format!("Failed to read board delivery: {error}"))
+        }).await.map_err(|error| format!("Task join error: {error}"))?
+    }
+
+    async fn acknowledge_board_outbox(&self, idempotency_key: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let key = idempotency_key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE board_outbox SET state = 'acknowledged', acknowledged_at = ?1 WHERE idempotency_key = ?2",
+                params![now_string(), key],
+            ).map(|_| ()).map_err(|error| error.to_string())
+        }).await.map_err(|error| format!("Task join error: {error}"))?
+    }
+
+    async fn list_pending_board_outbox(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<BoardOutboxItem>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut statement = conn.prepare(
+                "SELECT id, boss_mission_id, task_id, delivery_kind, idempotency_key, payload, state, attempts, \
+                 created_at, acknowledged_at FROM board_outbox WHERE state != 'acknowledged' ORDER BY created_at LIMIT ?1"
+            ).map_err(|error| error.to_string())?;
+            let rows = statement.query_map(params![limit.min(1000) as i64], parse_board_outbox_row)
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+            Ok(rows)
+        }).await.map_err(|error| format!("Task join error: {error}"))?
+    }
 }
 
 /// Column list shared by every board task SELECT so `parse_board_task_row`
 /// indices stay in sync.
 const BOARD_TASK_COLUMNS: &str = "id, boss_mission_id, task_key, title, prompt, backend, \
-    model_override, model_effort, working_directory, repository, branch, depends_on, status, outcome, \
-    worker_mission_id, prior_worker_mission_id, prior_outcome, prior_result_digest, attempts, \
-    result_digest, notes, created_at, updated_at";
+    model_override, model_effort, working_directory, repository, branch, role, acceptance_criteria, \
+    verification_command, design_domain, declared_write_set, risk_class, token_budget, cost_budget_cents, \
+    depends_on, status, outcome, worker_mission_id, prior_worker_mission_id, prior_outcome, \
+    prior_result_digest, attempts, result_digest, notes, created_at, updated_at";
 
 fn parse_board_task_row(row: &rusqlite::Row<'_>) -> Result<BoardTask, rusqlite::Error> {
     let id: String = row.get(0)?;
     let boss_mission_id: String = row.get(1)?;
-    let depends_on_json: String = row.get(11)?;
-    let status_str: String = row.get(12)?;
-    let outcome_str: Option<String> = row.get(13)?;
-    let worker_mission_id: Option<String> = row.get(14)?;
-    let prior_worker_mission_id: Option<String> = row.get(15)?;
-    let prior_outcome: Option<String> = row.get(16)?;
-    let attempts: i64 = row.get(18)?;
+    let acceptance_criteria: String = row.get(12)?;
+    let declared_write_set: String = row.get(15)?;
+    let token_budget: Option<i64> = row.get(17)?;
+    let depends_on_json: String = row.get(19)?;
+    let status_str: String = row.get(20)?;
+    let outcome_str: Option<String> = row.get(21)?;
+    let worker_mission_id: Option<String> = row.get(22)?;
+    let prior_worker_mission_id: Option<String> = row.get(23)?;
+    let prior_outcome: Option<String> = row.get(24)?;
+    let attempts: i64 = row.get(26)?;
     Ok(BoardTask {
         id: Uuid::parse_str(&id)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
@@ -10286,18 +10937,103 @@ fn parse_board_task_row(row: &rusqlite::Row<'_>) -> Result<BoardTask, rusqlite::
         working_directory: row.get(8)?,
         repository: row.get(9)?,
         branch: row.get(10)?,
+        role: BoardTaskRole::parse(&row.get::<_, String>(11)?),
+        acceptance_criteria: serde_json::from_str(&acceptance_criteria).unwrap_or_default(),
+        verification_command: row.get(13)?,
+        design_domain: row.get(14)?,
+        declared_write_set: serde_json::from_str(&declared_write_set).unwrap_or_default(),
+        risk_class: row.get(16)?,
+        token_budget: token_budget.map(|value| value.max(0) as u64),
+        cost_budget_cents: row.get(18)?,
         depends_on: serde_json::from_str(&depends_on_json).unwrap_or_default(),
         status: BoardTaskStatus::parse(&status_str).unwrap_or(BoardTaskStatus::Pending),
         outcome: outcome_str.as_deref().and_then(BoardTaskOutcome::parse),
         worker_mission_id: worker_mission_id.and_then(|s| Uuid::parse_str(&s).ok()),
         prior_worker_mission_id: prior_worker_mission_id.and_then(|s| Uuid::parse_str(&s).ok()),
         prior_outcome: prior_outcome.as_deref().and_then(BoardTaskOutcome::parse),
-        prior_result_digest: row.get(17)?,
+        prior_result_digest: row.get(25)?,
         attempts: attempts as u32,
-        result_digest: row.get(19)?,
-        notes: row.get(20)?,
-        created_at: row.get(21)?,
-        updated_at: row.get(22)?,
+        result_digest: row.get(27)?,
+        notes: row.get(28)?,
+        created_at: row.get(29)?,
+        updated_at: row.get(30)?,
+    })
+}
+
+fn parse_board_project(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Option<BoardProject>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT slug, repository, workspace_id, specification_path, specification_revision, \
+         compute_policy, budget_policy, active_controller_lease, created_at, updated_at \
+         FROM board_projects WHERE slug = ?1",
+        params![slug],
+        |row| {
+            let workspace_id: String = row.get(2)?;
+            let budget_policy: String = row.get(6)?;
+            Ok(BoardProject {
+                slug: row.get(0)?,
+                repository: row.get(1)?,
+                workspace_id: Uuid::parse_str(&workspace_id).unwrap_or_default(),
+                specification_path: row.get(3)?,
+                specification_revision: row.get(4)?,
+                compute_policy: row.get(5)?,
+                budget_policy: serde_json::from_str(&budget_policy).unwrap_or_default(),
+                active_controller_lease: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn parse_task_attempt_row(row: &rusqlite::Row<'_>) -> Result<TaskAttempt, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let task_id: String = row.get(1)?;
+    let attempt_number: i64 = row.get(2)?;
+    let mission_id: String = row.get(3)?;
+    let role: String = row.get(6)?;
+    let run_id: Option<String> = row.get(7)?;
+    let changed_files: String = row.get(9)?;
+    let evidence: String = row.get(10)?;
+    Ok(TaskAttempt {
+        id: Uuid::parse_str(&id).unwrap_or_default(),
+        task_id: Uuid::parse_str(&task_id).unwrap_or_default(),
+        attempt_number: attempt_number.max(0) as u32,
+        mission_id: Uuid::parse_str(&mission_id).unwrap_or_default(),
+        backend: row.get(4)?,
+        model: row.get(5)?,
+        role: BoardTaskRole::parse(&role),
+        run_id: run_id.and_then(|value| Uuid::parse_str(&value).ok()),
+        commit_sha: row.get(8)?,
+        changed_files: serde_json::from_str(&changed_files).unwrap_or_default(),
+        verification_evidence: serde_json::from_str(&evidence).unwrap_or_default(),
+        cost_cents: row.get(11)?,
+        terminal_class: row.get(12)?,
+        started_at: row.get(13)?,
+        finished_at: row.get(14)?,
+    })
+}
+
+fn parse_board_outbox_row(row: &rusqlite::Row<'_>) -> Result<BoardOutboxItem, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let boss_mission_id: String = row.get(1)?;
+    let task_id: Option<String> = row.get(2)?;
+    let payload: String = row.get(5)?;
+    let attempts: i64 = row.get(7)?;
+    Ok(BoardOutboxItem {
+        id: Uuid::parse_str(&id).unwrap_or_default(),
+        boss_mission_id: Uuid::parse_str(&boss_mission_id).unwrap_or_default(),
+        task_id: task_id.and_then(|value| Uuid::parse_str(&value).ok()),
+        delivery_kind: row.get(3)?,
+        idempotency_key: row.get(4)?,
+        payload: serde_json::from_str(&payload).unwrap_or_default(),
+        state: row.get(6)?,
+        attempts: attempts.max(0) as u32,
+        created_at: row.get(8)?,
+        acknowledged_at: row.get(9)?,
     })
 }
 
@@ -10832,9 +11568,10 @@ mod tests {
     use crate::api::control::AgentEvent;
     use crate::api::mission_store::{
         now_string, Automation, AutomationDriver, AwaitingKind, CommandSource, FreshSession,
-        MissionMode, MissionProjectPatch, MissionStatus, MissionStore, PalomaCooldownState,
-        PalomaDecision, PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig,
-        StopPolicy, TelegramAlert, TelegramAlertPreference, TelegramChannel, TelegramConversation,
+        MissionExecutionState, MissionMode, MissionProjectPatch, MissionStatus, MissionStore,
+        MissionToolExecution, MissionToolExecutionState, PalomaCooldownState, PalomaDecision,
+        PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig, StopPolicy,
+        TelegramAlert, TelegramAlertPreference, TelegramChannel, TelegramConversation,
         TelegramConversationMessage, TelegramConversationMessageDirection,
         TelegramMissionInterestLevel, TelegramMissionSubscription, TelegramStructuredMemoryEntry,
         TelegramStructuredMemoryKind, TelegramStructuredMemoryScope, TelegramTriggerMode,
@@ -14713,7 +15450,9 @@ mod tests {
 
     #[tokio::test]
     async fn board_tasks_roundtrip() {
-        use crate::api::mission_store::{BoardTaskOutcome, BoardTaskStatus, NewBoardTask};
+        use crate::api::mission_store::{
+            BoardTaskOutcome, BoardTaskRole, BoardTaskStatus, NewBoardTask,
+        };
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
             .await
@@ -14734,7 +15473,16 @@ mod tests {
             working_directory: Some("/workspaces/x/wt-1".to_string()),
             repository: Some("Th0rgal/sandboxed.sh".to_string()),
             branch: Some("agent/test".to_string()),
+            role: BoardTaskRole::Reviewer,
+            acceptance_criteria: vec!["tests pass".into()],
+            verification_command: Some("cargo test".into()),
+            design_domain: Some("mission-store".into()),
+            declared_write_set: vec!["src/api/mission_store".into()],
+            risk_class: "high".into(),
+            token_budget: Some(10_000),
+            cost_budget_cents: Some(250),
             depends_on: deps.into_iter().map(String::from).collect(),
+            ..Default::default()
         };
 
         let tasks = store
@@ -14746,6 +15494,10 @@ mod tests {
         assert_eq!(tasks[1].depends_on, vec!["t1".to_string()]);
         assert_eq!(tasks[0].repository.as_deref(), Some("Th0rgal/sandboxed.sh"));
         assert_eq!(tasks[0].branch.as_deref(), Some("agent/test"));
+        assert_eq!(tasks[0].role, BoardTaskRole::Reviewer);
+        assert_eq!(tasks[0].acceptance_criteria, vec!["tests pass"]);
+        assert_eq!(tasks[0].declared_write_set, vec!["src/api/mission_store"]);
+        assert_eq!(tasks[0].token_budget, Some(10_000));
 
         // Active boards includes our boss.
         let active = store.list_active_board_missions().await.expect("active");
@@ -14799,6 +15551,129 @@ mod tests {
             .expect("get")
             .expect("some");
         assert_eq!(fetched.task_key, "t2");
+    }
+
+    #[tokio::test]
+    async fn project_attempt_and_outbox_ledgers_are_idempotent() {
+        use crate::api::mission_store::{
+            BoardOutboxItem, BoardProject, BoardTaskRole, NewBoardTask, TaskAttempt,
+        };
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("store");
+        let boss = store
+            .create_mission(Some("boss"), None, None, None, None, None, None)
+            .await
+            .expect("boss");
+        let task = store
+            .upsert_board_tasks(
+                boss.id,
+                vec![NewBoardTask {
+                    task_key: "worker".into(),
+                    title: "worker".into(),
+                    prompt: "implement".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("task")
+            .remove(0);
+
+        let project = BoardProject {
+            slug: "beal".into(),
+            repository: "owner/beal".into(),
+            workspace_id: boss.workspace_id,
+            specification_path: "SPEC.md".into(),
+            specification_revision: "abc123".into(),
+            compute_policy: "remote_required".into(),
+            budget_policy: serde_json::json!({"cost_cents": 500}),
+            active_controller_lease: Some("controller-1".into()),
+            created_at: now_string(),
+            updated_at: now_string(),
+        };
+        store.upsert_board_project(project).await.expect("project");
+        assert_eq!(
+            store
+                .get_board_project("beal")
+                .await
+                .unwrap()
+                .unwrap()
+                .compute_policy,
+            "remote_required"
+        );
+
+        let attempt = TaskAttempt {
+            id: Uuid::new_v4(),
+            task_id: task.id,
+            attempt_number: 1,
+            mission_id: Uuid::new_v4(),
+            backend: "codex".into(),
+            model: Some("gpt-5.6-terra".into()),
+            role: BoardTaskRole::Worker,
+            run_id: None,
+            commit_sha: None,
+            changed_files: vec![],
+            verification_evidence: serde_json::json!({}),
+            cost_cents: None,
+            terminal_class: None,
+            started_at: now_string(),
+            finished_at: None,
+        };
+        store
+            .create_task_attempt(attempt.clone())
+            .await
+            .expect("attempt");
+        store
+            .create_task_attempt(attempt)
+            .await
+            .expect("idempotent attempt");
+        store
+            .finish_task_attempt(
+                task.id,
+                1,
+                "success",
+                Some("deadbeef"),
+                &["src/lib.rs".into()],
+                &serde_json::json!({"command": "cargo test", "passed": true}),
+                Some(42),
+            )
+            .await
+            .expect("finish");
+        let attempts = store.list_task_attempts(task.id).await.expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].commit_sha.as_deref(), Some("deadbeef"));
+
+        let delivery = BoardOutboxItem {
+            id: Uuid::new_v4(),
+            boss_mission_id: boss.id,
+            task_id: Some(task.id),
+            delivery_kind: "spawn".into(),
+            idempotency_key: "beal:worker:1:spawn".into(),
+            payload: serde_json::json!({"mission_id": attempts[0].mission_id}),
+            state: "pending".into(),
+            attempts: 0,
+            created_at: now_string(),
+            acknowledged_at: None,
+        };
+        store
+            .enqueue_board_outbox(delivery.clone())
+            .await
+            .expect("enqueue");
+        store
+            .enqueue_board_outbox(delivery)
+            .await
+            .expect("idempotent enqueue");
+        assert_eq!(store.list_pending_board_outbox(10).await.unwrap().len(), 1);
+        store
+            .acknowledge_board_outbox("beal:worker:1:spawn")
+            .await
+            .unwrap();
+        assert!(store
+            .list_pending_board_outbox(10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// FLEET-001: deferred goals round-trip and the scheduled-pending query
@@ -14929,5 +15804,133 @@ mod tests {
                 .as_deref(),
             Some("Fix, commit and push the original PR")
         );
+    }
+
+    #[tokio::test]
+    async fn mission_run_generations_exclude_ack_and_ignore_late_updates() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "run-test")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("leased"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        store
+            .update_mission_status(mission.id, MissionStatus::AwaitingUser)
+            .await
+            .unwrap();
+
+        let first = store
+            .begin_mission_run(mission.id, "actor-a", Some("mission-a.scope"))
+            .await
+            .expect("first generation");
+        assert_eq!(first.generation, 1);
+        assert!(store
+            .begin_mission_run(mission.id, "actor-b", None)
+            .await
+            .unwrap_err()
+            .contains("already has non-terminal run"));
+        assert!(store
+            .update_mission_status(mission.id, MissionStatus::Acknowledged)
+            .await
+            .unwrap_err()
+            .contains("cannot be acknowledged"));
+
+        assert!(store
+            .finish_mission_run(first.run_id, first.generation, Some("settled"))
+            .await
+            .unwrap());
+        store
+            .update_mission_status(mission.id, MissionStatus::Acknowledged)
+            .await
+            .unwrap();
+        assert!(store
+            .begin_mission_run(mission.id, "actor-b", None)
+            .await
+            .unwrap_err()
+            .contains("acknowledged mission"));
+        store
+            .update_mission_status(mission.id, MissionStatus::Interrupted)
+            .await
+            .unwrap();
+        let second = store
+            .begin_mission_run(mission.id, "actor-b", None)
+            .await
+            .expect("second generation");
+        assert_eq!(second.generation, 2);
+        assert!(!store
+            .heartbeat_mission_run(
+                first.run_id,
+                first.generation,
+                MissionExecutionState::Running,
+                None,
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .get_active_mission_run(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .run_id,
+            second.run_id
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_tool_execution_is_scoped_to_its_run() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "tool-test")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("tool"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let run = store
+            .begin_mission_run(mission.id, "actor", None)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let tool = MissionToolExecution {
+            tool_call_id: "call-1".to_string(),
+            run_id: run.run_id,
+            tool_kind: "Bash".to_string(),
+            state: MissionToolExecutionState::Provisional,
+            started_at: now.to_rfc3339(),
+            heartbeat_at: now.to_rfc3339(),
+            deadline_at: (now + chrono::Duration::seconds(120)).to_rfc3339(),
+            process_pid: None,
+            durable_job_id: None,
+            completed_at: None,
+            exit_status: None,
+            failure_class: None,
+        };
+        store.register_tool_execution(&tool).await.unwrap();
+        assert_eq!(
+            store
+                .list_active_tool_executions(run.run_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .finish_tool_execution(
+                run.run_id,
+                "call-1",
+                MissionToolExecutionState::Completed,
+                Some(0),
+                None,
+            )
+            .await
+            .unwrap());
+        assert!(store
+            .list_active_tool_executions(run.run_id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

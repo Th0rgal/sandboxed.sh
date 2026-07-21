@@ -59,7 +59,8 @@ use super::desktop;
 use super::library::SharedLibrary;
 use super::mission_store::{
     self, create_mission_store, now_string, AwaitingKind, BoardTask, BoardTaskStatus, Mission,
-    MissionHistoryEntry, MissionStore, MissionStoreType, NewBoardTask,
+    MissionExecutionState, MissionHistoryEntry, MissionRun, MissionStore, MissionStoreType,
+    MissionToolExecution, MissionToolExecutionState, NewBoardTask,
 };
 use super::routes::AppState;
 
@@ -110,6 +111,34 @@ fn parse_durable_job_result(result: &serde_json::Value) -> Option<serde_json::Va
     }
 
     visit(result, 0)
+}
+
+async fn acquire_execution_run(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Option<Uuid>,
+    owner_actor_id: &str,
+) -> Result<Option<MissionRun>, String> {
+    let Some(mission_id) = mission_id else {
+        return Ok(None);
+    };
+    let run = mission_store
+        .begin_mission_run(mission_id, owner_actor_id, None)
+        .await?;
+    if !mission_store
+        .heartbeat_mission_run(
+            run.run_id,
+            run.generation,
+            MissionExecutionState::Running,
+            None,
+        )
+        .await?
+    {
+        return Err(format!(
+            "run {} generation {} was superseded before execution",
+            run.run_id, run.generation
+        ));
+    }
+    Ok(Some(run))
 }
 
 /// One entry in the main control queue: (message id, content, optional per-message
@@ -2412,7 +2441,80 @@ async fn get_running_missions(
         .send(ControlCommand::ListRunning { respond: tx })
         .await
         .map_err(session_unavailable)?;
-    rx.await.map_err(recv_failed)
+    let actor_rows = rx.await.map_err(recv_failed)?;
+    let durable_runs = control
+        .mission_store
+        .list_active_mission_runs()
+        .await
+        .map_err(internal_error)?;
+    let mut actor_by_mission: HashMap<Uuid, super::mission_runner::RunningMissionInfo> = actor_rows
+        .into_iter()
+        .map(|row| (row.mission_id, row))
+        .collect();
+    let mut projected = Vec::with_capacity(durable_runs.len() + actor_by_mission.len());
+    for run in durable_runs {
+        let mission = control
+            .mission_store
+            .get_mission(run.mission_id)
+            .await
+            .map_err(internal_error)?;
+        let heartbeat_age = chrono::DateTime::parse_from_rfc3339(&run.heartbeat_at)
+            .ok()
+            .map(|timestamp| {
+                (chrono::Utc::now() - timestamp.with_timezone(&chrono::Utc))
+                    .num_seconds()
+                    .max(0) as u64
+            })
+            .unwrap_or(u64::MAX);
+        let presentation_conflict = mission.as_ref().and_then(|mission| {
+            (mission.status == MissionStatus::Acknowledged || mission.status.is_terminal())
+                .then(|| format!("status_{}_with_non_terminal_run", mission.status))
+        });
+        let mut row = actor_by_mission.remove(&run.mission_id).unwrap_or_else(|| {
+            super::mission_runner::RunningMissionInfo {
+                mission_id: run.mission_id,
+                state: run.execution_state.as_str().to_string(),
+                queue_len: 0,
+                history_len: 0,
+                seconds_since_activity: heartbeat_age,
+                tool_call_in_flight: run.execution_state == MissionExecutionState::WaitingTool,
+                health: super::mission_runner::MissionHealth::Reconciling {
+                    reason: "durable_run_without_registered_actor".to_string(),
+                },
+                expected_deliverables: 0,
+                current_activity: None,
+                subtask_total: 0,
+                subtask_completed: 0,
+                run_id: Some(run.run_id),
+                generation: Some(run.generation),
+                heartbeat_at: Some(run.heartbeat_at.clone()),
+                scope_unit: run.scope_unit.clone(),
+                status_conflict: Some("durable_run_without_registered_actor".to_string()),
+            }
+        });
+        row.state = run.execution_state.as_str().to_string();
+        row.run_id = Some(run.run_id);
+        row.generation = Some(run.generation);
+        row.heartbeat_at = Some(run.heartbeat_at.clone());
+        row.scope_unit = run.scope_unit.clone();
+        if let Some(conflict) = presentation_conflict {
+            row.status_conflict = Some(conflict.clone());
+            row.health = super::mission_runner::MissionHealth::Reconciling { reason: conflict };
+        } else if heartbeat_age > 60 && run.execution_state != MissionExecutionState::WaitingUser {
+            let reason = format!("run_heartbeat_stale_{heartbeat_age}s");
+            row.status_conflict = Some(reason.clone());
+            row.health = super::mission_runner::MissionHealth::Reconciling { reason };
+        }
+        projected.push(row);
+    }
+    for (_, mut row) in actor_by_mission {
+        row.status_conflict = Some("registered_actor_without_durable_run".to_string());
+        row.health = super::mission_runner::MissionHealth::Reconciling {
+            reason: "registered_actor_without_durable_run".to_string(),
+        };
+        projected.push(row);
+    }
+    Ok(projected)
 }
 
 /// Look up an automation by ID, returning 404 if it does not exist.
@@ -4120,11 +4222,59 @@ pub struct ListMissionsQuery {
     pub workspace: Option<String>,
 }
 
+fn mission_execution_projection(run: &MissionRun, status: MissionStatus) -> serde_json::Value {
+    let heartbeat_age = chrono::DateTime::parse_from_rfc3339(&run.heartbeat_at)
+        .ok()
+        .map(|timestamp| {
+            (chrono::Utc::now() - timestamp.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64
+        })
+        .unwrap_or(u64::MAX);
+    let conflict = if status == MissionStatus::Acknowledged || status.is_terminal() {
+        Some(format!("status_{status}_with_non_terminal_run"))
+    } else if heartbeat_age > 60 && run.execution_state != MissionExecutionState::WaitingUser {
+        Some(format!("run_heartbeat_stale_{heartbeat_age}s"))
+    } else {
+        None
+    };
+    serde_json::json!({
+        "run_id": run.run_id,
+        "generation": run.generation,
+        "state": run.execution_state,
+        "health": if conflict.is_some() { "reconciling" } else { "healthy" },
+        "heartbeat_at": run.heartbeat_at,
+        "scope_unit": run.scope_unit,
+        "status_conflict": conflict,
+    })
+}
+
+fn attach_execution_to_mission_value(
+    mut value: serde_json::Value,
+    mission: &Mission,
+    run: Option<&MissionRun>,
+) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "execution".to_string(),
+            run.map(|run| mission_execution_projection(run, mission.status))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "acknowledged_at".to_string(),
+            (mission.status == MissionStatus::Acknowledged)
+                .then(|| serde_json::Value::String(mission.updated_at.clone()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    value
+}
+
 pub async fn list_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Query(query): Query<ListMissionsQuery>,
-) -> Result<Json<Vec<Mission>>, (StatusCode, String)> {
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     // Default to the most recent 50; honor an explicit limit so callers (e.g.
     // the assistant MCP) can request more, capped to keep the response bounded.
@@ -4207,7 +4357,22 @@ pub async fn list_missions(
     };
 
     populate_activity(&control, &mut missions).await;
-    Ok(Json(missions))
+    let active_runs: HashMap<Uuid, MissionRun> = control
+        .mission_store
+        .list_active_mission_runs()
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|run| (run.mission_id, run))
+        .collect();
+    let values = missions
+        .into_iter()
+        .map(|mission| {
+            let value = serde_json::to_value(&mission).unwrap_or(serde_json::Value::Null);
+            attach_execution_to_mission_value(value, &mission, active_runs.get(&mission.id))
+        })
+        .collect();
+    Ok(Json(values))
 }
 
 /// Targeted post-deploy/observability health for the mission fleet (P#8). One
@@ -4861,7 +5026,16 @@ pub async fn get_mission(
 
             // Serialize then attach the computed spark_offload block so Paloma
             // can route heavy builds without probing the host each time.
-            let mut value = serde_json::to_value(&mission).map_err(internal_error)?;
+            let active_run = control
+                .mission_store
+                .get_active_mission_run(mission.id)
+                .await
+                .map_err(internal_error)?;
+            let mut value = attach_execution_to_mission_value(
+                serde_json::to_value(&mission).map_err(internal_error)?,
+                &mission,
+                active_run.as_ref(),
+            );
             let host_configured =
                 state.config.spark_arbiter_url.is_some() || state.config.spark_ssh_target.is_some();
             let enabled = workspace
@@ -4953,6 +5127,13 @@ pub async fn get_mission_digest(
             }
         }
     }
+    let execution = control
+        .mission_store
+        .get_active_mission_run(mission.id)
+        .await
+        .map_err(internal_error)?
+        .as_ref()
+        .map(|run| mission_execution_projection(run, mission.status));
 
     Ok(Json(serde_json::json!({
         "id": mission.id,
@@ -4969,6 +5150,8 @@ pub async fn get_mission_digest(
         "project": mission.project,
         "created_at": mission.created_at,
         "updated_at": mission.updated_at,
+        "acknowledged_at": (mission.status == MissionStatus::Acknowledged).then_some(mission.updated_at.clone()),
+        "execution": execution,
         "history_len": mission.history.len(),
         "last_user_message": last_user,
         "last_assistant_message": last_assistant,
@@ -8593,6 +8776,7 @@ fn event_visibility(event_type: &str) -> &'static str {
 #[derive(Debug, Serialize)]
 pub struct MissionSnapshotResponse {
     pub mission: Mission,
+    pub execution: Option<serde_json::Value>,
     pub events: Vec<mission_store::StoredEvent>,
     pub event_counts: HashMap<String, usize>,
     pub counts: HashMap<String, usize>,
@@ -8749,9 +8933,17 @@ pub async fn get_mission_snapshot(
         .await?
         .into_iter()
         .find(|info| info.mission_id == mission_id);
+    let execution = control
+        .mission_store
+        .get_active_mission_run(mission_id)
+        .await
+        .map_err(internal_error)?
+        .as_ref()
+        .map(|run| mission_execution_projection(run, mission.status));
 
     Ok(Json(MissionSnapshotResponse {
         mission,
+        execution,
         events: summary.events,
         counts: event_counts.clone(),
         event_counts,
@@ -12551,6 +12743,31 @@ async fn control_actor_loop(
     // here from the `ToolResult` event arm; read by the auto-resume watcher.
     background_tasks: super::mission_runner::BackgroundTaskRegistry,
 ) {
+    // A process-local actor cannot reattach a harness JoinHandle after restart.
+    // Close any inherited execution lease before accepting new work; durable
+    // workspace/remote jobs remain independently recoverable by job id.
+    if let Ok(inherited_runs) = mission_store.list_active_mission_runs().await {
+        for run in inherited_runs {
+            let _ = mission_store
+                .finish_mission_run(
+                    run.run_id,
+                    run.generation,
+                    Some("actor_restart_process_ownership_unrecoverable"),
+                )
+                .await;
+            if let Ok(Some(mission)) = mission_store.get_mission(run.mission_id).await {
+                if mission.status == MissionStatus::Active {
+                    let _ = mission_store
+                        .update_mission_status_with_reason(
+                            run.mission_id,
+                            MissionStatus::Interrupted,
+                            Some("actor_restart_process_ownership_unrecoverable"),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
     let mut queue: VecDeque<ControlQueueEntry> = VecDeque::new();
@@ -12610,6 +12827,9 @@ async fn control_actor_loop(
     // Track which mission the main `running` task is actually working on.
     // This is different from `current_mission` which can change when user creates a new mission.
     let mut running_mission_id: Option<Uuid> = None;
+    let mut running_run: Option<MissionRun> = None;
+    let mut execution_heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+    execution_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Track last activity for the main runner (for stall detection)
     let mut main_runner_last_activity: std::time::Instant = std::time::Instant::now();
     // Track current activity label for the main runner
@@ -12900,6 +13120,107 @@ async fn control_actor_loop(
         )
         .await;
         tokio::select! {
+            _ = execution_heartbeat.tick() => {
+                let mut leases = Vec::new();
+                if let Some(run) = running_run.clone() {
+                    let state = if main_runner_active_tool_calls
+                        .load(std::sync::atomic::Ordering::Relaxed) > 0
+                    {
+                        MissionExecutionState::WaitingTool
+                    } else {
+                        MissionExecutionState::Running
+                    };
+                    leases.push((run, state, main_runner_last_activity.elapsed().as_secs()));
+                }
+                leases.extend(parallel_runners.values().filter_map(|runner| {
+                    runner.durable_run.clone().map(|run| {
+                        let state = if runner.active_tool_calls
+                            .load(std::sync::atomic::Ordering::Relaxed) > 0
+                        {
+                            MissionExecutionState::WaitingTool
+                        } else {
+                            MissionExecutionState::Running
+                        };
+                        (run, state, runner.last_activity.elapsed().as_secs())
+                    })
+                }));
+                for (run, state, idle_secs) in leases {
+                    match mission_store
+                        .heartbeat_mission_run(run.run_id, run.generation, state, None)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            generation = run.generation,
+                            "Ignored heartbeat for stale mission run generation"
+                        ),
+                        Err(error) => tracing::warn!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            "Failed to persist mission run heartbeat: {error}"
+                        ),
+                    }
+                    let mut live_registered_tools = 0usize;
+                    if let Ok(tools) = mission_store
+                        .list_active_tool_executions(run.run_id)
+                        .await
+                    {
+                        for tool in tools {
+                            let expired = chrono::DateTime::parse_from_rfc3339(
+                                &tool.deadline_at,
+                            )
+                            .map(|deadline| {
+                                deadline.with_timezone(&chrono::Utc) <= chrono::Utc::now()
+                            })
+                            .unwrap_or(true);
+                            if expired && tool.state == MissionToolExecutionState::Provisional {
+                                let _ = mission_store
+                                    .finish_tool_execution(
+                                        run.run_id,
+                                        &tool.tool_call_id,
+                                        MissionToolExecutionState::Stale,
+                                        None,
+                                        Some("unmatched_tool_call_deadline"),
+                                    )
+                                    .await;
+                            } else {
+                                live_registered_tools += 1;
+                            }
+                        }
+                    }
+                    if idle_secs >= 15 * 60
+                        && state != MissionExecutionState::WaitingUser
+                        && live_registered_tools == 0
+                    {
+                        tracing::warn!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            idle_secs,
+                            "Interrupting mission after 15 minutes without registered liveness evidence"
+                        );
+                        let _ = mission_store
+                            .heartbeat_mission_run(
+                                run.run_id,
+                                run.generation,
+                                MissionExecutionState::Stopping,
+                                None,
+                            )
+                            .await;
+                        if running_mission_id == Some(run.mission_id) {
+                            if let Some(token) = &running_cancel {
+                                token.cancel();
+                                runner_force_clear_deadline = Some(
+                                    tokio::time::Instant::now() + RUNNER_FORCE_CLEAR_GRACE,
+                                );
+                            }
+                        } else if let Some(runner) = parallel_runners.get_mut(&run.mission_id) {
+                            runner.cancel();
+                        }
+                    }
+                }
+            }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
@@ -13162,6 +13483,21 @@ async fn control_actor_loop(
                                     }
                                     // Try to start if not already running
                                     if !runner.is_running() {
+                                        if let Err(error) = runner
+                                            .acquire_durable_run(
+                                                &mission_store,
+                                                &format!("control:{session_user_id}"),
+                                            )
+                                            .await
+                                        {
+                                            let _ = events_tx.send(AgentEvent::Error {
+                                                message: format!("Mission run lease rejected: {error}"),
+                                                mission_id: Some(tid),
+                                                resumable: true,
+                                            });
+                                            let _ = respond.send(UserMessageAck::Rejected(error));
+                                            continue;
+                                        }
                                         runner.start_next(
                                             config.clone(),
                                             Arc::clone(&root_agent),
@@ -13363,6 +13699,21 @@ async fn control_actor_loop(
                                                 source: source.clone(),
                                             });
                                             // Start execution
+                                            if let Err(error) = runner
+                                                .acquire_durable_run(
+                                                    &mission_store,
+                                                    &format!("control:{session_user_id}"),
+                                                )
+                                                .await
+                                            {
+                                                let _ = events_tx.send(AgentEvent::Error {
+                                                    message: format!("Mission run lease rejected: {error}"),
+                                                    mission_id: Some(tid),
+                                                    resumable: true,
+                                                });
+                                                let _ = respond.send(UserMessageAck::Rejected(error));
+                                                continue;
+                                            }
                                             runner.start_next(
                                                 config.clone(),
                                                 Arc::clone(&root_agent),
@@ -13734,6 +14085,26 @@ async fn control_actor_loop(
                                 main_runner_active_tool_calls
                                     .store(0, std::sync::atomic::Ordering::Relaxed);
                                 let user_id_for_turn = session_user_id.clone();
+                                running_run = match acquire_execution_run(
+                                    &mission_store,
+                                    mission_id,
+                                    &format!("control:{session_user_id}"),
+                                )
+                                .await
+                                {
+                                    Ok(run) => run,
+                                    Err(error) => {
+                                        running_cancel = None;
+                                        running_mission_id = None;
+                                        let _ = respond.send(UserMessageAck::Rejected(error.clone()));
+                                        let _ = events_tx.send(AgentEvent::Error {
+                                            message: format!("Mission run lease rejected: {error}"),
+                                            mission_id,
+                                            resumable: true,
+                                        });
+                                        continue;
+                                    }
+                                };
                                 running = Some(tokio::spawn(async move {
                                     let result = run_single_control_turn(
                                         cfg,
@@ -13787,6 +14158,16 @@ async fn control_actor_loop(
                     ControlCommand::Cancel => {
                         if let Some(token) = &running_cancel {
                             token.cancel();
+                            if let Some(run) = running_run.as_ref() {
+                                let _ = mission_store
+                                    .heartbeat_mission_run(
+                                        run.run_id,
+                                        run.generation,
+                                        MissionExecutionState::Stopping,
+                                        None,
+                                    )
+                                    .await;
+                            }
                             // Don't send Error event here - the task will complete and send
                             // an AssistantMessage with the cancellation result when it finishes.
                             // Sending both causes duplicate UI messages.
@@ -14122,6 +14503,18 @@ async fn control_actor_loop(
                             runner.queue_message(Uuid::new_v4(), content, None, None);
 
                             // Start execution
+                            if let Err(error) = runner
+                                .acquire_durable_run(
+                                    &mission_store,
+                                    &format!("control:{session_user_id}"),
+                                )
+                                .await
+                            {
+                                let _ = respond.send(Err(format!(
+                                    "Failed to acquire mission run lease: {error}"
+                                )));
+                                continue;
+                            }
                             let started = runner.start_next(
                                 config.clone(),
                                 Arc::clone(&root_agent),
@@ -14225,7 +14618,20 @@ async fn control_actor_loop(
                                 // Cancel runner if running
                                 if let Some(runner) = parallel_runners.get_mut(&child.id) {
                                     runner.cancel();
-                                    parallel_runners.remove(&child.id);
+                                    if let Some(run) = runner.durable_run.as_ref() {
+                                        let _ = mission_store
+                                            .heartbeat_mission_run(
+                                                run.run_id,
+                                                run.generation,
+                                                MissionExecutionState::Stopping,
+                                                None,
+                                            )
+                                            .await;
+                                    }
+                                    // Keep the runner registered until its task
+                                    // actually exits; dropping the JoinHandle
+                                    // here would detach live work.
+                                    continue;
                                 }
                                 if let Err(e) = mission_store
                                     .update_mission_status(child.id, MissionStatus::Interrupted)
@@ -14246,41 +14652,21 @@ async fn control_actor_loop(
                         // First check parallel runners
                         if let Some(runner) = parallel_runners.get_mut(&mission_id) {
                             runner.cancel();
-                            // Update status to Interrupted so the mission can be
-                            // resumed later (fixes #149: cancel left status as pending).
-                            if let Err(e) = mission_store
-                                .update_mission_status(mission_id, MissionStatus::Interrupted)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to update cancelled parallel mission status: {}",
-                                    e
-                                );
-                            } else {
-                                maybe_schedule_mission_metadata_refresh_for_status(
-                                    &mission_store,
-                                    &events_tx,
-                                    mission_id,
-                                    MissionStatus::Interrupted,
-                                );
+                            if let Some(run) = runner.durable_run.as_ref() {
+                                let _ = mission_store
+                                    .heartbeat_mission_run(
+                                        run.run_id,
+                                        run.generation,
+                                        MissionExecutionState::Stopping,
+                                        None,
+                                    )
+                                    .await;
                             }
                             let _ = events_tx.send(AgentEvent::Error {
-                                message: format!("Parallel mission {} cancelled", mission_id),
+                                message: format!("Parallel mission {} cancellation requested", mission_id),
                                 mission_id: Some(mission_id),
                                 resumable: true, // Cancelled missions can be resumed
                             });
-                            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                mission_id,
-                                status: MissionStatus::Interrupted,
-                                summary: None,
-                            });
-                            parallel_runners.remove(&mission_id);
-                            close_mission_desktop_sessions(
-                                &mission_store,
-                                mission_id,
-                                &config.working_dir,
-                            )
-                            .await;
                             // Cascade cancel child missions
                             cancel_child_missions(mission_id, &mission_store, &mut parallel_runners, &events_tx, &config.working_dir).await;
                             let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
@@ -14292,6 +14678,16 @@ async fn control_actor_loop(
                                 // Cancel the current execution
                                 if let Some(token) = &running_cancel {
                                     token.cancel();
+                                    if let Some(run) = running_run.as_ref() {
+                                        let _ = mission_store
+                                            .heartbeat_mission_run(
+                                                run.run_id,
+                                                run.generation,
+                                                MissionExecutionState::Stopping,
+                                                None,
+                                            )
+                                            .await;
+                                    }
                                     // Arm the force-clear deadline. Most cancels
                                     // wind down within a few seconds via the
                                     // task's own observation of the cancel
@@ -14391,7 +14787,16 @@ async fn control_actor_loop(
                         // stop logic but lands on `Paused` instead of `Interrupted`.
                         if let Some(runner) = parallel_runners.get_mut(&mission_id) {
                             runner.cancel();
-                            parallel_runners.remove(&mission_id);
+                            if let Some(run) = runner.durable_run.as_ref() {
+                                let _ = mission_store
+                                    .heartbeat_mission_run(
+                                        run.run_id,
+                                        run.generation,
+                                        MissionExecutionState::Stopping,
+                                        None,
+                                    )
+                                    .await;
+                            }
                             close_mission_desktop_sessions(
                                 &mission_store,
                                 mission_id,
@@ -14401,6 +14806,16 @@ async fn control_actor_loop(
                         } else if running_mission_id == Some(mission_id) {
                             if let Some(token) = &running_cancel {
                                 token.cancel();
+                                if let Some(run) = running_run.as_ref() {
+                                    let _ = mission_store
+                                        .heartbeat_mission_run(
+                                            run.run_id,
+                                            run.generation,
+                                            MissionExecutionState::Stopping,
+                                            None,
+                                        )
+                                        .await;
+                                }
                                 // Arm the force-clear deadline so a zombie runner
                                 // that never observes the cancel still gets torn
                                 // down (matches CancelMission).
@@ -14491,6 +14906,13 @@ async fn control_actor_loop(
                                     current_activity: main_runner_activity.clone(),
                                     subtask_total: main_runner_subtasks.len(),
                                     subtask_completed: main_runner_subtasks.iter().filter(|s| s.completed).count(),
+                                    run_id: running_run.as_ref().map(|run| run.run_id),
+                                    generation: running_run.as_ref().map(|run| run.generation),
+                                    heartbeat_at: running_run.as_ref().map(|run| run.heartbeat_at.clone()),
+                                    scope_unit: running_run.as_ref().and_then(|run| run.scope_unit.clone()),
+                                    status_conflict: running_run
+                                        .is_none()
+                                        .then(|| "actor_without_durable_run".to_string()),
                                 });
                             }
                         }
@@ -14627,6 +15049,18 @@ async fn control_actor_loop(
                                     }
                                     runner.queue_message(Uuid::new_v4(), resume_prompt, None, None);
 
+                                    if let Err(error) = runner
+                                        .acquire_durable_run(
+                                            &mission_store,
+                                            &format!("control:{session_user_id}"),
+                                        )
+                                        .await
+                                    {
+                                        let _ = respond.send(Err(format!(
+                                            "Failed to acquire mission run lease: {error}"
+                                        )));
+                                        continue;
+                                    }
                                     let started = runner.start_next(
                                         config.clone(),
                                         Arc::clone(&root_agent),
@@ -14795,6 +15229,23 @@ async fn control_actor_loop(
                                         main_runner_active_tool_calls
                                             .store(0, std::sync::atomic::Ordering::Relaxed);
                                         let user_id_for_turn = session_user_id.clone();
+                                        running_run = match acquire_execution_run(
+                                            &mission_store,
+                                            Some(mission_id),
+                                            &format!("control:{session_user_id}"),
+                                        )
+                                        .await
+                                        {
+                                            Ok(run) => run,
+                                            Err(error) => {
+                                                running_cancel = None;
+                                                running_mission_id = None;
+                                                let _ = respond.send(Err(format!(
+                                                    "Failed to acquire mission run lease: {error}"
+                                                )));
+                                                continue;
+                                            }
+                                        };
                                         running = Some(tokio::spawn(async move {
                                             let result = run_single_control_turn(
                                                 cfg,
@@ -15227,6 +15678,25 @@ async fn control_actor_loop(
                             completed_completion_confidence =
                                 Some(completion_evidence.completion_confidence);
                             completed_agent_output = agent_result.output.clone();
+                            if let Some(run) = running_run.take() {
+                                let reason = agent_result
+                                    .terminal_reason
+                                    .map(|value| format!("{value:?}"));
+                                if let Err(error) = mission_store
+                                    .finish_mission_run(
+                                        run.run_id,
+                                        run.generation,
+                                        reason.as_deref(),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        mission_id = %run.mission_id,
+                                        run_id = %run.run_id,
+                                        "Failed to close main mission run: {error}"
+                                    );
+                                }
+                            }
                             // Only append assistant to local history if this mission is still the current mission.
                             // Note: User message was already added before execution started.
                             // If the user created a new mission mid-execution, history was cleared for that new mission,
@@ -15394,6 +15864,15 @@ async fn control_actor_loop(
                             }
                         }
                         Err(e) => {
+                            if let Some(run) = running_run.take() {
+                                let _ = mission_store
+                                    .finish_mission_run(
+                                        run.run_id,
+                                        run.generation,
+                                        Some("runner_join_failed"),
+                                    )
+                                    .await;
+                            }
                             let _ = events_tx.send(AgentEvent::Error {
                                 message: format!("Control session task join failed: {}", e),
                                 mission_id: completed_mission_id,
@@ -15601,6 +16080,33 @@ async fn control_actor_loop(
                     main_runner_active_tool_calls
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                     let user_id_for_turn = session_user_id.clone();
+                    running_run = match acquire_execution_run(
+                        &mission_store,
+                        mission_id,
+                        &format!("control:{session_user_id}"),
+                    )
+                    .await
+                    {
+                        Ok(run) => run,
+                        Err(error) => {
+                            running_cancel = None;
+                            running_mission_id = None;
+                            let _ = events_tx.send(AgentEvent::Error {
+                                message: format!("Mission run lease rejected: {error}"),
+                                mission_id,
+                                resumable: true,
+                            });
+                            set_and_emit_status(
+                                &status,
+                                &events_tx,
+                                ControlRunState::Idle,
+                                queue.len(),
+                                mission_id,
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
                     running = Some(tokio::spawn(async move {
                         let result = run_single_control_turn(
                             cfg,
@@ -15643,6 +16149,15 @@ async fn control_actor_loop(
                     if runner.check_finished() {
                         if let Some((_msg_id, _user_msg, mut result)) = runner.poll_completion().await {
                             maybe_recover_soft_llm_error(&mut result);
+                            let durable_terminal_reason = result
+                                .terminal_reason
+                                .map(|reason| format!("{reason:?}"));
+                            runner
+                                .finish_durable_run(
+                                    &mission_store,
+                                    durable_terminal_reason.as_deref(),
+                                )
+                                .await;
                             let completion_evidence = completion_evidence_for_agent_result(&result);
                             tracing::info!(
                                 "Parallel mission {} completed (success: {}, cost: {} cents)",
@@ -15815,6 +16330,25 @@ async fn control_actor_loop(
                                         );
                                         runner.session_id = m.session_id;
                                     }
+                                }
+                                if let Err(error) = runner
+                                    .acquire_durable_run(
+                                        &mission_store,
+                                        &format!("control:{session_user_id}"),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        "Failed to acquire next mission run lease: {error}"
+                                    );
+                                    let _ = events_tx.send(AgentEvent::Error {
+                                        message: format!("Mission run lease rejected: {error}"),
+                                        mission_id: Some(*mission_id),
+                                        resumable: true,
+                                    });
+                                    completed_missions.push(*mission_id);
+                                    continue;
                                 }
                                 let started = runner.start_next(
                                     config.clone(),
@@ -16071,6 +16605,15 @@ async fn control_actor_loop(
                 main_runner_active_tool_calls
                     .store(0, std::sync::atomic::Ordering::Relaxed);
                 runner_force_clear_deadline = None;
+                if let Some(run) = running_run.take() {
+                    let _ = mission_store
+                        .finish_mission_run(
+                            run.run_id,
+                            run.generation,
+                            Some("force_killed_after_cancel_timeout"),
+                        )
+                        .await;
+                }
                 if let Some(mid) = stuck_mid {
                     // Mark mission as Interrupted so it stays resumable.
                     if let Err(e) = mission_store
@@ -16168,6 +16711,60 @@ async fn control_actor_loop(
                                     runner
                                         .active_tool_calls
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+
+                                let durable_run = if running_mission_id == Some(*mid) {
+                                    running_run.clone()
+                                } else {
+                                    parallel_runners
+                                        .get(mid)
+                                        .and_then(|runner| runner.durable_run.clone())
+                                };
+                                if let Some(run) = durable_run {
+                                    let now = chrono::Utc::now();
+                                    let waiting_state = if matches!(
+                                        name.as_str(),
+                                        "request_user_input" | "AskUserQuestion" | "frontend_tool"
+                                    ) {
+                                        MissionExecutionState::WaitingUser
+                                    } else {
+                                        MissionExecutionState::WaitingTool
+                                    };
+                                    let _ = mission_store
+                                        .heartbeat_mission_run(
+                                            run.run_id,
+                                            run.generation,
+                                            waiting_state,
+                                            None,
+                                        )
+                                        .await;
+                                    let execution = MissionToolExecution {
+                                        tool_call_id: tool_call_id.clone(),
+                                        run_id: run.run_id,
+                                        tool_kind: name.clone(),
+                                        state: MissionToolExecutionState::Provisional,
+                                        started_at: now.to_rfc3339(),
+                                        heartbeat_at: now.to_rfc3339(),
+                                        // An unmatched protocol event alone is
+                                        // evidence for at most 120 seconds.
+                                        deadline_at: (now + chrono::Duration::seconds(120))
+                                            .to_rfc3339(),
+                                        process_pid: None,
+                                        durable_job_id: None,
+                                        completed_at: None,
+                                        exit_status: None,
+                                        failure_class: None,
+                                    };
+                                    if let Err(error) = mission_store
+                                        .register_tool_execution(&execution)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            mission_id = %mid,
+                                            tool_call_id = %tool_call_id,
+                                            "Failed to register tool execution: {error}"
+                                        );
+                                    }
                                 }
 
                                 // Background-task auto-resume: stash the command
@@ -16325,6 +16922,47 @@ async fn control_actor_loop(
                                         std::sync::atomic::Ordering::Relaxed,
                                         |c| if c > 0 { Some(c - 1) } else { None },
                                     );
+                                }
+
+                                let durable_run = if running_mission_id == Some(*mid) {
+                                    running_run.clone()
+                                } else {
+                                    parallel_runners
+                                        .get(mid)
+                                        .and_then(|runner| runner.durable_run.clone())
+                                };
+                                if let Some(run) = durable_run {
+                                    match mission_store
+                                        .finish_tool_execution(
+                                            run.run_id,
+                                            tool_call_id,
+                                            MissionToolExecutionState::Completed,
+                                            Some(0),
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            let _ = mission_store
+                                                .heartbeat_mission_run(
+                                                    run.run_id,
+                                                    run.generation,
+                                                    MissionExecutionState::Running,
+                                                    None,
+                                                )
+                                                .await;
+                                        }
+                                        Ok(false) => tracing::debug!(
+                                            mission_id = %mid,
+                                            tool_call_id = %tool_call_id,
+                                            "Stored late or unmatched tool result without mutating current run"
+                                        ),
+                                        Err(error) => tracing::warn!(
+                                            mission_id = %mid,
+                                            tool_call_id = %tool_call_id,
+                                            "Failed to finish tool execution: {error}"
+                                        ),
+                                    }
                                 }
 
                                 // Mark subtask complete if applicable
@@ -23276,6 +23914,7 @@ And the report:
             repository: None,
             branch: None,
             depends_on: Vec::new(),
+            ..Default::default()
         }
     }
 

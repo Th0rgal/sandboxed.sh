@@ -31,7 +31,10 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::agents::TerminalReason;
-use crate::api::mission_store::{BoardTask, BoardTaskOutcome, BoardTaskStatus, MissionStore};
+use crate::api::mission_store::{
+    now_string, BoardOutboxItem, BoardTask, BoardTaskOutcome, BoardTaskRole, BoardTaskStatus,
+    MissionStore, TaskAttempt,
+};
 
 use super::{ControlCommand, MissionStatus};
 
@@ -51,6 +54,17 @@ const STUCK_PENDING_SECS: i64 = 90;
 /// Digest truncation: keep the head and tail of the worker's final message.
 const DIGEST_HEAD_CHARS: usize = 400;
 const DIGEST_TAIL_CHARS: usize = 1200;
+
+fn role_default_model(task: &BoardTask) -> Option<&'static str> {
+    if task.backend != "codex" {
+        return None;
+    }
+    Some(match task.role {
+        BoardTaskRole::Planner | BoardTaskRole::Reviewer => "gpt-5.6-sol",
+        BoardTaskRole::Reconciler if task.risk_class == "high" => "gpt-5.6-sol",
+        BoardTaskRole::Worker | BoardTaskRole::Reconciler => "gpt-5.6-terra",
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RetryPreflight {
@@ -655,6 +669,50 @@ fn self_send_message(
     }
 }
 
+async fn durable_self_send(
+    mission_store: &Arc<dyn MissionStore>,
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    boss_mission_id: Uuid,
+    task_id: Option<Uuid>,
+    target_mission_id: Uuid,
+    delivery_kind: &str,
+    idempotency_key: String,
+    content: String,
+) -> bool {
+    let delivery_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, idempotency_key.as_bytes());
+    let item = BoardOutboxItem {
+        id: delivery_id,
+        boss_mission_id,
+        task_id,
+        delivery_kind: delivery_kind.to_string(),
+        idempotency_key: idempotency_key.clone(),
+        payload: serde_json::json!({
+            "target_mission_id": target_mission_id,
+            "content": content,
+        }),
+        state: "pending".to_string(),
+        attempts: 0,
+        created_at: now_string(),
+        acknowledged_at: None,
+    };
+    if let Err(error) = mission_store.enqueue_board_outbox(item).await {
+        tracing::warn!(target = %target_mission_id, %idempotency_key,
+            "board: refusing unjournaled delivery: {error}");
+        return false;
+    }
+    if !self_send_message(cmd_tx, target_mission_id, content) {
+        return false;
+    }
+    if let Err(error) = mission_store
+        .acknowledge_board_outbox(&idempotency_key)
+        .await
+    {
+        tracing::warn!(target = %target_mission_id, %idempotency_key,
+            "board: delivery accepted but acknowledgement persistence failed: {error}");
+    }
+    true
+}
+
 /// Fire-and-forget cancel of a specific (worker) mission's runner. Mirrors
 /// [`self_send_message`]: try_send only, receiver dropped — the scheduler runs
 /// on the task that consumes this channel and must never await it.
@@ -801,7 +859,18 @@ pub async fn scheduler_pass(
                             retry_prompt(task, &RetryPreflight::NothingFound),
                             worker_contract(task)
                         );
-                        if self_send_message(cmd_tx, worker_id, prompt) {
+                        if durable_self_send(
+                            mission_store,
+                            cmd_tx,
+                            boss_id,
+                            Some(task.id),
+                            worker_id,
+                            "retry",
+                            format!("board:{}:attempt:{}:retry", task.id, task.attempts),
+                            prompt,
+                        )
+                        .await
+                        {
                             let mut t = task.clone();
                             t.notes = append_note(&t.notes, "re-kicked stuck pending worker");
                             let _ = mission_store.save_board_task(&t).await;
@@ -930,7 +999,24 @@ pub async fn scheduler_pass(
         if !needs {
             wake_state.insert(boss_id, false);
         } else if !wake_state.get(&boss_id).copied().unwrap_or(false)
-            && self_send_message(cmd_tx, boss_id, BOARD_WAKE_PROMPT.to_string())
+            && durable_self_send(
+                mission_store,
+                cmd_tx,
+                boss_id,
+                None,
+                boss_id,
+                "controller_notification",
+                format!(
+                    "board:{boss_id}:wake:{}",
+                    fresh
+                        .iter()
+                        .map(|task| task.updated_at.as_str())
+                        .max()
+                        .unwrap_or("empty")
+                ),
+                BOARD_WAKE_PROMPT.to_string(),
+            )
+            .await
         {
             wake_state.insert(boss_id, true);
             tracing::info!(boss = %boss_id, "board: sent wake (tasks awaiting decision)");
@@ -956,9 +1042,11 @@ async fn spawn_task_worker(
     // Board tasks bypass the public create-mission handler, so apply the same
     // backend-aware normalization here as a defensive migration for tasks that
     // were persisted before upsert started normalizing them.
-    let model_override = task
+    let requested_model = task
         .model_override
         .as_deref()
+        .or_else(|| role_default_model(task));
+    let model_override = requested_model
         .and_then(|model| super::normalize_model_override_for_backend(Some(&task.backend), model));
     let mission = mission_store
         .create_mission_with_parent(
@@ -983,9 +1071,40 @@ async fn spawn_task_worker(
         t.notes = append_note(&t.notes, &format!("retry: attempt {}", t.attempts));
     }
     mission_store.save_board_task(&t).await?;
+    mission_store
+        .create_task_attempt(TaskAttempt {
+            id: Uuid::new_v4(),
+            task_id: t.id,
+            attempt_number: t.attempts,
+            mission_id: mission.id,
+            backend: t.backend.clone(),
+            model: t.model_override.clone(),
+            role: t.role,
+            run_id: None,
+            commit_sha: None,
+            changed_files: vec![],
+            verification_evidence: serde_json::json!({}),
+            cost_cents: None,
+            terminal_class: None,
+            started_at: now_string(),
+            finished_at: None,
+        })
+        .await?;
 
     let prompt = format!("{}{}", retry_prompt(&t, preflight), worker_contract(&t));
-    if !self_send_message(cmd_tx, mission.id, prompt) {
+    let delivery_key = format!("board:{}:attempt:{}:spawn", t.id, t.attempts);
+    if !durable_self_send(
+        mission_store,
+        cmd_tx,
+        t.boss_mission_id,
+        Some(t.id),
+        mission.id,
+        if t.attempts > 1 { "retry" } else { "spawn" },
+        delivery_key,
+        prompt,
+    )
+    .await
+    {
         // Channel full: leave the task running; the zombie sweep re-kicks the
         // pending worker mission after the grace period.
         tracing::warn!(task = %t.task_key, "board: spawn message deferred (channel full)");
@@ -1003,6 +1122,29 @@ async fn settle_task(
     outcome: BoardTaskOutcome,
     output: &str,
 ) {
+    let terminal_class = match outcome {
+        BoardTaskOutcome::Success => "success",
+        BoardTaskOutcome::Blocked => "blocked",
+        BoardTaskOutcome::Failed => "agent_failure",
+    };
+    let evidence = serde_json::json!({
+        "result_digest": digest_excerpt(output),
+        "verification_command": task.verification_command.clone(),
+    });
+    if let Err(error) = mission_store
+        .finish_task_attempt(
+            task.id,
+            task.attempts,
+            terminal_class,
+            None,
+            &[],
+            &evidence,
+            None,
+        )
+        .await
+    {
+        tracing::warn!(task = %task.task_key, "board: failed to close task attempt: {error}");
+    }
     if outcome == BoardTaskOutcome::Failed && task.attempts < MAX_ATTEMPTS {
         // Silent automatic retry: back to pending, next pass respawns fresh.
         task.status = BoardTaskStatus::Pending;
@@ -1195,6 +1337,14 @@ mod tests {
             working_directory: None,
             repository: None,
             branch: None,
+            role: crate::api::mission_store::BoardTaskRole::Worker,
+            acceptance_criteria: vec![],
+            verification_command: None,
+            design_domain: None,
+            declared_write_set: vec![],
+            risk_class: "normal".into(),
+            token_budget: None,
+            cost_budget_cents: None,
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             status,
             outcome,
@@ -1572,6 +1722,7 @@ mod tests {
                         repository: None,
                         branch: None,
                         depends_on: vec![],
+                        ..Default::default()
                     },
                     NewBoardTask {
                         task_key: "t2".into(),
@@ -1584,6 +1735,7 @@ mod tests {
                         repository: None,
                         branch: None,
                         depends_on: vec!["t1".into()],
+                        ..Default::default()
                     },
                 ],
             )
@@ -1625,6 +1777,7 @@ mod tests {
                     repository: None,
                     branch: None,
                     depends_on: vec![],
+                    ..Default::default()
                 }],
             )
             .await
@@ -1697,6 +1850,7 @@ mod tests {
                         repository: None,
                         branch: None,
                         depends_on: vec![],
+                        ..Default::default()
                     },
                     NewBoardTask {
                         task_key: "pending".into(),
@@ -1709,6 +1863,7 @@ mod tests {
                         repository: None,
                         branch: None,
                         depends_on: vec![],
+                        ..Default::default()
                     },
                 ],
             )

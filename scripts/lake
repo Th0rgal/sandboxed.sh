@@ -1,0 +1,83 @@
+#!/bin/sh
+# Mission-local Lake policy shim. Heavy commands route through the durable
+# remote-build protocol; metadata queries and node-side execution stay local.
+set -u
+
+policy="${SANDBOXED_COMPUTE_POLICY:-local_allowed}"
+
+find_real_lake() {
+  for candidate in \
+    "${SANDBOXED_REAL_LAKE:-}" \
+    "${ELAN_HOME:-}/bin/lake" \
+    "${HOME:-}/.elan/bin/lake" \
+    "/root/.elan/bin/lake" \
+    "/usr/bin/lake" \
+    "/bin/lake"
+  do
+    [ -n "$candidate" ] || continue
+    [ -x "$candidate" ] || continue
+    [ "$(readlink -f "$candidate" 2>/dev/null || printf %s "$candidate")" = \
+      "$(readlink -f "$0" 2>/dev/null || printf %s "$0")" ] && continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  old_ifs=$IFS; IFS=:
+  for directory in ${PATH:-}; do
+    [ -n "$directory" ] || directory=.
+    candidate="$directory/lake"
+    [ -x "$candidate" ] || continue
+    [ "$(readlink -f "$candidate" 2>/dev/null || printf %s "$candidate")" = \
+      "$(readlink -f "$0" 2>/dev/null || printf %s "$0")" ] && continue
+    IFS=$old_ifs
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  IFS=$old_ifs
+  return 1
+}
+
+real_lake="$(find_real_lake)" || {
+  echo "sandboxed lake shim: real Lake binary not found" >&2
+  exit 127
+}
+
+# Remote nodes must execute the real tool and never recurse through dispatch.
+if [ "${SANDBOXED_REMOTE_EXECUTION:-0}" = "1" ]; then
+  exec "$real_lake" "$@"
+fi
+
+heavy=0
+case "${1:-}" in
+  build|test|check) heavy=1 ;;
+  env)
+    case "${2:-}" in lean|lake) heavy=1 ;; esac
+    ;;
+esac
+
+# Operators can add project-specific verification verbs without replacing the
+# shim. Values are comma-separated first arguments.
+case ",${SANDBOXED_REMOTE_LAKE_COMMANDS:-}," in
+  *",${1:-},"*) heavy=1 ;;
+esac
+
+if [ "$heavy" -eq 0 ] || [ "$policy" = "local_allowed" ]; then
+  exec "$real_lake" "$@"
+fi
+
+remote-lean-build lake "$@"
+remote_status=$?
+if [ "$remote_status" -ne 75 ]; then
+  exit "$remote_status"
+fi
+
+if [ "$policy" = "remote_required" ] && [ "${SANDBOXED_ALLOW_LOCAL_LEAN:-0}" != "1" ]; then
+  echo "sandboxed lake shim: remote_required policy blocked local heavy Lean execution; remote capacity is unavailable" >&2
+  exit 75
+fi
+
+if [ "$policy" = "remote_required" ]; then
+  echo "sandboxed lake shim: POLICY OVERRIDE SANDBOXED_ALLOW_LOCAL_LEAN=1; running heavy Lean locally" >&2
+else
+  echo "sandboxed lake shim: remote_preferred placement unavailable; using the local Lean slot" >&2
+fi
+exec lean-slot "$real_lake" "$@"

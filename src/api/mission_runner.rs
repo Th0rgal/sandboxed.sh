@@ -2433,9 +2433,9 @@ const STALL_WARN_SECS: u64 = 120;
 const STALL_SEVERE_SECS: u64 = 300;
 /// An unmatched ToolCall is only evidence that a tool *may* still be running.
 /// Some harnesses omit ToolResult events, so this hint must not suppress
-/// severe-stall handling forever. One hour accommodates large local builds
-/// while bounding stale counter damage.
-pub(crate) const TOOL_CALL_STALL_GRACE_SECS: u64 = 3600;
+/// severe-stall handling forever. Long work must register a managed process or
+/// durable job; a bare unmatched protocol event is provisional for two minutes.
+pub(crate) const TOOL_CALL_STALL_GRACE_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -2460,6 +2460,9 @@ pub enum MissionHealth {
     MissingDeliverables { missing: Vec<String> },
     /// Mission ended unexpectedly
     UnexpectedEnd { reason: String },
+    /// Durable row, actor registry, or presentation status disagree. The
+    /// reconciler must repair the conflict rather than hiding it.
+    Reconciling { reason: String },
 }
 
 /// Classify how long a turn has been quiet.
@@ -2663,6 +2666,9 @@ pub struct MissionRunner {
     /// the mission parks in `AwaitingUser`, so this field is informational and
     /// for in-process inspection only).
     pub background_tasks: HashMap<String, BackgroundTask>,
+
+    /// Durable generation lease for the currently executing turn.
+    pub durable_run: Option<crate::api::mission_store::MissionRun>,
 }
 
 impl MissionRunner {
@@ -2703,6 +2709,57 @@ impl MissionRunner {
             user_id: None,
             active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             background_tasks: HashMap::new(),
+            durable_run: None,
+        }
+    }
+
+    pub async fn acquire_durable_run(
+        &mut self,
+        mission_store: &Arc<dyn crate::api::mission_store::MissionStore>,
+        owner_actor_id: &str,
+    ) -> Result<(), String> {
+        if self.is_running() || self.queue.is_empty() {
+            return Ok(());
+        }
+        let run = mission_store
+            .begin_mission_run(self.mission_id, owner_actor_id, None)
+            .await?;
+        let alive = mission_store
+            .heartbeat_mission_run(
+                run.run_id,
+                run.generation,
+                crate::api::mission_store::MissionExecutionState::Running,
+                None,
+            )
+            .await?;
+        if !alive {
+            return Err(format!(
+                "new mission run {} generation {} was superseded before start",
+                run.run_id, run.generation
+            ));
+        }
+        self.durable_run = Some(run);
+        Ok(())
+    }
+
+    pub async fn finish_durable_run(
+        &mut self,
+        mission_store: &Arc<dyn crate::api::mission_store::MissionStore>,
+        terminal_reason: Option<&str>,
+    ) {
+        let Some(run) = self.durable_run.take() else {
+            return;
+        };
+        if let Err(error) = mission_store
+            .finish_mission_run(run.run_id, run.generation, terminal_reason)
+            .await
+        {
+            tracing::warn!(
+                mission_id = %self.mission_id,
+                run_id = %run.run_id,
+                generation = run.generation,
+                "Failed to close durable mission run: {error}"
+            );
         }
     }
 
@@ -8322,6 +8379,16 @@ pub struct RunningMissionInfo {
     pub subtask_total: usize,
     /// Completed subtasks
     pub subtask_completed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_conflict: Option<String>,
 }
 
 impl From<&MissionRunner> for RunningMissionInfo {
@@ -8348,6 +8415,20 @@ impl From<&MissionRunner> for RunningMissionInfo {
             current_activity: runner.current_activity.clone(),
             subtask_total: runner.subtasks.len(),
             subtask_completed: runner.subtasks.iter().filter(|s| s.completed).count(),
+            run_id: runner.durable_run.as_ref().map(|run| run.run_id),
+            generation: runner.durable_run.as_ref().map(|run| run.generation),
+            heartbeat_at: runner
+                .durable_run
+                .as_ref()
+                .map(|run| run.heartbeat_at.clone()),
+            scope_unit: runner
+                .durable_run
+                .as_ref()
+                .and_then(|run| run.scope_unit.clone()),
+            status_conflict: runner
+                .durable_run
+                .is_none()
+                .then(|| "actor_without_durable_run".to_string()),
         }
     }
 }
@@ -8532,7 +8613,7 @@ mod tests {
         ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
         ClaudeTurnWaitState, CopiedOpenCodeProbe, MissionHealth, MissionRunState,
         MissionStallSeverity, OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
-        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS, TOOL_CALL_STALL_GRACE_SECS,
+        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -10499,14 +10580,13 @@ mod tests {
     // ── subprocess-aware stall classifier tests (TASK 2) ──────────────
 
     #[test]
-    fn stall_severity_severe_downgraded_to_warning_when_tool_alive() {
-        // A 12-minute `lake build` produces no model tokens but is honest
-        // work. The classifier must not escalate this to Severe (which
-        // trips the auto-terminate watchdog) just because of token silence.
+    fn stall_severity_unregistered_tool_hint_expires_before_severe_threshold() {
+        // Unmatched harness events are provisional only. Long work must
+        // register a managed process or durable job in the control plane.
         let result = stall_severity(STALL_SEVERE_SECS + 1, true).unwrap();
         assert!(
-            matches!(result, MissionStallSeverity::Warning),
-            "expected Warning when a tool subprocess is alive, got {:?}",
+            matches!(result, MissionStallSeverity::Severe),
+            "expected Severe after provisional tool grace, got {:?}",
             result
         );
     }
@@ -10520,16 +10600,14 @@ mod tests {
     }
 
     #[test]
-    fn stall_severity_grants_long_tool_call_a_bounded_warning_window() {
-        // 30 minutes of silence after a ToolCall (e.g. a long `make check`)
-        // remains Warning and does not interrupt a healthy large build.
+    fn stall_severity_does_not_grant_unregistered_long_tool_immunity() {
         let result = stall_severity(STALL_SEVERE_SECS * 6, true).unwrap();
-        assert!(matches!(result, MissionStallSeverity::Warning));
+        assert!(matches!(result, MissionStallSeverity::Severe));
     }
 
     #[test]
     fn stall_severity_does_not_trust_unmatched_tool_call_forever() {
-        let result = stall_severity(TOOL_CALL_STALL_GRACE_SECS, true).unwrap();
+        let result = stall_severity(STALL_SEVERE_SECS + 1, true).unwrap();
         assert!(matches!(result, MissionStallSeverity::Severe));
     }
 
@@ -10586,19 +10664,16 @@ mod tests {
     }
 
     #[test]
-    fn running_health_warning_when_tool_alive_at_severe_threshold() {
-        // The end-to-end claim of TASK 2: when the mission is well past
-        // the severe stall threshold *and* a tool subprocess is in flight,
-        // the public health classification stays at Warning.
+    fn running_health_provisional_tool_hint_expires_at_severe_threshold() {
         let health = running_health(MissionRunState::Running, STALL_SEVERE_SECS + 1, true);
         match health {
             MissionHealth::Stalled { severity, .. } => {
                 assert!(
-                    matches!(severity, MissionStallSeverity::Warning),
-                    "tool-alive must keep severity at Warning"
+                    matches!(severity, MissionStallSeverity::Severe),
+                    "unregistered tool hints must not suppress Severe"
                 );
             }
-            other => panic!("Expected Stalled (Warning), got {:?}", other),
+            other => panic!("Expected Stalled (Severe), got {:?}", other),
         }
     }
 

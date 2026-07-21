@@ -1,8 +1,9 @@
 //! MCP server for a standalone Hermes assistant.
 //!
 //! This is intentionally narrower than `orchestrator-mcp`: it exposes the
-//! control-plane tools a personal assistant needs without deployment or
-//! durable-job capabilities.
+//! control-plane tools a personal assistant needs without deployment access.
+//! Long workspace commands are exposed as durable jobs so the gateway never
+//! has to hold a synchronous MCP request open for a build.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -200,6 +201,95 @@ struct WorkspaceBashParams {
     cwd: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StartWorkspaceJobParams {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    argv: Option<Vec<String>>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    mission_id: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    resource_class: Option<String>,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceJobParams {
+    job_id: String,
+    #[serde(default = "default_job_tail_bytes")]
+    tail_bytes: usize,
+}
+
+fn default_job_tail_bytes() -> usize {
+    16 * 1024
+}
+
+fn shell_quote_arg(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn workspace_job_command(
+    command: Option<String>,
+    argv: Option<Vec<String>>,
+) -> Result<String, String> {
+    match (command, argv) {
+        (Some(command), None) if !command.trim().is_empty() => Ok(command),
+        (None, Some(argv)) if !argv.is_empty() => Ok(argv
+            .iter()
+            .map(|arg| shell_quote_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ")),
+        (Some(_), Some(_)) => Err("Pass exactly one of command or argv, not both".to_string()),
+        _ => Err("Pass a non-empty command or argv".to_string()),
+    }
+}
+
+fn is_heavy_workspace_command(command: &str) -> bool {
+    let normalized = command
+        .split_whitespace()
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    [
+        "lake build",
+        "lake test",
+        "cargo build --release",
+        "cargo test --all",
+        "npm run build",
+        "bun run build",
+        "next build",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn compact_workspace_job(job: Value) -> Value {
+    json!({
+        "id": job.get("id").cloned().unwrap_or(Value::Null),
+        "status": job.get("status").cloned().unwrap_or(Value::Null),
+        "heartbeat_at": job.get("heartbeat_at").cloned().unwrap_or(Value::Null),
+        "deadline_at": job.get("deadline_at").cloned().unwrap_or(Value::Null),
+        "scope_unit": job.get("scope_unit").cloned().unwrap_or(Value::Null),
+        "pid": job.get("pid").cloned().unwrap_or(Value::Null),
+        "exit_code": job.get("exit_code").cloned().unwrap_or(Value::Null),
+        "signal": job.get("signal").cloned().unwrap_or(Value::Null),
+        "workspace_id": job.get("workspace_id").cloned().unwrap_or(Value::Null),
+        "mission_id": job.get("started_by_mission_id").cloned().unwrap_or(Value::Null),
+        "resource_class": job.get("resource_class").cloned().unwrap_or(Value::Null),
+        "created_at": job.get("created_at").cloned().unwrap_or(Value::Null),
+        "updated_at": job.get("updated_at").cloned().unwrap_or(Value::Null),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -647,7 +737,10 @@ impl AssistantMcp {
             api_url,
             api_token,
             jwt_secret,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -1057,7 +1150,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "workspace_bash".to_string(),
-                description: "Run a bash command inside a sandboxed.sh workspace — the same context missions run in, with the workspace's configured environment variables and (when a GitHub account is connected in the dashboard) GitHub git credentials wired in for `git push`. Prefer this over local bash for git operations and anything needing workspace secrets.".to_string(),
+                description: "Run a short diagnostic command inside a sandboxed.sh workspace. Defaults to 60 seconds and never exceeds 120 seconds. Heavy commands such as `lake build` are rejected; use start_workspace_job for long work.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["command"],
@@ -1065,8 +1158,47 @@ impl AssistantMcp {
                         "command": {"type": "string", "description": "Shell command to run in the workspace."},
                         "workspace_id": {"type": "string", "description": "Workspace UUID. Defaults to the assistant's default workspace."},
                         "cwd": {"type": "string", "description": "Working directory relative to the workspace root."},
-                        "timeout_secs": {"type": "integer", "description": "Timeout in seconds, default 300, max 600."}
+                        "timeout_secs": {"type": "integer", "description": "Timeout in seconds, default 60, max 120."}
                     }
+                }),
+            },
+            ToolDefinition {
+                name: "start_workspace_job".to_string(),
+                description: "Start a restart-safe long-running command in a workspace and return immediately with a durable job id. Supply exactly one of command or argv. Retries must reuse the same idempotency_key; a reused key cannot submit duplicate work.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id", "idempotency_key"],
+                    "properties": {
+                        "command": {"type": "string", "description": "Shell command. Mutually exclusive with argv."},
+                        "argv": {"type": "array", "items": {"type": "string"}, "description": "Argument vector, safely shell-quoted. Mutually exclusive with command."},
+                        "workspace_id": {"type": "string", "description": "Workspace UUID. Defaults to the assistant default workspace."},
+                        "mission_id": {"type": "string", "description": "Owning mission UUID."},
+                        "cwd": {"type": "string", "description": "Working directory relative to the workspace root."},
+                        "timeout_secs": {"type": "integer", "description": "Absolute runtime limit. Default 7200 seconds, maximum 86400."},
+                        "resource_class": {"type": "string", "description": "Scheduling hint such as lean_heavy, cpu, or io."},
+                        "idempotency_key": {"type": "string", "description": "Stable retry key for this logical submission."}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "get_workspace_job".to_string(),
+                description: "Inspect a durable workspace job by id, including heartbeat, deadline, scope, exit status, and bounded stdout/stderr tails.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["job_id"],
+                    "properties": {
+                        "job_id": {"type": "string"},
+                        "tail_bytes": {"type": "integer", "description": "Maximum bytes from each log, default 16384, maximum 65536."}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "cancel_workspace_job".to_string(),
+                description: "Idempotently request cancellation of a durable workspace job. Returns after cancellation is recorded; process teardown continues asynchronously.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["job_id"],
+                    "properties": {"job_id": {"type": "string"}}
                 }),
             },
             ToolDefinition {
@@ -1362,6 +1494,13 @@ impl AssistantMcp {
         if params.command.trim().is_empty() {
             return Err("Command is empty".to_string());
         }
+        if is_heavy_workspace_command(&params.command) {
+            return Err(serde_json::to_string(&json!({
+                "error": "heavy_command_requires_durable_job",
+                "message": "This command can outlive a synchronous Hermes MCP call. Use start_workspace_job and poll get_workspace_job.",
+                "tool": "start_workspace_job"
+            })).unwrap_or_else(|_| "heavy command requires start_workspace_job".to_string()));
+        }
         let workspace_id = resolve_default_workspace_id(params.workspace_id).ok_or_else(|| {
             "No workspace_id given and no default workspace configured \
              (HERMES_DEFAULT_WORKSPACE_ID / ASSISTANT_DEFAULT_WORKSPACE_ID)"
@@ -1374,7 +1513,7 @@ impl AssistantMcp {
                 json!({
                     "command": params.command,
                     "cwd": params.cwd,
-                    "timeout_secs": params.timeout_secs,
+                    "timeout_secs": params.timeout_secs.unwrap_or(60).clamp(1, 120),
                 }),
             )
             .await?;
@@ -1387,6 +1526,58 @@ impl AssistantMcp {
             .json()
             .await
             .map_err(|error| format!("Failed to parse exec result: {error}"))
+    }
+
+    async fn start_workspace_job(&self, params: StartWorkspaceJobParams) -> Result<Value, String> {
+        let workspace_id = resolve_default_workspace_id(params.workspace_id).ok_or_else(|| {
+            "No workspace_id given and no default workspace configured (HERMES_DEFAULT_WORKSPACE_ID / ASSISTANT_DEFAULT_WORKSPACE_ID)".to_string()
+        })?;
+        let workspace_id = parse_uuid(&workspace_id)?;
+        let mission_id = parse_uuid(&params.mission_id)?;
+        let command = workspace_job_command(params.command, params.argv)?;
+        let key = params.idempotency_key.trim();
+        if key.is_empty() {
+            return Err("idempotency_key is required".to_string());
+        }
+        let response = self
+            .api_post(
+                "/api/durable-jobs",
+                json!({
+                    "command": command,
+                    "cwd": params.cwd,
+                    "workspace_id": workspace_id,
+                    "started_by_mission_id": mission_id,
+                    "timeout_secs": params.timeout_secs.unwrap_or(7200).clamp(1, 86400),
+                    "resource_class": params.resource_class,
+                    "idempotency_key": key,
+                }),
+            )
+            .await?;
+        let job = Self::response_value(response, "Start workspace job").await?;
+        Ok(json!({"job": compact_workspace_job(job)}))
+    }
+
+    async fn get_workspace_job(&self, params: WorkspaceJobParams) -> Result<Value, String> {
+        let id = parse_uuid(&params.job_id)?;
+        let response = self.api_get(&format!("/api/durable-jobs/{id}")).await?;
+        let job = Self::response_value(response, "Get workspace job").await?;
+        let tail_bytes = params.tail_bytes.clamp(1, 64 * 1024);
+        let response = self
+            .api_get(&format!(
+                "/api/durable-jobs/{id}/logs?tail_bytes={tail_bytes}"
+            ))
+            .await?;
+        let logs = Self::response_value(response, "Get workspace job logs").await?;
+        Ok(json!({"job": compact_workspace_job(job), "logs": logs}))
+    }
+
+    async fn cancel_workspace_job(&self, params: WorkspaceJobParams) -> Result<Value, String> {
+        let id = parse_uuid(&params.job_id)?;
+        let response = self
+            .api_post(&format!("/api/durable-jobs/{id}/cancel"), json!({}))
+            .await?;
+        let job = Self::response_value(response, "Cancel workspace job").await?;
+        Ok(json!({"job": compact_workspace_job(job), "cancellation_acknowledged": true}))
     }
 
     async fn send_message(&self, params: SendMessageParams) -> Result<Value, String> {
@@ -2095,6 +2286,21 @@ impl AssistantMcp {
                 let params: WorkspaceBashParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
                 self.workspace_bash(params).await
+            }
+            "start_workspace_job" => {
+                let params: StartWorkspaceJobParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.start_workspace_job(params).await
+            }
+            "get_workspace_job" => {
+                let params: WorkspaceJobParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.get_workspace_job(params).await
+            }
+            "cancel_workspace_job" => {
+                let params: WorkspaceJobParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.cancel_workspace_job(params).await
             }
             "get_mission_health" => {
                 let params: MissionHealthParams = serde_json::from_value(arguments)
@@ -3024,6 +3230,9 @@ mod tests {
             "save_workspace_template",
             "delete_workspace_template",
             "rebuild_workspace_from_template",
+            "start_workspace_job",
+            "get_workspace_job",
+            "cancel_workspace_job",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -3043,6 +3252,19 @@ mod tests {
                 .unwrap()
                 .contains(&json!("confirm")));
         }
+    }
+
+    #[test]
+    fn workspace_bash_rejects_heavy_commands_and_job_argv_is_quoted() {
+        assert!(is_heavy_workspace_command("lake build Verity"));
+        assert!(is_heavy_workspace_command("cd repo && cargo test --all"));
+        assert!(!is_heavy_workspace_command("git status --short"));
+        assert_eq!(
+            workspace_job_command(None, Some(vec!["printf".into(), "%s".into(), "a'b".into()]))
+                .unwrap(),
+            "'printf' '%s' 'a'\\''b'"
+        );
+        assert!(workspace_job_command(Some("true".into()), Some(vec!["true".into()])).is_err());
     }
 
     #[test]

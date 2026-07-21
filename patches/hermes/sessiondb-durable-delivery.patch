@@ -1,0 +1,326 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -14,0 +15 @@ import contextvars
++import hashlib
+@@ -1674,0 +1676,4 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
++            delivery_id = (
++                f"cron:{chat_id}:{job.get('id', '?')}:"
++                f"{job.get('_delivery_run_id') or job.get('last_run_at') or hashlib.sha256(content.encode('utf-8')).hexdigest()}"
++            )
+@@ -1687,0 +1693 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
++                    delivery_id=delivery_id,
+@@ -1695,3 +1701,28 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+-                msg = f"API session delivery failed for '{chat_id}': {e}"
+-                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+-                delivery_errors.append(msg)
++                if isinstance(e, ValueError):
++                    msg = f"API session delivery failed for '{chat_id}': {e}"
++                    logger.warning("Job '%s': %s", job.get("id", "?"), msg)
++                    delivery_errors.append(msg)
++                    continue
++                try:
++                    from hermes_state import spool_session_delivery
++
++                    spool_path = spool_session_delivery(
++                        delivery_id=delivery_id,
++                        session_id=str(chat_id),
++                        role="assistant",
++                        content=content,
++                    )
++                    logger.warning(
++                        "Job '%s': SessionDB append failed after retries; spooled delivery %s at %s: %s",
++                        job.get("id", "?"),
++                        delivery_id,
++                        spool_path,
++                        e,
++                    )
++                except Exception as spool_error:
++                    msg = (
++                        f"API session delivery and spool failed for '{chat_id}': "
++                        f"append={e}; spool={spool_error}"
++                    )
++                    logger.error("Job '%s': %s", job.get("id", "?"), msg)
++                    delivery_errors.append(msg)
+@@ -4013 +4044,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
+-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
++                    delivery_job = dict(job)
++                    delivery_job["_delivery_run_id"] = execution_id
++                    delivery_error = _deliver_result(
++                        delivery_job,
++                        deliver_content,
++                        adapters=adapters,
++                        loop=loop,
++                    )
+diff --git a/gateway/run.py b/gateway/run.py
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -22835,0 +22836,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool =
++    # Recover cron/controller transcript deliveries that exhausted SessionDB
++    # lock retries in a previous process. The receipt row and message append
++    # commit together, so replay is idempotent across gateway crashes.
++    try:
++        from hermes_state import replay_session_delivery_spool
++
++        replay_result = await asyncio.get_running_loop().run_in_executor(
++            None, replay_session_delivery_spool
++        )
++        if replay_result["replayed"] or replay_result["failed"]:
++            logger.info(
++                "SessionDB delivery spool replayed=%d failed=%d",
++                replay_result["replayed"],
++                replay_result["failed"],
++            )
++    except Exception:
++        logger.exception("SessionDB delivery spool replay failed during gateway startup")
++
+diff --git a/hermes_state.py b/hermes_state.py
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -17,0 +18 @@ import asyncio
++import hashlib
+@@ -19,0 +21 @@ import logging
++import os
+@@ -35,0 +38,58 @@ logger = logging.getLogger(__name__)
++def _delivery_spool_dir() -> Path:
++    return Path(get_hermes_home()) / "delivery-spool"
++
++
++def spool_session_delivery(
++    delivery_id: str,
++    session_id: str,
++    role: str,
++    content: str,
++) -> Path:
++    """Atomically spool a transcript delivery after SessionDB retries expire."""
++    spool_dir = _delivery_spool_dir()
++    spool_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
++    digest = hashlib.sha256(delivery_id.encode("utf-8")).hexdigest()
++    destination = spool_dir / f"{digest}.json"
++    temporary = spool_dir / f".{digest}.{os.getpid()}.{threading.get_ident()}.tmp"
++    payload = {
++        "delivery_id": delivery_id,
++        "session_id": session_id,
++        "role": role,
++        "content": content,
++        "created_at": time.time(),
++    }
++    with temporary.open("x", encoding="utf-8") as handle:
++        json.dump(payload, handle, ensure_ascii=False)
++        handle.flush()
++        os.fsync(handle.fileno())
++    os.replace(temporary, destination)
++    return destination
++
++
++def replay_session_delivery_spool() -> Dict[str, int]:
++    """Replay durable deliveries, deleting files only after a committed append."""
++    spool_dir = _delivery_spool_dir()
++    result = {"replayed": 0, "failed": 0}
++    if not spool_dir.exists():
++        return result
++    db = SessionDB()
++    try:
++        for path in sorted(spool_dir.glob("*.json")):
++            try:
++                payload = json.loads(path.read_text(encoding="utf-8"))
++                db.append_message(
++                    session_id=str(payload["session_id"]),
++                    role=str(payload.get("role") or "assistant"),
++                    content=payload.get("content"),
++                    delivery_id=str(payload["delivery_id"]),
++                )
++                path.unlink()
++                result["replayed"] += 1
++            except Exception:
++                result["failed"] += 1
++                logger.exception("Failed to replay SessionDB delivery spool entry %s", path)
++    finally:
++        db.close()
++    return result
++
++
+@@ -155 +215 @@ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+-SCHEMA_VERSION = 22
++SCHEMA_VERSION = 23
+@@ -835,0 +896,7 @@ CREATE TABLE IF NOT EXISTS messages (
++CREATE TABLE IF NOT EXISTS delivery_receipts (
++    delivery_id TEXT PRIMARY KEY,
++    message_id INTEGER,
++    created_at REAL NOT NULL,
++    FOREIGN KEY (message_id) REFERENCES messages(id)
++);
++
+@@ -1003,0 +1071 @@ class SessionDB:
++    _WRITE_RETRY_DEADLINE_S = 10.0
+@@ -1286 +1354,15 @@ class SessionDB:
+-        for attempt in range(self._WRITE_MAX_RETRIES):
++        started_at = time.monotonic()
++        try:
++            retry_deadline_s = max(
++                0.1,
++                float(os.environ.get(
++                    "HERMES_SESSIONDB_WRITE_RETRY_DEADLINE_SECONDS",
++                    self._WRITE_RETRY_DEADLINE_S,
++                )),
++            )
++        except (TypeError, ValueError):
++            retry_deadline_s = self._WRITE_RETRY_DEADLINE_S
++        deadline_at = started_at + retry_deadline_s
++        attempt = 0
++        while attempt < self._WRITE_MAX_RETRIES and time.monotonic() < deadline_at:
++            transaction_started_at = time.monotonic()
+@@ -1304,0 +1387,7 @@ class SessionDB:
++                if attempt:
++                    logger.info(
++                        "SessionDB write recovered lock_wait_ms=%.1f retries=%d transaction_ms=%.1f",
++                        (transaction_started_at - started_at) * 1000,
++                        attempt,
++                        (time.monotonic() - transaction_started_at) * 1000,
++                    )
+@@ -1310,3 +1399,5 @@ class SessionDB:
+-                    if attempt < self._WRITE_MAX_RETRIES - 1:
+-                        jitter = random.uniform(
+-                            self._WRITE_RETRY_MIN_S,
++                    remaining = deadline_at - time.monotonic()
++                    if attempt < self._WRITE_MAX_RETRIES - 1 and remaining > 0:
++                        # Bounded full jitter: every retry samples from zero to
++                        # the exponentially increasing cap, avoiding writer convoys.
++                        cap = min(
+@@ -1313,0 +1405,2 @@ class SessionDB:
++                            self._WRITE_RETRY_MIN_S * (2 ** attempt),
++                            remaining,
+@@ -1314,0 +1408 @@ class SessionDB:
++                        jitter = random.uniform(0, max(0, cap))
+@@ -1315,0 +1410 @@ class SessionDB:
++                        attempt += 1
+@@ -1330,0 +1426 @@ class SessionDB:
++                attempt += 1
+@@ -1332,0 +1429,7 @@ class SessionDB:
++        logger.error(
++            "SessionDB write failed lock_wait_ms=%.1f retries=%d deadline_s=%.1f error=%s",
++            (time.monotonic() - started_at) * 1000,
++            attempt,
++            retry_deadline_s,
++            last_err,
++        )
+@@ -4171,0 +4275 @@ class SessionDB:
++        delivery_id: Optional[str] = None,
+@@ -4226,0 +4331,11 @@ class SessionDB:
++            if delivery_id:
++                claimed = conn.execute(
++                    "INSERT OR IGNORE INTO delivery_receipts (delivery_id, message_id, created_at) VALUES (?, NULL, ?)",
++                    (delivery_id, time.time()),
++                )
++                if claimed.rowcount == 0:
++                    prior = conn.execute(
++                        "SELECT message_id FROM delivery_receipts WHERE delivery_id = ?",
++                        (delivery_id,),
++                    ).fetchone()
++                    return prior[0] if prior and prior[0] is not None else 0
+@@ -4268,0 +4384,5 @@ class SessionDB:
++            if delivery_id:
++                conn.execute(
++                    "UPDATE delivery_receipts SET message_id = ? WHERE delivery_id = ?",
++                    (msg_id, delivery_id),
++                )
+diff --git a/tests/cron/test_scheduler.py b/tests/cron/test_scheduler.py
+--- a/tests/cron/test_scheduler.py
++++ b/tests/cron/test_scheduler.py
+@@ -4060,0 +4061 @@ class TestDeliverApiServerOrigin:
++            "_delivery_run_id": str(tmp_path),
+@@ -4088,0 +4090 @@ class TestDeliverApiServerOrigin:
++            "_delivery_run_id": str(tmp_path),
+diff --git a/tests/test_sessiondb_delivery_spool.py b/tests/test_sessiondb_delivery_spool.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_sessiondb_delivery_spool.py
+@@ -0,0 +1,88 @@
++import sqlite3
++import threading
++import time
++
++from hermes_state import (
++    SessionDB,
++    replay_session_delivery_spool,
++    spool_session_delivery,
++)
++
++
++def test_delivery_id_deduplicates_transcript_append(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        db.create_session("api-1", source="api_server")
++        first = db.append_message(
++            "api-1", role="assistant", content="done", delivery_id="cron:api-1:j:r1"
++        )
++        second = db.append_message(
++            "api-1", role="assistant", content="done", delivery_id="cron:api-1:j:r1"
++        )
++        assert second == first
++        assert [message["content"] for message in db.get_messages("api-1")] == ["done"]
++    finally:
++        db.close()
++
++
++def test_spool_survives_and_replays_once(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HOME", str(tmp_path))
++    db = SessionDB()
++    try:
++        db.create_session("api-1", source="api_server")
++    finally:
++        db.close()
++
++    spool_session_delivery("cron:api-1:j:r1", "api-1", "assistant", "done")
++    assert replay_session_delivery_spool() == {"replayed": 1, "failed": 0}
++    # Recreating the same deterministic delivery after a crash is harmless.
++    spool_session_delivery("cron:api-1:j:r1", "api-1", "assistant", "done")
++    assert replay_session_delivery_spool() == {"replayed": 1, "failed": 0}
++
++    verify = SessionDB()
++    try:
++        assert [message["content"] for message in verify.get_messages("api-1")] == ["done"]
++    finally:
++        verify.close()
++
++
++def test_concurrent_writer_waits_for_lock_without_losing_delivery(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_SESSIONDB_WRITE_RETRY_DEADLINE_SECONDS", "2")
++    path = tmp_path / "state.db"
++    setup = SessionDB(path)
++    setup.create_session("api-1", source="api_server")
++    setup.close()
++
++    blocker = sqlite3.connect(path, timeout=0.1, isolation_level=None)
++    blocker.execute("BEGIN IMMEDIATE")
++    result = []
++
++    def writer():
++        db = SessionDB(path)
++        try:
++            result.append(
++                db.append_message(
++                    "api-1",
++                    role="assistant",
++                    content="eventually committed",
++                    delivery_id="cron:api-1:j:r2",
++                )
++            )
++        finally:
++            db.close()
++
++    thread = threading.Thread(target=writer)
++    thread.start()
++    time.sleep(0.25)
++    blocker.rollback()
++    blocker.close()
++    thread.join(timeout=3)
++
++    assert not thread.is_alive()
++    assert len(result) == 1
++    verify = SessionDB(path)
++    try:
++        assert verify.get_messages("api-1")[-1]["content"] == "eventually committed"
++    finally:
++        verify.close()

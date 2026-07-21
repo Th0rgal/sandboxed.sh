@@ -1133,6 +1133,10 @@ pub async fn execute_lean_build(
     // executed from a repository.
     let mut cmd = tokio::process::Command::new(&command[0]);
     cmd.env_clear().args(&command[1..]).current_dir(&build_cwd);
+    // A node may also have the mission lake shim installed in /usr/local/bin.
+    // This marker makes the shim execute the real Lake binary instead of
+    // recursively dispatching another remote build.
+    cmd.env("SANDBOXED_REMOTE_EXECUTION", "1");
     for (key, value) in cache_env(work_root) {
         cmd.env(key, value);
     }

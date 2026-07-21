@@ -50,6 +50,12 @@ pub struct DurableJob {
     pub signal: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Persisted liveness signal advanced by the server-owned watcher.
+    #[serde(default)]
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    /// Absolute runtime deadline. Long jobs default to two hours.
+    #[serde(default)]
+    pub deadline_at: Option<DateTime<Utc>>,
     pub started_by_mission_id: Option<Uuid>,
     #[serde(default)]
     pub workspace_id: Option<Uuid>,
@@ -65,6 +71,12 @@ pub struct DurableJob {
     /// terminate it.
     #[serde(default)]
     pub scope_unit: Option<String>,
+    /// Caller-selected scheduling/resource hint (for example `lean_heavy`).
+    #[serde(default)]
+    pub resource_class: Option<String>,
+    /// Retry key supplied by the caller. The job id is derived from this key.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +93,14 @@ pub struct StartDurableJobRequest {
     pub workspace_id: Option<Uuid>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Maximum runtime in seconds. Defaults to two hours and is capped at one day.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub resource_class: Option<String>,
+    /// Required by Hermes-facing callers so reconnect retries cannot duplicate work.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +113,32 @@ pub struct JobLogsQuery {
 
 fn default_tail_bytes() -> usize {
     16 * 1024
+}
+
+const DEFAULT_JOB_TIMEOUT_SECS: u64 = 2 * 60 * 60;
+const MAX_JOB_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+const FORCE_CLEAR_SECS: u64 = 30;
+
+fn validated_idempotency_key(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err("idempotency_key cannot be empty".to_string());
+    }
+    if key.len() > 200 {
+        return Err("idempotency_key must be at most 200 bytes".to_string());
+    }
+    Ok(Some(key.to_string()))
+}
+
+fn durable_job_id(user_id: &str, mission_id: Uuid, key: Option<&str>) -> Uuid {
+    match key {
+        Some(key) => Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("sandboxed.sh/durable-job/{user_id}/{mission_id}/{key}").as_bytes(),
+        ),
+        None => Uuid::new_v4(),
+    }
 }
 
 fn require_workspace_scope(workspace_id: Option<Uuid>) -> Result<Uuid, String> {
@@ -431,31 +477,93 @@ async fn write_terminal_job_state(
     write_job(state, &job).await.unwrap_or(job)
 }
 
+async fn signal_job(job: &DurableJob, force: bool) {
+    if let Some(unit) = job.scope_unit.as_deref() {
+        if force {
+            let unit = if unit.ends_with(".scope") {
+                unit.to_string()
+            } else {
+                format!("{unit}.scope")
+            };
+            let _ = Command::new("systemctl")
+                .args(["kill", "--kill-who=all", "--signal=KILL", unit.as_str()])
+                .status()
+                .await;
+        } else if stop_scope(unit).await {
+            return;
+        }
+    }
+    if let Some(pid) = job.pid {
+        if force {
+            force_kill_process_group(pid);
+        } else {
+            terminate_process_group(pid);
+        }
+    }
+}
+
 fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
     tokio::spawn(async move {
-        if let Ok(status) = child.wait().await {
-            if let Ok(job) = read_job(&state, id).await {
-                let job_status = if status.success() {
-                    DurableJobStatus::Completed
-                } else {
-                    DurableJobStatus::Failed
-                };
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let deadline = read_job(&state, id)
+                .await
+                .ok()
+                .and_then(|job| job.deadline_at)
+                .map(|deadline| {
+                    (deadline - Utc::now())
+                        .to_std()
+                        .unwrap_or(std::time::Duration::from_millis(1))
+                })
+                .unwrap_or_default();
+            tokio::select! {
+                status = child.wait() => {
+                    let Ok(status) = status else { break };
+                    if let Ok(job) = read_job(&state, id).await {
+                        let job_status = if status.success() {
+                            DurableJobStatus::Completed
+                        } else {
+                            DurableJobStatus::Failed
+                        };
                 #[cfg(unix)]
-                let signal = {
-                    use std::os::unix::process::ExitStatusExt;
-                    status.signal()
-                };
+                        let signal = {
+                            use std::os::unix::process::ExitStatusExt;
+                            status.signal()
+                        };
                 #[cfg(not(unix))]
-                let signal = None;
-                let _ = write_terminal_job_state(
-                    &state,
-                    job,
-                    job_status,
-                    status.code(),
-                    signal,
-                    Utc::now(),
-                )
-                .await;
+                        let signal = None;
+                        let _ = write_terminal_job_state(
+                            &state, job, job_status, status.code(), signal, Utc::now(),
+                        ).await;
+                    }
+                    break;
+                }
+                _ = heartbeat.tick() => {
+                    if let Ok(mut job) = read_job(&state, id).await {
+                        if job.status != DurableJobStatus::Running { break; }
+                        let now = Utc::now();
+                        job.heartbeat_at = Some(now);
+                        job.updated_at = now;
+                        let _ = write_job(&state, &job).await;
+                    }
+                }
+                _ = tokio::time::sleep(deadline), if !deadline.is_zero() => {
+                    if let Ok(mut job) = read_job(&state, id).await {
+                        if job.status == DurableJobStatus::Running {
+                            job.status = DurableJobStatus::Failed;
+                            job.updated_at = Utc::now();
+                            let _ = write_job(&state, &job).await;
+                            signal_job(&job, false).await;
+                            tokio::time::sleep(std::time::Duration::from_secs(FORCE_CLEAR_SECS)).await;
+                            if job.pid.is_some_and(process_alive) {
+                                signal_job(&job, true).await;
+                            }
+                        }
+                    }
+                    let _ = child.wait().await;
+                    break;
+                }
             }
         }
     });
@@ -483,6 +591,18 @@ fn terminate_process_group(pid: u32) {
     }
 }
 
+#[cfg(unix)]
+fn force_kill_process_group(pid: u32) {
+    unsafe {
+        let pgid = libc::getpgid(pid as libc::pid_t);
+        if pgid > 0 {
+            let _ = libc::kill(-pgid, libc::SIGKILL);
+        } else {
+            let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
 async fn stop_scope(unit: &str) -> bool {
     let unit = if unit.ends_with(".scope") {
         unit.to_string()
@@ -499,6 +619,9 @@ async fn stop_scope(unit: &str) -> bool {
 
 #[cfg(not(unix))]
 fn terminate_process_group(_pid: u32) {}
+
+#[cfg(not(unix))]
+fn force_kill_process_group(_pid: u32) {}
 
 async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
     if matches!(
@@ -546,6 +669,54 @@ pub async fn start_job(
     }
     let (workspace_id, started_by_mission_id) =
         authorize_start(&state, &user, req.workspace_id, req.started_by_mission_id).await?;
+    let idempotency_key = validated_idempotency_key(req.idempotency_key.as_deref())
+        .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
+    let id = durable_job_id(&user.id, started_by_mission_id, idempotency_key.as_deref());
+    if idempotency_key.is_some() {
+        match read_job(&state, id).await {
+            Ok(existing) => {
+                if existing.command != command || existing.workspace_id != req.workspace_id {
+                    return Err(err(
+                        StatusCode::CONFLICT,
+                        "idempotency_key was already used with different job parameters",
+                    ));
+                }
+                return Ok(Json(refresh_job(&state, existing).await));
+            }
+            Err(_) => {}
+        }
+        tokio::fs::create_dir_all(job_dir(&state, id))
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let claim = job_dir(&state, id).join("submission.claim");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&claim)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                for _ in 0..40 {
+                    if let Ok(existing) = read_job(&state, id).await {
+                        if existing.command != command || existing.workspace_id != req.workspace_id
+                        {
+                            return Err(err(
+                                StatusCode::CONFLICT,
+                                "idempotency_key parameter mismatch",
+                            ));
+                        }
+                        return Ok(Json(refresh_job(&state, existing).await));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    "idempotent job submission is still being registered",
+                ));
+            }
+            Err(error) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
+        }
+    }
 
     let workspace = Some(state.workspaces.get(workspace_id).await.ok_or_else(|| {
         err(
@@ -563,7 +734,6 @@ pub async fn start_job(
     }
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
-    let id = Uuid::new_v4();
     let dir = job_dir(&state, id);
     tokio::fs::create_dir_all(&dir)
         .await
@@ -598,6 +768,10 @@ pub async fn start_job(
     let wrapper = durable_shell_wrapper(command);
 
     let now = Utc::now();
+    let timeout_secs = req
+        .timeout_secs
+        .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS)
+        .clamp(1, MAX_JOB_TIMEOUT_SECS);
     let mut job = DurableJob {
         id,
         command: command.to_string(),
@@ -608,6 +782,8 @@ pub async fn start_job(
         signal: None,
         created_at: now,
         updated_at: now,
+        heartbeat_at: Some(now),
+        deadline_at: Some(now + chrono::Duration::seconds(timeout_secs as i64)),
         started_by_mission_id: Some(started_by_mission_id),
         workspace_id: req.workspace_id,
         owner_user_id: Some(user.id.clone()),
@@ -619,6 +795,8 @@ pub async fn start_job(
                 .machine_name()
                 .map(|machine| crate::workspace_exec::durable_scope_unit(&machine, id))
         }),
+        resource_class: req.resource_class,
+        idempotency_key,
     };
     job = write_job(&state, &job)
         .await
@@ -818,15 +996,14 @@ pub async fn cancel_job(
         job = write_job(&state, &job)
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        let stopped_scope = match job.scope_unit.as_deref() {
-            Some(unit) => stop_scope(unit).await,
-            None => false,
-        };
-        if !stopped_scope {
-            if let Some(pid) = job.pid {
-                terminate_process_group(pid);
+        let cancelling = job.clone();
+        tokio::spawn(async move {
+            signal_job(&cancelling, false).await;
+            tokio::time::sleep(std::time::Duration::from_secs(FORCE_CLEAR_SECS)).await;
+            if cancelling.pid.is_some_and(process_alive) {
+                signal_job(&cancelling, true).await;
             }
-        }
+        });
     }
     Ok(Json(job))
 }
@@ -856,6 +1033,8 @@ mod tests {
             signal: None,
             created_at: now,
             updated_at: now,
+            heartbeat_at: Some(now),
+            deadline_at: None,
             started_by_mission_id: None,
             workspace_id: None,
             owner_user_id: None,
@@ -863,6 +1042,8 @@ mod tests {
             stderr_log: "/tmp/stderr.log".to_string(),
             status_file: "/tmp/exit.json".to_string(),
             scope_unit: None,
+            resource_class: None,
+            idempotency_key: None,
         }
     }
 
@@ -879,6 +1060,17 @@ mod tests {
         assert!(require_workspace_scope(None)
             .unwrap_err()
             .contains("cannot run on the API host"));
+    }
+
+    #[test]
+    fn idempotency_key_derives_one_stable_job_id() {
+        let mission_id = Uuid::new_v4();
+        let first = durable_job_id("user", mission_id, Some("logical-build-1"));
+        let retry = durable_job_id("user", mission_id, Some("logical-build-1"));
+        let distinct = durable_job_id("user", mission_id, Some("logical-build-2"));
+        assert_eq!(first, retry);
+        assert_ne!(first, distinct);
+        assert!(validated_idempotency_key(Some(" ")).is_err());
     }
 
     #[test]

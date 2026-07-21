@@ -140,6 +140,122 @@ pub struct MissionActivity {
     pub last_activity_at: Option<String>,
 }
 
+/// Durable execution truth for one mission runner generation. Mission status
+/// remains a presentation/attention field; non-terminal rows here are the
+/// authoritative answer to whether work is still executing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionExecutionState {
+    Queued,
+    Starting,
+    Running,
+    WaitingTool,
+    WaitingUser,
+    WaitingBackground,
+    Stopping,
+    Terminal,
+}
+
+impl MissionExecutionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::WaitingTool => "waiting_tool",
+            Self::WaitingUser => "waiting_user",
+            Self::WaitingBackground => "waiting_background",
+            Self::Stopping => "stopping",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "queued" => Self::Queued,
+            "starting" => Self::Starting,
+            "running" => Self::Running,
+            "waiting_tool" => Self::WaitingTool,
+            "waiting_user" => Self::WaitingUser,
+            "waiting_background" => Self::WaitingBackground,
+            "stopping" => Self::Stopping,
+            "terminal" => Self::Terminal,
+            _ => return None,
+        })
+    }
+
+    pub fn is_terminal(self) -> bool {
+        self == Self::Terminal
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissionRun {
+    pub run_id: Uuid,
+    pub mission_id: Uuid,
+    pub generation: u64,
+    pub execution_state: MissionExecutionState,
+    pub owner_actor_id: String,
+    pub scope_unit: Option<String>,
+    pub started_at: String,
+    pub heartbeat_at: String,
+    pub stopping_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub terminal_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionToolExecutionState {
+    Provisional,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Stale,
+}
+
+impl MissionToolExecutionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Provisional => "provisional",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Stale => "stale",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "provisional" => Self::Provisional,
+            "running" => Self::Running,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "stale" => Self::Stale,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissionToolExecution {
+    pub tool_call_id: String,
+    pub run_id: Uuid,
+    pub tool_kind: String,
+    pub state: MissionToolExecutionState,
+    pub started_at: String,
+    pub heartbeat_at: String,
+    pub deadline_at: String,
+    pub process_pid: Option<u32>,
+    pub durable_job_id: Option<Uuid>,
+    pub completed_at: Option<String>,
+    pub exit_status: Option<i32>,
+    pub failure_class: Option<String>,
+}
+
 /// Disambiguates *why* a mission is parked in `AwaitingUser`: the agent asked a
 /// real question that needs a decision, vs. it just finished a turn / its work
 /// and is waiting to be acknowledged or merged. Only meaningful while the
@@ -1333,6 +1449,95 @@ impl BoardTaskOutcome {
     }
 }
 
+/// Server-side role used for model routing, budgets, and independent review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardTaskRole {
+    Planner,
+    #[default]
+    Worker,
+    Reviewer,
+    Reconciler,
+}
+
+impl std::fmt::Display for BoardTaskRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Planner => "planner",
+            Self::Worker => "worker",
+            Self::Reviewer => "reviewer",
+            Self::Reconciler => "reconciler",
+        })
+    }
+}
+
+impl BoardTaskRole {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "planner" => Self::Planner,
+            "reviewer" => Self::Reviewer,
+            "reconciler" => Self::Reconciler,
+            _ => Self::Worker,
+        }
+    }
+}
+
+/// Canonical project record. Repository markdown remains the source of human
+/// intent; only its path and immutable revision are stored here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardProject {
+    pub slug: String,
+    pub repository: String,
+    pub workspace_id: Uuid,
+    pub specification_path: String,
+    pub specification_revision: String,
+    pub compute_policy: String,
+    #[serde(default)]
+    pub budget_policy: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_controller_lease: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Immutable history for one task execution attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAttempt {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub attempt_number: u32,
+    pub mission_id: Uuid,
+    pub backend: String,
+    pub model: Option<String>,
+    pub role: BoardTaskRole,
+    pub run_id: Option<Uuid>,
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    #[serde(default)]
+    pub verification_evidence: serde_json::Value,
+    pub cost_cents: Option<i64>,
+    pub terminal_class: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// Durable delivery intent used by board spawn, wake, retry, and controller
+/// notification operations. A row is deleted only after acknowledgement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardOutboxItem {
+    pub id: Uuid,
+    pub boss_mission_id: Uuid,
+    pub task_id: Option<Uuid>,
+    pub delivery_kind: String,
+    pub idempotency_key: String,
+    pub payload: serde_json::Value,
+    pub state: String,
+    pub attempts: u32,
+    pub created_at: String,
+    pub acknowledged_at: Option<String>,
+}
+
 /// A task on a boss mission's board.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoardTask {
@@ -1358,6 +1563,22 @@ pub struct BoardTask {
     /// Declared git branch created for this task.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    #[serde(default)]
+    pub role: BoardTaskRole,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub design_domain: Option<String>,
+    #[serde(default)]
+    pub declared_write_set: Vec<String>,
+    #[serde(default = "default_board_risk_class")]
+    pub risk_class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_budget_cents: Option<i64>,
     /// Task keys (same board) that must settle successfully or be accepted
     /// before this task may start.
     pub depends_on: Vec<String>,
@@ -1402,7 +1623,52 @@ pub struct NewBoardTask {
     #[serde(default)]
     pub branch: Option<String>,
     #[serde(default)]
+    pub role: BoardTaskRole,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub verification_command: Option<String>,
+    #[serde(default)]
+    pub design_domain: Option<String>,
+    #[serde(default)]
+    pub declared_write_set: Vec<String>,
+    #[serde(default = "default_board_risk_class")]
+    pub risk_class: String,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_cents: Option<i64>,
+    #[serde(default)]
     pub depends_on: Vec<String>,
+}
+
+impl Default for NewBoardTask {
+    fn default() -> Self {
+        Self {
+            task_key: String::new(),
+            title: String::new(),
+            prompt: String::new(),
+            backend: "codex".to_string(),
+            model_override: None,
+            model_effort: None,
+            working_directory: None,
+            repository: None,
+            branch: None,
+            role: BoardTaskRole::Worker,
+            acceptance_criteria: vec![],
+            verification_command: None,
+            design_domain: None,
+            declared_write_set: vec![],
+            risk_class: default_board_risk_class(),
+            token_budget: None,
+            cost_budget_cents: None,
+            depends_on: vec![],
+        }
+    }
+}
+
+fn default_board_risk_class() -> String {
+    "normal".to_string()
 }
 
 /// Sanitize a string for use as a filename.
@@ -1491,6 +1757,76 @@ pub trait MissionStore: Send + Sync {
 
     /// Get a single mission by ID.
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String>;
+
+    /// Acquire the sole non-terminal execution lease for a mission. Every
+    /// successful acquisition increments the mission generation.
+    async fn begin_mission_run(
+        &self,
+        mission_id: Uuid,
+        owner_actor_id: &str,
+        scope_unit: Option<&str>,
+    ) -> Result<MissionRun, String> {
+        let _ = (mission_id, owner_actor_id, scope_unit);
+        Err("mission run leases are not supported by this store".to_string())
+    }
+
+    async fn get_active_mission_run(&self, mission_id: Uuid) -> Result<Option<MissionRun>, String> {
+        let _ = mission_id;
+        Ok(None)
+    }
+
+    async fn list_active_mission_runs(&self) -> Result<Vec<MissionRun>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn heartbeat_mission_run(
+        &self,
+        run_id: Uuid,
+        generation: u64,
+        state: MissionExecutionState,
+        scope_unit: Option<&str>,
+    ) -> Result<bool, String> {
+        let _ = (run_id, generation, state, scope_unit);
+        Ok(false)
+    }
+
+    async fn finish_mission_run(
+        &self,
+        run_id: Uuid,
+        generation: u64,
+        terminal_reason: Option<&str>,
+    ) -> Result<bool, String> {
+        let _ = (run_id, generation, terminal_reason);
+        Ok(false)
+    }
+
+    async fn register_tool_execution(
+        &self,
+        execution: &MissionToolExecution,
+    ) -> Result<(), String> {
+        let _ = execution;
+        Ok(())
+    }
+
+    async fn finish_tool_execution(
+        &self,
+        run_id: Uuid,
+        tool_call_id: &str,
+        state: MissionToolExecutionState,
+        exit_status: Option<i32>,
+        failure_class: Option<&str>,
+    ) -> Result<bool, String> {
+        let _ = (run_id, tool_call_id, state, exit_status, failure_class);
+        Ok(false)
+    }
+
+    async fn list_active_tool_executions(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<MissionToolExecution>, String> {
+        let _ = run_id;
+        Ok(Vec::new())
+    }
 
     /// Load the oldest persisted user message without applying the history
     /// projection/window used by `get_mission`.
@@ -3066,6 +3402,66 @@ pub trait MissionStore: Send + Sync {
     async fn save_board_task(&self, task: &BoardTask) -> Result<(), String> {
         let _ = task;
         Err("Task board not supported by this mission store".to_string())
+    }
+
+    async fn upsert_board_project(&self, project: BoardProject) -> Result<BoardProject, String> {
+        let _ = project;
+        Err("Project ledger not supported by this mission store".to_string())
+    }
+
+    async fn get_board_project(&self, slug: &str) -> Result<Option<BoardProject>, String> {
+        let _ = slug;
+        Ok(None)
+    }
+
+    async fn create_task_attempt(&self, attempt: TaskAttempt) -> Result<TaskAttempt, String> {
+        let _ = attempt;
+        Err("Task attempt ledger not supported by this mission store".to_string())
+    }
+
+    async fn finish_task_attempt(
+        &self,
+        task_id: Uuid,
+        attempt_number: u32,
+        terminal_class: &str,
+        commit_sha: Option<&str>,
+        changed_files: &[String],
+        verification_evidence: &serde_json::Value,
+        cost_cents: Option<i64>,
+    ) -> Result<(), String> {
+        let _ = (
+            task_id,
+            attempt_number,
+            terminal_class,
+            commit_sha,
+            changed_files,
+            verification_evidence,
+            cost_cents,
+        );
+        Ok(())
+    }
+
+    async fn list_task_attempts(&self, task_id: Uuid) -> Result<Vec<TaskAttempt>, String> {
+        let _ = task_id;
+        Ok(vec![])
+    }
+
+    async fn enqueue_board_outbox(&self, item: BoardOutboxItem) -> Result<BoardOutboxItem, String> {
+        let _ = item;
+        Err("Board outbox not supported by this mission store".to_string())
+    }
+
+    async fn acknowledge_board_outbox(&self, idempotency_key: &str) -> Result<(), String> {
+        let _ = idempotency_key;
+        Ok(())
+    }
+
+    async fn list_pending_board_outbox(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<BoardOutboxItem>, String> {
+        let _ = limit;
+        Ok(vec![])
     }
 
     /// Persist the control session's pending message queue as a JSON snapshot

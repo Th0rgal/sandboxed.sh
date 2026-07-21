@@ -703,12 +703,12 @@ mod tests {
     }
 
     #[test]
-    fn inactivity_watchdog_preserves_live_tool_past_threshold() {
-        assert!(!inactivity_is_cancellable(STUCK_SECONDS * 2, true));
+    fn inactivity_watchdog_requires_registered_liveness_past_threshold() {
+        assert!(inactivity_is_cancellable(STUCK_SECONDS * 2, true));
     }
 
     #[test]
     fn inactivity_watchdog_eventually_cancels_stale_tool_hint() {
-        assert!(inactivity_is_cancellable(TOOL_CALL_STALL_GRACE_SECS, true));
+        assert!(inactivity_is_cancellable(STUCK_SECONDS, true));
     }
 }
