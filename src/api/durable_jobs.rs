@@ -637,12 +637,15 @@ fn job_has_liveness_evidence(
     }
 }
 
-fn retryable_pidless_receipt(job: &DurableJob) -> bool {
-    job.status == DurableJobStatus::Unknown && job.pid.is_none()
-}
-
 fn job_accepts_heartbeat(status: &DurableJobStatus) -> bool {
     *status == DurableJobStatus::Running
+}
+
+fn job_is_cancellable(status: &DurableJobStatus) -> bool {
+    matches!(
+        status,
+        DurableJobStatus::Running | DurableJobStatus::Unknown
+    )
 }
 
 fn deadline_terminal_status() -> DurableJobStatus {
@@ -891,9 +894,10 @@ pub async fn start_job(
                 ));
             }
             let existing = refresh_job(&state, existing).await;
-            if !retryable_pidless_receipt(&existing) {
-                return Ok(Json(existing));
-            }
+            // Any persisted receipt closes the submission decision. A pidless
+            // receipt may be the crash window after spawn but before PID
+            // persistence, so resubmitting it could duplicate live work.
+            return Ok(Json(existing));
         }
     }
 
@@ -920,9 +924,7 @@ pub async fn start_job(
                         ));
                     }
                     let existing = refresh_job(&state, existing).await;
-                    if !retryable_pidless_receipt(&existing) {
-                        return Ok(Json(existing));
-                    }
+                    return Ok(Json(existing));
                 }
                 Some(claim)
             }
@@ -936,9 +938,7 @@ pub async fn start_job(
                             ));
                         }
                         let existing = refresh_job(&state, existing).await;
-                        if !retryable_pidless_receipt(&existing) {
-                            return Ok(Json(existing));
-                        }
+                        return Ok(Json(existing));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
@@ -1201,7 +1201,7 @@ pub async fn cancel_job(
         .map_err(|e| err(StatusCode::NOT_FOUND, e))?;
     authorize_job(&state, &user, &job).await?;
     job = refresh_job(&state, job).await;
-    if job_accepts_heartbeat(&job.status) {
+    if job_is_cancellable(&job.status) {
         job.status = DurableJobStatus::Cancelled;
         job.updated_at = Utc::now();
         job = write_job(&state, &job)
@@ -1286,17 +1286,6 @@ mod tests {
     }
 
     #[test]
-    fn only_unknown_pidless_receipts_are_retryable() {
-        let mut job = test_job(DurableJobStatus::Running);
-        job.pid = None;
-        assert!(!retryable_pidless_receipt(&job));
-        job.status = DurableJobStatus::Unknown;
-        assert!(retryable_pidless_receipt(&job));
-        job.pid = Some(123);
-        assert!(!retryable_pidless_receipt(&job));
-    }
-
-    #[test]
     fn terminal_jobs_stop_heartbeat_updates_without_stopping_the_watcher() {
         assert!(job_accepts_heartbeat(&DurableJobStatus::Running));
         for status in [
@@ -1307,6 +1296,15 @@ mod tests {
         ] {
             assert!(!job_accepts_heartbeat(&status));
         }
+    }
+
+    #[test]
+    fn ambiguous_jobs_remain_cancellable_without_being_heartbeat_eligible() {
+        assert!(job_is_cancellable(&DurableJobStatus::Unknown));
+        assert!(!job_accepts_heartbeat(&DurableJobStatus::Unknown));
+        assert!(!job_is_cancellable(&DurableJobStatus::Completed));
+        assert!(!job_is_cancellable(&DurableJobStatus::Failed));
+        assert!(!job_is_cancellable(&DurableJobStatus::Cancelled));
     }
 
     #[test]

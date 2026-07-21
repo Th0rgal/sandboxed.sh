@@ -2153,7 +2153,7 @@ async fn prepare_workspace_dir(path: &Path) -> anyhow::Result<PathBuf> {
 
 fn remote_build_wrapper_path(workspace: &Workspace, mission_id: Uuid) -> PathBuf {
     if workspace.workspace_type == WorkspaceType::Container && !is_container_fallback(workspace) {
-        PathBuf::from("/usr/local/bin/remote-lean-build")
+        PathBuf::from("/usr/local/lib/sandboxed-sh/bin/remote-lean-build")
     } else {
         mission_workspace_dir_for_root(&workspace.path, mission_id)
             .join(".sandboxed-sh/bin/remote-lean-build")
@@ -2183,7 +2183,10 @@ pub(crate) async fn install_remote_build_wrapper(
         let destination = if workspace.workspace_type == WorkspaceType::Container
             && !is_container_fallback(workspace)
         {
-            workspace.path.join("usr/local/bin").join(name)
+            workspace
+                .path
+                .join("usr/local/lib/sandboxed-sh/bin")
+                .join(name)
         } else {
             remote_build_wrapper_path(workspace, mission_id)
                 .parent()
@@ -3900,6 +3903,29 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[tokio::test]
+    async fn container_lake_shim_does_not_overwrite_the_real_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let workspace = Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+        let real_lake = root.path().join("usr/local/bin/lake");
+        tokio::fs::create_dir_all(real_lake.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&real_lake, b"real lake").await.unwrap();
+
+        install_remote_build_wrapper(&workspace, mission_id)
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(&real_lake).await.unwrap(), b"real lake");
+        let shim = root.path().join("usr/local/lib/sandboxed-sh/bin/lake");
+        assert_eq!(
+            tokio::fs::read(shim).await.unwrap(),
+            include_bytes!("../../scripts/lake")
+        );
     }
 
     #[test]
