@@ -680,31 +680,53 @@ fn dispatch_board_outbox_item(
             tokio::spawn(async move {
                 match rx.await {
                     Ok(UserMessageAck::Queued | UserMessageAck::Delivered) => {
-                        if let Err(error) = store.acknowledge_board_outbox(&idempotency_key).await {
-                            tracing::warn!(target = %target_mission_id, %idempotency_key,
-                                "board: accepted delivery acknowledgement failed: {error}");
+                        match store.acknowledge_board_outbox(&idempotency_key).await {
+                            Ok(()) => {
+                                inflight
+                                    .lock()
+                                    .expect("board outbox lock")
+                                    .remove(&delivery_id);
+                            }
+                            Err(error) => {
+                                tracing::warn!(target = %target_mission_id, %idempotency_key,
+                                    "board: accepted delivery acknowledgement failed: {error}");
+                            }
                         }
+                    }
+                    Ok(UserMessageAck::Dropped) => {
                         inflight
                             .lock()
                             .expect("board outbox lock")
                             .remove(&delivery_id);
+                        tracing::warn!(
+                            target = %target_mission_id,
+                            %idempotency_key,
+                            "board: actor dropped delivery; leaving outbox pending"
+                        );
                     }
-                    Ok(UserMessageAck::Dropped) => tracing::warn!(
-                        target = %target_mission_id,
-                        %idempotency_key,
-                        "board: actor dropped delivery; leaving outbox pending"
-                    ),
-                    Ok(UserMessageAck::Rejected(reason)) => tracing::warn!(
-                        target = %target_mission_id,
-                        %idempotency_key,
-                        %reason,
-                        "board: actor rejected delivery; leaving outbox pending"
-                    ),
-                    Err(error) => tracing::warn!(
-                        target = %target_mission_id,
-                        %idempotency_key,
-                        "board: delivery acknowledgement channel closed; leaving outbox pending: {error}"
-                    ),
+                    Ok(UserMessageAck::Rejected(reason)) => {
+                        inflight
+                            .lock()
+                            .expect("board outbox lock")
+                            .remove(&delivery_id);
+                        tracing::warn!(
+                            target = %target_mission_id,
+                            %idempotency_key,
+                            %reason,
+                            "board: actor rejected delivery; leaving outbox pending"
+                        );
+                    }
+                    Err(error) => {
+                        inflight
+                            .lock()
+                            .expect("board outbox lock")
+                            .remove(&delivery_id);
+                        tracing::warn!(
+                            target = %target_mission_id,
+                            %idempotency_key,
+                            "board: delivery acknowledgement channel closed; leaving outbox pending: {error}"
+                        );
+                    }
                 }
             });
             true
@@ -1420,6 +1442,52 @@ mod tests {
         })
         .await
         .expect("outbox acknowledgement persisted");
+        assert!(inflight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_delivery_is_released_for_pending_replay() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let inflight: BoardOutboxInflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let boss = Uuid::new_v4();
+
+        assert!(
+            durable_self_send(
+                &store,
+                &cmd_tx,
+                &inflight,
+                BoardDelivery {
+                    boss_mission_id: boss,
+                    task_id: None,
+                    target_mission_id: boss,
+                    delivery_kind: "controller_notification",
+                    idempotency_key: format!("board:{boss}:wake:dropped"),
+                    content: "wake".to_string(),
+                },
+            )
+            .await
+        );
+        let ControlCommand::UserMessage { respond, .. } =
+            cmd_rx.recv().await.expect("board command")
+        else {
+            panic!("expected user message");
+        };
+        respond
+            .send(UserMessageAck::Dropped)
+            .expect("ack receiver alive");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if inflight.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped delivery released");
+        assert_eq!(store.list_pending_board_outbox(10).await.unwrap().len(), 1);
     }
 
     #[test]

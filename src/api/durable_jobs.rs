@@ -636,6 +636,10 @@ fn job_has_liveness_evidence(
     }
 }
 
+fn retryable_pidless_receipt(job: &DurableJob) -> bool {
+    job.status == DurableJobStatus::Unknown && job.pid.is_none()
+}
+
 #[cfg(unix)]
 fn scope_unit_is_active(scope_unit: &str) -> bool {
     let unit = if scope_unit.ends_with(".scope") {
@@ -778,6 +782,13 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
                     job = write_job(state, &job).await.unwrap_or(job);
                 }
             }
+        } else {
+            let now = Utc::now();
+            if (now - job.created_at).num_seconds() >= PIDLESS_START_GRACE_SECS {
+                job.status = DurableJobStatus::Unknown;
+                job.updated_at = now;
+                job = write_job(state, &job).await.unwrap_or(job);
+            }
         }
     }
     job
@@ -856,7 +867,10 @@ pub async fn start_job(
                     "idempotency_key was already used with different job parameters",
                 ));
             }
-            return Ok(Json(refresh_job(&state, existing).await));
+            let existing = refresh_job(&state, existing).await;
+            if !retryable_pidless_receipt(&existing) {
+                return Ok(Json(existing));
+            }
         }
     }
 
@@ -882,7 +896,10 @@ pub async fn start_job(
                             "idempotency_key was already used with different job parameters",
                         ));
                     }
-                    return Ok(Json(refresh_job(&state, existing).await));
+                    let existing = refresh_job(&state, existing).await;
+                    if !retryable_pidless_receipt(&existing) {
+                        return Ok(Json(existing));
+                    }
                 }
                 Some(claim)
             }
@@ -895,7 +912,10 @@ pub async fn start_job(
                                 "idempotency_key parameter mismatch",
                             ));
                         }
-                        return Ok(Json(refresh_job(&state, existing).await));
+                        let existing = refresh_job(&state, existing).await;
+                        if !retryable_pidless_receipt(&existing) {
+                            return Ok(Json(existing));
+                        }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
@@ -1240,6 +1260,17 @@ mod tests {
         assert_eq!(first, retry);
         assert_ne!(first, distinct);
         assert!(validated_idempotency_key(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn only_unknown_pidless_receipts_are_retryable() {
+        let mut job = test_job(DurableJobStatus::Running);
+        job.pid = None;
+        assert!(!retryable_pidless_receipt(&job));
+        job.status = DurableJobStatus::Unknown;
+        assert!(retryable_pidless_receipt(&job));
+        job.pid = Some(123);
+        assert!(!retryable_pidless_receipt(&job));
     }
 
     #[test]
