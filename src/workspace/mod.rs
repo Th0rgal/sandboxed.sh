@@ -377,11 +377,11 @@ impl Workspace {
 
     /// Env vars that let the in-workspace `remote-lean-build` wrapper dispatch
     /// a build for `mission_id` to a remote runner node via the host
-    /// `POST /api/remote-build` endpoint — or `None` when neither remote
-    /// nodes nor spark offload are enabled, or no signing secret is
-    /// available. Mirrors [`Self::spark_offload_env`]: the exposed token is a
-    /// per-mission, scope-bound capability token (domain-separated from the
-    /// spark token), never a node bearer token or the dashboard JWT.
+    /// `POST /api/remote-build` endpoint. The compute policy is always
+    /// returned so the Lake shim still fails closed when dispatch credentials
+    /// are unavailable. When configured, the exposed token is a per-mission,
+    /// scope-bound capability token (domain-separated from the spark token),
+    /// never a node bearer token or the dashboard JWT.
     pub fn remote_build_env(&self, mission_id: Uuid) -> Option<HashMap<String, String>> {
         let mut m = HashMap::new();
         m.insert(
@@ -2160,7 +2160,7 @@ fn remote_build_wrapper_path(workspace: &Workspace, mission_id: Uuid) -> PathBuf
     }
 }
 
-async fn install_remote_build_wrapper(
+pub(crate) async fn install_remote_build_wrapper(
     workspace: &Workspace,
     mission_id: Uuid,
 ) -> anyhow::Result<()> {
@@ -3909,6 +3909,13 @@ mod tests {
         let verity = Workspace::new_container("verity".into(), root.path().join("container"));
         assert_eq!(beal.compute_policy(), ComputePolicy::RemoteRequired);
         assert_eq!(verity.compute_policy(), ComputePolicy::RemoteRequired);
+        assert_eq!(
+            beal.remote_build_env(Uuid::new_v4())
+                .unwrap()
+                .get("SANDBOXED_COMPUTE_POLICY")
+                .map(String::as_str),
+            Some("remote_required")
+        );
     }
 
     #[test]

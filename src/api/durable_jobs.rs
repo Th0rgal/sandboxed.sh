@@ -724,6 +724,27 @@ pub async fn start_job(
             format!("workspace not found: {workspace_id}"),
         )
     })?);
+    let mut job_env = req.env;
+    if let Some(workspace) = workspace.as_ref() {
+        // Durable jobs are the Hermes-facing path for long commands, so they
+        // must receive the same compute-policy boundary as an agent runner.
+        // In particular, a Beal/Verity `lake build` may never bypass the Lake
+        // shim merely because it was submitted through assistant-MCP.
+        crate::workspace::install_remote_build_wrapper(workspace, started_by_mission_id)
+            .await
+            .map_err(|error| {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to install workspace build policy wrappers: {error}"),
+                )
+            })?;
+        if let Some(remote_env) = workspace.remote_build_env(started_by_mission_id) {
+            // Policy, endpoint and capability token are server-owned. Caller
+            // env may still opt into the audited emergency local override,
+            // but cannot downgrade `remote_required` itself.
+            job_env.extend(remote_env);
+        }
+    }
     let cwd = match workspace.as_ref() {
         Some(workspace) => resolve_workspace_cwd(
             &workspace.path,
@@ -802,7 +823,6 @@ pub async fn start_job(
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let mut job_env = req.env;
     let status_path_for_child = workspace
         .as_ref()
         .map(|workspace| {
