@@ -49,6 +49,17 @@ def configure(config: dict, assistant_mcp: str) -> None:
     tools["prompts"] = False
     tools["resources"] = False
 
+    # Proton currently fails its production startup self-test because its
+    # optional Python dependencies are not installed. Keep it explicitly
+    # disabled until that probe passes instead of paying the failure cost on
+    # every gateway start.
+    plugins = config.setdefault("plugins", {})
+    enabled = plugins.setdefault("enabled", [])
+    disabled = plugins.setdefault("disabled", [])
+    plugins["enabled"] = [name for name in enabled if name != "proton-platform"]
+    if "proton-platform" not in disabled:
+        disabled.append("proton-platform")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -78,7 +89,8 @@ def main() -> None:
 
     print(
         f"Configured {path}: native Kanban disabled, "
-        f"assistant-MCP timeout=120s, tools={len(ASSISTANT_TOOLS)}"
+        f"assistant-MCP timeout=120s, tools={len(ASSISTANT_TOOLS)}, "
+        "Proton disabled"
     )
 
 
