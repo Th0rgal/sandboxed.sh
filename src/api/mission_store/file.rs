@@ -341,6 +341,12 @@ impl MissionStore for FileMissionStore {
         status: MissionStatus,
         terminal_reason: Option<&str>,
     ) -> Result<(), String> {
+        if status == MissionStatus::Acknowledged && self.get_active_mission_run(id).await?.is_some()
+        {
+            return Err(format!(
+                "mission {id} cannot be acknowledged while a run is non-terminal"
+            ));
+        }
         let mut missions = self.missions.write().await;
         let mission = missions
             .get_mut(&id)
@@ -405,10 +411,19 @@ impl MissionStore for FileMissionStore {
         grace_seconds: u64,
     ) -> Result<Vec<Uuid>, String> {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(grace_seconds as i64);
+        let active: std::collections::HashSet<Uuid> = self
+            .list_active_mission_runs()
+            .await?
+            .into_iter()
+            .map(|run| run.mission_id)
+            .collect();
         let mut missions = self.missions.write().await;
         let mut promoted = Vec::new();
         for mission in missions.values_mut() {
             if mission.status != MissionStatus::AwaitingUser {
+                continue;
+            }
+            if active.contains(&mission.id) {
                 continue;
             }
             let Some(ref viewed_at) = mission.first_viewed_at else {
@@ -1085,5 +1100,53 @@ mod tests {
             .await
             .expect("begin second run");
         assert_eq!(second.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn active_run_blocks_manual_and_automatic_acknowledgement() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = FileMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("file store");
+        let mission = store
+            .create_mission(Some("Waiting"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+        let run = store
+            .begin_mission_run(mission.id, "actor", None)
+            .await
+            .expect("begin run");
+        store
+            .update_mission_status(mission.id, MissionStatus::AwaitingUser)
+            .await
+            .expect("mark awaiting user");
+        store
+            .set_mission_first_viewed_at_if_unset(mission.id, "2000-01-01T00:00:00Z")
+            .await
+            .expect("set viewed timestamp");
+
+        assert!(store
+            .update_mission_status(mission.id, MissionStatus::Acknowledged)
+            .await
+            .unwrap_err()
+            .contains("run is non-terminal"));
+        assert!(store
+            .acknowledge_stale_awaiting_user_missions(0)
+            .await
+            .expect("run acknowledgement sweep")
+            .is_empty());
+        assert_eq!(
+            store
+                .get_mission(mission.id)
+                .await
+                .expect("get mission")
+                .expect("mission exists")
+                .status,
+            MissionStatus::AwaitingUser
+        );
+        assert!(store
+            .finish_mission_run(run.run_id, run.generation, Some("completed"))
+            .await
+            .expect("finish run"));
     }
 }
