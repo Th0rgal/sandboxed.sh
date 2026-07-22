@@ -484,6 +484,13 @@ pub enum ControlCommand {
     ListRunning {
         respond: oneshot::Sender<Vec<crate::api::mission_runner::RunningMissionInfo>>,
     },
+    /// Return the durable lease identity only when a harness process currently
+    /// owns this mission. Parked parallel runners remain registered for queue
+    /// continuity but deliberately return `None` here.
+    GetActorRunLease {
+        mission_id: Uuid,
+        respond: oneshot::Sender<Option<(Uuid, u64)>>,
+    },
     /// Resume an interrupted mission
     ResumeMission {
         mission_id: Uuid,
