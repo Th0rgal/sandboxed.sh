@@ -1144,22 +1144,35 @@ async fn get_remote_build(
             "node_id is required to poll a build".to_string(),
         ));
     }
-    // A terminal receipt is the durable authority. Serve it before touching
-    // the node so exact-head evidence remains recoverable after the runner is
-    // offline, reconfigured, or has pruned its own job record.
-    if let Some(receipt) =
+    // Prefer the live node because it retains bounded logs and artifact
+    // digests. Keep the durable receipt ready as the authority when the node
+    // is offline, reconfigured, or has pruned its own job record.
+    let persisted_terminal_receipt =
         crate::remote_node::job_ledger::terminal_receipt(&state.config.working_dir, job_id)
             .await
-            .unwrap_or_default()
-    {
-        return remote_build_response_from_receipt(&query, receipt);
-    }
+            .unwrap_or_default();
     let settings = &state.config.remote_nodes;
-    let node = settings.node(&query.node_id).cloned().ok_or((
-        StatusCode::BAD_REQUEST,
-        format!("remote node '{}' is not configured", query.node_id),
-    ))?;
-    let shared_token = node_shared_token(&node)?;
+    let node = match settings.node(&query.node_id).cloned() {
+        Some(node) => node,
+        None => {
+            if let Some(receipt) = persisted_terminal_receipt.clone() {
+                return remote_build_response_from_receipt(&query, receipt);
+            }
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("remote node '{}' is not configured", query.node_id),
+            ));
+        }
+    };
+    let shared_token = match node_shared_token(&node) {
+        Ok(token) => token,
+        Err(error) => {
+            if let Some(receipt) = persisted_terminal_receipt.clone() {
+                return remote_build_response_from_receipt(&query, receipt);
+            }
+            return Err(error);
+        }
+    };
     let status = match RemoteNodeClient::default()
         .get_job(&node, &shared_token, job_id)
         .await
@@ -1168,11 +1181,11 @@ async fn get_remote_build(
         Err(error) => {
             // Finalization can race this lookup. Recheck the durable receipt
             // before surfacing a transient/404 node failure.
-            if let Some(receipt) =
+            if let Some(receipt) = persisted_terminal_receipt.clone().or(
                 crate::remote_node::job_ledger::terminal_receipt(&state.config.working_dir, job_id)
                     .await
-                    .unwrap_or_default()
-            {
+                    .unwrap_or_default(),
+            ) {
                 return remote_build_response_from_receipt(&query, receipt);
             }
             return Err((job_status_error_status(&error), error.to_string()));
@@ -1192,9 +1205,14 @@ async fn get_remote_build(
         .into_iter()
         .find(|handle| handle.job_id == job_id);
     let terminal_receipt = if handle.is_none() {
-        crate::remote_node::job_ledger::terminal_receipt(&state.config.working_dir, job_id)
-            .await
-            .unwrap_or_default()
+        match persisted_terminal_receipt {
+            Some(receipt) => Some(receipt),
+            None => {
+                crate::remote_node::job_ledger::terminal_receipt(&state.config.working_dir, job_id)
+                    .await
+                    .unwrap_or_default()
+            }
+        }
     } else {
         None
     };

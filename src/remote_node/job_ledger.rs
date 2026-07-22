@@ -156,6 +156,17 @@ pub async fn terminal_receipt(
         .find(|receipt| receipt.job_id == job_id))
 }
 
+pub async fn terminal_receipts_for_mission(
+    working_dir: &Path,
+    mission_id: Uuid,
+) -> anyhow::Result<Vec<RemoteJobReceipt>> {
+    Ok(load_receipts_result(working_dir)
+        .await?
+        .into_iter()
+        .filter(|receipt| receipt.mission_id == mission_id)
+        .collect())
+}
+
 /// Close an active handle and retain immutable validation evidence. Raw
 /// mission and tentative handles are removed without producing a receipt.
 pub async fn finalize(
@@ -387,6 +398,7 @@ mod tests {
     async fn finalization_retains_immutable_remote_validation_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let job_id = Uuid::new_v4();
+        let mission_id = Uuid::new_v4();
         let identity = RemoteJobIdentity {
             repository: "https://example.invalid/repo.git".to_string(),
             commit: "a".repeat(40),
@@ -397,7 +409,7 @@ mod tests {
         record(
             dir.path(),
             JobHandle {
-                mission_id: Uuid::new_v4(),
+                mission_id,
                 node_id: "node-a".to_string(),
                 job_id,
                 started_at: chrono::Utc::now(),
@@ -419,5 +431,16 @@ mod tests {
         assert_eq!(receipt.identity, identity);
         assert_eq!(receipt.state, "succeeded");
         assert_eq!(receipt.exit_status, Some(0));
+        assert_eq!(
+            terminal_receipts_for_mission(dir.path(), mission_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(terminal_receipts_for_mission(dir.path(), Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

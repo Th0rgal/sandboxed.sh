@@ -10598,7 +10598,7 @@ async fn paloma_webhook_forwarder_loop(
                         .await
                         .ok()
                         .flatten();
-                    let remote_jobs = crate::remote_node::job_ledger::load(&working_dir)
+                    let mut remote_jobs = crate::remote_node::job_ledger::load(&working_dir)
                         .await
                         .unwrap_or_default()
                         .into_iter()
@@ -10614,6 +10614,27 @@ async fn paloma_webhook_forwarder_loop(
                             })
                         })
                         .collect::<Vec<_>>();
+                    remote_jobs.extend(
+                        crate::remote_node::job_ledger::terminal_receipts_for_mission(
+                            &working_dir,
+                            mission_id,
+                        )
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|receipt| {
+                            serde_json::json!({
+                                "job_id": receipt.job_id,
+                                "node_id": receipt.node_id,
+                                "kind": "remote_build_receipt",
+                                "state": receipt.state,
+                                "started_at": receipt.started_at,
+                                "finished_at": receipt.finished_at,
+                                "exit_status": receipt.exit_status,
+                                "identity": receipt.identity,
+                            })
+                        }),
+                    );
                     let terminal_reason = mission
                         .as_ref()
                         .and_then(|mission| mission.terminal_reason.as_deref());
@@ -12249,17 +12270,14 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
     if !is_recoverable {
         return;
     }
-    // Claude Code transport failures (startup timeout, incomplete turn, etc.)
-    // carry a structured `claudecode_transport_failure` marker. These are
-    // never a successful turn — treating them as TurnComplete lets the mission
-    // re-enter an automation loop where every retry fake-succeeds. Keep the
-    // failure classification so the mission is surfaced as failed.
-    if result
-        .data
-        .as_ref()
-        .and_then(|v| v.get("claudecode_transport_failure"))
-        .is_some()
-    {
+    // Structured transport failures are never successful turns. Treating
+    // either the Claude marker or the generic/Codex stage as TurnComplete
+    // would erase the failure evidence before bounded auto-resume runs.
+    let has_transport_failure = result.data.as_ref().is_some_and(|data| {
+        data.get("claudecode_transport_failure").is_some()
+            || data.get("transport_failure_stage").is_some()
+    });
+    if has_transport_failure {
         return;
     }
     let output = result.output.trim();
@@ -25974,6 +25992,27 @@ Investigate <service/> failures.
         ));
         assert!(!is_transport_failure_evidence(
             &completion_evidence_for_agent_result(&auth)
+        ));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_preserves_pending_tool_transport_failure() {
+        let mut result = crate::agents::AgentResult::failure(
+            "Codex stopped while tool calls were still pending: remote build".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError)
+        .with_data(serde_json::json!({
+            "transport_failure_stage": "pending_tools",
+            "pending_tools": ["remote build"]
+        }));
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+        assert!(is_transport_failure_evidence(
+            &completion_evidence_for_agent_result(&result)
         ));
     }
 
