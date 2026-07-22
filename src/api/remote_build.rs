@@ -1078,6 +1078,45 @@ struct RemoteBuildStatusResponse {
     validation: Option<crate::remote_node::job_ledger::RemoteJobIdentity>,
 }
 
+fn remote_build_response_from_receipt(
+    query: &RemoteBuildStatusQuery,
+    receipt: crate::remote_node::job_ledger::RemoteJobReceipt,
+) -> Result<Json<RemoteBuildStatusResponse>, (StatusCode, String)> {
+    if receipt.mission_id != query.mission_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "job does not belong to this mission".to_string(),
+        ));
+    }
+    let current_head_match = query
+        .expected_head
+        .as_deref()
+        .map(|expected_head| receipt.identity.commit == expected_head);
+    let receipt_state = if receipt.state == "succeeded" && current_head_match == Some(false) {
+        "stale_success".to_string()
+    } else {
+        receipt.state.clone()
+    };
+    let status = NodeJobStatus {
+        job_id: receipt.job_id,
+        mission_id: receipt.mission_id,
+        state: receipt.state,
+        exit_code: receipt.exit_status,
+        created_at: receipt.started_at.to_rfc3339(),
+        started_at: Some(receipt.started_at.to_rfc3339()),
+        finished_at: Some(receipt.finished_at.to_rfc3339()),
+        error: None,
+        log_tail: None,
+        artifacts: Vec::new(),
+    };
+    Ok(Json(RemoteBuildStatusResponse {
+        status,
+        receipt_state,
+        current_head_match,
+        validation: Some(receipt.identity),
+    }))
+}
+
 /// `GET /api/remote-build/:job_id?mission_id=...&node_id=...` —
 /// job status for a build submitted with `wait: false`. Authenticated with
 /// the same per-mission capability token in `Authorization: Bearer ...` so
@@ -1105,16 +1144,40 @@ async fn get_remote_build(
             "node_id is required to poll a build".to_string(),
         ));
     }
+    // A terminal receipt is the durable authority. Serve it before touching
+    // the node so exact-head evidence remains recoverable after the runner is
+    // offline, reconfigured, or has pruned its own job record.
+    if let Some(receipt) =
+        crate::remote_node::job_ledger::terminal_receipt(&state.config.working_dir, job_id)
+            .await
+            .unwrap_or_default()
+    {
+        return remote_build_response_from_receipt(&query, receipt);
+    }
     let settings = &state.config.remote_nodes;
     let node = settings.node(&query.node_id).cloned().ok_or((
         StatusCode::BAD_REQUEST,
         format!("remote node '{}' is not configured", query.node_id),
     ))?;
     let shared_token = node_shared_token(&node)?;
-    let status = RemoteNodeClient::default()
+    let status = match RemoteNodeClient::default()
         .get_job(&node, &shared_token, job_id)
         .await
-        .map_err(|e| (job_status_error_status(&e), e.to_string()))?;
+    {
+        Ok(status) => status,
+        Err(error) => {
+            // Finalization can race this lookup. Recheck the durable receipt
+            // before surfacing a transient/404 node failure.
+            if let Some(receipt) =
+                crate::remote_node::job_ledger::terminal_receipt(&state.config.working_dir, job_id)
+                    .await
+                    .unwrap_or_default()
+            {
+                return remote_build_response_from_receipt(&query, receipt);
+            }
+            return Err((job_status_error_status(&error), error.to_string()));
+        }
+    };
     // The capability token is mission-scoped: never leak another mission's
     // job status through it.
     if status.mission_id != query.mission_id {
@@ -1444,6 +1507,49 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         assert!(validate_expected_head(&"a".repeat(40), Some(&"a".repeat(40))).is_ok());
         let error = validate_expected_head(&"a".repeat(40), Some(&"b".repeat(40))).unwrap_err();
         assert!(error.starts_with("STALE_VALIDATION_REQUEST:"));
+    }
+
+    #[test]
+    fn terminal_receipt_reports_stale_success_without_node_lookup() {
+        let mission_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let started_at = chrono::Utc::now();
+        let response = remote_build_response_from_receipt(
+            &RemoteBuildStatusQuery {
+                mission_id,
+                node_id: "offline-node".to_string(),
+                expected_head: Some("b".repeat(40)),
+            },
+            crate::remote_node::job_ledger::RemoteJobReceipt {
+                mission_id,
+                node_id: "offline-node".to_string(),
+                job_id,
+                started_at,
+                finished_at: started_at,
+                state: "succeeded".to_string(),
+                exit_status: Some(0),
+                identity: crate::remote_node::job_ledger::RemoteJobIdentity {
+                    repository: "https://github.com/example/verity.git".to_string(),
+                    commit: "a".repeat(40),
+                    command: vec!["lake".to_string(), "build".to_string()],
+                    toolchain: Some("leanprover/lean4:v4.19.0".to_string()),
+                    source_bundle_digest: None,
+                },
+            },
+        )
+        .unwrap()
+        .0;
+
+        assert_eq!(response.status.job_id, job_id);
+        assert_eq!(response.receipt_state, "stale_success");
+        assert_eq!(response.current_head_match, Some(false));
+        assert_eq!(
+            response
+                .validation
+                .as_ref()
+                .map(|identity| identity.commit.as_str()),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     #[test]
@@ -1947,7 +2053,7 @@ esac
             .expect("run stale exact-head validation");
         assert_eq!(stale.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&stale.stderr).contains("validation is stale"));
-        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "2");
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
 
         for receipt in std::fs::read_dir(&state).expect("read receipts before persistence failure")
         {
@@ -1980,7 +2086,7 @@ esac
             .contains("previous submission stopped"));
         assert_eq!(
             std::fs::read_to_string(&submit_count).unwrap(),
-            "3",
+            "2",
             "the accepted persistence-failure submission must block an identical retry"
         );
         let forced_after_reconciliation = command("success")
@@ -1992,7 +2098,7 @@ esac
             "explicitly forced build failed: {}",
             String::from_utf8_lossy(&forced_after_reconciliation.stderr)
         );
-        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "4");
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "3");
 
         for entry in std::fs::read_dir(&state).expect("read state before ambiguous submission") {
             let path = entry.expect("read state entry").path();

@@ -7369,11 +7369,9 @@ async fn reconcile_pending_handles(
                                 handle.mission_id,
                                 handle.job_id,
                                 handle.started_at,
-                                ledger_dir.clone(),
+                                ledger_dir,
                             )
                             .await;
-                            crate::remote_node::job_ledger::remove(&ledger_dir, handle.job_id)
-                                .await;
                         });
                     }
                     _ => {
@@ -7533,7 +7531,7 @@ async fn poll_recovered_remote_build(
                     started_at,
                     finished_at: Some(chrono::Utc::now()),
                 });
-                if let Err(error) = crate::remote_node::job_ledger::finalize(
+                match crate::remote_node::job_ledger::finalize(
                     &working_dir,
                     job_id,
                     &terminal_state,
@@ -7541,9 +7539,15 @@ async fn poll_recovered_remote_build(
                 )
                 .await
                 {
-                    tracing::warn!(%job_id, ?error, "recovered remote build receipt finalization failed");
+                    Ok(_) => return,
+                    Err(error) => {
+                        // Keep the active handle and retry. Removing it after a
+                        // full-disk/permission failure would discard the only
+                        // durable link to the terminal validation evidence.
+                        tracing::warn!(%job_id, ?error, "recovered remote build receipt finalization failed; retrying");
+                        continue;
+                    }
                 }
-                return;
             }
             Ok(_) => {
                 if let Err(error) =

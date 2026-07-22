@@ -174,6 +174,10 @@ import hashlib, json, sys
 request = json.load(open(sys.argv[1]))
 request.pop("token", None)
 request.pop("wait", None)
+# `expected_head` is a live freshness gate, not part of the immutable job
+# identity. A retry after the branch advances must resume the accepted job for
+# the pinned commit and report it as stale, never submit a duplicate.
+request.pop("expected_head", None)
 fingerprint = {"endpoint": sys.argv[2], "request": request}
 canonical = json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
 print(hashlib.sha256(canonical).hexdigest())
@@ -546,10 +550,20 @@ PY
     done
 fi
 
-python3 - "$state_file" <<'PY'
+python3 - "$state_file" "${REMOTE_BUILD_EXPECTED_HEAD:-}" <<'PY'
 import datetime, json, sys
 with open(sys.argv[1]) as f:
     resp = json.load(f)
+expected_head = sys.argv[2].strip()
+validation = resp.get("validation") or {}
+validated_commit = validation.get("commit") or resp.get("commit") or ""
+stale_success = bool(
+    expected_head
+    and validated_commit
+    and validated_commit != expected_head
+    and resp.get("state") == "succeeded"
+)
+effective_state = "stale_success" if stale_success else resp.get("state")
 duration = None
 try:
     started = datetime.datetime.fromisoformat(resp["started_at"])
@@ -560,7 +574,7 @@ except (KeyError, TypeError, ValueError):
 sys.stderr.write(
     "remote-lean-build: job %s on node '%s' finished: %s (exit %s, %ss)\n"
     % (resp.get("job_id"), resp.get("node_id"),
-       resp.get("receipt_state") or resp.get("state"),
+       effective_state,
        resp.get("exit_code"), duration if duration is not None else "?")
 )
 log_tail = resp.get("log_tail") or ""
@@ -573,7 +587,7 @@ for artifact in resp.get("artifacts") or []:
         "artifact: %(path)s sha256=%(sha256)s (%(size_bytes)d bytes)\n" % artifact
     )
 exit_code = resp.get("exit_code")
-if resp.get("receipt_state") == "stale_success":
+if stale_success:
     sys.stderr.write("remote-lean-build: validation is stale for the current expected head\n")
     sys.exit(1)
 sys.exit(exit_code if isinstance(exit_code, int) and 0 <= exit_code <= 255 else 1)
