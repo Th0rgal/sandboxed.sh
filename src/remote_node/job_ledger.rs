@@ -117,8 +117,9 @@ pub struct RemoteJobReceipt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalWakeDisposition {
     Ready,
-    /// Another remote validation is still active for the same mission. The
-    /// terminal callback must wait so it cannot close that job's run lease.
+    /// A newer ambiguous submission may have reached a node but has not yet
+    /// produced an accepted validation handle. The terminal callback must
+    /// wait until that job id is reconciled.
     Deferred,
     /// A later validation has taken ownership of the mission's continuation.
     SupersededBy(Uuid),
@@ -337,9 +338,9 @@ pub async fn terminal_wake_disposition(
             handle.kind == JobHandleKind::RemoteBuild
                 && handle.mission_id == receipt.mission_id
                 && handle.job_id != receipt.job_id
-                && handle.started_at > receipt.started_at
+                && (handle.started_at, handle.job_id) > (receipt.started_at, receipt.job_id)
         })
-        .max_by_key(|handle| handle.started_at)
+        .max_by_key(|handle| (handle.started_at, handle.job_id))
     {
         return Ok(TerminalWakeDisposition::SupersededBy(newer.job_id));
     }
@@ -348,18 +349,17 @@ pub async fn terminal_wake_disposition(
         .filter(|candidate| {
             candidate.mission_id == receipt.mission_id
                 && candidate.job_id != receipt.job_id
-                && candidate.started_at > receipt.started_at
+                && (candidate.started_at, candidate.job_id) > (receipt.started_at, receipt.job_id)
         })
-        .max_by_key(|candidate| candidate.started_at)
+        .max_by_key(|candidate| (candidate.started_at, candidate.job_id))
     {
         return Ok(TerminalWakeDisposition::SupersededBy(newer.job_id));
     }
     if handles.iter().any(|handle| {
-        matches!(
-            handle.kind,
-            JobHandleKind::RemoteBuild | JobHandleKind::Tentative
-        ) && handle.mission_id == receipt.mission_id
+        handle.kind == JobHandleKind::Tentative
+            && handle.mission_id == receipt.mission_id
             && handle.job_id != receipt.job_id
+            && (handle.started_at, handle.job_id) > (receipt.started_at, receipt.job_id)
     }) {
         return Ok(TerminalWakeDisposition::Deferred);
     }
@@ -982,7 +982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_wake_defers_behind_an_older_active_validation() {
+    async fn newer_terminal_wake_is_not_blocked_by_an_older_active_validation() {
         let dir = tempfile::tempdir().unwrap();
         let mission_id = Uuid::new_v4();
         let active_job_id = Uuid::new_v4();
@@ -1032,7 +1032,7 @@ mod tests {
             terminal_wake_disposition(dir.path(), &receipt)
                 .await
                 .unwrap(),
-            TerminalWakeDisposition::Deferred
+            TerminalWakeDisposition::Ready
         );
         assert_eq!(pending_terminal_wakes(dir.path()).await.unwrap().len(), 1);
     }
