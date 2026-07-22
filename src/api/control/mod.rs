@@ -10622,6 +10622,8 @@ async fn paloma_webhook_forwarder_loop(
                         .await
                         .unwrap_or_default()
                         .into_iter()
+                        .rev()
+                        .take(16)
                         .map(|receipt| {
                             serde_json::json!({
                                 "job_id": receipt.job_id,
@@ -12324,10 +12326,12 @@ fn completion_evidence_for_agent_result(
             terminal_reason,
             Some(TerminalReason::TurnComplete | TerminalReason::Completed)
         ));
-    let pending_tools = data
-        .and_then(|v| v.get("pending_tools"))
-        .and_then(|v| v.as_u64())
-        .and_then(|v| usize::try_from(v).ok());
+    let pending_tools = data.and_then(|v| v.get("pending_tools")).and_then(|value| {
+        value
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .or_else(|| value.as_array().map(Vec::len))
+    });
     let transport_failure_stage = data
         .and_then(|v| v.get("transport_failure_stage"))
         .or_else(|| data.and_then(|v| v.get("claudecode_transport_failure")))
@@ -26014,6 +26018,10 @@ Investigate <service/> failures.
         assert!(is_transport_failure_evidence(
             &completion_evidence_for_agent_result(&result)
         ));
+        assert_eq!(
+            completion_evidence_for_agent_result(&result).pending_tools,
+            Some(1)
+        );
     }
 
     #[test]
