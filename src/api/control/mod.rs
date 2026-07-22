@@ -7364,7 +7364,6 @@ async fn reconcile_pending_handles(
                         tokio::spawn(async move {
                             poll_recovered_remote_build(
                                 fleet,
-                                crate::remote_node::RemoteNodeClient::default(),
                                 node,
                                 shared_token,
                                 handle.mission_id,
@@ -7505,7 +7504,6 @@ async fn reconcile_pending_handles(
 /// not the mission's own remote execution backend.
 async fn poll_recovered_remote_build(
     fleet: Arc<crate::remote_node::FleetMonitor>,
-    client: crate::remote_node::RemoteNodeClient,
     node: crate::remote_node::RemoteNodeConfig,
     shared_token: String,
     mission_id: Uuid,
@@ -7513,6 +7511,7 @@ async fn poll_recovered_remote_build(
     started_at: chrono::DateTime<chrono::Utc>,
     working_dir: PathBuf,
 ) {
+    let client = crate::remote_node::RemoteNodeClient::default();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         match client.get_job(&node, &shared_token, job_id).await {

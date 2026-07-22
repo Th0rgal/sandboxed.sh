@@ -2897,9 +2897,9 @@ impl MissionRunner {
     /// completion path so its terminal result can still be recorded.
     pub fn force_clear_cancelled_if_due(&mut self) -> bool {
         if !self.cancellation_requested
-            || !self
+            || self
                 .cancellation_force_clear_deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
+                .is_none_or(|deadline| Instant::now() < deadline)
         {
             return false;
         }
