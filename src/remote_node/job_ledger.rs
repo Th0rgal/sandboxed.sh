@@ -290,10 +290,8 @@ pub async fn terminal_wake_disposition(
     if let Some(newer) = handles
         .iter()
         .filter(|handle| {
-            matches!(
-                handle.kind,
-                JobHandleKind::RemoteBuild | JobHandleKind::Tentative
-            ) && handle.mission_id == receipt.mission_id
+            handle.kind == JobHandleKind::RemoteBuild
+                && handle.mission_id == receipt.mission_id
                 && handle.job_id != receipt.job_id
                 && handle.started_at > receipt.started_at
         })
@@ -933,5 +931,75 @@ mod tests {
             TerminalWakeDisposition::Deferred
         );
         assert_eq!(pending_terminal_wakes(dir.path()).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn newer_tentative_submission_defers_without_suppressing_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let receipt_job_id = Uuid::new_v4();
+        let tentative_job_id = Uuid::new_v4();
+        let old_started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let new_started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let identity = RemoteJobIdentity {
+            repository: "https://example.invalid/verity.git".to_string(),
+            commit: "a".repeat(40),
+            cwd_rel_known: true,
+            cwd_rel: None,
+            command: vec!["lake".to_string(), "build".to_string()],
+            artifacts: Vec::new(),
+            toolchain: None,
+            source_bundle_digest: None,
+        };
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id,
+                node_id: "node-old".to_string(),
+                job_id: receipt_job_id,
+                started_at: old_started_at,
+                accepted_at: Some(old_started_at),
+                heartbeat_at: Some(old_started_at),
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(identity.clone()),
+                wake_on_terminal: true,
+            },
+        )
+        .await
+        .unwrap();
+        finalize(dir.path(), receipt_job_id, "succeeded", Some(0))
+            .await
+            .unwrap();
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id,
+                node_id: "node-new".to_string(),
+                job_id: tentative_job_id,
+                started_at: new_started_at,
+                accepted_at: None,
+                heartbeat_at: None,
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::Tentative,
+                identity: Some(identity),
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let receipt = terminal_receipt(dir.path(), receipt_job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal_wake_disposition(dir.path(), &receipt)
+                .await
+                .unwrap(),
+            TerminalWakeDisposition::Deferred
+        );
+        assert_eq!(pending_terminal_wakes(dir.path()).await.unwrap().len(), 1);
+        assert_eq!(receipt.wake_suppressed_by, None);
     }
 }
