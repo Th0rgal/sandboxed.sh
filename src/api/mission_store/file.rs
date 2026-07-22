@@ -1,8 +1,8 @@
 //! JSON file-based mission store (legacy).
 
 use super::{
-    now_string, sanitize_filename, Mission, MissionHistoryEntry, MissionStatus,
-    MissionStatusCounts, MissionStore,
+    now_string, sanitize_filename, Mission, MissionExecutionState, MissionHistoryEntry, MissionRun,
+    MissionStatus, MissionStatusCounts, MissionStore,
 };
 use crate::api::control::{AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
@@ -21,6 +21,8 @@ const METADATA_SOURCE_USER: &str = "user";
 struct MissionStoreSnapshot {
     missions: HashMap<Uuid, Mission>,
     trees: HashMap<Uuid, AgentTreeNode>,
+    #[serde(default)]
+    runs: HashMap<Uuid, MissionRun>,
     /// FLEET-001 scheduling: deferred goals held outside the Mission struct
     /// (mirrors the sqlite `deferred_goal` column).
     #[serde(default)]
@@ -32,6 +34,7 @@ pub struct FileMissionStore {
     path: PathBuf,
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
+    runs: Arc<RwLock<HashMap<Uuid, MissionRun>>>,
     deferred_goals: Arc<RwLock<HashMap<Uuid, String>>>,
     persist_lock: Arc<Mutex<()>>,
 }
@@ -64,6 +67,7 @@ impl FileMissionStore {
             path,
             missions: Arc::new(RwLock::new(snapshot.missions)),
             trees: Arc::new(RwLock::new(snapshot.trees)),
+            runs: Arc::new(RwLock::new(snapshot.runs)),
             deferred_goals: Arc::new(RwLock::new(snapshot.deferred_goals)),
             persist_lock: Arc::new(Mutex::new(())),
         })
@@ -74,6 +78,7 @@ impl FileMissionStore {
         let snapshot = MissionStoreSnapshot {
             missions: self.missions.read().await.clone(),
             trees: self.trees.read().await.clone(),
+            runs: self.runs.read().await.clone(),
             deferred_goals: self.deferred_goals.read().await.clone(),
         };
         let data = serde_json::to_vec_pretty(&snapshot)
@@ -121,6 +126,130 @@ impl MissionStore for FileMissionStore {
 
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String> {
         Ok(self.missions.read().await.get(&id).cloned())
+    }
+
+    async fn begin_mission_run(
+        &self,
+        mission_id: Uuid,
+        owner_actor_id: &str,
+        scope_unit: Option<&str>,
+    ) -> Result<MissionRun, String> {
+        match self.missions.read().await.get(&mission_id) {
+            None => return Err(format!("mission not found: {mission_id}")),
+            Some(mission) if mission.status == MissionStatus::Acknowledged => {
+                return Err(format!(
+                    "acknowledged mission {mission_id} cannot acquire a non-terminal run"
+                ));
+            }
+            Some(_) => {}
+        }
+
+        let mut runs = self.runs.write().await;
+        if let Some(run) = runs
+            .values()
+            .find(|run| run.mission_id == mission_id && !run.execution_state.is_terminal())
+        {
+            return Err(format!(
+                "mission {mission_id} already has non-terminal run {} generation {}",
+                run.run_id, run.generation
+            ));
+        }
+        let generation = runs
+            .values()
+            .filter(|run| run.mission_id == mission_id)
+            .map(|run| run.generation)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let now = now_string();
+        let run = MissionRun {
+            run_id: Uuid::new_v4(),
+            mission_id,
+            generation,
+            execution_state: MissionExecutionState::Starting,
+            owner_actor_id: owner_actor_id.to_string(),
+            scope_unit: scope_unit.map(str::to_string),
+            started_at: now.clone(),
+            heartbeat_at: now,
+            stopping_at: None,
+            ended_at: None,
+            terminal_reason: None,
+        };
+        runs.insert(run.run_id, run.clone());
+        drop(runs);
+        self.persist().await?;
+        Ok(run)
+    }
+
+    async fn get_active_mission_run(&self, mission_id: Uuid) -> Result<Option<MissionRun>, String> {
+        Ok(self
+            .runs
+            .read()
+            .await
+            .values()
+            .find(|run| run.mission_id == mission_id && !run.execution_state.is_terminal())
+            .cloned())
+    }
+
+    async fn list_active_mission_runs(&self) -> Result<Vec<MissionRun>, String> {
+        Ok(self
+            .runs
+            .read()
+            .await
+            .values()
+            .filter(|run| !run.execution_state.is_terminal())
+            .cloned()
+            .collect())
+    }
+
+    async fn heartbeat_mission_run(
+        &self,
+        run_id: Uuid,
+        generation: u64,
+        state: MissionExecutionState,
+        scope_unit: Option<&str>,
+    ) -> Result<bool, String> {
+        let mut runs = self.runs.write().await;
+        let Some(run) = runs.get_mut(&run_id) else {
+            return Ok(false);
+        };
+        if run.generation != generation || run.execution_state.is_terminal() {
+            return Ok(false);
+        }
+        run.execution_state = state;
+        run.heartbeat_at = now_string();
+        if let Some(scope) = scope_unit {
+            run.scope_unit = Some(scope.to_string());
+        }
+        if state == MissionExecutionState::Stopping && run.stopping_at.is_none() {
+            run.stopping_at = Some(run.heartbeat_at.clone());
+        }
+        drop(runs);
+        self.persist().await?;
+        Ok(true)
+    }
+
+    async fn finish_mission_run(
+        &self,
+        run_id: Uuid,
+        generation: u64,
+        terminal_reason: Option<&str>,
+    ) -> Result<bool, String> {
+        let mut runs = self.runs.write().await;
+        let Some(run) = runs.get_mut(&run_id) else {
+            return Ok(false);
+        };
+        if run.generation != generation || run.execution_state.is_terminal() {
+            return Ok(false);
+        }
+        let now = now_string();
+        run.execution_state = MissionExecutionState::Terminal;
+        run.heartbeat_at = now.clone();
+        run.ended_at = Some(now);
+        run.terminal_reason = terminal_reason.map(str::to_string);
+        drop(runs);
+        self.persist().await?;
+        Ok(true)
     }
 
     async fn create_mission_with_parent(
@@ -212,6 +341,12 @@ impl MissionStore for FileMissionStore {
         status: MissionStatus,
         terminal_reason: Option<&str>,
     ) -> Result<(), String> {
+        if status == MissionStatus::Acknowledged && self.get_active_mission_run(id).await?.is_some()
+        {
+            return Err(format!(
+                "mission {id} cannot be acknowledged while a run is non-terminal"
+            ));
+        }
         let mut missions = self.missions.write().await;
         let mission = missions
             .get_mut(&id)
@@ -276,10 +411,19 @@ impl MissionStore for FileMissionStore {
         grace_seconds: u64,
     ) -> Result<Vec<Uuid>, String> {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(grace_seconds as i64);
+        let active: std::collections::HashSet<Uuid> = self
+            .list_active_mission_runs()
+            .await?
+            .into_iter()
+            .map(|run| run.mission_id)
+            .collect();
         let mut missions = self.missions.write().await;
         let mut promoted = Vec::new();
         for mission in missions.values_mut() {
             if mission.status != MissionStatus::AwaitingUser {
+                continue;
+            }
+            if active.contains(&mission.id) {
                 continue;
             }
             let Some(ref viewed_at) = mission.first_viewed_at else {
@@ -904,5 +1048,105 @@ mod tests {
             .expect("create blank titled mission");
         assert_eq!(blank_titled.metadata_source, None);
         assert_eq!(blank_titled.metadata_updated_at, None);
+    }
+
+    #[tokio::test]
+    async fn mission_run_leases_persist_and_advance_generation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = FileMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("file store");
+        let mission = store
+            .create_mission(Some("Leased"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+
+        let first = store
+            .begin_mission_run(mission.id, "actor-a", Some("mission-a.scope"))
+            .await
+            .expect("begin first run");
+        assert_eq!(first.generation, 1);
+        assert!(store
+            .begin_mission_run(mission.id, "actor-b", None)
+            .await
+            .unwrap_err()
+            .contains("already has non-terminal run"));
+        assert!(store
+            .heartbeat_mission_run(
+                first.run_id,
+                first.generation,
+                MissionExecutionState::Running,
+                None,
+            )
+            .await
+            .expect("heartbeat first run"));
+
+        let reopened = FileMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("reopen file store");
+        let active = reopened
+            .get_active_mission_run(mission.id)
+            .await
+            .expect("get active run")
+            .expect("active run persisted");
+        assert_eq!(active.run_id, first.run_id);
+        assert_eq!(active.execution_state, MissionExecutionState::Running);
+        assert!(reopened
+            .finish_mission_run(first.run_id, first.generation, Some("completed"))
+            .await
+            .expect("finish first run"));
+        let second = reopened
+            .begin_mission_run(mission.id, "actor-b", None)
+            .await
+            .expect("begin second run");
+        assert_eq!(second.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn active_run_blocks_manual_and_automatic_acknowledgement() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = FileMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("file store");
+        let mission = store
+            .create_mission(Some("Waiting"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+        let run = store
+            .begin_mission_run(mission.id, "actor", None)
+            .await
+            .expect("begin run");
+        store
+            .update_mission_status(mission.id, MissionStatus::AwaitingUser)
+            .await
+            .expect("mark awaiting user");
+        store
+            .set_mission_first_viewed_at_if_unset(mission.id, "2000-01-01T00:00:00Z")
+            .await
+            .expect("set viewed timestamp");
+
+        assert!(store
+            .update_mission_status(mission.id, MissionStatus::Acknowledged)
+            .await
+            .unwrap_err()
+            .contains("run is non-terminal"));
+        assert!(store
+            .acknowledge_stale_awaiting_user_missions(0)
+            .await
+            .expect("run acknowledgement sweep")
+            .is_empty());
+        assert_eq!(
+            store
+                .get_mission(mission.id)
+                .await
+                .expect("get mission")
+                .expect("mission exists")
+                .status,
+            MissionStatus::AwaitingUser
+        );
+        assert!(store
+            .finish_mission_run(run.run_id, run.generation, Some("completed"))
+            .await
+            .expect("finish run"));
     }
 }

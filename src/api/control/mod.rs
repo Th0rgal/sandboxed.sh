@@ -59,7 +59,8 @@ use super::desktop;
 use super::library::SharedLibrary;
 use super::mission_store::{
     self, create_mission_store, now_string, AwaitingKind, BoardTask, BoardTaskStatus, Mission,
-    MissionHistoryEntry, MissionStore, MissionStoreType, NewBoardTask,
+    MissionExecutionState, MissionHistoryEntry, MissionRun, MissionStore, MissionStoreType,
+    MissionToolExecution, MissionToolExecutionState, NewBoardTask,
 };
 use super::routes::AppState;
 
@@ -110,6 +111,34 @@ fn parse_durable_job_result(result: &serde_json::Value) -> Option<serde_json::Va
     }
 
     visit(result, 0)
+}
+
+async fn acquire_execution_run(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Option<Uuid>,
+    owner_actor_id: &str,
+) -> Result<Option<MissionRun>, String> {
+    let Some(mission_id) = mission_id else {
+        return Ok(None);
+    };
+    let run = mission_store
+        .begin_mission_run(mission_id, owner_actor_id, None)
+        .await?;
+    if !mission_store
+        .heartbeat_mission_run(
+            run.run_id,
+            run.generation,
+            MissionExecutionState::Running,
+            None,
+        )
+        .await?
+    {
+        return Err(format!(
+            "run {} generation {} was superseded before execution",
+            run.run_id, run.generation
+        ));
+    }
+    Ok(Some(run))
 }
 
 /// One entry in the main control queue: (message id, content, optional per-message
@@ -2412,7 +2441,80 @@ async fn get_running_missions(
         .send(ControlCommand::ListRunning { respond: tx })
         .await
         .map_err(session_unavailable)?;
-    rx.await.map_err(recv_failed)
+    let actor_rows = rx.await.map_err(recv_failed)?;
+    let durable_runs = control
+        .mission_store
+        .list_active_mission_runs()
+        .await
+        .map_err(internal_error)?;
+    let mut actor_by_mission: HashMap<Uuid, super::mission_runner::RunningMissionInfo> = actor_rows
+        .into_iter()
+        .map(|row| (row.mission_id, row))
+        .collect();
+    let mut projected = Vec::with_capacity(durable_runs.len() + actor_by_mission.len());
+    for run in durable_runs {
+        let mission = control
+            .mission_store
+            .get_mission(run.mission_id)
+            .await
+            .map_err(internal_error)?;
+        let heartbeat_age = chrono::DateTime::parse_from_rfc3339(&run.heartbeat_at)
+            .ok()
+            .map(|timestamp| {
+                (chrono::Utc::now() - timestamp.with_timezone(&chrono::Utc))
+                    .num_seconds()
+                    .max(0) as u64
+            })
+            .unwrap_or(u64::MAX);
+        let presentation_conflict = mission.as_ref().and_then(|mission| {
+            (mission.status == MissionStatus::Acknowledged || mission.status.is_terminal())
+                .then(|| format!("status_{}_with_non_terminal_run", mission.status))
+        });
+        let mut row = actor_by_mission.remove(&run.mission_id).unwrap_or_else(|| {
+            super::mission_runner::RunningMissionInfo {
+                mission_id: run.mission_id,
+                state: run.execution_state.as_str().to_string(),
+                queue_len: 0,
+                history_len: 0,
+                seconds_since_activity: heartbeat_age,
+                tool_call_in_flight: run.execution_state == MissionExecutionState::WaitingTool,
+                health: super::mission_runner::MissionHealth::Reconciling {
+                    reason: "durable_run_without_registered_actor".to_string(),
+                },
+                expected_deliverables: 0,
+                current_activity: None,
+                subtask_total: 0,
+                subtask_completed: 0,
+                run_id: Some(run.run_id),
+                generation: Some(run.generation),
+                heartbeat_at: Some(run.heartbeat_at.clone()),
+                scope_unit: run.scope_unit.clone(),
+                status_conflict: Some("durable_run_without_registered_actor".to_string()),
+            }
+        });
+        row.state = run.execution_state.as_str().to_string();
+        row.run_id = Some(run.run_id);
+        row.generation = Some(run.generation);
+        row.heartbeat_at = Some(run.heartbeat_at.clone());
+        row.scope_unit = run.scope_unit.clone();
+        if let Some(conflict) = presentation_conflict {
+            row.status_conflict = Some(conflict.clone());
+            row.health = super::mission_runner::MissionHealth::Reconciling { reason: conflict };
+        } else if heartbeat_age > 60 && run.execution_state != MissionExecutionState::WaitingUser {
+            let reason = format!("run_heartbeat_stale_{heartbeat_age}s");
+            row.status_conflict = Some(reason.clone());
+            row.health = super::mission_runner::MissionHealth::Reconciling { reason };
+        }
+        projected.push(row);
+    }
+    for (_, mut row) in actor_by_mission {
+        row.status_conflict = Some("registered_actor_without_durable_run".to_string());
+        row.health = super::mission_runner::MissionHealth::Reconciling {
+            reason: "registered_actor_without_durable_run".to_string(),
+        };
+        projected.push(row);
+    }
+    Ok(projected)
 }
 
 /// Look up an automation by ID, returning 404 if it does not exist.
@@ -2762,12 +2864,37 @@ pub struct QueuedMessage {
     /// for snapshots written before this field existed.
     #[serde(default)]
     pub source: Option<String>,
+    /// The actor had already consumed this message into an executing parallel
+    /// turn when the snapshot was written. After restart it is a durable
+    /// idempotency marker, not work to replay: the inherited run is
+    /// interrupted and an explicit resume is required.
+    #[serde(default)]
+    pub inflight: bool,
+}
+
+fn partition_restored_control_messages(
+    items: Vec<QueuedMessage>,
+) -> (Vec<QueuedMessage>, Vec<QueuedMessage>) {
+    let mut pending = Vec::with_capacity(items.len());
+    let mut consumed = Vec::new();
+    for item in items {
+        if item.inflight {
+            consumed.push(item);
+        } else {
+            pending.push(item);
+        }
+    }
+    (pending, consumed)
 }
 
 /// Serialize the control session queue to a stable JSON snapshot for
 /// persistence across restarts (see `MissionStore::save_control_queue`).
-fn serialize_queue_snapshot(queue: &VecDeque<ControlQueueEntry>) -> String {
-    let items: Vec<QueuedMessage> = queue
+fn serialize_queue_snapshot(
+    queue: &VecDeque<ControlQueueEntry>,
+    parallel_runners: &std::collections::HashMap<Uuid, super::mission_runner::MissionRunner>,
+    recovered_consumed: &HashMap<Uuid, QueuedMessage>,
+) -> String {
+    let mut items: Vec<QueuedMessage> = queue
         .iter()
         .map(|(id, content, agent, target_mid, source)| QueuedMessage {
             id: *id,
@@ -2775,8 +2902,39 @@ fn serialize_queue_snapshot(queue: &VecDeque<ControlQueueEntry>) -> String {
             agent: agent.clone(),
             mission_id: *target_mid,
             source: source.clone(),
+            inflight: false,
         })
         .collect();
+    let mut runners: Vec<_> = parallel_runners.iter().collect();
+    runners.sort_by_key(|(mission_id, _)| **mission_id);
+    for (mission_id, runner) in runners {
+        if let Some(message) = runner.inflight_message() {
+            // `inflight_message` is also used as a prepared slot before
+            // `begin_mission_run` succeeds. Only a durable run proves the
+            // actor crossed the consumption boundary; a crash before that
+            // must replay the message instead of treating it as completed.
+            let durably_started = runner.durable_run.is_some();
+            items.push(QueuedMessage {
+                id: message.id,
+                content: message.content.clone(),
+                agent: message.agent.clone(),
+                mission_id: Some(*mission_id),
+                source: message.source.clone(),
+                inflight: durably_started,
+            });
+        }
+        items.extend(runner.queue.iter().map(|message| QueuedMessage {
+            id: message.id,
+            content: message.content.clone(),
+            agent: message.agent.clone(),
+            mission_id: Some(*mission_id),
+            source: message.source.clone(),
+            inflight: false,
+        }));
+    }
+    let mut consumed: Vec<_> = recovered_consumed.values().cloned().collect();
+    consumed.sort_by_key(|message| message.id);
+    items.extend(consumed);
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -2793,19 +2951,23 @@ async fn persist_control_queue_if_changed(
     mission_store: &Arc<dyn MissionStore>,
     session_user_id: &str,
     queue: &VecDeque<ControlQueueEntry>,
+    parallel_runners: &std::collections::HashMap<Uuid, super::mission_runner::MissionRunner>,
+    recovered_consumed: &HashMap<Uuid, QueuedMessage>,
     last_persisted: &mut String,
-) {
-    let snapshot = serialize_queue_snapshot(queue);
+) -> Result<(), String> {
+    let snapshot = serialize_queue_snapshot(queue, parallel_runners, recovered_consumed);
     if snapshot != *last_persisted {
-        if let Err(e) = mission_store
+        if let Err(error) = mission_store
             .save_control_queue(session_user_id, &snapshot)
             .await
         {
-            tracing::warn!("Failed to persist control queue: {e}");
+            tracing::warn!("Failed to persist control queue: {error}");
+            return Err(error);
         } else {
             *last_persisted = snapshot;
         }
     }
+    Ok(())
 }
 
 /// Tool result posted by the frontend for an interactive tool call.
@@ -4120,11 +4282,127 @@ pub struct ListMissionsQuery {
     pub workspace: Option<String>,
 }
 
+fn mission_execution_projection(run: &MissionRun, status: MissionStatus) -> serde_json::Value {
+    let heartbeat_age = chrono::DateTime::parse_from_rfc3339(&run.heartbeat_at)
+        .ok()
+        .map(|timestamp| {
+            (chrono::Utc::now() - timestamp.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64
+        })
+        .unwrap_or(u64::MAX);
+    let conflict = if status == MissionStatus::Acknowledged || status.is_terminal() {
+        Some(format!("status_{status}_with_non_terminal_run"))
+    } else if heartbeat_age > 60 && run.execution_state != MissionExecutionState::WaitingUser {
+        Some(format!("run_heartbeat_stale_{heartbeat_age}s"))
+    } else {
+        None
+    };
+    serde_json::json!({
+        "run_id": run.run_id,
+        "generation": run.generation,
+        "state": run.execution_state,
+        "health": if conflict.is_some() { "reconciling" } else { "healthy" },
+        "heartbeat_at": run.heartbeat_at,
+        "scope_unit": run.scope_unit,
+        "status_conflict": conflict,
+    })
+}
+
+fn attach_execution_to_mission_value(
+    mut value: serde_json::Value,
+    mission: &Mission,
+    run: Option<&MissionRun>,
+) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "execution".to_string(),
+            run.map(|run| mission_execution_projection(run, mission.status))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "acknowledged_at".to_string(),
+            if mission.status == MissionStatus::Acknowledged {
+                serde_json::Value::String(mission.updated_at.clone())
+            } else {
+                serde_json::Value::Null
+            },
+        );
+    }
+    value
+}
+
+fn is_user_wait_tool(tool_kind: &str) -> bool {
+    matches!(tool_kind, "request_user_input" | "frontend_tool") || is_interactive_ui_tool(tool_kind)
+}
+
+const PROVISIONAL_TOOL_DEADLINE_SECS: i64 = 120;
+const MANAGED_SHELL_TOOL_DEADLINE_SECS: i64 = 10 * 60;
+const LONG_BUILD_TOOL_DEADLINE_SECS: i64 = 2 * 60 * 60;
+
+/// Return the absolute liveness window for a harness tool call.
+///
+/// Unknown protocol calls remain provisional for at most two minutes. Native
+/// harness shell tools are different: the harness emits the ToolResult only
+/// after its managed subprocess exits, so expiring their lease after two
+/// minutes would make a healthy synchronous command indistinguishable from an
+/// orphan. Keep ordinary shell work within the generic ten-minute ceiling and
+/// allow known build/verification commands the same two-hour ceiling as a
+/// durable workspace job.
+fn tool_execution_deadline_secs(tool_kind: &str, args: &serde_json::Value) -> i64 {
+    if !matches!(tool_kind, "Bash" | "bash" | "shell" | "Shell") {
+        return PROVISIONAL_TOOL_DEADLINE_SECS;
+    }
+
+    let command = args
+        .get("command")
+        .or_else(|| args.get("cmd"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let normalized = command
+        .split_whitespace()
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let is_long_build = [
+        "remote-lean-build",
+        "lake build",
+        "lake test",
+        "lake env lean",
+        "cargo build --release",
+        "cargo test --all",
+        "npm run build",
+        "bun run build",
+        "next build",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+
+    if is_long_build {
+        LONG_BUILD_TOOL_DEADLINE_SECS
+    } else {
+        MANAGED_SHELL_TOOL_DEADLINE_SECS
+    }
+}
+
+fn mission_heartbeat_state(
+    active_tool_calls: usize,
+    has_registered_user_wait: bool,
+) -> MissionExecutionState {
+    if has_registered_user_wait {
+        MissionExecutionState::WaitingUser
+    } else if active_tool_calls > 0 {
+        MissionExecutionState::WaitingTool
+    } else {
+        MissionExecutionState::Running
+    }
+}
+
 pub async fn list_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Query(query): Query<ListMissionsQuery>,
-) -> Result<Json<Vec<Mission>>, (StatusCode, String)> {
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     // Default to the most recent 50; honor an explicit limit so callers (e.g.
     // the assistant MCP) can request more, capped to keep the response bounded.
@@ -4207,7 +4485,22 @@ pub async fn list_missions(
     };
 
     populate_activity(&control, &mut missions).await;
-    Ok(Json(missions))
+    let active_runs: HashMap<Uuid, MissionRun> = control
+        .mission_store
+        .list_active_mission_runs()
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|run| (run.mission_id, run))
+        .collect();
+    let values = missions
+        .into_iter()
+        .map(|mission| {
+            let value = serde_json::to_value(&mission).unwrap_or(serde_json::Value::Null);
+            attach_execution_to_mission_value(value, &mission, active_runs.get(&mission.id))
+        })
+        .collect();
+    Ok(Json(values))
 }
 
 /// Targeted post-deploy/observability health for the mission fleet (P#8). One
@@ -4861,7 +5154,16 @@ pub async fn get_mission(
 
             // Serialize then attach the computed spark_offload block so Paloma
             // can route heavy builds without probing the host each time.
-            let mut value = serde_json::to_value(&mission).map_err(internal_error)?;
+            let active_run = control
+                .mission_store
+                .get_active_mission_run(mission.id)
+                .await
+                .map_err(internal_error)?;
+            let mut value = attach_execution_to_mission_value(
+                serde_json::to_value(&mission).map_err(internal_error)?,
+                &mission,
+                active_run.as_ref(),
+            );
             let host_configured =
                 state.config.spark_arbiter_url.is_some() || state.config.spark_ssh_target.is_some();
             let enabled = workspace
@@ -4953,6 +5255,13 @@ pub async fn get_mission_digest(
             }
         }
     }
+    let execution = control
+        .mission_store
+        .get_active_mission_run(mission.id)
+        .await
+        .map_err(internal_error)?
+        .as_ref()
+        .map(|run| mission_execution_projection(run, mission.status));
 
     Ok(Json(serde_json::json!({
         "id": mission.id,
@@ -4969,6 +5278,8 @@ pub async fn get_mission_digest(
         "project": mission.project,
         "created_at": mission.created_at,
         "updated_at": mission.updated_at,
+        "acknowledged_at": (mission.status == MissionStatus::Acknowledged).then_some(mission.updated_at.clone()),
+        "execution": execution,
         "history_len": mission.history.len(),
         "last_user_message": last_user,
         "last_assistant_message": last_assistant,
@@ -8593,6 +8904,7 @@ fn event_visibility(event_type: &str) -> &'static str {
 #[derive(Debug, Serialize)]
 pub struct MissionSnapshotResponse {
     pub mission: Mission,
+    pub execution: Option<serde_json::Value>,
     pub events: Vec<mission_store::StoredEvent>,
     pub event_counts: HashMap<String, usize>,
     pub counts: HashMap<String, usize>,
@@ -8749,9 +9061,17 @@ pub async fn get_mission_snapshot(
         .await?
         .into_iter()
         .find(|info| info.mission_id == mission_id);
+    let execution = control
+        .mission_store
+        .get_active_mission_run(mission_id)
+        .await
+        .map_err(internal_error)?
+        .as_ref()
+        .map(|run| mission_execution_projection(run, mission.status));
 
     Ok(Json(MissionSnapshotResponse {
         mission,
+        execution,
         events: summary.events,
         counts: event_counts.clone(),
         event_counts,
@@ -12551,6 +12871,29 @@ async fn control_actor_loop(
     // here from the `ToolResult` event arm; read by the auto-resume watcher.
     background_tasks: super::mission_runner::BackgroundTaskRegistry,
 ) {
+    // A process-local actor cannot reattach a harness JoinHandle after restart.
+    // Close any inherited execution lease before accepting new work; durable
+    // workspace/remote jobs remain independently recoverable by job id. Use
+    // the established server_shutdown reason so the startup recovery task
+    // below re-drives task-mode missions (assistant-mode missions remain idle).
+    if let Ok(inherited_runs) = mission_store.list_active_mission_runs().await {
+        for run in inherited_runs {
+            let _ = mission_store
+                .finish_mission_run(run.run_id, run.generation, Some("server_shutdown"))
+                .await;
+            if let Ok(Some(mission)) = mission_store.get_mission(run.mission_id).await {
+                if mission.status == MissionStatus::Active {
+                    let _ = mission_store
+                        .update_mission_status_with_reason(
+                            run.mission_id,
+                            MissionStatus::Interrupted,
+                            Some("server_shutdown"),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
     let mut queue: VecDeque<ControlQueueEntry> = VecDeque::new();
@@ -12563,12 +12906,18 @@ async fn control_actor_loop(
     // a client retry of the same id via `accept_user_message_id` (whichever
     // arrives first runs; the other is dropped), so nothing executes twice.
     let mut restored_db_snapshot = String::new();
+    let mut recovered_consumed_user_messages: HashMap<Uuid, QueuedMessage> = HashMap::new();
     if let Ok(payload) = mission_store.load_control_queue(&session_user_id).await {
         if !payload.trim().is_empty() {
             match serde_json::from_str::<Vec<QueuedMessage>>(&payload) {
                 Ok(items) => {
                     let count = items.len();
-                    for it in items {
+                    let (pending, consumed) = partition_restored_control_messages(items);
+                    let interrupted = consumed.len();
+                    recovered_consumed_user_messages
+                        .extend(consumed.into_iter().map(|message| (message.id, message)));
+                    let mut replayed = 0usize;
+                    for it in pending {
                         let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
                         if let Err(e) = self_cmd_tx.try_send(ControlCommand::UserMessage {
                             id: it.id,
@@ -12580,6 +12929,8 @@ async fn control_actor_loop(
                             respond: ack_tx,
                         }) {
                             tracing::warn!("Failed to re-queue restored control message: {e}");
+                        } else {
+                            replayed += 1;
                         }
                     }
                     if count > 0 {
@@ -12587,19 +12938,31 @@ async fn control_actor_loop(
                         // loop-top persist below rewrites the DB to the real
                         // (re-injected) state instead of leaving it stale.
                         restored_db_snapshot = payload;
-                        tracing::info!("Re-queued {count} message(s) from the previous session");
+                        tracing::info!(
+                            replayed,
+                            interrupted,
+                            total = count,
+                            "Recovered durable control messages from the previous session"
+                        );
                     }
                 }
                 Err(e) => tracing::warn!("Failed to parse persisted control queue: {e}"),
             }
         }
     }
+    // Parallel mission runners - each runs independently. Their pending
+    // messages share the durable session queue snapshot with the main queue.
+    let mut parallel_runners: std::collections::HashMap<
+        Uuid,
+        super::mission_runner::MissionRunner,
+    > = std::collections::HashMap::new();
+
     // Snapshot of the queue as last written to the store; used to debounce
     // persistence so we only write to the DB when the queue actually changes.
     // When messages were restored, seed it with the stale on-disk snapshot so
     // the first loop-top persist overwrites it with the live queue.
     let mut last_persisted_queue: String = if restored_db_snapshot.is_empty() {
-        serialize_queue_snapshot(&queue)
+        serialize_queue_snapshot(&queue, &parallel_runners, &recovered_consumed_user_messages)
     } else {
         restored_db_snapshot
     };
@@ -12610,6 +12973,9 @@ async fn control_actor_loop(
     // Track which mission the main `running` task is actually working on.
     // This is different from `current_mission` which can change when user creates a new mission.
     let mut running_mission_id: Option<Uuid> = None;
+    let mut running_run: Option<MissionRun> = None;
+    let mut execution_heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+    execution_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Track last activity for the main runner (for stall detection)
     let mut main_runner_last_activity: std::time::Instant = std::time::Instant::now();
     // Track current activity label for the main runner
@@ -12638,12 +13004,6 @@ async fn control_actor_loop(
     // the JoinHandle and clean up the in-memory state.
     let mut runner_force_clear_deadline: Option<tokio::time::Instant> = None;
     const RUNNER_FORCE_CLEAR_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-
-    // Parallel mission runners - each runs independently
-    let mut parallel_runners: std::collections::HashMap<
-        Uuid,
-        super::mission_runner::MissionRunner,
-    > = std::collections::HashMap::new();
 
     // Correlate Bash `tool_call_id` -> command string so that when the matching
     // `Bash` ToolResult carries a background-start marker we can record the
@@ -12677,6 +13037,8 @@ async fn control_actor_loop(
     // Per-boss "wake outstanding" flags, coalescing board wakes across passes.
     let mut board_wake_state: std::collections::HashMap<Uuid, bool> =
         std::collections::HashMap::new();
+    let board_outbox_inflight: board::BoardOutboxInflight =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
     // Helper to extract file paths from text (for mission summaries)
     fn extract_file_paths(text: &str) -> Vec<String> {
@@ -12892,18 +13254,142 @@ async fn control_actor_loop(
         // during streaming, where the queue is usually unchanged). Each dequeue
         // site below also persists immediately so a popped message can't be
         // re-run after a crash (see `persist_control_queue_if_changed`).
-        persist_control_queue_if_changed(
+        let _ = persist_control_queue_if_changed(
             &mission_store,
             &session_user_id,
             &queue,
+            &parallel_runners,
+            &recovered_consumed_user_messages,
             &mut last_persisted_queue,
         )
         .await;
         tokio::select! {
+            _ = execution_heartbeat.tick() => {
+                let mut leases = Vec::new();
+                if let Some(run) = running_run.clone() {
+                    leases.push((
+                        run,
+                        main_runner_active_tool_calls
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        main_runner_last_activity.elapsed().as_secs(),
+                    ));
+                }
+                leases.extend(parallel_runners.values().filter_map(|runner| {
+                    runner.durable_run.clone().map(|run| {
+                        (
+                            run,
+                            runner
+                                .active_tool_calls
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            runner.last_activity.elapsed().as_secs(),
+                        )
+                    })
+                }));
+                for (run, active_tool_calls, idle_secs) in leases {
+                    let mut live_registered_tools = 0usize;
+                    let mut has_registered_user_wait = false;
+                    if let Ok(tools) = mission_store
+                        .list_active_tool_executions(run.run_id)
+                        .await
+                    {
+                        for tool in tools {
+                            if is_user_wait_tool(&tool.tool_kind) {
+                                // User-input tools remain live until their
+                                // matching result arrives. The generic 120s
+                                // provisional deadline must never reap a
+                                // mission merely because a human took longer
+                                // than two minutes to answer.
+                                has_registered_user_wait = true;
+                                live_registered_tools += 1;
+                                continue;
+                            }
+                            let expired = chrono::DateTime::parse_from_rfc3339(
+                                &tool.deadline_at,
+                            )
+                            .map(|deadline| {
+                                deadline.with_timezone(&chrono::Utc) <= chrono::Utc::now()
+                            })
+                            .unwrap_or(true);
+                            if expired && tool.state == MissionToolExecutionState::Provisional {
+                                let _ = mission_store
+                                    .finish_tool_execution(
+                                        run.run_id,
+                                        &tool.tool_call_id,
+                                        MissionToolExecutionState::Stale,
+                                        None,
+                                        Some("unmatched_tool_call_deadline"),
+                                    )
+                                    .await;
+                            } else {
+                                live_registered_tools += 1;
+                            }
+                        }
+                    }
+                    let state = mission_heartbeat_state(
+                        active_tool_calls,
+                        has_registered_user_wait,
+                    );
+                    match mission_store
+                        .heartbeat_mission_run(run.run_id, run.generation, state, None)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            generation = run.generation,
+                            "Ignored heartbeat for stale mission run generation"
+                        ),
+                        Err(error) => tracing::warn!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            "Failed to persist mission run heartbeat: {error}"
+                        ),
+                    }
+                    if idle_secs >= 15 * 60
+                        && state != MissionExecutionState::WaitingUser
+                        && live_registered_tools == 0
+                    {
+                        tracing::warn!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            idle_secs,
+                            "Interrupting mission after 15 minutes without registered liveness evidence"
+                        );
+                        let _ = mission_store
+                            .heartbeat_mission_run(
+                                run.run_id,
+                                run.generation,
+                                MissionExecutionState::Stopping,
+                                None,
+                            )
+                            .await;
+                        if running_mission_id == Some(run.mission_id) {
+                            if let Some(token) = &running_cancel {
+                                token.cancel();
+                                runner_force_clear_deadline = Some(
+                                    tokio::time::Instant::now() + RUNNER_FORCE_CLEAR_GRACE,
+                                );
+                            }
+                        } else if let Some(runner) = parallel_runners.get_mut(&run.mission_id) {
+                            runner.cancel();
+                        }
+                    }
+                }
+            }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
+                        if recovered_consumed_user_messages.contains_key(&id) {
+                            // The previous actor had already started this exact
+                            // deterministic delivery. Its run was interrupted
+                            // during startup recovery, so acknowledge the retry
+                            // without repeating side effects; the mission now
+                            // requires an explicit resume.
+                            let _ = respond.send(UserMessageAck::Delivered);
+                            continue;
+                        }
                         if !accept_user_message_id(&mut accepted_user_message_ids, id) {
                             let status_snapshot = status.read().await;
                             let _ = respond.send(if status_snapshot.state != ControlRunState::Idle {
@@ -13138,47 +13624,161 @@ async fn control_actor_loop(
                                         continue;
                                     }
                                 }
-                                if let Some(runner) = parallel_runners.get_mut(&tid) {
-                                    let was_running = runner.is_running();
-                                    runner.queue_message(id, content.clone(), msg_agent, source.clone());
-                                    let _ = events_tx.send(AgentEvent::UserMessage {
-                                        id,
-                                        content: content.clone(),
-                                        queued: was_running,
-                                        mission_id: Some(tid),
-                                        source: source.clone(),
-                                    });
-                                    // Surface the parallel queue growth to all
-                                    // clients (Status events otherwise only
-                                    // carry the main queue length). Only when
-                                    // the message actually stays queued —
-                                    // otherwise start_next pops it right away.
-                                    if was_running {
-                                        let _ = events_tx.send(AgentEvent::Status {
-                                            state: ControlRunState::Running,
-                                            queue_len: runner.queue.len(),
-                                            mission_id: Some(tid),
-                                        });
-                                    }
-                                    // Try to start if not already running
-                                    if !runner.is_running() {
-                                        runner.start_next(
-                                            config.clone(),
-                                            Arc::clone(&root_agent),
-                                            Arc::clone(&mcp),
-                                            Arc::clone(&workspaces),
-                                            library.clone(),
-                                            events_tx.clone(),
-                                            Arc::clone(&tool_hub),
-                                            Arc::clone(&status),
-                                            mission_cmd_tx.clone(),
-                                            Arc::new(RwLock::new(Some(tid))),
-                                            secrets.clone(),
-                                        );
-                                    }
-                                    let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
+                                let Some(runner) = parallel_runners.get_mut(&tid) else {
+                                    accepted_user_message_ids.remove(&id);
+                                    let _ = respond.send(UserMessageAck::Rejected(format!(
+                                        "mission {tid} runner disappeared before queueing"
+                                    )));
+                                    continue;
+                                };
+                                if runner.cancellation_requested() {
+                                    accepted_user_message_ids.remove(&id);
+                                    let _ = respond.send(UserMessageAck::Rejected(format!(
+                                        "mission {tid} is stopping"
+                                    )));
                                     continue;
                                 }
+                                let was_running = runner.is_running();
+                                runner.queue_message(id, content.clone(), msg_agent, source.clone());
+                                // For an idle runner, reserve its prepared slot. Queue
+                                // serialization deliberately keeps this replayable until
+                                // acquire_durable_run succeeds.
+                                if !was_running && runner.take_next_message_for_start().is_none() {
+                                    accepted_user_message_ids.remove(&id);
+                                    let _ = respond.send(UserMessageAck::Rejected(format!(
+                                        "mission {tid} delivery disappeared before persistence"
+                                    )));
+                                    continue;
+                                }
+                                let _ = events_tx.send(AgentEvent::UserMessage {
+                                    id,
+                                    content: content.clone(),
+                                    queued: was_running,
+                                    mission_id: Some(tid),
+                                    source: source.clone(),
+                                });
+                                // Surface the parallel queue growth to all
+                                // clients (Status events otherwise only
+                                // carry the main queue length). Only when
+                                // the message actually stays queued —
+                                // otherwise start_next pops it right away.
+                                if was_running {
+                                    let _ = events_tx.send(AgentEvent::Status {
+                                        state: ControlRunState::Running,
+                                        queue_len: runner.queue.len(),
+                                        mission_id: Some(tid),
+                                    });
+                                }
+                                // Persist queued and prepared parallel deliveries before
+                                // they can be acknowledged. Prepared work remains marked
+                                // pending until its durable run lease exists.
+                                if let Err(error) = persist_control_queue_if_changed(
+                                    &mission_store,
+                                    &session_user_id,
+                                    &queue,
+                                    &parallel_runners,
+                                    &recovered_consumed_user_messages,
+                                    &mut last_persisted_queue,
+                                )
+                                .await
+                                {
+                                    if let Some(runner) = parallel_runners.get_mut(&tid) {
+                                        runner.remove_from_queue(id);
+                                        runner.remove_inflight_message(id);
+                                    }
+                                    accepted_user_message_ids.remove(&id);
+                                    let _ = respond.send(UserMessageAck::Rejected(format!(
+                                        "failed to persist parallel delivery: {error}"
+                                    )));
+                                    continue;
+                                }
+                                if !was_running {
+                                    let Some(runner) = parallel_runners.get_mut(&tid) else {
+                                        accepted_user_message_ids.remove(&id);
+                                        let _ = respond.send(UserMessageAck::Rejected(format!(
+                                            "mission {tid} runner disappeared before start"
+                                        )));
+                                        continue;
+                                    };
+                                    if let Err(error) = runner
+                                        .acquire_durable_run(
+                                            &mission_store,
+                                            &format!("control:{session_user_id}"),
+                                        )
+                                        .await
+                                    {
+                                        let _ = events_tx.send(AgentEvent::Error {
+                                            message: format!("Mission run lease rejected: {error}"),
+                                            mission_id: Some(tid),
+                                            resumable: true,
+                                        });
+                                        runner.remove_from_queue(id);
+                                        runner.remove_inflight_message(id);
+                                        let _ = persist_control_queue_if_changed(
+                                            &mission_store,
+                                            &session_user_id,
+                                            &queue,
+                                            &parallel_runners,
+                                            &recovered_consumed_user_messages,
+                                            &mut last_persisted_queue,
+                                        )
+                                        .await;
+                                        accepted_user_message_ids.remove(&id);
+                                        let _ = respond.send(UserMessageAck::Rejected(error));
+                                        continue;
+                                    }
+                                    if let Err(error) = persist_control_queue_if_changed(
+                                        &mission_store,
+                                        &session_user_id,
+                                        &queue,
+                                        &parallel_runners,
+                                        &recovered_consumed_user_messages,
+                                        &mut last_persisted_queue,
+                                    )
+                                    .await
+                                    {
+                                        if let Some(runner) = parallel_runners.get_mut(&tid) {
+                                            runner
+                                                .finish_durable_run(
+                                                    &mission_store,
+                                                    Some("consumed_snapshot_persist_failed"),
+                                                )
+                                                .await;
+                                            runner.remove_inflight_message(id);
+                                        }
+                                        accepted_user_message_ids.remove(&id);
+                                        let _ = respond.send(UserMessageAck::Rejected(format!(
+                                            "failed to persist consumed parallel delivery: {error}"
+                                        )));
+                                        continue;
+                                    }
+                                    let Some(runner) = parallel_runners.get_mut(&tid) else {
+                                        accepted_user_message_ids.remove(&id);
+                                        let _ = respond.send(UserMessageAck::Rejected(format!(
+                                            "mission {tid} runner disappeared before start"
+                                        )));
+                                        continue;
+                                    };
+                                    runner.start_next(
+                                        config.clone(),
+                                        Arc::clone(&root_agent),
+                                        Arc::clone(&mcp),
+                                        Arc::clone(&workspaces),
+                                        library.clone(),
+                                        events_tx.clone(),
+                                        Arc::clone(&tool_hub),
+                                        Arc::clone(&status),
+                                        mission_cmd_tx.clone(),
+                                        Arc::new(RwLock::new(Some(tid))),
+                                        secrets.clone(),
+                                    );
+                                }
+                                // The durable snapshot, not process creation,
+                                // is the acceptance boundary. Report Queued even
+                                // when execution started immediately so outbox
+                                // retirement never depends on a volatile handle.
+                                let _ = respond.send(UserMessageAck::Queued);
+                                continue;
                             }
                         }
 
@@ -13354,6 +13954,18 @@ async fn control_actor_loop(
                                             }
                                             // Queue the message
                                             runner.queue_message(id, content.clone(), msg_agent, source.clone());
+                                            // Reserve the prepared slot before its first
+                                            // snapshot. Serialization keeps it replayable until
+                                            // a durable run exists; start_next consumes this slot.
+                                            if runner.take_next_message_for_start().is_none() {
+                                                accepted_user_message_ids.remove(&id);
+                                                let _ = respond.send(UserMessageAck::Rejected(
+                                                    format!(
+                                                        "mission {tid} delivery disappeared before persistence"
+                                                    ),
+                                                ));
+                                                continue;
+                                            }
                                             // Emit user message event
                                             let _ = events_tx.send(AgentEvent::UserMessage {
                                                 id,
@@ -13362,7 +13974,87 @@ async fn control_actor_loop(
                                                 mission_id: Some(tid),
                                                 source: source.clone(),
                                             });
-                                            // Start execution
+                                            // Journal the prepared delivery as replayable pending
+                                            // before acquiring the run or starting a process.
+                                            parallel_runners.insert(tid, runner);
+                                            if let Err(error) = persist_control_queue_if_changed(
+                                                &mission_store,
+                                                &session_user_id,
+                                                &queue,
+                                                &parallel_runners,
+                                                &recovered_consumed_user_messages,
+                                                &mut last_persisted_queue,
+                                            )
+                                            .await
+                                            {
+                                                parallel_runners.remove(&tid);
+                                                accepted_user_message_ids.remove(&id);
+                                                let _ = respond.send(UserMessageAck::Rejected(
+                                                    format!(
+                                                        "failed to persist parallel delivery: {error}"
+                                                    ),
+                                                ));
+                                                continue;
+                                            }
+                                            let runner = parallel_runners
+                                                .get_mut(&tid)
+                                                .expect("parallel runner inserted above");
+                                            if let Err(error) = runner
+                                                .acquire_durable_run(
+                                                    &mission_store,
+                                                    &format!("control:{session_user_id}"),
+                                                )
+                                                .await
+                                            {
+                                                let _ = events_tx.send(AgentEvent::Error {
+                                                    message: format!("Mission run lease rejected: {error}"),
+                                                    mission_id: Some(tid),
+                                                    resumable: true,
+                                                });
+                                                parallel_runners.remove(&tid);
+                                                let _ = persist_control_queue_if_changed(
+                                                    &mission_store,
+                                                    &session_user_id,
+                                                    &queue,
+                                                    &parallel_runners,
+                                                    &recovered_consumed_user_messages,
+                                                    &mut last_persisted_queue,
+                                                )
+                                                .await;
+                                                accepted_user_message_ids.remove(&id);
+                                                let _ = respond.send(UserMessageAck::Rejected(error));
+                                                continue;
+                                            }
+                                            if let Err(error) = persist_control_queue_if_changed(
+                                                &mission_store,
+                                                &session_user_id,
+                                                &queue,
+                                                &parallel_runners,
+                                                &recovered_consumed_user_messages,
+                                                &mut last_persisted_queue,
+                                            )
+                                            .await
+                                            {
+                                                if let Some(runner) = parallel_runners.get_mut(&tid) {
+                                                    runner
+                                                        .finish_durable_run(
+                                                            &mission_store,
+                                                            Some("consumed_snapshot_persist_failed"),
+                                                        )
+                                                        .await;
+                                                }
+                                                parallel_runners.remove(&tid);
+                                                accepted_user_message_ids.remove(&id);
+                                                let _ = respond.send(UserMessageAck::Rejected(
+                                                    format!(
+                                                        "failed to persist consumed parallel delivery: {error}"
+                                                    ),
+                                                ));
+                                                continue;
+                                            }
+                                            let runner = parallel_runners
+                                                .get_mut(&tid)
+                                                .expect("parallel runner persisted above");
                                             runner.start_next(
                                                 config.clone(),
                                                 Arc::clone(&root_agent),
@@ -13377,8 +14069,7 @@ async fn control_actor_loop(
                                                 secrets.clone(),
                                             );
                                             tracing::info!("Auto-started mission {} in parallel", tid);
-                                            parallel_runners.insert(tid, runner);
-                                            let _ = respond.send(UserMessageAck::Delivered);
+                                            let _ = respond.send(UserMessageAck::Queued);
                                             continue;
                                         }
                                         Err(e) => {
@@ -13601,6 +14292,26 @@ async fn control_actor_loop(
                             }
                         }
                         queue.push_back((id, content, msg_agent, target_mission_id, source.clone()));
+                        // `Queued` is an acceptance acknowledgement. Persist the
+                        // message before sending it so a crash cannot lose an
+                        // outbox delivery that its producer has already retired.
+                        if let Err(error) = persist_control_queue_if_changed(
+                            &mission_store,
+                            &session_user_id,
+                            &queue,
+                            &parallel_runners,
+                            &recovered_consumed_user_messages,
+                            &mut last_persisted_queue,
+                        )
+                        .await
+                        {
+                            queue.retain(|(queued_id, ..)| *queued_id != id);
+                            accepted_user_message_ids.remove(&id);
+                            let _ = respond.send(UserMessageAck::Rejected(format!(
+                                "failed to persist queued delivery: {error}"
+                            )));
+                            continue;
+                        }
                         let status_mission_id = if running.is_some() {
                             running_mission_id
                         } else {
@@ -13626,13 +14337,29 @@ async fn control_actor_loop(
                             if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                                 // Persist the dequeue before the awaits that start
                                 // the run, so a crash here can't restore + re-run it.
-                                persist_control_queue_if_changed(
+                                if let Err(error) = persist_control_queue_if_changed(
                                     &mission_store,
                                     &session_user_id,
                                     &queue,
+                                    &parallel_runners,
+                                    &recovered_consumed_user_messages,
                                     &mut last_persisted_queue,
                                 )
-                                .await;
+                                .await
+                                {
+                                    queue.push_front((
+                                        mid,
+                                        msg,
+                                        per_msg_agent,
+                                        msg_target_mid,
+                                        msg_source,
+                                    ));
+                                    let _ = respond.send(UserMessageAck::Queued);
+                                    tracing::warn!(
+                                        "Queued delivery retained because dequeue persistence failed: {error}"
+                                    );
+                                    continue;
+                                }
                                 set_and_emit_status(
                                     &status,
                                     &events_tx,
@@ -13734,6 +14461,51 @@ async fn control_actor_loop(
                                 main_runner_active_tool_calls
                                     .store(0, std::sync::atomic::Ordering::Relaxed);
                                 let user_id_for_turn = session_user_id.clone();
+                                running_run = match acquire_execution_run(
+                                    &mission_store,
+                                    mission_id,
+                                    &format!("control:{session_user_id}"),
+                                )
+                                .await
+                                {
+                                    Ok(run) => run,
+                                    Err(error) => {
+                                        running_cancel = None;
+                                        running_mission_id = None;
+                                        // The queue dequeue was already persisted, but no
+                                        // run owns this delivery. Roll back the just-appended
+                                        // history entry and release the deterministic message
+                                        // id so the caller/outbox can retry it safely.
+                                        if history.last().is_some_and(|entry| {
+                                            entry.0 == "user" && entry.1 == msg
+                                        }) {
+                                            history.pop();
+                                            persist_mission_history_to(
+                                                &mission_store,
+                                                &events_tx,
+                                                msg_target_mid,
+                                                &history,
+                                            )
+                                            .await;
+                                        }
+                                        accepted_user_message_ids.remove(&mid);
+                                        set_and_emit_status(
+                                            &status,
+                                            &events_tx,
+                                            ControlRunState::Idle,
+                                            queue.len(),
+                                            msg_target_mid,
+                                        )
+                                        .await;
+                                        let _ = respond.send(UserMessageAck::Rejected(error.clone()));
+                                        let _ = events_tx.send(AgentEvent::Error {
+                                            message: format!("Mission run lease rejected: {error}"),
+                                            mission_id,
+                                            resumable: true,
+                                        });
+                                        continue;
+                                    }
+                                };
                                 running = Some(tokio::spawn(async move {
                                     let result = run_single_control_turn(
                                         cfg,
@@ -13770,6 +14542,9 @@ async fn control_actor_loop(
                         }
                         let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                     }
+                    ControlCommand::ReleaseUserMessageId { id } => {
+                        accepted_user_message_ids.remove(&id);
+                    }
                     ControlCommand::ToolResult { tool_call_id, name, result, respond } => {
                         // Deliver to the tool hub. resolve() caches the result if
                         // no one has registered yet (resolve-before-register), and
@@ -13787,6 +14562,16 @@ async fn control_actor_loop(
                     ControlCommand::Cancel => {
                         if let Some(token) = &running_cancel {
                             token.cancel();
+                            if let Some(run) = running_run.as_ref() {
+                                let _ = mission_store
+                                    .heartbeat_mission_run(
+                                        run.run_id,
+                                        run.generation,
+                                        MissionExecutionState::Stopping,
+                                        None,
+                                    )
+                                    .await;
+                            }
                             // Don't send Error event here - the task will complete and send
                             // an AssistantMessage with the cancellation result when it finishes.
                             // Sending both causes duplicate UI messages.
@@ -14122,6 +14907,18 @@ async fn control_actor_loop(
                             runner.queue_message(Uuid::new_v4(), content, None, None);
 
                             // Start execution
+                            if let Err(error) = runner
+                                .acquire_durable_run(
+                                    &mission_store,
+                                    &format!("control:{session_user_id}"),
+                                )
+                                .await
+                            {
+                                let _ = respond.send(Err(format!(
+                                    "Failed to acquire mission run lease: {error}"
+                                )));
+                                continue;
+                            }
                             let started = runner.start_next(
                                 config.clone(),
                                 Arc::clone(&root_agent),
@@ -14225,7 +15022,20 @@ async fn control_actor_loop(
                                 // Cancel runner if running
                                 if let Some(runner) = parallel_runners.get_mut(&child.id) {
                                     runner.cancel();
-                                    parallel_runners.remove(&child.id);
+                                    if let Some(run) = runner.durable_run.as_ref() {
+                                        let _ = mission_store
+                                            .heartbeat_mission_run(
+                                                run.run_id,
+                                                run.generation,
+                                                MissionExecutionState::Stopping,
+                                                None,
+                                            )
+                                            .await;
+                                    }
+                                    // Keep the runner registered until its task
+                                    // actually exits; dropping the JoinHandle
+                                    // here would detach live work.
+                                    continue;
                                 }
                                 if let Err(e) = mission_store
                                     .update_mission_status(child.id, MissionStatus::Interrupted)
@@ -14246,43 +15056,36 @@ async fn control_actor_loop(
                         // First check parallel runners
                         if let Some(runner) = parallel_runners.get_mut(&mission_id) {
                             runner.cancel();
-                            // Update status to Interrupted so the mission can be
-                            // resumed later (fixes #149: cancel left status as pending).
-                            if let Err(e) = mission_store
-                                .update_mission_status(mission_id, MissionStatus::Interrupted)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to update cancelled parallel mission status: {}",
-                                    e
-                                );
-                            } else {
-                                maybe_schedule_mission_metadata_refresh_for_status(
-                                    &mission_store,
-                                    &events_tx,
-                                    mission_id,
-                                    MissionStatus::Interrupted,
-                                );
+                            if let Some(run) = runner.durable_run.as_ref() {
+                                let _ = mission_store
+                                    .heartbeat_mission_run(
+                                        run.run_id,
+                                        run.generation,
+                                        MissionExecutionState::Stopping,
+                                        None,
+                                    )
+                                    .await;
                             }
                             let _ = events_tx.send(AgentEvent::Error {
-                                message: format!("Parallel mission {} cancelled", mission_id),
+                                message: format!("Parallel mission {} cancellation requested", mission_id),
                                 mission_id: Some(mission_id),
                                 resumable: true, // Cancelled missions can be resumed
                             });
-                            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                mission_id,
-                                status: MissionStatus::Interrupted,
-                                summary: None,
-                            });
-                            parallel_runners.remove(&mission_id);
-                            close_mission_desktop_sessions(
-                                &mission_store,
-                                mission_id,
-                                &config.working_dir,
-                            )
-                            .await;
                             // Cascade cancel child missions
                             cancel_child_missions(mission_id, &mission_store, &mut parallel_runners, &events_tx, &config.working_dir).await;
+                            if let Err(error) = persist_control_queue_if_changed(
+                                &mission_store,
+                                &session_user_id,
+                                &queue,
+                                &parallel_runners,
+                                &recovered_consumed_user_messages,
+                                &mut last_persisted_queue,
+                            )
+                            .await
+                            {
+                                tracing::warn!(mission_id = %mission_id,
+                                    "Failed to persist cleared queues after cancellation: {error}");
+                            }
                             let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
                         } else {
                             // Check if this is the currently executing mission
@@ -14292,6 +15095,16 @@ async fn control_actor_loop(
                                 // Cancel the current execution
                                 if let Some(token) = &running_cancel {
                                     token.cancel();
+                                    if let Some(run) = running_run.as_ref() {
+                                        let _ = mission_store
+                                            .heartbeat_mission_run(
+                                                run.run_id,
+                                                run.generation,
+                                                MissionExecutionState::Stopping,
+                                                None,
+                                            )
+                                            .await;
+                                    }
                                     // Arm the force-clear deadline. Most cancels
                                     // wind down within a few seconds via the
                                     // task's own observation of the cancel
@@ -14391,7 +15204,16 @@ async fn control_actor_loop(
                         // stop logic but lands on `Paused` instead of `Interrupted`.
                         if let Some(runner) = parallel_runners.get_mut(&mission_id) {
                             runner.cancel();
-                            parallel_runners.remove(&mission_id);
+                            if let Some(run) = runner.durable_run.as_ref() {
+                                let _ = mission_store
+                                    .heartbeat_mission_run(
+                                        run.run_id,
+                                        run.generation,
+                                        MissionExecutionState::Stopping,
+                                        None,
+                                    )
+                                    .await;
+                            }
                             close_mission_desktop_sessions(
                                 &mission_store,
                                 mission_id,
@@ -14401,6 +15223,16 @@ async fn control_actor_loop(
                         } else if running_mission_id == Some(mission_id) {
                             if let Some(token) = &running_cancel {
                                 token.cancel();
+                                if let Some(run) = running_run.as_ref() {
+                                    let _ = mission_store
+                                        .heartbeat_mission_run(
+                                            run.run_id,
+                                            run.generation,
+                                            MissionExecutionState::Stopping,
+                                            None,
+                                        )
+                                        .await;
+                                }
                                 // Arm the force-clear deadline so a zombie runner
                                 // that never observes the cancel still gets torn
                                 // down (matches CancelMission).
@@ -14491,6 +15323,13 @@ async fn control_actor_loop(
                                     current_activity: main_runner_activity.clone(),
                                     subtask_total: main_runner_subtasks.len(),
                                     subtask_completed: main_runner_subtasks.iter().filter(|s| s.completed).count(),
+                                    run_id: running_run.as_ref().map(|run| run.run_id),
+                                    generation: running_run.as_ref().map(|run| run.generation),
+                                    heartbeat_at: running_run.as_ref().map(|run| run.heartbeat_at.clone()),
+                                    scope_unit: running_run.as_ref().and_then(|run| run.scope_unit.clone()),
+                                    status_conflict: running_run
+                                        .is_none()
+                                        .then(|| "actor_without_durable_run".to_string()),
                                 });
                             }
                         }
@@ -14627,6 +15466,18 @@ async fn control_actor_loop(
                                     }
                                     runner.queue_message(Uuid::new_v4(), resume_prompt, None, None);
 
+                                    if let Err(error) = runner
+                                        .acquire_durable_run(
+                                            &mission_store,
+                                            &format!("control:{session_user_id}"),
+                                        )
+                                        .await
+                                    {
+                                        let _ = respond.send(Err(format!(
+                                            "Failed to acquire mission run lease: {error}"
+                                        )));
+                                        continue;
+                                    }
                                     let started = runner.start_next(
                                         config.clone(),
                                         Arc::clone(&root_agent),
@@ -14741,17 +15592,32 @@ async fn control_actor_loop(
 
                                 // Start execution if not already running
                                 if running.is_none() {
-                                    if let Some((mid, msg, _per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
+                                    if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                                         // Persist the dequeue before the awaits that
                                         // start the run, so a crash here can't
                                         // restore + re-run it.
-                                        persist_control_queue_if_changed(
+                                        if let Err(error) = persist_control_queue_if_changed(
                                             &mission_store,
                                             &session_user_id,
                                             &queue,
+                                            &parallel_runners,
+                                            &recovered_consumed_user_messages,
                                             &mut last_persisted_queue,
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            queue.push_front((
+                                                mid,
+                                                msg,
+                                                per_msg_agent,
+                                                msg_target_mid,
+                                                msg_source,
+                                            ));
+                                            let _ = respond.send(Err(format!(
+                                                "Failed to persist resumed mission queue: {error}"
+                                            )));
+                                            continue;
+                                        }
                                         let target_mid = msg_target_mid.unwrap_or(mission_id);
                                         set_and_emit_status(
                                             &status,
@@ -14795,6 +15661,23 @@ async fn control_actor_loop(
                                         main_runner_active_tool_calls
                                             .store(0, std::sync::atomic::Ordering::Relaxed);
                                         let user_id_for_turn = session_user_id.clone();
+                                        running_run = match acquire_execution_run(
+                                            &mission_store,
+                                            Some(mission_id),
+                                            &format!("control:{session_user_id}"),
+                                        )
+                                        .await
+                                        {
+                                            Ok(run) => run,
+                                            Err(error) => {
+                                                running_cancel = None;
+                                                running_mission_id = None;
+                                                let _ = respond.send(Err(format!(
+                                                    "Failed to acquire mission run lease: {error}"
+                                                )));
+                                                continue;
+                                            }
+                                        };
                                         running = Some(tokio::spawn(async move {
                                             let result = run_single_control_turn(
                                                 cfg,
@@ -14946,6 +15829,7 @@ async fn control_actor_loop(
                                 agent: agent.clone(),
                                 mission_id: *target_mid,
                                 source: source.clone(),
+                                inflight: false,
                             })
                             .collect();
                         // Also collect queued messages from parallel runners
@@ -14957,6 +15841,7 @@ async fn control_actor_loop(
                                     agent: qm.agent.clone(),
                                     mission_id: Some(*mid),
                                     source: qm.source.clone(),
+                                    inflight: false,
                                 });
                             }
                         }
@@ -15227,6 +16112,25 @@ async fn control_actor_loop(
                             completed_completion_confidence =
                                 Some(completion_evidence.completion_confidence);
                             completed_agent_output = agent_result.output.clone();
+                            if let Some(run) = running_run.take() {
+                                let reason = agent_result
+                                    .terminal_reason
+                                    .map(|value| format!("{value:?}"));
+                                if let Err(error) = mission_store
+                                    .finish_mission_run(
+                                        run.run_id,
+                                        run.generation,
+                                        reason.as_deref(),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        mission_id = %run.mission_id,
+                                        run_id = %run.run_id,
+                                        "Failed to close main mission run: {error}"
+                                    );
+                                }
+                            }
                             // Only append assistant to local history if this mission is still the current mission.
                             // Note: User message was already added before execution started.
                             // If the user created a new mission mid-execution, history was cleared for that new mission,
@@ -15394,6 +16298,15 @@ async fn control_actor_loop(
                             }
                         }
                         Err(e) => {
+                            if let Some(run) = running_run.take() {
+                                let _ = mission_store
+                                    .finish_mission_run(
+                                        run.run_id,
+                                        run.generation,
+                                        Some("runner_join_failed"),
+                                    )
+                                    .await;
+                            }
                             let _ = events_tx.send(AgentEvent::Error {
                                 message: format!("Control session task join failed: {}", e),
                                 mission_id: completed_mission_id,
@@ -15515,13 +16428,81 @@ async fn control_actor_loop(
                 if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                     // Persist the dequeue before the awaits that start the run, so
                     // a crash here can't restore + re-run it.
-                    persist_control_queue_if_changed(
+                    if let Err(error) = persist_control_queue_if_changed(
                         &mission_store,
                         &session_user_id,
                         &queue,
+                        &parallel_runners,
+                        &recovered_consumed_user_messages,
                         &mut last_persisted_queue,
                     )
-                    .await;
+                    .await
+                    {
+                        queue.push_front((
+                            mid,
+                            msg,
+                            per_msg_agent,
+                            msg_target_mid,
+                            msg_source,
+                        ));
+                        tracing::warn!(
+                            "Queued delivery retained because dequeue persistence failed: {error}"
+                        );
+                        continue;
+                    }
+                    // Acquire the durable run before publishing the message as
+                    // started or appending it to history. If a stale run lease
+                    // rejects acquisition, retain the exact queued delivery so
+                    // an idempotent retry cannot be acknowledged without ever
+                    // executing its turn.
+                    let mission_id = msg_target_mid;
+                    running_run = match acquire_execution_run(
+                        &mission_store,
+                        mission_id,
+                        &format!("control:{session_user_id}"),
+                    )
+                    .await
+                    {
+                        Ok(run) => run,
+                        Err(error) => {
+                            queue.push_front((
+                                mid,
+                                msg,
+                                per_msg_agent,
+                                msg_target_mid,
+                                msg_source,
+                            ));
+                            if let Err(persist_error) = persist_control_queue_if_changed(
+                                &mission_store,
+                                &session_user_id,
+                                &queue,
+                                &parallel_runners,
+                                &recovered_consumed_user_messages,
+                                &mut last_persisted_queue,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "Failed to persist queued delivery after run lease rejection: {persist_error}"
+                                );
+                            }
+                            let _ = events_tx.send(AgentEvent::Error {
+                                message: format!("Mission run lease rejected: {error}"),
+                                mission_id,
+                                resumable: true,
+                            });
+                            set_and_emit_status(
+                                &status,
+                                &events_tx,
+                                ControlRunState::Idle,
+                                queue.len(),
+                                mission_id,
+                            )
+                            .await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                            continue;
+                        }
+                    };
                     set_and_emit_status(
                         &status,
                         &events_tx,
@@ -15558,9 +16539,9 @@ async fn control_actor_loop(
                     let tree_ref = Arc::clone(&current_tree);
                     let progress_ref = Arc::clone(&progress);
                     running_cancel = Some(cancel.clone());
-                    // Use the mission ID that was captured when message was queued
-                    // This prevents race conditions where current_mission changes between queueing and execution
-                    let mission_id = msg_target_mid;
+                    // Use the mission ID that was captured when message was queued.
+                    // This prevents races where current_mission changes between
+                    // queueing and execution.
                     let (workspace_id, model_override, model_effort, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
                         match mission_store.get_mission(mid).await {
                             Ok(Some(mission)) => (
@@ -15640,9 +16621,76 @@ async fn control_actor_loop(
                 let mut completed_missions = Vec::new();
 
                 for (mission_id, runner) in parallel_runners.iter_mut() {
+                    if runner.force_clear_cancelled_if_due() {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            "Force-aborting stuck parallel runner after cancellation grace period"
+                        );
+                        runner
+                            .finish_durable_run(
+                                &mission_store,
+                                Some("force_killed_after_cancel_timeout"),
+                            )
+                            .await;
+                        if let Err(error) = mission_store
+                            .update_mission_status_with_reason(
+                                *mission_id,
+                                MissionStatus::Interrupted,
+                                Some("force_killed_after_cancel_timeout"),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                "Failed to mark force-cleared parallel mission interrupted: {error}"
+                            );
+                        } else {
+                            maybe_schedule_mission_metadata_refresh_for_status(
+                                &mission_store,
+                                &events_tx,
+                                *mission_id,
+                                MissionStatus::Interrupted,
+                            );
+                            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                mission_id: *mission_id,
+                                status: MissionStatus::Interrupted,
+                                summary: Some(
+                                    "Cancel timed out; force-aborted stuck parallel runner."
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                        if let Err(error) = mission_store
+                            .complete_running_executions_for_mission(
+                                *mission_id,
+                                false,
+                                Some(
+                                    "Force-aborted stuck parallel runner after cancel timed out"
+                                        .to_string(),
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                "Failed to complete parallel executions on force-clear: {error}"
+                            );
+                        }
+                        completed_missions.push(*mission_id);
+                        continue;
+                    }
                     if runner.check_finished() {
                         if let Some((_msg_id, _user_msg, mut result)) = runner.poll_completion().await {
                             maybe_recover_soft_llm_error(&mut result);
+                            let durable_terminal_reason = result
+                                .terminal_reason
+                                .map(|reason| format!("{reason:?}"));
+                            runner
+                                .finish_durable_run(
+                                    &mission_store,
+                                    durable_terminal_reason.as_deref(),
+                                )
+                                .await;
                             let completion_evidence = completion_evidence_for_agent_result(&result);
                             tracing::info!(
                                 "Parallel mission {} completed (success: {}, cost: {} cents)",
@@ -15755,6 +16803,7 @@ async fn control_actor_loop(
                                     | Some(TerminalReason::RateLimited)
                                     | Some(TerminalReason::CapacityLimited)
                             );
+                            let cancellation_requested = runner.cancellation_requested();
                             let was_queue_empty = runner.queue.is_empty();
                             // Grok /goal sentinel hook for the parallel-runner
                             // path. Same contract as the main-session hook
@@ -15772,7 +16821,10 @@ async fn control_actor_loop(
                                 )
                                 .await;
                             }
-                            if was_queue_empty && !is_transient_infra_failure {
+                            if was_queue_empty
+                                && !is_transient_infra_failure
+                                && !cancellation_requested
+                            {
                                 // Small delay so the UI can display the completion before restarting.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                 let messages = agent_finished_automation_messages(
@@ -15815,6 +16867,25 @@ async fn control_actor_loop(
                                         );
                                         runner.session_id = m.session_id;
                                     }
+                                }
+                                if let Err(error) = runner
+                                    .acquire_durable_run(
+                                        &mission_store,
+                                        &format!("control:{session_user_id}"),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        "Failed to acquire next mission run lease: {error}"
+                                    );
+                                    let _ = events_tx.send(AgentEvent::Error {
+                                        message: format!("Mission run lease rejected: {error}"),
+                                        mission_id: Some(*mission_id),
+                                        resumable: true,
+                                    });
+                                    completed_missions.push(*mission_id);
+                                    continue;
                                 }
                                 let started = runner.start_next(
                                     config.clone(),
@@ -15908,6 +16979,7 @@ async fn control_actor_loop(
                         &snapshot,
                         max_parallel,
                         &mut board_wake_state,
+                        &board_outbox_inflight,
                     )
                     .await;
                 }
@@ -16071,6 +17143,15 @@ async fn control_actor_loop(
                 main_runner_active_tool_calls
                     .store(0, std::sync::atomic::Ordering::Relaxed);
                 runner_force_clear_deadline = None;
+                if let Some(run) = running_run.take() {
+                    let _ = mission_store
+                        .finish_mission_run(
+                            run.run_id,
+                            run.generation,
+                            Some("force_killed_after_cancel_timeout"),
+                        )
+                        .await;
+                }
                 if let Some(mid) = stuck_mid {
                     // Mark mission as Interrupted so it stays resumable.
                     if let Err(e) = mission_store
@@ -16168,6 +17249,58 @@ async fn control_actor_loop(
                                     runner
                                         .active_tool_calls
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+
+                                let durable_run = if running_mission_id == Some(*mid) {
+                                    running_run.clone()
+                                } else {
+                                    parallel_runners
+                                        .get(mid)
+                                        .and_then(|runner| runner.durable_run.clone())
+                                };
+                                if let Some(run) = durable_run {
+                                    let now = chrono::Utc::now();
+                                    let waiting_state = if is_user_wait_tool(name) {
+                                        MissionExecutionState::WaitingUser
+                                    } else {
+                                        MissionExecutionState::WaitingTool
+                                    };
+                                    let _ = mission_store
+                                        .heartbeat_mission_run(
+                                            run.run_id,
+                                            run.generation,
+                                            waiting_state,
+                                            None,
+                                        )
+                                        .await;
+                                    let execution = MissionToolExecution {
+                                        tool_call_id: tool_call_id.clone(),
+                                        run_id: run.run_id,
+                                        tool_kind: name.clone(),
+                                        state: MissionToolExecutionState::Provisional,
+                                        started_at: now.to_rfc3339(),
+                                        heartbeat_at: now.to_rfc3339(),
+                                        deadline_at: (now
+                                            + chrono::Duration::seconds(
+                                                tool_execution_deadline_secs(name, args),
+                                            ))
+                                        .to_rfc3339(),
+                                        process_pid: None,
+                                        durable_job_id: None,
+                                        completed_at: None,
+                                        exit_status: None,
+                                        failure_class: None,
+                                    };
+                                    if let Err(error) = mission_store
+                                        .register_tool_execution(&execution)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            mission_id = %mid,
+                                            tool_call_id = %tool_call_id,
+                                            "Failed to register tool execution: {error}"
+                                        );
+                                    }
                                 }
 
                                 // Background-task auto-resume: stash the command
@@ -16325,6 +17458,47 @@ async fn control_actor_loop(
                                         std::sync::atomic::Ordering::Relaxed,
                                         |c| if c > 0 { Some(c - 1) } else { None },
                                     );
+                                }
+
+                                let durable_run = if running_mission_id == Some(*mid) {
+                                    running_run.clone()
+                                } else {
+                                    parallel_runners
+                                        .get(mid)
+                                        .and_then(|runner| runner.durable_run.clone())
+                                };
+                                if let Some(run) = durable_run {
+                                    match mission_store
+                                        .finish_tool_execution(
+                                            run.run_id,
+                                            tool_call_id,
+                                            MissionToolExecutionState::Completed,
+                                            Some(0),
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            let _ = mission_store
+                                                .heartbeat_mission_run(
+                                                    run.run_id,
+                                                    run.generation,
+                                                    MissionExecutionState::Running,
+                                                    None,
+                                                )
+                                                .await;
+                                        }
+                                        Ok(false) => tracing::debug!(
+                                            mission_id = %mid,
+                                            tool_call_id = %tool_call_id,
+                                            "Stored late or unmatched tool result without mutating current run"
+                                        ),
+                                        Err(error) => tracing::warn!(
+                                            mission_id = %mid,
+                                            tool_call_id = %tool_call_id,
+                                            "Failed to finish tool execution: {error}"
+                                        ),
+                                    }
                                 }
 
                                 // Mark subtask complete if applicable
@@ -19959,6 +21133,54 @@ mod tests {
         assert!(refusal.contains("80 GiB is free"));
     }
 
+    #[test]
+    fn mission_heartbeat_preserves_registered_user_waits() {
+        assert!(is_user_wait_tool("request_user_input"));
+        assert!(is_user_wait_tool("AskUserQuestion"));
+        assert!(is_user_wait_tool("frontend_tool"));
+        assert!(is_user_wait_tool("question"));
+        assert!(is_user_wait_tool("ui_confirm"));
+        assert!(!is_user_wait_tool("workspace_bash"));
+        assert_eq!(
+            mission_heartbeat_state(1, true),
+            MissionExecutionState::WaitingUser
+        );
+        assert_eq!(
+            mission_heartbeat_state(1, false),
+            MissionExecutionState::WaitingTool
+        );
+        assert_eq!(
+            mission_heartbeat_state(0, false),
+            MissionExecutionState::Running
+        );
+    }
+
+    #[test]
+    fn tool_execution_deadlines_are_bounded_by_tool_class() {
+        assert_eq!(
+            tool_execution_deadline_secs("Read", &serde_json::json!({"path": "README.md"})),
+            PROVISIONAL_TOOL_DEADLINE_SECS
+        );
+        assert_eq!(
+            tool_execution_deadline_secs("Bash", &serde_json::json!({"command": "git status"})),
+            MANAGED_SHELL_TOOL_DEADLINE_SECS
+        );
+        assert_eq!(
+            tool_execution_deadline_secs(
+                "bash",
+                &serde_json::json!({"command": "cd Verity && lake build"})
+            ),
+            LONG_BUILD_TOOL_DEADLINE_SECS
+        );
+        assert_eq!(
+            tool_execution_deadline_secs(
+                "Shell",
+                &serde_json::json!({"cmd": "remote-lean-build -- lake test"})
+            ),
+            LONG_BUILD_TOOL_DEADLINE_SECS
+        );
+    }
+
     fn reset_metadata_refresh_test_state() {
         let stale_tasks = {
             let mut tasks = MISSION_METADATA_REFRESH_TASKS
@@ -23276,6 +24498,7 @@ And the report:
             repository: None,
             branch: None,
             depends_on: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -23972,6 +25195,138 @@ Investigate <service/> failures.
 
         assert!(queue_has_pending_target_mission(&queue, mission_id));
         assert!(!queue_has_pending_target_mission(&queue, Uuid::new_v4()));
+    }
+
+    #[test]
+    fn queue_snapshot_replays_prepared_parallel_message_until_run_exists() {
+        let main_mission = Uuid::new_v4();
+        let parallel_mission = Uuid::new_v4();
+        let main_queue = VecDeque::from([(
+            Uuid::new_v4(),
+            "main".to_string(),
+            None,
+            Some(main_mission),
+            Some("api:test".to_string()),
+        )]);
+        let mut runner = crate::api::mission_runner::MissionRunner::new(
+            parallel_mission,
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let parallel_message_id = Uuid::new_v4();
+        runner.queue_message(
+            parallel_message_id,
+            "parallel".to_string(),
+            None,
+            Some("task-board".to_string()),
+        );
+        runner
+            .take_next_message_for_start()
+            .expect("parallel message should move to the in-flight slot");
+        assert!(runner.queue.is_empty());
+        let parallel = std::collections::HashMap::from([(parallel_mission, runner)]);
+
+        let snapshot = serialize_queue_snapshot(&main_queue, &parallel, &HashMap::new());
+        let messages: Vec<QueuedMessage> = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|message| {
+            message.id == parallel_message_id
+                && message.content == "parallel"
+                && message.mission_id == Some(parallel_mission)
+                && !message.inflight
+        }));
+        assert!(messages
+            .iter()
+            .any(|message| message.content == "main" && !message.inflight));
+    }
+
+    #[test]
+    fn queue_snapshot_marks_parallel_message_consumed_with_durable_run() {
+        let mission_id = Uuid::new_v4();
+        let mut runner = crate::api::mission_runner::MissionRunner::new(
+            mission_id,
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let message_id = Uuid::new_v4();
+        runner.queue_message(
+            message_id,
+            "parallel".into(),
+            None,
+            Some("task-board".into()),
+        );
+        runner
+            .take_next_message_for_start()
+            .expect("message should enter prepared slot");
+        runner.durable_run = Some(MissionRun {
+            run_id: Uuid::new_v4(),
+            mission_id,
+            generation: 1,
+            execution_state: MissionExecutionState::Running,
+            owner_actor_id: "control:test".into(),
+            scope_unit: None,
+            started_at: now_string(),
+            heartbeat_at: now_string(),
+            stopping_at: None,
+            ended_at: None,
+            terminal_reason: None,
+        });
+        let runners = std::collections::HashMap::from([(mission_id, runner)]);
+
+        let snapshot = serialize_queue_snapshot(&VecDeque::new(), &runners, &HashMap::new());
+        let messages: Vec<QueuedMessage> = serde_json::from_str(&snapshot).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, message_id);
+        assert!(messages[0].inflight);
+    }
+
+    #[test]
+    fn restart_marks_inflight_parallel_messages_consumed_without_replay() {
+        let pending_id = Uuid::new_v4();
+        let inflight_id = Uuid::new_v4();
+        let (pending, consumed) = partition_restored_control_messages(vec![
+            QueuedMessage {
+                id: pending_id,
+                content: "not started".into(),
+                agent: None,
+                mission_id: Some(Uuid::new_v4()),
+                source: None,
+                inflight: false,
+            },
+            QueuedMessage {
+                id: inflight_id,
+                content: "already started".into(),
+                agent: None,
+                mission_id: Some(Uuid::new_v4()),
+                source: Some("task-board".into()),
+                inflight: true,
+            },
+        ]);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, pending_id);
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].id, inflight_id);
+        assert!(consumed[0].inflight);
+
+        let recovered = HashMap::from([(inflight_id, consumed[0].clone())]);
+        let snapshot = serialize_queue_snapshot(&VecDeque::new(), &HashMap::new(), &recovered);
+        let reparsed: Vec<QueuedMessage> = serde_json::from_str(&snapshot).unwrap();
+        let (replayed_again, consumed_again) = partition_restored_control_messages(reparsed);
+        assert!(replayed_again.is_empty());
+        assert_eq!(consumed_again.len(), 1);
+        assert_eq!(consumed_again[0].id, inflight_id);
     }
 
     #[test]

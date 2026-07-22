@@ -161,6 +161,24 @@ pub fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputePolicy {
+    LocalAllowed,
+    RemotePreferred,
+    RemoteRequired,
+}
+
+impl ComputePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalAllowed => "local_allowed",
+            Self::RemotePreferred => "remote_preferred",
+            Self::RemoteRequired => "remote_required",
+        }
+    }
+}
+
 /// A workspace definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
@@ -239,6 +257,41 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// Compute placement policy for heavy Lean work. An explicit config value
+    /// wins; Beal and Verity fail closed remotely by default, other Lean
+    /// workspaces prefer remote capacity, and non-Lean work stays local.
+    pub fn compute_policy(&self) -> ComputePolicy {
+        let configured = self
+            .config
+            .get("compute_policy")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                self.config
+                    .get("remote_build")
+                    .and_then(|value| value.get("compute_policy"))
+                    .and_then(|value| value.as_str())
+            });
+        if let Some(policy) = configured {
+            return match policy {
+                "remote_required" => ComputePolicy::RemoteRequired,
+                "remote_preferred" => ComputePolicy::RemotePreferred,
+                _ => ComputePolicy::LocalAllowed,
+            };
+        }
+        let identity = format!("{} {}", self.name, self.path.display()).to_ascii_lowercase();
+        if identity.contains("beal") || identity.contains("verity") {
+            return ComputePolicy::RemoteRequired;
+        }
+        let lean_workspace = self.template.as_deref() == Some("lean")
+            || self.skills.iter().any(|skill| skill == "lean")
+            || self.config.get("remote_build").is_some();
+        if lean_workspace {
+            ComputePolicy::RemotePreferred
+        } else {
+            ComputePolicy::LocalAllowed
+        }
+    }
+
     /// True when this workspace runs in its own network namespace — a
     /// container with `shared_network = false` and Tailscale veth networking
     /// (the only path that passes `--network-veth` to systemd-nspawn).
@@ -322,46 +375,39 @@ impl Workspace {
         Some(m)
     }
 
-    /// Whether remote runner nodes are configured for this deployment
-    /// (`SANDBOXED_REMOTE_NODES_ENABLED` + a non-empty node list).
-    fn remote_nodes_enabled() -> bool {
-        crate::remote_node::RemoteNodeSettings::from_env()
-            .map(|settings| settings.enabled && !settings.nodes.is_empty())
-            .unwrap_or(false)
-    }
-
     /// Env vars that let the in-workspace `remote-lean-build` wrapper dispatch
     /// a build for `mission_id` to a remote runner node via the host
-    /// `POST /api/remote-build` endpoint — or `None` when neither remote
-    /// nodes nor spark offload are enabled, or no signing secret is
-    /// available. Mirrors [`Self::spark_offload_env`]: the exposed token is a
-    /// per-mission, scope-bound capability token (domain-separated from the
-    /// spark token), never a node bearer token or the dashboard JWT.
+    /// `POST /api/remote-build` endpoint. The compute policy is always
+    /// returned so the Lake shim still fails closed when dispatch credentials
+    /// are unavailable. When configured, the exposed token is a per-mission,
+    /// scope-bound capability token (domain-separated from the spark token),
+    /// never a node bearer token or the dashboard JWT.
     pub fn remote_build_env(&self, mission_id: Uuid) -> Option<HashMap<String, String>> {
-        // Gate on either build-offload backend being available: the endpoint
-        // itself answers 503 when remote nodes are absent, letting the
-        // wrapper fall back to a local (or spark) build.
-        if !Self::remote_nodes_enabled() && !self.spark_offload_enabled() {
-            return None;
-        }
-        let token = crate::api::remote_build::build_remote_build_token(mission_id)?;
-        let port = std::env::var("PORT")
-            .ok()
-            .filter(|s| !s.trim().is_empty())?;
         let mut m = HashMap::new();
         m.insert(
-            "REMOTE_BUILD_URL".to_string(),
-            format!(
-                "http://{}:{}/api/remote-build",
-                self.host_ip_from_workspace(),
-                port
-            ),
+            "SANDBOXED_COMPUTE_POLICY".to_string(),
+            self.compute_policy().as_str().to_string(),
         );
-        m.insert("REMOTE_BUILD_TOKEN".to_string(), token);
         m.insert(
             "REMOTE_BUILD_MISSION_ID".to_string(),
             mission_id.to_string(),
         );
+        if let (Some(token), Some(port)) = (
+            crate::api::remote_build::build_remote_build_token(mission_id),
+            std::env::var("PORT")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+        ) {
+            m.insert(
+                "REMOTE_BUILD_URL".to_string(),
+                format!(
+                    "http://{}:{}/api/remote-build",
+                    self.host_ip_from_workspace(),
+                    port
+                ),
+            );
+            m.insert("REMOTE_BUILD_TOKEN".to_string(), token);
+        }
         let remote_config = self.config.get("remote_build");
         let node_id = remote_config
             .and_then(|config| config.get("node_id"))
@@ -383,7 +429,7 @@ impl Workspace {
             .unwrap_or_else(|| vec!["lean"]);
         m.insert(
             "REMOTE_BUILD_REQUIREMENTS".to_string(),
-            serde_json::to_string(&requirements).ok()?,
+            serde_json::to_string(&requirements).unwrap_or_else(|_| "[\"lean\"]".to_string()),
         );
         if let Some(timeout) = remote_config
             .and_then(|config| config.get("timeout_secs"))
@@ -2107,14 +2153,14 @@ async fn prepare_workspace_dir(path: &Path) -> anyhow::Result<PathBuf> {
 
 fn remote_build_wrapper_path(workspace: &Workspace, mission_id: Uuid) -> PathBuf {
     if workspace.workspace_type == WorkspaceType::Container && !is_container_fallback(workspace) {
-        PathBuf::from("/usr/local/bin/remote-lean-build")
+        PathBuf::from("/usr/local/lib/sandboxed-sh/bin/remote-lean-build")
     } else {
         mission_workspace_dir_for_root(&workspace.path, mission_id)
             .join(".sandboxed-sh/bin/remote-lean-build")
     }
 }
 
-async fn install_remote_build_wrapper(
+pub(crate) async fn install_remote_build_wrapper(
     workspace: &Workspace,
     mission_id: Uuid,
 ) -> anyhow::Result<()> {
@@ -2124,19 +2170,23 @@ async fn install_remote_build_wrapper(
     // workspace opted in), and `spark-build` (the raw Spark offloader that
     // `lean-slot` shells out to). Previously `lean-slot`/`spark-build` were
     // hand-copied into container rootfs and drifted per workspace.
-    const WRAPPERS: [(&str, &[u8]); 3] = [
+    const WRAPPERS: [(&str, &[u8]); 4] = [
         (
             "remote-lean-build",
             include_bytes!("../../scripts/remote-lean-build"),
         ),
         ("lean-slot", include_bytes!("../../scripts/lean-slot")),
         ("spark-build", include_bytes!("../../scripts/spark-build")),
+        ("lake", include_bytes!("../../scripts/lake")),
     ];
     for (name, contents) in WRAPPERS {
         let destination = if workspace.workspace_type == WorkspaceType::Container
             && !is_container_fallback(workspace)
         {
-            workspace.path.join("usr/local/bin").join(name)
+            workspace
+                .path
+                .join("usr/local/lib/sandboxed-sh/bin")
+                .join(name)
         } else {
             remote_build_wrapper_path(workspace, mission_id)
                 .parent()
@@ -3835,6 +3885,11 @@ mod tests {
             tokio::fs::read(&path).await.unwrap(),
             include_bytes!("../../scripts/remote-lean-build")
         );
+        let lake_path = path.parent().unwrap().join("lake");
+        assert_eq!(
+            tokio::fs::read(&lake_path).await.unwrap(),
+            include_bytes!("../../scripts/lake")
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3848,6 +3903,91 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[tokio::test]
+    async fn container_lake_shim_does_not_overwrite_the_real_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let workspace = Workspace::new_container("verity".to_string(), root.path().to_path_buf());
+        let real_lake = root.path().join("usr/local/bin/lake");
+        tokio::fs::create_dir_all(real_lake.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&real_lake, b"real lake").await.unwrap();
+
+        install_remote_build_wrapper(&workspace, mission_id)
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(&real_lake).await.unwrap(), b"real lake");
+        let shim = root.path().join("usr/local/lib/sandboxed-sh/bin/lake");
+        assert_eq!(
+            tokio::fs::read(shim).await.unwrap(),
+            include_bytes!("../../scripts/lake")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_lake_build_is_normalized_without_duplicating_argv() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let real_lake = root.path().join("real-lake");
+        let remote_build = root.path().join("remote-lean-build");
+        std::fs::write(&real_lake, b"#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::write(&remote_build, b"#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n").unwrap();
+        for path in [&real_lake, &remote_build] {
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/lake"))
+            .args(["env", "lake", "build", "Target"])
+            .env("SANDBOXED_REAL_LAKE", &real_lake)
+            .env("SANDBOXED_COMPUTE_POLICY", "remote_required")
+            .env("PATH", root.path())
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "<lake>\n<build>\n<Target>\n"
+        );
+    }
+
+    #[test]
+    fn compute_policy_defaults_fail_closed_for_beal_and_verity() {
+        let root = tempfile::tempdir().unwrap();
+        let beal = Workspace::default_host(root.path().join("beal-worktree"));
+        let verity = Workspace::new_container("verity".into(), root.path().join("container"));
+        assert_eq!(beal.compute_policy(), ComputePolicy::RemoteRequired);
+        assert_eq!(verity.compute_policy(), ComputePolicy::RemoteRequired);
+        assert_eq!(
+            beal.remote_build_env(Uuid::new_v4())
+                .unwrap()
+                .get("SANDBOXED_COMPUTE_POLICY")
+                .map(String::as_str),
+            Some("remote_required")
+        );
+    }
+
+    #[test]
+    fn compute_policy_prefers_remote_for_other_lean_and_honors_override() {
+        let root = tempfile::tempdir().unwrap();
+        let mut lean = Workspace::default_host(root.path().to_path_buf());
+        lean.template = Some("lean".into());
+        assert_eq!(lean.compute_policy(), ComputePolicy::RemotePreferred);
+        lean.config = serde_json::json!({"compute_policy": "local_allowed"});
+        assert_eq!(lean.compute_policy(), ComputePolicy::LocalAllowed);
     }
     use serde_json::json;
 

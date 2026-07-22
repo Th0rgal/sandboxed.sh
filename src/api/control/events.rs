@@ -384,6 +384,12 @@ pub enum ControlCommand {
         /// Respond with the delivery outcome (queued / delivered / dropped).
         respond: oneshot::Sender<UserMessageAck>,
     },
+    /// Forget an idempotency guard after a durable internal delivery was
+    /// explicitly dropped/rejected, allowing the same persisted command ID
+    /// to be retried without weakening normal client-message deduplication.
+    ReleaseUserMessageId {
+        id: Uuid,
+    },
     ToolResult {
         tool_call_id: String,
         name: String,

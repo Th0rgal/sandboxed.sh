@@ -1,8 +1,9 @@
 //! In-memory mission store (non-persistent).
 
 use super::{
-    now_string, BoardTask, BoardTaskStatus, Mission, MissionHistoryEntry, MissionStatus,
-    MissionStatusCounts, MissionStore, NewBoardTask,
+    now_string, BoardOutboxItem, BoardProject, BoardTask, BoardTaskStatus, Mission,
+    MissionExecutionState, MissionHistoryEntry, MissionRun, MissionStatus, MissionStatusCounts,
+    MissionStore, MissionToolExecution, MissionToolExecutionState, NewBoardTask, TaskAttempt,
 };
 use crate::api::control::{AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
@@ -22,6 +23,11 @@ pub struct InMemoryMissionStore {
     /// FLEET-001 scheduling: deferred goals held outside the Mission struct
     /// (mirrors the sqlite `deferred_goal` column).
     deferred_goals: Arc<RwLock<HashMap<Uuid, String>>>,
+    runs: Arc<RwLock<HashMap<Uuid, MissionRun>>>,
+    tool_executions: Arc<RwLock<HashMap<(Uuid, String), MissionToolExecution>>>,
+    board_projects: Arc<RwLock<HashMap<String, BoardProject>>>,
+    task_attempts: Arc<RwLock<HashMap<(Uuid, u32), TaskAttempt>>>,
+    board_outbox: Arc<RwLock<HashMap<String, BoardOutboxItem>>>,
 }
 
 impl InMemoryMissionStore {
@@ -31,6 +37,11 @@ impl InMemoryMissionStore {
             trees: Arc::new(RwLock::new(HashMap::new())),
             board_tasks: Arc::new(RwLock::new(HashMap::new())),
             deferred_goals: Arc::new(RwLock::new(HashMap::new())),
+            runs: Arc::new(RwLock::new(HashMap::new())),
+            tool_executions: Arc::new(RwLock::new(HashMap::new())),
+            board_projects: Arc::new(RwLock::new(HashMap::new())),
+            task_attempts: Arc::new(RwLock::new(HashMap::new())),
+            board_outbox: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -73,6 +84,175 @@ impl MissionStore for InMemoryMissionStore {
 
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String> {
         Ok(self.missions.read().await.get(&id).cloned())
+    }
+
+    async fn begin_mission_run(
+        &self,
+        mission_id: Uuid,
+        owner_actor_id: &str,
+        scope_unit: Option<&str>,
+    ) -> Result<MissionRun, String> {
+        match self.missions.read().await.get(&mission_id) {
+            None => return Err(format!("mission not found: {mission_id}")),
+            Some(mission) if mission.status == MissionStatus::Acknowledged => {
+                return Err(format!(
+                    "acknowledged mission {mission_id} cannot acquire a non-terminal run"
+                ));
+            }
+            Some(_) => {}
+        }
+        let mut runs = self.runs.write().await;
+        if let Some(run) = runs
+            .values()
+            .find(|run| run.mission_id == mission_id && !run.execution_state.is_terminal())
+        {
+            return Err(format!(
+                "mission {mission_id} already has non-terminal run {} generation {}",
+                run.run_id, run.generation
+            ));
+        }
+        let generation = runs
+            .values()
+            .filter(|run| run.mission_id == mission_id)
+            .map(|run| run.generation)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let now = now_string();
+        let run = MissionRun {
+            run_id: Uuid::new_v4(),
+            mission_id,
+            generation,
+            execution_state: MissionExecutionState::Starting,
+            owner_actor_id: owner_actor_id.to_string(),
+            scope_unit: scope_unit.map(str::to_string),
+            started_at: now.clone(),
+            heartbeat_at: now,
+            stopping_at: None,
+            ended_at: None,
+            terminal_reason: None,
+        };
+        runs.insert(run.run_id, run.clone());
+        Ok(run)
+    }
+
+    async fn get_active_mission_run(&self, mission_id: Uuid) -> Result<Option<MissionRun>, String> {
+        Ok(self
+            .runs
+            .read()
+            .await
+            .values()
+            .find(|run| run.mission_id == mission_id && !run.execution_state.is_terminal())
+            .cloned())
+    }
+
+    async fn list_active_mission_runs(&self) -> Result<Vec<MissionRun>, String> {
+        Ok(self
+            .runs
+            .read()
+            .await
+            .values()
+            .filter(|run| !run.execution_state.is_terminal())
+            .cloned()
+            .collect())
+    }
+
+    async fn heartbeat_mission_run(
+        &self,
+        run_id: Uuid,
+        generation: u64,
+        state: MissionExecutionState,
+        scope_unit: Option<&str>,
+    ) -> Result<bool, String> {
+        let mut runs = self.runs.write().await;
+        let Some(run) = runs.get_mut(&run_id) else {
+            return Ok(false);
+        };
+        if run.generation != generation || run.execution_state.is_terminal() {
+            return Ok(false);
+        }
+        run.execution_state = state;
+        run.heartbeat_at = now_string();
+        if let Some(scope) = scope_unit {
+            run.scope_unit = Some(scope.to_string());
+        }
+        if state == MissionExecutionState::Stopping && run.stopping_at.is_none() {
+            run.stopping_at = Some(run.heartbeat_at.clone());
+        }
+        Ok(true)
+    }
+
+    async fn finish_mission_run(
+        &self,
+        run_id: Uuid,
+        generation: u64,
+        terminal_reason: Option<&str>,
+    ) -> Result<bool, String> {
+        let mut runs = self.runs.write().await;
+        let Some(run) = runs.get_mut(&run_id) else {
+            return Ok(false);
+        };
+        if run.generation != generation || run.execution_state.is_terminal() {
+            return Ok(false);
+        }
+        let now = now_string();
+        run.execution_state = MissionExecutionState::Terminal;
+        run.heartbeat_at = now.clone();
+        run.ended_at = Some(now);
+        run.terminal_reason = terminal_reason.map(str::to_string);
+        Ok(true)
+    }
+
+    async fn register_tool_execution(
+        &self,
+        execution: &MissionToolExecution,
+    ) -> Result<(), String> {
+        self.tool_executions.write().await.insert(
+            (execution.run_id, execution.tool_call_id.clone()),
+            execution.clone(),
+        );
+        Ok(())
+    }
+
+    async fn finish_tool_execution(
+        &self,
+        run_id: Uuid,
+        tool_call_id: &str,
+        state: MissionToolExecutionState,
+        exit_status: Option<i32>,
+        failure_class: Option<&str>,
+    ) -> Result<bool, String> {
+        let mut tools = self.tool_executions.write().await;
+        let Some(tool) = tools.get_mut(&(run_id, tool_call_id.to_string())) else {
+            return Ok(false);
+        };
+        let now = now_string();
+        tool.state = state;
+        tool.heartbeat_at = now.clone();
+        tool.completed_at = Some(now);
+        tool.exit_status = exit_status;
+        tool.failure_class = failure_class.map(str::to_string);
+        Ok(true)
+    }
+
+    async fn list_active_tool_executions(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<MissionToolExecution>, String> {
+        Ok(self
+            .tool_executions
+            .read()
+            .await
+            .values()
+            .filter(|tool| {
+                tool.run_id == run_id
+                    && matches!(
+                        tool.state,
+                        MissionToolExecutionState::Provisional | MissionToolExecutionState::Running
+                    )
+            })
+            .cloned()
+            .collect())
     }
 
     async fn create_mission_with_parent(
@@ -163,6 +343,12 @@ impl MissionStore for InMemoryMissionStore {
         status: MissionStatus,
         terminal_reason: Option<&str>,
     ) -> Result<(), String> {
+        if status == MissionStatus::Acknowledged && self.get_active_mission_run(id).await?.is_some()
+        {
+            return Err(format!(
+                "mission {id} cannot be acknowledged while a run is non-terminal"
+            ));
+        }
         let mut missions = self.missions.write().await;
         let mission = missions
             .get_mut(&id)
@@ -224,10 +410,19 @@ impl MissionStore for InMemoryMissionStore {
         grace_seconds: u64,
     ) -> Result<Vec<Uuid>, String> {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(grace_seconds as i64);
+        let active: std::collections::HashSet<Uuid> = self
+            .list_active_mission_runs()
+            .await?
+            .into_iter()
+            .map(|run| run.mission_id)
+            .collect();
         let mut missions = self.missions.write().await;
         let mut promoted = Vec::new();
         for mission in missions.values_mut() {
             if mission.status != MissionStatus::AwaitingUser {
+                continue;
+            }
+            if active.contains(&mission.id) {
                 continue;
             }
             let Some(ref viewed_at) = mission.first_viewed_at else {
@@ -612,6 +807,14 @@ impl MissionStore for InMemoryMissionStore {
                         bt.working_directory = t.working_directory;
                         bt.repository = t.repository;
                         bt.branch = t.branch;
+                        bt.role = t.role;
+                        bt.acceptance_criteria = t.acceptance_criteria;
+                        bt.verification_command = t.verification_command;
+                        bt.design_domain = t.design_domain;
+                        bt.declared_write_set = t.declared_write_set;
+                        bt.risk_class = t.risk_class;
+                        bt.token_budget = t.token_budget;
+                        bt.cost_budget_cents = t.cost_budget_cents;
                         bt.depends_on = t.depends_on;
                         bt.updated_at = now.clone();
                     }
@@ -630,6 +833,14 @@ impl MissionStore for InMemoryMissionStore {
                         working_directory: t.working_directory,
                         repository: t.repository,
                         branch: t.branch,
+                        role: t.role,
+                        acceptance_criteria: t.acceptance_criteria,
+                        verification_command: t.verification_command,
+                        design_domain: t.design_domain,
+                        declared_write_set: t.declared_write_set,
+                        risk_class: t.risk_class,
+                        token_budget: t.token_budget,
+                        cost_budget_cents: t.cost_budget_cents,
                         depends_on: t.depends_on,
                         status: BoardTaskStatus::Pending,
                         outcome: None,
@@ -703,6 +914,100 @@ impl MissionStore for InMemoryMissionStore {
         saved.updated_at = now_string();
         map.insert(task.id, saved);
         Ok(())
+    }
+
+    async fn upsert_board_project(
+        &self,
+        mut project: BoardProject,
+    ) -> Result<BoardProject, String> {
+        let mut projects = self.board_projects.write().await;
+        if let Some(existing) = projects.get(&project.slug) {
+            project.created_at = existing.created_at.clone();
+        }
+        project.updated_at = now_string();
+        projects.insert(project.slug.clone(), project.clone());
+        Ok(project)
+    }
+
+    async fn get_board_project(&self, slug: &str) -> Result<Option<BoardProject>, String> {
+        Ok(self.board_projects.read().await.get(slug).cloned())
+    }
+
+    async fn create_task_attempt(&self, attempt: TaskAttempt) -> Result<TaskAttempt, String> {
+        let mut attempts = self.task_attempts.write().await;
+        Ok(attempts
+            .entry((attempt.task_id, attempt.attempt_number))
+            .or_insert(attempt)
+            .clone())
+    }
+
+    async fn finish_task_attempt(
+        &self,
+        task_id: Uuid,
+        attempt_number: u32,
+        terminal_class: &str,
+        commit_sha: Option<&str>,
+        changed_files: &[String],
+        verification_evidence: &serde_json::Value,
+        cost_cents: Option<i64>,
+    ) -> Result<(), String> {
+        let mut attempts = self.task_attempts.write().await;
+        let attempt = attempts
+            .get_mut(&(task_id, attempt_number))
+            .ok_or_else(|| "Task attempt not found".to_string())?;
+        attempt.terminal_class = Some(terminal_class.to_string());
+        attempt.commit_sha = commit_sha.map(str::to_string);
+        attempt.changed_files = changed_files.to_vec();
+        attempt.verification_evidence = verification_evidence.clone();
+        attempt.cost_cents = cost_cents;
+        attempt.finished_at = Some(now_string());
+        Ok(())
+    }
+
+    async fn list_task_attempts(&self, task_id: Uuid) -> Result<Vec<TaskAttempt>, String> {
+        let mut attempts: Vec<_> = self
+            .task_attempts
+            .read()
+            .await
+            .values()
+            .filter(|attempt| attempt.task_id == task_id)
+            .cloned()
+            .collect();
+        attempts.sort_by_key(|attempt| attempt.attempt_number);
+        Ok(attempts)
+    }
+
+    async fn enqueue_board_outbox(&self, item: BoardOutboxItem) -> Result<BoardOutboxItem, String> {
+        let mut outbox = self.board_outbox.write().await;
+        Ok(outbox
+            .entry(item.idempotency_key.clone())
+            .or_insert(item)
+            .clone())
+    }
+
+    async fn acknowledge_board_outbox(&self, idempotency_key: &str) -> Result<(), String> {
+        if let Some(item) = self.board_outbox.write().await.get_mut(idempotency_key) {
+            item.state = "acknowledged".to_string();
+            item.acknowledged_at = Some(now_string());
+        }
+        Ok(())
+    }
+
+    async fn list_pending_board_outbox(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<BoardOutboxItem>, String> {
+        let mut items: Vec<_> = self
+            .board_outbox
+            .read()
+            .await
+            .values()
+            .filter(|item| item.state != "acknowledged")
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        items.truncate(limit);
+        Ok(items)
     }
 }
 

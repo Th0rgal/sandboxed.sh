@@ -31,9 +31,12 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::agents::TerminalReason;
-use crate::api::mission_store::{BoardTask, BoardTaskOutcome, BoardTaskStatus, MissionStore};
+use crate::api::mission_store::{
+    now_string, BoardOutboxItem, BoardTask, BoardTaskOutcome, BoardTaskRole, BoardTaskStatus,
+    MissionHistoryEntry, MissionStore, TaskAttempt,
+};
 
-use super::{ControlCommand, MissionStatus};
+use super::{ControlCommand, MissionStatus, UserMessageAck};
 
 /// One slot is always reserved for the boss itself so digest delivery can
 /// never be starved by board workers occupying every parallel slot.
@@ -51,6 +54,17 @@ const STUCK_PENDING_SECS: i64 = 90;
 /// Digest truncation: keep the head and tail of the worker's final message.
 const DIGEST_HEAD_CHARS: usize = 400;
 const DIGEST_TAIL_CHARS: usize = 1200;
+
+fn role_default_model(task: &BoardTask) -> Option<&'static str> {
+    if task.backend != "codex" {
+        return None;
+    }
+    Some(match task.role {
+        BoardTaskRole::Planner | BoardTaskRole::Reviewer => "gpt-5.6-sol",
+        BoardTaskRole::Reconciler if task.risk_class == "high" => "gpt-5.6-sol",
+        BoardTaskRole::Worker | BoardTaskRole::Reconciler => "gpt-5.6-terra",
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RetryPreflight {
@@ -616,6 +630,34 @@ fn board_needs_attention(tasks: &[BoardTask]) -> bool {
         .any(|t| matches!(t.status, BoardTaskStatus::Settled | BoardTaskStatus::Failed))
 }
 
+/// Stable revision for a controller wake. Board state alone is insufficient:
+/// an acknowledged outbox row remains durable after the boss consumes it. If
+/// the boss turn does not mutate any task, reusing the same task-only key would
+/// make the next wake look acknowledged without actually queueing a message.
+///
+/// Mission history advances when the boss starts consuming the wake, so it
+/// distinguishes successive controller turns while preserving the same key
+/// across retries/restarts before consumption.
+fn board_wake_revision(tasks: &[BoardTask], history: &[MissionHistoryEntry]) -> Uuid {
+    let latest_task_update = tasks
+        .iter()
+        .map(|task| task.updated_at.as_str())
+        .max()
+        .unwrap_or("empty");
+    let latest_history = history.last();
+    let revision_material = format!(
+        "{latest_task_update}\0{}\0{}\0{}",
+        history.len(),
+        latest_history
+            .map(|entry| entry.role.as_str())
+            .unwrap_or(""),
+        latest_history
+            .map(|entry| entry.content.as_str())
+            .unwrap_or("")
+    );
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, revision_material.as_bytes())
+}
+
 /// Generic, content-free wake delivered to a boss when its board changes.
 /// Deliberately mentions NO specific task or other board — the boss reacts to
 /// its OWN board state. If this ever reaches the wrong mission, that mission
@@ -628,31 +670,378 @@ const BOARD_WAKE_PROMPT: &str = "[task-board] Your task board changed — one or
     work. Scheduling, retries, and worker dispatch are automatic — never wait or poll. If \
     board_status shows nothing needing action, just end your turn.";
 
-/// Fire-and-forget control-plane send into the actor's own command channel.
-/// Always strict: delivered only to `target_mission_id`, never re-routed to
-/// the main session or rewritten as a `/goal`. Never awaits (the scheduler
-/// runs on the task that consumes this channel).
-fn self_send_message(
+pub type BoardOutboxInflight = Arc<std::sync::Mutex<HashSet<Uuid>>>;
+
+/// Dispatch a persisted outbox item into the actor's own command channel.
+/// The deterministic message id makes concurrent/startup replay harmless.
+/// A background waiter acknowledges the outbox only after the consumer has
+/// accepted the command; the scheduler itself must not await its own channel.
+fn dispatch_board_outbox_item(
+    mission_store: &Arc<dyn MissionStore>,
     cmd_tx: &mpsc::Sender<ControlCommand>,
+    inflight: &BoardOutboxInflight,
+    delivery_id: Uuid,
+    idempotency_key: String,
     target_mission_id: Uuid,
     content: String,
 ) -> bool {
-    let (respond, _rx) = oneshot::channel();
+    if !inflight
+        .lock()
+        .expect("board outbox lock")
+        .insert(delivery_id)
+    {
+        return true;
+    }
+    let (respond, rx) = oneshot::channel();
     match cmd_tx.try_send(ControlCommand::UserMessage {
-        id: Uuid::new_v4(),
+        id: delivery_id,
         content,
         agent: None,
         target_mission_id: Some(target_mission_id),
         strict: true,
-        source: None,
+        source: Some("task-board".to_string()),
         respond,
     }) {
-        Ok(()) => true,
+        Ok(()) => {
+            let store = Arc::clone(mission_store);
+            let inflight = Arc::clone(inflight);
+            let release_tx = cmd_tx.clone();
+            tokio::spawn(async move {
+                match rx.await {
+                    Ok(UserMessageAck::Queued | UserMessageAck::Delivered) => {
+                        match store.acknowledge_board_outbox(&idempotency_key).await {
+                            Ok(()) => {
+                                inflight
+                                    .lock()
+                                    .expect("board outbox lock")
+                                    .remove(&delivery_id);
+                            }
+                            Err(error) => {
+                                tracing::warn!(target = %target_mission_id, %idempotency_key,
+                                    "board: accepted delivery acknowledgement failed: {error}");
+                                inflight
+                                    .lock()
+                                    .expect("board outbox lock")
+                                    .remove(&delivery_id);
+                            }
+                        }
+                    }
+                    Ok(UserMessageAck::Dropped) => {
+                        let _ = release_tx
+                            .send(ControlCommand::ReleaseUserMessageId { id: delivery_id })
+                            .await;
+                        inflight
+                            .lock()
+                            .expect("board outbox lock")
+                            .remove(&delivery_id);
+                        tracing::warn!(
+                            target = %target_mission_id,
+                            %idempotency_key,
+                            "board: actor dropped delivery; leaving outbox pending"
+                        );
+                    }
+                    Ok(UserMessageAck::Rejected(reason)) => {
+                        let _ = release_tx
+                            .send(ControlCommand::ReleaseUserMessageId { id: delivery_id })
+                            .await;
+                        inflight
+                            .lock()
+                            .expect("board outbox lock")
+                            .remove(&delivery_id);
+                        tracing::warn!(
+                            target = %target_mission_id,
+                            %idempotency_key,
+                            %reason,
+                            "board: actor rejected delivery; leaving outbox pending"
+                        );
+                    }
+                    Err(error) => {
+                        let _ = release_tx
+                            .send(ControlCommand::ReleaseUserMessageId { id: delivery_id })
+                            .await;
+                        inflight
+                            .lock()
+                            .expect("board outbox lock")
+                            .remove(&delivery_id);
+                        tracing::warn!(
+                            target = %target_mission_id,
+                            %idempotency_key,
+                            "board: delivery acknowledgement channel closed; leaving outbox pending: {error}"
+                        );
+                    }
+                }
+            });
+            true
+        }
         Err(e) => {
-            tracing::warn!(target = %target_mission_id, "board: self-send failed: {}", e);
+            inflight
+                .lock()
+                .expect("board outbox lock")
+                .remove(&delivery_id);
+            tracing::warn!(target = %target_mission_id, %idempotency_key,
+                "board: outbox dispatch failed: {e}");
             false
         }
     }
+}
+
+fn outbox_payload(item: &BoardOutboxItem) -> Result<(Uuid, String), String> {
+    let target = item
+        .payload
+        .get("target_mission_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing target_mission_id".to_string())
+        .and_then(|value| Uuid::parse_str(value).map_err(|error| error.to_string()))?;
+    let content = item
+        .payload
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing content".to_string())?
+        .to_string();
+    Ok((target, content))
+}
+
+/// Revalidate a durable delivery against the current board and mission rows.
+///
+/// Outbox rows survive crashes by design, but the operator may cancel a board
+/// or a worker may finish before replay. Re-sending such a stale row through
+/// `UserMessage` would reactivate the terminal target. Store read failures keep
+/// the row pending for a later pass; conclusive state mismatches retire it.
+async fn board_outbox_replay_is_eligible(
+    mission_store: &Arc<dyn MissionStore>,
+    item: &BoardOutboxItem,
+    target: Uuid,
+) -> Result<bool, String> {
+    let Some(boss) = mission_store.get_mission(item.boss_mission_id).await? else {
+        return Ok(false);
+    };
+    if boss_status_is_terminal(boss.status) || boss.status == MissionStatus::Paused {
+        return Ok(false);
+    }
+
+    match item.delivery_kind.as_str() {
+        "spawn" | "retry" => {
+            let Some(task_id) = item.task_id else {
+                return Ok(false);
+            };
+            let Some(task) = mission_store.get_board_task(task_id).await? else {
+                return Ok(false);
+            };
+            if task.boss_mission_id != item.boss_mission_id
+                || task.status != BoardTaskStatus::Running
+                || task.worker_mission_id != Some(target)
+            {
+                return Ok(false);
+            }
+            let current_spawn_key = format!("board:{}:attempt:{}:spawn", task.id, task.attempts);
+            let current_retry_key = format!("board:{}:attempt:{}:retry", task.id, task.attempts);
+            if item.idempotency_key != current_spawn_key
+                && item.idempotency_key != current_retry_key
+            {
+                return Ok(false);
+            }
+            let Some(worker) = mission_store.get_mission(target).await? else {
+                return Ok(false);
+            };
+            // A board spawn delivery is the transition out of Pending. Any
+            // later presentation/terminal state proves this exact intent is
+            // stale or was already consumed before its acknowledgement landed.
+            Ok(worker.status == MissionStatus::Pending)
+        }
+        "controller_notification" => {
+            if item.task_id.is_some() || target != item.boss_mission_id {
+                return Ok(false);
+            }
+            let tasks = mission_store.list_board_tasks(item.boss_mission_id).await?;
+            let current_key = format!(
+                "board:{}:wake:{}",
+                item.boss_mission_id,
+                board_wake_revision(&tasks, &boss.history)
+            );
+            Ok(board_needs_attention(&tasks) && item.idempotency_key == current_key)
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn replay_pending_board_outbox(
+    mission_store: &Arc<dyn MissionStore>,
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    inflight: &BoardOutboxInflight,
+) {
+    let pending = match mission_store.list_pending_board_outbox(1000).await {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!("board: failed to load pending outbox: {error}");
+            return;
+        }
+    };
+    let mut eligible = Vec::new();
+    for item in pending {
+        let (target, content) = match outbox_payload(&item) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(idempotency_key = %item.idempotency_key,
+                    "board: invalid pending outbox payload: {error}");
+                continue;
+            }
+        };
+        match board_outbox_replay_is_eligible(mission_store, &item, target).await {
+            Ok(true) => eligible.push((item, target, content)),
+            Ok(false) => {
+                tracing::info!(
+                    target = %target,
+                    idempotency_key = %item.idempotency_key,
+                    delivery_kind = %item.delivery_kind,
+                    "board: retiring stale pending outbox delivery"
+                );
+                if let Err(error) = mission_store
+                    .acknowledge_board_outbox(&item.idempotency_key)
+                    .await
+                {
+                    tracing::warn!(
+                        idempotency_key = %item.idempotency_key,
+                        "board: failed to retire stale outbox delivery: {error}"
+                    );
+                }
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target = %target,
+                    idempotency_key = %item.idempotency_key,
+                    "board: could not revalidate pending outbox delivery: {error}"
+                );
+                continue;
+            }
+        }
+    }
+
+    // A zombie sweep may persist `:retry` while the original same-attempt
+    // `:spawn` row is still pending. Coalesce before sending anything: the
+    // actor cannot consume its own channel until this scheduler pass returns,
+    // so dispatching both would queue the task twice.
+    let retry_tasks: HashSet<Uuid> = eligible
+        .iter()
+        .filter(|(item, _, _)| item.idempotency_key.ends_with(":retry"))
+        .filter_map(|(item, _, _)| item.task_id)
+        .collect();
+    for (item, target, content) in eligible {
+        if item.idempotency_key.ends_with(":spawn")
+            && item
+                .task_id
+                .is_some_and(|task_id| retry_tasks.contains(&task_id))
+        {
+            tracing::info!(
+                target = %target,
+                idempotency_key = %item.idempotency_key,
+                "board: retiring spawn delivery superseded by same-attempt retry"
+            );
+            if let Err(error) = mission_store
+                .acknowledge_board_outbox(&item.idempotency_key)
+                .await
+            {
+                tracing::warn!(
+                    idempotency_key = %item.idempotency_key,
+                    "board: failed to retire superseded spawn delivery: {error}"
+                );
+            }
+            continue;
+        }
+        let _ = dispatch_board_outbox_item(
+            mission_store,
+            cmd_tx,
+            inflight,
+            item.id,
+            item.idempotency_key,
+            target,
+            content,
+        );
+    }
+}
+
+struct BoardDelivery {
+    boss_mission_id: Uuid,
+    task_id: Option<Uuid>,
+    target_mission_id: Uuid,
+    delivery_kind: &'static str,
+    idempotency_key: String,
+    content: String,
+}
+
+async fn durable_self_send(
+    mission_store: &Arc<dyn MissionStore>,
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    inflight: &BoardOutboxInflight,
+    delivery: BoardDelivery,
+) -> bool {
+    let BoardDelivery {
+        boss_mission_id,
+        task_id,
+        target_mission_id,
+        delivery_kind,
+        idempotency_key,
+        content,
+    } = delivery;
+    if let Some(prefix) = idempotency_key.strip_suffix(":retry") {
+        let superseded_spawn_key = format!("{prefix}:spawn");
+        if let Err(error) = mission_store
+            .acknowledge_board_outbox(&superseded_spawn_key)
+            .await
+        {
+            tracing::warn!(
+                target = %target_mission_id,
+                %idempotency_key,
+                superseded = %superseded_spawn_key,
+                "board: refusing retry until its superseded spawn is retired: {error}"
+            );
+            return false;
+        }
+    }
+    let delivery_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, idempotency_key.as_bytes());
+    let item = BoardOutboxItem {
+        id: delivery_id,
+        boss_mission_id,
+        task_id,
+        delivery_kind: delivery_kind.to_string(),
+        idempotency_key: idempotency_key.clone(),
+        payload: serde_json::json!({
+            "target_mission_id": target_mission_id,
+            "content": content,
+        }),
+        state: "pending".to_string(),
+        attempts: 0,
+        created_at: now_string(),
+        acknowledged_at: None,
+    };
+    let persisted = match mission_store.enqueue_board_outbox(item).await {
+        Ok(item) => item,
+        Err(error) => {
+            tracing::warn!(target = %target_mission_id, %idempotency_key,
+                "board: refusing unjournaled delivery: {error}");
+            return false;
+        }
+    };
+    if persisted.state == "acknowledged" {
+        return true;
+    }
+    let (persisted_target, persisted_content) = match outbox_payload(&persisted) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(target = %target_mission_id, %idempotency_key,
+                "board: invalid persisted outbox payload: {error}");
+            return false;
+        }
+    };
+    dispatch_board_outbox_item(
+        mission_store,
+        cmd_tx,
+        inflight,
+        persisted.id,
+        persisted.idempotency_key,
+        persisted_target,
+        persisted_content,
+    )
 }
 
 /// Fire-and-forget cancel of a specific (worker) mission's runner. Mirrors
@@ -737,7 +1126,16 @@ pub async fn scheduler_pass(
     // Per-boss "a wake is outstanding" flag, owned by the actor loop. Coalesces
     // wakes: at most one pending wake per boss until it next runs (consuming it).
     wake_state: &mut HashMap<Uuid, bool>,
+    // Rows already handed to the actor in this process. Pending rows are
+    // replayed after restart, but not on every scheduler tick while an
+    // acknowledgement is still in flight.
+    outbox_inflight: &BoardOutboxInflight,
 ) {
+    // Re-drive every durable intent before inspecting live board state. The
+    // deterministic command id prevents duplicate execution if a prior send
+    // is still in the channel; an item remains pending until the actor sends a
+    // queued/delivered acknowledgement.
+    replay_pending_board_outbox(mission_store, cmd_tx, outbox_inflight).await;
     let boards = match mission_store.list_active_board_missions().await {
         Ok(b) => b,
         Err(e) => {
@@ -768,7 +1166,15 @@ pub async fn scheduler_pass(
         // getting workers re-spawned and wake banners it can never act on.
         // Cancel its non-terminal tasks (+ live workers) and skip; next pass the
         // boss drops out entirely.
-        if let Ok(Some(boss)) = mission_store.get_mission(boss_id).await {
+        let boss = match mission_store.get_mission(boss_id).await {
+            Ok(boss) => boss,
+            Err(error) => {
+                tracing::warn!(boss = %boss_id,
+                    "board: failed to load boss mission for scheduling: {error}");
+                None
+            }
+        };
+        if let Some(boss) = boss.as_ref() {
             if boss_status_is_terminal(boss.status) {
                 cancel_dead_boss_board(mission_store, cmd_tx, boss_id, &tasks).await;
                 wake_state.remove(&boss_id);
@@ -801,7 +1207,24 @@ pub async fn scheduler_pass(
                             retry_prompt(task, &RetryPreflight::NothingFound),
                             worker_contract(task)
                         );
-                        if self_send_message(cmd_tx, worker_id, prompt) {
+                        if durable_self_send(
+                            mission_store,
+                            cmd_tx,
+                            outbox_inflight,
+                            BoardDelivery {
+                                boss_mission_id: boss_id,
+                                task_id: Some(task.id),
+                                target_mission_id: worker_id,
+                                delivery_kind: "retry",
+                                idempotency_key: format!(
+                                    "board:{}:attempt:{}:retry",
+                                    task.id, task.attempts
+                                ),
+                                content: prompt,
+                            },
+                        )
+                        .await
+                        {
                             let mut t = task.clone();
                             t.notes = append_note(&t.notes, "re-kicked stuck pending worker");
                             let _ = mission_store.save_board_task(&t).await;
@@ -891,6 +1314,7 @@ pub async fn scheduler_pass(
                     match spawn_task_worker(
                         mission_store,
                         cmd_tx,
+                        outbox_inflight,
                         &task,
                         boss.workspace_id,
                         &preflight,
@@ -929,11 +1353,30 @@ pub async fn scheduler_pass(
         let needs = board_needs_attention(&fresh);
         if !needs {
             wake_state.insert(boss_id, false);
-        } else if !wake_state.get(&boss_id).copied().unwrap_or(false)
-            && self_send_message(cmd_tx, boss_id, BOARD_WAKE_PROMPT.to_string())
-        {
-            wake_state.insert(boss_id, true);
-            tracing::info!(boss = %boss_id, "board: sent wake (tasks awaiting decision)");
+        } else if !wake_state.get(&boss_id).copied().unwrap_or(false) {
+            if let Some(boss) = boss.as_ref() {
+                if durable_self_send(
+                    mission_store,
+                    cmd_tx,
+                    outbox_inflight,
+                    BoardDelivery {
+                        boss_mission_id: boss_id,
+                        task_id: None,
+                        target_mission_id: boss_id,
+                        delivery_kind: "controller_notification",
+                        idempotency_key: format!(
+                            "board:{boss_id}:wake:{}",
+                            board_wake_revision(&fresh, &boss.history)
+                        ),
+                        content: BOARD_WAKE_PROMPT.to_string(),
+                    },
+                )
+                .await
+                {
+                    wake_state.insert(boss_id, true);
+                    tracing::info!(boss = %boss_id, "board: sent wake (tasks awaiting decision)");
+                }
+            }
         }
     }
 }
@@ -949,6 +1392,7 @@ fn append_note(notes: &Option<String>, line: &str) -> Option<String> {
 async fn spawn_task_worker(
     mission_store: &Arc<dyn MissionStore>,
     cmd_tx: &mpsc::Sender<ControlCommand>,
+    outbox_inflight: &BoardOutboxInflight,
     task: &BoardTask,
     workspace_id: Uuid,
     preflight: &RetryPreflight,
@@ -956,9 +1400,11 @@ async fn spawn_task_worker(
     // Board tasks bypass the public create-mission handler, so apply the same
     // backend-aware normalization here as a defensive migration for tasks that
     // were persisted before upsert started normalizing them.
-    let model_override = task
+    let requested_model = task
         .model_override
         .as_deref()
+        .or_else(|| role_default_model(task));
+    let model_override = requested_model
         .and_then(|model| super::normalize_model_override_for_backend(Some(&task.backend), model));
     let mission = mission_store
         .create_mission_with_parent(
@@ -983,9 +1429,43 @@ async fn spawn_task_worker(
         t.notes = append_note(&t.notes, &format!("retry: attempt {}", t.attempts));
     }
     mission_store.save_board_task(&t).await?;
+    mission_store
+        .create_task_attempt(TaskAttempt {
+            id: Uuid::new_v4(),
+            task_id: t.id,
+            attempt_number: t.attempts,
+            mission_id: mission.id,
+            backend: t.backend.clone(),
+            model: t.model_override.clone(),
+            role: t.role,
+            run_id: None,
+            commit_sha: None,
+            changed_files: vec![],
+            verification_evidence: serde_json::json!({}),
+            cost_cents: None,
+            terminal_class: None,
+            started_at: now_string(),
+            finished_at: None,
+        })
+        .await?;
 
     let prompt = format!("{}{}", retry_prompt(&t, preflight), worker_contract(&t));
-    if !self_send_message(cmd_tx, mission.id, prompt) {
+    let delivery_key = format!("board:{}:attempt:{}:spawn", t.id, t.attempts);
+    if !durable_self_send(
+        mission_store,
+        cmd_tx,
+        outbox_inflight,
+        BoardDelivery {
+            boss_mission_id: t.boss_mission_id,
+            task_id: Some(t.id),
+            target_mission_id: mission.id,
+            delivery_kind: if t.attempts > 1 { "retry" } else { "spawn" },
+            idempotency_key: delivery_key,
+            content: prompt,
+        },
+    )
+    .await
+    {
         // Channel full: leave the task running; the zombie sweep re-kicks the
         // pending worker mission after the grace period.
         tracing::warn!(task = %t.task_key, "board: spawn message deferred (channel full)");
@@ -1003,6 +1483,29 @@ async fn settle_task(
     outcome: BoardTaskOutcome,
     output: &str,
 ) {
+    let terminal_class = match outcome {
+        BoardTaskOutcome::Success => "success",
+        BoardTaskOutcome::Blocked => "blocked",
+        BoardTaskOutcome::Failed => "agent_failure",
+    };
+    let evidence = serde_json::json!({
+        "result_digest": digest_excerpt(output),
+        "verification_command": task.verification_command.clone(),
+    });
+    if let Err(error) = mission_store
+        .finish_task_attempt(
+            task.id,
+            task.attempts,
+            terminal_class,
+            None,
+            &[],
+            &evidence,
+            None,
+        )
+        .await
+    {
+        tracing::warn!(task = %task.task_key, "board: failed to close task attempt: {error}");
+    }
     if outcome == BoardTaskOutcome::Failed && task.attempts < MAX_ATTEMPTS {
         // Silent automatic retry: back to pending, next pass respawns fresh.
         task.status = BoardTaskStatus::Pending;
@@ -1070,7 +1573,395 @@ pub async fn on_worker_settled(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::mission_store::NewBoardTask;
+    use crate::api::mission_store::{InMemoryMissionStore, NewBoardTask};
+
+    #[tokio::test]
+    async fn durable_delivery_stays_pending_until_actor_acknowledges() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let inflight: BoardOutboxInflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let boss = Uuid::new_v4();
+        let key = format!("board:{boss}:wake:test");
+
+        assert!(
+            durable_self_send(
+                &store,
+                &cmd_tx,
+                &inflight,
+                BoardDelivery {
+                    boss_mission_id: boss,
+                    task_id: None,
+                    target_mission_id: boss,
+                    delivery_kind: "controller_notification",
+                    idempotency_key: key.clone(),
+                    content: "wake".to_string(),
+                },
+            )
+            .await
+        );
+        assert_eq!(store.list_pending_board_outbox(10).await.unwrap().len(), 1);
+
+        let command = cmd_rx.recv().await.expect("board command");
+        let ControlCommand::UserMessage {
+            id,
+            source,
+            respond,
+            ..
+        } = command
+        else {
+            panic!("expected user message");
+        };
+        assert_eq!(id, Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes()));
+        assert_eq!(source.as_deref(), Some("task-board"));
+        respond
+            .send(UserMessageAck::Delivered)
+            .expect("ack receiver alive");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if store
+                    .list_pending_board_outbox(10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("outbox acknowledgement persisted");
+        assert!(inflight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_delivery_is_released_for_pending_replay() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let inflight: BoardOutboxInflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let boss = Uuid::new_v4();
+
+        assert!(
+            durable_self_send(
+                &store,
+                &cmd_tx,
+                &inflight,
+                BoardDelivery {
+                    boss_mission_id: boss,
+                    task_id: None,
+                    target_mission_id: boss,
+                    delivery_kind: "controller_notification",
+                    idempotency_key: format!("board:{boss}:wake:dropped"),
+                    content: "wake".to_string(),
+                },
+            )
+            .await
+        );
+        let ControlCommand::UserMessage { respond, .. } =
+            cmd_rx.recv().await.expect("board command")
+        else {
+            panic!("expected user message");
+        };
+        respond
+            .send(UserMessageAck::Dropped)
+            .expect("ack receiver alive");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if inflight.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped delivery released");
+        assert!(matches!(
+            cmd_rx.recv().await,
+            Some(ControlCommand::ReleaseUserMessageId { .. })
+        ));
+        assert_eq!(store.list_pending_board_outbox(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replay_retires_wake_for_terminal_boss_without_dispatching() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let boss = store
+            .create_mission_with_parent(
+                Some("terminal boss"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create boss");
+        store
+            .upsert_board_tasks(
+                boss.id,
+                vec![NewBoardTask {
+                    task_key: "review".into(),
+                    title: "review".into(),
+                    prompt: "p".into(),
+                    backend: "codex".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("create task");
+        let mut task = store
+            .list_board_tasks(boss.id)
+            .await
+            .expect("list task")
+            .remove(0);
+        task.status = BoardTaskStatus::Settled;
+        store.save_board_task(&task).await.expect("settle task");
+
+        let key = format!("board:{}:wake:stale", boss.id);
+        store
+            .enqueue_board_outbox(BoardOutboxItem {
+                id: Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes()),
+                boss_mission_id: boss.id,
+                task_id: None,
+                delivery_kind: "controller_notification".into(),
+                idempotency_key: key,
+                payload: serde_json::json!({
+                    "target_mission_id": boss.id,
+                    "content": BOARD_WAKE_PROMPT,
+                }),
+                state: "pending".into(),
+                attempts: 0,
+                created_at: now_string(),
+                acknowledged_at: None,
+            })
+            .await
+            .expect("enqueue wake");
+        store
+            .update_mission_status(boss.id, MissionStatus::Interrupted)
+            .await
+            .expect("cancel boss");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let inflight: BoardOutboxInflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        replay_pending_board_outbox(&store, &cmd_tx, &inflight).await;
+
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "terminal boss must not be woken"
+        );
+        assert!(store
+            .list_pending_board_outbox(10)
+            .await
+            .expect("pending outbox")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_retires_spawn_for_acknowledged_worker_without_dispatching() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let boss = store
+            .create_mission_with_parent(
+                Some("live boss"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create boss");
+        let worker = store
+            .create_mission_with_parent(
+                Some("worker"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(boss.id),
+                None,
+            )
+            .await
+            .expect("create worker");
+        store
+            .upsert_board_tasks(
+                boss.id,
+                vec![NewBoardTask {
+                    task_key: "worker".into(),
+                    title: "worker".into(),
+                    prompt: "p".into(),
+                    backend: "codex".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("create task");
+        let mut task = store
+            .list_board_tasks(boss.id)
+            .await
+            .expect("list task")
+            .remove(0);
+        task.status = BoardTaskStatus::Running;
+        task.worker_mission_id = Some(worker.id);
+        task.attempts = 1;
+        store
+            .save_board_task(&task)
+            .await
+            .expect("save running task");
+        store
+            .update_mission_status(worker.id, MissionStatus::Acknowledged)
+            .await
+            .expect("acknowledge worker");
+
+        let key = format!("board:{}:attempt:1:spawn", task.id);
+        store
+            .enqueue_board_outbox(BoardOutboxItem {
+                id: Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes()),
+                boss_mission_id: boss.id,
+                task_id: Some(task.id),
+                delivery_kind: "spawn".into(),
+                idempotency_key: key,
+                payload: serde_json::json!({
+                    "target_mission_id": worker.id,
+                    "content": "do work",
+                }),
+                state: "pending".into(),
+                attempts: 0,
+                created_at: now_string(),
+                acknowledged_at: None,
+            })
+            .await
+            .expect("enqueue spawn");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let inflight: BoardOutboxInflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        replay_pending_board_outbox(&store, &cmd_tx, &inflight).await;
+
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "acknowledged worker must not be reactivated"
+        );
+        assert!(store
+            .list_pending_board_outbox(10)
+            .await
+            .expect("pending outbox")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_coalesces_same_attempt_spawn_and_retry() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let boss = store
+            .create_mission_with_parent(
+                Some("live boss"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create boss");
+        let worker = store
+            .create_mission_with_parent(
+                Some("pending worker"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(boss.id),
+                None,
+            )
+            .await
+            .expect("create worker");
+        store
+            .upsert_board_tasks(
+                boss.id,
+                vec![NewBoardTask {
+                    task_key: "worker".into(),
+                    title: "worker".into(),
+                    prompt: "p".into(),
+                    backend: "codex".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("create task");
+        let mut task = store
+            .list_board_tasks(boss.id)
+            .await
+            .expect("list task")
+            .remove(0);
+        task.status = BoardTaskStatus::Running;
+        task.worker_mission_id = Some(worker.id);
+        task.attempts = 1;
+        store
+            .save_board_task(&task)
+            .await
+            .expect("save running task");
+
+        let spawn_key = format!("board:{}:attempt:1:spawn", task.id);
+        let retry_key = format!("board:{}:attempt:1:retry", task.id);
+        for (key, kind, content) in [
+            (&spawn_key, "spawn", "initial"),
+            (&retry_key, "retry", "re-kick"),
+        ] {
+            store
+                .enqueue_board_outbox(BoardOutboxItem {
+                    id: Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes()),
+                    boss_mission_id: boss.id,
+                    task_id: Some(task.id),
+                    delivery_kind: kind.into(),
+                    idempotency_key: key.clone(),
+                    payload: serde_json::json!({
+                        "target_mission_id": worker.id,
+                        "content": content,
+                    }),
+                    state: "pending".into(),
+                    attempts: 0,
+                    created_at: now_string(),
+                    acknowledged_at: None,
+                })
+                .await
+                .expect("enqueue delivery");
+        }
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(2);
+        let inflight: BoardOutboxInflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        replay_pending_board_outbox(&store, &cmd_tx, &inflight).await;
+
+        let ControlCommand::UserMessage { id, content, .. } =
+            cmd_rx.try_recv().expect("retry should dispatch")
+        else {
+            panic!("expected user message");
+        };
+        assert_eq!(id, Uuid::new_v5(&Uuid::NAMESPACE_OID, retry_key.as_bytes()));
+        assert_eq!(content, "re-kick");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "superseded spawn must not also dispatch"
+        );
+        let pending = store
+            .list_pending_board_outbox(10)
+            .await
+            .expect("pending outbox");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].idempotency_key, retry_key);
+    }
 
     #[test]
     fn retry_with_surviving_branch_includes_prior_attempt_digest() {
@@ -1195,6 +2086,14 @@ mod tests {
             working_directory: None,
             repository: None,
             branch: None,
+            role: crate::api::mission_store::BoardTaskRole::Worker,
+            acceptance_criteria: vec![],
+            verification_command: None,
+            design_domain: None,
+            declared_write_set: vec![],
+            risk_class: "normal".into(),
+            token_budget: None,
+            cost_budget_cents: None,
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             status,
             outcome,
@@ -1552,6 +2451,42 @@ mod tests {
         assert!(!board_needs_attention(&[]));
     }
 
+    #[test]
+    fn wake_revision_reissues_after_boss_consumes_wake() {
+        let tasks = vec![mk(
+            "review",
+            &[],
+            BoardTaskStatus::Settled,
+            Some(BoardTaskOutcome::Success),
+        )];
+        let before = vec![MissionHistoryEntry {
+            role: "assistant".into(),
+            content: "Previous controller turn".into(),
+        }];
+
+        let initial = board_wake_revision(&tasks, &before);
+        assert_eq!(initial, board_wake_revision(&tasks, &before));
+
+        let mut after_consumption = before.clone();
+        after_consumption.push(MissionHistoryEntry {
+            role: "user".into(),
+            content: BOARD_WAKE_PROMPT.into(),
+        });
+        assert_ne!(
+            initial,
+            board_wake_revision(&tasks, &after_consumption),
+            "a consumed wake must permit a successor even when task timestamps are unchanged"
+        );
+
+        let mut changed_tasks = tasks.clone();
+        changed_tasks[0].updated_at = "2026-01-02T00:00:00Z".into();
+        assert_ne!(
+            initial,
+            board_wake_revision(&changed_tasks, &before),
+            "task state changes must continue to produce a fresh wake revision"
+        );
+    }
+
     #[tokio::test]
     async fn upsert_and_dep_flow_in_memory_store() {
         use crate::api::mission_store::InMemoryMissionStore;
@@ -1572,6 +2507,7 @@ mod tests {
                         repository: None,
                         branch: None,
                         depends_on: vec![],
+                        ..Default::default()
                     },
                     NewBoardTask {
                         task_key: "t2".into(),
@@ -1584,6 +2520,7 @@ mod tests {
                         repository: None,
                         branch: None,
                         depends_on: vec!["t1".into()],
+                        ..Default::default()
                     },
                 ],
             )
@@ -1625,6 +2562,7 @@ mod tests {
                     repository: None,
                     branch: None,
                     depends_on: vec![],
+                    ..Default::default()
                 }],
             )
             .await
@@ -1697,6 +2635,7 @@ mod tests {
                         repository: None,
                         branch: None,
                         depends_on: vec![],
+                        ..Default::default()
                     },
                     NewBoardTask {
                         task_key: "pending".into(),
@@ -1709,6 +2648,7 @@ mod tests {
                         repository: None,
                         branch: None,
                         depends_on: vec![],
+                        ..Default::default()
                     },
                 ],
             )
@@ -1745,8 +2685,17 @@ mod tests {
         };
         let mut wake_state = HashMap::new();
         wake_state.insert(boss_id, true);
+        let outbox_inflight: BoardOutboxInflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
 
-        scheduler_pass(&store, &cmd_tx, &snapshot, 4, &mut wake_state).await;
+        scheduler_pass(
+            &store,
+            &cmd_tx,
+            &snapshot,
+            4,
+            &mut wake_state,
+            &outbox_inflight,
+        )
+        .await;
 
         // All tasks cancelled, boss no longer scheduled, wake state cleared.
         let after = store.list_board_tasks(boss_id).await.expect("list");

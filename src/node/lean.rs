@@ -255,12 +255,24 @@ pub fn validate_lean_build(
             ALLOWED_COMMANDS.join("/")
         ));
     }
-    // `lake env` and `elan run` are direct arbitrary-command escape hatches.
-    // Lake is therefore limited to its build operation. Repository builds are
-    // still untrusted code and must run under the dedicated, non-root node
-    // service account documented in REMOTE_NODES.md.
-    if argv0 == "lake" && command.get(1).map(String::as_str) != Some("build") {
-        return Err("lake command must use the 'build' subcommand".to_string());
+    // Lake repository operations may execute untrusted project code and must
+    // therefore run under the dedicated, non-root node service account. Keep
+    // arbitrary-command escape hatches (`lake env <anything>`, `lake exe`) out
+    // of the protocol while accepting the verification verbs routed by the
+    // mission-local shim. `lake env lean` is safe because the nested executable
+    // is fixed rather than caller-selected.
+    if argv0 == "lake" {
+        let allowed = matches!(
+            command.get(1).map(String::as_str),
+            Some("build" | "test" | "check")
+        ) || (command.get(1).map(String::as_str) == Some("env")
+            && command.get(2).map(String::as_str) == Some("lean"));
+        if !allowed {
+            return Err(
+                "lake command must use build, test, check, or the fixed 'env lean' form"
+                    .to_string(),
+            );
+        }
     }
     for key in env.keys() {
         if !allowlist.iter().any(|allowed| allowed == key) {
@@ -1133,6 +1145,10 @@ pub async fn execute_lean_build(
     // executed from a repository.
     let mut cmd = tokio::process::Command::new(&command[0]);
     cmd.env_clear().args(&command[1..]).current_dir(&build_cwd);
+    // A node may also have the mission lake shim installed in /usr/local/bin.
+    // This marker makes the shim execute the real Lake binary instead of
+    // recursively dispatching another remote build.
+    cmd.env("SANDBOXED_REMOTE_EXECUTION", "1");
     for (key, value) in cache_env(work_root) {
         cmd.env(key, value);
     }
@@ -1487,6 +1503,23 @@ mod tests {
             ),
             Ok(())
         );
+        for command in [
+            vec!["lake", "test"],
+            vec!["lake", "check"],
+            vec!["lake", "env", "lean", "Main.lean"],
+        ] {
+            let command = command.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(
+                validate_lean_build(
+                    &source(&"a".repeat(40)),
+                    Some("morpho-verity"),
+                    &command,
+                    &env,
+                    &allowlist(),
+                ),
+                Ok(())
+            );
+        }
         // Path-form argv[0] is rejected even when the basename is allowed:
         // `./lake` or an absolute path would execute an arbitrary file from
         // the checkout / node fs instead of the PATH-resolved tool.
@@ -1673,6 +1706,7 @@ mod tests {
     fn validation_rejects_command_execution_subcommands() {
         for command in [
             vec!["lake", "env", "bash"],
+            vec!["lake", "env", "lake", "build"],
             vec!["lake", "exe", "tool"],
             vec!["elan", "run", "stable", "bash"],
         ] {

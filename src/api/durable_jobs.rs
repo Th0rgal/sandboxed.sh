@@ -6,7 +6,7 @@
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 
 use axum::{
@@ -18,6 +18,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
 use uuid::Uuid;
@@ -50,6 +51,12 @@ pub struct DurableJob {
     pub signal: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Persisted liveness signal advanced by the server-owned watcher.
+    #[serde(default)]
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    /// Absolute runtime deadline. Long jobs default to two hours.
+    #[serde(default)]
+    pub deadline_at: Option<DateTime<Utc>>,
     pub started_by_mission_id: Option<Uuid>,
     #[serde(default)]
     pub workspace_id: Option<Uuid>,
@@ -60,11 +67,30 @@ pub struct DurableJob {
     pub stdout_log: String,
     pub stderr_log: String,
     pub status_file: String,
+    /// False only while the server is preparing the process launch. Legacy
+    /// receipts default to true. A stale false receipt with no live scope or
+    /// start marker is safe for the same idempotency key to resubmit.
+    #[serde(default = "default_spawn_accepted")]
+    pub spawn_accepted: bool,
     /// Transient systemd scope owned by this durable job. It intentionally
     /// does not carry the launching mission's tag, so mission teardown cannot
     /// terminate it.
     #[serde(default)]
     pub scope_unit: Option<String>,
+    /// Caller-selected scheduling/resource hint (for example `lean_heavy`).
+    #[serde(default)]
+    pub resource_class: Option<String>,
+    /// Retry key supplied by the caller. The job id is derived from this key.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Hash of every caller-controlled execution option. Environment values
+    /// are hashed rather than persisted so job receipts never expose secrets.
+    #[serde(default)]
+    pub request_fingerprint: Option<String>,
+}
+
+fn default_spawn_accepted() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +107,14 @@ pub struct StartDurableJobRequest {
     pub workspace_id: Option<Uuid>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Maximum runtime in seconds. Defaults to two hours and is capped at one day.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub resource_class: Option<String>,
+    /// Required by Hermes-facing callers so reconnect retries cannot duplicate work.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +127,72 @@ pub struct JobLogsQuery {
 
 fn default_tail_bytes() -> usize {
     16 * 1024
+}
+
+const DEFAULT_JOB_TIMEOUT_SECS: u64 = 2 * 60 * 60;
+const MAX_JOB_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+const FORCE_CLEAR_SECS: u64 = 30;
+
+fn validated_idempotency_key(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err("idempotency_key cannot be empty".to_string());
+    }
+    if key.len() > 200 {
+        return Err("idempotency_key must be at most 200 bytes".to_string());
+    }
+    Ok(Some(key.to_string()))
+}
+
+fn durable_job_id(user_id: &str, mission_id: Uuid, key: Option<&str>) -> Uuid {
+    match key {
+        Some(key) => Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("sandboxed.sh/durable-job/{user_id}/{mission_id}/{key}").as_bytes(),
+        ),
+        None => Uuid::new_v4(),
+    }
+}
+
+fn durable_job_request_fingerprint(
+    command: &str,
+    cwd: &Path,
+    workspace_id: Uuid,
+    env: &std::collections::HashMap<String, String>,
+    timeout_secs: u64,
+    resource_class: Option<&str>,
+) -> String {
+    let mut env = env.iter().collect::<Vec<_>>();
+    env.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let payload = serde_json::to_vec(&(
+        command,
+        cwd.to_string_lossy(),
+        workspace_id,
+        env,
+        timeout_secs,
+        resource_class,
+    ))
+    .expect("durable job fingerprint payload is serializable");
+    hex::encode(Sha256::digest(payload))
+}
+
+fn job_matches_request(job: &DurableJob, request_fingerprint: &str) -> bool {
+    job.request_fingerprint.as_deref() == Some(request_fingerprint)
+}
+
+fn try_acquire_submission_claim(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn require_workspace_scope(workspace_id: Option<Uuid>) -> Result<Uuid, String> {
@@ -118,6 +218,12 @@ struct ExitRecord {
     exit_code: Option<i32>,
     signal: Option<i32>,
     finished_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StartRecord {
+    pid: u32,
+    started_at: DateTime<Utc>,
 }
 
 fn err(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
@@ -168,8 +274,34 @@ fn durable_shell_wrapper(command: &str) -> String {
     // `set -e; false` must terminate only this subshell so the parent can
     // always persist the restart-safe terminal record.
     format!(
-        "(\n{command}\n)\ncode=$?\nprintf '{{\"exit_code\":%s,\"signal\":null,\"finished_at\":\"%s\"}}\\n' \"$code\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$SANDBOXED_SH_DURABLE_STATUS\"\nexit \"$code\"\n"
+        "if [ -n \"${{REMOTE_BUILD_COMMAND:-}}\" ]; then\n  __oa_policy_bin=${{REMOTE_BUILD_COMMAND%/*}}\n  PATH=$__oa_policy_bin:$PATH\n  export PATH\n  unset __oa_policy_bin\nfi\n__oa_started_tmp=\"${{SANDBOXED_SH_DURABLE_STARTED}}.tmp.$$\"\nprintf '{{\"pid\":%s,\"started_at\":\"%s\"}}\\n' \"$$\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$__oa_started_tmp\" || exit 125\nmv -f \"$__oa_started_tmp\" \"$SANDBOXED_SH_DURABLE_STARTED\" || exit 125\nunset __oa_started_tmp\n(\n{command}\n)\ncode=$?\nprintf '{{\"exit_code\":%s,\"signal\":null,\"finished_at\":\"%s\"}}\\n' \"$code\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$SANDBOXED_SH_DURABLE_STATUS\"\nexit \"$code\"\n"
     )
+}
+
+fn durable_started_file(job: &DurableJob) -> PathBuf {
+    Path::new(&job.status_file).with_file_name("started.json")
+}
+
+fn preparing_receipt_is_resubmittable(job: &DurableJob) -> bool {
+    !job.spawn_accepted
+        && !failed_receipt_has_process_evidence(job)
+        && matches!(
+            job.status,
+            DurableJobStatus::Unknown | DurableJobStatus::Failed
+        )
+}
+
+fn submission_receipt_is_final(job: &DurableJob) -> bool {
+    job.spawn_accepted
+        || failed_receipt_has_process_evidence(job)
+        || matches!(
+            job.status,
+            DurableJobStatus::Completed | DurableJobStatus::Cancelled
+        )
+}
+
+fn failed_receipt_has_process_evidence(job: &DurableJob) -> bool {
+    job.status == DurableJobStatus::Failed && (job.exit_code.is_some() || job.signal.is_some())
 }
 
 async fn authorize_job(
@@ -353,24 +485,33 @@ fn resolve_workspace_cwd(
             workspace_root.display()
         ));
     }
-    Ok(canonical_cwd)
+    // Keep the configured/logical workspace prefix after validating its
+    // canonical target. WorkspaceExec strips that prefix to derive the path
+    // inside a container. Returning the canonical target here breaks that
+    // mapping when the configured root is a stable symlink (as on dev), and
+    // silently turns every requested cwd into `/`.
+    Ok(cwd)
 }
 
 fn merge_job_for_write(current: Option<DurableJob>, mut next: DurableJob) -> DurableJob {
     if let Some(current) = current {
-        if matches!(
+        let current_is_terminal = matches!(
             current.status,
             DurableJobStatus::Completed | DurableJobStatus::Failed | DurableJobStatus::Cancelled
-        ) && !matches!(
+        );
+        let next_is_terminal = matches!(
             next.status,
             DurableJobStatus::Completed | DurableJobStatus::Failed | DurableJobStatus::Cancelled
-        ) {
+        );
+        if current_is_terminal && !next_is_terminal {
             return current;
         }
-        if current.status == DurableJobStatus::Cancelled
-            && next.status != DurableJobStatus::Cancelled
-        {
-            next.status = DurableJobStatus::Cancelled;
+        // A terminal observation is monotonic. In particular, a deadline
+        // transition to Failed must not be overwritten by a late watcher that
+        // observes the child exiting successfully after cancellation. Updates
+        // to metadata for the same terminal state remain allowed.
+        if current_is_terminal && next.status != current.status {
+            next.status = current.status;
         }
     }
     next
@@ -412,6 +553,21 @@ async fn read_job(state: &AppState, id: Uuid) -> Result<DurableJob, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("invalid durable job entry: {}", e))
 }
 
+async fn read_exit_record(job: &DurableJob) -> Option<ExitRecord> {
+    tokio::fs::read(&job.status_file)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ExitRecord>(&bytes).ok())
+}
+
+async fn read_started_pid(job: &DurableJob) -> Option<u32> {
+    tokio::fs::read(durable_started_file(job))
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<StartRecord>(&bytes).ok())
+        .map(|record| record.pid)
+}
+
 async fn write_terminal_job_state(
     state: &AppState,
     mut job: DurableJob,
@@ -424,6 +580,12 @@ async fn write_terminal_job_state(
         job = latest;
     }
 
+    // Reaching this function requires either an OS child-exit observation or
+    // the wrapper's durable terminal receipt. Both prove that spawn crossed
+    // the acceptance boundary even if the API crashed before persisting the
+    // normal post-spawn update. Preserve that proof so an idempotent retry
+    // cannot delete the receipt and submit the command again.
+    job.spawn_accepted = true;
     job.status = status;
     job.exit_code = exit_code;
     job.signal = signal;
@@ -431,39 +593,276 @@ async fn write_terminal_job_state(
     write_job(state, &job).await.unwrap_or(job)
 }
 
+async fn write_observed_child_exit(
+    state: &AppState,
+    job: DurableJob,
+    status: ExitStatus,
+) -> DurableJob {
+    #[cfg(unix)]
+    let process_signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let process_signal = None;
+    let recorded_exit = read_exit_record(&job).await;
+    let exit =
+        merge_process_exit_observation(recorded_exit, status.code(), process_signal, Utc::now());
+    let job_status = terminal_status_for_exit(&job, exit.exit_code, exit.finished_at);
+    write_terminal_job_state(
+        state,
+        job,
+        job_status,
+        exit.exit_code,
+        exit.signal,
+        exit.finished_at,
+    )
+    .await
+}
+
+async fn signal_job(job: &DurableJob, force: bool) {
+    if let Some(unit) = job.scope_unit.as_deref() {
+        if force {
+            let unit = if unit.ends_with(".scope") {
+                unit.to_string()
+            } else {
+                format!("{unit}.scope")
+            };
+            let _ = Command::new("systemctl")
+                .args(["kill", "--kill-who=all", "--signal=KILL", unit.as_str()])
+                .status()
+                .await;
+        } else if stop_scope(unit).await {
+            return;
+        }
+    }
+    if let Some(pid) = job.pid {
+        if force {
+            force_kill_process_group(pid);
+        } else {
+            terminate_process_group(pid);
+        }
+    }
+}
+
 fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
     tokio::spawn(async move {
-        if let Ok(status) = child.wait().await {
-            if let Ok(job) = read_job(&state, id).await {
-                let job_status = if status.success() {
-                    DurableJobStatus::Completed
-                } else {
-                    DurableJobStatus::Failed
-                };
-                #[cfg(unix)]
-                let signal = {
-                    use std::os::unix::process::ExitStatusExt;
-                    status.signal()
-                };
-                #[cfg(not(unix))]
-                let signal = None;
-                let _ = write_terminal_job_state(
-                    &state,
-                    job,
-                    job_status,
-                    status.code(),
-                    signal,
-                    Utc::now(),
-                )
-                .await;
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let deadline = read_job(&state, id)
+                .await
+                .ok()
+                .and_then(|job| job.deadline_at)
+                .map(|deadline| {
+                    (deadline - Utc::now())
+                        .to_std()
+                        .unwrap_or(std::time::Duration::from_millis(1))
+                })
+                .unwrap_or_default();
+            tokio::select! {
+                status = child.wait() => {
+                    let Ok(status) = status else { break };
+                    if let Ok(job) = read_job(&state, id).await {
+                        let _ = write_observed_child_exit(&state, job, status).await;
+                    }
+                    break;
+                }
+                _ = heartbeat.tick() => {
+                    if let Ok(mut job) = read_job(&state, id).await {
+                        if job_accepts_heartbeat(&job.status) {
+                            let now = Utc::now();
+                            job.heartbeat_at = Some(now);
+                            job.updated_at = now;
+                            let _ = write_job(&state, &job).await;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(deadline), if !deadline.is_zero() => {
+                    if let Ok(mut job) = read_job(&state, id).await {
+                        if job.status == DurableJobStatus::Running {
+                            // The command may have finished just before the
+                            // deadline while this watcher was not scheduled,
+                            // making both select branches ready. Only honor a
+                            // durable receipt after the OS confirms the child
+                            // exited: the command inherits the receipt path and
+                            // could otherwise write it early, then keep running.
+                            if let Some(status) = confirmed_child_exit(child.try_wait()) {
+                                let _ = write_observed_child_exit(&state, job, status).await;
+                                break;
+                            }
+                            job.status = deadline_terminal_status();
+                            job.updated_at = Utc::now();
+                            let _ = write_job(&state, &job).await;
+                            signal_job(&job, false).await;
+                            tokio::time::sleep(std::time::Duration::from_secs(FORCE_CLEAR_SECS)).await;
+                            if job_requires_force_clear(&job) {
+                                signal_job(&job, true).await;
+                            }
+                        }
+                    }
+                    let _ = child.wait().await;
+                    break;
+                }
             }
         }
     });
 }
 
+fn confirmed_child_exit(observation: std::io::Result<Option<ExitStatus>>) -> Option<ExitStatus> {
+    observation.ok().flatten()
+}
+
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+fn job_has_liveness_evidence(
+    scope_unit: Option<&str>,
+    process_is_alive: bool,
+    scope_is_active: bool,
+) -> bool {
+    if scope_unit.is_some() {
+        scope_is_active
+    } else {
+        process_is_alive
+    }
+}
+
+fn terminal_receipt_can_be_honored(
+    scope_unit: Option<&str>,
+    process_is_alive: bool,
+    scope_is_active: bool,
+) -> bool {
+    !job_has_liveness_evidence(scope_unit, process_is_alive, scope_is_active)
+}
+
+fn pidless_scope_is_live(scope_unit: Option<&str>, scope_is_active: bool) -> bool {
+    scope_unit.is_some() && scope_is_active
+}
+
+fn job_accepts_heartbeat(status: &DurableJobStatus) -> bool {
+    *status == DurableJobStatus::Running
+}
+
+fn job_is_cancellable(status: &DurableJobStatus) -> bool {
+    matches!(
+        status,
+        DurableJobStatus::Running | DurableJobStatus::Unknown
+    )
+}
+
+fn deadline_terminal_status() -> DurableJobStatus {
+    DurableJobStatus::Failed
+}
+
+fn terminal_status_for_exit(
+    job: &DurableJob,
+    exit_code: Option<i32>,
+    finished_at: DateTime<Utc>,
+) -> DurableJobStatus {
+    if job
+        .deadline_at
+        .is_some_and(|deadline| finished_at >= deadline)
+    {
+        deadline_terminal_status()
+    } else if exit_code == Some(0) {
+        DurableJobStatus::Completed
+    } else {
+        DurableJobStatus::Failed
+    }
+}
+
+fn merge_process_exit_observation(
+    recorded: Option<ExitRecord>,
+    process_exit_code: Option<i32>,
+    process_signal: Option<i32>,
+    observed_at: DateTime<Utc>,
+) -> ExitRecord {
+    match recorded {
+        Some(mut exit) => {
+            exit.exit_code = exit.exit_code.or(process_exit_code);
+            exit.signal = exit.signal.or(process_signal);
+            exit
+        }
+        None => ExitRecord {
+            exit_code: process_exit_code,
+            signal: process_signal,
+            finished_at: observed_at,
+        },
+    }
+}
+
+fn job_deadline_elapsed(job: &DurableJob, now: DateTime<Utc>) -> bool {
+    job.deadline_at.is_some_and(|deadline| deadline <= now)
+}
+
+async fn mark_job_deadline_exceeded(
+    state: &AppState,
+    mut job: DurableJob,
+    now: DateTime<Utc>,
+) -> DurableJob {
+    job.status = deadline_terminal_status();
+    job.updated_at = now;
+    job = write_job(state, &job).await.unwrap_or(job);
+    let cancelling = job.clone();
+    tokio::spawn(async move {
+        signal_job(&cancelling, false).await;
+        tokio::time::sleep(std::time::Duration::from_secs(FORCE_CLEAR_SECS)).await;
+        if job_requires_force_clear(&cancelling) {
+            signal_job(&cancelling, true).await;
+        }
+    });
+    job
+}
+
+fn requires_force_clear(scope_unit: Option<&str>, process_is_alive: bool) -> bool {
+    // A systemd-run wrapper may exit before the payload in its transient
+    // scope. Force-signalling the named scope is idempotent, so always do it
+    // after the grace period even when the persisted wrapper PID is gone.
+    scope_unit.is_some() || process_is_alive
+}
+
+fn job_requires_force_clear(job: &DurableJob) -> bool {
+    requires_force_clear(
+        job.scope_unit.as_deref(),
+        job.pid.is_some_and(process_alive),
+    )
+}
+
+#[cfg(unix)]
+fn scope_unit_is_active(scope_unit: &str) -> bool {
+    let unit = if scope_unit.ends_with(".scope") {
+        scope_unit.to_string()
+    } else {
+        format!("{scope_unit}.scope")
+    };
+    std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", unit.as_str()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn scope_unit_is_active(_scope_unit: &str) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn process_owned_by_job(job: &DurableJob, pid: u32) -> bool {
+    let scope_is_active = job.scope_unit.as_deref().is_some_and(scope_unit_is_active);
+    job_has_liveness_evidence(
+        job.scope_unit.as_deref(),
+        process_alive(pid),
+        scope_is_active,
+    )
+}
+
+#[cfg(not(unix))]
+fn process_owned_by_job(_job: &DurableJob, _pid: u32) -> bool {
+    false
 }
 
 #[cfg(not(unix))]
@@ -479,6 +878,18 @@ fn terminate_process_group(pid: u32) {
             let _ = libc::kill(-pgid, libc::SIGTERM);
         } else {
             let _ = libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn force_kill_process_group(pid: u32) {
+    unsafe {
+        let pgid = libc::getpgid(pid as libc::pid_t);
+        if pgid > 0 {
+            let _ = libc::kill(-pgid, libc::SIGKILL);
+        } else {
+            let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
     }
 }
@@ -500,34 +911,115 @@ async fn stop_scope(unit: &str) -> bool {
 #[cfg(not(unix))]
 fn terminate_process_group(_pid: u32) {}
 
+#[cfg(not(unix))]
+fn force_kill_process_group(_pid: u32) {}
+
 async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
     if matches!(
         job.status,
         DurableJobStatus::Running | DurableJobStatus::Unknown
     ) {
-        if let Ok(bytes) = tokio::fs::read(&job.status_file).await {
-            if let Ok(exit) = serde_json::from_slice::<ExitRecord>(&bytes) {
-                let status = if exit.exit_code == Some(0) {
-                    DurableJobStatus::Completed
-                } else {
-                    DurableJobStatus::Failed
-                };
-                return write_terminal_job_state(
-                    state,
-                    job,
-                    status,
-                    exit.exit_code,
-                    exit.signal,
-                    exit.finished_at,
-                )
-                .await;
+        let scope_is_active = job.scope_unit.as_deref().is_some_and(scope_unit_is_active);
+        let started_pid = read_started_pid(&job).await;
+        let direct_pid_is_live =
+            job.scope_unit.is_none() && job.pid.or(started_pid).is_some_and(process_alive);
+        let can_honor_terminal_receipt = terminal_receipt_can_be_honored(
+            job.scope_unit.as_deref(),
+            direct_pid_is_live,
+            scope_is_active,
+        );
+
+        if let Some(exit) = read_exit_record(&job)
+            .await
+            .filter(|_| can_honor_terminal_receipt)
+        {
+            // The API can be offline while a durable command runs beyond
+            // its absolute deadline and later publishes a successful exit
+            // record. Require the persisted process/scope to be gone before
+            // trusting it: the command inherits this path and may write an
+            // early receipt while it is still running. Then classify the
+            // recorded finish time so restart recovery cannot erase a timeout.
+            let status = terminal_status_for_exit(&job, exit.exit_code, exit.finished_at);
+            return write_terminal_job_state(
+                state,
+                job,
+                status,
+                exit.exit_code,
+                exit.signal,
+                exit.finished_at,
+            )
+            .await;
+        }
+
+        if !job.spawn_accepted {
+            let now = Utc::now();
+            if scope_is_active || direct_pid_is_live {
+                job.spawn_accepted = true;
+                job.status = DurableJobStatus::Running;
+                if job.scope_unit.is_none() {
+                    job.pid = started_pid;
+                }
+                job.heartbeat_at = Some(now);
+                job.updated_at = now;
+                job = write_job(state, &job).await.unwrap_or(job);
+            } else {
+                if (now - job.created_at).num_seconds() >= PIDLESS_START_GRACE_SECS {
+                    job.status = DurableJobStatus::Unknown;
+                    job.updated_at = now;
+                    job = write_job(state, &job).await.unwrap_or(job);
+                }
+                return job;
             }
         }
 
         if let Some(pid) = job.pid {
-            if !process_alive(pid) {
+            if !process_owned_by_job(&job, pid) {
+                // systemd-run may need a brief moment to attach the payload
+                // to its transient scope, and very short commands can exit
+                // just before their wrapper atomically publishes exit.json.
+                // Keep the persisted start lease provisional during that
+                // bounded window instead of returning a false `unknown`.
+                let now = Utc::now();
+                if (now - job.created_at).num_seconds() >= PIDLESS_START_GRACE_SECS {
+                    job.status = DurableJobStatus::Unknown;
+                    job.updated_at = now;
+                    job = write_job(state, &job).await.unwrap_or(job);
+                }
+            } else {
+                let now = Utc::now();
+                if job_deadline_elapsed(&job, now) {
+                    job = mark_job_deadline_exceeded(state, job, now).await;
+                } else if job
+                    .heartbeat_at
+                    .is_none_or(|heartbeat| (now - heartbeat).num_seconds() >= 5)
+                {
+                    // The original child watcher is process-local. After an
+                    // API restart, a verified live PID in the persisted scope
+                    // is enough to reattach the lease and advance heartbeat
+                    // without resubmitting the underlying remote job.
+                    job.heartbeat_at = Some(now);
+                    job.updated_at = now;
+                    job = write_job(state, &job).await.unwrap_or(job);
+                }
+            }
+        } else {
+            let now = Utc::now();
+            let scope_is_active = job.scope_unit.as_deref().is_some_and(scope_unit_is_active);
+            if pidless_scope_is_live(job.scope_unit.as_deref(), scope_is_active) {
+                if job_deadline_elapsed(&job, now) {
+                    job = mark_job_deadline_exceeded(state, job, now).await;
+                } else {
+                    // The API may have restarted after the deterministic scope was
+                    // launched but before its wrapper PID reached job.json. Reattach
+                    // to that scope instead of terminalizing or resubmitting it.
+                    job.status = DurableJobStatus::Running;
+                    job.heartbeat_at = Some(now);
+                    job.updated_at = now;
+                    job = write_job(state, &job).await.unwrap_or(job);
+                }
+            } else if (now - job.created_at).num_seconds() >= PIDLESS_START_GRACE_SECS {
                 job.status = DurableJobStatus::Unknown;
-                job.updated_at = Utc::now();
+                job.updated_at = now;
                 job = write_job(state, &job).await.unwrap_or(job);
             }
         }
@@ -546,6 +1038,9 @@ pub async fn start_job(
     }
     let (workspace_id, started_by_mission_id) =
         authorize_start(&state, &user, req.workspace_id, req.started_by_mission_id).await?;
+    let idempotency_key = validated_idempotency_key(req.idempotency_key.as_deref())
+        .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
+    let id = durable_job_id(&user.id, started_by_mission_id, idempotency_key.as_deref());
 
     let workspace = Some(state.workspaces.get(workspace_id).await.ok_or_else(|| {
         err(
@@ -553,6 +1048,28 @@ pub async fn start_job(
             format!("workspace not found: {workspace_id}"),
         )
     })?);
+    let caller_env = req.env;
+    let mut job_env = caller_env.clone();
+    if let Some(workspace) = workspace.as_ref() {
+        // Durable jobs are the Hermes-facing path for long commands, so they
+        // must receive the same compute-policy boundary as an agent runner.
+        // In particular, a Beal/Verity `lake build` may never bypass the Lake
+        // shim merely because it was submitted through assistant-MCP.
+        crate::workspace::install_remote_build_wrapper(workspace, started_by_mission_id)
+            .await
+            .map_err(|error| {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to install workspace build policy wrappers: {error}"),
+                )
+            })?;
+        if let Some(remote_env) = workspace.remote_build_env(started_by_mission_id) {
+            // Policy, endpoint and capability token are server-owned. Caller
+            // env may still opt into the audited emergency local override,
+            // but cannot downgrade `remote_required` itself.
+            job_env.extend(remote_env);
+        }
+    }
     let cwd = match workspace.as_ref() {
         Some(workspace) => resolve_workspace_cwd(
             &workspace.path,
@@ -563,11 +1080,95 @@ pub async fn start_job(
     }
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
-    let id = Uuid::new_v4();
+    let timeout_secs = req
+        .timeout_secs
+        .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS)
+        .clamp(1, MAX_JOB_TIMEOUT_SECS);
+    let request_fingerprint = durable_job_request_fingerprint(
+        command,
+        &cwd,
+        workspace_id,
+        &caller_env,
+        timeout_secs,
+        req.resource_class.as_deref(),
+    );
+    if idempotency_key.is_some() {
+        if let Ok(existing) = read_job(&state, id).await {
+            if !job_matches_request(&existing, &request_fingerprint) {
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    "idempotency_key was already used with different job parameters",
+                ));
+            }
+            let existing = refresh_job(&state, existing).await;
+            // Only accepted or conclusively terminal receipts close the
+            // submission decision. A Running receipt with spawn_accepted=false
+            // is still being registered and must be resolved under the claim.
+            if submission_receipt_is_final(&existing) {
+                return Ok(Json(existing));
+            }
+        }
+    }
+
     let dir = job_dir(&state, id);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // The lock, rather than file existence, owns the submission lease. A
+    // failed request drops the lock, so a later retry can reuse the same key;
+    // a concurrent request waits for the first job receipt instead of spawning
+    // a duplicate process.
+    let _submission_claim = if idempotency_key.is_some() {
+        let claim_path = dir.join("submission.claim");
+        let mut claim = None;
+        for _ in 0..40 {
+            claim = try_acquire_submission_claim(&claim_path)
+                .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            if claim.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let claim = claim.ok_or_else(|| {
+            err(
+                StatusCode::CONFLICT,
+                "idempotent job submission is still being registered",
+            )
+        })?;
+
+        // Close the race between the initial read and taking the lock. A
+        // concurrent retry waits for the submitting request to release this
+        // claim; it never returns a provisional Running receipt as accepted.
+        if let Ok(existing) = read_job(&state, id).await {
+            if !job_matches_request(&existing, &request_fingerprint) {
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    "idempotency_key was already used with different job parameters",
+                ));
+            }
+            let existing = refresh_job(&state, existing).await;
+            if submission_receipt_is_final(&existing) {
+                return Ok(Json(existing));
+            }
+            if !preparing_receipt_is_resubmittable(&existing) {
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    "idempotent job submission is still being registered",
+                ));
+            }
+            tokio::fs::remove_file(job_file(&state, id))
+                .await
+                .map_err(|error| {
+                    err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to clear stale pre-spawn receipt: {error}"),
+                    )
+                })?;
+        }
+        Some(claim)
+    } else {
+        None
+    };
     let runtime_dir = workspace
         .as_ref()
         .map(|workspace| {
@@ -583,6 +1184,11 @@ pub async fn start_job(
     let stdout_log = runtime_dir.join("stdout.log");
     let stderr_log = runtime_dir.join("stderr.log");
     let status_file = runtime_dir.join("exit.json");
+    let started_file = runtime_dir.join("started.json");
+    // A prior crashed pre-spawn attempt is resubmitted only while holding the
+    // submission claim and only after refresh proved it has no live owner.
+    let _ = tokio::fs::remove_file(&status_file).await;
+    let _ = tokio::fs::remove_file(&started_file).await;
 
     let stdout = std::fs::OpenOptions::new()
         .create(true)
@@ -608,23 +1214,26 @@ pub async fn start_job(
         signal: None,
         created_at: now,
         updated_at: now,
+        heartbeat_at: Some(now),
+        deadline_at: Some(now + chrono::Duration::seconds(timeout_secs as i64)),
         started_by_mission_id: Some(started_by_mission_id),
         workspace_id: req.workspace_id,
         owner_user_id: Some(user.id.clone()),
         stdout_log: stdout_log.to_string_lossy().to_string(),
         stderr_log: stderr_log.to_string_lossy().to_string(),
         status_file: status_file.to_string_lossy().to_string(),
-        scope_unit: workspace.as_ref().and_then(|workspace| {
-            WorkspaceExec::new(workspace.clone())
-                .machine_name()
-                .map(|machine| crate::workspace_exec::durable_scope_unit(&machine, id))
-        }),
+        spawn_accepted: false,
+        scope_unit: workspace
+            .as_ref()
+            .and_then(|workspace| WorkspaceExec::new(workspace.clone()).durable_scope_unit(id)),
+        resource_class: req.resource_class,
+        idempotency_key,
+        request_fingerprint: Some(request_fingerprint),
     };
     job = write_job(&state, &job)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let mut job_env = req.env;
     let status_path_for_child = workspace
         .as_ref()
         .map(|workspace| {
@@ -635,7 +1244,21 @@ pub async fn start_job(
         "SANDBOXED_SH_DURABLE_STATUS".to_string(),
         status_path_for_child,
     );
-    let shell_args = vec!["-lc".to_string(), wrapper];
+    let started_path_for_child = workspace
+        .as_ref()
+        .map(|workspace| {
+            WorkspaceExec::new(workspace.clone()).translate_path_for_container(&started_file)
+        })
+        .unwrap_or_else(|| started_file.to_string_lossy().to_string());
+    job_env.insert(
+        "SANDBOXED_SH_DURABLE_STARTED".to_string(),
+        started_path_for_child,
+    );
+    // WorkspaceExec already provides the container login-shell boundary and
+    // changes to the translated cwd before it execs this shell. A second
+    // login shell can reset PWD to HOME (observed as `/` in nspawn), causing
+    // a requested repository build to run against the wrong tree.
+    let shell_args = vec!["-c".to_string(), wrapper];
     let child_result = match workspace {
         Some(workspace) => {
             WorkspaceExec::new(workspace)
@@ -682,6 +1305,7 @@ pub async fn start_job(
         }
     };
     job.pid = child.id();
+    job.spawn_accepted = true;
     job.updated_at = Utc::now();
     job = match write_job(&state, &job).await {
         Ok(job) => job,
@@ -812,21 +1436,20 @@ pub async fn cancel_job(
         .map_err(|e| err(StatusCode::NOT_FOUND, e))?;
     authorize_job(&state, &user, &job).await?;
     job = refresh_job(&state, job).await;
-    if job.status == DurableJobStatus::Running {
+    if job_is_cancellable(&job.status) {
         job.status = DurableJobStatus::Cancelled;
         job.updated_at = Utc::now();
         job = write_job(&state, &job)
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        let stopped_scope = match job.scope_unit.as_deref() {
-            Some(unit) => stop_scope(unit).await,
-            None => false,
-        };
-        if !stopped_scope {
-            if let Some(pid) = job.pid {
-                terminate_process_group(pid);
+        let cancelling = job.clone();
+        tokio::spawn(async move {
+            signal_job(&cancelling, false).await;
+            tokio::time::sleep(std::time::Duration::from_secs(FORCE_CLEAR_SECS)).await;
+            if job_requires_force_clear(&cancelling) {
+                signal_job(&cancelling, true).await;
             }
-        }
+        });
     }
     Ok(Json(job))
 }
@@ -856,13 +1479,19 @@ mod tests {
             signal: None,
             created_at: now,
             updated_at: now,
+            heartbeat_at: Some(now),
+            deadline_at: None,
             started_by_mission_id: None,
             workspace_id: None,
             owner_user_id: None,
             stdout_log: "/tmp/stdout.log".to_string(),
             stderr_log: "/tmp/stderr.log".to_string(),
             status_file: "/tmp/exit.json".to_string(),
+            spawn_accepted: true,
             scope_unit: None,
+            resource_class: None,
+            idempotency_key: None,
+            request_fingerprint: None,
         }
     }
 
@@ -882,6 +1511,288 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_key_derives_one_stable_job_id() {
+        let mission_id = Uuid::new_v4();
+        let first = durable_job_id("user", mission_id, Some("logical-build-1"));
+        let retry = durable_job_id("user", mission_id, Some("logical-build-1"));
+        let distinct = durable_job_id("user", mission_id, Some("logical-build-2"));
+        assert_eq!(first, retry);
+        assert_ne!(first, distinct);
+        assert!(validated_idempotency_key(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn only_stale_pre_spawn_receipts_are_resubmittable() {
+        let mut job = test_job(DurableJobStatus::Unknown);
+        job.spawn_accepted = false;
+        assert!(preparing_receipt_is_resubmittable(&job));
+        assert!(!submission_receipt_is_final(&job));
+
+        job.spawn_accepted = true;
+        assert!(!preparing_receipt_is_resubmittable(&job));
+        assert!(submission_receipt_is_final(&job));
+        job.spawn_accepted = false;
+        job.status = DurableJobStatus::Running;
+        assert!(!preparing_receipt_is_resubmittable(&job));
+        assert!(
+            !submission_receipt_is_final(&job),
+            "a provisional Running receipt must not be returned as accepted"
+        );
+
+        job.status = DurableJobStatus::Failed;
+        assert!(preparing_receipt_is_resubmittable(&job));
+        assert!(!submission_receipt_is_final(&job));
+
+        job.exit_code = Some(1);
+        assert!(
+            !preparing_receipt_is_resubmittable(&job),
+            "a wrapper-recorded failure proves that spawn occurred"
+        );
+        assert!(submission_receipt_is_final(&job));
+        job.exit_code = None;
+
+        job.status = DurableJobStatus::Completed;
+        assert!(!preparing_receipt_is_resubmittable(&job));
+        assert!(submission_receipt_is_final(&job));
+
+        job.spawn_accepted = true;
+        assert!(!preparing_receipt_is_resubmittable(&job));
+    }
+
+    #[test]
+    fn terminal_jobs_stop_heartbeat_updates_without_stopping_the_watcher() {
+        assert!(job_accepts_heartbeat(&DurableJobStatus::Running));
+        for status in [
+            DurableJobStatus::Completed,
+            DurableJobStatus::Failed,
+            DurableJobStatus::Cancelled,
+            DurableJobStatus::Unknown,
+        ] {
+            assert!(!job_accepts_heartbeat(&status));
+        }
+    }
+
+    #[test]
+    fn ambiguous_jobs_remain_cancellable_without_being_heartbeat_eligible() {
+        assert!(job_is_cancellable(&DurableJobStatus::Unknown));
+        assert!(!job_accepts_heartbeat(&DurableJobStatus::Unknown));
+        assert!(!job_is_cancellable(&DurableJobStatus::Completed));
+        assert!(!job_is_cancellable(&DurableJobStatus::Failed));
+        assert!(!job_is_cancellable(&DurableJobStatus::Cancelled));
+    }
+
+    #[test]
+    fn scoped_job_is_force_cleared_after_its_wrapper_pid_exits() {
+        assert!(requires_force_clear(Some("sandboxed-durable-demo"), false));
+        assert!(requires_force_clear(None, true));
+        assert!(!requires_force_clear(None, false));
+    }
+
+    #[test]
+    fn deadline_is_always_classified_as_failed() {
+        assert_eq!(deadline_terminal_status(), DurableJobStatus::Failed);
+    }
+
+    #[test]
+    fn successful_exit_after_deadline_remains_failed_during_restart_recovery() {
+        let deadline = Utc::now();
+        let mut job = test_job(DurableJobStatus::Running);
+        job.deadline_at = Some(deadline);
+
+        assert_eq!(
+            terminal_status_for_exit(&job, Some(0), deadline + chrono::Duration::seconds(1),),
+            DurableJobStatus::Failed
+        );
+        assert_eq!(
+            terminal_status_for_exit(&job, Some(0), deadline),
+            DurableJobStatus::Failed
+        );
+    }
+
+    #[test]
+    fn successful_exit_before_deadline_survives_late_restart_observation() {
+        let deadline = Utc::now();
+        let mut job = test_job(DurableJobStatus::Running);
+        job.deadline_at = Some(deadline);
+
+        assert_eq!(
+            terminal_status_for_exit(&job, Some(0), deadline - chrono::Duration::seconds(1),),
+            DurableJobStatus::Completed
+        );
+    }
+
+    #[test]
+    fn live_watcher_prefers_recorded_finish_time_over_delayed_observation() {
+        let deadline = Utc::now();
+        let mut job = test_job(DurableJobStatus::Running);
+        job.deadline_at = Some(deadline);
+        let recorded = ExitRecord {
+            exit_code: Some(0),
+            signal: None,
+            finished_at: deadline - chrono::Duration::milliseconds(1),
+        };
+
+        let exit = merge_process_exit_observation(
+            Some(recorded),
+            Some(0),
+            None,
+            deadline + chrono::Duration::milliseconds(1),
+        );
+
+        assert!(exit.finished_at < deadline);
+        assert_eq!(
+            terminal_status_for_exit(&job, exit.exit_code, exit.finished_at),
+            DurableJobStatus::Completed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deadline_receipt_is_not_honored_while_child_is_still_running() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 10"])
+            .spawn()
+            .unwrap();
+
+        assert!(confirmed_child_exit(child.try_wait()).is_none());
+
+        child.kill().await.unwrap();
+        let _ = child.wait().await;
+    }
+
+    #[test]
+    fn pidless_live_scope_still_obeys_its_absolute_deadline() {
+        let now = Utc::now();
+        let mut job = test_job(DurableJobStatus::Running);
+        job.pid = None;
+        job.scope_unit = Some("sandboxed-durable-demo".to_string());
+        job.deadline_at = Some(now - chrono::Duration::seconds(1));
+
+        assert!(pidless_scope_is_live(job.scope_unit.as_deref(), true));
+        assert!(job_deadline_elapsed(&job, now));
+    }
+
+    #[test]
+    fn idempotency_fingerprint_covers_every_execution_option() {
+        let workspace_id = Uuid::new_v4();
+        let mut env = std::collections::HashMap::from([("MODE".to_string(), "one".to_string())]);
+        let base = durable_job_request_fingerprint(
+            "lake build",
+            Path::new("/workspaces/beal"),
+            workspace_id,
+            &env,
+            7_200,
+            Some("lean_heavy"),
+        );
+        assert_eq!(
+            base,
+            durable_job_request_fingerprint(
+                "lake build",
+                Path::new("/workspaces/beal"),
+                workspace_id,
+                &env,
+                7_200,
+                Some("lean_heavy"),
+            )
+        );
+        env.insert("MODE".to_string(), "two".to_string());
+        assert_ne!(
+            base,
+            durable_job_request_fingerprint(
+                "lake build",
+                Path::new("/workspaces/beal"),
+                workspace_id,
+                &env,
+                7_200,
+                Some("lean_heavy"),
+            )
+        );
+        assert_ne!(
+            base,
+            durable_job_request_fingerprint(
+                "lake build",
+                Path::new("/workspaces/verity"),
+                workspace_id,
+                &std::collections::HashMap::from([("MODE".to_string(), "one".to_string(),)]),
+                7_200,
+                Some("lean_heavy"),
+            )
+        );
+        assert_ne!(
+            base,
+            durable_job_request_fingerprint(
+                "lake build",
+                Path::new("/workspaces/beal"),
+                workspace_id,
+                &std::collections::HashMap::from([("MODE".to_string(), "one".to_string(),)]),
+                3_600,
+                Some("lean_heavy"),
+            )
+        );
+        assert_ne!(
+            base,
+            durable_job_request_fingerprint(
+                "lake build",
+                Path::new("/workspaces/beal"),
+                workspace_id,
+                &std::collections::HashMap::from([("MODE".to_string(), "one".to_string(),)]),
+                7_200,
+                Some("diagnostic"),
+            )
+        );
+    }
+
+    #[test]
+    fn failed_submission_claim_can_be_reacquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim_path = dir.path().join("submission.claim");
+        let first = try_acquire_submission_claim(&claim_path)
+            .unwrap()
+            .expect("first claim");
+        assert!(try_acquire_submission_claim(&claim_path).unwrap().is_none());
+        drop(first);
+        assert!(try_acquire_submission_claim(&claim_path).unwrap().is_some());
+    }
+
+    #[test]
+    fn scoped_liveness_uses_the_unit_instead_of_the_wrapper_pid() {
+        assert!(job_has_liveness_evidence(
+            Some("sandboxed-durable-demo"),
+            false,
+            true,
+        ));
+        assert!(!job_has_liveness_evidence(
+            Some("sandboxed-durable-demo"),
+            true,
+            false,
+        ));
+        assert!(job_has_liveness_evidence(None, true, false));
+        assert!(!job_has_liveness_evidence(None, false, true));
+        assert!(pidless_scope_is_live(Some("sandboxed-durable-demo"), true));
+        assert!(!pidless_scope_is_live(
+            Some("sandboxed-durable-demo"),
+            false
+        ));
+        assert!(!pidless_scope_is_live(None, true));
+    }
+
+    #[test]
+    fn restart_refresh_does_not_honor_receipt_with_a_live_owner() {
+        assert!(!terminal_receipt_can_be_honored(None, true, false));
+        assert!(!terminal_receipt_can_be_honored(
+            Some("sandboxed-durable-demo"),
+            false,
+            true,
+        ));
+        assert!(terminal_receipt_can_be_honored(None, false, false));
+        assert!(terminal_receipt_can_be_honored(
+            Some("sandboxed-durable-demo"),
+            false,
+            false,
+        ));
+    }
+
+    #[test]
     fn explicit_job_owner_is_isolated_between_users() {
         let mut job = test_job(DurableJobStatus::Running);
         assert_eq!(explicit_owner_authorized(&job, "alice"), None);
@@ -894,12 +1805,19 @@ mod tests {
     fn wrapper_records_failure_even_when_command_enables_errexit() {
         let dir = tempfile::tempdir().unwrap();
         let status_file = dir.path().join("exit.json");
+        let started_file = dir.path().join("started.json");
+        let wrapper = durable_shell_wrapper("set -eu; false");
+        assert!(wrapper.contains("REMOTE_BUILD_COMMAND%/*"));
         let output = std::process::Command::new("/bin/sh")
-            .args(["-lc", &durable_shell_wrapper("set -eu; false")])
+            .args(["-lc", &wrapper])
             .env("SANDBOXED_SH_DURABLE_STATUS", &status_file)
+            .env("SANDBOXED_SH_DURABLE_STARTED", &started_file)
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1));
+        let started: StartRecord =
+            serde_json::from_slice(&std::fs::read(started_file).unwrap()).unwrap();
+        assert!(started.pid > 0);
         let record: ExitRecord =
             serde_json::from_slice(&std::fs::read(status_file).unwrap()).unwrap();
         assert_eq!(record.exit_code, Some(1));
@@ -926,7 +1844,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolved, mission.canonicalize().unwrap());
+        assert_eq!(resolved, mission);
     }
 
     #[test]
@@ -934,6 +1852,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(resolve_workspace_cwd(dir.path(), WorkspaceType::Host, Some("/tmp")).is_err());
         assert!(resolve_workspace_cwd(dir.path(), WorkspaceType::Container, Some("../")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_cwd_preserves_symlink_root_after_escape_validation() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let canonical_root = parent.path().join("canonical");
+        let logical_root = parent.path().join("logical");
+        std::fs::create_dir_all(canonical_root.join("workspaces/repo")).unwrap();
+        symlink(&canonical_root, &logical_root).unwrap();
+
+        let cwd = resolve_workspace_cwd(
+            &logical_root,
+            WorkspaceType::Container,
+            Some("/workspaces/repo"),
+        )
+        .unwrap();
+
+        assert_eq!(cwd, logical_root.join("workspaces/repo"));
+        assert_ne!(cwd, canonical_root.join("workspaces/repo"));
     }
 
     #[test]
@@ -958,6 +1898,31 @@ mod tests {
         let merged = merge_job_for_write(Some(current), next);
 
         assert_eq!(merged.status, DurableJobStatus::Cancelled);
+    }
+
+    #[test]
+    fn merge_job_for_write_preserves_failed_status_over_late_success() {
+        let current = test_job(DurableJobStatus::Failed);
+        let mut next = current.clone();
+        next.status = DurableJobStatus::Completed;
+        next.exit_code = Some(0);
+
+        let merged = merge_job_for_write(Some(current), next);
+
+        assert_eq!(merged.status, DurableJobStatus::Failed);
+        assert_eq!(merged.exit_code, Some(0));
+    }
+
+    #[test]
+    fn merge_job_for_write_allows_same_terminal_metadata_update() {
+        let current = test_job(DurableJobStatus::Failed);
+        let mut next = current.clone();
+        next.exit_code = Some(124);
+
+        let merged = merge_job_for_write(Some(current), next);
+
+        assert_eq!(merged.status, DurableJobStatus::Failed);
+        assert_eq!(merged.exit_code, Some(124));
     }
 
     #[tokio::test]

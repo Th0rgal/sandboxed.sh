@@ -120,6 +120,16 @@ fn ca_env_scrub_prelude() -> String {
     )
 }
 
+/// Re-prepend the server-installed build-policy wrapper directory after a
+/// login shell has processed its profile. Container profiles commonly put
+/// `/root/.elan/bin` first, which would otherwise bypass the `lake` shim even
+/// though the authoritative PATH was present in the process environment.
+fn compute_policy_path_prelude() -> &'static str {
+    "if [ -n \"${REMOTE_BUILD_COMMAND:-}\" ]; then \
+     __oa_policy_bin=${REMOTE_BUILD_COMMAND%/*}; \
+     PATH=$__oa_policy_bin:$PATH; export PATH; unset __oa_policy_bin; fi; "
+}
+
 fn environ_has_keepalive_marker(environ: &[u8]) -> bool {
     let expected = format!(
         "{}={}",
@@ -304,6 +314,20 @@ fn exec_scope_unit_for_mission(
 /// scopes explicitly.
 pub fn durable_scope_unit(machine_name: &str, job_id: uuid::Uuid) -> String {
     format!("sandboxed-durable-{machine_name}-{}", job_id.simple())
+}
+
+fn durable_scope_unit_for_launch(
+    workspace_type: WorkspaceType,
+    uses_nspawn: bool,
+    caps: &MissionResourceCaps,
+    machine_name: Option<String>,
+    job_id: uuid::Uuid,
+) -> Option<String> {
+    if workspace_type == WorkspaceType::Container && uses_nspawn && !caps.is_disabled() {
+        machine_name.map(|machine| durable_scope_unit(&machine, job_id))
+    } else {
+        None
+    }
 }
 
 /// Recover the 8-hex mission short id from an exec scope unit name produced
@@ -591,12 +615,12 @@ mod tests {
 
     use super::{
         append_nsenter_target_root_arg, ca_env_scrub_prelude, durable_command_runs_on_api_host,
-        durable_scope_unit, environ_has_keepalive_marker, exec_scope_unit,
-        exec_scope_unit_for_mission, exec_unit_belongs_to_mission, machine_name_from_exec_unit,
-        mission_short_id_from_exec_unit, mission_tag_from_path, normalize_container_path,
-        nspawn_directory_from_cmdline, persistent_nspawn_command, replace_command_env,
-        resolv_conf_bind_args, synthesized_container_resolv_conf, WorkspaceExec, WorkspaceType,
-        CA_BUNDLE_ENV_VARS,
+        durable_scope_unit, durable_scope_unit_for_launch, environ_has_keepalive_marker,
+        exec_scope_unit, exec_scope_unit_for_mission, exec_unit_belongs_to_mission,
+        machine_name_from_exec_unit, mission_short_id_from_exec_unit, mission_tag_from_path,
+        normalize_container_path, nspawn_directory_from_cmdline, persistent_nspawn_command,
+        replace_command_env, resolv_conf_bind_args, synthesized_container_resolv_conf,
+        MissionResourceCaps, WorkspaceExec, WorkspaceType, CA_BUNDLE_ENV_VARS,
     };
     use std::collections::HashMap;
     use std::ffi::OsStr;
@@ -708,6 +732,42 @@ mod tests {
         );
         assert_eq!(mission_short_id_from_exec_unit(&unit), None);
         assert!(!unit.starts_with("sandboxed-exec-"));
+    }
+
+    #[test]
+    fn durable_scope_receipt_requires_an_actual_scope_wrapper() {
+        let id = uuid::Uuid::new_v4();
+        let machine = || Some("sandboxed-demo-deadbeef".to_string());
+        assert_eq!(
+            durable_scope_unit_for_launch(
+                WorkspaceType::Container,
+                true,
+                &MissionResourceCaps::default(),
+                machine(),
+                id,
+            ),
+            None
+        );
+        let caps = MissionResourceCaps {
+            cpu_weight: Some("100".to_string()),
+            ..Default::default()
+        };
+        assert!(durable_scope_unit_for_launch(
+            WorkspaceType::Container,
+            true,
+            &caps,
+            machine(),
+            id,
+        )
+        .is_some());
+        assert_eq!(
+            durable_scope_unit_for_launch(WorkspaceType::Host, true, &caps, machine(), id),
+            None
+        );
+        assert_eq!(
+            durable_scope_unit_for_launch(WorkspaceType::Container, false, &caps, machine(), id,),
+            None
+        );
     }
 
     #[tokio::test]
@@ -969,6 +1029,7 @@ mod tests {
         let cmd = WorkspaceExec::build_shell_command_with_env("/w", "curl", &[], None);
         assert!(cmd.contains("SSL_CERT_FILE"));
         assert!(cmd.contains("NODE_EXTRA_CA_CERTS"));
+        assert!(cmd.contains("REMOTE_BUILD_COMMAND%/*"));
         assert!(cmd.trim_start().starts_with("for __oa_ca in"));
     }
 
@@ -1323,6 +1384,10 @@ impl WorkspaceExec {
         // HTTPS inside the container. Runs first so workspace-configured CA
         // vars re-exported below still win.
         cmd.push_str(&ca_env_scrub_prelude());
+        // `/bin/sh -lc` may replace PATH while reading the container profile.
+        // Restore only the non-secret wrapper directory here; the remaining
+        // environment stays out of the visible command line.
+        cmd.push_str(compute_policy_path_prelude());
 
         // Export env vars inside the shell command so they're available in the container.
         // Keys are validated to POSIX env var names (alphanumeric + underscore) to prevent
@@ -1478,6 +1543,19 @@ impl WorkspaceExec {
     /// (workspace env override → process env; see [`resolve_resource_var`]).
     pub fn mission_resource_caps(&self) -> MissionResourceCaps {
         mission_resource_caps_from_env(&self.workspace.env_vars)
+    }
+
+    /// Exact scope receipt for a durable launch. Host/fallback execution and
+    /// uncapped container execution do not use `systemd-run`, so advertising
+    /// a scope for those paths would make healthy PIDs fail ownership checks.
+    pub fn durable_scope_unit(&self, job_id: uuid::Uuid) -> Option<String> {
+        durable_scope_unit_for_launch(
+            self.workspace.workspace_type,
+            use_nspawn_for_workspace(&self.workspace),
+            &self.mission_resource_caps(),
+            self.machine_name(),
+            job_id,
+        )
     }
 
     /// The boot scope unit name for this workspace's container, when one can
@@ -2016,9 +2094,7 @@ impl WorkspaceExec {
             use_nspawn_for_workspace(&self.workspace),
         )
         .then(|| env.clone());
-        let scope_unit = self
-            .machine_name()
-            .map(|machine| durable_scope_unit(&machine, durable_job_id));
+        let scope_unit = self.durable_scope_unit(durable_job_id);
         let mut cmd = self
             .build_command(
                 cwd,

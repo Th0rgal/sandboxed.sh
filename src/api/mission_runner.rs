@@ -2433,9 +2433,9 @@ const STALL_WARN_SECS: u64 = 120;
 const STALL_SEVERE_SECS: u64 = 300;
 /// An unmatched ToolCall is only evidence that a tool *may* still be running.
 /// Some harnesses omit ToolResult events, so this hint must not suppress
-/// severe-stall handling forever. One hour accommodates large local builds
-/// while bounding stale counter damage.
-pub(crate) const TOOL_CALL_STALL_GRACE_SECS: u64 = 3600;
+/// severe-stall handling forever. Long work must register a managed process or
+/// durable job; a bare unmatched protocol event is provisional for two minutes.
+pub(crate) const TOOL_CALL_STALL_GRACE_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -2460,6 +2460,9 @@ pub enum MissionHealth {
     MissingDeliverables { missing: Vec<String> },
     /// Mission ended unexpectedly
     UnexpectedEnd { reason: String },
+    /// Durable row, actor registry, or presentation status disagree. The
+    /// reconciler must repair the conflict rather than hiding it.
+    Reconciling { reason: String },
 }
 
 /// Classify how long a turn has been quiet.
@@ -2610,6 +2613,12 @@ pub struct MissionRunner {
     /// Message queue for this mission
     pub queue: VecDeque<QueuedMessage>,
 
+    /// Message owned by the currently executing turn. Kept separately from
+    /// `queue` so the control actor can persist it until the turn completes;
+    /// after a restart it is safely replayed instead of being lost between
+    /// dequeue and history persistence.
+    inflight_message: Option<QueuedMessage>,
+
     /// Conversation history: (role, content)
     pub history: Vec<(String, String)>,
 
@@ -2663,7 +2672,22 @@ pub struct MissionRunner {
     /// the mission parks in `AwaitingUser`, so this field is informational and
     /// for in-process inspection only).
     pub background_tasks: HashMap<String, BackgroundTask>,
+
+    /// Durable generation lease for the currently executing turn.
+    pub durable_run: Option<crate::api::mission_store::MissionRun>,
+
+    /// Once cancellation is requested, this runner must drain its current
+    /// handle and be removed without starting queued or automated follow-ups.
+    cancellation_requested: bool,
+
+    /// Absolute deadline after which a cancelled runner is force-aborted if
+    /// its harness ignores the cancellation token. Parallel runners own their
+    /// JoinHandle here, so the deadline must travel with the runner rather than
+    /// only being tracked by the control actor's main-runner state.
+    cancellation_force_clear_deadline: Option<Instant>,
 }
+
+const RUNNER_FORCE_CLEAR_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl MissionRunner {
     /// Create a new mission runner.
@@ -2689,6 +2713,7 @@ impl MissionRunner {
             model_override,
             model_effort,
             queue: VecDeque::new(),
+            inflight_message: None,
             history: Vec::new(),
             cancel_token: None,
             running_handle: None,
@@ -2703,6 +2728,59 @@ impl MissionRunner {
             user_id: None,
             active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             background_tasks: HashMap::new(),
+            durable_run: None,
+            cancellation_requested: false,
+            cancellation_force_clear_deadline: None,
+        }
+    }
+
+    pub async fn acquire_durable_run(
+        &mut self,
+        mission_store: &Arc<dyn crate::api::mission_store::MissionStore>,
+        owner_actor_id: &str,
+    ) -> Result<(), String> {
+        if self.is_running() || !self.has_startable_message() {
+            return Ok(());
+        }
+        let run = mission_store
+            .begin_mission_run(self.mission_id, owner_actor_id, None)
+            .await?;
+        let alive = mission_store
+            .heartbeat_mission_run(
+                run.run_id,
+                run.generation,
+                crate::api::mission_store::MissionExecutionState::Running,
+                None,
+            )
+            .await?;
+        if !alive {
+            return Err(format!(
+                "new mission run {} generation {} was superseded before start",
+                run.run_id, run.generation
+            ));
+        }
+        self.durable_run = Some(run);
+        Ok(())
+    }
+
+    pub async fn finish_durable_run(
+        &mut self,
+        mission_store: &Arc<dyn crate::api::mission_store::MissionStore>,
+        terminal_reason: Option<&str>,
+    ) {
+        let Some(run) = self.durable_run.take() else {
+            return;
+        };
+        if let Err(error) = mission_store
+            .finish_mission_run(run.run_id, run.generation, terminal_reason)
+            .await
+        {
+            tracing::warn!(
+                mission_id = %self.mission_id,
+                run_id = %run.run_id,
+                generation = run.generation,
+                "Failed to close durable mission run: {error}"
+            );
         }
     }
 
@@ -2803,9 +2881,76 @@ impl MissionRunner {
 
     /// Cancel the current execution.
     pub fn cancel(&mut self) {
+        self.cancellation_requested = true;
+        self.cancellation_force_clear_deadline
+            .get_or_insert_with(|| Instant::now() + RUNNER_FORCE_CLEAR_GRACE);
+        self.clear_queue();
         if let Some(token) = &self.cancel_token {
             token.cancel();
         }
+    }
+
+    /// Force-abort a cancelled turn once its grace period expires.
+    ///
+    /// Returns `true` when the runner should be removed from the actor's
+    /// registry. A handle which has already finished is left for the normal
+    /// completion path so its terminal result can still be recorded.
+    pub fn force_clear_cancelled_if_due(&mut self) -> bool {
+        if !self.cancellation_requested
+            || !self
+                .cancellation_force_clear_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return false;
+        }
+
+        if self
+            .running_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            return false;
+        }
+
+        if let Some(handle) = self.running_handle.take() {
+            handle.abort();
+        }
+        self.cancel_token = None;
+        self.inflight_message = None;
+        self.reset_turn_tool_calls();
+        self.state = MissionRunState::Finished;
+        self.cancellation_force_clear_deadline = None;
+        true
+    }
+
+    pub fn inflight_message(&self) -> Option<&QueuedMessage> {
+        self.inflight_message.as_ref()
+    }
+
+    fn has_startable_message(&self) -> bool {
+        self.inflight_message.is_some() || !self.queue.is_empty()
+    }
+
+    pub fn remove_inflight_message(&mut self, message_id: Uuid) -> bool {
+        if self.inflight_message.as_ref().map(|message| message.id) == Some(message_id) {
+            self.inflight_message = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn cancellation_requested(&self) -> bool {
+        self.cancellation_requested
+    }
+
+    pub(crate) fn take_next_message_for_start(&mut self) -> Option<QueuedMessage> {
+        if self.is_running() || self.cancellation_requested || self.inflight_message.is_some() {
+            return None;
+        }
+        let message = self.queue.pop_front()?;
+        self.inflight_message = Some(message.clone());
+        Some(message)
     }
 
     /// Remove a specific message from the queue by ID.
@@ -2841,15 +2986,16 @@ impl MissionRunner {
         current_mission: Arc<RwLock<Option<Uuid>>>,
         secrets: Option<Arc<SecretsStore>>,
     ) -> bool {
-        // Don't start if already running
-        if self.is_running() {
+        if self.is_running() || self.cancellation_requested {
             return false;
         }
-
-        // Get next message from queue
-        let msg = match self.queue.pop_front() {
-            Some(m) => m,
-            None => return false,
+        let msg = if let Some(message) = self.inflight_message.clone() {
+            message
+        } else {
+            match self.take_next_message_for_start() {
+                Some(message) => message,
+                None => return false,
+            }
         };
 
         self.reset_turn_tool_calls();
@@ -2941,6 +3087,8 @@ impl MissionRunner {
 
         // Check if handle is finished
         if handle.is_finished() {
+            self.cancellation_force_clear_deadline = None;
+            self.inflight_message = None;
             // A completed or panicked turn can leave an unmatched ToolCall in
             // harnesses that omit ToolResult events. Never expose that stale
             // hint while queued or carry it into the next turn.
@@ -8322,6 +8470,16 @@ pub struct RunningMissionInfo {
     pub subtask_total: usize,
     /// Completed subtasks
     pub subtask_completed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_conflict: Option<String>,
 }
 
 impl From<&MissionRunner> for RunningMissionInfo {
@@ -8348,6 +8506,20 @@ impl From<&MissionRunner> for RunningMissionInfo {
             current_activity: runner.current_activity.clone(),
             subtask_total: runner.subtasks.len(),
             subtask_completed: runner.subtasks.iter().filter(|s| s.completed).count(),
+            run_id: runner.durable_run.as_ref().map(|run| run.run_id),
+            generation: runner.durable_run.as_ref().map(|run| run.generation),
+            heartbeat_at: runner
+                .durable_run
+                .as_ref()
+                .map(|run| run.heartbeat_at.clone()),
+            scope_unit: runner
+                .durable_run
+                .as_ref()
+                .and_then(|run| run.scope_unit.clone()),
+            status_conflict: runner
+                .durable_run
+                .is_none()
+                .then(|| "actor_without_durable_run".to_string()),
         }
     }
 }
@@ -8530,9 +8702,9 @@ mod tests {
         text_buffer_stream_looks_degenerate, thinking_overlaps_visible_answer, tls_error_hint,
         truncate_garbled_output, use_thinking_only_fallback, utf8_safe_prefix,
         ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, CopiedOpenCodeProbe, MissionHealth, MissionRunState,
+        ClaudeTurnWaitState, CopiedOpenCodeProbe, MissionHealth, MissionRunState, MissionRunner,
         MissionStallSeverity, OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
-        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS, TOOL_CALL_STALL_GRACE_SECS,
+        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -10499,14 +10671,13 @@ mod tests {
     // ── subprocess-aware stall classifier tests (TASK 2) ──────────────
 
     #[test]
-    fn stall_severity_severe_downgraded_to_warning_when_tool_alive() {
-        // A 12-minute `lake build` produces no model tokens but is honest
-        // work. The classifier must not escalate this to Severe (which
-        // trips the auto-terminate watchdog) just because of token silence.
+    fn stall_severity_unregistered_tool_hint_expires_before_severe_threshold() {
+        // Unmatched harness events are provisional only. Long work must
+        // register a managed process or durable job in the control plane.
         let result = stall_severity(STALL_SEVERE_SECS + 1, true).unwrap();
         assert!(
-            matches!(result, MissionStallSeverity::Warning),
-            "expected Warning when a tool subprocess is alive, got {:?}",
+            matches!(result, MissionStallSeverity::Severe),
+            "expected Severe after provisional tool grace, got {:?}",
             result
         );
     }
@@ -10520,16 +10691,14 @@ mod tests {
     }
 
     #[test]
-    fn stall_severity_grants_long_tool_call_a_bounded_warning_window() {
-        // 30 minutes of silence after a ToolCall (e.g. a long `make check`)
-        // remains Warning and does not interrupt a healthy large build.
+    fn stall_severity_does_not_grant_unregistered_long_tool_immunity() {
         let result = stall_severity(STALL_SEVERE_SECS * 6, true).unwrap();
-        assert!(matches!(result, MissionStallSeverity::Warning));
+        assert!(matches!(result, MissionStallSeverity::Severe));
     }
 
     #[test]
     fn stall_severity_does_not_trust_unmatched_tool_call_forever() {
-        let result = stall_severity(TOOL_CALL_STALL_GRACE_SECS, true).unwrap();
+        let result = stall_severity(STALL_SEVERE_SECS + 1, true).unwrap();
         assert!(matches!(result, MissionStallSeverity::Severe));
     }
 
@@ -10586,19 +10755,16 @@ mod tests {
     }
 
     #[test]
-    fn running_health_warning_when_tool_alive_at_severe_threshold() {
-        // The end-to-end claim of TASK 2: when the mission is well past
-        // the severe stall threshold *and* a tool subprocess is in flight,
-        // the public health classification stays at Warning.
+    fn running_health_provisional_tool_hint_expires_at_severe_threshold() {
         let health = running_health(MissionRunState::Running, STALL_SEVERE_SECS + 1, true);
         match health {
             MissionHealth::Stalled { severity, .. } => {
                 assert!(
-                    matches!(severity, MissionStallSeverity::Warning),
-                    "tool-alive must keep severity at Warning"
+                    matches!(severity, MissionStallSeverity::Severe),
+                    "unregistered tool hints must not suppress Severe"
                 );
             }
-            other => panic!("Expected Stalled (Warning), got {:?}", other),
+            other => panic!("Expected Stalled (Severe), got {:?}", other),
         }
     }
 
@@ -11895,5 +12061,124 @@ mod tests {
         let mut s = String::from("Here is the plan: A, B, C. We should pick B. ");
         s.push_str(&"Yielding pending your choice. ".repeat(20));
         assert!(text_buffer_stream_looks_degenerate(&s, 4096, 40, 3));
+    }
+
+    #[test]
+    fn running_message_remains_durable_until_completion() {
+        let mut runner = MissionRunner::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let message_id = Uuid::new_v4();
+        runner.queue_message(
+            message_id,
+            "durable controller wake".to_string(),
+            None,
+            Some("task-board".to_string()),
+        );
+
+        let started = runner
+            .take_next_message_for_start()
+            .expect("queued message should start");
+        assert_eq!(started.id, message_id);
+        assert!(runner.queue.is_empty());
+        assert_eq!(
+            runner.inflight_message().map(|message| message.id),
+            Some(message_id)
+        );
+        assert!(runner.has_startable_message());
+
+        let followup_id = Uuid::new_v4();
+        runner.queue_message(followup_id, "follow-up".to_string(), None, None);
+        assert!(runner.take_next_message_for_start().is_none());
+        assert_eq!(
+            runner.queue.front().map(|message| message.id),
+            Some(followup_id)
+        );
+        assert_eq!(
+            runner.inflight_message().map(|message| message.id),
+            Some(message_id),
+            "preparing another delivery must not overwrite the durable inflight marker"
+        );
+    }
+
+    #[test]
+    fn cancellation_clears_followups_and_prevents_restart() {
+        let mut runner = MissionRunner::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        runner.queue_message(Uuid::new_v4(), "queued follow-up".to_string(), None, None);
+
+        runner.cancel();
+
+        assert!(runner.cancellation_requested());
+        assert!(runner.queue.is_empty());
+        assert!(runner.take_next_message_for_start().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_parallel_runner_force_aborts_after_deadline() {
+        let mut runner = MissionRunner::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        runner.state = MissionRunState::Running;
+        runner.running_handle = Some(tokio::spawn(async {
+            std::future::pending::<(Uuid, String, AgentResult)>().await
+        }));
+
+        runner.cancel();
+        runner.cancellation_force_clear_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+
+        assert!(runner.force_clear_cancelled_if_due());
+        assert!(runner.running_handle.is_none());
+        assert!(matches!(runner.state, MissionRunState::Finished));
+        assert!(!runner.force_clear_cancelled_if_due());
+    }
+
+    #[test]
+    fn repeated_cancel_does_not_extend_force_clear_deadline() {
+        let mut runner = MissionRunner::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        runner.cancel();
+        let first_deadline = runner
+            .cancellation_force_clear_deadline
+            .expect("cancel should arm the deadline");
+        runner.cancel();
+
+        assert_eq!(
+            runner.cancellation_force_clear_deadline,
+            Some(first_deadline),
+            "an idempotent cancel retry must not postpone force-clear"
+        );
     }
 }

@@ -161,10 +161,12 @@ pub struct WorkspaceResponse {
     pub mcps_replace_defaults: bool,
     pub config_profile: Option<String>,
     pub config: serde_json::Value,
+    pub compute_policy: workspace::ComputePolicy,
 }
 
 impl From<Workspace> for WorkspaceResponse {
     fn from(w: Workspace) -> Self {
+        let compute_policy = w.compute_policy();
         Self {
             id: w.id,
             name: w.name,
@@ -186,6 +188,7 @@ impl From<Workspace> for WorkspaceResponse {
             mcps_replace_defaults: w.mcps_replace_defaults,
             config_profile: w.config_profile,
             config: w.config,
+            compute_policy,
         }
     }
 }
