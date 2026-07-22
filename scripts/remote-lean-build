@@ -54,6 +54,14 @@ req = {
 repo_root = pathlib.Path(
     subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
 ).resolve()
+toolchain_path = repo_root / "lean-toolchain"
+if toolchain_path.is_file():
+    toolchain = toolchain_path.read_text(encoding="utf-8").strip()
+    if toolchain:
+        req["toolchain"] = toolchain[:256]
+expected_head = os.environ.get("REMOTE_BUILD_EXPECTED_HEAD", "").strip()
+if expected_head:
+    req["expected_head"] = expected_head
 
 def git_paths(*args):
     raw = subprocess.check_output(["git", "-C", str(repo_root), *args])
@@ -166,6 +174,10 @@ import hashlib, json, sys
 request = json.load(open(sys.argv[1]))
 request.pop("token", None)
 request.pop("wait", None)
+# `expected_head` is a live freshness gate, not part of the immutable job
+# identity. A retry after the branch advances must resume the accepted job for
+# the pinned commit and report it as stale, never submit a duplicate.
+request.pop("expected_head", None)
 fingerprint = {"endpoint": sys.argv[2], "request": request}
 canonical = json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
 print(hashlib.sha256(canonical).hexdigest())
@@ -293,7 +305,7 @@ except (OSError, ValueError):
     raise SystemExit(0)
 job = str(receipt.get("job_id") or "")
 node = str(receipt.get("node_id") or "")
-state = str(receipt.get("state") or "")
+state = str(receipt.get("receipt_state") or receipt.get("state") or "")
 if state == "ambiguous":
     print("ambiguous", "ambiguous", state, sep="\t")
     raise SystemExit(0)
@@ -306,7 +318,7 @@ PY
         submitted|queued|running)
             echo "remote-lean-build: resuming job $job_id on node '$node_id' for ${commit:0:12} ..." >&2
             ;;
-        succeeded|failed|cancelled|lost)
+        succeeded|stale_success|failed|cancelled|lost)
             echo "remote-lean-build: replaying terminal job $job_id on node '$node_id' for ${commit:0:12} ..." >&2
             ;;
         ambiguous)
@@ -325,7 +337,19 @@ import json, os, sys, tempfile
 path, request_path, reason = sys.argv[1:]
 request = json.load(open(request_path))
 request.pop("token", None)
-request.pop("repo", None)
+repo = request.pop("repo", None)
+if repo:
+    from urllib.parse import urlsplit, urlunsplit
+    try:
+        parsed = urlsplit(repo)
+        host = parsed.hostname or ""
+        if parsed.port:
+            host += ":%d" % parsed.port
+        request["repository"] = urlunsplit(
+            (parsed.scheme, host, parsed.path, "", "")
+        ) if parsed.scheme else repo
+    except ValueError:
+        request["repository"] = repo
 request.pop("wait", None)
 bundle = request.pop("source_bundle", None)
 if bundle:
@@ -411,7 +435,19 @@ import json, os, sys, tempfile
 path, request_path, job_id, node_id = sys.argv[1:]
 request = json.load(open(request_path))
 request.pop("token", None)
-request.pop("repo", None)
+repo = request.pop("repo", None)
+if repo:
+    from urllib.parse import urlsplit, urlunsplit
+    try:
+        parsed = urlsplit(repo)
+        host = parsed.hostname or ""
+        if parsed.port:
+            host += ":%d" % parsed.port
+        request["repository"] = urlunsplit(
+            (parsed.scheme, host, parsed.path, "", "")
+        ) if parsed.scheme else repo
+    except ValueError:
+        request["repository"] = repo
 request.pop("wait", None)
 bundle = request.pop("source_bundle", None)
 if bundle:
@@ -448,6 +484,14 @@ print(urllib.parse.quote(sys.argv[1], safe=""))
 PY
 )"
 poll_url="${REMOTE_BUILD_URL%/}/$job_id?mission_id=$encoded_mission&node_id=$encoded_node"
+if [ -n "${REMOTE_BUILD_EXPECTED_HEAD:-}" ]; then
+    encoded_expected_head="$(python3 - "$REMOTE_BUILD_EXPECTED_HEAD" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=""))
+PY
+)"
+    poll_url="$poll_url&expected_head=$encoded_expected_head"
+fi
 poll_secs="${REMOTE_BUILD_POLL_SECS:-3}"
 client_timeout_secs="${REMOTE_BUILD_CLIENT_TIMEOUT_SECS:-7500}"
 case "$poll_secs" in
@@ -458,7 +502,8 @@ case "$client_timeout_secs" in
 esac
 [ "$poll_secs" -gt 0 ] || die "REMOTE_BUILD_POLL_SECS must be greater than zero"
 [ "$client_timeout_secs" -gt 0 ] || die "REMOTE_BUILD_CLIENT_TIMEOUT_SECS must be greater than zero"
-if [ "$receipt_state" != "succeeded" ] && [ "$receipt_state" != "failed" ] \
+if [ "$receipt_state" != "succeeded" ] && [ "$receipt_state" != "stale_success" ] \
+    && [ "$receipt_state" != "failed" ] \
     && [ "$receipt_state" != "cancelled" ] && [ "$receipt_state" != "lost" ]; then
     deadline=$(( $(date +%s) + client_timeout_secs ))
 
@@ -483,11 +528,11 @@ try:
 finally:
     if os.path.exists(tmp):
         os.unlink(tmp)
-print(status.get("state") or "")
+print(status.get("receipt_state") or status.get("state") or "")
 PY
             )" || die "invalid remote-build status response"
             case "$receipt_state" in
-                succeeded|failed|cancelled|lost) break ;;
+                succeeded|stale_success|failed|cancelled|lost) break ;;
             esac
         elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
             echo "remote-lean-build: polling authorization failed; the accepted job remains resumable" >&2
@@ -505,10 +550,20 @@ PY
     done
 fi
 
-python3 - "$state_file" <<'PY'
+python3 - "$state_file" "${REMOTE_BUILD_EXPECTED_HEAD:-}" <<'PY'
 import datetime, json, sys
 with open(sys.argv[1]) as f:
     resp = json.load(f)
+expected_head = sys.argv[2].strip()
+validation = resp.get("validation") or {}
+validated_commit = validation.get("commit") or resp.get("commit") or ""
+stale_success = bool(
+    expected_head
+    and validated_commit
+    and validated_commit != expected_head
+    and resp.get("state") == "succeeded"
+)
+effective_state = "stale_success" if stale_success else resp.get("state")
 duration = None
 try:
     started = datetime.datetime.fromisoformat(resp["started_at"])
@@ -518,7 +573,8 @@ except (KeyError, TypeError, ValueError):
     pass
 sys.stderr.write(
     "remote-lean-build: job %s on node '%s' finished: %s (exit %s, %ss)\n"
-    % (resp.get("job_id"), resp.get("node_id"), resp.get("state"),
+    % (resp.get("job_id"), resp.get("node_id"),
+       effective_state,
        resp.get("exit_code"), duration if duration is not None else "?")
 )
 log_tail = resp.get("log_tail") or ""
@@ -531,5 +587,8 @@ for artifact in resp.get("artifacts") or []:
         "artifact: %(path)s sha256=%(sha256)s (%(size_bytes)d bytes)\n" % artifact
     )
 exit_code = resp.get("exit_code")
+if stale_success:
+    sys.stderr.write("remote-lean-build: validation is stale for the current expected head\n")
+    sys.exit(1)
 sys.exit(exit_code if isinstance(exit_code, int) and 0 <= exit_code <= 255 else 1)
 PY

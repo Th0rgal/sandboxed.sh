@@ -276,6 +276,15 @@ pub struct RemoteBuildRequest {
     pub repo: String,
     /// Full 40-char lowercase hex commit SHA.
     pub commit: String,
+    /// Optional exact-head gate captured by the caller immediately before
+    /// submission. A mismatch fails before placement, so an already-stale
+    /// validation can never consume remote capacity.
+    #[serde(default)]
+    pub expected_head: Option<String>,
+    /// Toolchain identity recorded in the durable receipt. The node still
+    /// reads the pinned checkout's toolchain file as the execution authority.
+    #[serde(default)]
+    pub toolchain: Option<String>,
     /// Optional, bounded source overlay whose hashes are verified by the node
     /// before it is applied over the pinned commit.
     #[serde(default)]
@@ -322,6 +331,48 @@ struct RemoteBuildWaitResponse {
 struct RemoteBuildAcceptedResponse {
     job_id: Uuid,
     node_id: String,
+    repository: String,
+    commit: String,
+    command: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    toolchain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_bundle_digest: Option<String>,
+}
+
+fn repository_identity(repo: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(repo) else {
+        return repo.to_string();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
+}
+
+fn remote_job_identity(
+    req: &RemoteBuildRequest,
+) -> crate::remote_node::job_ledger::RemoteJobIdentity {
+    crate::remote_node::job_ledger::RemoteJobIdentity {
+        repository: repository_identity(&req.repo),
+        commit: req.commit.clone(),
+        command: req.command.clone(),
+        toolchain: req.toolchain.clone(),
+        source_bundle_digest: req
+            .source_bundle
+            .as_ref()
+            .map(|bundle| bundle.manifest_sha256.clone()),
+    }
+}
+
+fn validate_expected_head(commit: &str, expected_head: Option<&str>) -> Result<(), String> {
+    match expected_head {
+        Some(expected_head) if expected_head != commit => Err(format!(
+            "STALE_VALIDATION_REQUEST: pinned commit {commit} does not match expected head {expected_head}"
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn should_reprobe_after_placement_failure(_status: Option<&RemoteNodeStatus>) -> bool {
@@ -603,6 +654,21 @@ fn record_remote_build_status(
         .record_outcome(remote_build_dispatch_outcome(node_id, status, started_at));
 }
 
+async fn finalize_remote_build_handle(
+    working_dir: &std::path::Path,
+    job_id: Uuid,
+    state: &str,
+    exit_status: Option<i32>,
+) -> bool {
+    match crate::remote_node::job_ledger::finalize(working_dir, job_id, state, exit_status).await {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(%job_id, ?error, "remote build receipt finalization failed; observation will retry");
+            false
+        }
+    }
+}
+
 async fn remote_build_started_at(state: &AppState, job_id: Uuid) -> chrono::DateTime<chrono::Utc> {
     if let Some(started_at) = state
         .fleet
@@ -642,9 +708,17 @@ fn spawn_remote_build_observer(
             if cancel_requested {
                 if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
                     if error.is_not_found() {
-                        crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id)
-                            .await;
-                        return;
+                        if finalize_remote_build_handle(
+                            &state.config.working_dir,
+                            job_id,
+                            "lost",
+                            None,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
                     }
                     tracing::warn!(
                         mission_id = %mission_id,
@@ -658,14 +732,33 @@ fn spawn_remote_build_observer(
             match client.get_job(&node, &shared_token, job_id).await {
                 Ok(status) if remote_build_is_terminal(&status.state) => {
                     record_remote_build_status(&state, &node.id, &status, started_at);
-                    crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
-                    return;
+                    if finalize_remote_build_handle(
+                        &state.config.working_dir,
+                        job_id,
+                        &status.state,
+                        status.exit_code,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                 }
                 Err(error) if cancel_requested && error.is_not_found() => {
-                    crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
-                    return;
+                    if finalize_remote_build_handle(&state.config.working_dir, job_id, "lost", None)
+                        .await
+                    {
+                        return;
+                    }
                 }
-                Ok(status) => record_remote_build_status(&state, &node.id, &status, started_at),
+                Ok(status) => {
+                    record_remote_build_status(&state, &node.id, &status, started_at);
+                    if let Err(error) =
+                        crate::remote_node::job_ledger::heartbeat(&state.config.working_dir, job_id)
+                            .await
+                    {
+                        tracing::warn!(%job_id, ?error, "remote build heartbeat persistence failed");
+                    }
+                }
                 Err(_) => {}
             }
         }
@@ -691,6 +784,9 @@ async fn submit_remote_build(
     }
     if req.command.is_empty() {
         return (StatusCode::BAD_REQUEST, "command argv required").into_response();
+    }
+    if let Err(message) = validate_expected_head(&req.commit, req.expected_head.as_deref()) {
+        return (StatusCode::CONFLICT, message).into_response();
     }
     let max_estimated_disk_bytes =
         env_gib("REMOTE_BUILD_MAX_ESTIMATED_DISK_GB", MAX_ESTIMATED_DISK_GB);
@@ -772,6 +868,7 @@ async fn submit_remote_build(
         },
     };
 
+    let identity = remote_job_identity(&req);
     let client = RemoteNodeClient::default();
     let started_at = chrono::Utc::now();
     if let Err(error) = crate::remote_node::job_ledger::record(
@@ -782,8 +879,10 @@ async fn submit_remote_build(
             job_id,
             started_at,
             accepted_at: None,
+            heartbeat_at: None,
             disk_reservation_bytes: req.estimated_disk_bytes,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
+            identity: Some(identity.clone()),
         },
     )
     .await
@@ -856,8 +955,10 @@ async fn submit_remote_build(
             job_id,
             started_at,
             accepted_at: Some(chrono::Utc::now()),
+            heartbeat_at: Some(chrono::Utc::now()),
             disk_reservation_bytes: req.estimated_disk_bytes,
             kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
+            identity: Some(identity.clone()),
         },
     )
     .await
@@ -896,6 +997,11 @@ async fn submit_remote_build(
             Json(RemoteBuildAcceptedResponse {
                 job_id,
                 node_id: node.id.clone(),
+                repository: identity.repository,
+                commit: identity.commit,
+                command: identity.command,
+                toolchain: identity.toolchain,
+                source_bundle_digest: identity.source_bundle_digest,
             }),
         )
             .into_response();
@@ -911,7 +1017,16 @@ async fn submit_remote_build(
         };
         record_remote_build_status(&state, &node.id, &status, started_at);
         if remote_build_is_terminal(&status.state) {
-            crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
+            if !finalize_remote_build_handle(
+                &state.config.working_dir,
+                job_id,
+                &status.state,
+                status.exit_code,
+            )
+            .await
+            {
+                continue;
+            }
             let duration_secs = (chrono::Utc::now() - started_at).num_seconds().max(0) as u64;
             return Json(RemoteBuildWaitResponse {
                 exit_code: status.exit_code,
@@ -923,6 +1038,11 @@ async fn submit_remote_build(
                 artifacts: status.artifacts,
             })
             .into_response();
+        }
+        if let Err(error) =
+            crate::remote_node::job_ledger::heartbeat(&state.config.working_dir, job_id).await
+        {
+            tracing::warn!(%job_id, ?error, "remote build heartbeat persistence failed");
         }
     }
     state.fleet.record_outcome(outcome(
@@ -952,6 +1072,61 @@ pub struct RemoteBuildStatusQuery {
     pub mission_id: Uuid,
     #[serde(default = "default_node_id")]
     pub node_id: String,
+    /// Live head observed by a gate/controller. The node state remains
+    /// unchanged, while `receipt_state` becomes `stale_success` when a green
+    /// build validated a different immutable commit.
+    #[serde(default)]
+    pub expected_head: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RemoteBuildStatusResponse {
+    #[serde(flatten)]
+    status: NodeJobStatus,
+    receipt_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_head_match: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation: Option<crate::remote_node::job_ledger::RemoteJobIdentity>,
+}
+
+fn remote_build_response_from_receipt(
+    query: &RemoteBuildStatusQuery,
+    receipt: crate::remote_node::job_ledger::RemoteJobReceipt,
+) -> Result<Json<RemoteBuildStatusResponse>, (StatusCode, String)> {
+    if receipt.mission_id != query.mission_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "job does not belong to this mission".to_string(),
+        ));
+    }
+    let current_head_match = query
+        .expected_head
+        .as_deref()
+        .map(|expected_head| receipt.identity.commit == expected_head);
+    let receipt_state = if receipt.state == "succeeded" && current_head_match == Some(false) {
+        "stale_success".to_string()
+    } else {
+        receipt.state.clone()
+    };
+    let status = NodeJobStatus {
+        job_id: receipt.job_id,
+        mission_id: receipt.mission_id,
+        state: receipt.state,
+        exit_code: receipt.exit_status,
+        created_at: receipt.started_at.to_rfc3339(),
+        started_at: Some(receipt.started_at.to_rfc3339()),
+        finished_at: Some(receipt.finished_at.to_rfc3339()),
+        error: None,
+        log_tail: None,
+        artifacts: Vec::new(),
+    };
+    Ok(Json(RemoteBuildStatusResponse {
+        status,
+        receipt_state,
+        current_head_match,
+        validation: Some(receipt.identity),
+    }))
 }
 
 /// `GET /api/remote-build/:job_id?mission_id=...&node_id=...` —
@@ -963,7 +1138,7 @@ async fn get_remote_build(
     Path(job_id): Path<Uuid>,
     Query(query): Query<RemoteBuildStatusQuery>,
     headers: HeaderMap,
-) -> Result<Json<NodeJobStatus>, (StatusCode, String)> {
+) -> Result<Json<RemoteBuildStatusResponse>, (StatusCode, String)> {
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -981,16 +1156,53 @@ async fn get_remote_build(
             "node_id is required to poll a build".to_string(),
         ));
     }
+    // Prefer the live node because it retains bounded logs and artifact
+    // digests. Keep the durable receipt ready as the authority when the node
+    // is offline, reconfigured, or has pruned its own job record.
+    let persisted_terminal_receipt =
+        crate::remote_node::job_ledger::terminal_receipt(&state.config.working_dir, job_id)
+            .await
+            .unwrap_or_default();
     let settings = &state.config.remote_nodes;
-    let node = settings.node(&query.node_id).cloned().ok_or((
-        StatusCode::BAD_REQUEST,
-        format!("remote node '{}' is not configured", query.node_id),
-    ))?;
-    let shared_token = node_shared_token(&node)?;
-    let status = RemoteNodeClient::default()
+    let node = match settings.node(&query.node_id).cloned() {
+        Some(node) => node,
+        None => {
+            if let Some(receipt) = persisted_terminal_receipt.clone() {
+                return remote_build_response_from_receipt(&query, receipt);
+            }
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("remote node '{}' is not configured", query.node_id),
+            ));
+        }
+    };
+    let shared_token = match node_shared_token(&node) {
+        Ok(token) => token,
+        Err(error) => {
+            if let Some(receipt) = persisted_terminal_receipt.clone() {
+                return remote_build_response_from_receipt(&query, receipt);
+            }
+            return Err(error);
+        }
+    };
+    let status = match RemoteNodeClient::default()
         .get_job(&node, &shared_token, job_id)
         .await
-        .map_err(|e| (job_status_error_status(&e), e.to_string()))?;
+    {
+        Ok(status) => status,
+        Err(error) => {
+            // Finalization can race this lookup. Recheck the durable receipt
+            // before surfacing a transient/404 node failure.
+            if let Some(receipt) = persisted_terminal_receipt.clone().or(
+                crate::remote_node::job_ledger::terminal_receipt(&state.config.working_dir, job_id)
+                    .await
+                    .unwrap_or_default(),
+            ) {
+                return remote_build_response_from_receipt(&query, receipt);
+            }
+            return Err((job_status_error_status(&error), error.to_string()));
+        }
+    };
     // The capability token is mission-scoped: never leak another mission's
     // job status through it.
     if status.mission_id != query.mission_id {
@@ -999,17 +1211,84 @@ async fn get_remote_build(
             "job does not belong to this mission".to_string(),
         ));
     }
+    let handle = crate::remote_node::job_ledger::load(&state.config.working_dir)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|handle| handle.job_id == job_id);
+    let terminal_receipt = if handle.is_none() {
+        match persisted_terminal_receipt {
+            Some(receipt) => Some(receipt),
+            None => {
+                crate::remote_node::job_ledger::terminal_receipt(&state.config.working_dir, job_id)
+                    .await
+                    .unwrap_or_default()
+            }
+        }
+    } else {
+        None
+    };
+    let validation = handle
+        .as_ref()
+        .and_then(|handle| handle.identity.clone())
+        .or_else(|| {
+            terminal_receipt
+                .as_ref()
+                .map(|receipt| receipt.identity.clone())
+        });
+    let current_head_match = query.expected_head.as_deref().and_then(|expected_head| {
+        validation
+            .as_ref()
+            .map(|identity| identity.commit == expected_head)
+    });
+    let receipt_state = if status.state == "succeeded" && current_head_match == Some(false) {
+        "stale_success".to_string()
+    } else {
+        status.state.clone()
+    };
     let started_at = remote_build_started_at(&state, job_id).await;
     record_remote_build_status(&state, &node.id, &status, started_at);
     if remote_build_is_terminal(&status.state) {
-        crate::remote_node::job_ledger::remove(&state.config.working_dir, job_id).await;
+        finalize_remote_build_handle(
+            &state.config.working_dir,
+            job_id,
+            &status.state,
+            status.exit_code,
+        )
+        .await;
+    } else if let Err(error) =
+        crate::remote_node::job_ledger::heartbeat(&state.config.working_dir, job_id).await
+    {
+        tracing::warn!(%job_id, ?error, "remote build heartbeat persistence failed");
     }
-    Ok(Json(status))
+    Ok(Json(RemoteBuildStatusResponse {
+        status,
+        receipt_state,
+        current_head_match,
+        validation,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_handle_finalization_reports_persistence_failure() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let invalid_working_dir = temp.path().join("not-a-directory");
+        std::fs::write(&invalid_working_dir, b"file").expect("create invalid working dir");
+
+        assert!(
+            !finalize_remote_build_handle(
+                &invalid_working_dir,
+                Uuid::new_v4(),
+                "succeeded",
+                Some(0),
+            )
+            .await
+        );
+    }
 
     fn node_job_status(state: &str) -> NodeJobStatus {
         NodeJobStatus {
@@ -1073,8 +1352,10 @@ mod tests {
             job_id: Uuid::new_v4(),
             started_at: now,
             accepted_at: None,
+            heartbeat_at: None,
             disk_reservation_bytes: 12 * GIB,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
+            identity: None,
         };
 
         assert!(handle_needs_reservation(
@@ -1243,6 +1524,79 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         assert!(!verify_remote_build_token_with_secret(
             "wrong", mission, &token, now
         ));
+    }
+
+    #[test]
+    fn immutable_identity_redacts_repository_credentials() {
+        let req: RemoteBuildRequest = serde_json::from_value(serde_json::json!({
+            "mission_id": Uuid::new_v4(),
+            "token": "token",
+            "repo": "https://secret-user:secret-token@example.invalid/org/repo.git?token=secret#fragment",
+            "commit": "a".repeat(40),
+            "command": ["lake", "build"],
+            "toolchain": "leanprover/lean4:v4.19.0",
+            "wait": false
+        }))
+        .unwrap();
+        let identity = remote_job_identity(&req);
+
+        assert_eq!(identity.repository, "https://example.invalid/org/repo.git");
+        assert_eq!(identity.commit, "a".repeat(40));
+        assert_eq!(identity.command, vec!["lake", "build"]);
+        assert_eq!(
+            identity.toolchain.as_deref(),
+            Some("leanprover/lean4:v4.19.0")
+        );
+    }
+
+    #[test]
+    fn exact_head_gate_rejects_an_already_stale_request() {
+        assert!(validate_expected_head(&"a".repeat(40), Some(&"a".repeat(40))).is_ok());
+        let error = validate_expected_head(&"a".repeat(40), Some(&"b".repeat(40))).unwrap_err();
+        assert!(error.starts_with("STALE_VALIDATION_REQUEST:"));
+    }
+
+    #[test]
+    fn terminal_receipt_reports_stale_success_without_node_lookup() {
+        let mission_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let started_at = chrono::Utc::now();
+        let response = remote_build_response_from_receipt(
+            &RemoteBuildStatusQuery {
+                mission_id,
+                node_id: "offline-node".to_string(),
+                expected_head: Some("b".repeat(40)),
+            },
+            crate::remote_node::job_ledger::RemoteJobReceipt {
+                mission_id,
+                node_id: "offline-node".to_string(),
+                job_id,
+                started_at,
+                finished_at: started_at,
+                state: "succeeded".to_string(),
+                exit_status: Some(0),
+                identity: crate::remote_node::job_ledger::RemoteJobIdentity {
+                    repository: "https://github.com/example/verity.git".to_string(),
+                    commit: "a".repeat(40),
+                    command: vec!["lake".to_string(), "build".to_string()],
+                    toolchain: Some("leanprover/lean4:v4.19.0".to_string()),
+                    source_bundle_digest: None,
+                },
+            },
+        )
+        .unwrap()
+        .0;
+
+        assert_eq!(response.status.job_id, job_id);
+        assert_eq!(response.receipt_state, "stale_success");
+        assert_eq!(response.current_head_match, Some(false));
+        assert_eq!(
+            response
+                .validation
+                .as_ref()
+                .map(|identity| identity.commit.as_str()),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     #[test]
@@ -1435,7 +1789,8 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         git(&["config", "user.name", "Remote Build Test"]);
         git(&["config", "user.email", "remote-build@example.invalid"]);
         std::fs::write(repo.join("Theory/Proof.lean"), "old\n").unwrap();
-        git(&["add", "Theory/Proof.lean"]);
+        std::fs::write(repo.join("lean-toolchain"), "leanprover/lean4:v4.19.0\n").unwrap();
+        git(&["add", "Theory/Proof.lean", "lean-toolchain"]);
         git(&[
             "-c",
             "commit.gpgsign=false",
@@ -1494,6 +1849,7 @@ printf '503'
             )
             .env("REMOTE_BUILD_TOKEN", "test-token")
             .env("REMOTE_BUILD_MISSION_ID", Uuid::new_v4().to_string())
+            .env("REMOTE_BUILD_EXPECTED_HEAD", "a".repeat(40))
             .env("REMOTE_BUILD_TEST_CAPTURE", &capture)
             .output()
             .unwrap();
@@ -1506,6 +1862,16 @@ printf '503'
                 .get("estimated_disk_bytes")
                 .and_then(serde_json::Value::as_u64),
             Some(12 * GIB)
+        );
+        assert_eq!(
+            request.get("toolchain").and_then(serde_json::Value::as_str),
+            Some("leanprover/lean4:v4.19.0")
+        );
+        assert_eq!(
+            request
+                .get("expected_head")
+                .and_then(serde_json::Value::as_str),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
         let bundle = request.get("source_bundle").unwrap();
         let files = bundle.get("files").unwrap().as_array().unwrap();
@@ -1594,7 +1960,15 @@ case "$url" in
         if [ "$REMOTE_BUILD_TEST_POLL_MODE" = "fail" ]; then
             exit 7
         fi
-        printf '{"job_id":"11111111-1111-1111-1111-111111111111","mission_id":"%s","state":"succeeded","exit_code":0,"created_at":"2026-07-15T20:00:00Z","started_at":"2026-07-15T20:00:01Z","finished_at":"2026-07-15T20:00:03Z","error":null,"log_tail":"remote ok\\n","artifacts":[]}' "$REMOTE_BUILD_TEST_MISSION_ID" > "$output"
+        if [ "$REMOTE_BUILD_TEST_POLL_MODE" = "stale" ]; then
+            case "$url" in
+                *expected_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb*) ;;
+                *) exit 22 ;;
+            esac
+            printf '{"job_id":"11111111-1111-1111-1111-111111111111","mission_id":"%s","state":"succeeded","receipt_state":"stale_success","current_head_match":false,"exit_code":0,"created_at":"2026-07-15T20:00:00Z","started_at":"2026-07-15T20:00:01Z","finished_at":"2026-07-15T20:00:03Z","error":null,"log_tail":"remote ok\\n","artifacts":[]}' "$REMOTE_BUILD_TEST_MISSION_ID" > "$output"
+        else
+            printf '{"job_id":"11111111-1111-1111-1111-111111111111","mission_id":"%s","state":"succeeded","receipt_state":"succeeded","current_head_match":true,"exit_code":0,"created_at":"2026-07-15T20:00:00Z","started_at":"2026-07-15T20:00:01Z","finished_at":"2026-07-15T20:00:03Z","error":null,"log_tail":"remote ok\\n","artifacts":[]}' "$REMOTE_BUILD_TEST_MISSION_ID" > "$output"
+        fi
         printf '200'
         ;;
     *)
@@ -1719,6 +2093,14 @@ esac
         assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
         assert!(String::from_utf8_lossy(&replayed.stderr).contains("replaying terminal job"));
         assert_eq!(String::from_utf8_lossy(&replayed.stdout), "remote ok\n");
+
+        let stale = command("stale")
+            .env("REMOTE_BUILD_EXPECTED_HEAD", "b".repeat(40))
+            .output()
+            .expect("run stale exact-head validation");
+        assert_eq!(stale.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&stale.stderr).contains("validation is stale"));
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
 
         for receipt in std::fs::read_dir(&state).expect("read receipts before persistence failure")
         {

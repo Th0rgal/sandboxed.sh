@@ -397,6 +397,8 @@ Request body:
   "token": "<REMOTE_BUILD_TOKEN>",
   "repo": "https://github.com/org/repo.git",
   "commit": "<40-hex sha>",
+  "expected_head": "<40-hex sha>",
+  "toolchain": "leanprover/lean4:v4.19.0",
   "cwd_rel": "verity",
   "command": ["lake", "build"],
   "timeout_secs": 3600,
@@ -410,9 +412,19 @@ Request body:
 `requirements` defaults to `["lean"]`, `node_id` to `"auto"`, `wait` to
 `true`. With `wait: true` the call polls the node every 3s (client-side cap
 2h) and returns `{exit_code, state, duration_secs, log_tail, node_id,
-job_id, artifacts}`. With `wait: false` it returns `202 {job_id, node_id}`;
-poll `GET /api/remote-build/:job_id?mission_id=...&node_id=...` with the
-capability in `Authorization: Bearer $REMOTE_BUILD_TOKEN` for the job status.
+job_id, artifacts}`. With `wait: false` it returns `202` with the job/node plus
+the credential-free immutable validation identity (repository, commit, command,
+toolchain, and source-bundle digest). Poll
+`GET /api/remote-build/:job_id?mission_id=...&node_id=...` with the capability
+in `Authorization: Bearer $REMOTE_BUILD_TOKEN` for the job status. Pass
+`expected_head=<live sha>` while polling to receive
+`receipt_state=stale_success` and `current_head_match=false` when a green job
+validated an older commit. Submission returns `409 STALE_VALIDATION_REQUEST`
+when `expected_head` already differs from `commit`.
+The core retains bounded terminal receipts in
+`.sandboxed-sh/remote-job-receipts.json`, including the credential-free
+repository, commit, command, toolchain, overlay digest, node, and job ID. This
+keeps exact-head evidence available after the active reservation is released.
 Capabilities expire after six hours by default (`REMOTE_BUILD_TOKEN_TTL_SECS`)
 and new submissions require a live mission. Placement failures and
 unconfigured/unavailable fleets
@@ -429,9 +441,10 @@ remote-lean-build lake build Verity
 ```
 
 It derives `repo` (`git remote get-url origin`), `commit`
-(`git rev-parse HEAD`) and `cwd_rel` (`git rev-parse --show-prefix`),
-refuses a dirty tree for a new submission (exit 2 — the node builds a pinned
-commit, so uncommitted changes would be silently ignored), submits asynchronously to
+(`git rev-parse HEAD`), the Lean toolchain, and `cwd_rel`
+(`git rev-parse --show-prefix`). Dirty Lean sources and build metadata are sent
+as a bounded hashed overlay; unsupported deletions/renames fail before
+submission. It submits asynchronously to
 `$REMOTE_BUILD_URL` with `$REMOTE_BUILD_TOKEN`/`$REMOTE_BUILD_MISSION_ID`,
 persists the returned job/node receipt under
 `${XDG_STATE_HOME:-$HOME/.local/state}/sandboxed-sh/remote-builds/`, then polls
@@ -459,7 +472,10 @@ response and never falls back. It also persists a secret-free `ambiguous`
 receipt, so an identical retry cannot submit a second job before operators
 confirm reconciliation; `REMOTE_BUILD_FORCE_NEW=1` is an explicit override.
 
-Optional: `REMOTE_BUILD_TIMEOUT_SECS` forwards a job timeout (clamped by the
+Optional: `REMOTE_BUILD_EXPECTED_HEAD` freezes an exact-head gate at
+submission and is also sent on status polls. A `stale_success` receipt exits
+non-zero even when the remote command itself exited zero.
+`REMOTE_BUILD_TIMEOUT_SECS` forwards a job timeout (clamped by the
 node's `SANDBOXED_NODE_MAX_JOB_SECS`). `REMOTE_BUILD_SUBMIT_TIMEOUT_SECS`
 controls the pre-receipt HTTP budget (default 90 seconds, long enough for a
 fresh probe plus node submission). Submit timeouts and response-side transport
@@ -467,7 +483,8 @@ failures are treated as ambiguous outcomes and never trigger local fallback;
 only failures that happen before connecting are fallback-safe. Failure to
 persist the receipt after a `202` is also fail-closed and reports the accepted
 job handle. `REMOTE_BUILD_STATE_DIR` overrides the receipt directory. Receipts
-never contain the capability token or the Git remote URL.
+never contain the capability token or repository credentials; they retain the
+credential-free repository identity needed to audit the validation.
 `REMOTE_BUILD_FORCE_NEW=1` deliberately bypasses a live matching receipt and
 should be reserved for operator-directed retries.
 

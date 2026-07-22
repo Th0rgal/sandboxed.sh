@@ -150,6 +150,9 @@ pub enum MissionExecutionState {
     Starting,
     Running,
     WaitingTool,
+    /// A durable remote job owns the long-running work. Its persisted job
+    /// handle, rather than an unmatched harness tool call, proves liveness.
+    WaitingRemoteJob,
     WaitingUser,
     WaitingBackground,
     Stopping,
@@ -163,6 +166,7 @@ impl MissionExecutionState {
             Self::Starting => "starting",
             Self::Running => "running",
             Self::WaitingTool => "waiting_tool",
+            Self::WaitingRemoteJob => "waiting_remote_job",
             Self::WaitingUser => "waiting_user",
             Self::WaitingBackground => "waiting_background",
             Self::Stopping => "stopping",
@@ -176,6 +180,7 @@ impl MissionExecutionState {
             "starting" => Self::Starting,
             "running" => Self::Running,
             "waiting_tool" => Self::WaitingTool,
+            "waiting_remote_job" => Self::WaitingRemoteJob,
             "waiting_user" => Self::WaitingUser,
             "waiting_background" => Self::WaitingBackground,
             "stopping" => Self::Stopping,
