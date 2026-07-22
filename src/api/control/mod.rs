@@ -7257,6 +7257,49 @@ async fn record_suppressed_remote_build_terminal_event(
     Ok(())
 }
 
+/// Ask the live control actor whether it still owns the mission process.
+///
+/// The durable run can still say `waiting_remote_job` for a short window after
+/// the synchronous remote-build tool has returned: the harness may already be
+/// consuming the result or running its next tool. Closing that lease from the
+/// receipt outbox would leave a live actor emitting stale-generation events.
+/// Query the actor directly instead of inferring process ownership from the
+/// persisted execution state.
+async fn control_actor_mission_run(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    mission_id: Uuid,
+) -> Result<Option<(Uuid, u64)>, String> {
+    let (respond, response) = oneshot::channel();
+    cmd_tx
+        .send(ControlCommand::GetActorRunLease {
+            mission_id,
+            respond,
+        })
+        .await
+        .map_err(|_| "remote-build control actor is unavailable".to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), response)
+        .await
+        .map_err(|_| "remote-build control actor ownership query timed out".to_string())?
+        .map_err(|_| "remote-build control actor ownership query was dropped".to_string())
+}
+
+fn select_actor_run_lease(
+    mission_id: Uuid,
+    main_running: bool,
+    main_mission_id: Option<Uuid>,
+    main_lease: Option<(Uuid, u64)>,
+    parallel_running: bool,
+    parallel_lease: Option<(Uuid, u64)>,
+) -> Option<(Uuid, u64)> {
+    if main_running && main_mission_id == Some(mission_id) {
+        main_lease
+    } else if parallel_running {
+        parallel_lease
+    } else {
+        None
+    }
+}
+
 async fn deliver_remote_build_terminal_wake(
     state: &AppState,
     receipt: &crate::remote_node::job_ledger::RemoteJobReceipt,
@@ -7299,24 +7342,42 @@ async fn deliver_remote_build_terminal_wake(
         owner.send(event);
         return Ok(true);
     }
-    if let Some(run) = owner
+    let active_run = owner
         .mission_store
         .get_active_mission_run(receipt.mission_id)
-        .await?
-    {
+        .await?;
+    let actor_run = if let Some(session) = live_session.as_ref() {
+        control_actor_mission_run(&session.cmd_tx, receipt.mission_id).await?
+    } else {
+        None
+    };
+    if let Some((actor_run_id, actor_generation)) = actor_run {
+        let actor_matches_lease = active_run
+            .as_ref()
+            .is_some_and(|run| run.run_id == actor_run_id && run.generation == actor_generation);
+        if !actor_matches_lease {
+            return Err(format!(
+                "remote-build actor/run lease conflict for mission {}: actor run {:?} generation {:?}",
+                receipt.mission_id, actor_run_id, actor_generation
+            ));
+        }
+    }
+    if let Some(run) = active_run {
         if run.execution_state != MissionExecutionState::WaitingRemoteJob {
             // The harness is still consuming the synchronous result. Let that
             // turn finish rather than racing it with a second continuation.
             return Ok(false);
         }
-        owner
-            .mission_store
-            .finish_mission_run(
-                run.run_id,
-                run.generation,
-                Some(&format!("remote_build_{}", receipt.state)),
-            )
-            .await?;
+        if actor_run.is_none() {
+            owner
+                .mission_store
+                .finish_mission_run(
+                    run.run_id,
+                    run.generation,
+                    Some(&format!("remote_build_{}", receipt.state)),
+                )
+                .await?;
+        }
     }
 
     let content = remote_build_terminal_message(receipt);
@@ -16121,6 +16182,22 @@ async fn control_actor_loop(
 
                         let _ = respond.send(running_list);
                     }
+                    ControlCommand::GetActorRunLease { mission_id, respond } => {
+                        let parallel_runner = parallel_runners.get(&mission_id);
+                        let actor_run = select_actor_run_lease(
+                            mission_id,
+                            running.is_some(),
+                            running_mission_id,
+                            running_run
+                                .as_ref()
+                                .map(|run| (run.run_id, run.generation)),
+                            parallel_runner.is_some_and(|runner| runner.is_running()),
+                            parallel_runner
+                                .and_then(|runner| runner.durable_run.as_ref())
+                                .map(|run| (run.run_id, run.generation)),
+                        );
+                        let _ = respond.send(actor_run);
+                    }
                     ControlCommand::ResumeMission { mission_id, clean_workspace, skip_message, respond } => {
                         // Resumable terminal writers do not hold a lease, so a replacement
                         // writer may have been created since this mission stopped. Serialize
@@ -22180,6 +22257,69 @@ mod tests {
         assert_eq!(
             mission_heartbeat_state(1, false, true),
             MissionExecutionState::WaitingRemoteJob
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_terminal_wake_detects_live_actor_ownership() {
+        let mission_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let Some(ControlCommand::GetActorRunLease {
+                mission_id: requested_mission_id,
+                respond,
+            }) = cmd_rx.recv().await
+            else {
+                panic!("expected GetActorRunLease query");
+            };
+            assert_eq!(requested_mission_id, mission_id);
+            let _ = respond.send(Some((run_id, 7)));
+        });
+
+        assert_eq!(
+            control_actor_mission_run(&cmd_tx, mission_id)
+                .await
+                .unwrap(),
+            Some((run_id, 7))
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_terminal_wake_does_not_confuse_another_actor() {
+        let target_mission_id = Uuid::new_v4();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let Some(ControlCommand::GetActorRunLease {
+                mission_id: requested_mission_id,
+                respond,
+            }) = cmd_rx.recv().await
+            else {
+                panic!("expected GetActorRunLease query");
+            };
+            assert_eq!(requested_mission_id, target_mission_id);
+            let _ = respond.send(None);
+        });
+
+        assert!(control_actor_mission_run(&cmd_tx, target_mission_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn remote_terminal_wake_closes_parked_parallel_lease() {
+        let mission_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+
+        assert_eq!(
+            select_actor_run_lease(mission_id, false, None, None, false, Some((run_id, 9)),),
+            None,
+            "a parked parallel runner retains its lease but owns no process"
+        );
+        assert_eq!(
+            select_actor_run_lease(mission_id, false, None, None, true, Some((run_id, 9)),),
+            Some((run_id, 9))
         );
     }
 
