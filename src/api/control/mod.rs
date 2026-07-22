@@ -185,6 +185,20 @@ pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
     )
 }
 
+fn projected_running_health(
+    state: super::mission_runner::MissionRunState,
+    seconds_since_activity: u64,
+    tool_call_in_flight: bool,
+    waiting_remote_job: bool,
+) -> super::mission_runner::MissionHealth {
+    if waiting_remote_job {
+        // A fresh durable remote-job heartbeat is process-backed liveness, not
+        // the provisional unmatched-tool hint that expires after ten minutes.
+        return super::mission_runner::MissionHealth::Healthy;
+    }
+    super::mission_runner::running_health(state, seconds_since_activity, tool_call_in_flight)
+}
+
 fn remote_node_needs_on_demand_probe(
     _status: Option<&crate::remote_node::RemoteNodeStatus>,
 ) -> bool {
@@ -6132,6 +6146,20 @@ async fn activate_mission_for_message(
         });
     }
     Ok(())
+}
+
+async fn activate_mission_id_for_message(
+    control_hub: &ControlHub,
+    store: &Arc<dyn MissionStore>,
+    events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
+    mission_id: Uuid,
+    content: &str,
+) -> Result<(), String> {
+    let mission = store
+        .get_mission(mission_id)
+        .await?
+        .ok_or_else(|| format!("mission {mission_id} no longer exists"))?;
+    activate_mission_for_message(control_hub, store, events_tx, &mission, content).await
 }
 
 struct MessageWriterLeaseGuard {
@@ -15487,10 +15515,11 @@ async fn control_actor_loop(
                                     history_len: history.len(),
                                     seconds_since_activity,
                                     tool_call_in_flight,
-                                    health: super::mission_runner::running_health(
+                                    health: projected_running_health(
                                         mission_state,
                                         seconds_since_activity,
                                         tool_call_in_flight,
+                                        waiting_remote_job,
                                     ),
                                     expected_deliverables: 0,
                                     current_activity: main_runner_activity.clone(),
@@ -15513,6 +15542,7 @@ async fn control_actor_loop(
                             if remote_job_missions.contains(&info.mission_id) {
                                 info.state = "waiting_remote_job".to_string();
                                 info.tool_call_in_flight = true;
+                                info.health = super::mission_runner::MissionHealth::Healthy;
                             }
                             running_list.push(info);
                         }
@@ -16550,17 +16580,43 @@ async fn control_actor_loop(
                             && transport_auto_resumed_missions.insert(mission_id)
                             && !queue_has_pending_target_mission(&queue, mission_id)
                         {
-                            tracing::info!(
-                                %mission_id,
-                                "Auto-resuming mission once after structured transport failure"
-                            );
-                            queue.push_back((
-                                Uuid::new_v4(),
-                                "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.".to_string(),
-                                None,
-                                Some(mission_id),
-                                Some("transport_auto_resume".to_string()),
-                            ));
+                            let resume_message = "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.".to_string();
+                            let activation = activate_mission_id_for_message(
+                                &control_hub,
+                                &mission_store,
+                                &events_tx,
+                                mission_id,
+                                &resume_message,
+                            )
+                            .await;
+                            match activation {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        %mission_id,
+                                        "Auto-resuming mission once after structured transport failure"
+                                    );
+                                    queue.push_back((
+                                        Uuid::new_v4(),
+                                        resume_message,
+                                        None,
+                                        Some(mission_id),
+                                        Some("transport_auto_resume".to_string()),
+                                    ));
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %mission_id,
+                                        "Structured transport auto-resume could not reactivate mission: {error}"
+                                    );
+                                    let _ = events_tx.send(AgentEvent::Error {
+                                        message: format!(
+                                            "Transport recovery could not reactivate mission {mission_id}: {error}"
+                                        ),
+                                        mission_id: Some(mission_id),
+                                        resumable: true,
+                                    });
+                                }
+                            }
                         }
                         let is_transient_infra_failure = matches!(
                             completed_terminal_reason,
@@ -16646,6 +16702,57 @@ async fn control_actor_loop(
                             "Queued delivery retained because dequeue persistence failed: {error}"
                         );
                         continue;
+                    }
+                    // Internal transport retries bypass the user-message
+                    // command path, so re-assert activation at dequeue too.
+                    // This also covers a retry restored from the durable queue
+                    // after a controller restart.
+                    if msg_source.as_deref() == Some("transport_auto_resume") {
+                        let activation = match msg_target_mid {
+                            Some(mission_id) => {
+                                activate_mission_id_for_message(
+                                    &control_hub,
+                                    &mission_store,
+                                    &events_tx,
+                                    mission_id,
+                                    &msg,
+                                )
+                                .await
+                            }
+                            None => Err("transport auto-resume is missing mission_id".to_string()),
+                        };
+                        if let Err(error) = activation {
+                            queue.push_front((
+                                mid,
+                                msg,
+                                per_msg_agent,
+                                msg_target_mid,
+                                msg_source,
+                            ));
+                            if let Err(persist_error) = persist_control_queue_if_changed(
+                                &mission_store,
+                                &session_user_id,
+                                &queue,
+                                &parallel_runners,
+                                &recovered_consumed_user_messages,
+                                &mut last_persisted_queue,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "Failed to restore transport retry after activation rejection: {persist_error}"
+                                );
+                            }
+                            let _ = events_tx.send(AgentEvent::Error {
+                                message: format!(
+                                    "Transport recovery could not activate its mission: {error}"
+                                ),
+                                mission_id: msg_target_mid,
+                                resumable: true,
+                            });
+                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                            continue;
+                        }
                     }
                     // Acquire the durable run before publishing the message as
                     // started or appending it to history. If a stale run lease
@@ -25671,6 +25778,31 @@ Investigate <service/> failures.
         // until the user resumes it), so they are not activation-eligible here.
         assert!(!message_activates_mission(MissionStatus::Active));
         assert!(!message_activates_mission(MissionStatus::Paused));
+    }
+
+    #[test]
+    fn durable_remote_job_heartbeat_keeps_projected_health_healthy() {
+        let health = projected_running_health(
+            crate::api::mission_runner::MissionRunState::Running,
+            600,
+            true,
+            true,
+        );
+        assert!(matches!(
+            health,
+            crate::api::mission_runner::MissionHealth::Healthy
+        ));
+
+        let without_remote_job = projected_running_health(
+            crate::api::mission_runner::MissionRunState::Running,
+            600,
+            true,
+            false,
+        );
+        assert!(matches!(
+            without_remote_job,
+            crate::api::mission_runner::MissionHealth::Stalled { .. }
+        ));
     }
 
     #[test]

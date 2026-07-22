@@ -659,11 +659,13 @@ async fn finalize_remote_build_handle(
     job_id: Uuid,
     state: &str,
     exit_status: Option<i32>,
-) {
-    if let Err(error) =
-        crate::remote_node::job_ledger::finalize(working_dir, job_id, state, exit_status).await
-    {
-        tracing::warn!(%job_id, ?error, "remote build receipt finalization failed");
+) -> bool {
+    match crate::remote_node::job_ledger::finalize(working_dir, job_id, state, exit_status).await {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(%job_id, ?error, "remote build receipt finalization failed; observation will retry");
+            false
+        }
     }
 }
 
@@ -706,14 +708,17 @@ fn spawn_remote_build_observer(
             if cancel_requested {
                 if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
                     if error.is_not_found() {
-                        finalize_remote_build_handle(
+                        if finalize_remote_build_handle(
                             &state.config.working_dir,
                             job_id,
                             "lost",
                             None,
                         )
-                        .await;
-                        return;
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
                     }
                     tracing::warn!(
                         mission_id = %mission_id,
@@ -727,19 +732,23 @@ fn spawn_remote_build_observer(
             match client.get_job(&node, &shared_token, job_id).await {
                 Ok(status) if remote_build_is_terminal(&status.state) => {
                     record_remote_build_status(&state, &node.id, &status, started_at);
-                    finalize_remote_build_handle(
+                    if finalize_remote_build_handle(
                         &state.config.working_dir,
                         job_id,
                         &status.state,
                         status.exit_code,
                     )
-                    .await;
-                    return;
+                    .await
+                    {
+                        return;
+                    }
                 }
                 Err(error) if cancel_requested && error.is_not_found() => {
-                    finalize_remote_build_handle(&state.config.working_dir, job_id, "lost", None)
-                        .await;
-                    return;
+                    if finalize_remote_build_handle(&state.config.working_dir, job_id, "lost", None)
+                        .await
+                    {
+                        return;
+                    }
                 }
                 Ok(status) => {
                     record_remote_build_status(&state, &node.id, &status, started_at);
@@ -1008,13 +1017,16 @@ async fn submit_remote_build(
         };
         record_remote_build_status(&state, &node.id, &status, started_at);
         if remote_build_is_terminal(&status.state) {
-            finalize_remote_build_handle(
+            if !finalize_remote_build_handle(
                 &state.config.working_dir,
                 job_id,
                 &status.state,
                 status.exit_code,
             )
-            .await;
+            .await
+            {
+                continue;
+            }
             let duration_secs = (chrono::Utc::now() - started_at).num_seconds().max(0) as u64;
             return Json(RemoteBuildWaitResponse {
                 exit_code: status.exit_code,
@@ -1260,6 +1272,23 @@ async fn get_remote_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_handle_finalization_reports_persistence_failure() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let invalid_working_dir = temp.path().join("not-a-directory");
+        std::fs::write(&invalid_working_dir, b"file").expect("create invalid working dir");
+
+        assert!(
+            !finalize_remote_build_handle(
+                &invalid_working_dir,
+                Uuid::new_v4(),
+                "succeeded",
+                Some(0),
+            )
+            .await
+        );
+    }
 
     fn node_job_status(state: &str) -> NodeJobStatus {
         NodeJobStatus {
