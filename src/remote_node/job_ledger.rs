@@ -372,7 +372,11 @@ pub async fn finalize(
         return Ok(false);
     };
     let handle = handles.remove(index);
-    if let Some(identity) = handle.identity {
+    if handle.kind == JobHandleKind::RemoteBuild {
+        let Some(identity) = handle.identity else {
+            store(working_dir, &handles).await?;
+            return Ok(true);
+        };
         let mut receipts = load_receipts_result(working_dir).await?;
         let previous_wake_delivered_at = receipts
             .iter()
@@ -1001,5 +1005,50 @@ mod tests {
         );
         assert_eq!(pending_terminal_wakes(dir.path()).await.unwrap().len(), 1);
         assert_eq!(receipt.wake_suppressed_by, None);
+    }
+
+    #[tokio::test]
+    async fn terminal_tentative_handle_never_becomes_validation_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id,
+                node_id: "node-a".to_string(),
+                job_id,
+                started_at: now,
+                accepted_at: None,
+                heartbeat_at: None,
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::Tentative,
+                identity: Some(RemoteJobIdentity {
+                    repository: "https://example.invalid/verity.git".to_string(),
+                    commit: "a".repeat(40),
+                    cwd_rel_known: true,
+                    cwd_rel: None,
+                    command: vec!["lake".to_string(), "build".to_string()],
+                    artifacts: Vec::new(),
+                    toolchain: None,
+                    source_bundle_digest: None,
+                }),
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(finalize(dir.path(), job_id, "lost", None).await.unwrap());
+        assert!(load_result(dir.path()).await.unwrap().is_empty());
+        assert!(terminal_receipt(dir.path(), job_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(terminal_receipts_for_mission(dir.path(), mission_id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
