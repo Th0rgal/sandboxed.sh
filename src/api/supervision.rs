@@ -29,7 +29,7 @@ use super::control::MissionStatus;
 #[allow(unused_imports)]
 use super::control::*;
 use super::mission_runner::TOOL_CALL_STALL_GRACE_SECS;
-use super::mission_store::MissionStore;
+use super::mission_store::{MissionExecutionState, MissionStore};
 
 mod bg_autoresume;
 
@@ -52,6 +52,28 @@ pub(crate) async fn recover_server_shutdown_missions(
                         "Startup recovery: leaving assistant-mode active mission idle"
                     );
                     continue;
+                }
+
+                match mission_has_detached_durable_run(mission_store.as_ref(), mission.id).await {
+                    Ok(true) => {
+                        tracing::info!(
+                            mission_id = %mission.id,
+                            "Startup recovery: durable detached execution will be reattached"
+                        );
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        // Execution truth is authoritative. Defer instead of
+                        // overwriting it with a server-shutdown presentation
+                        // status while the store is temporarily unavailable.
+                        tracing::warn!(
+                            mission_id = %mission.id,
+                            %error,
+                            "Startup recovery: could not inspect active run; deferring recovery"
+                        );
+                        continue;
+                    }
                 }
 
                 tracing::warn!(
@@ -323,6 +345,20 @@ fn execution_state_proves_durable_liveness(state: &str) -> bool {
     state == "waiting_remote_job"
 }
 
+fn detached_run_proves_durable_liveness(state: MissionExecutionState) -> bool {
+    state == MissionExecutionState::WaitingRemoteJob
+}
+
+async fn mission_has_detached_durable_run(
+    mission_store: &dyn MissionStore,
+    mission_id: Uuid,
+) -> Result<bool, String> {
+    Ok(mission_store
+        .get_active_mission_run(mission_id)
+        .await?
+        .is_some_and(|run| detached_run_proves_durable_liveness(run.execution_state)))
+}
+
 pub(crate) async fn stuck_mission_watchdog_loop(
     mission_store: Arc<dyn MissionStore>,
     cmd_tx: mpsc::Sender<ControlCommand>,
@@ -500,6 +536,33 @@ pub(crate) async fn stuck_mission_watchdog_loop(
                     "Stuck-mission watchdog: leaving idle assistant-mode mission active"
                 );
                 continue;
+            }
+            // A remote build deliberately outlives the harness process. The
+            // durable run lease is authoritative here: the remote-build
+            // reconciler owns its heartbeat and terminal transition after the
+            // conversational runner exits. Marking the presentation row
+            // interrupted would make that reconciler flip it back to Active on
+            // every tick, producing a false orphan/reconcile loop.
+            match mission_has_detached_durable_run(mission_store.as_ref(), mission.id).await {
+                Ok(true) => {
+                    tracing::debug!(
+                        mission_id = %mission.id,
+                        "Stuck-mission watchdog: detached durable execution owns liveness"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // Fail closed: if execution truth is temporarily
+                    // unavailable, do not write a conflicting terminal
+                    // presentation status. The next watchdog tick retries.
+                    tracing::warn!(
+                        mission_id = %mission.id,
+                        %error,
+                        "Stuck-mission watchdog: could not inspect active run; deferring orphan reconciliation"
+                    );
+                    continue;
+                }
             }
             tracing::warn!(
                 "Stuck-mission watchdog: orphan {} (no live runner); marking interrupted",
@@ -730,5 +793,21 @@ mod tests {
             "waiting_remote_job"
         ));
         assert!(!execution_state_proves_durable_liveness("waiting_tool"));
+    }
+
+    #[test]
+    fn detached_durable_run_is_not_an_orphan() {
+        assert!(detached_run_proves_durable_liveness(
+            MissionExecutionState::WaitingRemoteJob
+        ));
+        assert!(!detached_run_proves_durable_liveness(
+            MissionExecutionState::WaitingBackground
+        ));
+        assert!(!detached_run_proves_durable_liveness(
+            MissionExecutionState::Running
+        ));
+        assert!(!detached_run_proves_durable_liveness(
+            MissionExecutionState::WaitingTool
+        ));
     }
 }
