@@ -357,7 +357,10 @@ fn remote_job_identity(
     crate::remote_node::job_ledger::RemoteJobIdentity {
         repository: repository_identity(&req.repo),
         commit: req.commit.clone(),
+        cwd_rel_known: true,
+        cwd_rel: req.cwd_rel.clone(),
         command: req.command.clone(),
+        artifacts: req.artifacts.clone(),
         toolchain: req.toolchain.clone(),
         source_bundle_digest: req
             .source_bundle
@@ -773,6 +776,64 @@ fn spawn_remote_build_observer(
     });
 }
 
+async fn equivalent_remote_validation_response(
+    state: &AppState,
+    req: &RemoteBuildRequest,
+    identity: &crate::remote_node::job_ledger::RemoteJobIdentity,
+) -> Option<axum::response::Response> {
+    match crate::remote_node::job_ledger::equivalent_remote_validation(
+        &state.config.working_dir,
+        identity,
+    )
+    .await
+    {
+        Ok(Some(crate::remote_node::job_ledger::EquivalentRemoteValidation::Succeeded(
+            receipt,
+        ))) => {
+            tracing::info!(
+                mission_id = %req.mission_id,
+                canonical_mission_id = %receipt.mission_id,
+                job_id = %receipt.job_id,
+                "reusing successful immutable remote validation receipt"
+            );
+            let response = remote_build_status_from_receipt(
+                req.mission_id,
+                req.expected_head.as_deref(),
+                receipt,
+                true,
+            );
+            Some((StatusCode::OK, Json(response)).into_response())
+        }
+        Ok(Some(crate::remote_node::job_ledger::EquivalentRemoteValidation::Active(handle))) => {
+            Some(
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "code": "REMOTE_VALIDATION_ALREADY_ACTIVE",
+                        "message": "an equivalent immutable remote validation is already unresolved; reconcile or attach to its canonical job before retrying",
+                        "job_id": handle.job_id,
+                        "node_id": handle.node_id,
+                        "mission_id": handle.mission_id,
+                        "accepted": handle.accepted_at.is_some(),
+                        "validation": identity,
+                    })),
+                )
+                    .into_response(),
+            )
+        }
+        Ok(None) => None,
+        Err(error) => Some(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "remote validation ledger could not be reconciled before submission: {error}"
+                ),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 async fn submit_remote_build(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RemoteBuildRequest>,
@@ -818,15 +879,26 @@ async fn submit_remote_build(
     // placement labels, but may not remove the runtime readiness gate by
     // sending an empty or unrelated requirements list.
     let requirements = normalized_lean_requirements(&req.requirements);
+    let identity = remote_job_identity(&req);
+
+    // Reuse completed evidence even when every runner is currently offline.
+    // This optimistic read is repeated under the placement lock after any
+    // explicit network probe, which closes the concurrent-submit race.
+    if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await {
+        return response;
+    }
     if let Err((status, message)) =
         probe_explicit_lean_node(&state, &req.node_id, &requirements).await
     {
         return (status, message).into_response();
     }
-
-    // Serialize placement through tentative-handle persistence. Otherwise a
-    // burst can select the same idle node before its next heartbeat.
+    // Serialize the authoritative second identity check, placement, and
+    // tentative-handle persistence. No network probe runs while this mutex is
+    // held, so a slow explicit runner cannot block unrelated auto placement.
     let placement_guard = placement_lock().lock().await;
+    if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await {
+        return response;
+    }
     let node = match resolve_node(
         &state,
         &req.node_id,
@@ -876,7 +948,6 @@ async fn submit_remote_build(
         },
     };
 
-    let identity = remote_job_identity(&req);
     let client = RemoteNodeClient::default();
     let started_at = chrono::Utc::now();
     if let Err(error) = crate::remote_node::job_ledger::record(
@@ -1102,6 +1173,47 @@ struct RemoteBuildStatusResponse {
     current_head_match: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     validation: Option<crate::remote_node::job_ledger::RemoteJobIdentity>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_mission_id: Option<Uuid>,
+}
+
+fn remote_build_status_from_receipt(
+    response_mission_id: Uuid,
+    expected_head: Option<&str>,
+    receipt: crate::remote_node::job_ledger::RemoteJobReceipt,
+    reused: bool,
+) -> RemoteBuildStatusResponse {
+    let canonical_mission_id =
+        (receipt.mission_id != response_mission_id).then_some(receipt.mission_id);
+    let current_head_match =
+        expected_head.map(|expected_head| receipt.identity.commit == expected_head);
+    let receipt_state = if receipt.state == "succeeded" && current_head_match == Some(false) {
+        "stale_success".to_string()
+    } else {
+        receipt.state.clone()
+    };
+    let status = NodeJobStatus {
+        job_id: receipt.job_id,
+        mission_id: response_mission_id,
+        state: receipt.state,
+        exit_code: receipt.exit_status,
+        created_at: receipt.started_at.to_rfc3339(),
+        started_at: Some(receipt.started_at.to_rfc3339()),
+        finished_at: Some(receipt.finished_at.to_rfc3339()),
+        error: None,
+        log_tail: Some("reused durable terminal receipt".to_string()),
+        artifacts: Vec::new(),
+    };
+    RemoteBuildStatusResponse {
+        status,
+        receipt_state,
+        current_head_match,
+        validation: Some(receipt.identity),
+        reused,
+        canonical_mission_id,
+    }
 }
 
 fn remote_build_response_from_receipt(
@@ -1114,33 +1226,12 @@ fn remote_build_response_from_receipt(
             "job does not belong to this mission".to_string(),
         ));
     }
-    let current_head_match = query
-        .expected_head
-        .as_deref()
-        .map(|expected_head| receipt.identity.commit == expected_head);
-    let receipt_state = if receipt.state == "succeeded" && current_head_match == Some(false) {
-        "stale_success".to_string()
-    } else {
-        receipt.state.clone()
-    };
-    let status = NodeJobStatus {
-        job_id: receipt.job_id,
-        mission_id: receipt.mission_id,
-        state: receipt.state,
-        exit_code: receipt.exit_status,
-        created_at: receipt.started_at.to_rfc3339(),
-        started_at: Some(receipt.started_at.to_rfc3339()),
-        finished_at: Some(receipt.finished_at.to_rfc3339()),
-        error: None,
-        log_tail: None,
-        artifacts: Vec::new(),
-    };
-    Ok(Json(RemoteBuildStatusResponse {
-        status,
-        receipt_state,
-        current_head_match,
-        validation: Some(receipt.identity),
-    }))
+    Ok(Json(remote_build_status_from_receipt(
+        query.mission_id,
+        query.expected_head.as_deref(),
+        receipt,
+        false,
+    )))
 }
 
 /// `GET /api/remote-build/:job_id?mission_id=...&node_id=...` —
@@ -1283,6 +1374,8 @@ async fn get_remote_build(
         receipt_state,
         current_head_match,
         validation,
+        reused: false,
+        canonical_mission_id: None,
     }))
 }
 
@@ -1551,7 +1644,9 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             "token": "token",
             "repo": "https://secret-user:secret-token@example.invalid/org/repo.git?token=secret#fragment",
             "commit": "a".repeat(40),
+            "cwd_rel": "Compiler",
             "command": ["lake", "build"],
+            "artifacts": ["build/report.json"],
             "toolchain": "leanprover/lean4:v4.19.0",
             "wait": false
         }))
@@ -1560,7 +1655,10 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
 
         assert_eq!(identity.repository, "https://example.invalid/org/repo.git");
         assert_eq!(identity.commit, "a".repeat(40));
+        assert!(identity.cwd_rel_known);
+        assert_eq!(identity.cwd_rel.as_deref(), Some("Compiler"));
         assert_eq!(identity.command, vec!["lake", "build"]);
+        assert_eq!(identity.artifacts, vec!["build/report.json"]);
         assert_eq!(
             identity.toolchain.as_deref(),
             Some("leanprover/lean4:v4.19.0")
@@ -1596,7 +1694,10 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
                 identity: crate::remote_node::job_ledger::RemoteJobIdentity {
                     repository: "https://github.com/example/verity.git".to_string(),
                     commit: "a".repeat(40),
+                    cwd_rel_known: true,
+                    cwd_rel: None,
                     command: vec!["lake".to_string(), "build".to_string()],
+                    artifacts: Vec::new(),
                     toolchain: Some("leanprover/lean4:v4.19.0".to_string()),
                     source_bundle_digest: None,
                 },
@@ -2002,6 +2103,11 @@ case "$url" in
         if [ "$REMOTE_BUILD_TEST_POLL_MODE" = "ambiguous" ]; then
             exit 28
         fi
+        if [ "$REMOTE_BUILD_TEST_POLL_MODE" = "reused" ]; then
+            printf '{"job_id":"22222222-2222-2222-2222-222222222222","mission_id":"%s","node_id":"lean:cpu","state":"succeeded","receipt_state":"succeeded","current_head_match":true,"exit_code":0,"created_at":"2026-07-15T20:00:00Z","started_at":"2026-07-15T20:00:01Z","finished_at":"2026-07-15T20:00:03Z","error":null,"log_tail":"reused durable terminal receipt","artifacts":[],"reused":true}' "$REMOTE_BUILD_TEST_MISSION_ID" > "$output"
+            printf '200'
+            exit 0
+        fi
         printf '{"job_id":"11111111-1111-1111-1111-111111111111","node_id":"lean:gpu"}' > "$output"
         printf '202'
         ;;
@@ -2203,6 +2309,29 @@ esac
         );
         assert!(receipt.get("token").is_none());
         assert!(receipt.get("repo").is_none());
+
+        for entry in std::fs::read_dir(&state).expect("read state before terminal reuse") {
+            let path = entry.expect("read state entry").path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).expect("remove stale test lock directory");
+            } else {
+                std::fs::remove_file(path).expect("remove prior test receipt");
+            }
+        }
+        std::fs::write(&submit_count, "0").expect("reset submit counter");
+        let reused = run("reused");
+        assert!(
+            reused.status.success(),
+            "terminal receipt reuse failed: {}",
+            String::from_utf8_lossy(&reused.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&submit_count).unwrap(), "1");
+        assert!(String::from_utf8_lossy(&reused.stderr)
+            .contains("reusing terminal job 22222222-2222-2222-2222-222222222222"));
+        assert_eq!(
+            String::from_utf8_lossy(&reused.stdout),
+            "reused durable terminal receipt\n"
+        );
     }
 
     #[test]

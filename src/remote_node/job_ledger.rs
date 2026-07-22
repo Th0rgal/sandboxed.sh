@@ -35,7 +35,19 @@ pub enum JobHandleKind {
 pub struct RemoteJobIdentity {
     pub repository: String,
     pub commit: String,
+    /// `false` means this identity predates cwd persistence. Such receipts are
+    /// intentionally not equal to new root-cwd requests because their actual
+    /// execution directory is unknowable after upgrade.
+    #[serde(default)]
+    pub cwd_rel_known: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_rel: Option<String>,
     pub command: Vec<String>,
+    /// Requested artifact digests are part of execution identity. Terminal
+    /// receipt reuse is disabled when this is non-empty until receipts retain
+    /// the resulting artifact entries as well.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolchain: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,6 +106,17 @@ pub struct RemoteJobReceipt {
     /// continuation (live control queue or persisted deferred goal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_delivered_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum EquivalentRemoteValidation {
+    /// An accepted or ambiguously submitted job with the same immutable
+    /// validation identity is still unresolved. A new submission must fail
+    /// closed until that canonical job is reconciled.
+    Active(JobHandle),
+    /// A successful terminal receipt already proves this exact validation.
+    /// Callers may replay it without consuming remote capacity.
+    Succeeded(RemoteJobReceipt),
 }
 
 fn ledger_path(working_dir: &Path) -> PathBuf {
@@ -180,6 +203,44 @@ pub async fn terminal_receipts_for_mission(
         .into_iter()
         .filter(|receipt| receipt.mission_id == mission_id)
         .collect())
+}
+
+/// Resolve an immutable validation identity across mission boundaries.
+///
+/// The ledger and receipt files are inspected under one lock so finalization
+/// cannot move a matching job between them during the lookup. Successful
+/// receipts take precedence over a redundant in-flight job left by an older
+/// client: once exact evidence exists, no third build should be dispatched.
+pub async fn equivalent_remote_validation(
+    working_dir: &Path,
+    identity: &RemoteJobIdentity,
+) -> anyhow::Result<Option<EquivalentRemoteValidation>> {
+    let _guard = lock().lock().await;
+    let receipts = load_receipts_result(working_dir).await?;
+    if let Some(receipt) = receipts
+        .into_iter()
+        .filter(|receipt| {
+            receipt.identity == *identity
+                && identity.artifacts.is_empty()
+                && receipt.state == "succeeded"
+                && receipt.exit_status == Some(0)
+        })
+        .max_by_key(|receipt| receipt.finished_at)
+    {
+        return Ok(Some(EquivalentRemoteValidation::Succeeded(receipt)));
+    }
+    Ok(load_result(working_dir)
+        .await?
+        .into_iter()
+        .filter(|handle| {
+            handle.identity.as_ref() == Some(identity)
+                && matches!(
+                    handle.kind,
+                    JobHandleKind::RemoteBuild | JobHandleKind::Tentative
+                )
+        })
+        .min_by_key(|handle| handle.started_at)
+        .map(EquivalentRemoteValidation::Active))
 }
 
 /// Terminal remote-build receipts whose mission continuation has not yet
@@ -409,6 +470,20 @@ mod tests {
         assert_eq!(handle.kind, JobHandleKind::Tentative);
     }
 
+    #[test]
+    fn legacy_validation_identity_keeps_cwd_unknown() {
+        let identity: RemoteJobIdentity = serde_json::from_value(serde_json::json!({
+            "repository": "https://example.invalid/repo.git",
+            "commit": "a".repeat(40),
+            "command": ["lake", "build"]
+        }))
+        .unwrap();
+
+        assert!(!identity.cwd_rel_known);
+        assert_eq!(identity.cwd_rel, None);
+        assert!(identity.artifacts.is_empty());
+    }
+
     #[tokio::test]
     async fn accepted_handle_replaces_pre_submit_tentative_handle() {
         let dir = tempfile::tempdir().unwrap();
@@ -454,7 +529,10 @@ mod tests {
             identity: Some(RemoteJobIdentity {
                 repository: "https://example.invalid/repo.git".to_string(),
                 commit: "a".repeat(40),
+                cwd_rel_known: true,
+                cwd_rel: None,
                 command: vec!["lake".to_string(), "build".to_string()],
+                artifacts: Vec::new(),
                 toolchain: None,
                 source_bundle_digest: None,
             }),
@@ -477,7 +555,10 @@ mod tests {
         let identity = RemoteJobIdentity {
             repository: "https://example.invalid/repo.git".to_string(),
             commit: "a".repeat(40),
+            cwd_rel_known: true,
+            cwd_rel: None,
             command: vec!["lake".to_string(), "build".to_string()],
+            artifacts: Vec::new(),
             toolchain: Some("leanprover/lean4:v4.19.0".to_string()),
             source_bundle_digest: Some("b".repeat(64)),
         };
@@ -525,5 +606,106 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn immutable_validation_lookup_blocks_active_and_reuses_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+        let identity = RemoteJobIdentity {
+            repository: "https://example.invalid/repo.git".to_string(),
+            commit: "a".repeat(40),
+            cwd_rel_known: true,
+            cwd_rel: None,
+            command: vec!["lake".to_string(), "build".to_string()],
+            artifacts: Vec::new(),
+            toolchain: Some("leanprover/lean4:v4.24.0".to_string()),
+            source_bundle_digest: None,
+        };
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id: Uuid::new_v4(),
+                node_id: "node-a".to_string(),
+                job_id,
+                started_at: chrono::Utc::now(),
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: Some(chrono::Utc::now()),
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(identity.clone()),
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            equivalent_remote_validation(dir.path(), &identity)
+                .await
+                .unwrap(),
+            Some(EquivalentRemoteValidation::Active(handle)) if handle.job_id == job_id
+        ));
+
+        finalize(dir.path(), job_id, "succeeded", Some(0))
+            .await
+            .unwrap();
+        assert!(matches!(
+            equivalent_remote_validation(dir.path(), &identity)
+                .await
+                .unwrap(),
+            Some(EquivalentRemoteValidation::Succeeded(receipt)) if receipt.job_id == job_id
+        ));
+
+        let changed_cwd = RemoteJobIdentity {
+            cwd_rel: Some("subproject".to_string()),
+            ..identity.clone()
+        };
+        assert!(equivalent_remote_validation(dir.path(), &changed_cwd)
+            .await
+            .unwrap()
+            .is_none());
+
+        let artifact_identity = RemoteJobIdentity {
+            artifacts: vec!["build/report.json".to_string()],
+            ..identity.clone()
+        };
+        let artifact_job_id = Uuid::new_v4();
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id: Uuid::new_v4(),
+                node_id: "node-b".to_string(),
+                job_id: artifact_job_id,
+                started_at: chrono::Utc::now(),
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: Some(chrono::Utc::now()),
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(artifact_identity.clone()),
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+        finalize(dir.path(), artifact_job_id, "succeeded", Some(0))
+            .await
+            .unwrap();
+        assert!(
+            equivalent_remote_validation(dir.path(), &artifact_identity)
+                .await
+                .unwrap()
+                .is_none(),
+            "artifact-producing validation cannot replay until receipts retain artifact digests"
+        );
+
+        let changed_overlay = RemoteJobIdentity {
+            source_bundle_digest: Some("b".repeat(64)),
+            ..identity
+        };
+        assert!(equivalent_remote_validation(dir.path(), &changed_overlay)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

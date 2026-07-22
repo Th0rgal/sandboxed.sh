@@ -399,7 +399,61 @@ if [ -z "$job_id" ]; then
         cat "$response_file" >&2; echo >&2
         exit 75  # EX_TEMPFAIL: caller should fall back to a local build
     fi
-    if [ "$http_code" != "202" ]; then
+    reused_terminal=0
+    if [ "$http_code" = "200" ]; then
+        reuse_fields="$(python3 - "$response_file" <<'PY'
+import json, re, sys
+response = json.load(open(sys.argv[1]))
+job = str(response.get("job_id") or "")
+node = str(response.get("node_id") or "")
+state = str(response.get("receipt_state") or response.get("state") or "")
+if not re.fullmatch(r"[0-9a-fA-F-]{36}", job):
+    raise SystemExit("invalid job_id in reused receipt")
+if not node.strip() or any(ch in node for ch in "\t\r\n"):
+    raise SystemExit("invalid node_id in reused receipt")
+if state not in {"succeeded", "stale_success", "failed", "cancelled", "lost"}:
+    raise SystemExit("non-terminal reused receipt")
+print(job, node, state, sep="\t")
+PY
+        )" || die "invalid reused remote-build receipt"
+        IFS=$'\t' read -r job_id node_id receipt_state <<< "$reuse_fields"
+        python3 - "$state_file" "$request_file" "$response_file" <<'PY'
+import json, os, sys, tempfile
+path, request_path, response_path = sys.argv[1:]
+request = json.load(open(request_path))
+response = json.load(open(response_path))
+request.pop("token", None)
+repo = request.pop("repo", None)
+if repo:
+    from urllib.parse import urlsplit, urlunsplit
+    try:
+        parsed = urlsplit(repo)
+        host = parsed.hostname or ""
+        if parsed.port:
+            host += ":%d" % parsed.port
+        request["repository"] = urlunsplit(
+            (parsed.scheme, host, parsed.path, "", "")
+        ) if parsed.scheme else repo
+    except ValueError:
+        request["repository"] = repo
+request.pop("wait", None)
+bundle = request.pop("source_bundle", None)
+if bundle:
+    request["source_bundle_sha256"] = bundle.get("manifest_sha256")
+request.update(response)
+fd, tmp = tempfile.mkstemp(prefix=".remote-build-", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w") as out:
+        json.dump(request, out, sort_keys=True)
+        out.write("\n")
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+        reused_terminal=1
+        echo "remote-lean-build: reusing terminal job $job_id on node '$node_id' for ${commit:0:12}; no new build submitted" >&2
+    elif [ "$http_code" != "202" ]; then
         case "$http_code" in
             5??)
                 if [ "$http_code" != "503" ] && ! persist_ambiguous_receipt "http-$http_code"; then
@@ -413,11 +467,12 @@ if [ -z "$job_id" ]; then
         exit 1
     fi
 
-    # From this point the node has accepted work. Keep the pre-created blocker
-    # unless a complete durable receipt is written below.
-    submit_lock_persistent=1
+    if [ "$reused_terminal" = "0" ]; then
+        # From this point the node has accepted work. Keep the pre-created
+        # blocker unless a complete durable receipt is written below.
+        submit_lock_persistent=1
 
-    IFS=$'\t' read -r job_id node_id < <(python3 - "$response_file" <<'PY'
+        IFS=$'\t' read -r job_id node_id < <(python3 - "$response_file" <<'PY'
 import json, re, sys
 response = json.load(open(sys.argv[1]))
 job = str(response.get("job_id") or "")
@@ -428,9 +483,9 @@ if not node.strip() or any(ch in node for ch in "\t\r\n"):
     raise SystemExit("invalid node_id in submit response")
 print(job, node, sep="\t")
 PY
-    ) || die "invalid remote-build submit response"
+        ) || die "invalid remote-build submit response"
 
-    python3 - "$state_file" "$request_file" "$job_id" "$node_id" <<'PY'
+        python3 - "$state_file" "$request_file" "$job_id" "$node_id" <<'PY'
 import json, os, sys, tempfile
 path, request_path, job_id, node_id = sys.argv[1:]
 request = json.load(open(request_path))
@@ -463,12 +518,13 @@ finally:
     if os.path.exists(tmp):
         os.unlink(tmp)
 PY
-    persist_status=$?
-    if [ "$persist_status" -ne 0 ]; then
-        die "accepted job $job_id on node '$node_id' but failed to persist its receipt; do not fall back locally or resubmit" 1
+        persist_status=$?
+        if [ "$persist_status" -ne 0 ]; then
+            die "accepted job $job_id on node '$node_id' but failed to persist its receipt; do not fall back locally or resubmit" 1
+        fi
+        submit_lock_persistent=0
+        echo "remote-lean-build: submitted job $job_id on node '$node_id'; receipt $state_file" >&2
     fi
-    submit_lock_persistent=0
-    echo "remote-lean-build: submitted job $job_id on node '$node_id'; receipt $state_file" >&2
 fi
 
 release_submit_lock
