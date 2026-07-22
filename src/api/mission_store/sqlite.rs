@@ -2998,6 +2998,11 @@ impl MissionStore for SqliteMissionStore {
                     "acknowledged mission {mission_id} cannot acquire a non-terminal run"
                 ));
             }
+            if !matches!(mission_status.as_str(), "pending" | "active") {
+                return Err(format!(
+                    "mission {mission_id} has status {mission_status}; activate it before acquiring a non-terminal run"
+                ));
+            }
             if let Some(existing) = tx
                 .query_row(
                     "SELECT run_id, mission_id, generation, execution_state, owner_actor_id, scope_unit, started_at, heartbeat_at, stopping_at, ended_at, terminal_reason
@@ -15820,6 +15825,16 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(store
+            .begin_mission_run(mission.id, "actor-a", Some("mission-a.scope"))
+            .await
+            .unwrap_err()
+            .contains("activate it before acquiring"));
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .unwrap();
+
         let first = store
             .begin_mission_run(mission.id, "actor-a", Some("mission-a.scope"))
             .await
@@ -15851,6 +15866,15 @@ mod tests {
             .contains("acknowledged mission"));
         store
             .update_mission_status(mission.id, MissionStatus::Interrupted)
+            .await
+            .unwrap();
+        assert!(store
+            .begin_mission_run(mission.id, "actor-b", None)
+            .await
+            .unwrap_err()
+            .contains("activate it before acquiring"));
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
             .await
             .unwrap();
         let second = store
