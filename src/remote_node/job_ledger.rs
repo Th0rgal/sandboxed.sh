@@ -66,6 +66,12 @@ pub struct JobHandle {
     /// command handles deserialize with no identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<RemoteJobIdentity>,
+    /// The submitting harness no longer waits on the HTTP response, so the
+    /// terminal receipt must wake the owning mission. Recovered remote builds
+    /// are promoted to this mode because a restart severed any synchronous
+    /// waiter that may have existed.
+    #[serde(default)]
+    pub wake_on_terminal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +85,15 @@ pub struct RemoteJobReceipt {
     #[serde(default)]
     pub exit_status: Option<i32>,
     pub identity: RemoteJobIdentity,
+    /// Remote-build receipts are also a durable wake-up outbox. Legacy
+    /// receipts predate that contract and default to `false`, so upgrading
+    /// never replays old validations into missions.
+    #[serde(default)]
+    pub wake_required: bool,
+    /// Set only after the owning mission has durably accepted the terminal
+    /// continuation (live control queue or persisted deferred goal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_delivered_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn ledger_path(working_dir: &Path) -> PathBuf {
@@ -167,6 +182,34 @@ pub async fn terminal_receipts_for_mission(
         .collect())
 }
 
+/// Terminal remote-build receipts whose mission continuation has not yet
+/// reached a durable queue. The startup reconciler retries these after a
+/// process crash, making receipt finalization and mission wake-up effectively
+/// an outbox operation rather than a best-effort callback.
+pub async fn pending_terminal_wakes(working_dir: &Path) -> anyhow::Result<Vec<RemoteJobReceipt>> {
+    Ok(load_receipts_result(working_dir)
+        .await?
+        .into_iter()
+        .filter(|receipt| receipt.wake_required && receipt.wake_delivered_at.is_none())
+        .collect())
+}
+
+pub async fn mark_terminal_wake_delivered(
+    working_dir: &Path,
+    job_id: Uuid,
+) -> anyhow::Result<bool> {
+    let _guard = lock().lock().await;
+    let mut receipts = load_receipts_result(working_dir).await?;
+    let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.job_id == job_id) else {
+        return Ok(false);
+    };
+    if receipt.wake_delivered_at.is_none() {
+        receipt.wake_delivered_at = Some(chrono::Utc::now());
+        store_receipts(working_dir, &receipts).await?;
+    }
+    Ok(true)
+}
+
 /// Close an active handle and retain immutable validation evidence. Raw
 /// mission and tentative handles are removed without producing a receipt.
 pub async fn finalize(
@@ -185,6 +228,10 @@ pub async fn finalize(
     let handle = handles.remove(index);
     if let Some(identity) = handle.identity {
         let mut receipts = load_receipts_result(working_dir).await?;
+        let previous_wake_delivered_at = receipts
+            .iter()
+            .find(|receipt| receipt.job_id == job_id)
+            .and_then(|receipt| receipt.wake_delivered_at);
         receipts.retain(|receipt| receipt.job_id != job_id);
         receipts.push(RemoteJobReceipt {
             mission_id: handle.mission_id,
@@ -195,10 +242,21 @@ pub async fn finalize(
             state: state.to_string(),
             exit_status,
             identity,
+            wake_required: handle.kind == JobHandleKind::RemoteBuild && handle.wake_on_terminal,
+            wake_delivered_at: previous_wake_delivered_at,
         });
         if receipts.len() > MAX_RECEIPTS {
             receipts.sort_by_key(|receipt| receipt.finished_at);
-            receipts.drain(..receipts.len() - MAX_RECEIPTS);
+            let mut excess = receipts.len() - MAX_RECEIPTS;
+            receipts.retain(|receipt| {
+                let pending_wake = receipt.wake_required && receipt.wake_delivered_at.is_none();
+                if excess > 0 && !pending_wake {
+                    excess -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
         }
         store_receipts(working_dir, &receipts).await?;
     }
@@ -253,6 +311,19 @@ pub async fn heartbeat(working_dir: &Path, job_id: Uuid) -> anyhow::Result<bool>
     Ok(true)
 }
 
+pub async fn require_terminal_wake(working_dir: &Path, job_id: Uuid) -> anyhow::Result<bool> {
+    let _guard = lock().lock().await;
+    let mut handles = load_result(working_dir).await?;
+    let Some(handle) = handles.iter_mut().find(|handle| handle.job_id == job_id) else {
+        return Ok(false);
+    };
+    if !handle.wake_on_terminal {
+        handle.wake_on_terminal = true;
+        store(working_dir, &handles).await?;
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +342,7 @@ mod tests {
             disk_reservation_bytes: 0,
             kind: JobHandleKind::Mission,
             identity: None,
+            wake_on_terminal: false,
         };
 
         record(dir.path(), handle.clone()).await.unwrap();
@@ -298,6 +370,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: JobHandleKind::Mission,
                 identity: None,
+                wake_on_terminal: false,
             },
         )
         .await;
@@ -351,6 +424,7 @@ mod tests {
             disk_reservation_bytes: 0,
             kind: JobHandleKind::Tentative,
             identity: None,
+            wake_on_terminal: false,
         };
         record(dir.path(), handle.clone()).await.unwrap();
 
@@ -384,6 +458,7 @@ mod tests {
                 toolchain: None,
                 source_bundle_digest: None,
             }),
+            wake_on_terminal: false,
         };
         record(dir.path(), handle).await.unwrap();
 
@@ -418,6 +493,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: JobHandleKind::RemoteBuild,
                 identity: Some(identity.clone()),
+                wake_on_terminal: true,
             },
         )
         .await
@@ -431,6 +507,13 @@ mod tests {
         assert_eq!(receipt.identity, identity);
         assert_eq!(receipt.state, "succeeded");
         assert_eq!(receipt.exit_status, Some(0));
+        assert!(receipt.wake_required);
+        assert_eq!(receipt.wake_delivered_at, None);
+        assert_eq!(pending_terminal_wakes(dir.path()).await.unwrap().len(), 1);
+        assert!(mark_terminal_wake_delivered(dir.path(), job_id)
+            .await
+            .unwrap());
+        assert!(pending_terminal_wakes(dir.path()).await.unwrap().is_empty());
         assert_eq!(
             terminal_receipts_for_mission(dir.path(), mission_id)
                 .await

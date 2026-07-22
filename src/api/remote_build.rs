@@ -716,6 +716,7 @@ fn spawn_remote_build_observer(
                         )
                         .await
                         {
+                            super::control::deliver_pending_remote_build_wakes(&state).await;
                             return;
                         }
                         continue;
@@ -740,6 +741,7 @@ fn spawn_remote_build_observer(
                     )
                     .await
                     {
+                        super::control::deliver_pending_remote_build_wakes(&state).await;
                         return;
                     }
                 }
@@ -747,6 +749,7 @@ fn spawn_remote_build_observer(
                     if finalize_remote_build_handle(&state.config.working_dir, job_id, "lost", None)
                         .await
                     {
+                        super::control::deliver_pending_remote_build_wakes(&state).await;
                         return;
                     }
                 }
@@ -757,6 +760,11 @@ fn spawn_remote_build_observer(
                             .await
                     {
                         tracing::warn!(%job_id, ?error, "remote build heartbeat persistence failed");
+                    }
+                    if let Err(error) =
+                        super::control::ensure_remote_build_wait(&state, mission_id, job_id).await
+                    {
+                        tracing::warn!(%mission_id, %job_id, %error, "remote build mission lease heartbeat failed");
                     }
                 }
                 Err(_) => {}
@@ -883,6 +891,7 @@ async fn submit_remote_build(
             disk_reservation_bytes: req.estimated_disk_bytes,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
             identity: Some(identity.clone()),
+            wake_on_terminal: false,
         },
     )
     .await
@@ -959,6 +968,11 @@ async fn submit_remote_build(
             disk_reservation_bytes: req.estimated_disk_bytes,
             kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
             identity: Some(identity.clone()),
+            // The bundled wrapper uses the asynchronous HTTP API but keeps
+            // polling synchronously inside the harness tool. The control
+            // actor arms terminal wake-up only if that turn actually ends
+            // while the job is still unresolved.
+            wake_on_terminal: false,
         },
     )
     .await
@@ -1249,13 +1263,16 @@ async fn get_remote_build(
     let started_at = remote_build_started_at(&state, job_id).await;
     record_remote_build_status(&state, &node.id, &status, started_at);
     if remote_build_is_terminal(&status.state) {
-        finalize_remote_build_handle(
+        if finalize_remote_build_handle(
             &state.config.working_dir,
             job_id,
             &status.state,
             status.exit_code,
         )
-        .await;
+        .await
+        {
+            super::control::deliver_pending_remote_build_wakes(&state).await;
+        }
     } else if let Err(error) =
         crate::remote_node::job_ledger::heartbeat(&state.config.working_dir, job_id).await
     {
@@ -1356,6 +1373,7 @@ mod tests {
             disk_reservation_bytes: 12 * GIB,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
             identity: None,
+            wake_on_terminal: false,
         };
 
         assert!(handle_needs_reservation(
@@ -1582,6 +1600,8 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
                     toolchain: Some("leanprover/lean4:v4.19.0".to_string()),
                     source_bundle_digest: None,
                 },
+                wake_required: false,
+                wake_delivered_at: None,
             },
         )
         .unwrap()
