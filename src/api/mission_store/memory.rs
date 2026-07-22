@@ -92,11 +92,23 @@ impl MissionStore for InMemoryMissionStore {
         owner_actor_id: &str,
         scope_unit: Option<&str>,
     ) -> Result<MissionRun, String> {
-        match self.missions.read().await.get(&mission_id) {
+        let missions = self.missions.read().await;
+        match missions.get(&mission_id) {
             None => return Err(format!("mission not found: {mission_id}")),
             Some(mission) if mission.status == MissionStatus::Acknowledged => {
                 return Err(format!(
                     "acknowledged mission {mission_id} cannot acquire a non-terminal run"
+                ));
+            }
+            Some(mission)
+                if !matches!(
+                    mission.status,
+                    MissionStatus::Pending | MissionStatus::Active
+                ) =>
+            {
+                return Err(format!(
+                    "mission {mission_id} has status {}; activate it before acquiring a non-terminal run",
+                    mission.status
                 ));
             }
             Some(_) => {}
@@ -1248,6 +1260,34 @@ mod tests {
         assert_eq!(updated.session_id.as_deref(), Some("new-session"));
         assert!(!updated.resumable);
         assert_eq!(updated.interrupted_at, None);
+    }
+
+    #[tokio::test]
+    async fn inactive_mission_cannot_acquire_a_run_until_reactivated() {
+        let store = InMemoryMissionStore::new();
+        let mission = store
+            .create_mission(Some("Queued work"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+        store
+            .update_mission_status(mission.id, MissionStatus::Interrupted)
+            .await
+            .expect("interrupt mission");
+
+        assert!(store
+            .begin_mission_run(mission.id, "actor", None)
+            .await
+            .unwrap_err()
+            .contains("activate it before acquiring"));
+
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("reactivate mission");
+        store
+            .begin_mission_run(mission.id, "actor", None)
+            .await
+            .expect("active mission can acquire run");
     }
 
     #[tokio::test]

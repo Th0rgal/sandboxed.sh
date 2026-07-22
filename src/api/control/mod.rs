@@ -146,6 +146,35 @@ async fn acquire_execution_run(
 /// clippy's `type_complexity` threshold.
 type ControlQueueEntry = (Uuid, String, Option<String>, Option<Uuid>, Option<String>);
 
+/// Pop the first queued delivery whose target is not explicitly paused.
+/// Paused deliveries remain durable and rotate behind runnable work; when all
+/// entries are paused the queue returns to its original order and nothing is
+/// dequeued, avoiding both head-of-line blocking and a retry spin.
+async fn pop_next_runnable_control_queue(
+    queue: &mut VecDeque<ControlQueueEntry>,
+    store: &Arc<dyn MissionStore>,
+) -> Option<ControlQueueEntry> {
+    let queued = queue.len();
+    for _ in 0..queued {
+        let entry = queue.pop_front()?;
+        let paused = match entry.3 {
+            Some(mission_id) => store
+                .get_mission(mission_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|mission| mission.status == MissionStatus::Paused),
+            None => false,
+        };
+        if paused {
+            queue.push_back(entry);
+            continue;
+        }
+        return Some(entry);
+    }
+    None
+}
+
 /// Silence threshold before declaring a mission stuck. Conservative so
 /// legitimately long codex turns (Lean compiles, CI polls) don't trigger
 /// false positives. Shared between the watchdog loop and the actor's
@@ -183,6 +212,13 @@ pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
             | MissionStatus::WaitingBackground
             | MissionStatus::Acknowledged
     )
+}
+
+fn queued_delivery_requires_activation(
+    target_mission_id: Option<Uuid>,
+    source: Option<&str>,
+) -> bool {
+    target_mission_id.is_some() || source == Some("transport_auto_resume")
 }
 
 fn projected_running_health(
@@ -6160,6 +6196,26 @@ async fn activate_mission_id_for_message(
         .await?
         .ok_or_else(|| format!("mission {mission_id} no longer exists"))?;
     activate_mission_for_message(control_hub, store, events_tx, &mission, content).await
+}
+
+async fn restore_mission_after_failed_run_acquisition(
+    store: &Arc<dyn MissionStore>,
+    events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
+    mission: &Mission,
+) -> Result<(), String> {
+    store
+        .update_mission_status_with_reason(
+            mission.id,
+            mission.status,
+            mission.terminal_reason.as_deref(),
+        )
+        .await?;
+    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+        mission_id: mission.id,
+        status: mission.status,
+        summary: Some("Run acquisition failed; prior mission status restored".to_string()),
+    });
+    Ok(())
 }
 
 struct MessageWriterLeaseGuard {
@@ -14519,7 +14575,7 @@ async fn control_actor_loop(
                             });
                         }
                         if running.is_none() {
-                            if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
+                            if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = pop_next_runnable_control_queue(&mut queue, &mission_store).await {
                                 // Persist the dequeue before the awaits that start
                                 // the run, so a crash here can't restore + re-run it.
                                 if let Err(error) = persist_control_queue_if_changed(
@@ -15069,6 +15125,21 @@ async fn control_actor_loop(
                                 continue;
                             }
 
+                            if let Err(error) = activate_mission_for_message(
+                                &control_hub,
+                                &mission_store,
+                                &events_tx,
+                                &mission,
+                                &content,
+                            )
+                            .await
+                            {
+                                let _ = respond.send(Err(format!(
+                                    "Failed to activate mission before starting: {error}"
+                                )));
+                                continue;
+                            }
+
                             // Create a new MissionRunner
                             let mut runner = super::mission_runner::MissionRunner::new(
                                 mission_id,
@@ -15099,8 +15170,21 @@ async fn control_actor_loop(
                                 )
                                 .await
                             {
+                                let rollback = restore_mission_after_failed_run_acquisition(
+                                    &mission_store,
+                                    &events_tx,
+                                    &mission,
+                                )
+                                .await;
                                 let _ = respond.send(Err(format!(
-                                    "Failed to acquire mission run lease: {error}"
+                                    "Failed to acquire mission run lease: {error}{}",
+                                    rollback
+                                        .err()
+                                        .map(|rollback_error| format!(
+                                            "; failed to restore {} status: {rollback_error}",
+                                            mission.status
+                                        ))
+                                        .unwrap_or_default()
                                 )));
                                 continue;
                             }
@@ -15119,29 +15203,6 @@ async fn control_actor_loop(
                             );
 
                             if started {
-                                if mission.status != MissionStatus::Active {
-                                    tracing::info!(
-                                        "Activating parallel mission {} (was {})",
-                                        mission_id,
-                                        mission.status
-                                    );
-                                    if let Err(e) = mission_store
-                                        .update_mission_status(mission_id, MissionStatus::Active)
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            "Failed to activate parallel mission {}: {}",
-                                            mission_id,
-                                            e
-                                        );
-                                    } else {
-                                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                            mission_id,
-                                            status: MissionStatus::Active,
-                                            summary: None,
-                                        });
-                                    }
-                                }
                                 tracing::info!("Mission {} started in parallel", mission_id);
                                 entry.insert(runner);
                                 let _ = respond.send(Ok(()));
@@ -15655,6 +15716,19 @@ async fn control_actor_loop(
                                         continue;
                                     }
 
+                                    // Explicit resume is the authority to clear
+                                    // a paused/interrupted presentation row.
+                                    // Persist it before acquiring the run so the
+                                    // store can reject any stale-state race.
+                                    if let Err(error) = mission_store
+                                        .update_mission_status(mission_id, MissionStatus::Active)
+                                        .await
+                                    {
+                                        let _ = respond.send(Err(format!(
+                                            "Failed to activate mission before resume: {error}"
+                                        )));
+                                        continue;
+                                    }
                                     let mut runner = super::mission_runner::MissionRunner::new(
                                         mission_id,
                                         mission.workspace_id,
@@ -15681,11 +15755,41 @@ async fn control_actor_loop(
                                         )
                                         .await
                                     {
+                                        let rollback =
+                                            restore_mission_after_failed_run_acquisition(
+                                                &mission_store,
+                                                &events_tx,
+                                                &mission,
+                                            )
+                                            .await;
                                         let _ = respond.send(Err(format!(
-                                            "Failed to acquire mission run lease: {error}"
+                                            "Failed to acquire mission run lease: {error}{}",
+                                            rollback
+                                                .err()
+                                                .map(|rollback_error| format!(
+                                                    "; failed to restore {} status: {rollback_error}",
+                                                    mission.status
+                                                ))
+                                                .unwrap_or_default()
                                         )));
                                         continue;
                                     }
+                                    if mission.status == MissionStatus::Paused {
+                                        let _ = mission_store
+                                            .set_mission_paused_at(mission_id, None)
+                                            .await;
+                                    }
+                                    maybe_schedule_mission_metadata_refresh_for_status(
+                                        &mission_store,
+                                        &events_tx,
+                                        mission_id,
+                                        MissionStatus::Active,
+                                    );
+                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        mission_id,
+                                        status: MissionStatus::Active,
+                                        summary: None,
+                                    });
                                     let started = runner.start_next(
                                         config.clone(),
                                         Arc::clone(&root_agent),
@@ -15705,34 +15809,6 @@ async fn control_actor_loop(
                                             "Failed to start mission execution".to_string(),
                                         ));
                                         continue;
-                                    }
-
-                                    if let Err(e) = mission_store
-                                        .update_mission_status(mission_id, MissionStatus::Active)
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            "Failed to resume parallel mission {}: {}",
-                                            mission_id,
-                                            e
-                                        );
-                                    } else {
-                                        if mission.status == MissionStatus::Paused {
-                                            let _ = mission_store
-                                                .set_mission_paused_at(mission_id, None)
-                                                .await;
-                                        }
-                                        maybe_schedule_mission_metadata_refresh_for_status(
-                                            &mission_store,
-                                            &events_tx,
-                                            mission_id,
-                                            MissionStatus::Active,
-                                        );
-                                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                            mission_id,
-                                            status: MissionStatus::Active,
-                                            summary: None,
-                                        });
                                     }
 
                                     parallel_runners.insert(mission_id, runner);
@@ -15800,7 +15876,7 @@ async fn control_actor_loop(
 
                                 // Start execution if not already running
                                 if running.is_none() {
-                                    if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
+                                    if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = pop_next_runnable_control_queue(&mut queue, &mission_store).await {
                                         // Persist the dequeue before the awaits that
                                         // start the run, so a crash here can't
                                         // restore + re-run it.
@@ -16678,7 +16754,7 @@ async fn control_actor_loop(
                 }
 
                 // Start next queued message, if any.
-                if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
+                if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = pop_next_runnable_control_queue(&mut queue, &mission_store).await {
                     // Persist the dequeue before the awaits that start the run, so
                     // a crash here can't restore + re-run it.
                     if let Err(error) = persist_control_queue_if_changed(
@@ -16703,11 +16779,16 @@ async fn control_actor_loop(
                         );
                         continue;
                     }
-                    // Internal transport retries bypass the user-message
-                    // command path, so re-assert activation at dequeue too.
-                    // This also covers a retry restored from the durable queue
-                    // after a controller restart.
-                    if msg_source.as_deref() == Some("transport_auto_resume") {
+                    // Re-assert activation for every targeted delivery at
+                    // dequeue. A message may have waited behind another turn
+                    // while cancellation, acknowledgement, a background wait,
+                    // or a controller restart changed the presentation row.
+                    // Acquiring a new run without this check can produce an
+                    // interrupted/acknowledged mission with a live run lease.
+                    if queued_delivery_requires_activation(
+                        msg_target_mid,
+                        msg_source.as_deref(),
+                    ) {
                         let activation = match msg_target_mid {
                             Some(mission_id) => {
                                 activate_mission_id_for_message(
@@ -16740,12 +16821,12 @@ async fn control_actor_loop(
                             .await
                             {
                                 tracing::warn!(
-                                    "Failed to restore transport retry after activation rejection: {persist_error}"
+                                    "Failed to restore queued delivery after activation rejection: {persist_error}"
                                 );
                             }
                             let _ = events_tx.send(AgentEvent::Error {
                                 message: format!(
-                                    "Transport recovery could not activate its mission: {error}"
+                                    "Queued delivery could not activate its mission: {error}"
                                 ),
                                 mission_id: msg_target_mid,
                                 resumable: true,
@@ -17187,6 +17268,35 @@ async fn control_actor_loop(
                                             "Refreshed runner session_id from store"
                                         );
                                         runner.session_id = m.session_id;
+                                    }
+                                }
+                                let next_content = runner
+                                    .inflight_message()
+                                    .or_else(|| runner.queue.front())
+                                    .map(|message| message.content.clone());
+                                if let Some(next_content) = next_content {
+                                    if let Err(error) = activate_mission_id_for_message(
+                                        &control_hub,
+                                        &mission_store,
+                                        &events_tx,
+                                        *mission_id,
+                                        &next_content,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            mission_id = %mission_id,
+                                            "Failed to activate mission for its next queued turn: {error}"
+                                        );
+                                        let _ = events_tx.send(AgentEvent::Error {
+                                            message: format!(
+                                                "Queued delivery could not activate its mission: {error}"
+                                            ),
+                                            mission_id: Some(*mission_id),
+                                            resumable: true,
+                                        });
+                                        completed_missions.push(*mission_id);
+                                        continue;
                                     }
                                 }
                                 if let Err(error) = runner
@@ -25545,6 +25655,100 @@ Investigate <service/> failures.
         assert!(!queue_has_pending_target_mission(&queue, Uuid::new_v4()));
     }
 
+    #[tokio::test]
+    async fn paused_queued_delivery_is_parked_without_blocking_runnable_work() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let paused = store
+            .create_mission(Some("paused"), None, None, None, None, None, None)
+            .await
+            .expect("create paused mission");
+        store
+            .update_mission_status(paused.id, MissionStatus::Paused)
+            .await
+            .expect("pause mission");
+        let active = store
+            .create_mission(Some("active"), None, None, None, None, None, None)
+            .await
+            .expect("create active mission");
+        store
+            .update_mission_status(active.id, MissionStatus::Active)
+            .await
+            .expect("activate mission");
+
+        let paused_entry = (
+            Uuid::new_v4(),
+            "park me".to_string(),
+            None,
+            Some(paused.id),
+            None,
+        );
+        let active_entry = (
+            Uuid::new_v4(),
+            "run me".to_string(),
+            None,
+            Some(active.id),
+            None,
+        );
+        let mut queue = VecDeque::from([paused_entry.clone(), active_entry.clone()]);
+
+        let popped = pop_next_runnable_control_queue(&mut queue, &store)
+            .await
+            .expect("active delivery should be selected");
+        assert_eq!(popped.0, active_entry.0);
+        assert_eq!(queue, VecDeque::from([paused_entry.clone()]));
+
+        assert!(pop_next_runnable_control_queue(&mut queue, &store)
+            .await
+            .is_none());
+        assert_eq!(queue, VecDeque::from([paused_entry]));
+    }
+
+    #[tokio::test]
+    async fn failed_run_acquisition_restores_prior_status_and_reason() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("resume"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+        store
+            .update_mission_status_with_reason(
+                mission.id,
+                MissionStatus::Interrupted,
+                Some("transport"),
+            )
+            .await
+            .expect("interrupt mission");
+        let interrupted = store
+            .get_mission(mission.id)
+            .await
+            .expect("load mission")
+            .expect("mission exists");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("optimistic activation");
+        let (events_tx, mut events_rx) = broadcast::channel(4);
+
+        restore_mission_after_failed_run_acquisition(&store, &events_tx, &interrupted)
+            .await
+            .expect("restore prior status");
+
+        let restored = store
+            .get_mission(mission.id)
+            .await
+            .expect("reload mission")
+            .expect("mission exists");
+        assert_eq!(restored.status, MissionStatus::Interrupted);
+        assert_eq!(restored.terminal_reason.as_deref(), Some("transport"));
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(AgentEvent::MissionStatusChanged {
+                status: MissionStatus::Interrupted,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn queue_snapshot_replays_prepared_parallel_message_until_run_exists() {
         let main_mission = Uuid::new_v4();
@@ -25776,6 +25980,31 @@ Investigate <service/> failures.
         // Already-running and explicitly-paused missions are handled elsewhere
         // (a running mission needs no activation; a paused one must stay parked
         // until the user resumes it), so they are not activation-eligible here.
+        assert!(!message_activates_mission(MissionStatus::Active));
+        assert!(!message_activates_mission(MissionStatus::Paused));
+    }
+
+    #[test]
+    fn every_targeted_queued_delivery_reasserts_mission_activation() {
+        let mission_id = Uuid::new_v4();
+
+        assert!(queued_delivery_requires_activation(Some(mission_id), None));
+        assert!(queued_delivery_requires_activation(
+            Some(mission_id),
+            Some("agent_finished")
+        ));
+        assert!(queued_delivery_requires_activation(
+            Some(mission_id),
+            Some("transport_auto_resume")
+        ));
+        assert!(queued_delivery_requires_activation(
+            None,
+            Some("transport_auto_resume")
+        ));
+        assert!(!queued_delivery_requires_activation(None, None));
+
+        assert!(message_activates_mission(MissionStatus::Interrupted));
+        assert!(message_activates_mission(MissionStatus::Acknowledged));
         assert!(!message_activates_mission(MissionStatus::Active));
         assert!(!message_activates_mission(MissionStatus::Paused));
     }

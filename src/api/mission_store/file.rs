@@ -134,11 +134,23 @@ impl MissionStore for FileMissionStore {
         owner_actor_id: &str,
         scope_unit: Option<&str>,
     ) -> Result<MissionRun, String> {
-        match self.missions.read().await.get(&mission_id) {
+        let missions = self.missions.read().await;
+        match missions.get(&mission_id) {
             None => return Err(format!("mission not found: {mission_id}")),
             Some(mission) if mission.status == MissionStatus::Acknowledged => {
                 return Err(format!(
                     "acknowledged mission {mission_id} cannot acquire a non-terminal run"
+                ));
+            }
+            Some(mission)
+                if !matches!(
+                    mission.status,
+                    MissionStatus::Pending | MissionStatus::Active
+                ) =>
+            {
+                return Err(format!(
+                    "mission {mission_id} has status {}; activate it before acquiring a non-terminal run",
+                    mission.status
                 ));
             }
             Some(_) => {}
@@ -177,6 +189,7 @@ impl MissionStore for FileMissionStore {
         };
         runs.insert(run.run_id, run.clone());
         drop(runs);
+        drop(missions);
         self.persist().await?;
         Ok(run)
     }
@@ -1095,6 +1108,19 @@ mod tests {
             .finish_mission_run(first.run_id, first.generation, Some("completed"))
             .await
             .expect("finish first run"));
+        reopened
+            .update_mission_status(mission.id, MissionStatus::Interrupted)
+            .await
+            .expect("interrupt mission");
+        assert!(reopened
+            .begin_mission_run(mission.id, "actor-b", None)
+            .await
+            .unwrap_err()
+            .contains("activate it before acquiring"));
+        reopened
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("reactivate mission");
         let second = reopened
             .begin_mission_run(mission.id, "actor-b", None)
             .await
