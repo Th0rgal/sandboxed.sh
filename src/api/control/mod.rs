@@ -146,10 +146,11 @@ async fn acquire_execution_run(
 /// clippy's `type_complexity` threshold.
 type ControlQueueEntry = (Uuid, String, Option<String>, Option<Uuid>, Option<String>);
 
-/// Pop the first queued delivery whose target is not explicitly paused.
-/// Paused deliveries remain durable and rotate behind runnable work; when all
-/// entries are paused the queue returns to its original order and nothing is
-/// dequeued, avoiding both head-of-line blocking and a retry spin.
+/// Pop the first queued delivery whose target is not explicitly paused or
+/// still owned by a detached durable wait. Parked deliveries remain durable
+/// and rotate behind runnable work; when all entries are parked the queue
+/// returns to its original order and nothing is dequeued, avoiding both
+/// head-of-line blocking and a retry spin on the active run constraint.
 async fn pop_next_runnable_control_queue(
     queue: &mut VecDeque<ControlQueueEntry>,
     store: &Arc<dyn MissionStore>,
@@ -157,16 +158,31 @@ async fn pop_next_runnable_control_queue(
     let queued = queue.len();
     for _ in 0..queued {
         let entry = queue.pop_front()?;
-        let paused = match entry.3 {
-            Some(mission_id) => store
-                .get_mission(mission_id)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|mission| mission.status == MissionStatus::Paused),
+        let parked = match entry.3 {
+            Some(mission_id) => {
+                let paused = store
+                    .get_mission(mission_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|mission| mission.status == MissionStatus::Paused);
+                let detached_wait = store
+                    .get_active_mission_run(mission_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|run| {
+                        matches!(
+                            run.execution_state,
+                            MissionExecutionState::WaitingRemoteJob
+                                | MissionExecutionState::Stopping
+                        )
+                    });
+                paused || detached_wait
+            }
             None => false,
         };
-        if paused {
+        if parked {
             queue.push_back(entry);
             continue;
         }
@@ -2520,6 +2536,8 @@ async fn get_running_missions(
             (mission.status == MissionStatus::Acknowledged || mission.status.is_terminal())
                 .then(|| format!("status_{}_with_non_terminal_run", mission.status))
         });
+        let healthy_detached_remote_wait =
+            detached_remote_wait_is_healthy(run.execution_state, heartbeat_age);
         let mut row = actor_by_mission.remove(&run.mission_id).unwrap_or_else(|| {
             super::mission_runner::RunningMissionInfo {
                 mission_id: run.mission_id,
@@ -2531,8 +2549,12 @@ async fn get_running_missions(
                     run.execution_state,
                     MissionExecutionState::WaitingTool | MissionExecutionState::WaitingRemoteJob
                 ),
-                health: super::mission_runner::MissionHealth::Reconciling {
-                    reason: "durable_run_without_registered_actor".to_string(),
+                health: if healthy_detached_remote_wait {
+                    super::mission_runner::MissionHealth::Healthy
+                } else {
+                    super::mission_runner::MissionHealth::Reconciling {
+                        reason: "durable_run_without_registered_actor".to_string(),
+                    }
                 },
                 expected_deliverables: 0,
                 current_activity: None,
@@ -2542,7 +2564,8 @@ async fn get_running_missions(
                 generation: Some(run.generation),
                 heartbeat_at: Some(run.heartbeat_at.clone()),
                 scope_unit: run.scope_unit.clone(),
-                status_conflict: Some("durable_run_without_registered_actor".to_string()),
+                status_conflict: (!healthy_detached_remote_wait)
+                    .then(|| "durable_run_without_registered_actor".to_string()),
             }
         });
         row.state = run.execution_state.as_str().to_string();
@@ -2568,6 +2591,10 @@ async fn get_running_missions(
         projected.push(row);
     }
     Ok(projected)
+}
+
+fn detached_remote_wait_is_healthy(state: MissionExecutionState, heartbeat_age: u64) -> bool {
+    state == MissionExecutionState::WaitingRemoteJob && heartbeat_age <= 60
 }
 
 /// Look up an automation by ID, returning 404 if it does not exist.
@@ -4468,6 +4495,85 @@ fn remote_build_handle_proves_liveness(
         .or(handle.accepted_at)
         .unwrap_or(handle.started_at);
     now.signed_duration_since(last_proof) <= chrono::Duration::seconds(60)
+}
+
+async fn mission_has_unresolved_remote_build(
+    working_dir: &std::path::Path,
+    mission_id: Uuid,
+) -> bool {
+    crate::remote_node::job_ledger::load(working_dir)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .any(|handle| {
+            handle.mission_id == mission_id
+                && handle.kind == crate::remote_node::job_ledger::JobHandleKind::RemoteBuild
+                && handle.accepted_at.is_some()
+                && handle.wake_on_terminal
+        })
+}
+
+async fn arm_unresolved_remote_build_wake(working_dir: &std::path::Path, mission_id: Uuid) -> bool {
+    let handles = match crate::remote_node::job_ledger::load(working_dir).await {
+        Ok(handles) => handles,
+        Err(error) => {
+            tracing::warn!(%mission_id, ?error, "remote-build handles could not be loaded before turn parking");
+            return false;
+        }
+    };
+    let jobs = handles
+        .into_iter()
+        .filter(|handle| {
+            handle.mission_id == mission_id
+                && handle.kind == crate::remote_node::job_ledger::JobHandleKind::RemoteBuild
+                && handle.accepted_at.is_some()
+        })
+        .map(|handle| handle.job_id)
+        .collect::<Vec<_>>();
+    if jobs.is_empty() {
+        return false;
+    }
+    for job_id in jobs {
+        match crate::remote_node::job_ledger::require_terminal_wake(working_dir, job_id).await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                tracing::warn!(%mission_id, %job_id, ?error, "remote-build terminal wake could not be armed before turn parking");
+                return false;
+            }
+        }
+    }
+    true
+}
+
+async fn mission_should_park_on_remote_build(
+    mission_store: &Arc<dyn MissionStore>,
+    working_dir: &std::path::Path,
+    mission_id: Uuid,
+) -> bool {
+    if !arm_unresolved_remote_build_wake(working_dir, mission_id).await
+        || !mission_has_unresolved_remote_build(working_dir, mission_id).await
+    {
+        return false;
+    }
+    let Ok(Some(mission)) = mission_store.get_mission(mission_id).await else {
+        return false;
+    };
+    if matches!(
+        mission.status,
+        MissionStatus::Interrupted
+            | MissionStatus::Paused
+            | MissionStatus::Blocked
+            | MissionStatus::NotFeasible
+    ) {
+        return false;
+    }
+    mission_store
+        .get_active_mission_run(mission_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|run| run.execution_state != MissionExecutionState::Stopping)
 }
 
 pub async fn list_missions(
@@ -6992,6 +7098,268 @@ impl RemoteMissionOwner {
     }
 }
 
+async fn remote_build_wait_owner(
+    state: &AppState,
+    mission_id: Uuid,
+) -> Result<Option<(RemoteMissionOwner, Option<ControlState>)>, String> {
+    for session in state.control.all_sessions().await {
+        match session.mission_store.get_mission(mission_id).await {
+            Ok(Some(_)) => {
+                return Ok(Some((RemoteMissionOwner::live(&session), Some(session))));
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                %mission_id,
+                %error,
+                "remote-build owner lookup skipped an unavailable live store"
+            ),
+        }
+    }
+    Ok(
+        super::mission_workspace_gc::persisted_mission_store(state, mission_id)
+            .await?
+            .map(|(store, _)| (RemoteMissionOwner::offline(store), None)),
+    )
+}
+
+/// Make a durable remote-build handle authoritative execution evidence.
+/// This is called both while the submitting actor is alive and by startup
+/// reconciliation, so a backend restart can reconstruct the lease before an
+/// old `acknowledged` presentation hides live compute.
+pub(crate) async fn ensure_remote_build_wait(
+    state: &AppState,
+    mission_id: Uuid,
+    job_id: Uuid,
+) -> Result<bool, String> {
+    let Some((owner, _)) = remote_build_wait_owner(state, mission_id).await? else {
+        return Ok(false);
+    };
+    let Some(mission) = owner.mission_store.get_mission(mission_id).await? else {
+        return Ok(false);
+    };
+    let active_run = owner
+        .mission_store
+        .get_active_mission_run(mission_id)
+        .await?;
+    if active_run
+        .as_ref()
+        .is_some_and(|run| run.execution_state == MissionExecutionState::Stopping)
+    {
+        return Ok(false);
+    }
+    if active_run.is_none()
+        && matches!(
+            mission.status,
+            MissionStatus::Interrupted
+                | MissionStatus::Paused
+                | MissionStatus::Blocked
+                | MissionStatus::NotFeasible
+        )
+    {
+        // An operator/policy terminalization with no run lease is deliberate.
+        // Keep observing the node receipt, but never resurrect execution.
+        return Ok(false);
+    }
+    if mission.status != MissionStatus::Active {
+        owner
+            .mission_store
+            .update_mission_status(mission_id, MissionStatus::Active)
+            .await?;
+        owner.send(AgentEvent::MissionStatusChanged {
+            mission_id,
+            status: MissionStatus::Active,
+            summary: Some(format!(
+                "Reconciled live remote validation {job_id}; waiting for its terminal receipt"
+            )),
+        });
+    }
+    if let Some(run) = active_run {
+        return owner
+            .mission_store
+            .heartbeat_mission_run(
+                run.run_id,
+                run.generation,
+                MissionExecutionState::WaitingRemoteJob,
+                None,
+            )
+            .await;
+    }
+
+    let run = owner
+        .mission_store
+        .begin_mission_run(mission_id, &format!("remote-build:{job_id}"), None)
+        .await?;
+    owner
+        .mission_store
+        .heartbeat_mission_run(
+            run.run_id,
+            run.generation,
+            MissionExecutionState::WaitingRemoteJob,
+            None,
+        )
+        .await
+}
+
+fn remote_build_terminal_message(
+    receipt: &crate::remote_node::job_ledger::RemoteJobReceipt,
+) -> String {
+    format!(
+        "Remote validation reached terminal state. Reconcile this exact receipt before any new submission.\n\njob_id: {}\nnode_id: {}\nstate: {}\nexit_status: {:?}\nrepository: {}\ncommit: {}\ncommand: {}\ntoolchain: {}\nsource_bundle_digest: {}\n\nConfirm the live PR head still equals the validated commit. Treat a successful receipt for an older head as STALE_SUCCESS, not as an integration gate.",
+        receipt.job_id,
+        receipt.node_id,
+        receipt.state,
+        receipt.exit_status,
+        receipt.identity.repository,
+        receipt.identity.commit,
+        receipt.identity.command.join(" "),
+        receipt.identity.toolchain.as_deref().unwrap_or("unspecified"),
+        receipt
+            .identity
+            .source_bundle_digest
+            .as_deref()
+            .unwrap_or("none"),
+    )
+}
+
+async fn deliver_remote_build_terminal_wake(
+    state: &AppState,
+    receipt: &crate::remote_node::job_ledger::RemoteJobReceipt,
+) -> Result<bool, String> {
+    let Some((owner, live_session)) = remote_build_wait_owner(state, receipt.mission_id).await?
+    else {
+        return Ok(false);
+    };
+    let Some(mission) = owner.mission_store.get_mission(receipt.mission_id).await? else {
+        return Ok(false);
+    };
+    if matches!(
+        mission.status,
+        MissionStatus::Interrupted
+            | MissionStatus::Paused
+            | MissionStatus::Blocked
+            | MissionStatus::NotFeasible
+    ) {
+        let event = AgentEvent::AssistantMessage {
+            id: Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!("sandboxed:remote-build-terminal-event:{}", receipt.job_id).as_bytes(),
+            ),
+            content: remote_build_terminal_message(receipt),
+            success: receipt.state == "succeeded" && receipt.exit_status == Some(0),
+            cost_cents: 0,
+            cost_source: crate::agents::CostSource::Unknown,
+            usage: None,
+            model: None,
+            model_normalized: None,
+            mission_id: Some(receipt.mission_id),
+            shared_files: None,
+            resumable: true,
+            completion_evidence: None,
+        };
+        let _ = owner
+            .mission_store
+            .log_event(receipt.mission_id, &event)
+            .await;
+        owner.send(event);
+        return Ok(true);
+    }
+    if let Some(run) = owner
+        .mission_store
+        .get_active_mission_run(receipt.mission_id)
+        .await?
+    {
+        if run.execution_state != MissionExecutionState::WaitingRemoteJob {
+            // The harness is still consuming the synchronous result. Let that
+            // turn finish rather than racing it with a second continuation.
+            return Ok(false);
+        }
+        owner
+            .mission_store
+            .finish_mission_run(
+                run.run_id,
+                run.generation,
+                Some(&format!("remote_build_{}", receipt.state)),
+            )
+            .await?;
+    }
+
+    let content = remote_build_terminal_message(receipt);
+    if let Some(session) = live_session {
+        let delivery_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("sandboxed:remote-build-terminal:{}", receipt.job_id).as_bytes(),
+        );
+        let (respond, response) = oneshot::channel();
+        session
+            .cmd_tx
+            .send(ControlCommand::UserMessage {
+                id: delivery_id,
+                content,
+                agent: None,
+                target_mission_id: Some(receipt.mission_id),
+                strict: true,
+                source: Some("remote-build-terminal".to_string()),
+                respond,
+            })
+            .await
+            .map_err(|_| "remote-build terminal control session unavailable".to_string())?;
+        return match tokio::time::timeout(std::time::Duration::from_secs(10), response).await {
+            Ok(Ok(UserMessageAck::Queued | UserMessageAck::Delivered)) => Ok(true),
+            Ok(Ok(UserMessageAck::Rejected(error))) => Err(error),
+            Ok(Ok(UserMessageAck::Dropped)) => Ok(false),
+            Ok(Err(_)) => Ok(false),
+            Err(_) => Ok(false),
+        };
+    }
+
+    // No control actor is booted for this user. Persist one exact deferred
+    // continuation and make the normal scheduler pick it up when the session
+    // returns. Repeating this write after a crash is idempotent.
+    owner
+        .mission_store
+        .set_deferred_goal(receipt.mission_id, Some(content))
+        .await?;
+    owner
+        .mission_store
+        .update_mission_status(receipt.mission_id, MissionStatus::Pending)
+        .await?;
+    Ok(true)
+}
+
+pub(crate) async fn deliver_pending_remote_build_wakes(state: &AppState) {
+    let receipts =
+        match crate::remote_node::job_ledger::pending_terminal_wakes(&state.config.working_dir)
+            .await
+        {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                tracing::warn!(?error, "remote-build wake outbox could not be loaded");
+                return;
+            }
+        };
+    for receipt in receipts {
+        match deliver_remote_build_terminal_wake(state, &receipt).await {
+            Ok(true) => {
+                if let Err(error) = crate::remote_node::job_ledger::mark_terminal_wake_delivered(
+                    &state.config.working_dir,
+                    receipt.job_id,
+                )
+                .await
+                {
+                    tracing::warn!(job_id = %receipt.job_id, ?error, "remote-build wake receipt acknowledgement failed");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                mission_id = %receipt.mission_id,
+                job_id = %receipt.job_id,
+                %error,
+                "remote-build terminal wake will retry"
+            ),
+        }
+    }
+}
+
 async fn finalize_remote_mission(
     owner: &RemoteMissionOwner,
     mission_id: Uuid,
@@ -7099,6 +7467,7 @@ async fn dispatch_remote_job(
             disk_reservation_bytes: 0,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
             identity: None,
+            wake_on_terminal: false,
         },
     )
     .await
@@ -7146,6 +7515,7 @@ async fn dispatch_remote_job(
             disk_reservation_bytes: 0,
             kind: crate::remote_node::job_ledger::JobHandleKind::Mission,
             identity: None,
+            wake_on_terminal: false,
         },
     )
     .await
@@ -7355,6 +7725,7 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
         let mut pass = 0u32;
         loop {
             pass += 1;
+            deliver_pending_remote_build_wakes(&state).await;
             let handles = match crate::remote_node::job_ledger::load(&working_dir).await {
                 Ok(handles) => handles,
                 Err(err) => {
@@ -7368,7 +7739,15 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
                 .filter(|h| !settled.contains(&h.job_id))
                 .collect();
             if pending.is_empty() {
-                return;
+                let pending_wakes =
+                    crate::remote_node::job_ledger::pending_terminal_wakes(&working_dir)
+                        .await
+                        .unwrap_or_default();
+                if pending_wakes.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                continue;
             }
             if pass == 1 {
                 tracing::info!(
@@ -7435,6 +7814,21 @@ async fn reconcile_pending_handles(
                 continue;
             }
             if handle.kind == crate::remote_node::job_ledger::JobHandleKind::RemoteBuild {
+                if let Err(error) = crate::remote_node::job_ledger::require_terminal_wake(
+                    working_dir,
+                    handle.job_id,
+                )
+                .await
+                {
+                    tracing::warn!(job_id = %handle.job_id, ?error, "recovered remote build wake requirement could not be persisted");
+                    continue;
+                }
+                if let Err(error) =
+                    ensure_remote_build_wait(state.as_ref(), handle.mission_id, handle.job_id).await
+                {
+                    tracing::warn!(mission_id = %handle.mission_id, job_id = %handle.job_id, %error, "recovered remote build run lease could not be reconciled");
+                    continue;
+                }
                 let node = state.config.remote_nodes.node(&handle.node_id).cloned();
                 let shared_token = node
                     .as_ref()
@@ -7443,17 +7837,15 @@ async fn reconcile_pending_handles(
                 match (node, shared_token) {
                     (Some(node), Some(shared_token)) => {
                         settled.insert(handle.job_id);
-                        let ledger_dir = working_dir.to_path_buf();
-                        let fleet = Arc::clone(&state.fleet);
+                        let app_state = Arc::clone(state);
                         tokio::spawn(async move {
                             poll_recovered_remote_build(
-                                fleet,
+                                app_state,
                                 node,
                                 shared_token,
                                 handle.mission_id,
                                 handle.job_id,
                                 handle.started_at,
-                                ledger_dir,
                             )
                             .await;
                         });
@@ -7581,18 +7973,19 @@ async fn reconcile_pending_handles(
     }
 }
 
-/// Observe a waited remote-build job after API restart. This deliberately has
-/// no mission-status side effects: the build was a tool call within a mission,
-/// not the mission's own remote execution backend.
+/// Observe a remote-build tool job after API restart. The node work remains a
+/// tool execution rather than a standalone mission, but its durable handle now
+/// owns a `waiting_remote_job` run lease and its receipt owns an idempotent
+/// continuation wake-up.
 async fn poll_recovered_remote_build(
-    fleet: Arc<crate::remote_node::FleetMonitor>,
+    state: Arc<AppState>,
     node: crate::remote_node::RemoteNodeConfig,
     shared_token: String,
     mission_id: Uuid,
     job_id: Uuid,
     started_at: chrono::DateTime<chrono::Utc>,
-    working_dir: PathBuf,
 ) {
+    let working_dir = state.config.working_dir.clone();
     let client = crate::remote_node::RemoteNodeClient::default();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -7605,16 +7998,18 @@ async fn poll_recovered_remote_build(
             {
                 let terminal_state = status.state.clone();
                 let terminal_exit_code = status.exit_code;
-                fleet.record_outcome(crate::remote_node::DispatchOutcome {
-                    mission_id,
-                    node_id: node.id.clone(),
-                    job_id: Some(job_id),
-                    state: status.state,
-                    exit_code: status.exit_code,
-                    error: status.error,
-                    started_at,
-                    finished_at: Some(chrono::Utc::now()),
-                });
+                state
+                    .fleet
+                    .record_outcome(crate::remote_node::DispatchOutcome {
+                        mission_id,
+                        node_id: node.id.clone(),
+                        job_id: Some(job_id),
+                        state: status.state,
+                        exit_code: status.exit_code,
+                        error: status.error,
+                        started_at,
+                        finished_at: Some(chrono::Utc::now()),
+                    });
                 match crate::remote_node::job_ledger::finalize(
                     &working_dir,
                     job_id,
@@ -7623,7 +8018,10 @@ async fn poll_recovered_remote_build(
                 )
                 .await
                 {
-                    Ok(_) => return,
+                    Ok(_) => {
+                        deliver_pending_remote_build_wakes(&state).await;
+                        return;
+                    }
                     Err(error) => {
                         // Keep the active handle and retry. Removing it after a
                         // full-disk/permission failure would discard the only
@@ -7638,6 +8036,9 @@ async fn poll_recovered_remote_build(
                     crate::remote_node::job_ledger::heartbeat(&working_dir, job_id).await
                 {
                     tracing::warn!(%job_id, ?error, "recovered remote build heartbeat persistence failed");
+                }
+                if let Err(error) = ensure_remote_build_wait(&state, mission_id, job_id).await {
+                    tracing::warn!(%mission_id, %job_id, %error, "recovered remote build mission lease heartbeat failed");
                 }
             }
             Err(_) => {}
@@ -16383,6 +16784,7 @@ async fn control_actor_loop(
                     let mut completed_terminal_reason = None;
                     let mut completed_completion_confidence = None;
                     let mut completed_transport_failure = false;
+                    let mut completed_waiting_remote_job = false;
                     // Captured for the post-turn `grok_goal` sentinel hook (see
                     // `post_turn_handle_grok_goal`), which runs after this
                     // `match` closes — `agent_result` itself is out of scope
@@ -16400,22 +16802,55 @@ async fn control_actor_loop(
                                 is_transport_failure_evidence(&completion_evidence);
                             completed_agent_output = agent_result.output.clone();
                             if let Some(run) = running_run.take() {
-                                let reason = agent_result
-                                    .terminal_reason
-                                    .map(|value| format!("{value:?}"));
-                                if let Err(error) = mission_store
-                                    .finish_mission_run(
+                                completed_waiting_remote_job =
+                                    mission_should_park_on_remote_build(
+                                        &mission_store,
+                                        &config.working_dir,
+                                        run.mission_id,
+                                    )
+                                    .await;
+                                let run_update = if completed_waiting_remote_job {
+                                    mission_store
+                                        .heartbeat_mission_run(
+                                            run.run_id,
+                                            run.generation,
+                                            MissionExecutionState::WaitingRemoteJob,
+                                            None,
+                                        )
+                                        .await
+                                } else {
+                                    let reason = agent_result
+                                        .terminal_reason
+                                        .map(|value| format!("{value:?}"));
+                                    mission_store
+                                        .finish_mission_run(
                                         run.run_id,
                                         run.generation,
                                         reason.as_deref(),
                                     )
-                                    .await
-                                {
+                                        .await
+                                };
+                                if let Err(error) = run_update {
                                     tracing::warn!(
                                         mission_id = %run.mission_id,
                                         run_id = %run.run_id,
-                                        "Failed to close main mission run: {error}"
+                                        waiting_remote_job = completed_waiting_remote_job,
+                                        "Failed to settle main mission run: {error}"
                                     );
+                                }
+                                if completed_waiting_remote_job {
+                                    if let Err(error) = mission_store
+                                        .update_mission_status(run.mission_id, MissionStatus::Active)
+                                        .await
+                                    {
+                                        tracing::warn!(mission_id = %run.mission_id, %error, "Failed to keep remote-wait mission active");
+                                    } else {
+                                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            mission_id: run.mission_id,
+                                            status: MissionStatus::Active,
+                                            summary: Some("Waiting for durable remote validation".to_string()),
+                                        });
+                                    }
                                 }
                             }
                             // Only append assistant to local history if this mission is still the current mission.
@@ -16477,7 +16912,8 @@ async fn control_actor_loop(
                             // We also check the current mission status from DB to handle:
                             // - Explicit complete_mission calls (which update DB status)
                             // - Parallel missions (each has its own DB status)
-                            if let Some(mission_id) = completed_mission_id {
+                            if !completed_waiting_remote_job {
+                                if let Some(mission_id) = completed_mission_id {
                                 maybe_finalize_terminal_mission(
                                     &mission_store,
                                     &events_tx,
@@ -16489,6 +16925,7 @@ async fn control_actor_loop(
                                     "turn finished before follow-up enqueue",
                                 )
                                 .await;
+                                }
                             }
 
                             // Parse rich tags and validate referenced files
@@ -16550,7 +16987,8 @@ async fn control_actor_loop(
                                 resumable,
                                 completion_evidence: Some(completion_evidence),
                             });
-                            if let Some(mission_id) = completed_mission_id {
+                            if !completed_waiting_remote_job {
+                                if let Some(mission_id) = completed_mission_id {
                                 // Update automation executions based on agent outcome
                                 let error_msg = if agent_result.success {
                                     None
@@ -16582,6 +17020,7 @@ async fn control_actor_loop(
                                     &config.working_dir,
                                 )
                                 .await;
+                                }
                             }
                         }
                         Err(e) => {
@@ -16651,7 +17090,8 @@ async fn control_actor_loop(
                     // rate limits, capacity limits) — these aren't "the agent finished work",
                     // they're transient failures that the retry/recovery logic handles.
                     // Firing automations on these creates noisy retry loops.
-                    if let Some(mission_id) = completed_mission_id {
+                    if !completed_waiting_remote_job {
+                        if let Some(mission_id) = completed_mission_id {
                         if completed_transport_failure
                             && transport_auto_resumed_missions.insert(mission_id)
                             && !queue_has_pending_target_mission(&queue, mission_id)
@@ -16749,6 +17189,7 @@ async fn control_actor_loop(
                                 "turn finished with no same-mission follow-up queued",
                             )
                             .await;
+                        }
                         }
                     }
                 }
@@ -17070,12 +17511,46 @@ async fn control_actor_loop(
                             let durable_terminal_reason = result
                                 .terminal_reason
                                 .map(|reason| format!("{reason:?}"));
-                            runner
-                                .finish_durable_run(
-                                    &mission_store,
-                                    durable_terminal_reason.as_deref(),
-                                )
-                                .await;
+                            let waiting_remote_job = mission_should_park_on_remote_build(
+                                &mission_store,
+                                &config.working_dir,
+                                *mission_id,
+                            )
+                            .await;
+                            if waiting_remote_job {
+                                if let Some(run) = runner.durable_run.as_ref() {
+                                    if let Err(error) = mission_store
+                                        .heartbeat_mission_run(
+                                            run.run_id,
+                                            run.generation,
+                                            MissionExecutionState::WaitingRemoteJob,
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(mission_id = %mission_id, run_id = %run.run_id, %error, "Failed to park parallel mission on remote build");
+                                    }
+                                }
+                                if let Err(error) = mission_store
+                                    .update_mission_status(*mission_id, MissionStatus::Active)
+                                    .await
+                                {
+                                    tracing::warn!(mission_id = %mission_id, %error, "Failed to keep parallel remote-wait mission active");
+                                } else {
+                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        mission_id: *mission_id,
+                                        status: MissionStatus::Active,
+                                        summary: Some("Waiting for durable remote validation".to_string()),
+                                    });
+                                }
+                            } else {
+                                runner
+                                    .finish_durable_run(
+                                        &mission_store,
+                                        durable_terminal_reason.as_deref(),
+                                    )
+                                    .await;
+                            }
                             let completion_evidence = completion_evidence_for_agent_result(&result);
                             tracing::info!(
                                 "Parallel mission {} completed (success: {}, cost: {} cents)",
@@ -17136,7 +17611,7 @@ async fn control_actor_loop(
                             });
 
                             // Update automation executions based on agent outcome
-                            {
+                            if !waiting_remote_job {
                                 let error_msg = if result.success {
                                     None
                                 } else {
@@ -17178,6 +17653,14 @@ async fn control_actor_loop(
                                 &entries,
                             )
                             .await;
+
+                            if waiting_remote_job {
+                                tracing::info!(
+                                    mission_id = %mission_id,
+                                    "Parallel mission turn parked on durable remote validation"
+                                );
+                                continue;
+                            }
 
                             // Check if we should enqueue agent_finished automations.
                             // Skip for transient infrastructure failures (auth, rate limit,
@@ -21603,6 +22086,7 @@ mod tests {
             disk_reservation_bytes: 0,
             kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
             identity: None,
+            wake_on_terminal: false,
         };
         assert!(remote_build_handle_proves_liveness(&handle, now));
         handle.heartbeat_at = Some(now - chrono::Duration::seconds(61));
@@ -21611,6 +22095,118 @@ mod tests {
         assert!(remote_build_handle_proves_liveness(&handle, now));
         handle.kind = crate::remote_node::job_ledger::JobHandleKind::Mission;
         assert!(!remote_build_handle_proves_liveness(&handle, now));
+    }
+
+    #[tokio::test]
+    async fn unresolved_remote_build_parks_a_turn_even_with_a_stale_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        crate::remote_node::job_ledger::record(
+            dir.path(),
+            crate::remote_node::job_ledger::JobHandle {
+                mission_id,
+                node_id: "node-a".to_string(),
+                job_id: Uuid::new_v4(),
+                started_at: chrono::Utc::now() - chrono::Duration::minutes(5),
+                accepted_at: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+                heartbeat_at: Some(chrono::Utc::now() - chrono::Duration::minutes(2)),
+                disk_reservation_bytes: 0,
+                kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
+                identity: None,
+                wake_on_terminal: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(mission_has_unresolved_remote_build(dir.path(), mission_id).await);
+        assert!(!mission_has_unresolved_remote_build(dir.path(), Uuid::new_v4()).await);
+
+        let synchronous_mission_id = Uuid::new_v4();
+        let synchronous_job_id = Uuid::new_v4();
+        crate::remote_node::job_ledger::record(
+            dir.path(),
+            crate::remote_node::job_ledger::JobHandle {
+                mission_id: synchronous_mission_id,
+                node_id: "node-sync".to_string(),
+                job_id: synchronous_job_id,
+                started_at: chrono::Utc::now(),
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: Some(chrono::Utc::now()),
+                disk_reservation_bytes: 0,
+                kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
+                identity: None,
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !mission_has_unresolved_remote_build(dir.path(), synchronous_mission_id).await,
+            "a synchronous waiter must not park a second mission continuation"
+        );
+        crate::remote_node::job_ledger::require_terminal_wake(dir.path(), synchronous_job_id)
+            .await
+            .unwrap();
+        assert!(mission_has_unresolved_remote_build(dir.path(), synchronous_mission_id).await);
+
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("remote wait"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .unwrap();
+        let run = store
+            .begin_mission_run(mission.id, "test", None)
+            .await
+            .unwrap();
+        crate::remote_node::job_ledger::record(
+            dir.path(),
+            crate::remote_node::job_ledger::JobHandle {
+                mission_id: mission.id,
+                node_id: "node-b".to_string(),
+                job_id: Uuid::new_v4(),
+                started_at: chrono::Utc::now(),
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: Some(chrono::Utc::now()),
+                disk_reservation_bytes: 0,
+                kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
+                identity: None,
+                wake_on_terminal: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(mission_should_park_on_remote_build(&store, dir.path(), mission.id).await);
+        store
+            .heartbeat_mission_run(
+                run.run_id,
+                run.generation,
+                MissionExecutionState::Stopping,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!mission_should_park_on_remote_build(&store, dir.path(), mission.id).await);
+    }
+
+    #[test]
+    fn detached_remote_wait_is_healthy_only_while_its_lease_heartbeat_is_fresh() {
+        assert!(detached_remote_wait_is_healthy(
+            MissionExecutionState::WaitingRemoteJob,
+            60
+        ));
+        assert!(!detached_remote_wait_is_healthy(
+            MissionExecutionState::WaitingRemoteJob,
+            61
+        ));
+        assert!(!detached_remote_wait_is_healthy(
+            MissionExecutionState::Running,
+            1
+        ));
     }
 
     #[test]
@@ -25658,6 +26254,27 @@ Investigate <service/> failures.
     #[tokio::test]
     async fn paused_queued_delivery_is_parked_without_blocking_runnable_work() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let remote_wait = store
+            .create_mission(Some("remote wait"), None, None, None, None, None, None)
+            .await
+            .expect("create remote-wait mission");
+        store
+            .update_mission_status(remote_wait.id, MissionStatus::Active)
+            .await
+            .expect("activate remote-wait mission");
+        let remote_run = store
+            .begin_mission_run(remote_wait.id, "remote-build:test", None)
+            .await
+            .expect("begin remote-wait run");
+        store
+            .heartbeat_mission_run(
+                remote_run.run_id,
+                remote_run.generation,
+                MissionExecutionState::WaitingRemoteJob,
+                None,
+            )
+            .await
+            .expect("park remote-wait run");
         let paused = store
             .create_mission(Some("paused"), None, None, None, None, None, None)
             .await
@@ -25682,6 +26299,13 @@ Investigate <service/> failures.
             Some(paused.id),
             None,
         );
+        let remote_entry = (
+            Uuid::new_v4(),
+            "wait for receipt".to_string(),
+            None,
+            Some(remote_wait.id),
+            None,
+        );
         let active_entry = (
             Uuid::new_v4(),
             "run me".to_string(),
@@ -25689,18 +26313,25 @@ Investigate <service/> failures.
             Some(active.id),
             None,
         );
-        let mut queue = VecDeque::from([paused_entry.clone(), active_entry.clone()]);
+        let mut queue = VecDeque::from([
+            remote_entry.clone(),
+            paused_entry.clone(),
+            active_entry.clone(),
+        ]);
 
         let popped = pop_next_runnable_control_queue(&mut queue, &store)
             .await
             .expect("active delivery should be selected");
         assert_eq!(popped.0, active_entry.0);
-        assert_eq!(queue, VecDeque::from([paused_entry.clone()]));
+        assert_eq!(
+            queue,
+            VecDeque::from([remote_entry.clone(), paused_entry.clone()])
+        );
 
         assert!(pop_next_runnable_control_queue(&mut queue, &store)
             .await
             .is_none());
-        assert_eq!(queue, VecDeque::from([paused_entry]));
+        assert_eq!(queue, VecDeque::from([remote_entry, paused_entry]));
     }
 
     #[tokio::test]
