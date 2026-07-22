@@ -2477,7 +2477,10 @@ async fn get_running_missions(
                 queue_len: 0,
                 history_len: 0,
                 seconds_since_activity: heartbeat_age,
-                tool_call_in_flight: run.execution_state == MissionExecutionState::WaitingTool,
+                tool_call_in_flight: matches!(
+                    run.execution_state,
+                    MissionExecutionState::WaitingTool | MissionExecutionState::WaitingRemoteJob
+                ),
                 health: super::mission_runner::MissionHealth::Reconciling {
                     reason: "durable_run_without_registered_actor".to_string(),
                 },
@@ -4388,14 +4391,33 @@ fn tool_execution_deadline_secs(tool_kind: &str, args: &serde_json::Value) -> i6
 fn mission_heartbeat_state(
     active_tool_calls: usize,
     has_registered_user_wait: bool,
+    has_durable_remote_job: bool,
 ) -> MissionExecutionState {
-    if has_registered_user_wait {
+    if has_durable_remote_job {
+        MissionExecutionState::WaitingRemoteJob
+    } else if has_registered_user_wait {
         MissionExecutionState::WaitingUser
     } else if active_tool_calls > 0 {
         MissionExecutionState::WaitingTool
     } else {
         MissionExecutionState::Running
     }
+}
+
+fn remote_build_handle_proves_liveness(
+    handle: &crate::remote_node::job_ledger::JobHandle,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if handle.kind != crate::remote_node::job_ledger::JobHandleKind::RemoteBuild
+        || handle.accepted_at.is_none()
+    {
+        return false;
+    }
+    let last_proof = handle
+        .heartbeat_at
+        .or(handle.accepted_at)
+        .unwrap_or(handle.started_at);
+    now.signed_duration_since(last_proof) <= chrono::Duration::seconds(60)
 }
 
 pub async fn list_missions(
@@ -6989,8 +7011,10 @@ async fn dispatch_remote_job(
             job_id,
             started_at: submit_started_at,
             accepted_at: None,
+            heartbeat_at: None,
             disk_reservation_bytes: 0,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
+            identity: None,
         },
     )
     .await
@@ -7034,8 +7058,10 @@ async fn dispatch_remote_job(
             job_id,
             started_at: submit_started_at,
             accepted_at: Some(chrono::Utc::now()),
+            heartbeat_at: Some(chrono::Utc::now()),
             disk_reservation_bytes: 0,
             kind: crate::remote_node::job_ledger::JobHandleKind::Mission,
+            identity: None,
         },
     )
     .await
@@ -7344,6 +7370,7 @@ async fn reconcile_pending_handles(
                                 handle.mission_id,
                                 handle.job_id,
                                 handle.started_at,
+                                ledger_dir.clone(),
                             )
                             .await;
                             crate::remote_node::job_ledger::remove(&ledger_dir, handle.job_id)
@@ -7484,6 +7511,7 @@ async fn poll_recovered_remote_build(
     mission_id: Uuid,
     job_id: Uuid,
     started_at: chrono::DateTime<chrono::Utc>,
+    working_dir: PathBuf,
 ) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -7494,6 +7522,8 @@ async fn poll_recovered_remote_build(
                     "succeeded" | "failed" | "cancelled" | "lost"
                 ) =>
             {
+                let terminal_state = status.state.clone();
+                let terminal_exit_code = status.exit_code;
                 fleet.record_outcome(crate::remote_node::DispatchOutcome {
                     mission_id,
                     node_id: node.id.clone(),
@@ -7504,9 +7534,26 @@ async fn poll_recovered_remote_build(
                     started_at,
                     finished_at: Some(chrono::Utc::now()),
                 });
+                if let Err(error) = crate::remote_node::job_ledger::finalize(
+                    &working_dir,
+                    job_id,
+                    &terminal_state,
+                    terminal_exit_code,
+                )
+                .await
+                {
+                    tracing::warn!(%job_id, ?error, "recovered remote build receipt finalization failed");
+                }
                 return;
             }
-            Ok(_) | Err(_) => {}
+            Ok(_) => {
+                if let Err(error) =
+                    crate::remote_node::job_ledger::heartbeat(&working_dir, job_id).await
+                {
+                    tracing::warn!(%job_id, ?error, "recovered remote build heartbeat persistence failed");
+                }
+            }
+            Err(_) => {}
         }
     }
 }
@@ -10490,6 +10537,7 @@ async fn paloma_webhook_forwarder_loop(
     mut events_rx: broadcast::Receiver<AgentEvent>,
     mission_store: Arc<dyn MissionStore>,
     workspaces: workspace::SharedWorkspaceStore,
+    working_dir: PathBuf,
     url: String,
     secret: Option<String>,
     http: reqwest::Client,
@@ -10514,7 +10562,8 @@ async fn paloma_webhook_forwarder_loop(
                 mission_id, status, ..
             }) => {
                 // `insert` returns the prior value; forward only on a real change.
-                let changed = last_status.insert(mission_id, status) != Some(status);
+                let old_status = last_status.insert(mission_id, status);
+                let changed = old_status != Some(status);
                 if !changed || !webhook_forwardable_status(status) {
                     continue;
                 }
@@ -10531,6 +10580,7 @@ async fn paloma_webhook_forwarder_loop(
                 let secret = secret.clone();
                 let mission_store = Arc::clone(&mission_store);
                 let workspaces = workspaces.clone();
+                let working_dir = working_dir.clone();
                 let sem = Arc::clone(&sem);
                 tokio::spawn(async move {
                     let _permit = sem.acquire_owned().await;
@@ -10540,6 +10590,40 @@ async fn paloma_webhook_forwarder_loop(
                         .and_then(|mission| mission.title.clone())
                         .unwrap_or_else(|| mission_id.to_string());
                     let project = mission.as_ref().map(|m| &m.project);
+                    let run = mission_store
+                        .get_active_mission_run(mission_id)
+                        .await
+                        .ok()
+                        .flatten();
+                    let remote_jobs = crate::remote_node::job_ledger::load(&working_dir)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|handle| handle.mission_id == mission_id)
+                        .map(|handle| {
+                            serde_json::json!({
+                                "job_id": handle.job_id,
+                                "node_id": handle.node_id,
+                                "kind": handle.kind,
+                                "accepted_at": handle.accepted_at,
+                                "heartbeat_at": handle.heartbeat_at,
+                                "identity": handle.identity,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let terminal_reason = mission
+                        .as_ref()
+                        .and_then(|mission| mission.terminal_reason.as_deref());
+                    let recommended_action = match terminal_reason {
+                        Some("server_shutdown" | "orphan_no_runner") => "resume_once",
+                        Some("auth_error") => "disable_provider_and_reroute",
+                        Some("rate_limited" | "capacity_limited") => "reroute_or_queue",
+                        Some("watchdog_stalled" | "cancelled") => "inspect_artifacts",
+                        _ if status == MissionStatus::Interrupted => "reconcile_then_resume",
+                        _ if status == MissionStatus::Failed => "classify_failure",
+                        _ if status == MissionStatus::AwaitingUser => "inspect_result",
+                        _ => "notify",
+                    };
                     // Resolve workspace_name from the registry (the store row
                     // usually leaves it null), so the payload is self-contained.
                     let workspace_name = match mission.as_ref() {
@@ -10555,6 +10639,7 @@ async fn paloma_webhook_forwarder_loop(
                         "event_id": event_id,
                         "sequence": seq,
                         "mission_id": mission_id,
+                        "old_status": old_status,
                         "status": status,
                         // Event-type mirror of `status` so consumers with
                         // route-level event filters (e.g. the Hermes webhook
@@ -10569,6 +10654,17 @@ async fn paloma_webhook_forwarder_loop(
                         "workspace_id": mission.as_ref().map(|m| m.workspace_id),
                         "workspace_name": workspace_name,
                         "backend": mission.as_ref().map(|m| m.backend.clone()),
+                        "terminal_reason": terminal_reason,
+                        "resumable": matches!(status, MissionStatus::Interrupted | MissionStatus::Failed | MissionStatus::Blocked),
+                        "recommended_action": recommended_action,
+                        "execution": run.as_ref().map(|run| serde_json::json!({
+                            "run_id": run.run_id,
+                            "generation": run.generation,
+                            "state": run.execution_state,
+                            "heartbeat_at": run.heartbeat_at,
+                            "scope_unit": run.scope_unit,
+                        })),
+                        "remote_jobs": remote_jobs,
                         "updated_at": mission.as_ref().map(|m| m.updated_at.clone()),
                         // When the status itself last changed (P#5) — the most
                         // relevant staleness anchor for a status-change webhook.
@@ -10779,6 +10875,7 @@ fn spawn_control_session(
             events_tx.subscribe(),
             Arc::clone(&state.mission_store),
             workspaces.clone(),
+            config.working_dir.clone(),
             url.clone(),
             config.paloma_webhook_secret.clone(),
             reqwest::Client::builder()
@@ -12293,6 +12390,13 @@ fn completion_evidence_for_agent_result(
     }
 }
 
+fn is_transport_failure_evidence(evidence: &crate::agents::CompletionEvidence) -> bool {
+    matches!(
+        evidence.failure_class,
+        Some(crate::agents::FailureClass::TransportError)
+    )
+}
+
 fn is_bare_llm_error_output(output: &str) -> bool {
     if looks_like_structured_provider_error(output) {
         return true;
@@ -12987,6 +13091,10 @@ async fn control_actor_loop(
     // messages (re-injected as commands above) rely on this same guard: the
     // first occurrence runs, any later duplicate is dropped.
     let mut accepted_user_message_ids: HashSet<Uuid> = HashSet::new();
+    // One bounded same-mission retry for structured transport failures. Auth,
+    // quota/capacity, source failures, stalls, and loops are deliberately not
+    // eligible. Writer leases are re-acquired by the normal start path.
+    let mut transport_auto_resumed_missions: HashSet<Uuid> = HashSet::new();
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
     // Track number of in-flight tool calls on the main runner so the stall
@@ -13285,9 +13393,31 @@ async fn control_actor_loop(
                         )
                     })
                 }));
+                let remote_jobs_by_mission = if leases.is_empty() {
+                    HashSet::new()
+                } else {
+                    match crate::remote_node::job_ledger::load(&config.working_dir).await {
+                        Ok(handles) => {
+                            let now = chrono::Utc::now();
+                            handles
+                                .into_iter()
+                                .filter(|handle| remote_build_handle_proves_liveness(handle, now))
+                                .map(|handle| handle.mission_id)
+                                .collect()
+                        }
+                        Err(error) => {
+                            tracing::warn!(?error, "Failed to inspect durable remote jobs for execution heartbeat");
+                            HashSet::new()
+                        }
+                    }
+                };
                 for (run, active_tool_calls, idle_secs) in leases {
                     let mut live_registered_tools = 0usize;
                     let mut has_registered_user_wait = false;
+                    let has_durable_remote_job = remote_jobs_by_mission.contains(&run.mission_id);
+                    if has_durable_remote_job {
+                        live_registered_tools += 1;
+                    }
                     if let Ok(tools) = mission_store
                         .list_active_tool_executions(run.run_id)
                         .await
@@ -13328,6 +13458,7 @@ async fn control_actor_loop(
                     let state = mission_heartbeat_state(
                         active_tool_calls,
                         has_registered_user_wait,
+                        has_durable_remote_job,
                     );
                     match mission_store
                         .heartbeat_mission_run(run.run_id, run.generation, state, None)
@@ -13348,6 +13479,7 @@ async fn control_actor_loop(
                     }
                     if idle_secs >= 15 * 60
                         && state != MissionExecutionState::WaitingUser
+                        && state != MissionExecutionState::WaitingRemoteJob
                         && live_registered_tools == 0
                     {
                         tracing::warn!(
@@ -15282,16 +15414,31 @@ async fn control_actor_loop(
                     ControlCommand::ListRunning { respond } => {
                         // Return info about currently running missions
                         let mut running_list = Vec::new();
+                        let remote_job_missions = crate::remote_node::job_ledger::load(
+                            &config.working_dir,
+                        )
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|handle| {
+                            remote_build_handle_proves_liveness(handle, chrono::Utc::now())
+                        })
+                        .map(|handle| handle.mission_id)
+                        .collect::<HashSet<_>>();
 
                         // Add main mission if running - use running_mission_id (the actual mission being executed)
                         // instead of current_mission (which can change when user creates a new mission)
                         if running.is_some() {
                             if let Some(mission_id) = running_mission_id {
+                                let waiting_remote_job =
+                                    remote_job_missions.contains(&mission_id);
                                 let seconds_since_activity =
                                     main_runner_last_activity.elapsed().as_secs();
                                 let state_label = {
                                     let status_guard = status.read().await;
-                                    if status_guard.mission_id == Some(mission_id)
+                                    if waiting_remote_job {
+                                        "waiting_remote_job"
+                                    } else if status_guard.mission_id == Some(mission_id)
                                         && status_guard.state == ControlRunState::WaitingForTool
                                     {
                                         "waiting_for_tool"
@@ -15304,9 +15451,10 @@ async fn control_actor_loop(
                                 } else {
                                     super::mission_runner::MissionRunState::Running
                                 };
-                                let tool_call_in_flight = main_runner_active_tool_calls
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                    > 0;
+                                let tool_call_in_flight = waiting_remote_job
+                                    || main_runner_active_tool_calls
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                        > 0;
                                 running_list.push(super::mission_runner::RunningMissionInfo {
                                     mission_id,
                                     state: state_label.to_string(),
@@ -15336,7 +15484,12 @@ async fn control_actor_loop(
 
                         // Add all parallel runners
                         for runner in parallel_runners.values() {
-                            running_list.push(super::mission_runner::RunningMissionInfo::from(runner));
+                            let mut info = super::mission_runner::RunningMissionInfo::from(runner);
+                            if remote_job_missions.contains(&info.mission_id) {
+                                info.state = "waiting_remote_job".to_string();
+                                info.tool_call_in_flight = true;
+                            }
+                            running_list.push(info);
                         }
 
                         let _ = respond.send(running_list);
@@ -16098,6 +16251,7 @@ async fn control_actor_loop(
                     runner_force_clear_deadline = None;
                     let mut completed_terminal_reason = None;
                     let mut completed_completion_confidence = None;
+                    let mut completed_transport_failure = false;
                     // Captured for the post-turn `grok_goal` sentinel hook (see
                     // `post_turn_handle_grok_goal`), which runs after this
                     // `match` closes — `agent_result` itself is out of scope
@@ -16111,6 +16265,8 @@ async fn control_actor_loop(
                             completed_terminal_reason = agent_result.terminal_reason;
                             completed_completion_confidence =
                                 Some(completion_evidence.completion_confidence);
+                            completed_transport_failure =
+                                is_transport_failure_evidence(&completion_evidence);
                             completed_agent_output = agent_result.output.clone();
                             if let Some(run) = running_run.take() {
                                 let reason = agent_result
@@ -16365,12 +16521,28 @@ async fn control_actor_loop(
                     // they're transient failures that the retry/recovery logic handles.
                     // Firing automations on these creates noisy retry loops.
                     if let Some(mission_id) = completed_mission_id {
+                        if completed_transport_failure
+                            && transport_auto_resumed_missions.insert(mission_id)
+                            && !queue_has_pending_target_mission(&queue, mission_id)
+                        {
+                            tracing::info!(
+                                %mission_id,
+                                "Auto-resuming mission once after structured transport failure"
+                            );
+                            queue.push_back((
+                                Uuid::new_v4(),
+                                "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.".to_string(),
+                                None,
+                                Some(mission_id),
+                                Some("transport_auto_resume".to_string()),
+                            ));
+                        }
                         let is_transient_infra_failure = matches!(
                             completed_terminal_reason,
                             Some(TerminalReason::AuthError)
                                 | Some(TerminalReason::RateLimited)
                                 | Some(TerminalReason::CapacityLimited)
-                        );
+                        ) || completed_transport_failure;
                         let already_queued_for_mission = queue
                             .iter()
                             .any(|(_id, _msg, _agent, target_mid, _source)| *target_mid == Some(mission_id));
@@ -16802,9 +16974,26 @@ async fn control_actor_loop(
                                 Some(TerminalReason::AuthError)
                                     | Some(TerminalReason::RateLimited)
                                     | Some(TerminalReason::CapacityLimited)
-                            );
+                            ) || is_transport_failure_evidence(&completion_evidence);
                             let cancellation_requested = runner.cancellation_requested();
                             let was_queue_empty = runner.queue.is_empty();
+                            if is_transient_infra_failure
+                                && is_transport_failure_evidence(&completion_evidence)
+                                && !cancellation_requested
+                                && was_queue_empty
+                                && transport_auto_resumed_missions.insert(*mission_id)
+                            {
+                                tracing::info!(
+                                    mission_id = %mission_id,
+                                    "Auto-resuming parallel mission once after structured transport failure"
+                                );
+                                runner.queue_message(
+                                    Uuid::new_v4(),
+                                    "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.".to_string(),
+                                    None,
+                                    Some("transport_auto_resume".to_string()),
+                                );
+                            }
                             // Grok /goal sentinel hook for the parallel-runner
                             // path. Same contract as the main-session hook
                             // above: runs before the AgentFinished automations
@@ -21142,17 +21331,44 @@ mod tests {
         assert!(is_user_wait_tool("ui_confirm"));
         assert!(!is_user_wait_tool("workspace_bash"));
         assert_eq!(
-            mission_heartbeat_state(1, true),
+            mission_heartbeat_state(1, true, false),
             MissionExecutionState::WaitingUser
         );
         assert_eq!(
-            mission_heartbeat_state(1, false),
+            mission_heartbeat_state(1, false, false),
             MissionExecutionState::WaitingTool
         );
         assert_eq!(
-            mission_heartbeat_state(0, false),
+            mission_heartbeat_state(0, false, false),
             MissionExecutionState::Running
         );
+        assert_eq!(
+            mission_heartbeat_state(1, false, true),
+            MissionExecutionState::WaitingRemoteJob
+        );
+    }
+
+    #[test]
+    fn only_fresh_accepted_remote_builds_prove_liveness() {
+        let now = chrono::Utc::now();
+        let mut handle = crate::remote_node::job_ledger::JobHandle {
+            mission_id: Uuid::new_v4(),
+            node_id: "node-a".to_string(),
+            job_id: Uuid::new_v4(),
+            started_at: now - chrono::Duration::seconds(120),
+            accepted_at: Some(now - chrono::Duration::seconds(30)),
+            heartbeat_at: None,
+            disk_reservation_bytes: 0,
+            kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
+            identity: None,
+        };
+        assert!(remote_build_handle_proves_liveness(&handle, now));
+        handle.heartbeat_at = Some(now - chrono::Duration::seconds(61));
+        assert!(!remote_build_handle_proves_liveness(&handle, now));
+        handle.heartbeat_at = Some(now - chrono::Duration::seconds(1));
+        assert!(remote_build_handle_proves_liveness(&handle, now));
+        handle.kind = crate::remote_node::job_ledger::JobHandleKind::Mission;
+        assert!(!remote_build_handle_proves_liveness(&handle, now));
     }
 
     #[test]
@@ -25735,6 +25951,27 @@ Investigate <service/> failures.
             evidence.completion_confidence,
             crate::agents::CompletionConfidence::High
         );
+    }
+
+    #[test]
+    fn only_structured_transport_failures_are_auto_resume_eligible() {
+        let transport = crate::agents::AgentResult::failure("disconnected", 0)
+            .with_terminal_reason(TerminalReason::LlmError)
+            .with_data(serde_json::json!({ "transport_failure_stage": "pending_tools" }));
+        let provider = crate::agents::AgentResult::failure("provider error", 0)
+            .with_terminal_reason(TerminalReason::LlmError);
+        let auth = crate::agents::AgentResult::failure("unauthorized", 0)
+            .with_terminal_reason(TerminalReason::AuthError);
+
+        assert!(is_transport_failure_evidence(
+            &completion_evidence_for_agent_result(&transport)
+        ));
+        assert!(!is_transport_failure_evidence(
+            &completion_evidence_for_agent_result(&provider)
+        ));
+        assert!(!is_transport_failure_evidence(
+            &completion_evidence_for_agent_result(&auth)
+        ));
     }
 
     #[test]

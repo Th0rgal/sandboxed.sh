@@ -1426,7 +1426,12 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
         } else if is_auth_error(&final_message) {
             TerminalReason::AuthError
         } else if stopped_with_pending_tool_error {
-            TerminalReason::Stalled
+            // This is a provider/stream disconnect after Codex emitted tool
+            // calls, not evidence that the agent itself made no progress.
+            // Structured transport data below lets the controller perform one
+            // bounded same-mission resume without treating source failures or
+            // ordinary stalls as retryable transport.
+            TerminalReason::LlmError
         } else {
             TerminalReason::LlmError
         };
@@ -1445,6 +1450,15 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
     }
     if let Some(m) = resolved_model.as_deref() {
         result = result.with_model(m.to_string());
+    }
+    if stopped_with_pending_tool_error {
+        let mut pending_tool_names = pending_tools.values().cloned().collect::<Vec<_>>();
+        pending_tool_names.sort_unstable();
+        pending_tool_names.dedup();
+        result = result.with_data(serde_json::json!({
+            "transport_failure_stage": "pending_tools",
+            "pending_tools": pending_tool_names,
+        }));
     }
 
     result

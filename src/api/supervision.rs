@@ -319,6 +319,10 @@ fn inactivity_is_cancellable(seconds_since_activity: u64, tool_call_in_flight: b
         && (!tool_call_in_flight || seconds_since_activity >= TOOL_CALL_STALL_GRACE_SECS)
 }
 
+fn execution_state_proves_durable_liveness(state: &str) -> bool {
+    state == "waiting_remote_job"
+}
+
 pub(crate) async fn stuck_mission_watchdog_loop(
     mission_store: Arc<dyn MissionStore>,
     cmd_tx: mpsc::Sender<ControlCommand>,
@@ -398,6 +402,14 @@ pub(crate) async fn stuck_mission_watchdog_loop(
         // the row Interrupted.
         for info in &running_list {
             if info.seconds_since_activity < STUCK_SECONDS {
+                continue;
+            }
+            if execution_state_proves_durable_liveness(&info.state) {
+                tracing::debug!(
+                    mission_id = %info.mission_id,
+                    seconds_since_activity = info.seconds_since_activity,
+                    "Stuck-mission watchdog: durable remote job proves liveness"
+                );
                 continue;
             }
             if !inactivity_is_cancellable(info.seconds_since_activity, info.tool_call_in_flight) {
@@ -710,5 +722,13 @@ mod tests {
     #[test]
     fn inactivity_watchdog_eventually_cancels_stale_tool_hint() {
         assert!(inactivity_is_cancellable(STUCK_SECONDS, true));
+    }
+
+    #[test]
+    fn durable_remote_wait_is_not_an_idle_runner() {
+        assert!(execution_state_proves_durable_liveness(
+            "waiting_remote_job"
+        ));
+        assert!(!execution_state_proves_durable_liveness("waiting_tool"));
     }
 }
