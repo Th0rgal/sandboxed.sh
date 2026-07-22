@@ -4501,49 +4501,38 @@ async fn mission_has_unresolved_remote_build(
     working_dir: &std::path::Path,
     mission_id: Uuid,
 ) -> bool {
-    crate::remote_node::job_ledger::load(working_dir)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .any(|handle| {
-            handle.mission_id == mission_id
-                && handle.kind == crate::remote_node::job_ledger::JobHandleKind::RemoteBuild
-                && handle.accepted_at.is_some()
-                && handle.wake_on_terminal
-        })
+    let Ok(Some(current_handle)) =
+        crate::remote_node::job_ledger::current_remote_build_wait_handle(working_dir, mission_id)
+            .await
+    else {
+        return false;
+    };
+    current_handle.wake_on_terminal
 }
 
 async fn arm_unresolved_remote_build_wake(working_dir: &std::path::Path, mission_id: Uuid) -> bool {
-    let handles = match crate::remote_node::job_ledger::load(working_dir).await {
-        Ok(handles) => handles,
+    let job_id = match crate::remote_node::job_ledger::current_remote_build_wait_handle(
+        working_dir,
+        mission_id,
+    )
+    .await
+    {
+        Ok(Some(handle)) => handle.job_id,
+        Ok(None) => return false,
         Err(error) => {
             tracing::warn!(%mission_id, ?error, "remote-build handles could not be loaded before turn parking");
             return false;
         }
     };
-    let jobs = handles
-        .into_iter()
-        .filter(|handle| {
-            handle.mission_id == mission_id
-                && handle.kind == crate::remote_node::job_ledger::JobHandleKind::RemoteBuild
-                && handle.accepted_at.is_some()
-        })
-        .map(|handle| handle.job_id)
-        .collect::<Vec<_>>();
-    if jobs.is_empty() {
-        return false;
-    }
-    for job_id in jobs {
-        match crate::remote_node::job_ledger::require_terminal_wake(working_dir, job_id).await {
-            Ok(true) => {}
-            Ok(false) => return false,
-            Err(error) => {
-                tracing::warn!(%mission_id, %job_id, ?error, "remote-build terminal wake could not be armed before turn parking");
-                return false;
-            }
+
+    match crate::remote_node::job_ledger::require_terminal_wake(working_dir, job_id).await {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(error) => {
+            tracing::warn!(%mission_id, %job_id, ?error, "remote-build terminal wake could not be armed before turn parking");
+            false
         }
     }
-    true
 }
 
 async fn mission_should_park_on_remote_build(
@@ -7131,6 +7120,22 @@ pub(crate) async fn ensure_remote_build_wait(
     mission_id: Uuid,
     job_id: Uuid,
 ) -> Result<bool, String> {
+    let current_job = crate::remote_node::job_ledger::current_remote_build_wait_handle(
+        &state.config.working_dir,
+        mission_id,
+    )
+    .await
+    .map_err(|error| format!("load current remote-build owner: {error}"))?;
+    let current_job_id = current_job.as_ref().map(|handle| handle.job_id);
+    if current_job_id != Some(job_id) {
+        tracing::debug!(
+            %mission_id,
+            %job_id,
+            current_job = ?current_job_id,
+            "remote build retained for receipt reconciliation without owning the mission wait lease"
+        );
+        return Ok(false);
+    }
     let Some((owner, _)) = remote_build_wait_owner(state, mission_id).await? else {
         return Ok(false);
     };
@@ -7633,6 +7638,7 @@ async fn dispatch_remote_job(
             node_id: node.id.clone(),
             job_id,
             started_at: submit_started_at,
+            submission_sequence: 0,
             accepted_at: None,
             heartbeat_at: None,
             disk_reservation_bytes: 0,
@@ -7681,6 +7687,7 @@ async fn dispatch_remote_job(
             node_id: node.id.clone(),
             job_id,
             started_at: submit_started_at,
+            submission_sequence: 0,
             accepted_at: Some(chrono::Utc::now()),
             heartbeat_at: Some(chrono::Utc::now()),
             disk_reservation_bytes: 0,
@@ -9877,6 +9884,35 @@ pub async fn cancel_mission(
         .map_err(recv_failed)?
         .map(|_| Json(serde_json::json!({ "ok": true, "cancelled": mission_id })))
         .map_err(|e| (StatusCode::NOT_FOUND, e))
+}
+
+/// Settle a durable run after the control actor has proved that no live main
+/// or parallel runner owns it. This covers parked remote waits left behind by
+/// a completed harness turn. Returning an idempotent cancel response without
+/// closing this row would permanently block the next generation.
+async fn finish_detached_run_for_cancel(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+) -> Result<bool, String> {
+    let Some(run) = mission_store.get_active_mission_run(mission_id).await? else {
+        return Ok(false);
+    };
+    mission_store
+        .heartbeat_mission_run(
+            run.run_id,
+            run.generation,
+            MissionExecutionState::Stopping,
+            None,
+        )
+        .await?;
+    mission_store
+        .finish_mission_run(
+            run.run_id,
+            run.generation,
+            Some("operator_cancelled_detached_run"),
+        )
+        .await?;
+    Ok(true)
 }
 
 /// Optional body for the pause endpoint (FLEET-004). Carries attribution only.
@@ -15963,9 +15999,31 @@ async fn control_actor_loop(
                                         || mission.status.is_terminal()
                                         || mission.status == MissionStatus::Acknowledged =>
                                     {
+                                        if let Err(error) = finish_detached_run_for_cancel(
+                                            &mission_store,
+                                            mission_id,
+                                        )
+                                        .await
+                                        {
+                                            let _ = respond.send(Err(format!(
+                                                "Failed to settle detached mission run: {error}"
+                                            )));
+                                            continue;
+                                        }
                                         let _ = respond.send(Ok(CancelMissionOutcome::Cancelled));
                                     }
                                     Ok(Some(_)) => {
+                                        if let Err(error) = finish_detached_run_for_cancel(
+                                            &mission_store,
+                                            mission_id,
+                                        )
+                                        .await
+                                        {
+                                            let _ = respond.send(Err(format!(
+                                                "Failed to settle detached mission run: {error}"
+                                            )));
+                                            continue;
+                                        }
                                         let update = mission_store
                                             .update_mission_status(
                                                 mission_id,
@@ -22307,6 +22365,48 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn cancelling_a_detached_wait_closes_its_run_lease() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("detached wait"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .unwrap();
+        let run = store
+            .begin_mission_run(mission.id, "remote-build:test", None)
+            .await
+            .unwrap();
+        store
+            .heartbeat_mission_run(
+                run.run_id,
+                run.generation,
+                MissionExecutionState::WaitingRemoteJob,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .update_mission_status(mission.id, MissionStatus::Interrupted)
+            .await
+            .unwrap();
+
+        assert!(finish_detached_run_for_cancel(&store, mission.id)
+            .await
+            .unwrap());
+        assert!(store
+            .get_active_mission_run(mission.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!finish_detached_run_for_cancel(&store, mission.id)
+            .await
+            .unwrap());
+    }
+
     #[test]
     fn remote_terminal_wake_closes_parked_parallel_lease() {
         let mission_id = Uuid::new_v4();
@@ -22331,6 +22431,7 @@ mod tests {
             node_id: "node-a".to_string(),
             job_id: Uuid::new_v4(),
             started_at: now - chrono::Duration::seconds(120),
+            submission_sequence: 0,
             accepted_at: Some(now - chrono::Duration::seconds(30)),
             heartbeat_at: None,
             disk_reservation_bytes: 0,
@@ -22358,6 +22459,7 @@ mod tests {
                 node_id: "node-a".to_string(),
                 job_id: Uuid::new_v4(),
                 started_at: chrono::Utc::now() - chrono::Duration::minutes(5),
+                submission_sequence: 0,
                 accepted_at: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
                 heartbeat_at: Some(chrono::Utc::now() - chrono::Duration::minutes(2)),
                 disk_reservation_bytes: 0,
@@ -22381,6 +22483,7 @@ mod tests {
                 node_id: "node-sync".to_string(),
                 job_id: synchronous_job_id,
                 started_at: chrono::Utc::now(),
+                submission_sequence: 0,
                 accepted_at: Some(chrono::Utc::now()),
                 heartbeat_at: Some(chrono::Utc::now()),
                 disk_reservation_bytes: 0,
@@ -22420,6 +22523,7 @@ mod tests {
                 node_id: "node-b".to_string(),
                 job_id: Uuid::new_v4(),
                 started_at: chrono::Utc::now(),
+                submission_sequence: 0,
                 accepted_at: Some(chrono::Utc::now()),
                 heartbeat_at: Some(chrono::Utc::now()),
                 disk_reservation_bytes: 0,
