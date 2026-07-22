@@ -60,6 +60,11 @@ pub struct JobHandle {
     pub node_id: String,
     pub job_id: Uuid,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Durable monotonic submission order assigned by the core ledger. This
+    /// is authoritative when wall-clock timestamps collide. Legacy handles
+    /// deserialize as zero and are treated conservatively when ambiguous.
+    #[serde(default)]
+    pub submission_sequence: u64,
     /// When the node acceptance response was observed. Tentative and legacy
     /// handles keep this empty and must remain conservatively reserved.
     #[serde(default)]
@@ -92,6 +97,8 @@ pub struct RemoteJobReceipt {
     pub node_id: String,
     pub job_id: Uuid,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub submission_sequence: u64,
     pub finished_at: chrono::DateTime<chrono::Utc>,
     pub state: String,
     #[serde(default)]
@@ -125,6 +132,10 @@ pub enum TerminalWakeDisposition {
     SupersededBy(Uuid),
 }
 
+fn validation_order(sequence: u64, started_at: chrono::DateTime<chrono::Utc>) -> (u64, i64) {
+    (sequence, started_at.timestamp_micros())
+}
+
 /// The one unresolved remote build, if any, that is still allowed to own a
 /// mission's `waiting_remote_job` lease. A terminal receipt from a later
 /// validation supersedes an older in-flight handle: the old node job must
@@ -145,21 +156,28 @@ pub async fn current_remote_build_wait_handle(
                 && handle.kind == JobHandleKind::RemoteBuild
                 && handle.accepted_at.is_some()
         })
-        .max_by_key(|handle| (handle.started_at, handle.job_id));
+        .max_by_key(|handle| validation_order(handle.submission_sequence, handle.started_at));
     let Some(current_handle) = current_handle else {
         return Ok(None);
     };
 
+    let current_order = validation_order(
+        current_handle.submission_sequence,
+        current_handle.started_at,
+    );
     let newer_terminal_exists = receipts.iter().any(|receipt| {
-        receipt.mission_id == mission_id
-            && (receipt.started_at, receipt.job_id)
-                > (current_handle.started_at, current_handle.job_id)
+        if receipt.mission_id != mission_id {
+            return false;
+        }
+        let receipt_order = validation_order(receipt.submission_sequence, receipt.started_at);
+        receipt_order > current_order
+            || (receipt_order == current_order
+                && (receipt.submission_sequence == 0 || current_handle.submission_sequence == 0))
     });
     let newer_ambiguous_submission_exists = handles.iter().any(|handle| {
         handle.mission_id == mission_id
             && handle.kind == JobHandleKind::Tentative
-            && (handle.started_at, handle.job_id)
-                > (current_handle.started_at, current_handle.job_id)
+            && validation_order(handle.submission_sequence, handle.started_at) > current_order
     });
 
     if newer_terminal_exists || newer_ambiguous_submission_exists {
@@ -331,6 +349,7 @@ pub async fn terminal_wake_disposition(
     let _guard = lock().lock().await;
     let handles = load_result(working_dir).await?;
     let receipts = load_receipts_result(working_dir).await?;
+    let receipt_order = validation_order(receipt.submission_sequence, receipt.started_at);
 
     if let Some(newer) = handles
         .iter()
@@ -338,9 +357,9 @@ pub async fn terminal_wake_disposition(
             handle.kind == JobHandleKind::RemoteBuild
                 && handle.mission_id == receipt.mission_id
                 && handle.job_id != receipt.job_id
-                && (handle.started_at, handle.job_id) > (receipt.started_at, receipt.job_id)
+                && validation_order(handle.submission_sequence, handle.started_at) > receipt_order
         })
-        .max_by_key(|handle| (handle.started_at, handle.job_id))
+        .max_by_key(|handle| validation_order(handle.submission_sequence, handle.started_at))
     {
         return Ok(TerminalWakeDisposition::SupersededBy(newer.job_id));
     }
@@ -349,9 +368,12 @@ pub async fn terminal_wake_disposition(
         .filter(|candidate| {
             candidate.mission_id == receipt.mission_id
                 && candidate.job_id != receipt.job_id
-                && (candidate.started_at, candidate.job_id) > (receipt.started_at, receipt.job_id)
+                && validation_order(candidate.submission_sequence, candidate.started_at)
+                    > receipt_order
         })
-        .max_by_key(|candidate| (candidate.started_at, candidate.job_id))
+        .max_by_key(|candidate| {
+            validation_order(candidate.submission_sequence, candidate.started_at)
+        })
     {
         return Ok(TerminalWakeDisposition::SupersededBy(newer.job_id));
     }
@@ -359,7 +381,16 @@ pub async fn terminal_wake_disposition(
         handle.kind == JobHandleKind::Tentative
             && handle.mission_id == receipt.mission_id
             && handle.job_id != receipt.job_id
-            && (handle.started_at, handle.job_id) > (receipt.started_at, receipt.job_id)
+            && validation_order(handle.submission_sequence, handle.started_at) >= receipt_order
+    }) {
+        return Ok(TerminalWakeDisposition::Deferred);
+    }
+    if handles.iter().any(|handle| {
+        handle.kind == JobHandleKind::RemoteBuild
+            && handle.mission_id == receipt.mission_id
+            && handle.job_id != receipt.job_id
+            && validation_order(handle.submission_sequence, handle.started_at) == receipt_order
+            && (handle.submission_sequence == 0 || receipt.submission_sequence == 0)
     }) {
         return Ok(TerminalWakeDisposition::Deferred);
     }
@@ -432,6 +463,7 @@ pub async fn finalize(
             node_id: handle.node_id,
             job_id,
             started_at: handle.started_at,
+            submission_sequence: handle.submission_sequence,
             finished_at: chrono::Utc::now(),
             state: state.to_string(),
             exit_status,
@@ -463,7 +495,32 @@ pub async fn finalize(
 pub async fn record(working_dir: &Path, handle: JobHandle) -> anyhow::Result<()> {
     let _guard = lock().lock().await;
     let mut handles = load_result(working_dir).await?;
-    handles.retain(|h| h.job_id != handle.job_id);
+    let mut handle = handle;
+    let previous_sequence = handles
+        .iter()
+        .find(|existing| existing.job_id == handle.job_id)
+        .map(|existing| existing.submission_sequence)
+        .unwrap_or(0);
+    if handle.submission_sequence == 0 {
+        handle.submission_sequence = if previous_sequence > 0 {
+            previous_sequence
+        } else {
+            let receipt_max = load_receipts_result(working_dir)
+                .await?
+                .into_iter()
+                .map(|receipt| receipt.submission_sequence)
+                .max()
+                .unwrap_or(0);
+            handles
+                .iter()
+                .map(|existing| existing.submission_sequence)
+                .max()
+                .unwrap_or(0)
+                .max(receipt_max)
+                .saturating_add(1)
+        };
+    }
+    handles.retain(|existing| existing.job_id != handle.job_id);
     handles.push(handle);
     store(working_dir, &handles).await
 }
@@ -532,6 +589,7 @@ mod tests {
             node_id: "node-a".to_string(),
             job_id,
             started_at: chrono::Utc::now(),
+            submission_sequence: 0,
             accepted_at: Some(chrono::Utc::now()),
             heartbeat_at: Some(chrono::Utc::now()),
             disk_reservation_bytes: 0,
@@ -560,6 +618,7 @@ mod tests {
                 node_id: "node-a".to_string(),
                 job_id: Uuid::new_v4(),
                 started_at: chrono::Utc::now(),
+                submission_sequence: 0,
                 accepted_at: Some(chrono::Utc::now()),
                 heartbeat_at: Some(chrono::Utc::now()),
                 disk_reservation_bytes: 0,
@@ -584,6 +643,7 @@ mod tests {
         let handle: JobHandle = serde_json::from_value(raw).unwrap();
 
         assert_eq!(handle.kind, JobHandleKind::Mission);
+        assert_eq!(handle.submission_sequence, 0);
         assert_eq!(handle.accepted_at, None);
         assert_eq!(handle.heartbeat_at, None);
         assert_eq!(handle.identity, None);
@@ -628,6 +688,7 @@ mod tests {
             node_id: "node-a".to_string(),
             job_id,
             started_at: chrono::Utc::now(),
+            submission_sequence: 0,
             accepted_at: None,
             heartbeat_at: None,
             disk_reservation_bytes: 0,
@@ -645,6 +706,7 @@ mod tests {
         assert_eq!(handles.len(), 1);
         assert_eq!(handles[0].job_id, job_id);
         assert_eq!(handles[0].kind, JobHandleKind::Mission);
+        assert_eq!(handles[0].submission_sequence, 1);
     }
 
     #[tokio::test]
@@ -656,6 +718,7 @@ mod tests {
             node_id: "node-a".to_string(),
             job_id,
             started_at: chrono::Utc::now(),
+            submission_sequence: 0,
             accepted_at: Some(chrono::Utc::now()),
             heartbeat_at: None,
             disk_reservation_bytes: 0,
@@ -703,6 +766,7 @@ mod tests {
                 node_id: "node-a".to_string(),
                 job_id,
                 started_at: chrono::Utc::now(),
+                submission_sequence: 0,
                 accepted_at: Some(chrono::Utc::now()),
                 heartbeat_at: Some(chrono::Utc::now()),
                 disk_reservation_bytes: 0,
@@ -763,6 +827,7 @@ mod tests {
                 node_id: "node-a".to_string(),
                 job_id,
                 started_at: chrono::Utc::now(),
+                submission_sequence: 0,
                 accepted_at: Some(chrono::Utc::now()),
                 heartbeat_at: Some(chrono::Utc::now()),
                 disk_reservation_bytes: 0,
@@ -812,6 +877,7 @@ mod tests {
                 node_id: "node-b".to_string(),
                 job_id: artifact_job_id,
                 started_at: chrono::Utc::now(),
+                submission_sequence: 0,
                 accepted_at: Some(chrono::Utc::now()),
                 heartbeat_at: Some(chrono::Utc::now()),
                 disk_reservation_bytes: 0,
@@ -869,6 +935,7 @@ mod tests {
                 node_id: "node-old".to_string(),
                 job_id: old_job_id,
                 started_at: old_started_at,
+                submission_sequence: 0,
                 accepted_at: Some(old_started_at),
                 heartbeat_at: Some(old_started_at),
                 disk_reservation_bytes: 0,
@@ -894,6 +961,7 @@ mod tests {
                 node_id: "node-new".to_string(),
                 job_id: new_job_id,
                 started_at: new_started_at,
+                submission_sequence: 0,
                 accepted_at: Some(new_started_at),
                 heartbeat_at: Some(new_started_at),
                 disk_reservation_bytes: 0,
@@ -938,6 +1006,7 @@ mod tests {
             node_id: "node-a".to_string(),
             job_id,
             started_at,
+            submission_sequence: 0,
             accepted_at: Some(started_at),
             heartbeat_at: Some(started_at),
             disk_reservation_bytes: 0,
@@ -982,6 +1051,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submission_sequence_breaks_equal_timestamp_ties_without_using_uuid_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let old_job_id = Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
+        let new_job_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let started_at = chrono::Utc::now();
+        let handle = |job_id| JobHandle {
+            mission_id,
+            node_id: "node-a".to_string(),
+            job_id,
+            started_at,
+            submission_sequence: 0,
+            accepted_at: Some(started_at),
+            heartbeat_at: Some(started_at),
+            disk_reservation_bytes: 0,
+            kind: JobHandleKind::RemoteBuild,
+            identity: None,
+            wake_on_terminal: true,
+        };
+
+        record(dir.path(), handle(old_job_id)).await.unwrap();
+        record(dir.path(), handle(new_job_id)).await.unwrap();
+
+        let handles = load(dir.path()).await.unwrap();
+        let old_sequence = handles
+            .iter()
+            .find(|handle| handle.job_id == old_job_id)
+            .unwrap()
+            .submission_sequence;
+        let new_sequence = handles
+            .iter()
+            .find(|handle| handle.job_id == new_job_id)
+            .unwrap()
+            .submission_sequence;
+        assert!(new_sequence > old_sequence);
+        assert_eq!(
+            current_remote_build_wait_handle(dir.path(), mission_id)
+                .await
+                .unwrap()
+                .map(|handle| handle.job_id),
+            Some(new_job_id)
+        );
+    }
+
+    #[tokio::test]
     async fn newer_terminal_wake_is_not_blocked_by_an_older_active_validation() {
         let dir = tempfile::tempdir().unwrap();
         let mission_id = Uuid::new_v4();
@@ -1010,6 +1124,7 @@ mod tests {
                     node_id: "node-a".to_string(),
                     job_id,
                     started_at,
+                    submission_sequence: 0,
                     accepted_at: Some(started_at),
                     heartbeat_at: Some(started_at),
                     disk_reservation_bytes: 0,
@@ -1062,6 +1177,7 @@ mod tests {
                 node_id: "node-old".to_string(),
                 job_id: receipt_job_id,
                 started_at: old_started_at,
+                submission_sequence: 0,
                 accepted_at: Some(old_started_at),
                 heartbeat_at: Some(old_started_at),
                 disk_reservation_bytes: 0,
@@ -1082,6 +1198,7 @@ mod tests {
                 node_id: "node-new".to_string(),
                 job_id: tentative_job_id,
                 started_at: new_started_at,
+                submission_sequence: 0,
                 accepted_at: None,
                 heartbeat_at: None,
                 disk_reservation_bytes: 0,
@@ -1120,6 +1237,7 @@ mod tests {
                 node_id: "node-a".to_string(),
                 job_id,
                 started_at: now,
+                submission_sequence: 0,
                 accepted_at: None,
                 heartbeat_at: None,
                 disk_reservation_bytes: 0,
