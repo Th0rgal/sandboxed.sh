@@ -124,6 +124,50 @@ pub enum TerminalWakeDisposition {
     SupersededBy(Uuid),
 }
 
+/// The one unresolved remote build, if any, that is still allowed to own a
+/// mission's `waiting_remote_job` lease. A terminal receipt from a later
+/// validation supersedes an older in-flight handle: the old node job must
+/// still be observed to terminal, but it must not resurrect or park the
+/// mission after the newer validation has already advanced the workflow.
+pub async fn current_remote_build_wait_handle(
+    working_dir: &Path,
+    mission_id: Uuid,
+) -> anyhow::Result<Option<JobHandle>> {
+    let _guard = lock().lock().await;
+    let handles = load_result(working_dir).await?;
+    let receipts = load_receipts_result(working_dir).await?;
+
+    let current_handle = handles
+        .iter()
+        .filter(|handle| {
+            handle.mission_id == mission_id
+                && handle.kind == JobHandleKind::RemoteBuild
+                && handle.accepted_at.is_some()
+        })
+        .max_by_key(|handle| (handle.started_at, handle.job_id));
+    let Some(current_handle) = current_handle else {
+        return Ok(None);
+    };
+
+    let newer_terminal_exists = receipts.iter().any(|receipt| {
+        receipt.mission_id == mission_id
+            && (receipt.started_at, receipt.job_id)
+                > (current_handle.started_at, current_handle.job_id)
+    });
+    let newer_ambiguous_submission_exists = handles.iter().any(|handle| {
+        handle.mission_id == mission_id
+            && handle.kind == JobHandleKind::Tentative
+            && (handle.started_at, handle.job_id)
+                > (current_handle.started_at, current_handle.job_id)
+    });
+
+    if newer_terminal_exists || newer_ambiguous_submission_exists {
+        Ok(None)
+    } else {
+        Ok(Some(current_handle.clone()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EquivalentRemoteValidation {
     /// An accepted or ambiguously submitted job with the same immutable
@@ -879,6 +923,62 @@ mod tests {
             .unwrap();
         assert!(old_receipt.wake_delivered_at.is_some());
         assert_eq!(old_receipt.wake_suppressed_by, Some(new_job_id));
+    }
+
+    #[tokio::test]
+    async fn newer_terminal_validation_prevents_old_handle_from_owning_wait_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let old_job_id = Uuid::new_v4();
+        let new_job_id = Uuid::new_v4();
+        let old_started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let new_started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let handle = |job_id, started_at| JobHandle {
+            mission_id,
+            node_id: "node-a".to_string(),
+            job_id,
+            started_at,
+            accepted_at: Some(started_at),
+            heartbeat_at: Some(started_at),
+            disk_reservation_bytes: 0,
+            kind: JobHandleKind::RemoteBuild,
+            identity: Some(RemoteJobIdentity {
+                repository: "https://example.invalid/verity.git".to_string(),
+                commit: job_id.to_string(),
+                cwd_rel_known: true,
+                cwd_rel: None,
+                command: vec!["lake".to_string(), "build".to_string()],
+                artifacts: Vec::new(),
+                toolchain: None,
+                source_bundle_digest: None,
+            }),
+            wake_on_terminal: true,
+        };
+
+        record(dir.path(), handle(old_job_id, old_started_at))
+            .await
+            .unwrap();
+        record(dir.path(), handle(new_job_id, new_started_at))
+            .await
+            .unwrap();
+        assert_eq!(
+            current_remote_build_wait_handle(dir.path(), mission_id)
+                .await
+                .unwrap()
+                .map(|handle| handle.job_id),
+            Some(new_job_id)
+        );
+
+        finalize(dir.path(), new_job_id, "succeeded", Some(0))
+            .await
+            .unwrap();
+        assert!(
+            current_remote_build_wait_handle(dir.path(), mission_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "an older live job is evidence only after a newer validation is terminal"
+        );
     }
 
     #[tokio::test]
