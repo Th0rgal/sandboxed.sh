@@ -1703,6 +1703,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
                 },
                 wake_required: false,
                 wake_delivered_at: None,
+                wake_suppressed_by: None,
             },
         )
         .unwrap()

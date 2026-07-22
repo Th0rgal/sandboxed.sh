@@ -106,6 +106,22 @@ pub struct RemoteJobReceipt {
     /// continuation (live control queue or persisted deferred goal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_delivered_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A newer validation for the same mission made this terminal callback
+    /// obsolete before it was delivered. The receipt remains immutable build
+    /// evidence, but it must not close the newer wait lease or start a stale
+    /// continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_suppressed_by: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalWakeDisposition {
+    Ready,
+    /// Another remote validation is still active for the same mission. The
+    /// terminal callback must wait so it cannot close that job's run lease.
+    Deferred,
+    /// A later validation has taken ownership of the mission's continuation.
+    SupersededBy(Uuid),
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +271,75 @@ pub async fn pending_terminal_wakes(working_dir: &Path) -> anyhow::Result<Vec<Re
         .collect())
 }
 
+/// Decide whether a durable terminal callback still owns the mission wake.
+///
+/// Missions may advance their immutable head while an older validation is in
+/// flight. After a restart the older handle is armed for recovery, while the
+/// resumed harness can submit the newer head in the same run. Delivering the
+/// old callback would then finish `waiting_remote_job` underneath the newer
+/// synchronous tool. Prefer the newest accepted validation and retain older
+/// receipts as evidence only.
+pub async fn terminal_wake_disposition(
+    working_dir: &Path,
+    receipt: &RemoteJobReceipt,
+) -> anyhow::Result<TerminalWakeDisposition> {
+    let _guard = lock().lock().await;
+    let handles = load_result(working_dir).await?;
+    let receipts = load_receipts_result(working_dir).await?;
+
+    if let Some(newer) = handles
+        .iter()
+        .filter(|handle| {
+            handle.kind == JobHandleKind::RemoteBuild
+                && handle.mission_id == receipt.mission_id
+                && handle.job_id != receipt.job_id
+                && handle.started_at > receipt.started_at
+        })
+        .max_by_key(|handle| handle.started_at)
+    {
+        return Ok(TerminalWakeDisposition::SupersededBy(newer.job_id));
+    }
+    if let Some(newer) = receipts
+        .iter()
+        .filter(|candidate| {
+            candidate.mission_id == receipt.mission_id
+                && candidate.job_id != receipt.job_id
+                && candidate.started_at > receipt.started_at
+        })
+        .max_by_key(|candidate| candidate.started_at)
+    {
+        return Ok(TerminalWakeDisposition::SupersededBy(newer.job_id));
+    }
+    if handles.iter().any(|handle| {
+        matches!(
+            handle.kind,
+            JobHandleKind::RemoteBuild | JobHandleKind::Tentative
+        ) && handle.mission_id == receipt.mission_id
+            && handle.job_id != receipt.job_id
+    }) {
+        return Ok(TerminalWakeDisposition::Deferred);
+    }
+    Ok(TerminalWakeDisposition::Ready)
+}
+
+pub async fn mark_terminal_wake_suppressed(
+    working_dir: &Path,
+    job_id: Uuid,
+    superseding_job_id: Uuid,
+) -> anyhow::Result<bool> {
+    let _guard = lock().lock().await;
+    let mut receipts = load_receipts_result(working_dir).await?;
+    let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.job_id == job_id) else {
+        return Ok(false);
+    };
+    if receipt.wake_delivered_at.is_none() {
+        receipt.wake_delivered_at = Some(chrono::Utc::now());
+        receipt.wake_suppressed_by = Some(superseding_job_id);
+        store_receipts(working_dir, &receipts).await?;
+    }
+    Ok(true)
+}
+
 pub async fn mark_terminal_wake_delivered(
     working_dir: &Path,
     job_id: Uuid,
@@ -287,7 +372,11 @@ pub async fn finalize(
         return Ok(false);
     };
     let handle = handles.remove(index);
-    if let Some(identity) = handle.identity {
+    if handle.kind == JobHandleKind::RemoteBuild {
+        let Some(identity) = handle.identity else {
+            store(working_dir, &handles).await?;
+            return Ok(true);
+        };
         let mut receipts = load_receipts_result(working_dir).await?;
         let previous_wake_delivered_at = receipts
             .iter()
@@ -305,6 +394,7 @@ pub async fn finalize(
             identity,
             wake_required: handle.kind == JobHandleKind::RemoteBuild && handle.wake_on_terminal,
             wake_delivered_at: previous_wake_delivered_at,
+            wake_suppressed_by: None,
         });
         if receipts.len() > MAX_RECEIPTS {
             receipts.sort_by_key(|receipt| receipt.finished_at);
@@ -707,5 +797,258 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn newer_validation_suppresses_stale_terminal_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let old_job_id = Uuid::new_v4();
+        let new_job_id = Uuid::new_v4();
+        let old_started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let new_started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let identity = |commit: char| RemoteJobIdentity {
+            repository: "https://example.invalid/verity.git".to_string(),
+            commit: commit.to_string().repeat(40),
+            cwd_rel_known: true,
+            cwd_rel: None,
+            command: vec!["lake".to_string(), "build".to_string()],
+            artifacts: Vec::new(),
+            toolchain: Some("leanprover/lean4:v4.24.0".to_string()),
+            source_bundle_digest: None,
+        };
+
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id,
+                node_id: "node-old".to_string(),
+                job_id: old_job_id,
+                started_at: old_started_at,
+                accepted_at: Some(old_started_at),
+                heartbeat_at: Some(old_started_at),
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(identity('a')),
+                wake_on_terminal: true,
+            },
+        )
+        .await
+        .unwrap();
+        finalize(dir.path(), old_job_id, "succeeded", Some(0))
+            .await
+            .unwrap();
+        let old_receipt = terminal_receipt(dir.path(), old_job_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id,
+                node_id: "node-new".to_string(),
+                job_id: new_job_id,
+                started_at: new_started_at,
+                accepted_at: Some(new_started_at),
+                heartbeat_at: Some(new_started_at),
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(identity('b')),
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            terminal_wake_disposition(dir.path(), &old_receipt)
+                .await
+                .unwrap(),
+            TerminalWakeDisposition::SupersededBy(new_job_id)
+        );
+        assert!(
+            mark_terminal_wake_suppressed(dir.path(), old_job_id, new_job_id)
+                .await
+                .unwrap()
+        );
+        assert!(pending_terminal_wakes(dir.path()).await.unwrap().is_empty());
+        let old_receipt = terminal_receipt(dir.path(), old_job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(old_receipt.wake_delivered_at.is_some());
+        assert_eq!(old_receipt.wake_suppressed_by, Some(new_job_id));
+    }
+
+    #[tokio::test]
+    async fn terminal_wake_defers_behind_an_older_active_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let active_job_id = Uuid::new_v4();
+        let receipt_job_id = Uuid::new_v4();
+        let active_started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let receipt_started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let identity = RemoteJobIdentity {
+            repository: "https://example.invalid/verity.git".to_string(),
+            commit: "a".repeat(40),
+            cwd_rel_known: true,
+            cwd_rel: None,
+            command: vec!["lake".to_string(), "build".to_string()],
+            artifacts: Vec::new(),
+            toolchain: None,
+            source_bundle_digest: None,
+        };
+        for (job_id, started_at, wake_on_terminal) in [
+            (active_job_id, active_started_at, false),
+            (receipt_job_id, receipt_started_at, true),
+        ] {
+            record(
+                dir.path(),
+                JobHandle {
+                    mission_id,
+                    node_id: "node-a".to_string(),
+                    job_id,
+                    started_at,
+                    accepted_at: Some(started_at),
+                    heartbeat_at: Some(started_at),
+                    disk_reservation_bytes: 0,
+                    kind: JobHandleKind::RemoteBuild,
+                    identity: Some(identity.clone()),
+                    wake_on_terminal,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        finalize(dir.path(), receipt_job_id, "succeeded", Some(0))
+            .await
+            .unwrap();
+        let receipt = terminal_receipt(dir.path(), receipt_job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal_wake_disposition(dir.path(), &receipt)
+                .await
+                .unwrap(),
+            TerminalWakeDisposition::Deferred
+        );
+        assert_eq!(pending_terminal_wakes(dir.path()).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn newer_tentative_submission_defers_without_suppressing_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let receipt_job_id = Uuid::new_v4();
+        let tentative_job_id = Uuid::new_v4();
+        let old_started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let new_started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let identity = RemoteJobIdentity {
+            repository: "https://example.invalid/verity.git".to_string(),
+            commit: "a".repeat(40),
+            cwd_rel_known: true,
+            cwd_rel: None,
+            command: vec!["lake".to_string(), "build".to_string()],
+            artifacts: Vec::new(),
+            toolchain: None,
+            source_bundle_digest: None,
+        };
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id,
+                node_id: "node-old".to_string(),
+                job_id: receipt_job_id,
+                started_at: old_started_at,
+                accepted_at: Some(old_started_at),
+                heartbeat_at: Some(old_started_at),
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(identity.clone()),
+                wake_on_terminal: true,
+            },
+        )
+        .await
+        .unwrap();
+        finalize(dir.path(), receipt_job_id, "succeeded", Some(0))
+            .await
+            .unwrap();
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id,
+                node_id: "node-new".to_string(),
+                job_id: tentative_job_id,
+                started_at: new_started_at,
+                accepted_at: None,
+                heartbeat_at: None,
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::Tentative,
+                identity: Some(identity),
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let receipt = terminal_receipt(dir.path(), receipt_job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal_wake_disposition(dir.path(), &receipt)
+                .await
+                .unwrap(),
+            TerminalWakeDisposition::Deferred
+        );
+        assert_eq!(pending_terminal_wakes(dir.path()).await.unwrap().len(), 1);
+        assert_eq!(receipt.wake_suppressed_by, None);
+    }
+
+    #[tokio::test]
+    async fn terminal_tentative_handle_never_becomes_validation_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id,
+                node_id: "node-a".to_string(),
+                job_id,
+                started_at: now,
+                accepted_at: None,
+                heartbeat_at: None,
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::Tentative,
+                identity: Some(RemoteJobIdentity {
+                    repository: "https://example.invalid/verity.git".to_string(),
+                    commit: "a".repeat(40),
+                    cwd_rel_known: true,
+                    cwd_rel: None,
+                    command: vec!["lake".to_string(), "build".to_string()],
+                    artifacts: Vec::new(),
+                    toolchain: None,
+                    source_bundle_digest: None,
+                }),
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(finalize(dir.path(), job_id, "lost", None).await.unwrap());
+        assert!(load_result(dir.path()).await.unwrap().is_empty());
+        assert!(terminal_receipt(dir.path(), job_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(terminal_receipts_for_mission(dir.path(), mission_id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

@@ -7221,6 +7221,42 @@ fn remote_build_terminal_message(
     )
 }
 
+async fn record_suppressed_remote_build_terminal_event(
+    state: &AppState,
+    receipt: &crate::remote_node::job_ledger::RemoteJobReceipt,
+    superseding_job_id: Uuid,
+) -> Result<(), String> {
+    let Some((owner, _)) = remote_build_wait_owner(state, receipt.mission_id).await? else {
+        return Err("remote-build owner is not available yet".to_string());
+    };
+    let event = AgentEvent::AssistantMessage {
+        id: Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("sandboxed:remote-build-superseded-event:{}", receipt.job_id).as_bytes(),
+        ),
+        content: format!(
+            "{}\n\nThis terminal wake was suppressed because newer validation job {} already owns the mission continuation. The receipt remains durable evidence only.",
+            remote_build_terminal_message(receipt), superseding_job_id
+        ),
+        success: receipt.state == "succeeded" && receipt.exit_status == Some(0),
+        cost_cents: 0,
+        cost_source: crate::agents::CostSource::Unknown,
+        usage: None,
+        model: None,
+        model_normalized: None,
+        mission_id: Some(receipt.mission_id),
+        shared_files: None,
+        resumable: true,
+        completion_evidence: None,
+    };
+    owner
+        .mission_store
+        .log_event(receipt.mission_id, &event)
+        .await?;
+    owner.send(event);
+    Ok(())
+}
+
 async fn deliver_remote_build_terminal_wake(
     state: &AppState,
     receipt: &crate::remote_node::job_ledger::RemoteJobReceipt,
@@ -7338,6 +7374,80 @@ pub(crate) async fn deliver_pending_remote_build_wakes(state: &AppState) {
             }
         };
     for receipt in receipts {
+        match crate::remote_node::job_ledger::terminal_wake_disposition(
+            &state.config.working_dir,
+            &receipt,
+        )
+        .await
+        {
+            Ok(crate::remote_node::job_ledger::TerminalWakeDisposition::Ready) => {}
+            Ok(crate::remote_node::job_ledger::TerminalWakeDisposition::Deferred) => {
+                tracing::debug!(
+                    mission_id = %receipt.mission_id,
+                    job_id = %receipt.job_id,
+                    "remote-build terminal wake deferred behind another active validation"
+                );
+                continue;
+            }
+            Ok(crate::remote_node::job_ledger::TerminalWakeDisposition::SupersededBy(
+                superseding_job_id,
+            )) => {
+                match crate::remote_node::job_ledger::mark_terminal_wake_suppressed(
+                    &state.config.working_dir,
+                    receipt.job_id,
+                    superseding_job_id,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        if let Err(error) = record_suppressed_remote_build_terminal_event(
+                            state,
+                            &receipt,
+                            superseding_job_id,
+                        )
+                        .await
+                        {
+                            // The receipt itself is the durable evidence. Do
+                            // not re-arm a stale continuation just because its
+                            // convenience transcript event could not be added.
+                            tracing::warn!(
+                                mission_id = %receipt.mission_id,
+                                job_id = %receipt.job_id,
+                                %superseding_job_id,
+                                %error,
+                                "remote-build superseded receipt event could not be recorded"
+                            );
+                        }
+                        tracing::info!(
+                            mission_id = %receipt.mission_id,
+                            job_id = %receipt.job_id,
+                            %superseding_job_id,
+                            "remote-build terminal wake suppressed by newer validation"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            mission_id = %receipt.mission_id,
+                            job_id = %receipt.job_id,
+                            %superseding_job_id,
+                            ?error,
+                            "remote-build superseded wake acknowledgement failed"
+                        );
+                    }
+                }
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    mission_id = %receipt.mission_id,
+                    job_id = %receipt.job_id,
+                    ?error,
+                    "remote-build wake ordering could not be reconciled"
+                );
+                continue;
+            }
+        }
         match deliver_remote_build_terminal_wake(state, &receipt).await {
             Ok(true) => {
                 if let Err(error) = crate::remote_node::job_ledger::mark_terminal_wake_delivered(
