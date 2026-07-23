@@ -1192,6 +1192,7 @@ pub struct RemoteBuildStatusQuery {
 struct RemoteBuildStatusResponse {
     #[serde(flatten)]
     status: NodeJobStatus,
+    node_id: String,
     receipt_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     current_head_match: Option<bool>,
@@ -1232,6 +1233,7 @@ fn remote_build_status_from_receipt(
     };
     RemoteBuildStatusResponse {
         status,
+        node_id: receipt.node_id,
         receipt_state,
         current_head_match,
         validation: Some(receipt.identity),
@@ -1395,6 +1397,7 @@ async fn get_remote_build(
     }
     Ok(Json(RemoteBuildStatusResponse {
         status,
+        node_id: node.id,
         receipt_state,
         current_head_match,
         validation,
@@ -1738,7 +1741,15 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         .0;
 
         assert_eq!(response.status.job_id, job_id);
+        assert_eq!(response.node_id, "offline-node");
         assert_eq!(response.receipt_state, "stale_success");
+        assert_eq!(
+            serde_json::to_value(&response)
+                .unwrap()
+                .get("node_id")
+                .and_then(serde_json::Value::as_str),
+            Some("offline-node")
+        );
         assert_eq!(response.current_head_match, Some(false));
         assert_eq!(
             response
