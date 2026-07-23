@@ -663,6 +663,10 @@ mod tests {
         let headers = auth_headers(&state.shared_token);
         let mission_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
+        let mission_dir = work_root.path().join(mission_id.to_string());
+        tokio::fs::create_dir_all(&mission_dir)
+            .await
+            .expect("mission dir");
         let job_claims = LeaseClaims {
             mission_id,
             node_id: state.node_id.clone(),
@@ -679,7 +683,7 @@ mod tests {
                 lease_token: create_lease_token(&job_claims, &state.shared_token)
                     .expect("lease token"),
                 payload: sandboxed_sh::remote_node::JobPayload::RawCommand {
-                    command: "sleep 0.2".to_string(),
+                    command: "while [ ! -e release ]; do sleep 0.01; done".to_string(),
                     timeout_secs: Some(30),
                     env: None,
                 },
@@ -713,6 +717,22 @@ mod tests {
         )
         .await;
         assert_eq!(rejected.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        tokio::fs::write(mission_dir.join("release"), b"")
+            .await
+            .expect("release async job");
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(record) = state.jobs.get(job_id).await.expect("read job") {
+                    if record.state.is_terminal() {
+                        break record;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("async job should finish");
+        assert_eq!(terminal.state, sandboxed_sh::node::JobState::Succeeded);
     }
 
     #[tokio::test]
