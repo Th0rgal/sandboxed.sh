@@ -83,12 +83,35 @@ pub struct JobHandle {
     /// command handles deserialize with no identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<RemoteJobIdentity>,
+    /// Whether the build owns a mission continuation. This is independent of
+    /// the HTTP response mode: the bundled wrapper requests a job id
+    /// asynchronously but keeps polling inside the harness tool. `None`
+    /// denotes a legacy ledger entry; recovery treats it conservatively so an
+    /// upgrade cannot discard an in-flight continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_for_completion: Option<bool>,
     /// The submitting harness no longer waits on the HTTP response, so the
     /// terminal receipt must wake the owning mission. Recovered remote builds
     /// are promoted to this mode because a restart severed any synchronous
     /// waiter that may have existed.
     #[serde(default)]
     pub wake_on_terminal: bool,
+}
+
+impl JobHandle {
+    /// Request-level continuation intent, also available while a submission
+    /// is still tentative and its node acceptance is ambiguous.
+    pub fn continuation_requested(&self) -> bool {
+        self.wake_on_terminal || self.wait_for_completion != Some(false)
+    }
+
+    /// True when this remote build owns a mission continuation. Newly written
+    /// fire-and-forget handles carry `Some(false)` and are excluded. Legacy
+    /// remote-build handles remain recoverable because their request mode was
+    /// not recorded.
+    pub fn expects_mission_continuation(&self) -> bool {
+        self.kind == JobHandleKind::RemoteBuild && self.continuation_requested()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +127,12 @@ pub struct RemoteJobReceipt {
     #[serde(default)]
     pub exit_status: Option<i32>,
     pub identity: RemoteJobIdentity,
+    /// The accepted request owned a mission continuation even if its terminal
+    /// wake had not yet been armed. This lets startup recover the narrow
+    /// crash window after finalization but before a synchronous result reaches
+    /// the harness. Legacy receipts default to false.
+    #[serde(default)]
+    pub continuation_expected: bool,
     /// Remote-build receipts are also a durable wake-up outbox. Legacy
     /// receipts predate that contract and default to `false`, so upgrading
     /// never replays old validations into missions.
@@ -155,6 +184,7 @@ pub async fn current_remote_build_wait_handle(
             handle.mission_id == mission_id
                 && handle.kind == JobHandleKind::RemoteBuild
                 && handle.accepted_at.is_some()
+                && handle.expects_mission_continuation()
         })
         .max_by_key(|handle| validation_order(handle.submission_sequence, handle.started_at));
     let Some(current_handle) = current_handle else {
@@ -166,7 +196,9 @@ pub async fn current_remote_build_wait_handle(
         current_handle.started_at,
     );
     let newer_terminal_exists = receipts.iter().any(|receipt| {
-        if receipt.mission_id != mission_id {
+        if receipt.mission_id != mission_id
+            || (!receipt.wake_required && !receipt.continuation_expected)
+        {
             return false;
         }
         let receipt_order = validation_order(receipt.submission_sequence, receipt.started_at);
@@ -177,6 +209,7 @@ pub async fn current_remote_build_wait_handle(
     let newer_ambiguous_submission_exists = handles.iter().any(|handle| {
         handle.mission_id == mission_id
             && handle.kind == JobHandleKind::Tentative
+            && handle.continuation_requested()
             && validation_order(handle.submission_sequence, handle.started_at) > current_order
     });
 
@@ -334,6 +367,48 @@ pub async fn pending_terminal_wakes(working_dir: &Path) -> anyhow::Result<Vec<Re
         .collect())
 }
 
+/// Terminal receipts that can recover an inherited `waiting_remote_job`
+/// lease. Unlike `pending_terminal_wakes`, this includes a synchronous result
+/// finalized immediately before a core crash, while its normal HTTP/tool
+/// delivery was still in flight.
+pub async fn recoverable_terminal_continuations(
+    working_dir: &Path,
+    mission_id: Uuid,
+) -> anyhow::Result<Vec<RemoteJobReceipt>> {
+    Ok(load_receipts_result(working_dir)
+        .await?
+        .into_iter()
+        .filter(|receipt| {
+            receipt.mission_id == mission_id
+                && receipt.wake_delivered_at.is_none()
+                && (receipt.wake_required || receipt.continuation_expected)
+        })
+        .collect())
+}
+
+/// Promote a terminal continuation into the durable wake outbox after startup
+/// proved that its mission still had an inherited remote-wait lease.
+pub async fn require_terminal_receipt_wake(
+    working_dir: &Path,
+    job_id: Uuid,
+) -> anyhow::Result<bool> {
+    let _guard = lock().lock().await;
+    let mut receipts = load_receipts_result(working_dir).await?;
+    let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.job_id == job_id) else {
+        return Ok(false);
+    };
+    if receipt.wake_delivered_at.is_some()
+        || (!receipt.wake_required && !receipt.continuation_expected)
+    {
+        return Ok(false);
+    }
+    if !receipt.wake_required {
+        receipt.wake_required = true;
+        store_receipts(working_dir, &receipts).await?;
+    }
+    Ok(true)
+}
+
 /// Decide whether a durable terminal callback still owns the mission wake.
 ///
 /// Missions may advance their immutable head while an older validation is in
@@ -355,6 +430,7 @@ pub async fn terminal_wake_disposition(
         .iter()
         .filter(|handle| {
             handle.kind == JobHandleKind::RemoteBuild
+                && handle.expects_mission_continuation()
                 && handle.mission_id == receipt.mission_id
                 && handle.job_id != receipt.job_id
                 && validation_order(handle.submission_sequence, handle.started_at) > receipt_order
@@ -367,6 +443,7 @@ pub async fn terminal_wake_disposition(
         .iter()
         .filter(|candidate| {
             candidate.mission_id == receipt.mission_id
+                && (candidate.wake_required || candidate.continuation_expected)
                 && candidate.job_id != receipt.job_id
                 && validation_order(candidate.submission_sequence, candidate.started_at)
                     > receipt_order
@@ -379,6 +456,7 @@ pub async fn terminal_wake_disposition(
     }
     if handles.iter().any(|handle| {
         handle.kind == JobHandleKind::Tentative
+            && handle.continuation_requested()
             && handle.mission_id == receipt.mission_id
             && handle.job_id != receipt.job_id
             && validation_order(handle.submission_sequence, handle.started_at) >= receipt_order
@@ -387,6 +465,7 @@ pub async fn terminal_wake_disposition(
     }
     if handles.iter().any(|handle| {
         handle.kind == JobHandleKind::RemoteBuild
+            && handle.expects_mission_continuation()
             && handle.mission_id == receipt.mission_id
             && handle.job_id != receipt.job_id
             && validation_order(handle.submission_sequence, handle.started_at) == receipt_order
@@ -448,6 +527,7 @@ pub async fn finalize(
     };
     let handle = handles.remove(index);
     if handle.kind == JobHandleKind::RemoteBuild {
+        let continuation_expected = handle.expects_mission_continuation();
         let Some(identity) = handle.identity else {
             store(working_dir, &handles).await?;
             return Ok(true);
@@ -468,6 +548,7 @@ pub async fn finalize(
             state: state.to_string(),
             exit_status,
             identity,
+            continuation_expected,
             wake_required: handle.kind == JobHandleKind::RemoteBuild && handle.wake_on_terminal,
             wake_delivered_at: previous_wake_delivered_at,
             wake_suppressed_by: None,
@@ -580,6 +661,41 @@ pub async fn require_terminal_wake(working_dir: &Path, job_id: Uuid) -> anyhow::
 mod tests {
     use super::*;
 
+    #[test]
+    fn remote_build_continuation_mode_is_explicit_and_legacy_safe() {
+        let base = JobHandle {
+            mission_id: Uuid::new_v4(),
+            node_id: "node-a".to_string(),
+            job_id: Uuid::new_v4(),
+            started_at: chrono::Utc::now(),
+            submission_sequence: 1,
+            accepted_at: Some(chrono::Utc::now()),
+            heartbeat_at: Some(chrono::Utc::now()),
+            disk_reservation_bytes: 0,
+            kind: JobHandleKind::RemoteBuild,
+            identity: None,
+            wait_for_completion: Some(false),
+            wake_on_terminal: false,
+        };
+
+        assert!(!base.expects_mission_continuation());
+        assert!(JobHandle {
+            wait_for_completion: Some(true),
+            ..base.clone()
+        }
+        .expects_mission_continuation());
+        assert!(JobHandle {
+            wait_for_completion: None,
+            ..base.clone()
+        }
+        .expects_mission_continuation());
+        assert!(JobHandle {
+            wake_on_terminal: true,
+            ..base
+        }
+        .expects_mission_continuation());
+    }
+
     #[tokio::test]
     async fn record_is_durable_and_idempotent() {
         let dir = tempfile::tempdir().unwrap();
@@ -595,6 +711,7 @@ mod tests {
             disk_reservation_bytes: 0,
             kind: JobHandleKind::Mission,
             identity: None,
+            wait_for_completion: None,
             wake_on_terminal: false,
         };
 
@@ -624,6 +741,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: JobHandleKind::Mission,
                 identity: None,
+                wait_for_completion: None,
                 wake_on_terminal: false,
             },
         )
@@ -694,6 +812,7 @@ mod tests {
             disk_reservation_bytes: 0,
             kind: JobHandleKind::Tentative,
             identity: None,
+            wait_for_completion: None,
             wake_on_terminal: false,
         };
         record(dir.path(), handle.clone()).await.unwrap();
@@ -733,6 +852,7 @@ mod tests {
                 toolchain: None,
                 source_bundle_digest: None,
             }),
+            wait_for_completion: None,
             wake_on_terminal: false,
         };
         record(dir.path(), handle).await.unwrap();
@@ -772,6 +892,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: JobHandleKind::RemoteBuild,
                 identity: Some(identity.clone()),
+                wait_for_completion: None,
                 wake_on_terminal: true,
             },
         )
@@ -833,6 +954,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: JobHandleKind::RemoteBuild,
                 identity: Some(identity.clone()),
+                wait_for_completion: None,
                 wake_on_terminal: false,
             },
         )
@@ -883,6 +1005,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: JobHandleKind::RemoteBuild,
                 identity: Some(artifact_identity.clone()),
+                wait_for_completion: None,
                 wake_on_terminal: false,
             },
         )
@@ -941,6 +1064,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: JobHandleKind::RemoteBuild,
                 identity: Some(identity('a')),
+                wait_for_completion: None,
                 wake_on_terminal: true,
             },
         )
@@ -967,6 +1091,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: JobHandleKind::RemoteBuild,
                 identity: Some(identity('b')),
+                wait_for_completion: None,
                 wake_on_terminal: false,
             },
         )
@@ -1021,6 +1146,7 @@ mod tests {
                 toolchain: None,
                 source_bundle_digest: None,
             }),
+            wait_for_completion: None,
             wake_on_terminal: true,
         };
 
@@ -1051,6 +1177,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fire_and_forget_validation_never_supersedes_a_continuation_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let continuation_job_id = Uuid::new_v4();
+        let detached_job_id = Uuid::new_v4();
+        let identity = |commit: char| RemoteJobIdentity {
+            repository: "https://example.invalid/verity.git".to_string(),
+            commit: commit.to_string().repeat(40),
+            cwd_rel_known: true,
+            cwd_rel: None,
+            command: vec!["lake".to_string(), "build".to_string()],
+            artifacts: Vec::new(),
+            toolchain: None,
+            source_bundle_digest: None,
+        };
+        let continuation_started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id,
+                node_id: "node-a".to_string(),
+                job_id: continuation_job_id,
+                started_at: continuation_started_at,
+                submission_sequence: 0,
+                accepted_at: Some(continuation_started_at),
+                heartbeat_at: Some(continuation_started_at),
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(identity('a')),
+                wait_for_completion: Some(true),
+                wake_on_terminal: true,
+            },
+        )
+        .await
+        .unwrap();
+        let detached_started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id,
+                node_id: "node-b".to_string(),
+                job_id: detached_job_id,
+                started_at: detached_started_at,
+                submission_sequence: 0,
+                accepted_at: Some(detached_started_at),
+                heartbeat_at: Some(detached_started_at),
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(identity('b')),
+                wait_for_completion: Some(false),
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+        finalize(dir.path(), detached_job_id, "succeeded", Some(0))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            current_remote_build_wait_handle(dir.path(), mission_id)
+                .await
+                .unwrap()
+                .map(|handle| handle.job_id),
+            Some(continuation_job_id),
+            "detached terminal evidence must not hide the live continuation owner"
+        );
+
+        finalize(dir.path(), continuation_job_id, "succeeded", Some(0))
+            .await
+            .unwrap();
+        let continuation_receipt = load_receipts_result(dir.path())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|receipt| receipt.job_id == continuation_job_id)
+            .unwrap();
+        assert_eq!(
+            terminal_wake_disposition(dir.path(), &continuation_receipt)
+                .await
+                .unwrap(),
+            TerminalWakeDisposition::Ready,
+            "a newer detached receipt must not suppress the owning terminal wake"
+        );
+    }
+
+    #[tokio::test]
     async fn submission_sequence_breaks_equal_timestamp_ties_without_using_uuid_order() {
         let dir = tempfile::tempdir().unwrap();
         let mission_id = Uuid::new_v4();
@@ -1068,6 +1281,7 @@ mod tests {
             disk_reservation_bytes: 0,
             kind: JobHandleKind::RemoteBuild,
             identity: None,
+            wait_for_completion: None,
             wake_on_terminal: true,
         };
 
@@ -1130,6 +1344,7 @@ mod tests {
                     disk_reservation_bytes: 0,
                     kind: JobHandleKind::RemoteBuild,
                     identity: Some(identity.clone()),
+                    wait_for_completion: None,
                     wake_on_terminal,
                 },
             )
@@ -1183,6 +1398,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: JobHandleKind::RemoteBuild,
                 identity: Some(identity.clone()),
+                wait_for_completion: None,
                 wake_on_terminal: true,
             },
         )
@@ -1204,6 +1420,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: JobHandleKind::Tentative,
                 identity: Some(identity),
+                wait_for_completion: None,
                 wake_on_terminal: false,
             },
         )
@@ -1252,6 +1469,7 @@ mod tests {
                     toolchain: None,
                     source_bundle_digest: None,
                 }),
+                wait_for_completion: None,
                 wake_on_terminal: false,
             },
         )

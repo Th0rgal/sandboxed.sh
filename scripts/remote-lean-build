@@ -50,6 +50,9 @@ req = {
     "commit": commit,
     "command": command,
     "wait": False,
+    # The HTTP request returns a job id, but this wrapper keeps the harness
+    # tool attached by polling that durable job to terminal state.
+    "resume_mission_on_terminal": True,
 }
 repo_root = pathlib.Path(
     subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
@@ -174,6 +177,7 @@ import hashlib, json, sys
 request = json.load(open(sys.argv[1]))
 request.pop("token", None)
 request.pop("wait", None)
+request.pop("resume_mission_on_terminal", None)
 # `expected_head` is a live freshness gate, not part of the immutable job
 # identity. A retry after the branch advances must resume the accepted job for
 # the pinned commit and report it as stale, never submit a duplicate.
@@ -351,6 +355,7 @@ if repo:
     except ValueError:
         request["repository"] = repo
 request.pop("wait", None)
+request.pop("resume_mission_on_terminal", None)
 bundle = request.pop("source_bundle", None)
 if bundle:
     request["source_bundle_sha256"] = bundle.get("manifest_sha256")
@@ -437,6 +442,7 @@ if repo:
     except ValueError:
         request["repository"] = repo
 request.pop("wait", None)
+request.pop("resume_mission_on_terminal", None)
 bundle = request.pop("source_bundle", None)
 if bundle:
     request["source_bundle_sha256"] = bundle.get("manifest_sha256")
@@ -504,6 +510,7 @@ if repo:
     except ValueError:
         request["repository"] = repo
 request.pop("wait", None)
+request.pop("resume_mission_on_terminal", None)
 bundle = request.pop("source_bundle", None)
 if bundle:
     request["source_bundle_sha256"] = bundle.get("manifest_sha256")
