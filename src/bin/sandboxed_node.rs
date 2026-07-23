@@ -679,7 +679,7 @@ mod tests {
                 lease_token: create_lease_token(&job_claims, &state.shared_token)
                     .expect("lease token"),
                 payload: sandboxed_sh::remote_node::JobPayload::RawCommand {
-                    command: "sleep 0.2".to_string(),
+                    command: "while [ ! -e release ]; do sleep 0.01; done".to_string(),
                     timeout_secs: Some(30),
                     env: None,
                 },
@@ -713,6 +713,28 @@ mod tests {
         )
         .await;
         assert_eq!(rejected.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        tokio::fs::write(
+            work_root
+                .path()
+                .join(mission_id.to_string())
+                .join("release"),
+            b"",
+        )
+        .await
+        .expect("release async job");
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(record) = state.jobs.get(job_id).await.expect("read job") {
+                    if record.state.is_terminal() {
+                        break record;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("async job should finish");
+        assert_eq!(terminal.state, sandboxed_sh::node::JobState::Succeeded);
     }
 
     #[tokio::test]
