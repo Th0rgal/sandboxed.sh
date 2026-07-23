@@ -1932,6 +1932,14 @@ pub async fn hermes_remote_proxy(
 
 pub const HERMES_CHAT_PROXY_PATH: &str = "/api/assistant/hermes";
 
+fn hermes_chat_proxy_status(status: StatusCode) -> StatusCode {
+    if status == StatusCode::UNAUTHORIZED {
+        StatusCode::BAD_GATEWAY
+    } else {
+        status
+    }
+}
+
 fn sanitize_hermes_chat_proxy_headers(headers: &mut axum::http::HeaderMap) {
     for header in [
         axum::http::header::HOST,
@@ -2020,7 +2028,10 @@ pub async fn hermes_chat_proxy(
         .await
     {
         Ok(upstream) => {
-            let status = upstream.status();
+            // The dashboard JWT has already passed protected_routes. A 401
+            // here comes from Hermes rejecting the server-injected
+            // API_SERVER_KEY, not from the browser login.
+            let status = hermes_chat_proxy_status(upstream.status());
             let mut response_headers = upstream.headers().clone();
             for hop in [
                 axum::http::header::CONTENT_LENGTH,
@@ -5171,10 +5182,11 @@ fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::conve
 mod tests {
     use super::{
         evaluate_debounce, evaluate_deploy_request, expand_hermes_env_refs, extract_version_token,
-        hermes_config_base_url, hermes_config_model_label, hermes_config_yaml, hermes_service_unit,
-        hermes_uses_native_codex, install_versioned_binary_as, is_safe_repo_path,
-        normalize_repo_path, prepare_deploy_backup, prune_deploy_backups, rollback_deployed_binary,
-        sandboxed_service_name_from_path, sanitize_hermes_chat_proxy_headers, select_repo_path,
+        hermes_chat_proxy_status, hermes_config_base_url, hermes_config_model_label,
+        hermes_config_yaml, hermes_service_unit, hermes_uses_native_codex,
+        install_versioned_binary_as, is_safe_repo_path, normalize_repo_path, prepare_deploy_backup,
+        prune_deploy_backups, rollback_deployed_binary, sandboxed_service_name_from_path,
+        sanitize_hermes_chat_proxy_headers, select_repo_path,
         systemd_service_component_from_states, upsert_hermes_mcp_command, ComponentStatus,
         DebounceDecision, DeployRefusal, DeployRollback, DEPLOY_DEBOUNCE_SECS,
         HERMES_SERVICE_DRAIN_DROP_IN,
@@ -5198,6 +5210,18 @@ mod tests {
         assert_eq!(
             headers.get(axum::http::header::CONTENT_TYPE),
             Some(&axum::http::HeaderValue::from_static("application/json"))
+        );
+    }
+
+    #[test]
+    fn hermes_upstream_auth_failure_is_not_reported_as_dashboard_auth_failure() {
+        assert_eq!(
+            hermes_chat_proxy_status(axum::http::StatusCode::UNAUTHORIZED),
+            axum::http::StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            hermes_chat_proxy_status(axum::http::StatusCode::FORBIDDEN),
+            axum::http::StatusCode::FORBIDDEN
         );
     }
 

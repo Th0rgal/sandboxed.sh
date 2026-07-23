@@ -1,16 +1,39 @@
 diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 61fd1b76b..33202333f 100644
 --- a/cron/scheduler.py
 +++ b/cron/scheduler.py
-@@ -14,0 +15 @@ import contextvars
+@@ -12,6 +12,7 @@ import asyncio
+ import atexit
+ import concurrent.futures
+ import contextvars
 +import hashlib
-@@ -1674,0 +1676,4 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+ import json
+ import logging
+ import os
+@@ -1537,6 +1538,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+         # conversation without falling back to a configured home platform
+         # such as Telegram.
+         if str(platform_name).lower() == "api_server":
++            resolved_chat_id = str(chat_id)
 +            delivery_id = (
 +                f"cron:{chat_id}:{job.get('id', '?')}:"
 +                f"{job.get('_delivery_run_id') or job.get('last_run_at') or hashlib.sha256(content.encode('utf-8')).hexdigest()}"
 +            )
-@@ -1687,0 +1693 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+             db = None
+             try:
+                 from hermes_state import SessionDB
+@@ -1552,6 +1558,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+                     session_id=resolved_chat_id,
+                     role="assistant",
+                     content=content,
 +                    delivery_id=delivery_id,
-@@ -1695,3 +1701,28 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+                 )
+                 logger.info(
+                     "Job '%s': appended durable delivery to API session %s",
+@@ -1559,9 +1566,34 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+                     resolved_chat_id,
+                 )
+             except Exception as e:
 -                msg = f"API session delivery failed for '{chat_id}': {e}"
 -                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
 -                delivery_errors.append(msg)
@@ -24,7 +47,7 @@ diff --git a/cron/scheduler.py b/cron/scheduler.py
 +
 +                    spool_path = spool_session_delivery(
 +                        delivery_id=delivery_id,
-+                        session_id=str(chat_id),
++                        session_id=resolved_chat_id,
 +                        role="assistant",
 +                        content=content,
 +                    )
@@ -42,7 +65,12 @@ diff --git a/cron/scheduler.py b/cron/scheduler.py
 +                    )
 +                    logger.error("Job '%s': %s", job.get("id", "?"), msg)
 +                    delivery_errors.append(msg)
-@@ -4013 +4044,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
+             finally:
+                 if db is not None:
+                     db.close()
+@@ -3877,6 +3909,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
+             if should_deliver:
+                 try:
 -                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
 +                    delivery_job = dict(job)
 +                    delivery_job["_delivery_run_id"] = execution_id
@@ -52,6 +80,9 @@ diff --git a/cron/scheduler.py b/cron/scheduler.py
 +                        adapters=adapters,
 +                        loop=loop,
 +                    )
+                 except Exception as de:
+                     delivery_error = str(de)
+                     logger.error("Delivery failed for job %s: %s", job["id"], de)
 diff --git a/gateway/run.py b/gateway/run.py
 --- a/gateway/run.py
 +++ b/gateway/run.py
@@ -81,7 +112,7 @@ diff --git a/hermes_state.py b/hermes_state.py
 +import hashlib
 @@ -19,0 +21 @@ import logging
 +import os
-@@ -35,0 +38,58 @@ logger = logging.getLogger(__name__)
+@@ -35,0 +38,62 @@ logger = logging.getLogger(__name__)
 +def _delivery_spool_dir() -> Path:
 +    return Path(get_hermes_home()) / "delivery-spool"
 +
@@ -124,8 +155,12 @@ diff --git a/hermes_state.py b/hermes_state.py
 +        for path in sorted(spool_dir.glob("*.json")):
 +            try:
 +                payload = json.loads(path.read_text(encoding="utf-8"))
++                session_id = str(payload["session_id"])
++                resolve_resume = getattr(db, "resolve_resume_session_id", None)
++                if callable(resolve_resume):
++                    session_id = resolve_resume(session_id)
 +                db.append_message(
-+                    session_id=str(payload["session_id"]),
++                    session_id=session_id,
 +                    role=str(payload.get("role") or "assistant"),
 +                    content=payload.get("content"),
 +                    delivery_id=str(payload["delivery_id"]),
@@ -140,10 +175,10 @@ diff --git a/hermes_state.py b/hermes_state.py
 +    return result
 +
 +
-@@ -155 +215 @@ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+@@ -155 +219 @@ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 -SCHEMA_VERSION = 22
 +SCHEMA_VERSION = 23
-@@ -835,0 +896,7 @@ CREATE TABLE IF NOT EXISTS messages (
+@@ -835,0 +900,7 @@ CREATE TABLE IF NOT EXISTS messages (
 +CREATE TABLE IF NOT EXISTS delivery_receipts (
 +    delivery_id TEXT PRIMARY KEY,
 +    message_id INTEGER,
@@ -151,9 +186,9 @@ diff --git a/hermes_state.py b/hermes_state.py
 +    FOREIGN KEY (message_id) REFERENCES messages(id)
 +);
 +
-@@ -1003,0 +1071 @@ class SessionDB:
+@@ -1003,0 +1075 @@ class SessionDB:
 +    _WRITE_RETRY_DEADLINE_S = 10.0
-@@ -1286 +1354,15 @@ class SessionDB:
+@@ -1286 +1358,15 @@ class SessionDB:
 -        for attempt in range(self._WRITE_MAX_RETRIES):
 +        started_at = time.monotonic()
 +        try:
@@ -170,7 +205,7 @@ diff --git a/hermes_state.py b/hermes_state.py
 +        attempt = 0
 +        while attempt < self._WRITE_MAX_RETRIES and time.monotonic() < deadline_at:
 +            transaction_started_at = time.monotonic()
-@@ -1304,0 +1387,7 @@ class SessionDB:
+@@ -1304,0 +1391,7 @@ class SessionDB:
 +                if attempt:
 +                    logger.info(
 +                        "SessionDB write recovered lock_wait_ms=%.1f retries=%d transaction_ms=%.1f",
@@ -178,7 +213,7 @@ diff --git a/hermes_state.py b/hermes_state.py
 +                        attempt,
 +                        (time.monotonic() - transaction_started_at) * 1000,
 +                    )
-@@ -1310,3 +1399,5 @@ class SessionDB:
+@@ -1310,3 +1403,5 @@ class SessionDB:
 -                    if attempt < self._WRITE_MAX_RETRIES - 1:
 -                        jitter = random.uniform(
 -                            self._WRITE_RETRY_MIN_S,
@@ -187,16 +222,16 @@ diff --git a/hermes_state.py b/hermes_state.py
 +                        # Bounded full jitter: every retry samples from zero to
 +                        # the exponentially increasing cap, avoiding writer convoys.
 +                        cap = min(
-@@ -1313,0 +1405,2 @@ class SessionDB:
+@@ -1313,0 +1409,2 @@ class SessionDB:
 +                            self._WRITE_RETRY_MIN_S * (2 ** attempt),
 +                            remaining,
-@@ -1314,0 +1408 @@ class SessionDB:
+@@ -1314,0 +1412 @@ class SessionDB:
 +                        jitter = random.uniform(0, max(0, cap))
-@@ -1315,0 +1410 @@ class SessionDB:
+@@ -1315,0 +1414 @@ class SessionDB:
 +                        attempt += 1
-@@ -1330,0 +1426 @@ class SessionDB:
+@@ -1330,0 +1430 @@ class SessionDB:
 +                attempt += 1
-@@ -1332,0 +1429,7 @@ class SessionDB:
+@@ -1332,0 +1433,7 @@ class SessionDB:
 +        logger.error(
 +            "SessionDB write failed lock_wait_ms=%.1f retries=%d deadline_s=%.1f error=%s",
 +            (time.monotonic() - started_at) * 1000,
@@ -204,9 +239,9 @@ diff --git a/hermes_state.py b/hermes_state.py
 +            retry_deadline_s,
 +            last_err,
 +        )
-@@ -4171,0 +4275 @@ class SessionDB:
+@@ -4171,0 +4279 @@ class SessionDB:
 +        delivery_id: Optional[str] = None,
-@@ -4226,0 +4331,11 @@ class SessionDB:
+@@ -4226,0 +4335,11 @@ class SessionDB:
 +            if delivery_id:
 +                claimed = conn.execute(
 +                    "INSERT OR IGNORE INTO delivery_receipts (delivery_id, message_id, created_at) VALUES (?, NULL, ?)",
@@ -218,27 +253,77 @@ diff --git a/hermes_state.py b/hermes_state.py
 +                        (delivery_id,),
 +                    ).fetchone()
 +                    return prior[0] if prior and prior[0] is not None else 0
-@@ -4268,0 +4384,5 @@ class SessionDB:
+@@ -4268,0 +4388,5 @@ class SessionDB:
 +            if delivery_id:
 +                conn.execute(
 +                    "UPDATE delivery_receipts SET message_id = ? WHERE delivery_id = ?",
 +                    (msg_id, delivery_id),
 +                )
 diff --git a/tests/cron/test_scheduler.py b/tests/cron/test_scheduler.py
+index 2554de37e..ad6ebf74c 100644
 --- a/tests/cron/test_scheduler.py
 +++ b/tests/cron/test_scheduler.py
-@@ -4060,0 +4061 @@ class TestDeliverApiServerOrigin:
+@@ -4059,5 +4059,6 @@ class TestDeliverApiServerOrigin:
+         job = {
+             "id": "desktop-watch",
 +            "_delivery_run_id": str(tmp_path),
-@@ -4088,0 +4090 @@ class TestDeliverApiServerOrigin:
+             "name": "Desktop build watcher",
+             "deliver": "origin",
+             "origin": {
+@@ -4087,5 +4088,6 @@ class TestDeliverApiServerOrigin:
+         job = {
+             "id": "bad-target",
 +            "_delivery_run_id": str(tmp_path),
+             "deliver": "origin",
+             "origin": {
+                 "platform": "api_server",
+@@ -4098,0 +4101,37 @@ class TestDeliverApiServerOrigin:
++    def test_spools_failed_append_to_resolved_continuation(self, tmp_path, monkeypatch):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setenv("HOME", str(tmp_path))
++
++        mock_db = MagicMock()
++        mock_db.resolve_resume_session_id.return_value = "api-session-child"
++        mock_db.get_session.return_value = {
++            "id": "api-session-child",
++            "source": "api_server",
++        }
++        mock_db.append_message.side_effect = RuntimeError("database is locked")
++
++        with patch("hermes_state.SessionDB", return_value=mock_db), patch(
++            "hermes_state.spool_session_delivery",
++            return_value=tmp_path / "delivery-spool" / "receipt.json",
++        ) as spool:
++            result = _deliver_result(
++                {
++                    "id": "desktop-watch",
++                    "_delivery_run_id": "run-1",
++                    "deliver": "origin",
++                    "origin": {
++                        "platform": "api_server",
++                        "chat_id": "api-session-parent",
++                    },
++                },
++                "The build finished successfully.",
++            )
++
++        assert result is None
++        spool.assert_called_once_with(
++            delivery_id="cron:api-session-parent:desktop-watch:run-1",
++            session_id="api-session-child",
++            role="assistant",
++            content="The build finished successfully.",
++        )
++
 diff --git a/tests/test_sessiondb_delivery_spool.py b/tests/test_sessiondb_delivery_spool.py
 new file mode 100644
 --- /dev/null
 +++ b/tests/test_sessiondb_delivery_spool.py
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,109 @@
 +import sqlite3
 +import threading
 +import time
++from unittest.mock import MagicMock
 +
 +from hermes_state import (
 +    SessionDB,
@@ -324,3 +409,24 @@ new file mode 100644
 +        assert verify.get_messages("api-1")[-1]["content"] == "eventually committed"
 +    finally:
 +        verify.close()
++
++
++def test_replay_resolves_spooled_parent_to_live_continuation(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HOME", str(tmp_path))
++    spool_session_delivery(
++        "cron:api-parent:j:r3", "api-parent", "assistant", "done"
++    )
++
++    mock_db = MagicMock()
++    mock_db.resolve_resume_session_id.return_value = "api-child"
++    monkeypatch.setattr("hermes_state.SessionDB", lambda: mock_db)
++
++    assert replay_session_delivery_spool() == {"replayed": 1, "failed": 0}
++    mock_db.append_message.assert_called_once_with(
++        session_id="api-child",
++        role="assistant",
++        content="done",
++        delivery_id="cron:api-parent:j:r3",
++    )
++    mock_db.close.assert_called_once()

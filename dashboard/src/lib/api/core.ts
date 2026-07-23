@@ -3,7 +3,12 @@
  * All other API modules import from this file.
  */
 
-import { authHeader, clearJwt, signalAuthRequired } from "../auth";
+import {
+  authHeader,
+  clearJwt,
+  getStoredJwt,
+  signalAuthRequired,
+} from "../auth";
 import { getRuntimeApiBase } from "../settings";
 
 // ---------------------------------------------------------------------------
@@ -70,13 +75,22 @@ export function isHttpStatusError(
 // ---------------------------------------------------------------------------
 
 export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+  const authentication = authHeader();
+  const requestJwt = authentication.Authorization?.startsWith("Bearer ")
+    ? authentication.Authorization.slice("Bearer ".length)
+    : null;
   const headers: Record<string, string> = {
     ...(init?.headers ? (init.headers as Record<string, string>) : {}),
-    ...authHeader(),
+    ...authentication,
   };
 
   const res = await fetch(apiUrl(path), { ...init, headers });
-  if (res.status === 401) {
+  // A delayed 401 from a request carrying an old token must not erase a token
+  // issued by a newer successful login.
+  if (
+    res.status === 401 &&
+    (getStoredJwt()?.token ?? null) === requestJwt
+  ) {
     clearJwt();
     signalAuthRequired();
   }

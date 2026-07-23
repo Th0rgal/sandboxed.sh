@@ -35,7 +35,17 @@ export function AlertsFeed() {
   const [filter, setFilter] = useState<FeedFilter>("all");
   // Older pages fetched via "load more"; reset when the filter changes.
   const [olderPages, setOlderPages] = useState<AlertFeedEntry[]>([]);
-  const [olderCursor, setOlderCursor] = useState<string | null>(null);
+  // `undefined` means no older page has been requested yet. `null` means the
+  // server explicitly reported that pagination is exhausted.
+  const [olderCursor, setOlderCursor] = useState<string | null | undefined>(
+    undefined,
+  );
+  // First-page boundary for which `olderCursor` was obtained. If SWR later
+  // refreshes to a different boundary, page the new gap before trusting the
+  // previously exhausted/deeper cursor again.
+  const [paginationAnchor, setPaginationAnchor] = useState<
+    string | null | undefined
+  >(undefined);
   const [loadingMore, setLoadingMore] = useState(false);
 
   const { data, isLoading } = useSWR(
@@ -49,24 +59,35 @@ export function AlertsFeed() {
   );
 
   const firstPage = useMemo(() => data?.alerts ?? [], [data]);
-  // Drop older entries that already appear in the (refreshing) first page.
+  // Drop duplicates and keep refreshed gap pages in chronological order even
+  // when they were fetched after an already-loaded older tail.
   const entries = useMemo(() => {
     if (olderPages.length === 0) return firstPage;
-    const seen = new Set(
-      firstPage.map((a) => `${a.mission_id}:${a.timestamp}`),
-    );
-    return [
-      ...firstPage,
-      ...olderPages.filter((a) => !seen.has(`${a.mission_id}:${a.timestamp}`)),
-    ];
+    const seen = new Set<string>();
+    return [...firstPage, ...olderPages]
+      .filter((alert) => {
+        const key = `${alert.mission_id}:${alert.timestamp}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort(
+        (left, right) =>
+          Date.parse(right.timestamp) - Date.parse(left.timestamp),
+      );
   }, [firstPage, olderPages]);
 
-  const cursor = olderCursor ?? data?.next_cursor ?? null;
+  const firstPageCursor = data?.next_cursor ?? null;
+  const cursor =
+    olderCursor === undefined || paginationAnchor !== firstPageCursor
+      ? firstPageCursor
+      : olderCursor;
 
   const changeFilter = useCallback((f: FeedFilter) => {
     setFilter(f);
     setOlderPages([]);
-    setOlderCursor(null);
+    setOlderCursor(undefined);
+    setPaginationAnchor(undefined);
   }, []);
 
   const loadMore = useCallback(async () => {
@@ -80,10 +101,11 @@ export function AlertsFeed() {
       });
       setOlderPages((prev) => [...prev, ...page.alerts]);
       setOlderCursor(page.next_cursor);
+      setPaginationAnchor(firstPageCursor);
     } finally {
       setLoadingMore(false);
     }
-  }, [cursor, filter, loadingMore]);
+  }, [cursor, filter, firstPageCursor, loadingMore]);
 
   return (
     <div className="flex h-full min-h-0 flex-col rounded-xl border border-border bg-[rgb(var(--foreground)/0.025)] p-3">

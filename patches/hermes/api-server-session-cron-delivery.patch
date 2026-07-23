@@ -24,20 +24,21 @@ index c595707..9e25672 100644
 +                from hermes_state import SessionDB
 +
 +                db = SessionDB()
-+                session = db.get_session(str(chat_id))
++                resolved_chat_id = db.resolve_resume_session_id(str(chat_id))
++                session = db.get_session(resolved_chat_id)
 +                if not session or str(session.get("source") or "") != "api_server":
 +                    raise ValueError(
 +                        f"API session '{chat_id}' does not exist or is not an api_server session"
 +                    )
 +                db.append_message(
-+                    session_id=str(chat_id),
++                    session_id=resolved_chat_id,
 +                    role="assistant",
 +                    content=content,
 +                )
 +                logger.info(
 +                    "Job '%s': appended durable delivery to API session %s",
 +                    job.get("id", "?"),
-+                    chat_id,
++                    resolved_chat_id,
 +                )
 +            except Exception as e:
 +                msg = f"API session delivery failed for '{chat_id}': {e}"

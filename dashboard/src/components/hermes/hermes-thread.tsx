@@ -248,6 +248,7 @@ export function HermesThread({ className }: { className?: string }) {
         prev.map((r) => (r.id === id ? { ...r, ...patch } : r)),
       );
     };
+    let streamFailure: string | null = null;
 
     try {
       let sid = sessionId;
@@ -362,11 +363,14 @@ export function HermesThread({ className }: { className?: string }) {
           },
           onError: (message) => {
             if (stale()) return;
-            setError(message);
+            streamFailure = message;
           },
         },
         controller.signal,
       );
+      if (streamFailure) {
+        throw new Error(streamFailure);
+      }
       if (!stale()) void refreshSessions();
     } catch (e) {
       if (!stale()) {

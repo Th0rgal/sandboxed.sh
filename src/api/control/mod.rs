@@ -146,6 +146,14 @@ async fn acquire_execution_run(
 /// clippy's `type_complexity` threshold.
 type ControlQueueEntry = (Uuid, String, Option<String>, Option<Uuid>, Option<String>);
 
+fn enqueue_control_message(queue: &mut VecDeque<ControlQueueEntry>, entry: ControlQueueEntry) {
+    if entry.4.as_deref() == Some("remote-build-terminal") {
+        queue.push_front(entry);
+    } else {
+        queue.push_back(entry);
+    }
+}
+
 /// Pop the first queued delivery whose target is not explicitly paused or
 /// still owned by a detached durable wait. Parked deliveries remain durable
 /// and rotate behind runnable work; when all entries are parked the queue
@@ -4538,7 +4546,12 @@ async fn recoverable_inherited_remote_wait(
         crate::remote_node::job_ledger::recoverable_terminal_continuations(working_dir, mission_id)
             .await?
             .into_iter()
-            .max_by_key(|receipt| receipt.finished_at);
+            .max_by_key(|receipt| {
+                crate::remote_node::job_ledger::validation_order(
+                    receipt.submission_sequence,
+                    receipt.started_at,
+                )
+            });
     let Some(receipt) = receipt else {
         return Ok(None);
     };
@@ -5946,6 +5959,14 @@ fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Opti
         "not", "never", "no", "without", "dont", "cannot", "cant", "forbid",
     ];
     const NEGATORS_AFTER: [&str; 4] = ["prohibited", "forbidden", "banned", "disallowed"];
+    const POLICY_ADVERBS: [&str; 6] = [
+        "currently",
+        "temporarily",
+        "explicitly",
+        "strictly",
+        "now",
+        "still",
+    ];
 
     clauses.iter().any(|words| {
         words.iter().enumerate().any(|(index, word)| {
@@ -5961,11 +5982,34 @@ fn inferred_pr_writer(explicit: Option<bool>, intent: Option<&str>, prompt: Opti
             });
             let stopped_before =
                 index >= 2 && words[index - 2] == "stop" && words[index - 1] == "before";
-            let after_end = (index + 4).min(words.len());
-            let negated_after = words[(index + 1).min(words.len())..after_end]
-                .iter()
-                .any(|next| NEGATORS_AFTER.contains(next));
-            !(negated_immediately || coordinated_negation || stopped_before || negated_after)
+            let mut prohibition_index = index + 1;
+            let has_copula = words
+                .get(prohibition_index)
+                .is_some_and(|word| matches!(*word, "is" | "are" | "was" | "were"));
+            if has_copula {
+                prohibition_index += 1;
+            }
+            let mut policy_adverbs = 0;
+            while policy_adverbs < 2
+                && words
+                    .get(prohibition_index)
+                    .is_some_and(|word| POLICY_ADVERBS.contains(word))
+            {
+                prohibition_index += 1;
+                policy_adverbs += 1;
+            }
+            let policy_prohibition = words
+                .get(prohibition_index)
+                .is_some_and(|word| NEGATORS_AFTER.contains(word))
+                && (has_copula
+                    || policy_adverbs > 0
+                    || words.get(prohibition_index + 1).is_none_or(|next| {
+                        matches!(
+                            *next,
+                            "by" | "under" | "here" | "globally" | "currently" | "temporarily"
+                        )
+                    }));
+            !(negated_immediately || coordinated_negation || stopped_before || policy_prohibition)
         })
     })
 }
@@ -7375,6 +7419,31 @@ async fn deliver_remote_build_terminal_wake(
             | MissionStatus::Blocked
             | MissionStatus::NotFeasible
     ) {
+        let actor_still_owns_run = if let Some(session) = live_session.as_ref() {
+            control_actor_mission_run(&session.cmd_tx, receipt.mission_id)
+                .await?
+                .is_some()
+        } else {
+            false
+        };
+        if !actor_still_owns_run {
+            if let Some(run) = owner
+                .mission_store
+                .get_active_mission_run(receipt.mission_id)
+                .await?
+            {
+                if run.execution_state == MissionExecutionState::WaitingRemoteJob {
+                    owner
+                        .mission_store
+                        .finish_mission_run(
+                            run.run_id,
+                            run.generation,
+                            Some("remote_build_terminal_after_mission_parked"),
+                        )
+                        .await?;
+                }
+            }
+        }
         let event = AgentEvent::AssistantMessage {
             id: Uuid::new_v5(
                 &Uuid::NAMESPACE_URL,
@@ -15259,7 +15328,10 @@ async fn control_actor_loop(
                                 }
                             }
                         }
-                        queue.push_back((id, content, msg_agent, target_mission_id, source.clone()));
+                        enqueue_control_message(
+                            &mut queue,
+                            (id, content, msg_agent, target_mission_id, source.clone()),
+                        );
                         // `Queued` is an acceptance acknowledgement. Persist the
                         // message before sending it so a crash cannot lose an
                         // outbox delivery that its producer has already retired.
@@ -22989,6 +23061,32 @@ mod tests {
             None,
             Some("Do not commit or push; fix the failing branch")
         ));
+        assert!(inferred_pr_writer(
+            None,
+            None,
+            Some("Fix the prohibited dependency usage")
+        ));
+        assert!(inferred_pr_writer(
+            None,
+            None,
+            Some("Implement the banned-import repair")
+        ));
+        assert!(!inferred_pr_writer(
+            None,
+            None,
+            Some("Merge prohibited by policy")
+        ));
+        assert!(!inferred_pr_writer(None, None, Some("Push forbidden")));
+        assert!(!inferred_pr_writer(
+            None,
+            None,
+            Some("Merging is currently prohibited")
+        ));
+        assert!(!inferred_pr_writer(
+            None,
+            None,
+            Some("Push is temporarily forbidden")
+        ));
         assert!(!inferred_pr_writer(
             None,
             Some("read_only_audit"),
@@ -23025,6 +23123,52 @@ mod tests {
             Some("read_only_audit"),
             None
         ));
+    }
+
+    #[test]
+    fn remote_terminal_wake_precedes_parked_user_followups() {
+        let mission_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let wake_id = Uuid::new_v4();
+        let mut queue = VecDeque::new();
+        enqueue_control_message(
+            &mut queue,
+            (
+                user_id,
+                "user follow-up".to_string(),
+                None,
+                Some(mission_id),
+                None,
+            ),
+        );
+        enqueue_control_message(
+            &mut queue,
+            (
+                wake_id,
+                "terminal receipt".to_string(),
+                None,
+                Some(mission_id),
+                Some("remote-build-terminal".to_string()),
+            ),
+        );
+
+        assert_eq!(queue.pop_front().map(|entry| entry.0), Some(wake_id));
+        assert_eq!(queue.pop_front().map(|entry| entry.0), Some(user_id));
+    }
+
+    #[test]
+    fn startup_recovery_prefers_submission_order_over_completion_order() {
+        let older_started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let newer_started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+
+        assert!(
+            crate::remote_node::job_ledger::validation_order(2, newer_started_at)
+                > crate::remote_node::job_ledger::validation_order(1, older_started_at)
+        );
+        assert!(
+            crate::remote_node::job_ledger::validation_order(0, newer_started_at)
+                > crate::remote_node::job_ledger::validation_order(0, older_started_at)
+        );
     }
 
     #[tokio::test]

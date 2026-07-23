@@ -161,7 +161,10 @@ pub enum TerminalWakeDisposition {
     SupersededBy(Uuid),
 }
 
-fn validation_order(sequence: u64, started_at: chrono::DateTime<chrono::Utc>) -> (u64, i64) {
+pub(crate) fn validation_order(
+    sequence: u64,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> (u64, i64) {
     (sequence, started_at.timestamp_micros())
 }
 
