@@ -228,7 +228,12 @@ impl AgentResult {
 
     /// Add additional data to the result.
     pub fn with_data(mut self, data: serde_json::Value) -> Self {
-        self.data = Some(data);
+        match (self.data.as_mut(), data) {
+            (Some(serde_json::Value::Object(existing)), serde_json::Value::Object(additional)) => {
+                existing.extend(additional);
+            }
+            (_, replacement) => self.data = Some(replacement),
+        }
         self
     }
 
@@ -373,6 +378,24 @@ mod tests {
         assert_eq!(data["native_terminal_seen"], true);
         assert_eq!(data["classification_source"], "structured");
         assert_eq!(data["turn_outcome"]["outcome"], "complete");
+    }
+
+    #[test]
+    fn additional_object_data_preserves_turn_outcome_metadata() {
+        let result = AgentResult::success("done", 0)
+            .with_turn_outcome(TurnOutcome::Complete {
+                signal: CompletionSignal::NativeTerminal,
+                confidence: CompletionConfidence::High,
+                message: None,
+            })
+            .with_data(serde_json::json!({
+                "transport_failure_stage": "pending_tools"
+            }));
+
+        let data = result.data.expect("metadata");
+        assert_eq!(data["turn_outcome"]["outcome"], "complete");
+        assert_eq!(data["completion_signal"], "native_terminal");
+        assert_eq!(data["transport_failure_stage"], "pending_tools");
     }
 
     #[test]

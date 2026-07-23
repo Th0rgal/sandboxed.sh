@@ -802,13 +802,44 @@ async fn equivalent_remote_validation_response(
                 job_id = %receipt.job_id,
                 "reusing successful immutable remote validation receipt"
             );
-            let response = remote_build_status_from_receipt(
-                req.mission_id,
-                req.expected_head.as_deref(),
-                receipt,
-                true,
-            );
-            Some((StatusCode::OK, Json(response)).into_response())
+            if req.wait {
+                let duration_secs = (receipt.finished_at - receipt.started_at)
+                    .num_seconds()
+                    .max(0) as u64;
+                let state = if receipt.state == "succeeded"
+                    && req
+                        .expected_head
+                        .as_deref()
+                        .is_some_and(|head| head != receipt.identity.commit)
+                {
+                    "stale_success".to_string()
+                } else {
+                    receipt.state
+                };
+                Some(
+                    (
+                        StatusCode::OK,
+                        Json(RemoteBuildWaitResponse {
+                            exit_code: receipt.exit_status,
+                            state,
+                            duration_secs,
+                            log_tail: "reused durable terminal receipt".to_string(),
+                            node_id: receipt.node_id,
+                            job_id: receipt.job_id,
+                            artifacts: Vec::new(),
+                        }),
+                    )
+                        .into_response(),
+                )
+            } else {
+                let response = remote_build_status_from_receipt(
+                    req.mission_id,
+                    req.expected_head.as_deref(),
+                    receipt,
+                    true,
+                );
+                Some((StatusCode::OK, Json(response)).into_response())
+            }
         }
         Ok(Some(crate::remote_node::job_ledger::EquivalentRemoteValidation::Active(handle))) => {
             Some(

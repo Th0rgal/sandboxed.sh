@@ -89,4 +89,23 @@ describe("HermesThread", () => {
     expect(composer).toHaveValue("Review active missions");
     expect(screen.getByRole("button", { name: "Retry" })).toBeVisible();
   });
+
+  test("preserves retry when Hermes reports an in-stream failure", async () => {
+    mockedHermesChatStream.mockImplementationOnce(
+      async (_sessionId, _message, handlers) => {
+        handlers.onError("Provider disconnected");
+      },
+    );
+    render(<HermesThread />);
+
+    const composer = screen.getByPlaceholderText("Message Hermes…");
+    fireEvent.change(composer, { target: { value: "Resume the mission" } });
+    fireEvent.click(screen.getByTitle("Send"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Provider disconnected",
+    );
+    expect(composer).toHaveValue("Resume the mission");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeVisible();
+  });
 });
