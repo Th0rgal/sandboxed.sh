@@ -4487,6 +4487,7 @@ fn remote_build_handle_proves_liveness(
 ) -> bool {
     if handle.kind != crate::remote_node::job_ledger::JobHandleKind::RemoteBuild
         || handle.accepted_at.is_none()
+        || !handle.expects_mission_continuation()
     {
         return false;
     }
@@ -4507,7 +4508,47 @@ async fn mission_has_unresolved_remote_build(
     else {
         return false;
     };
-    current_handle.wake_on_terminal
+    current_handle.expects_mission_continuation()
+}
+
+async fn recoverable_inherited_remote_wait(
+    working_dir: &std::path::Path,
+    mission_id: Uuid,
+    execution_state: MissionExecutionState,
+    mission_status: MissionStatus,
+) -> anyhow::Result<Option<Uuid>> {
+    if execution_state != MissionExecutionState::WaitingRemoteJob
+        || mission_status != MissionStatus::Active
+    {
+        return Ok(None);
+    }
+    if let Some(handle) =
+        crate::remote_node::job_ledger::current_remote_build_wait_handle(working_dir, mission_id)
+            .await?
+    {
+        return Ok(handle
+            .expects_mission_continuation()
+            .then_some(handle.job_id));
+    }
+
+    // `finalize` atomically moves a terminal job from the active ledger to
+    // the receipt outbox. A crash after that move but before delivery leaves
+    // no handle, yet the pending receipt still owns the mission continuation.
+    let receipt =
+        crate::remote_node::job_ledger::recoverable_terminal_continuations(working_dir, mission_id)
+            .await?
+            .into_iter()
+            .max_by_key(|receipt| receipt.finished_at);
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    if crate::remote_node::job_ledger::require_terminal_receipt_wake(working_dir, receipt.job_id)
+        .await?
+    {
+        Ok(Some(receipt.job_id))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn arm_unresolved_remote_build_wake(working_dir: &std::path::Path, mission_id: Uuid) -> bool {
@@ -7136,6 +7177,17 @@ pub(crate) async fn ensure_remote_build_wait(
         );
         return Ok(false);
     }
+    if !current_job
+        .as_ref()
+        .is_some_and(|handle| handle.expects_mission_continuation())
+    {
+        tracing::debug!(
+            %mission_id,
+            %job_id,
+            "fire-and-forget remote build retained without a mission wait lease"
+        );
+        return Ok(false);
+    }
     let Some((owner, _)) = remote_build_wait_owner(state, mission_id).await? else {
         return Ok(false);
     };
@@ -7644,6 +7696,7 @@ async fn dispatch_remote_job(
             disk_reservation_bytes: 0,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
             identity: None,
+            wait_for_completion: None,
             wake_on_terminal: false,
         },
     )
@@ -7693,6 +7746,7 @@ async fn dispatch_remote_job(
             disk_reservation_bytes: 0,
             kind: crate::remote_node::job_ledger::JobHandleKind::Mission,
             identity: None,
+            wait_for_completion: None,
             wake_on_terminal: false,
         },
     )
@@ -7992,20 +8046,24 @@ async fn reconcile_pending_handles(
                 continue;
             }
             if handle.kind == crate::remote_node::job_ledger::JobHandleKind::RemoteBuild {
-                if let Err(error) = crate::remote_node::job_ledger::require_terminal_wake(
-                    working_dir,
-                    handle.job_id,
-                )
-                .await
-                {
-                    tracing::warn!(job_id = %handle.job_id, ?error, "recovered remote build wake requirement could not be persisted");
-                    continue;
-                }
-                if let Err(error) =
-                    ensure_remote_build_wait(state.as_ref(), handle.mission_id, handle.job_id).await
-                {
-                    tracing::warn!(mission_id = %handle.mission_id, job_id = %handle.job_id, %error, "recovered remote build run lease could not be reconciled");
-                    continue;
+                let expects_continuation = handle.expects_mission_continuation();
+                if expects_continuation {
+                    if let Err(error) = crate::remote_node::job_ledger::require_terminal_wake(
+                        working_dir,
+                        handle.job_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(job_id = %handle.job_id, ?error, "recovered remote build wake requirement could not be persisted");
+                        continue;
+                    }
+                    if let Err(error) =
+                        ensure_remote_build_wait(state.as_ref(), handle.mission_id, handle.job_id)
+                            .await
+                    {
+                        tracing::warn!(mission_id = %handle.mission_id, job_id = %handle.job_id, %error, "recovered remote build run lease could not be reconciled");
+                        continue;
+                    }
                 }
                 let node = state.config.remote_nodes.node(&handle.node_id).cloned();
                 let shared_token = node
@@ -8024,6 +8082,7 @@ async fn reconcile_pending_handles(
                                 handle.mission_id,
                                 handle.job_id,
                                 handle.started_at,
+                                expects_continuation,
                             )
                             .await;
                         });
@@ -8162,6 +8221,7 @@ async fn poll_recovered_remote_build(
     mission_id: Uuid,
     job_id: Uuid,
     started_at: chrono::DateTime<chrono::Utc>,
+    expects_continuation: bool,
 ) {
     let working_dir = state.config.working_dir.clone();
     let client = crate::remote_node::RemoteNodeClient::default();
@@ -8215,8 +8275,10 @@ async fn poll_recovered_remote_build(
                 {
                     tracing::warn!(%job_id, ?error, "recovered remote build heartbeat persistence failed");
                 }
-                if let Err(error) = ensure_remote_build_wait(&state, mission_id, job_id).await {
-                    tracing::warn!(%mission_id, %job_id, %error, "recovered remote build mission lease heartbeat failed");
+                if expects_continuation {
+                    if let Err(error) = ensure_remote_build_wait(&state, mission_id, job_id).await {
+                        tracing::warn!(%mission_id, %job_id, %error, "recovered remote build mission lease heartbeat failed");
+                    }
                 }
             }
             Err(_) => {}
@@ -13699,6 +13761,63 @@ async fn control_actor_loop(
     // below re-drives task-mode missions (assistant-mode missions remain idle).
     if let Ok(inherited_runs) = mission_store.list_active_mission_runs().await {
         for run in inherited_runs {
+            if run.execution_state == MissionExecutionState::WaitingRemoteJob {
+                let mission_status = match mission_store.get_mission(run.mission_id).await {
+                    Ok(Some(mission)) => mission.status,
+                    Ok(None) => MissionStatus::Interrupted,
+                    Err(error) => {
+                        // Do not destroy detached work while its presentation
+                        // status cannot be read. The remote reconciler will
+                        // retry once the store is available.
+                        tracing::warn!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            %error,
+                            "Control actor startup: mission status unavailable; preserving wait lease"
+                        );
+                        continue;
+                    }
+                };
+                match recoverable_inherited_remote_wait(
+                    &config.working_dir,
+                    run.mission_id,
+                    run.execution_state,
+                    mission_status,
+                )
+                .await
+                {
+                    Ok(Some(job_id)) => {
+                        tracing::info!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            generation = run.generation,
+                            %job_id,
+                            "Control actor startup: preserving recoverable remote-build wait lease"
+                        );
+                        continue;
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            "Control actor startup: remote wait has no accepted ledger handle; interrupting stale lease"
+                        );
+                    }
+                    Err(error) => {
+                        // The ledger is execution truth for detached remote
+                        // work. Fail closed and let its reconciler retry rather
+                        // than destroying a possibly-live lease on a transient
+                        // read failure.
+                        tracing::warn!(
+                            mission_id = %run.mission_id,
+                            run_id = %run.run_id,
+                            %error,
+                            "Control actor startup: remote job ledger unavailable; preserving wait lease"
+                        );
+                        continue;
+                    }
+                }
+            }
             let _ = mission_store
                 .finish_mission_run(run.run_id, run.generation, Some("server_shutdown"))
                 .await;
@@ -22437,6 +22556,7 @@ mod tests {
             disk_reservation_bytes: 0,
             kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
             identity: None,
+            wait_for_completion: Some(true),
             wake_on_terminal: false,
         };
         assert!(remote_build_handle_proves_liveness(&handle, now));
@@ -22445,6 +22565,9 @@ mod tests {
         handle.heartbeat_at = Some(now - chrono::Duration::seconds(1));
         assert!(remote_build_handle_proves_liveness(&handle, now));
         handle.kind = crate::remote_node::job_ledger::JobHandleKind::Mission;
+        assert!(!remote_build_handle_proves_liveness(&handle, now));
+        handle.kind = crate::remote_node::job_ledger::JobHandleKind::RemoteBuild;
+        handle.wait_for_completion = Some(false);
         assert!(!remote_build_handle_proves_liveness(&handle, now));
     }
 
@@ -22465,6 +22588,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
                 identity: None,
+                wait_for_completion: None,
                 wake_on_terminal: true,
             },
         )
@@ -22489,14 +22613,15 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
                 identity: None,
+                wait_for_completion: Some(true),
                 wake_on_terminal: false,
             },
         )
         .await
         .unwrap();
         assert!(
-            !mission_has_unresolved_remote_build(dir.path(), synchronous_mission_id).await,
-            "a synchronous waiter must not park a second mission continuation"
+            mission_has_unresolved_remote_build(dir.path(), synchronous_mission_id).await,
+            "a synchronous waiter must keep its mission continuation recoverable"
         );
         crate::remote_node::job_ledger::require_terminal_wake(dir.path(), synchronous_job_id)
             .await
@@ -22529,6 +22654,7 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
                 identity: None,
+                wait_for_completion: None,
                 wake_on_terminal: true,
             },
         )
@@ -22545,6 +22671,204 @@ mod tests {
             .await
             .unwrap();
         assert!(!mission_should_park_on_remote_build(&store, dir.path(), mission.id).await);
+    }
+
+    #[tokio::test]
+    async fn actor_startup_preserves_only_ledger_backed_remote_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        crate::remote_node::job_ledger::record(
+            dir.path(),
+            crate::remote_node::job_ledger::JobHandle {
+                mission_id,
+                node_id: "node-a".to_string(),
+                job_id,
+                started_at: chrono::Utc::now(),
+                submission_sequence: 0,
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: Some(chrono::Utc::now()),
+                disk_reservation_bytes: 0,
+                kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
+                identity: Some(crate::remote_node::job_ledger::RemoteJobIdentity {
+                    repository: "https://example.invalid/repo.git".to_string(),
+                    commit: "abc123".to_string(),
+                    cwd_rel_known: true,
+                    cwd_rel: None,
+                    command: vec!["lake".to_string(), "build".to_string()],
+                    artifacts: Vec::new(),
+                    toolchain: Some("leanprover/lean4:v4.24.0".to_string()),
+                    source_bundle_digest: None,
+                }),
+                wait_for_completion: Some(true),
+                wake_on_terminal: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            recoverable_inherited_remote_wait(
+                dir.path(),
+                mission_id,
+                MissionExecutionState::WaitingRemoteJob,
+                MissionStatus::Active,
+            )
+            .await
+            .unwrap(),
+            Some(job_id)
+        );
+        assert_eq!(
+            recoverable_inherited_remote_wait(
+                dir.path(),
+                mission_id,
+                MissionExecutionState::Running,
+                MissionStatus::Active,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            recoverable_inherited_remote_wait(
+                dir.path(),
+                Uuid::new_v4(),
+                MissionExecutionState::WaitingRemoteJob,
+                MissionStatus::Active,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            recoverable_inherited_remote_wait(
+                dir.path(),
+                mission_id,
+                MissionExecutionState::WaitingRemoteJob,
+                MissionStatus::Paused,
+            )
+            .await
+            .unwrap(),
+            None,
+            "an operator-paused mission must not be resurrected on restart"
+        );
+
+        let fire_and_forget_mission_id = Uuid::new_v4();
+        crate::remote_node::job_ledger::record(
+            dir.path(),
+            crate::remote_node::job_ledger::JobHandle {
+                mission_id: fire_and_forget_mission_id,
+                node_id: "node-b".to_string(),
+                job_id: Uuid::new_v4(),
+                started_at: chrono::Utc::now(),
+                submission_sequence: 0,
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: Some(chrono::Utc::now()),
+                disk_reservation_bytes: 0,
+                kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
+                identity: None,
+                wait_for_completion: Some(false),
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recoverable_inherited_remote_wait(
+                dir.path(),
+                fire_and_forget_mission_id,
+                MissionExecutionState::WaitingRemoteJob,
+                MissionStatus::Active,
+            )
+            .await
+            .unwrap(),
+            None,
+            "fire-and-forget jobs must not arm a continuation after restart"
+        );
+
+        let finalized_sync_mission_id = Uuid::new_v4();
+        let finalized_sync_job_id = Uuid::new_v4();
+        crate::remote_node::job_ledger::record(
+            dir.path(),
+            crate::remote_node::job_ledger::JobHandle {
+                mission_id: finalized_sync_mission_id,
+                node_id: "node-c".to_string(),
+                job_id: finalized_sync_job_id,
+                started_at: chrono::Utc::now(),
+                submission_sequence: 0,
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: Some(chrono::Utc::now()),
+                disk_reservation_bytes: 0,
+                kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
+                identity: Some(crate::remote_node::job_ledger::RemoteJobIdentity {
+                    repository: "https://example.invalid/repo.git".to_string(),
+                    commit: "def456".to_string(),
+                    cwd_rel_known: true,
+                    cwd_rel: None,
+                    command: vec!["lake".to_string(), "build".to_string()],
+                    artifacts: Vec::new(),
+                    toolchain: Some("leanprover/lean4:v4.24.0".to_string()),
+                    source_bundle_digest: None,
+                }),
+                wait_for_completion: Some(true),
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(crate::remote_node::job_ledger::finalize(
+            dir.path(),
+            finalized_sync_job_id,
+            "succeeded",
+            Some(0),
+        )
+        .await
+        .unwrap());
+        assert!(
+            crate::remote_node::job_ledger::pending_terminal_wakes(dir.path())
+                .await
+                .unwrap()
+                .iter()
+                .all(|receipt| receipt.job_id != finalized_sync_job_id),
+            "normal synchronous completion must not race its HTTP result with a wake"
+        );
+        assert_eq!(
+            recoverable_inherited_remote_wait(
+                dir.path(),
+                finalized_sync_mission_id,
+                MissionExecutionState::WaitingRemoteJob,
+                MissionStatus::Active,
+            )
+            .await
+            .unwrap(),
+            Some(finalized_sync_job_id),
+            "startup must arm a terminal receipt when the synchronous wait lease survived"
+        );
+        assert!(
+            crate::remote_node::job_ledger::pending_terminal_wakes(dir.path())
+                .await
+                .unwrap()
+                .iter()
+                .any(|receipt| receipt.job_id == finalized_sync_job_id)
+        );
+
+        assert!(
+            crate::remote_node::job_ledger::finalize(dir.path(), job_id, "succeeded", Some(0),)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            recoverable_inherited_remote_wait(
+                dir.path(),
+                mission_id,
+                MissionExecutionState::WaitingRemoteJob,
+                MissionStatus::Active,
+            )
+            .await
+            .unwrap(),
+            Some(job_id),
+            "an undelivered terminal receipt must survive actor startup cleanup"
+        );
     }
 
     #[test]

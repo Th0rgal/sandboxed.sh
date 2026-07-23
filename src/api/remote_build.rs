@@ -310,6 +310,12 @@ pub struct RemoteBuildRequest {
     /// `{job_id, node_id}` immediately; poll `GET /api/remote-build/:job_id`.
     #[serde(default = "default_wait")]
     pub wait: bool,
+    /// Keep the owning mission attached to an asynchronous HTTP submission.
+    /// The bundled wrapper sets this because it requests a job id with
+    /// `wait=false` but continues polling inside the harness tool. Plain
+    /// fire-and-forget clients leave it false.
+    #[serde(default)]
+    pub resume_mission_on_terminal: bool,
     /// Artifact patterns (relative to the checkout root) to digest after a
     /// successful build.
     #[serde(default)]
@@ -838,6 +844,7 @@ async fn submit_remote_build(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RemoteBuildRequest>,
 ) -> axum::response::Response {
+    let expects_mission_continuation = req.wait || req.resume_mission_on_terminal;
     // Auth: per-mission, scope-bound capability token (NOT the dashboard JWT
     // and NOT a node bearer token) — a leak only authorizes remote builds
     // for this one mission. Same trust model as the spark offload endpoint.
@@ -963,6 +970,7 @@ async fn submit_remote_build(
             disk_reservation_bytes: req.estimated_disk_bytes,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
             identity: Some(identity.clone()),
+            wait_for_completion: Some(expects_mission_continuation),
             wake_on_terminal: false,
         },
     )
@@ -1041,6 +1049,7 @@ async fn submit_remote_build(
             disk_reservation_bytes: req.estimated_disk_bytes,
             kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
             identity: Some(identity.clone()),
+            wait_for_completion: Some(expects_mission_continuation),
             // The bundled wrapper uses the asynchronous HTTP API but keeps
             // polling synchronously inside the harness tool. The control
             // actor arms terminal wake-up only if that turn actually ends
@@ -1067,6 +1076,19 @@ async fn submit_remote_build(
             format!("remote build accepted but recovery handle could not be persisted: {err}"),
         )
             .into_response();
+    }
+
+    if expects_mission_continuation {
+        if let Err(error) =
+            super::control::ensure_remote_build_wait(&state, req.mission_id, job_id).await
+        {
+            tracing::warn!(
+                mission_id = %req.mission_id,
+                %job_id,
+                %error,
+                "synchronous remote build wait lease could not be recorded"
+            );
+        }
     }
 
     if !req.wait {
@@ -1469,6 +1491,7 @@ mod tests {
             disk_reservation_bytes: 12 * GIB,
             kind: crate::remote_node::job_ledger::JobHandleKind::Tentative,
             identity: None,
+            wait_for_completion: None,
             wake_on_terminal: false,
         };
 
@@ -1705,6 +1728,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
                     toolchain: Some("leanprover/lean4:v4.19.0".to_string()),
                     source_bundle_digest: None,
                 },
+                continuation_expected: false,
                 wake_required: false,
                 wake_delivered_at: None,
                 wake_suppressed_by: None,
@@ -1742,6 +1766,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         assert_eq!(req.requirements, vec!["lean".to_string()]);
         assert_eq!(req.cwd_rel, None);
         assert_eq!(req.timeout_secs, None);
+        assert!(!req.resume_mission_on_terminal);
         assert_eq!(req.estimated_disk_bytes, 12 * GIB);
         assert!(req.source_bundle.is_none());
         assert!(req.artifacts.is_empty());
@@ -1757,11 +1782,13 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             "requirements": ["lean", "bigmem"],
             "node_id": "babylon",
             "wait": false,
+            "resume_mission_on_terminal": true,
             "artifacts": [".lake/build/lib/*"],
         }))
         .unwrap();
         assert_eq!(req.node_id, "babylon");
         assert!(!req.wait);
+        assert!(req.resume_mission_on_terminal);
         assert_eq!(req.requirements, vec!["lean", "bigmem"]);
         assert_eq!(req.cwd_rel.as_deref(), Some("verity"));
         assert_eq!(req.timeout_secs, Some(1200));
