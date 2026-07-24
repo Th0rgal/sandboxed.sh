@@ -71,6 +71,22 @@ No output means every monitored filesystem is reachable and below its alert
 threshold. The current cron job ID is `6bfc537e6dc9`; a manual cron execution
 must also finish successfully before closing the incident.
 
+DGX is the one sentinel target that depends on the control plane's Tailscale
+service. If only `dgx-spark` is unknown, verify the route before changing SSH
+keys or adding a relay:
+
+```bash
+systemctl is-enabled tailscaled
+systemctl is-active tailscaled
+tailscale ping -c 2 100.77.4.93
+```
+
+`tailscaled` must be both enabled and active on `agent-core`. Recover the
+expected persisted service with `systemctl enable --now tailscaled`, then
+require all three checks to pass: Tailscale ping, strict-host-key SSH to DGX,
+and a silent `disk-sentinel.sh` run. Never restore the retired `old-agent`
+tunnel to mask a stopped local Tailscale service.
+
 | Service | Port | Domain | Binary |
 |---------|------|--------|--------|
 | `sandboxed-sh-prod` | 3000 | agent-backend.thomas.md | `/usr/local/bin/sandboxed-sh-prod` |
