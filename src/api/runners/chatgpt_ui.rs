@@ -202,6 +202,8 @@ pub async fn run_chatgpt_ui_turn(
                 .with_terminal_reason(TerminalReason::LlmError)
         }
     };
+    #[cfg(unix)]
+    let process_group = child.id().map(|pid| -(pid as i32));
 
     let request = serde_json::json!({
         "type": "run",
@@ -379,6 +381,14 @@ pub async fn run_chatgpt_ui_turn(
                 .with_terminal_reason(TerminalReason::LlmError);
         }
     };
+    // A well-behaved driver closes its browser before exiting, but enforce
+    // that boundary even if it leaves descendants behind after a clean exit.
+    #[cfg(unix)]
+    if let Some(process_group) = process_group {
+        unsafe {
+            libc::kill(process_group, libc::SIGKILL);
+        }
+    }
     if let Err(message) = validate_completion(
         completed,
         &output,

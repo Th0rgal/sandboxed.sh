@@ -7378,6 +7378,33 @@ fn resolve_host_executable(program: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+fn host_executable_available(program: &str) -> bool {
+    let executable = if std::path::Path::new(program).components().count() > 1 {
+        let path = std::path::PathBuf::from(program);
+        path.is_file().then_some(path)
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(program))
+                .find(|candidate| candidate.is_file())
+        })
+    };
+    let Some(executable) = executable else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        executable
+            .metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn copy_host_executable_into_container(
     workspace: &crate::workspace::Workspace,
     host_executable: &std::path::Path,
@@ -7800,26 +7827,39 @@ pub async fn check_backend_prerequisites(
                 },
             }
         }
-        "chatgpt_ui" => BackendPreflightResult {
-            backend_id: "chatgpt_ui".to_string(),
-            // Authentication cannot be established without opening a clean
-            // browser page. The turn driver performs that check; preflight
-            // only confirms that the explicitly configured driver exists.
-            available: cli_path.is_some_and(|path| std::path::Path::new(path).is_file()),
-            cli_available: cli_path.is_some_and(|path| std::path::Path::new(path).is_file()),
-            auto_install_possible: false,
-            missing_dependencies: if cli_path
-                .is_some_and(|path| std::path::Path::new(path).is_file())
-            {
-                Vec::new()
-            } else {
-                vec!["configured ChatGPT UI driver".to_string()]
-            },
-            message: Some(
-                "Browser driver presence checked; authentication remains unknown until a clean UI turn"
-                    .to_string(),
-            ),
-        },
+        "chatgpt_ui" => {
+            let driver_available =
+                cli_path.is_some_and(|path| std::path::Path::new(path).is_file());
+            let profile_available = get_backend_string_setting("chatgpt_ui", "profile_dir")
+                .is_some_and(|path| std::path::Path::new(&path).is_dir());
+            let python_path = get_backend_string_setting("chatgpt_ui", "python_path")
+                .unwrap_or_else(|| "python3".to_string());
+            let python_available = host_executable_available(&python_path);
+            let available = driver_available && profile_available && python_available;
+            let mut missing_dependencies = Vec::new();
+            if !driver_available {
+                missing_dependencies.push("configured ChatGPT UI driver".to_string());
+            }
+            if !profile_available {
+                missing_dependencies.push("configured ChatGPT UI profile directory".to_string());
+            }
+            if !python_available {
+                missing_dependencies.push("configured ChatGPT UI Python executable".to_string());
+            }
+            BackendPreflightResult {
+                backend_id: "chatgpt_ui".to_string(),
+                // Authentication cannot be established without opening a
+                // clean browser page. The turn driver performs that check.
+                available,
+                cli_available: available,
+                auto_install_possible: false,
+                missing_dependencies,
+                message: Some(
+                    "Driver, Python executable, and profile directory checked; authentication remains unknown until a clean UI turn"
+                        .to_string(),
+                ),
+            }
+        }
         _ => BackendPreflightResult {
             backend_id: backend_id.to_string(),
             available: false,
