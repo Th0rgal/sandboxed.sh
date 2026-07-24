@@ -41,12 +41,24 @@ export interface HermesMessage {
   reasoning_content?: string | null;
 }
 
+interface HermesSessionsResponse {
+  sessions?: HermesSession[];
+  /** Compatibility with older proxy responses. */
+  data?: HermesSession[];
+}
+
+interface HermesMessagesResponse {
+  messages?: HermesMessage[];
+  /** Compatibility with older proxy responses. */
+  data?: HermesMessage[];
+}
+
 export async function listHermesSessions(limit = 50): Promise<HermesSession[]> {
-  const res = await apiGet<{ data: HermesSession[] }>(
+  const res = await apiGet<HermesSessionsResponse>(
     `${HERMES_PROXY}/api/sessions?source=api_server&limit=${limit}`,
     "Failed to list Hermes sessions",
   );
-  return res.data ?? [];
+  return res.sessions ?? res.data ?? [];
 }
 
 export async function createHermesSession(title?: string): Promise<HermesSession> {
@@ -71,11 +83,11 @@ export async function createHermesSession(title?: string): Promise<HermesSession
 export async function getHermesSessionMessages(
   sessionId: string,
 ): Promise<HermesMessage[]> {
-  const res = await apiGet<{ data: HermesMessage[] }>(
+  const res = await apiGet<HermesMessagesResponse>(
     `${HERMES_PROXY}/api/sessions/${encodeURIComponent(sessionId)}/messages`,
     "Failed to load Hermes session",
   );
-  return res.data ?? [];
+  return res.messages ?? res.data ?? [];
 }
 
 export async function renameHermesSession(

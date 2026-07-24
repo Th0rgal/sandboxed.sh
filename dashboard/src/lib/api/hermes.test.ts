@@ -1,7 +1,12 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
-import { apiFetch } from "./core";
-import { createHermesSession, hermesChatStream } from "./hermes";
+import { apiFetch, apiGet } from "./core";
+import {
+  createHermesSession,
+  getHermesSessionMessages,
+  hermesChatStream,
+  listHermesSessions,
+} from "./hermes";
 
 vi.mock("./core", () => ({
   apiDel: vi.fn(),
@@ -12,10 +17,68 @@ vi.mock("./core", () => ({
 }));
 
 const mockedApiFetch = vi.mocked(apiFetch);
+const mockedApiGet = vi.mocked(apiGet);
 
 describe("Hermes chat stream", () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
+    mockedApiGet.mockReset();
+  });
+
+  test("reads the current Hermes session and message envelopes", async () => {
+    mockedApiGet
+      .mockResolvedValueOnce({
+        sessions: [{ id: "session-1", title: "Production canary" }],
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: 1,
+            session_id: "session-1",
+            role: "assistant",
+            content: "Done",
+          },
+        ],
+      });
+
+    await expect(listHermesSessions()).resolves.toEqual([
+      { id: "session-1", title: "Production canary" },
+    ]);
+    await expect(getHermesSessionMessages("session-1")).resolves.toEqual([
+      {
+        id: 1,
+        session_id: "session-1",
+        role: "assistant",
+        content: "Done",
+      },
+    ]);
+  });
+
+  test("keeps compatibility with legacy data envelopes", async () => {
+    mockedApiGet
+      .mockResolvedValueOnce({ data: [{ id: "session-legacy" }] })
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: 2,
+            role: "user",
+            content: "Hello",
+          },
+        ],
+      });
+
+    await expect(listHermesSessions()).resolves.toEqual([
+      { id: "session-legacy" },
+    ]);
+    await expect(
+      getHermesSessionMessages("session-legacy"),
+    ).resolves.toEqual([
+      {
+        id: 2,
+        role: "user",
+        content: "Hello",
+      },
+    ]);
   });
 
   test("parses valid SSE streams that use CRLF separators", async () => {
