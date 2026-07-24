@@ -70,6 +70,13 @@ async def assert_blank_chat(page) -> None:
         raise RuntimeError("fresh-chat baseline contains prior content")
 
 
+async def close_context_quietly(context) -> None:
+    try:
+        await context.close()
+    except Exception:
+        pass
+
+
 async def establish_fresh_chat(page) -> int:
     """Prove an authenticated, settled blank chat before observing responses."""
     await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60_000)
@@ -192,7 +199,7 @@ async def run(args, request) -> None:
         )
     finally:
         if context is not None:
-            await context.close()
+            await close_context_quietly(context)
 
 
 def main() -> None:
