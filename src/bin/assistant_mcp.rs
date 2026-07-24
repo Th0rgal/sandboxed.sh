@@ -911,7 +911,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "list_mission_shared_files".to_string(),
-                description: "List files and screenshots shared by assistant messages in a sandboxed.sh mission.".to_string(),
+                description: "List files and screenshots shared by assistant messages in a sandboxed.sh mission, including bounded files downloaded from a ChatGPT UI response.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -923,7 +923,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "download_shared_file".to_string(),
-                description: "Download a mission shared file URL to a local /tmp artifact path suitable for email attachments.".to_string(),
+                description: "Download a mission shared file URL to a local /tmp artifact path suitable for inspection or attachments. Use list_mission_shared_files first, including after ChatGPT UI missions that generated files.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id", "url"],
@@ -937,7 +937,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "start_mission".to_string(),
-                description: "Create a new sandboxed.sh mission and send its initial prompt. Set backend explicitly when possible. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Mark PR-changing work with writer=true; the API rejects concurrent writers for the same PR.".to_string(),
+                description: "Create a new sandboxed.sh mission and send its initial prompt. Set backend explicitly when possible. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Mark PR-changing work with writer=true; the API rejects concurrent writers for the same PR.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -946,7 +946,7 @@ impl AssistantMcp {
                         "prompt": {"type": "string"},
                         "workspace_id": {"type": "string"},
                         "backend": {"type": "string", "enum": ["opencode", "claudecode", "codex", "gemini", "grok", "chatgpt_ui"]},
-                        "model_override": {"type": "string", "description": "Exact account-supported model ID. For Codex Terra use gpt-5.6-terra with medium effort. Never invent variants such as gpt-5.5-sol."},
+                        "model_override": {"type": "string", "description": "Exact account-supported model ID. For ChatGPT UI Pro use the canonical ID gpt-5.6-pro; the harness verifies the visible Pro picker option. For Codex Terra use gpt-5.6-terra with medium effort. Never invent variants such as gpt-5.5-sol."},
                         "model_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                         "config_profile": {"type": "string"},
                         "agent": {"type": "string"},

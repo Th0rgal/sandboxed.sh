@@ -12,9 +12,13 @@ state lives only in the dedicated Playwright browser profile configured below.
   model labels, account entitlements, rate limits, and anti-automation controls
   can change without notice.
 - It supports text turns and translates driver text, diagnostic, tool-call,
-  tool-result, completion, and error events. The current ChatGPT web UI does not
-  expose sandboxed.sh's local tools. A response with an unresolved tool call is
-  failed rather than falsely reported complete.
+  tool-result, artifact, completion, and error events. The current ChatGPT web
+  UI does not expose sandboxed.sh's local tools. A response with an unresolved
+  tool call is failed rather than falsely reported complete.
+- Downloadable files in the latest assistant response are copied into the
+  mission workspace and exposed as ordinary sandboxed.sh shared files. A turn
+  accepts at most 8 files and 50 MiB total; paths are canonicalized and must
+  remain inside that mission workspace.
 - Conversation continuation currently sends sandboxed.sh's bounded text
   history in a fresh ChatGPT conversation. It does not persist ChatGPT
   conversation URLs.
@@ -61,7 +65,7 @@ Configure the backend through `PUT /api/backends/chatgpt_ui/config`:
     "headless": false,
     "display": ":93",
     "timeout_secs": 900,
-    "model": "GPT-5.6 Pro"
+    "model": "gpt-5.6-pro"
   }
 }
 ```
@@ -80,11 +84,13 @@ mission.
 
 ## Model selection
 
-Set `model` to the exact label visibly offered by the account. The driver opens
-the model picker and requires an exact text match; it fails with a compatibility
-diagnostic instead of silently substituting another model. A requested label
-being present proves only that the UI exposed and selected that label. It does
-not independently prove backend model identity or deep-research capabilities.
+Use the canonical `gpt-5.6-pro` model ID for ChatGPT Pro. The driver maps it to
+the current visible `Pro` intelligence option, clicks that exact radio item, and
+verifies that the composer picker changed to `Pro`. Other values remain exact
+visible-label lookups for compatibility. Selection failure is terminal; the
+driver never silently substitutes another model. A selected label proves only
+what the account UI exposed and selected, not independent backend model
+identity or deep-research capabilities.
 
 For a one-turn operator smoke test:
 
@@ -94,7 +100,7 @@ CHATGPT_UI_DRIVER=/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py \
 CHATGPT_UI_PROXY=socks5://127.0.0.1:10880 \
 CHATGPT_UI_HEADLESS=false DISPLAY=:93 \
   scripts/chatgpt_ui_smoke.sh \
-  /var/lib/sandboxed-sh/chatgpt-profile "GPT-5.6 Pro"
+  /var/lib/sandboxed-sh/chatgpt-profile gpt-5.6-pro
 ```
 
 Run without a model argument to test the account's current UI default.
@@ -112,7 +118,8 @@ match `proxy_server` when the account requires a stable external egress.
   blank page; directory presence is never treated as proof of authentication.
 - `requested model is not visibly available`: verify the exact current label
   and account entitlement; UI rollouts are account-specific.
-- `compatibility=chatgpt-ui-v1`: the versioned selector contract failed. Capture
+- `compatibility=chatgpt-ui-v2`: the versioned selector/download contract
+  failed. Capture
   only a clean, new chat with no sidebar identity or private history visible.
 - Profile lock errors: close every browser using the profile, or configure a
   separate dedicated profile for each concurrent mission.
@@ -134,6 +141,13 @@ Every turn navigates to a new-chat surface and refuses to send if assistant
 content is already present. Streaming events carry accumulated text snapshots,
 but success requires an explicit `complete` event, a clean driver exit, and
 balanced tool events.
+
+When ChatGPT presents an attached file, the driver follows only scoped artifact
+links or the filename-labelled artifact preview control in the latest assistant
+message. It then activates the preview's exact `Download` action. Arbitrary
+external links and generic page buttons are never followed. The Rust runner
+revalidates every receipt, converts it to a `<file>` tag, and the assistant MCP
+exposes it through `list_mission_shared_files` and `download_shared_file`.
 
 ## Inspiration and provenance
 

@@ -109,9 +109,10 @@ describe('BackendsPage ChatGPT UI settings', () => {
       '/opt/sandboxed-sh/chatgpt-ui-venv/bin/python'
     );
     expect(screen.getByLabelText('X11 display')).toHaveValue(':93');
-    fireEvent.change(screen.getByLabelText('Browser proxy server'), {
-      target: { value: 'socks5://127.0.0.1:10880' },
-    });
+    expect(screen.getByLabelText('Browser proxy server')).toHaveValue(
+      'socks5://127.0.0.1:10880'
+    );
+    expect(screen.getByLabelText('Canonical model ID')).toHaveValue('gpt-5.6-pro');
     expect(screen.getByText('Runtime paths configured')).toBeVisible();
 
     fireEvent.click(screen.getByRole('button', { name: 'Save ChatGPT UI' }));
@@ -125,6 +126,7 @@ describe('BackendsPage ChatGPT UI settings', () => {
           python_path: '/opt/sandboxed-sh/chatgpt-ui-venv/bin/python',
           proxy_server: 'socks5://127.0.0.1:10880',
           display: ':93',
+          model: 'gpt-5.6-pro',
           browser: 'chromium',
           headless: false,
           timeout_secs: 900,

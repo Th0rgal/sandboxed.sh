@@ -5,16 +5,28 @@ Protocol: one JSON request on stdin, NDJSON events on stdout. This helper
 references a profile by path but never reads, enumerates, or exports its files.
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
+import mimetypes
 import re
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-COMPAT_VERSION = "chatgpt-ui-v1"
+COMPAT_VERSION = "chatgpt-ui-v2"
 CHATGPT_URL = "https://chatgpt.com/"
+MAX_DOWNLOAD_FILES = 8
+MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+INTELLIGENCE_LABELS = ("Instant", "5.5", "Medium", "High", "Extra High", "Pro")
+PRO_MODEL_ALIASES = {
+    "gpt-5.6-pro",
+    "gpt 5.6 pro",
+    "gpt-5.6 pro",
+    "gpt 5.6-pro",
+}
 
 
 def emit(event_type: str, **payload) -> None:
@@ -25,12 +37,55 @@ def fail(code: str, message: str) -> None:
     emit("error", code=code, message=message)
 
 
+def model_selection(requested: str) -> tuple[str, str]:
+    """Return the exact visible picker label and canonical model identifier."""
+    normalized = " ".join(requested.strip().lower().split())
+    if normalized in PRO_MODEL_ALIASES:
+        return "Pro", "gpt-5.6-pro"
+    return requested.strip(), requested.strip()
+
+
+async def choose_intelligence_model(page, label: str) -> bool:
+    """Select a current composer intelligence option without touching the sidebar."""
+    picker_buttons = page.locator('button.__composer-pill[aria-haspopup="menu"]')
+    for index in range(await picker_buttons.count()):
+        button = picker_buttons.nth(index)
+        try:
+            if not await button.is_visible():
+                continue
+            current = (await button.inner_text()).strip()
+            if current not in INTELLIGENCE_LABELS:
+                continue
+            await button.click()
+            overlay = page.locator(
+                '[data-testid="composer-intelligence-picker-content"]:visible'
+            ).last
+            await overlay.wait_for(state="visible", timeout=3_000)
+            option = overlay.get_by_role("menuitemradio", name=label, exact=True)
+            await option.wait_for(state="visible", timeout=3_000)
+            await option.click()
+            selected = button.get_by_text(label, exact=True)
+            await selected.wait_for(state="visible", timeout=3_000)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 async def choose_model(page, requested: str) -> str:
-    """Select an exact visible model label; never infer aliases."""
+    """Select a verified current option or exact legacy model label."""
     if not requested:
         return ""
+    visible_label, canonical_model = model_selection(requested)
+    if visible_label in INTELLIGENCE_LABELS and await choose_intelligence_model(
+        page, visible_label
+    ):
+        return canonical_model
+
+    # Legacy ChatGPT rollouts expose a dedicated model picker. Keep this exact
+    # lookup as a compatibility path, but never scan arbitrary buttons whose
+    # aria-label may be a private conversation title.
     candidates = [
-        page.get_by_role("button", name=re.compile(r"(model|chatgpt)", re.I)).first,
         page.locator('[data-testid="model-switcher-dropdown-button"]').first,
     ]
     for candidate in candidates:
@@ -52,13 +107,132 @@ async def choose_model(page, requested: str) -> str:
     for overlay in overlays:
         try:
             if await overlay.is_visible(timeout=1000):
-                option = overlay.get_by_text(requested, exact=True).last
+                option = overlay.get_by_text(visible_label, exact=True).last
                 await option.wait_for(state="visible", timeout=3000)
                 await option.click()
-                return requested
+                return canonical_model
         except Exception:
             continue
     raise RuntimeError("requested model is not visibly available in the model picker")
+
+
+def safe_download_name(value: str, index: int) -> str:
+    basename = Path(value).name.strip()
+    if not basename:
+        basename = f"chatgpt-artifact-{index}"
+    safe = re.sub(r"[^A-Za-z0-9._ -]+", "_", basename).strip(" .")
+    return (safe or f"chatgpt-artifact-{index}")[:180]
+
+
+def downloadable_href(value: str | None) -> bool:
+    if not value:
+        return False
+    if value.startswith(("sandbox:", "blob:")):
+        return True
+    parsed = urlparse(value)
+    host = parsed.netloc.lower()
+    if not host and value.startswith("/"):
+        return "/files/" in parsed.path or "/download" in parsed.path
+    return (
+        host in {"chatgpt.com", "chat.openai.com"}
+        and ("/files/" in parsed.path or "/download" in parsed.path)
+    ) or host.endswith(".oaiusercontent.com")
+
+
+def download_control_key(
+    tag_name: str,
+    href: str | None,
+    aria_label: str | None,
+    class_name: str | None,
+    text: str | None,
+) -> str | None:
+    """Identify a narrowly scoped ChatGPT artifact control."""
+    if tag_name.lower() == "a" and downloadable_href(href):
+        return f"href:{href}"
+    if tag_name.lower() != "button" or "behavior-btn" not in (class_name or "").split():
+        return None
+    label = (aria_label or text or "").strip()
+    # Current ChatGPT artifact entities are buttons labelled with the generated
+    # filename. Requiring a filename suffix avoids clicking generic entity,
+    # citation, or action buttons that happen to share the behavior class.
+    if not label or not Path(label).suffix or "/" in label or "\\" in label:
+        return None
+    return f"button:{label}"
+
+
+async def collect_downloads(page, response, download_dir: Path) -> None:
+    """Download bounded assistant-generated artifacts and emit typed receipts."""
+    controls = response.locator('a[href], button.behavior-btn[aria-label]')
+    seen_controls: set[str] = set()
+    used_names: set[str] = set()
+    total_bytes = 0
+    emitted = 0
+    for index in range(await controls.count()):
+        if emitted >= MAX_DOWNLOAD_FILES:
+            break
+        control = controls.nth(index)
+        tag_name = await control.evaluate("(element) => element.tagName")
+        href = await control.get_attribute("href")
+        aria_label = await control.get_attribute("aria-label")
+        class_name = await control.get_attribute("class")
+        text = await control.inner_text()
+        control_key = download_control_key(
+            tag_name, href, aria_label, class_name, text
+        )
+        if control_key is None or control_key in seen_controls:
+            continue
+        seen_controls.add(control_key)
+        preview_open = False
+        try:
+            if tag_name.lower() == "button":
+                # Current ChatGPT opens an artifact preview first. The preview
+                # owns the actual browser download action.
+                await control.click()
+                preview_open = True
+                download_button = page.get_by_role(
+                    "button", name="Download", exact=True
+                ).last
+                await download_button.wait_for(state="visible", timeout=5_000)
+                async with page.expect_download(timeout=15_000) as pending:
+                    await download_button.click(no_wait_after=True)
+            else:
+                async with page.expect_download(timeout=15_000) as pending:
+                    await control.click(no_wait_after=True)
+            download = await pending.value
+            name = safe_download_name(download.suggested_filename, emitted + 1)
+            stem = Path(name).stem
+            suffix = Path(name).suffix
+            candidate = name
+            duplicate = 2
+            while candidate in used_names or (download_dir / candidate).exists():
+                candidate = safe_download_name(f"{stem}-{duplicate}{suffix}", emitted + 1)
+                duplicate += 1
+            destination = download_dir / candidate
+            await download.save_as(destination)
+            size = destination.stat().st_size
+            if size > MAX_DOWNLOAD_BYTES or total_bytes + size > MAX_DOWNLOAD_BYTES:
+                destination.unlink(missing_ok=True)
+                emit("diagnostic", message="stage=artifact_size_limit")
+                continue
+            total_bytes += size
+            emitted += 1
+            used_names.add(candidate)
+            content_type = mimetypes.guess_type(candidate)[0] or "application/octet-stream"
+            emit(
+                "artifact",
+                path=str(destination),
+                name=candidate,
+                content_type=content_type,
+                size_bytes=size,
+            )
+        except Exception:
+            emit("diagnostic", message="stage=artifact_download_skipped")
+        finally:
+            if preview_open:
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
 
 
 async def assert_blank_chat(page) -> None:
@@ -136,6 +310,15 @@ async def run(args, request) -> None:
         return
     timeout_ms = max(30_000, min(int(request.get("timeout_ms", 900_000)), 7_200_000))
     requested_model = request.get("model") or ""
+    requested_download_dir = request.get("download_dir")
+    download_dir = None
+    if requested_download_dir is not None:
+        candidate = Path(str(requested_download_dir))
+        if not candidate.is_absolute():
+            fail("invalid_request", "download_dir must be an absolute path")
+            return
+        candidate.mkdir(parents=True, exist_ok=True)
+        download_dir = candidate.resolve()
     emit("diagnostic", message=f"compatibility={COMPAT_VERSION}; browser={args.browser}")
 
     context = None
@@ -152,7 +335,10 @@ async def run(args, request) -> None:
                     "headless": args.headless == "true",
                     "viewport": {"width": 1440, "height": 1000},
                     "args": ["--disable-background-networking"],
+                    "accept_downloads": True,
                 }
+                if download_dir is not None:
+                    launch_options["downloads_path"] = str(download_dir)
                 if args.proxy_server:
                     launch_options["proxy"] = {"server": args.proxy_server}
                 context = await browser_type.launch_persistent_context(
@@ -199,6 +385,11 @@ async def run(args, request) -> None:
                 stop = page.get_by_role("button", name=re.compile(r"stop", re.I)).last
                 stop_visible = await stop.count() and await stop.is_visible()
                 if last and count > baseline and not stop_visible and stable >= 2:
+                    if download_dir is not None:
+                        stage = "artifacts"
+                        await collect_downloads(
+                            page, responses.nth(count - 1), download_dir
+                        )
                     emit("complete", content=last, model=model_used or None)
                     return
                 await asyncio.sleep(0.75)
