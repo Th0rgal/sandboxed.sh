@@ -12,7 +12,7 @@ import {
   updateSettings,
   BackendProviderResponse,
 } from '@/lib/api';
-import { Save, Loader, Check, Gauge, Bot } from 'lucide-react';
+import { Save, Loader, Check, Gauge, Bot, KeyRound, ServerCog, WandSparkles } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getRuntimeApiBase, writeSavedSettings } from '@/lib/settings';
 import { ServerConnectionCard } from '@/components/server-connection-card';
@@ -21,6 +21,19 @@ import { useBackendConfigs } from '@/lib/use-backend-configs';
 
 const SETTINGS_BACKEND_IDS = ['opencode', 'claudecode', 'grok', 'chatgpt_ui'] as const;
 type SettingsBackendId = typeof SETTINGS_BACKEND_IDS[number];
+
+const SETTINGS_BACKEND_NAMES: Record<SettingsBackendId, string> = {
+  opencode: 'OpenCode',
+  claudecode: 'Claude Code',
+  grok: 'Grok Build',
+  chatgpt_ui: 'ChatGPT UI (experimental)',
+};
+
+const CHATGPT_UI_PRODUCTION_DEFAULTS = {
+  profile_dir: '/var/lib/sandboxed-sh/chatgpt-profile',
+  driver_path: '/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py',
+  python_path: '/opt/sandboxed-sh/chatgpt-ui-venv/bin/python',
+};
 
 export default function BackendsPage() {
   const [activeBackendTab, setActiveBackendTab] = useState<SettingsBackendId>('opencode');
@@ -115,6 +128,15 @@ export default function BackendsPage() {
   const claudecodeBackendConfig = backendConfigs.claudecode;
   const grokBackendConfig = backendConfigs.grok;
   const chatgptUiBackendConfig = backendConfigs.chatgpt_ui;
+  const configurableBackends = SETTINGS_BACKEND_IDS.map((id) => ({
+    id,
+    name: backends.find((backend) => backend.id === id)?.name || SETTINGS_BACKEND_NAMES[id],
+  }));
+  const chatgptUiIsConfigured = Boolean(
+    chatgptUiForm.profile_dir.trim()
+      && chatgptUiForm.driver_path.trim()
+      && chatgptUiForm.python_path.trim()
+  );
 
   // Fetch Claude Code provider status (Anthropic provider configured for claudecode)
   const { data: claudecodeProvider } = useSWR<BackendProviderResponse>(
@@ -451,7 +473,7 @@ export default function BackendsPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2 mb-4">
-            {backends.map((backend) => (
+            {configurableBackends.map((backend) => (
               <button
                 key={backend.id}
                 onClick={() =>
@@ -606,41 +628,102 @@ export default function BackendsPage() {
               </div>
             </div>
           ) : activeBackendTab === 'chatgpt_ui' ? (
-            <div className="space-y-3">
-              <div className="rounded-lg border border-amber-500/20 bg-amber-500/[0.06] p-3 text-xs text-amber-200/80">
-                Experimental browser automation. Use a dedicated profile, review ChatGPT terms, and never place the profile in a repository or mission workspace.
+            <div className="space-y-4">
+              <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.06] p-4">
+                <div className="flex items-start gap-3">
+                  <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+                  <div>
+                    <p className="text-sm font-medium text-amber-100">Dedicated ChatGPT web login</p>
+                    <p className="mt-1 text-xs leading-5 text-amber-100/60">
+                      This harness does not reuse the OpenAI or Codex OAuth configured in provider settings.
+                      Sign in once inside the dedicated Playwright browser profile; never place that profile
+                      in a repository or mission workspace.
+                    </p>
+                  </div>
+                </div>
               </div>
-              <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
-                <input type="checkbox" checked={chatgptUiForm.enabled} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, enabled: e.target.checked }))} />
-                Enabled
-              </label>
+
+              <div className="flex flex-col gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] p-4 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-3">
+                  <div className={cn(
+                    'flex h-9 w-9 items-center justify-center rounded-lg',
+                    chatgptUiIsConfigured ? 'bg-emerald-500/10' : 'bg-white/[0.04]'
+                  )}>
+                    <ServerCog className={cn(
+                      'h-4 w-4',
+                      chatgptUiIsConfigured ? 'text-emerald-400' : 'text-white/35'
+                    )} />
+                  </div>
+                  <div>
+                    <p className="text-sm text-white">
+                      {chatgptUiIsConfigured ? 'Runtime paths configured' : 'Runtime paths required'}
+                    </p>
+                    <p className="mt-0.5 text-xs text-white/35">
+                      Paths are resolved on the connected Sandboxed.sh server.
+                    </p>
+                  </div>
+                </div>
+                <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={chatgptUiForm.enabled}
+                    onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, enabled: e.target.checked }))}
+                    className="rounded border-white/20 cursor-pointer"
+                  />
+                  Enable harness
+                </label>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">
+                  Server paths
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setChatgptUiForm((prev) => ({
+                    ...prev,
+                    ...CHATGPT_UI_PRODUCTION_DEFAULTS,
+                  }))}
+                  className="flex items-center gap-1.5 rounded-lg border border-indigo-400/20 bg-indigo-400/[0.06] px-2.5 py-1.5 text-xs text-indigo-300 transition-colors hover:bg-indigo-400/[0.1]"
+                >
+                  <WandSparkles className="h-3.5 w-3.5" />
+                  Use production defaults
+                </button>
+              </div>
               <div>
-                <label className="block text-xs text-white/60 mb-1.5">Browser profile directory</label>
-                <input type="text" value={chatgptUiForm.profile_dir} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, profile_dir: e.target.value }))} placeholder="/var/lib/sandboxed-sh/chatgpt-profile" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                <label htmlFor="chatgpt-ui-profile-dir" className="block text-xs text-white/60 mb-1.5">Browser profile directory</label>
+                <input id="chatgpt-ui-profile-dir" type="text" value={chatgptUiForm.profile_dir} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, profile_dir: e.target.value }))} placeholder="/var/lib/sandboxed-sh/chatgpt-profile" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                <p className="mt-1.5 text-xs text-white/30">
+                  Persistent browser state containing the separate chatgpt.com login.
+                </p>
               </div>
               <div>
-                <label className="block text-xs text-white/60 mb-1.5">Driver path</label>
-                <input type="text" value={chatgptUiForm.driver_path} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, driver_path: e.target.value }))} placeholder="/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                <label htmlFor="chatgpt-ui-driver-path" className="block text-xs text-white/60 mb-1.5">Driver path</label>
+                <input id="chatgpt-ui-driver-path" type="text" value={chatgptUiForm.driver_path} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, driver_path: e.target.value }))} placeholder="/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
               </div>
               <div>
-                <label className="block text-xs text-white/60 mb-1.5">Python executable</label>
-                <input type="text" value={chatgptUiForm.python_path} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, python_path: e.target.value }))} placeholder="/opt/sandboxed-sh/chatgpt-ui-venv/bin/python" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                <label htmlFor="chatgpt-ui-python-path" className="block text-xs text-white/60 mb-1.5">Python executable</label>
+                <input id="chatgpt-ui-python-path" type="text" value={chatgptUiForm.python_path} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, python_path: e.target.value }))} placeholder="/opt/sandboxed-sh/chatgpt-ui-venv/bin/python" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
               </div>
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div>
-                  <label className="block text-xs text-white/60 mb-1.5">Exact visible model label</label>
-                  <input type="text" value={chatgptUiForm.model} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, model: e.target.value }))} placeholder="GPT-5.6 Pro" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                  <label htmlFor="chatgpt-ui-model" className="block text-xs text-white/60 mb-1.5">Exact visible model label</label>
+                  <input id="chatgpt-ui-model" type="text" value={chatgptUiForm.model} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, model: e.target.value }))} placeholder="GPT-5.6 Pro" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
                 </div>
                 <div>
-                  <label className="block text-xs text-white/60 mb-1.5">Timeout (seconds)</label>
-                  <input type="number" min={30} max={7200} value={chatgptUiForm.timeout_secs} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, timeout_secs: Number(e.target.value) }))} className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                  <label htmlFor="chatgpt-ui-timeout" className="block text-xs text-white/60 mb-1.5">Timeout (seconds)</label>
+                  <input id="chatgpt-ui-timeout" type="number" min={30} max={7200} value={chatgptUiForm.timeout_secs} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, timeout_secs: Number(e.target.value) }))} className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
                 </div>
               </div>
               <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
                 <input type="checkbox" checked={chatgptUiForm.headless} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, headless: e.target.checked }))} />
                 Headless after interactive login provisioning
               </label>
-              <button onClick={handleSaveChatgptUiBackend} disabled={savingBackend || !chatgptUiForm.profile_dir || !chatgptUiForm.driver_path} className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:opacity-50">
+              <button
+                onClick={handleSaveChatgptUiBackend}
+                disabled={savingBackend || !chatgptUiIsConfigured || chatgptUiForm.timeout_secs < 30 || chatgptUiForm.timeout_secs > 7200}
+                className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+              >
                 {savingBackend ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
                 Save ChatGPT UI
               </button>
