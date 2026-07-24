@@ -1359,7 +1359,11 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile={env_path}
 WorkingDirectory=/var/lib/{runtime_name}
-ExecStart=/usr/local/bin/hermes gateway --accept-hooks run
+ExecStart=/usr/local/bin/hermes gateway run --accept-hooks
+# Hermes distinguishes an operator stop from an unexpected SIGTERM with a
+# short-lived marker. The CLI writes that marker before signalling the gateway,
+# allowing the drain to finish with exit code 0 during systemd stop/restart.
+ExecStop=/usr/local/bin/hermes gateway stop
 Restart=always
 RestartSec=5
 TimeoutStopSec=240
@@ -1375,7 +1379,8 @@ WantedBy=multi-user.target
     )
 }
 
-const HERMES_SERVICE_DRAIN_DROP_IN: &str = "[Service]\nKillMode=mixed\n";
+const HERMES_SERVICE_DRAIN_DROP_IN: &str =
+    "[Service]\nKillMode=mixed\nExecStop=/usr/local/bin/hermes gateway stop\n";
 
 /// Migrate an already-installed Hermes service to the same drain-safe process
 /// policy used by newly generated units.
@@ -1383,6 +1388,9 @@ const HERMES_SERVICE_DRAIN_DROP_IN: &str = "[Service]\nKillMode=mixed\n";
 /// A regular systemd stop signals every process in the service cgroup when the
 /// default `KillMode=control-group` is in effect. That kills `assistant-mcp`
 /// while the Hermes gateway is still draining an in-flight controller turn.
+/// A raw systemd SIGTERM is also classified by Hermes as an unexpected
+/// shutdown and exits non-zero; the explicit CLI stop writes Hermes's planned
+/// stop marker before signalling the gateway.
 /// Installing a drop-in is deliberately narrower than re-running adoption: it
 /// preserves the existing Hermes environment, plugins, credentials, and unit
 /// customizations.
@@ -5361,8 +5369,13 @@ mod tests {
 
         assert!(unit.contains("TimeoutStopSec=240\n"));
         assert!(unit.contains("KillMode=mixed\n"));
+        assert!(unit.contains("ExecStart=/usr/local/bin/hermes gateway run --accept-hooks\n"));
+        assert!(unit.contains("ExecStop=/usr/local/bin/hermes gateway stop\n"));
         assert!(!unit.contains("KillMode=control-group"));
-        assert_eq!(HERMES_SERVICE_DRAIN_DROP_IN, "[Service]\nKillMode=mixed\n");
+        assert_eq!(
+            HERMES_SERVICE_DRAIN_DROP_IN,
+            "[Service]\nKillMode=mixed\nExecStop=/usr/local/bin/hermes gateway stop\n"
+        );
     }
 
     #[tokio::test]
