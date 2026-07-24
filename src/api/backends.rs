@@ -423,14 +423,76 @@ pub async fn update_backend_config(
                     "model label must be at most 200 bytes".to_string(),
                 ));
             }
+            let proxy_server = settings
+                .get("proxy_server")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(proxy_server) = proxy_server {
+                let parsed = url::Url::parse(proxy_server).map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "proxy_server must be a URL".to_string(),
+                    )
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "proxy_server must use http, https, socks5, or socks5h".to_string(),
+                    ));
+                }
+                if !parsed.username().is_empty() || parsed.password().is_some() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "proxy_server must not contain credentials".to_string(),
+                    ));
+                }
+            }
+            let headless = settings
+                .get("headless")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            let display = settings
+                .get("display")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if !headless {
+                let Some(display) = display else {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "display is required when headless is false".to_string(),
+                    ));
+                };
+                let valid = display.strip_prefix(':').is_some_and(|rest| {
+                    let mut parts = rest.split('.');
+                    let number = parts.next().unwrap_or_default();
+                    let screen = parts.next();
+                    !number.is_empty()
+                        && number.chars().all(|character| character.is_ascii_digit())
+                        && screen.is_none_or(|value| {
+                            !value.is_empty()
+                                && value.chars().all(|character| character.is_ascii_digit())
+                        })
+                        && parts.next().is_none()
+                });
+                if !valid {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "display must use X11 syntax such as :93".to_string(),
+                    ));
+                }
+            }
             serde_json::json!({
                 "profile_dir": canonical_profile,
                 "driver_path": driver_path,
                 "python_path": python_path,
                 "browser": browser,
-                "headless": settings.get("headless").and_then(|v| v.as_bool()).unwrap_or(true),
+                "headless": headless,
+                "display": display,
                 "timeout_secs": timeout_secs,
                 "model": model,
+                "proxy_server": proxy_server,
             })
         }
         _ => req.settings.clone(),

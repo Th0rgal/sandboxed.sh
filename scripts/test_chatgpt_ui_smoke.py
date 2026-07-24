@@ -24,6 +24,9 @@ class ChatGptUiSmokeTests(unittest.TestCase):
                 "import json, sys\n"
                 "request = json.loads(sys.stdin.readline())\n"
                 "assert request['model'] == 'Visible model'\n"
+                "assert '--headless' in sys.argv\n"
+                "assert sys.argv[sys.argv.index('--headless') + 1] == 'false'\n"
+                "assert sys.argv[-2:] == ['--proxy-server', 'socks5://127.0.0.1:10880']\n"
                 "print(json.dumps({'type': 'complete', 'content': "
                 "'SANDBOXED_CHATGPT_UI_SMOKE_OK'}))\n",
                 encoding="utf-8",
@@ -33,6 +36,8 @@ class ChatGptUiSmokeTests(unittest.TestCase):
                 **os.environ,
                 "CHATGPT_UI_PYTHON": sys.executable,
                 "CHATGPT_UI_DRIVER": str(driver),
+                "CHATGPT_UI_PROXY": "socks5://127.0.0.1:10880",
+                "CHATGPT_UI_HEADLESS": "false",
             }
 
             completed = subprocess.run(

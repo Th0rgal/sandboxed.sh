@@ -33,6 +33,8 @@ const CHATGPT_UI_PRODUCTION_DEFAULTS = {
   profile_dir: '/var/lib/sandboxed-sh/chatgpt-profile',
   driver_path: '/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py',
   python_path: '/opt/sandboxed-sh/chatgpt-ui-venv/bin/python',
+  display: ':93',
+  headless: false,
 };
 
 export default function BackendsPage() {
@@ -101,6 +103,8 @@ export default function BackendsPage() {
     profile_dir: '',
     driver_path: '',
     python_path: 'python3',
+    proxy_server: '',
+    display: '',
     model: '',
     timeout_secs: 900,
     headless: true,
@@ -183,6 +187,8 @@ export default function BackendsPage() {
       profile_dir: typeof settings.profile_dir === 'string' ? settings.profile_dir : '',
       driver_path: typeof settings.driver_path === 'string' ? settings.driver_path : '',
       python_path: typeof settings.python_path === 'string' ? settings.python_path : 'python3',
+      proxy_server: typeof settings.proxy_server === 'string' ? settings.proxy_server : '',
+      display: typeof settings.display === 'string' ? settings.display : '',
       model: typeof settings.model === 'string' ? settings.model : '',
       timeout_secs: typeof settings.timeout_secs === 'number' ? settings.timeout_secs : 900,
       headless: settings.headless !== false,
@@ -325,6 +331,8 @@ export default function BackendsPage() {
           profile_dir: chatgptUiForm.profile_dir,
           driver_path: chatgptUiForm.driver_path || null,
           python_path: chatgptUiForm.python_path || 'python3',
+          proxy_server: chatgptUiForm.proxy_server || null,
+          display: chatgptUiForm.display || null,
           browser: 'chromium',
           headless: chatgptUiForm.headless,
           timeout_secs: chatgptUiForm.timeout_secs,
@@ -705,6 +713,20 @@ export default function BackendsPage() {
                 <label htmlFor="chatgpt-ui-python-path" className="block text-xs text-white/60 mb-1.5">Python executable</label>
                 <input id="chatgpt-ui-python-path" type="text" value={chatgptUiForm.python_path} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, python_path: e.target.value }))} placeholder="/opt/sandboxed-sh/chatgpt-ui-venv/bin/python" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
               </div>
+              <div>
+                <label htmlFor="chatgpt-ui-proxy-server" className="block text-xs text-white/60 mb-1.5">Browser proxy server</label>
+                <input id="chatgpt-ui-proxy-server" type="text" value={chatgptUiForm.proxy_server} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, proxy_server: e.target.value }))} placeholder="socks5://127.0.0.1:10880" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                <p className="mt-1.5 text-xs text-white/30">
+                  Optional egress proxy for ChatGPT only. Credentials in the URL are rejected.
+                </p>
+              </div>
+              <div>
+                <label htmlFor="chatgpt-ui-display" className="block text-xs text-white/60 mb-1.5">X11 display</label>
+                <input id="chatgpt-ui-display" type="text" value={chatgptUiForm.display} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, display: e.target.value }))} placeholder=":93" disabled={chatgptUiForm.headless} className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50 disabled:opacity-40" />
+                <p className="mt-1.5 text-xs text-white/30">
+                  Required for visible Chromium when anti-bot checks reject headless mode.
+                </p>
+              </div>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div>
                   <label htmlFor="chatgpt-ui-model" className="block text-xs text-white/60 mb-1.5">Exact visible model label</label>
@@ -721,7 +743,7 @@ export default function BackendsPage() {
               </label>
               <button
                 onClick={handleSaveChatgptUiBackend}
-                disabled={savingBackend || !chatgptUiIsConfigured || chatgptUiForm.timeout_secs < 30 || chatgptUiForm.timeout_secs > 7200}
+                disabled={savingBackend || !chatgptUiIsConfigured || (!chatgptUiForm.headless && !chatgptUiForm.display) || chatgptUiForm.timeout_secs < 30 || chatgptUiForm.timeout_secs > 7200}
                 className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {savingBackend ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
