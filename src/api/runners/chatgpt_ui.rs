@@ -46,6 +46,14 @@ enum DriverEvent {
         content: String,
         model: Option<String>,
     },
+    Artifact {
+        path: String,
+        name: String,
+        #[serde(rename = "content_type")]
+        _content_type: String,
+        #[serde(rename = "size_bytes")]
+        _size_bytes: u64,
+    },
     Error {
         code: Option<String>,
         message: String,
@@ -92,6 +100,70 @@ fn lock_profile(profile_dir: &Path) -> Result<ProfileLock, String> {
         "ChatGPT UI profile is already in use; each concurrent mission needs a separate profile directory".to_string()
     })?;
     Ok(ProfileLock(file))
+}
+
+async fn prepare_download_dir(work_dir: &Path) -> Result<PathBuf, String> {
+    let canonical_work_dir = work_dir
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve ChatGPT UI working directory: {error}"))?;
+    let download_dir = work_dir.join("chatgpt-ui-downloads");
+    tokio::fs::create_dir_all(&download_dir)
+        .await
+        .map_err(|error| format!("cannot create ChatGPT UI download directory: {error}"))?;
+    let canonical_download_dir = download_dir
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve ChatGPT UI download directory: {error}"))?;
+    if !canonical_download_dir.starts_with(&canonical_work_dir) {
+        return Err("chatgpt_ui download directory escapes the mission workspace".to_string());
+    }
+    Ok(canonical_download_dir)
+}
+
+fn escape_rich_tag_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn validate_artifact_receipt(
+    work_dir: &Path,
+    path: &str,
+    name: &str,
+) -> Result<(String, u64), String> {
+    const MAX_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
+    let canonical_work_dir = work_dir
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve ChatGPT UI working directory: {error}"))?;
+    let canonical_path = Path::new(path)
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve ChatGPT UI artifact: {error}"))?;
+    if !canonical_path.starts_with(&canonical_work_dir) || !canonical_path.is_file() {
+        return Err("chatgpt_ui artifact path is outside the mission workspace".to_string());
+    }
+    let metadata = canonical_path
+        .metadata()
+        .map_err(|error| format!("cannot inspect ChatGPT UI artifact: {error}"))?;
+    if metadata.len() > MAX_ARTIFACT_BYTES {
+        return Err("chatgpt_ui artifact exceeds the 50 MiB limit".to_string());
+    }
+    let relative = canonical_path
+        .strip_prefix(&canonical_work_dir)
+        .map_err(|_| "chatgpt_ui artifact path is outside the mission workspace".to_string())?;
+    let display_name = Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("chatgpt-artifact");
+    Ok((
+        format!(
+            r#"<file path="{}" name="{}" />"#,
+            escape_rich_tag_attribute(&relative.to_string_lossy()),
+            escape_rich_tag_attribute(display_name),
+        ),
+        metadata.len(),
+    ))
 }
 
 fn parse_bool_setting(key: &str, default: bool) -> bool {
@@ -225,6 +297,12 @@ pub async fn run_chatgpt_ui_turn(
             return AgentResult::failure(error, 0).with_terminal_reason(TerminalReason::LlmError)
         }
     };
+    let download_dir = match prepare_download_dir(work_dir).await {
+        Ok(path) => path,
+        Err(error) => {
+            return AgentResult::failure(error, 0).with_terminal_reason(TerminalReason::LlmError)
+        }
+    };
 
     let mut command = Command::new(&settings.python_path);
     command
@@ -268,6 +346,7 @@ pub async fn run_chatgpt_ui_turn(
         "message": message,
         "model": model,
         "timeout_ms": settings.timeout.as_millis() as u64,
+        "download_dir": download_dir,
     });
     if let Some(mut stdin) = child.stdin.take() {
         if stdin
@@ -286,6 +365,7 @@ pub async fn run_chatgpt_ui_turn(
     let mut output = String::new();
     let mut model_used = model.map(str::to_string);
     let mut pending_tools: HashMap<String, String> = HashMap::new();
+    let mut artifact_receipts: Vec<(String, String)> = Vec::new();
     let mut completed = false;
     let deadline_at = Instant::now() + settings.timeout;
     let deadline = tokio::time::sleep_until(deadline_at);
@@ -365,6 +445,9 @@ pub async fn run_chatgpt_ui_turn(
                         completed = true;
                         break;
                     }
+                    DriverEvent::Artifact { path, name, .. } => {
+                        artifact_receipts.push((path, name));
+                    }
                     DriverEvent::Error { code, message } => {
                         let reason = if code.as_deref() == Some("auth_required") {
                             TerminalReason::AuthError
@@ -373,8 +456,21 @@ pub async fn run_chatgpt_ui_turn(
                         } else {
                             TerminalReason::LlmError
                         };
+                        let failure_class = match reason {
+                            TerminalReason::AuthError => crate::agents::FailureClass::AuthError,
+                            TerminalReason::RateLimited => {
+                                crate::agents::FailureClass::RateLimited
+                            }
+                            _ => crate::agents::FailureClass::ProviderError,
+                        };
                         terminate_child_tree(&mut child).await;
-                        return AgentResult::failure(format!("chatgpt_ui: {message}"), 0).with_terminal_reason(reason);
+                        return AgentResult::failure(format!("chatgpt_ui: {message}"), 0)
+                            .with_terminal_reason(reason)
+                            .with_data(serde_json::json!({
+                                "provider_error_source": "chatgpt_ui_driver",
+                                "failure_class": failure_class,
+                                "classification_source": "structured",
+                            }));
                     }
                 }
             }
@@ -455,9 +551,38 @@ pub async fn run_chatgpt_ui_turn(
     ) {
         return AgentResult::failure(message, 0).with_terminal_reason(TerminalReason::LlmError);
     }
+    const MAX_ARTIFACT_FILES: usize = 8;
+    const MAX_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
+    let mut artifact_count = 0usize;
+    let mut artifact_bytes = 0u64;
+    for (path, name) in artifact_receipts {
+        if artifact_count >= MAX_ARTIFACT_FILES {
+            tracing::warn!(mission_id = %mission_id, "Rejected excess ChatGPT UI artifact receipt");
+            break;
+        }
+        match validate_artifact_receipt(work_dir, &path, &name) {
+            Ok((tag, size)) if artifact_bytes.saturating_add(size) <= MAX_ARTIFACT_BYTES => {
+                output.push_str("\n\n");
+                output.push_str(&tag);
+                artifact_count += 1;
+                artifact_bytes += size;
+            }
+            Ok((_tag, _size)) => {
+                tracing::warn!(mission_id = %mission_id, "Rejected ChatGPT UI artifact receipts exceeding the 50 MiB turn limit");
+            }
+            Err(error) => {
+                tracing::warn!(mission_id = %mission_id, error = %error, "Rejected ChatGPT UI artifact receipt");
+            }
+        }
+    }
     let mut result = AgentResult::success(output, 0)
         .with_terminal_reason(TerminalReason::TurnComplete)
-        .with_data(serde_json::json!({"backend": "chatgpt_ui", "usage_source": "chatgpt_web_subscription"}));
+        .with_data(serde_json::json!({
+            "backend": "chatgpt_ui",
+            "usage_source": "chatgpt_web_subscription",
+            "artifact_count": artifact_count,
+            "artifact_bytes": artifact_bytes,
+        }));
     if let Some(model) = model_used {
         result = result.with_model(model);
     }
@@ -527,6 +652,11 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(event, DriverEvent::ToolCall { .. }));
+        let artifact: DriverEvent = serde_json::from_str(
+            r#"{"type":"artifact","path":"/tmp/work/report.txt","name":"report.txt","content_type":"text/plain","size_bytes":12}"#,
+        )
+        .unwrap();
+        assert!(matches!(artifact, DriverEvent::Artifact { .. }));
     }
 
     #[test]
@@ -569,5 +699,27 @@ mod tests {
         assert!(validate_display(":93.0").is_ok());
         assert!(validate_display("localhost:93").is_err());
         assert!(validate_display(":93;touch /tmp/nope").is_err());
+    }
+
+    #[test]
+    fn artifact_receipt_must_resolve_inside_the_mission_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let work_dir = root.path().join("mission");
+        let outside = root.path().join("outside.txt");
+        std::fs::create_dir(&work_dir).unwrap();
+        std::fs::write(&outside, "outside").unwrap();
+        let artifact = work_dir.join("report.txt");
+        std::fs::write(&artifact, "report").unwrap();
+
+        let validated =
+            validate_artifact_receipt(&work_dir, artifact.to_str().unwrap(), "report.txt").unwrap();
+        assert_eq!(
+            validated.0,
+            r#"<file path="report.txt" name="report.txt" />"#
+        );
+        assert_eq!(validated.1, 6);
+        assert!(
+            validate_artifact_receipt(&work_dir, outside.to_str().unwrap(), "outside.txt").is_err()
+        );
     }
 }

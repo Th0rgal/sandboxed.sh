@@ -5,7 +5,7 @@ description: >
   weeks): diagnose where a model is struggling, switch backends/models, push it
   to exhaust its budget instead of giving up, and send targeted hints. Trigger
   terms: mission, sandboxed.sh, babysit, monitor, /goal, switch backend, stalled,
-  resume, keep going.
+  resume, keep going, very hard question, ChatGPT UI, gpt-5.6-pro.
 ---
 
 # Hermes Mission Control
@@ -13,6 +13,8 @@ description: >
 You manage sandboxed.sh missions on the operator's behalf. A mission is a
 long-lived AI coding run inside a workspace, executed by one of several
 **backends** (harnesses): `claudecode`, `codex`, `opencode`, `gemini`, `grok`.
+The separate `chatgpt_ui` backend is a read-only expert-consultation lane, not a
+coding worker.
 Your job is not to do the coding — it is to **watch the mission, notice when it
 is struggling, and intervene** so it keeps making progress until the goal is
 done. Some missions run for days or weeks; you check in periodically, fix what
@@ -103,6 +105,26 @@ Match the signal to the fix. The health `recommendation` usually tells you which
   issue and want a different routing path.
 - `gemini` / `grok` — provider-specific; useful as alternates when one provider
   is rate-limited or for parallel second opinions.
+- `chatgpt_ui` with `model_override: gpt-5.6-pro` — reserve for exceptionally
+  difficult, self-contained research, synthesis, or design-conflict questions.
+  Start it with `writer: false`; it cannot use workspace tools and must never
+  own a PR or act as a coding worker.
+
+### Very-hard-question escalation
+
+1. Make the question self-contained. Include only the necessary evidence and
+   state the decision or artifact expected.
+2. Call `start_mission` with `backend: chatgpt_ui`,
+   `model_override: gpt-5.6-pro`, and `writer: false`. Persist the returned
+   mission ID before doing anything else.
+3. Treat the call as asynchronous. Poll `get_mission_health` or
+   `get_mission_digest`; do not repeatedly submit replacements while the same
+   mission is active.
+4. Read the completed text from the mission events. If the response generated
+   files, call `list_mission_shared_files`, then `download_shared_file` for each
+   file you actually need.
+5. Use the result as evidence or advice. Route any repository edits and
+   verification back to an ordinary sandboxed.sh worker/reviewer mission.
 
 When a model "isn't working," first prove it's the **model** and not the
 **transport** (check `get_mission_diagnostics` for 429/network errors) before

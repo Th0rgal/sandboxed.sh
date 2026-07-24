@@ -33,7 +33,9 @@ const CHATGPT_UI_PRODUCTION_DEFAULTS = {
   profile_dir: '/var/lib/sandboxed-sh/chatgpt-profile',
   driver_path: '/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py',
   python_path: '/opt/sandboxed-sh/chatgpt-ui-venv/bin/python',
+  proxy_server: 'socks5://127.0.0.1:10880',
   display: ':93',
+  model: 'gpt-5.6-pro',
   headless: false,
 };
 
@@ -729,8 +731,8 @@ export default function BackendsPage() {
               </div>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div>
-                  <label htmlFor="chatgpt-ui-model" className="block text-xs text-white/60 mb-1.5">Exact visible model label</label>
-                  <input id="chatgpt-ui-model" type="text" value={chatgptUiForm.model} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, model: e.target.value }))} placeholder="GPT-5.6 Pro" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                  <label htmlFor="chatgpt-ui-model" className="block text-xs text-white/60 mb-1.5">Canonical model ID</label>
+                  <input id="chatgpt-ui-model" type="text" value={chatgptUiForm.model} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, model: e.target.value }))} placeholder="gpt-5.6-pro" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
                 </div>
                 <div>
                   <label htmlFor="chatgpt-ui-timeout" className="block text-xs text-white/60 mb-1.5">Timeout (seconds)</label>

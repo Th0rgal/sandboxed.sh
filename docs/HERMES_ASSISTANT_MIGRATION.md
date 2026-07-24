@@ -74,6 +74,8 @@ actually required; full histories are not injected by the status tools.
 - `get_mission_health` — diagnose stalls/loops/errors + a one-line recommendation
 - `get_mission_diagnostics` — tool-call timeline, repeated calls, error events
 - `start_mission`
+- `list_mission_shared_files`
+- `download_shared_file`
 - `send_message_to_mission`
 - `update_mission_settings` — switch backend/model/effort/agent for the next turn (between-turns)
 - `resume_mission` — restart an interrupted/blocked/failed mission, optionally with a steering hint
@@ -108,6 +110,13 @@ Security choices from the dev smoke:
 - Tool output is recursively scrubbed for secret-like keys and values.
 - Mission list tools return compact summaries instead of raw mission rows.
 - Detailed mission/event access requires explicit tool calls.
+
+For exceptional read-only research or design-conflict questions, Hermes may
+start `backend=chatgpt_ui` with `model_override=gpt-5.6-pro` and `writer=false`.
+The mission is asynchronous like every other Sandboxed mission. Generated
+ChatGPT files are available through `list_mission_shared_files` followed by
+`download_shared_file`; repository work remains owned by normal coding
+backends.
 
 ## Readiness Checks
 

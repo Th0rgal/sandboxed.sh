@@ -5,11 +5,13 @@ import argparse
 import json
 import sys
 import time
+from pathlib import Path
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--profile-dir", required=True)
 parser.add_argument("--browser")
 parser.add_argument("--headless")
+parser.add_argument("--proxy-server")
 parser.parse_args()
 request = json.loads(sys.stdin.readline())
 message = request.get("message", "")
@@ -28,6 +30,19 @@ elif message == "__tools__":
     emit("tool_call", id="mock-tool", name="mock", args={"safe": True})
     emit("tool_result", id="mock-tool", name="mock", result={"ok": True})
     emit("complete", content="mock tool response", model="mock-model")
+elif message == "__artifact__":
+    download_dir = Path(request["download_dir"])
+    download_dir.mkdir(parents=True, exist_ok=True)
+    artifact = download_dir / "mock-artifact.txt"
+    artifact.write_text("mock artifact\n", encoding="utf-8")
+    emit(
+        "artifact",
+        path=str(artifact),
+        name=artifact.name,
+        content_type="text/plain",
+        size_bytes=artifact.stat().st_size,
+    )
+    emit("complete", content="mock artifact response", model="mock-model")
 else:
     response = f"mock response: {message}"
     emit("text_delta", content=response[: max(1, len(response) // 2)])

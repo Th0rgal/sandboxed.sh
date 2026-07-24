@@ -12,9 +12,26 @@ DRIVER = Path(__file__).with_name("chatgpt_ui_mock_driver.py")
 
 def run_driver(message):
     with tempfile.TemporaryDirectory() as profile:
-        request = json.dumps({"message": message, "model": None}) + "\n"
+        download_dir = Path(profile) / "downloads"
+        request = (
+            json.dumps(
+                {
+                    "message": message,
+                    "model": None,
+                    "download_dir": str(download_dir),
+                }
+            )
+            + "\n"
+        )
         result = subprocess.run(
-            ["python3", str(DRIVER), "--profile-dir", profile],
+            [
+                "python3",
+                str(DRIVER),
+                "--profile-dir",
+                profile,
+                "--proxy-server",
+                "socks5://127.0.0.1:10880",
+            ],
             input=request,
             text=True,
             capture_output=True,
@@ -44,6 +61,15 @@ class MockDriverProtocolTests(unittest.TestCase):
             [event["type"] for event in events],
             ["diagnostic", "tool_call", "tool_result", "complete"],
         )
+
+    def test_artifact_event_precedes_completion(self):
+        events = run_driver("__artifact__")
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["diagnostic", "artifact", "complete"],
+        )
+        self.assertEqual(events[1]["name"], "mock-artifact.txt")
+        self.assertEqual(events[1]["content_type"], "text/plain")
 
 
 if __name__ == "__main__":

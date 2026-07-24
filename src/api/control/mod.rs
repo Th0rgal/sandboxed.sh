@@ -13183,7 +13183,15 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
         data.get("claudecode_transport_failure").is_some()
             || data.get("transport_failure_stage").is_some()
     });
-    if has_transport_failure {
+    // A backend that supplied an explicit failure class has already made a
+    // structured terminal decision. Its human-readable error text must never
+    // be reinterpreted as substantive assistant output by this legacy
+    // heuristic (for example, a ChatGPT UI selector compatibility failure).
+    let has_structured_failure = result.data.as_ref().is_some_and(|data| {
+        data.get("failure_class")
+            .is_some_and(|failure_class| !failure_class.is_null())
+    });
+    if has_transport_failure || has_structured_failure {
         return;
     }
     let output = result.output.trim();
@@ -28047,6 +28055,29 @@ Investigate <service/> failures.
         assert_eq!(
             completion_evidence_for_agent_result(&result).pending_tools,
             Some(1)
+        );
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_preserves_structured_provider_failure() {
+        let mut result = crate::agents::AgentResult::failure(
+            "chatgpt_ui: chatgpt-ui-v2: UI check failed at model_selection".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError)
+        .with_data(serde_json::json!({
+            "provider_error_source": "chatgpt_ui_driver",
+            "failure_class": crate::agents::FailureClass::ProviderError,
+            "classification_source": "structured",
+        }));
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+        assert_eq!(
+            completion_evidence_for_agent_result(&result).failure_class,
+            Some(crate::agents::FailureClass::ProviderError)
         );
     }
 
