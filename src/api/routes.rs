@@ -298,6 +298,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         Box::new(crate::backend::codex::CodexBackend::new()),
         Box::new(crate::backend::gemini::GeminiBackend::new()),
         Box::new(crate::backend::grok::GrokBackend::new()),
+        Box::new(crate::backend::chatgpt_ui::ChatGptUiBackend::new()),
     ];
     struct BackendProbe {
         id: String,
@@ -327,10 +328,21 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                     "default_agent": config.opencode_agent,
                     "permissive": config.opencode_permissive,
                 }),
+                "chatgpt_ui" => serde_json::json!({
+                    "profile_dir": null,
+                    "driver_path": null,
+                    "python_path": "python3",
+                    "browser": "chromium",
+                    "headless": true,
+                    "timeout_secs": 900,
+                    "model": null
+                }),
                 _ => serde_json::json!({}),
             };
             let mut entry = BackendConfigEntry::new(&p.id, &p.name, settings);
-            entry.enabled = p.detected;
+            // UI automation is opt-in even when Python is installed: the
+            // operator must provision an isolated browser profile explicitly.
+            entry.enabled = p.detected && p.id != "chatgpt_ui";
             entry
         })
         .collect();
@@ -411,8 +423,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     backend_registry.register(crate::backend::codex::registry_entry());
     backend_registry.register(crate::backend::gemini::registry_entry());
     backend_registry.register(crate::backend::grok::registry_entry());
+    backend_registry.register(crate::backend::chatgpt_ui::registry_entry());
     let backend_registry = Arc::new(RwLock::new(backend_registry));
-    tracing::info!("Backend registry initialized with {} backends", 5);
+    tracing::info!("Backend registry initialized with {} backends", 6);
 
     // Note: No central OpenCode server cleanup needed - missions use per-workspace CLI execution
 

@@ -19,10 +19,11 @@ import { ServerConnectionCard } from '@/components/server-connection-card';
 import { ModelRoutingDebug } from '@/components/model-routing-debug';
 import { useBackendConfigs } from '@/lib/use-backend-configs';
 
-const SETTINGS_BACKEND_IDS = ['opencode', 'claudecode', 'grok'] as const;
+const SETTINGS_BACKEND_IDS = ['opencode', 'claudecode', 'grok', 'chatgpt_ui'] as const;
+type SettingsBackendId = typeof SETTINGS_BACKEND_IDS[number];
 
 export default function BackendsPage() {
-  const [activeBackendTab, setActiveBackendTab] = useState<'opencode' | 'claudecode' | 'grok'>('opencode');
+  const [activeBackendTab, setActiveBackendTab] = useState<SettingsBackendId>('opencode');
   const [savingBackend, setSavingBackend] = useState(false);
   const [savingMissionLimit, setSavingMissionLimit] = useState(false);
   const [savingTaskLimit, setSavingTaskLimit] = useState(false);
@@ -83,6 +84,15 @@ export default function BackendsPage() {
     cli_path: '',
     enabled: true,
   });
+  const [chatgptUiForm, setChatgptUiForm] = useState({
+    profile_dir: '',
+    driver_path: '',
+    python_path: 'python3',
+    model: '',
+    timeout_secs: 900,
+    headless: true,
+    enabled: false,
+  });
 
   // SWR: fetch backends
   const { data: backends = [] } = useSWR('backends', listBackends, {
@@ -91,6 +101,7 @@ export default function BackendsPage() {
       { id: 'opencode', name: 'OpenCode' },
       { id: 'claudecode', name: 'Claude Code' },
       { id: 'grok', name: 'Grok Build' },
+      { id: 'chatgpt_ui', name: 'ChatGPT UI (experimental)' },
     ],
   });
 
@@ -103,6 +114,7 @@ export default function BackendsPage() {
   const opencodeBackendConfig = backendConfigs.opencode;
   const claudecodeBackendConfig = backendConfigs.claudecode;
   const grokBackendConfig = backendConfigs.grok;
+  const chatgptUiBackendConfig = backendConfigs.chatgpt_ui;
 
   // Fetch Claude Code provider status (Anthropic provider configured for claudecode)
   const { data: claudecodeProvider } = useSWR<BackendProviderResponse>(
@@ -141,6 +153,20 @@ export default function BackendsPage() {
       enabled: grokBackendConfig.enabled,
     });
   }, [grokBackendConfig]);
+
+  useEffect(() => {
+    if (!chatgptUiBackendConfig?.settings) return;
+    const settings = chatgptUiBackendConfig.settings as Record<string, unknown>;
+    setChatgptUiForm({
+      profile_dir: typeof settings.profile_dir === 'string' ? settings.profile_dir : '',
+      driver_path: typeof settings.driver_path === 'string' ? settings.driver_path : '',
+      python_path: typeof settings.python_path === 'string' ? settings.python_path : 'python3',
+      model: typeof settings.model === 'string' ? settings.model : '',
+      timeout_secs: typeof settings.timeout_secs === 'number' ? settings.timeout_secs : 900,
+      headless: settings.headless !== false,
+      enabled: chatgptUiBackendConfig.enabled,
+    });
+  }, [chatgptUiBackendConfig]);
 
   useEffect(() => {
     const limit = serverSettings?.max_parallel_missions;
@@ -263,6 +289,31 @@ export default function BackendsPage() {
           err instanceof Error ? err.message : 'Unknown error'
         }`
       );
+    } finally {
+      setSavingBackend(false);
+    }
+  };
+
+  const handleSaveChatgptUiBackend = async () => {
+    setSavingBackend(true);
+    try {
+      const result = await updateBackendConfig(
+        'chatgpt_ui',
+        {
+          profile_dir: chatgptUiForm.profile_dir,
+          driver_path: chatgptUiForm.driver_path || null,
+          python_path: chatgptUiForm.python_path || 'python3',
+          browser: 'chromium',
+          headless: chatgptUiForm.headless,
+          timeout_secs: chatgptUiForm.timeout_secs,
+          model: chatgptUiForm.model || null,
+        },
+        { enabled: chatgptUiForm.enabled }
+      );
+      toast.success(result.message || 'ChatGPT UI settings updated');
+      refreshBackendConfigs();
+    } catch (err) {
+      toast.error(`Failed to update ChatGPT UI settings: ${err instanceof Error ? err.message : 'Unknown error'}`);
     } finally {
       setSavingBackend(false);
     }
@@ -405,7 +456,7 @@ export default function BackendsPage() {
                 key={backend.id}
                 onClick={() =>
                   setActiveBackendTab(
-                    backend.id as 'opencode' | 'claudecode' | 'grok'
+                    backend.id as SettingsBackendId
                   )
                 }
                 className={cn(
@@ -553,6 +604,46 @@ export default function BackendsPage() {
                   Save Claude Code
                 </button>
               </div>
+            </div>
+          ) : activeBackendTab === 'chatgpt_ui' ? (
+            <div className="space-y-3">
+              <div className="rounded-lg border border-amber-500/20 bg-amber-500/[0.06] p-3 text-xs text-amber-200/80">
+                Experimental browser automation. Use a dedicated profile, review ChatGPT terms, and never place the profile in a repository or mission workspace.
+              </div>
+              <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
+                <input type="checkbox" checked={chatgptUiForm.enabled} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, enabled: e.target.checked }))} />
+                Enabled
+              </label>
+              <div>
+                <label className="block text-xs text-white/60 mb-1.5">Browser profile directory</label>
+                <input type="text" value={chatgptUiForm.profile_dir} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, profile_dir: e.target.value }))} placeholder="/var/lib/sandboxed-sh/chatgpt-profile" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+              </div>
+              <div>
+                <label className="block text-xs text-white/60 mb-1.5">Driver path</label>
+                <input type="text" value={chatgptUiForm.driver_path} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, driver_path: e.target.value }))} placeholder="/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+              </div>
+              <div>
+                <label className="block text-xs text-white/60 mb-1.5">Python executable</label>
+                <input type="text" value={chatgptUiForm.python_path} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, python_path: e.target.value }))} placeholder="/opt/sandboxed-sh/chatgpt-ui-venv/bin/python" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-white/60 mb-1.5">Exact visible model label</label>
+                  <input type="text" value={chatgptUiForm.model} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, model: e.target.value }))} placeholder="GPT-5.6 Pro" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                </div>
+                <div>
+                  <label className="block text-xs text-white/60 mb-1.5">Timeout (seconds)</label>
+                  <input type="number" min={30} max={7200} value={chatgptUiForm.timeout_secs} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, timeout_secs: Number(e.target.value) }))} className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                </div>
+              </div>
+              <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
+                <input type="checkbox" checked={chatgptUiForm.headless} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, headless: e.target.checked }))} />
+                Headless after interactive login provisioning
+              </label>
+              <button onClick={handleSaveChatgptUiBackend} disabled={savingBackend || !chatgptUiForm.profile_dir || !chatgptUiForm.driver_path} className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:opacity-50">
+                {savingBackend ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                Save ChatGPT UI
+              </button>
             </div>
           ) : activeBackendTab === 'grok' ? (
             <div className="space-y-3">

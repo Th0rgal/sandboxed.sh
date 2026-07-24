@@ -11,7 +11,7 @@ import type { Workspace } from '@/lib/api';
 import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
 import { toast } from '@/components/toast';
 
-const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok'] as const;
+const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok', 'chatgpt_ui'] as const;
 
 // Kept in sync with src/api/control.rs `normalize_model_effort_for_backend`.
 // Codex and Claude Code both accept the GPT reasoning-effort ladder. Other
@@ -153,6 +153,7 @@ export function NewMissionDialog({
       { id: 'codex', name: 'Codex' },
       { id: 'gemini', name: 'Gemini CLI' },
       { id: 'grok', name: 'Grok Build' },
+      { id: 'chatgpt_ui', name: 'ChatGPT UI (experimental)' },
     ],
     }
   );

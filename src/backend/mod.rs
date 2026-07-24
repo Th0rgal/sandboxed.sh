@@ -1,3 +1,4 @@
+pub mod chatgpt_ui;
 pub mod claudecode;
 pub mod codex;
 pub mod events;

@@ -313,6 +313,126 @@ pub async fn update_backend_config(
             }
             settings
         }
+        "chatgpt_ui" => {
+            let settings = req.settings.as_object().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid settings payload".to_string(),
+                )
+            })?;
+            let profile = settings
+                .get("profile_dir")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "profile_dir is required".to_string(),
+                    )
+                })?;
+            let profile_path = std::path::Path::new(profile);
+            if !profile_path.is_absolute() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "profile_dir must be an absolute path".to_string(),
+                ));
+            }
+            if !profile_path.is_dir() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "profile_dir must name an existing directory".to_string(),
+                ));
+            }
+            let canonical_profile = profile_path.canonicalize().map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to resolve profile_dir: {error}"),
+                )
+            })?;
+            let canonical_working_dir =
+                state.config.working_dir.canonicalize().map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to resolve server working directory: {error}"),
+                    )
+                })?;
+            if canonical_profile.starts_with(&canonical_working_dir) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "profile_dir must be outside the sandboxed.sh working directory".to_string(),
+                ));
+            }
+            let driver_path = settings
+                .get("driver_path")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let driver_path = driver_path.ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "driver_path is required".to_string(),
+                )
+            })?;
+            if !std::path::Path::new(driver_path).is_absolute() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "driver_path must be absolute when set".to_string(),
+                ));
+            }
+            if !std::path::Path::new(driver_path).is_file() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "driver_path must name an existing file".to_string(),
+                ));
+            }
+            let python_path = settings
+                .get("python_path")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("python3");
+            let timeout_secs = settings
+                .get("timeout_secs")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(900);
+            if !(30..=7200).contains(&timeout_secs) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "timeout_secs must be between 30 and 7200".to_string(),
+                ));
+            }
+            let browser = settings
+                .get("browser")
+                .and_then(|value| value.as_str())
+                .unwrap_or("chromium");
+            if !matches!(browser, "chromium" | "firefox" | "webkit") {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "browser must be chromium, firefox, or webkit".to_string(),
+                ));
+            }
+            let model = settings
+                .get("model")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if model.is_some_and(|value| value.len() > 200) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "model label must be at most 200 bytes".to_string(),
+                ));
+            }
+            serde_json::json!({
+                "profile_dir": canonical_profile,
+                "driver_path": driver_path,
+                "python_path": python_path,
+                "browser": browser,
+                "headless": settings.get("headless").and_then(|v| v.as_bool()).unwrap_or(true),
+                "timeout_secs": timeout_secs,
+                "model": model,
+            })
+        }
         _ => req.settings.clone(),
     };
 
