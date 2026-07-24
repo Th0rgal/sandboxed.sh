@@ -19257,6 +19257,11 @@ async fn run_single_control_turn(
         config.default_model = None;
     } else if backend_id.as_deref() == Some("gemini") && requested_model.is_none() {
         config.default_model = Some(resolve_gemini_default_model());
+    } else if backend_id.as_deref() == Some("chatgpt_ui") && requested_model.is_none() {
+        // Web model labels are account-specific. Never invent or inherit a
+        // CLI/API model slug for the browser harness.
+        config.default_model =
+            super::mission_runner::get_backend_string_setting("chatgpt_ui", "model");
     }
     if let Some(ref agent) = agent_override {
         config.opencode_agent = Some(agent.clone());
@@ -19525,6 +19530,35 @@ async fn run_single_control_turn(
                     cancel,
                     app_working_dir: &config.working_dir,
                     session_id: session_id.as_deref(),
+                    is_continuation: false,
+                    extras: crate::api::runners::TurnExtras::None,
+                }),
+            )
+            .await
+        }
+        Some("chatgpt_ui") => {
+            let mid = match require_mission_id(mission_id, "ChatGPT UI", &events_tx) {
+                Ok(id) => id,
+                Err(r) => return r,
+            };
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(
+                crate::api::runners::ChatGptUiRunner.run_turn(crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    // The browser always starts a fresh chat, so include the
+                    // bounded conversation frame on follow-up turns.
+                    message: &convo,
+                    model: requested_model
+                        .as_deref()
+                        .or(config.default_model.as_deref()),
+                    model_effort: None,
+                    agent: None,
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel,
+                    app_working_dir: &config.working_dir,
+                    session_id: None,
                     is_continuation: false,
                     extras: crate::api::runners::TurnExtras::None,
                 }),

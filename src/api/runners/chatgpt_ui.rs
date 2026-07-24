@@ -14,6 +14,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -201,6 +202,8 @@ pub async fn run_chatgpt_ui_turn(
                 .with_terminal_reason(TerminalReason::LlmError)
         }
     };
+    #[cfg(unix)]
+    let process_group = child.id().map(|pid| -(pid as i32));
 
     let request = serde_json::json!({
         "type": "run",
@@ -226,7 +229,8 @@ pub async fn run_chatgpt_ui_turn(
     let mut model_used = model.map(str::to_string);
     let mut pending_tools: HashMap<String, String> = HashMap::new();
     let mut completed = false;
-    let deadline = tokio::time::sleep(settings.timeout);
+    let deadline_at = Instant::now() + settings.timeout;
+    let deadline = tokio::time::sleep_until(deadline_at);
     tokio::pin!(deadline);
 
     loop {
@@ -246,7 +250,7 @@ pub async fn run_chatgpt_ui_turn(
                 });
             }
             _ = &mut deadline => {
-                terminate_child_tree(&mut child).await;
+                kill_child_tree(&mut child).await;
                 return AgentResult::failure(
                     format!("chatgpt_ui timed out after {} seconds", settings.timeout.as_secs()), 0
                 ).with_terminal_reason(TerminalReason::LlmError);
@@ -318,6 +322,18 @@ pub async fn run_chatgpt_ui_turn(
             }
         }
     }
+    let remaining = deadline_at.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        kill_child_tree(&mut child).await;
+        return AgentResult::failure(
+            format!(
+                "chatgpt_ui timed out after {} seconds",
+                settings.timeout.as_secs()
+            ),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+    }
     let status = tokio::select! {
         _ = cancel.cancelled() => {
             terminate_child_tree(&mut child).await;
@@ -335,12 +351,12 @@ pub async fn run_chatgpt_ui_turn(
             });
         }
         _ = &mut deadline => {
-            terminate_child_tree(&mut child).await;
+            kill_child_tree(&mut child).await;
             return AgentResult::failure(
                 format!("chatgpt_ui timed out after {} seconds", settings.timeout.as_secs()), 0
             ).with_terminal_reason(TerminalReason::LlmError);
         }
-        status = tokio::time::timeout(Duration::from_secs(5), child.wait()) => status,
+        status = tokio::time::timeout(remaining.min(Duration::from_secs(5)), child.wait()) => status,
     };
     let status = match status {
         Ok(Ok(status)) => Some(status),
@@ -349,18 +365,37 @@ pub async fn run_chatgpt_ui_turn(
                 .with_terminal_reason(TerminalReason::LlmError);
         }
         Err(_) => {
+            if Instant::now() >= deadline_at {
+                kill_child_tree(&mut child).await;
+                return AgentResult::failure(
+                    format!(
+                        "chatgpt_ui timed out after {} seconds",
+                        settings.timeout.as_secs()
+                    ),
+                    0,
+                )
+                .with_terminal_reason(TerminalReason::LlmError);
+            }
             terminate_child_tree(&mut child).await;
             return AgentResult::failure("chatgpt_ui driver did not exit after completion", 0)
                 .with_terminal_reason(TerminalReason::LlmError);
         }
     };
-    if !pending_tools.is_empty() {
-        return AgentResult::failure("chatgpt_ui ended with unresolved tool calls", 0)
-            .with_terminal_reason(TerminalReason::LlmError);
+    // A well-behaved driver closes its browser before exiting, but enforce
+    // that boundary even if it leaves descendants behind after a clean exit.
+    #[cfg(unix)]
+    if let Some(process_group) = process_group {
+        unsafe {
+            libc::kill(process_group, libc::SIGKILL);
+        }
     }
-    if !completed || output.trim().is_empty() || status.is_none_or(|status| !status.success()) {
-        return AgentResult::failure("chatgpt_ui driver exited without a completed response", 0)
-            .with_terminal_reason(TerminalReason::LlmError);
+    if let Err(message) = validate_completion(
+        completed,
+        &output,
+        pending_tools.len(),
+        status.is_some_and(|status| status.success()),
+    ) {
+        return AgentResult::failure(message, 0).with_terminal_reason(TerminalReason::LlmError);
     }
     let mut result = AgentResult::success(output, 0)
         .with_terminal_reason(TerminalReason::TurnComplete)
@@ -369,6 +404,21 @@ pub async fn run_chatgpt_ui_turn(
         result = result.with_model(model);
     }
     result
+}
+
+fn validate_completion(
+    completed: bool,
+    output: &str,
+    pending_tool_count: usize,
+    exit_success: bool,
+) -> Result<(), &'static str> {
+    if pending_tool_count != 0 {
+        return Err("chatgpt_ui ended with unresolved tool calls");
+    }
+    if !completed || output.trim().is_empty() || !exit_success {
+        return Err("chatgpt_ui driver exited without a completed response");
+    }
+    Ok(())
 }
 
 async fn terminate_child_tree(child: &mut tokio::process::Child) {
@@ -390,6 +440,19 @@ async fn terminate_child_tree(child: &mut tokio::process::Child) {
         if !exited {
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
         }
+        return;
+    }
+    let _ = child.kill().await;
+}
+
+/// Enforce a hard deadline without adding a graceful-shutdown tail to it.
+async fn kill_child_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
         return;
     }
     let _ = child.kill().await;
@@ -417,5 +480,20 @@ mod tests {
         assert!(lock_profile(&profile).is_err());
         drop(first);
         assert!(lock_profile(&profile).is_ok());
+    }
+
+    #[test]
+    fn completion_requires_signal_content_clean_exit_and_balanced_tools() {
+        assert!(validate_completion(true, "done", 0, true).is_ok());
+        assert_eq!(
+            validate_completion(false, "partial", 0, true),
+            Err("chatgpt_ui driver exited without a completed response")
+        );
+        assert_eq!(
+            validate_completion(true, "done", 1, true),
+            Err("chatgpt_ui ended with unresolved tool calls")
+        );
+        assert!(validate_completion(true, " ", 0, true).is_err());
+        assert!(validate_completion(true, "done", 0, false).is_err());
     }
 }
