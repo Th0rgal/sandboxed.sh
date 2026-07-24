@@ -4530,6 +4530,19 @@ async fn recoverable_inherited_remote_wait(
     {
         return Ok(None);
     }
+    recoverable_remote_continuation(working_dir, mission_id).await
+}
+
+/// Resolve the durable job that still owns a mission continuation.
+///
+/// This deliberately does not inspect the persisted run state. Node
+/// acceptance and the following mission heartbeat are separate writes, so a
+/// graceful shutdown can observe `running` or `waiting_tool` while the ledger
+/// already proves that a remote job owns the continuation.
+async fn recoverable_remote_continuation(
+    working_dir: &std::path::Path,
+    mission_id: Uuid,
+) -> anyhow::Result<Option<Uuid>> {
     if let Some(handle) =
         crate::remote_node::job_ledger::current_remote_build_wait_handle(working_dir, mission_id)
             .await?
@@ -4561,6 +4574,72 @@ async fn recoverable_inherited_remote_wait(
         Ok(Some(receipt.job_id))
     } else {
         Ok(None)
+    }
+}
+
+/// Decide whether graceful server shutdown must leave a mission's durable run
+/// open for the remote-job reconciler.
+///
+/// A live harness may still be polling a synchronous remote build when
+/// systemd asks the API to stop. Interrupting that harness is expected, but
+/// interrupting the mission/run is not: the accepted node job survives the
+/// process and owns the continuation. Fail closed on store/ledger read errors
+/// so a transient shutdown race cannot turn a recoverable wait into a duplicate
+/// submission after restart.
+async fn preserve_remote_wait_during_shutdown(
+    mission_store: &Arc<dyn MissionStore>,
+    working_dir: &std::path::Path,
+    mission_id: Uuid,
+) -> bool {
+    let run = match mission_store.get_active_mission_run(mission_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::warn!(
+                %mission_id,
+                %error,
+                "Graceful shutdown: active run unavailable; preserving mission fail-closed"
+            );
+            return true;
+        }
+    };
+    let mission_status = match mission_store.get_mission(mission_id).await {
+        Ok(Some(mission)) => mission.status,
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::warn!(
+                %mission_id,
+                %error,
+                "Graceful shutdown: mission status unavailable; preserving remote wait fail-closed"
+            );
+            return true;
+        }
+    };
+    if mission_status != MissionStatus::Active {
+        return false;
+    }
+
+    match recoverable_remote_continuation(working_dir, mission_id).await {
+        Ok(Some(job_id)) => {
+            tracing::info!(
+                %mission_id,
+                run_id = %run.run_id,
+                run_generation = run.generation,
+                %job_id,
+                "Graceful shutdown: preserving accepted remote-job continuation"
+            );
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                %mission_id,
+                run_id = %run.run_id,
+                %error,
+                "Graceful shutdown: remote ledger unavailable; preserving wait fail-closed"
+            );
+            true
+        }
     }
 }
 
@@ -16874,14 +16953,22 @@ async fn control_actor_loop(
                                 // Note: If missions differ, don't persist - the local history
                                 // belongs to current_mission, not running_mission_id
 
-                                if mission_store
-                                    .update_mission_status_with_reason(
+                                let preserve_remote_wait =
+                                    preserve_remote_wait_during_shutdown(
+                                        &mission_store,
+                                        &config.working_dir,
                                         mission_id,
-                                        MissionStatus::Interrupted,
-                                        Some("server_shutdown"),
                                     )
-                                    .await
-                                    .is_ok()
+                                    .await;
+                                if !preserve_remote_wait
+                                    && mission_store
+                                        .update_mission_status_with_reason(
+                                            mission_id,
+                                            MissionStatus::Interrupted,
+                                            Some("server_shutdown"),
+                                        )
+                                        .await
+                                        .is_ok()
                                 {
                                     maybe_schedule_mission_metadata_refresh_for_status(
                                         &mission_store,
@@ -16918,14 +17005,22 @@ async fn control_actor_loop(
                                 &entries,
                             )
                             .await;
-                            if mission_store
-                                .update_mission_status_with_reason(
+                            let preserve_remote_wait =
+                                preserve_remote_wait_during_shutdown(
+                                    &mission_store,
+                                    &config.working_dir,
                                     *mission_id,
-                                    MissionStatus::Interrupted,
-                                    Some("server_shutdown"),
                                 )
-                                .await
-                                .is_ok()
+                                .await;
+                            if !preserve_remote_wait
+                                && mission_store
+                                    .update_mission_status_with_reason(
+                                        *mission_id,
+                                        MissionStatus::Interrupted,
+                                        Some("server_shutdown"),
+                                    )
+                                    .await
+                                    .is_ok()
                             {
                                 maybe_schedule_mission_metadata_refresh_for_status(
                                     &mission_store,
@@ -22976,6 +23071,87 @@ mod tests {
             .unwrap(),
             Some(job_id),
             "an undelivered terminal receipt must survive actor startup cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_preserves_accepted_remote_wait_without_interrupting_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(
+                Some("remote wait during deploy"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .unwrap();
+        let run = store
+            .begin_mission_run(mission.id, "remote-build:test", None)
+            .await
+            .unwrap();
+        store
+            .heartbeat_mission_run(
+                run.run_id,
+                run.generation,
+                MissionExecutionState::Running,
+                None,
+            )
+            .await
+            .unwrap();
+        let job_id = Uuid::new_v4();
+        crate::remote_node::job_ledger::record(
+            dir.path(),
+            crate::remote_node::job_ledger::JobHandle {
+                mission_id: mission.id,
+                node_id: "node-a".to_string(),
+                job_id,
+                started_at: chrono::Utc::now(),
+                submission_sequence: 1,
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: Some(chrono::Utc::now()),
+                disk_reservation_bytes: 0,
+                kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
+                identity: None,
+                wait_for_completion: Some(true),
+                wake_on_terminal: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            preserve_remote_wait_during_shutdown(&store, dir.path(), mission.id).await,
+            "an accepted exact job must own the mission across a backend restart"
+        );
+        let preserved = store
+            .get_active_mission_run(mission.id)
+            .await
+            .unwrap()
+            .expect("run lease must stay non-terminal");
+        assert_eq!(preserved.run_id, run.run_id);
+        assert_eq!(
+            preserved.execution_state,
+            MissionExecutionState::Running,
+            "shutdown can race the heartbeat that parks an accepted remote job"
+        );
+        assert_eq!(
+            store.get_mission(mission.id).await.unwrap().unwrap().status,
+            MissionStatus::Active
+        );
+
+        crate::remote_node::job_ledger::remove(dir.path(), job_id).await;
+        assert!(
+            !preserve_remote_wait_during_shutdown(&store, dir.path(), mission.id).await,
+            "a cancelled ledger handle must not protect a stale wait lease"
         );
     }
 
