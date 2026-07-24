@@ -80,6 +80,7 @@ const BACKEND_LABELS: Record<string, string> = {
   codex: 'Codex',
   gemini: 'Gemini',
   grok: 'Grok Build',
+  chatgpt_ui: 'ChatGPT UI (experimental)',
 };
 
 function gatewayLabel(bot: AssistantGateway) {
@@ -1692,7 +1693,7 @@ export default function AssistantPage() {
                           {BACKEND_LABELS[b.id] || b.name || b.id}
                         </option>
                       ))
-                    : ['claudecode', 'opencode', 'codex', 'gemini', 'grok'].map((id) => (
+                    : ['claudecode', 'opencode', 'codex', 'gemini', 'grok', 'chatgpt_ui'].map((id) => (
                         <option key={id} value={id}>
                           {BACKEND_LABELS[id] || id}
                         </option>
@@ -1884,7 +1885,7 @@ export default function AssistantPage() {
                           {BACKEND_LABELS[b.id] || b.name || b.id}
                         </option>
                       ))
-                    : ['claudecode', 'opencode', 'codex', 'gemini', 'grok'].map((id) => (
+                    : ['claudecode', 'opencode', 'codex', 'gemini', 'grok', 'chatgpt_ui'].map((id) => (
                         <option key={id} value={id}>
                           {BACKEND_LABELS[id] || id}
                         </option>

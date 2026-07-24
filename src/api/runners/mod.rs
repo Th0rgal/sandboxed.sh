@@ -29,7 +29,7 @@ use crate::workspace::Workspace;
 
 /// Everything a harness needs to run one turn.
 ///
-/// The common fields are identical across all five backends; backend-specific
+/// The common fields are identical across all harness backends; backend-specific
 /// inputs travel in [`TurnExtras`]. Message framing (raw vs history-framed
 /// `convo`, `/goal` passthrough) is the caller's responsibility — by the time
 /// a `TurnContext` exists, `message` is exactly what the harness should see.
@@ -333,7 +333,7 @@ mod tests {
             runner_for("codex").unwrap().mid_turn_kind(),
             MidTurnKind::CodexAppServer
         );
-        for backend in ["opencode", "grok", "gemini"] {
+        for backend in ["opencode", "grok", "gemini", "chatgpt_ui"] {
             assert_eq!(
                 runner_for(backend).unwrap().mid_turn_kind(),
                 MidTurnKind::None

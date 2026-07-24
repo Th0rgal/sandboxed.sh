@@ -609,10 +609,19 @@ impl Config {
         // Default backend configuration
         let default_backend = std::env::var("DEFAULT_BACKEND").ok().and_then(|v| {
             let backend = v.trim().to_lowercase();
-            if backend.is_empty() || !["claudecode", "opencode", "grok", "gemini", "codex"].contains(&backend.as_str())
+            if backend.is_empty()
+                || ![
+                    "claudecode",
+                    "opencode",
+                    "grok",
+                    "gemini",
+                    "codex",
+                    "chatgpt_ui",
+                ]
+                .contains(&backend.as_str())
             {
                 tracing::warn!(
-                    "Invalid DEFAULT_BACKEND '{}'. Expected one of: claudecode, opencode, grok, gemini, codex",
+                    "Invalid DEFAULT_BACKEND '{}'. Expected one of: claudecode, opencode, grok, gemini, codex, chatgpt_ui",
                     v
                 );
                 None

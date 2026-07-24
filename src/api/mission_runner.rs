@@ -7800,6 +7800,26 @@ pub async fn check_backend_prerequisites(
                 },
             }
         }
+        "chatgpt_ui" => BackendPreflightResult {
+            backend_id: "chatgpt_ui".to_string(),
+            // Authentication cannot be established without opening a clean
+            // browser page. The turn driver performs that check; preflight
+            // only confirms that the explicitly configured driver exists.
+            available: cli_path.is_some_and(|path| std::path::Path::new(path).is_file()),
+            cli_available: cli_path.is_some_and(|path| std::path::Path::new(path).is_file()),
+            auto_install_possible: false,
+            missing_dependencies: if cli_path
+                .is_some_and(|path| std::path::Path::new(path).is_file())
+            {
+                Vec::new()
+            } else {
+                vec!["configured ChatGPT UI driver".to_string()]
+            },
+            message: Some(
+                "Browser driver presence checked; authentication remains unknown until a clean UI turn"
+                    .to_string(),
+            ),
+        },
         _ => BackendPreflightResult {
             backend_id: backend_id.to_string(),
             available: false,
@@ -7807,7 +7827,7 @@ pub async fn check_backend_prerequisites(
             auto_install_possible: false,
             missing_dependencies: vec![format!("unknown backend: {}", backend_id)],
             message: Some(format!(
-                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, gemini, grok",
+                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, gemini, grok, chatgpt_ui",
                 backend_id
             )),
         },
