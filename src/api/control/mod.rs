@@ -4530,6 +4530,19 @@ async fn recoverable_inherited_remote_wait(
     {
         return Ok(None);
     }
+    recoverable_remote_continuation(working_dir, mission_id).await
+}
+
+/// Resolve the durable job that still owns a mission continuation.
+///
+/// This deliberately does not inspect the persisted run state. Node
+/// acceptance and the following mission heartbeat are separate writes, so a
+/// graceful shutdown can observe `running` or `waiting_tool` while the ledger
+/// already proves that a remote job owns the continuation.
+async fn recoverable_remote_continuation(
+    working_dir: &std::path::Path,
+    mission_id: Uuid,
+) -> anyhow::Result<Option<Uuid>> {
     if let Some(handle) =
         crate::remote_node::job_ledger::current_remote_build_wait_handle(working_dir, mission_id)
             .await?
@@ -4590,10 +4603,6 @@ async fn preserve_remote_wait_during_shutdown(
             return true;
         }
     };
-    if run.execution_state != MissionExecutionState::WaitingRemoteJob {
-        return false;
-    }
-
     let mission_status = match mission_store.get_mission(mission_id).await {
         Ok(Some(mission)) => mission.status,
         Ok(None) => return false,
@@ -4606,15 +4615,11 @@ async fn preserve_remote_wait_during_shutdown(
             return true;
         }
     };
+    if mission_status != MissionStatus::Active {
+        return false;
+    }
 
-    match recoverable_inherited_remote_wait(
-        working_dir,
-        mission_id,
-        run.execution_state,
-        mission_status,
-    )
-    .await
-    {
+    match recoverable_remote_continuation(working_dir, mission_id).await {
         Ok(Some(job_id)) => {
             tracing::info!(
                 %mission_id,
@@ -22665,7 +22670,7 @@ mod tests {
             .heartbeat_mission_run(
                 run.run_id,
                 run.generation,
-                MissionExecutionState::WaitingRemoteJob,
+                MissionExecutionState::Running,
                 None,
             )
             .await
@@ -23061,7 +23066,7 @@ mod tests {
             .heartbeat_mission_run(
                 run.run_id,
                 run.generation,
-                MissionExecutionState::WaitingRemoteJob,
+                MissionExecutionState::Running,
                 None,
             )
             .await
@@ -23099,7 +23104,8 @@ mod tests {
         assert_eq!(preserved.run_id, run.run_id);
         assert_eq!(
             preserved.execution_state,
-            MissionExecutionState::WaitingRemoteJob
+            MissionExecutionState::Running,
+            "shutdown can race the heartbeat that parks an accepted remote job"
         );
         assert_eq!(
             store.get_mission(mission.id).await.unwrap().unwrap().status,
