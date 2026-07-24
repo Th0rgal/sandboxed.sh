@@ -3518,6 +3518,10 @@ async fn run_mission_turn(
         // confusing chdir error from the rejected-CLI path. See prod
         // mission 1aef657a (2026-05-16).
         config.default_model = Some(resolve_grok_default_model());
+    } else if backend_id == "chatgpt_ui" && model_override.is_none() {
+        // Model labels in the web UI are account/rollout dependent. Only use
+        // an explicit operator setting; never claim a hard-coded model exists.
+        config.default_model = get_backend_string_setting("chatgpt_ui", "model");
     }
     tracing::info!(
         mission_id = %mission_id,
@@ -3775,7 +3779,7 @@ async fn run_mission_turn(
             // session and --session/--continue must fire.
             is_continuation || has_opencode_session,
         ),
-        "grok" | "codex" => (
+        "grok" | "codex" | "chatgpt_ui" => (
             if is_goal_mode {
                 user_message.clone()
             } else {
@@ -3923,8 +3927,11 @@ pub(crate) fn get_backend_string_setting(backend_id: &str, key: &str) -> Option<
                 .and_then(|v| v.as_str())
             {
                 if !val.is_empty() {
-                    if key == "api_key" {
-                        tracing::debug!("Using {} {} from backend config", backend_id, key);
+                    if matches!(
+                        key,
+                        "api_key" | "profile_dir" | "driver_path" | "python_path"
+                    ) {
+                        tracing::debug!("Using configured {} {}", backend_id, key);
                     } else {
                         tracing::info!("Using {} {} from backend config: {}", backend_id, key, val);
                     }
@@ -3934,6 +3941,16 @@ pub(crate) fn get_backend_string_setting(backend_id: &str, key: &str) -> Option<
         }
     }
     None
+}
+
+/// Read an unsigned integer setting from a backend's config entry.
+pub(crate) fn get_backend_u64_setting(backend_id: &str, key: &str) -> Option<u64> {
+    let configs = read_backend_configs()?;
+    configs.into_iter().find_map(|config| {
+        (config.get("id")?.as_str()? == backend_id)
+            .then(|| config.get("settings")?.get(key)?.as_u64())
+            .flatten()
+    })
 }
 
 /// Read a boolean setting from a backend's config entry.

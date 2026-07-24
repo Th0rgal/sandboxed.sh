@@ -945,7 +945,7 @@ impl AssistantMcp {
                         "title": {"type": "string"},
                         "prompt": {"type": "string"},
                         "workspace_id": {"type": "string"},
-                        "backend": {"type": "string", "enum": ["opencode", "claudecode", "codex", "gemini", "grok"]},
+                        "backend": {"type": "string", "enum": ["opencode", "claudecode", "codex", "gemini", "grok", "chatgpt_ui"]},
                         "model_override": {"type": "string", "description": "Exact account-supported model ID. For Codex Terra use gpt-5.6-terra with medium effort. Never invent variants such as gpt-5.5-sol."},
                         "model_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                         "config_profile": {"type": "string"},
@@ -1224,13 +1224,13 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "update_mission_settings".to_string(),
-                description: "Change a mission's run settings for its NEXT turn: switch backend (claudecode/codex/opencode/gemini/grok), model, reasoning effort, or agent. Applies between turns — the mission must be idle (awaiting_user/acknowledged/interrupted), not actively running. If it is running, cancel_mission first (or wait), then update, then send_message_to_mission or resume_mission to kick the next turn. Note: model_effort only applies to claudecode and codex (low/medium/high/xhigh/max).".to_string(),
+                description: "Change a mission's run settings for its NEXT turn: switch backend (claudecode/codex/opencode/gemini/grok/chatgpt_ui), model, reasoning effort, or agent. Applies between turns — the mission must be idle (awaiting_user/acknowledged/interrupted), not actively running. If it is running, cancel_mission first (or wait), then update, then send_message_to_mission or resume_mission to kick the next turn. Note: model_effort only applies to claudecode and codex (low/medium/high/xhigh/max).".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
                     "properties": {
                         "mission_id": {"type": "string"},
-                        "backend": {"type": "string", "enum": ["opencode", "claudecode", "codex", "gemini", "grok"]},
+                        "backend": {"type": "string", "enum": ["opencode", "claudecode", "codex", "gemini", "grok", "chatgpt_ui"]},
                         "model_override": {"type": "string", "description": "Model id. Empty string clears it. When backend changes this is reset unless set explicitly."},
                         "model_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                         "agent": {"type": "string", "description": "Agent name. Empty string clears it."},

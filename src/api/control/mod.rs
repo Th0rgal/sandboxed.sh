@@ -6629,8 +6629,10 @@ pub async fn create_mission(
     // Skip validation for Claude Code, Codex, Gemini, and Grok - they have their own built-in agents
     if let Some(ref agent_name) = agent {
         let backend_id = backend.as_deref();
-        let skip_validation =
-            matches!(backend_id, Some("claudecode" | "codex" | "gemini" | "grok"));
+        let skip_validation = matches!(
+            backend_id,
+            Some("claudecode" | "codex" | "gemini" | "grok" | "chatgpt_ui")
+        );
         if !skip_validation {
             super::library::validate_agent_exists(
                 &state,
@@ -8772,7 +8774,7 @@ pub async fn update_mission_settings(
     if let Some(ref agent_name) = effective_agent {
         let skip_validation = matches!(
             effective_backend.as_str(),
-            "claudecode" | "codex" | "gemini" | "grok"
+            "claudecode" | "codex" | "gemini" | "grok" | "chatgpt_ui"
         );
         if !skip_validation {
             super::library::validate_agent_exists(

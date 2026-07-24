@@ -5,6 +5,7 @@
 //! backend turn runners themselves) move here so `mission_runner.rs` can
 //! shrink down to orchestration (dispatch, retry/fallback, TerminalReason).
 
+pub(crate) mod chatgpt_ui;
 pub(crate) mod claudecode;
 pub(crate) mod codex;
 pub(crate) mod errors;
@@ -94,6 +95,7 @@ pub(crate) struct OpenCodeRunner;
 pub(crate) struct CodexRunner;
 pub(crate) struct GrokRunner;
 pub(crate) struct GeminiRunner;
+pub(crate) struct ChatGptUiRunner;
 
 impl HarnessRunner for ClaudeCodeRunner {
     fn name(&self) -> &'static str {
@@ -247,6 +249,27 @@ impl HarnessRunner for GeminiRunner {
     }
 }
 
+impl HarnessRunner for ChatGptUiRunner {
+    fn name(&self) -> &'static str {
+        "chatgpt_ui"
+    }
+
+    fn run_turn<'a>(
+        &'a self,
+        ctx: TurnContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = AgentResult> + Send + 'a>> {
+        Box::pin(chatgpt_ui::run_chatgpt_ui_turn(
+            ctx.work_dir,
+            ctx.message,
+            ctx.model,
+            ctx.mission_id,
+            ctx.events_tx,
+            ctx.cancel,
+            ctx.app_working_dir,
+        ))
+    }
+}
+
 /// Resolve a backend id to its turn runner.
 pub(crate) fn runner_for(backend_id: &str) -> Option<&'static dyn HarnessRunner> {
     match backend_id {
@@ -255,6 +278,7 @@ pub(crate) fn runner_for(backend_id: &str) -> Option<&'static dyn HarnessRunner>
         "codex" => Some(&CodexRunner),
         "grok" => Some(&GrokRunner),
         "gemini" => Some(&GeminiRunner),
+        "chatgpt_ui" => Some(&ChatGptUiRunner),
         _ => None,
     }
 }
@@ -287,7 +311,14 @@ mod tests {
 
     #[test]
     fn runner_for_maps_every_backend() {
-        for backend in ["claudecode", "opencode", "codex", "grok", "gemini"] {
+        for backend in [
+            "claudecode",
+            "opencode",
+            "codex",
+            "grok",
+            "gemini",
+            "chatgpt_ui",
+        ] {
             let runner = runner_for(backend).expect("runner exists");
             assert_eq!(runner.name(), backend);
         }

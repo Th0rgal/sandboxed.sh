@@ -11,7 +11,7 @@ import type { Workspace } from '@/lib/api';
 import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
 import { toast } from '@/components/toast';
 
-const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok'] as const;
+const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok', 'chatgpt_ui'] as const;
 
 // Kept in sync with src/api/control.rs `normalize_model_effort_for_backend`.
 // Codex and Claude Code both accept the GPT reasoning-effort ladder. Other
@@ -153,6 +153,7 @@ export function NewMissionDialog({
       { id: 'codex', name: 'Codex' },
       { id: 'gemini', name: 'Gemini CLI' },
       { id: 'grok', name: 'Grok Build' },
+      { id: 'chatgpt_ui', name: 'ChatGPT UI (experimental)' },
     ],
     }
   );
@@ -213,6 +214,11 @@ export function NewMissionDialog({
   const { data: grokAgents, mutate: mutateGrokAgents } = useSWR<BackendAgent[]>(
     open && enabledBackends.some(b => b.id === 'grok') ? 'backend-grok-agents' : null,
     () => listBackendAgents('grok'),
+    { revalidateOnFocus: true, dedupingInterval: 5000 }
+  );
+  const { data: chatgptUiAgents, mutate: mutateChatgptUiAgents } = useSWR<BackendAgent[]>(
+    open && enabledBackends.some(b => b.id === 'chatgpt_ui') ? 'backend-chatgpt-ui-agents' : null,
+    () => listBackendAgents('chatgpt_ui'),
     { revalidateOnFocus: true, dedupingInterval: 5000 }
   );
 
@@ -279,6 +285,10 @@ export function NewMissionDialog({
           { id: 'build', name: 'Build' },
           { id: 'plan', name: 'Plan' },
         ];
+      } else if (backend.id === 'chatgpt_ui') {
+        agents = chatgptUiAgents || [
+          { id: 'chat', name: 'ChatGPT web conversation' },
+        ];
       }
 
       // Use agent.id for CLI value, agent.name for display (consistent across all backends)
@@ -294,7 +304,7 @@ export function NewMissionDialog({
     }
 
     return result;
-  }, [enabledBackends, opencodeAgents, claudecodeAgents, codexAgents, geminiAgents, grokAgents, agentsPayload, config, claudeCodeLibConfig]);
+  }, [enabledBackends, opencodeAgents, claudecodeAgents, codexAgents, geminiAgents, grokAgents, chatgptUiAgents, agentsPayload, config, claudeCodeLibConfig]);
 
   // Group agents by backend for display
   const agentsByBackend = useMemo(() => {
@@ -574,6 +584,7 @@ export function NewMissionDialog({
       mutateCodexAgents?.(),
       mutateGeminiAgents?.(),
       mutateGrokAgents?.(),
+      mutateChatgptUiAgents?.(),
       mutateAgentsPayload?.(),
       mutateConfig?.(),
     ]);

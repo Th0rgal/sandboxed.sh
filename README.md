@@ -179,6 +179,7 @@ deployment:
 
 ### Architecture & APIs
 - **[Harness System](docs/HARNESS_SYSTEM.md)** - Backend integration architecture
+- **[ChatGPT UI harness](docs/CHATGPT_UI_HARNESS.md)** - Experimental subscription-backed browser harness
 - **[Workspaces](docs/WORKSPACES.md)** - Isolated execution environments
 - **[Mission API](docs/MISSION_API.md)** - Mission lifecycle and control
 - **[Workspace API](docs/WORKSPACE_API.md)** - Workspace management endpoints
