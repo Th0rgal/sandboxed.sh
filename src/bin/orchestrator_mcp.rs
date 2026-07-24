@@ -548,7 +548,7 @@ impl OrchestratorMcp {
                     "properties": {
                         "backend": {
                             "type": "string",
-                            "enum": ["claudecode", "codex", "gemini", "opencode", "grok"],
+                            "enum": ["claudecode", "codex", "gemini", "opencode", "grok", "chatgpt_ui"],
                             "description": "Optional single backend to inspect. If omitted, returns all common backends."
                         }
                     }
@@ -711,8 +711,8 @@ impl OrchestratorMcp {
                         },
                         "backend": {
                             "type": "string",
-                            "enum": ["claudecode", "codex", "gemini", "opencode", "grok"],
-                            "description": "Backend/harness to use. MUST match the model: claudecode for Claude models, codex for OpenAI/GPT models, gemini for Gemini models, grok for Grok models, opencode for any model via provider routing."
+                            "enum": ["claudecode", "codex", "gemini", "opencode", "grok", "chatgpt_ui"],
+                            "description": "Backend/harness to use. MUST match the model: claudecode for Claude models, codex for OpenAI/GPT models, gemini for Gemini models, grok for Grok models, opencode for provider routing, or chatgpt_ui with an exact visible web model label."
                         },
                         "model_override": {
                             "type": "string",
@@ -767,7 +767,7 @@ impl OrchestratorMcp {
                                 "required": ["title", "prompt"],
                                 "properties": {
                                     "title": { "type": "string" },
-                                    "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "grok"] },
+                                    "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "grok", "chatgpt_ui"] },
                                     "model_override": { "type": "string", "description": "Exact account-supported model ID. For Codex Terra use gpt-5.6-terra with medium effort; gpt-5.5-sol is unsupported." },
                                     "model_effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
                                     "agent": { "type": "string" },
@@ -1557,6 +1557,12 @@ impl OrchestratorMcp {
                     "provider_targeted": provider_targets_backend(&workspace_root, ProviderType::Xai, "grok"),
                     "reason": "Grok Build can use a targeted xAI provider API key or the CLI's own X login cache.",
                     "default_backends": default_backends_for_provider(ProviderType::Xai),
+                }),
+                "chatgpt_ui" => json!({
+                    "backend": "chatgpt_ui",
+                    "ready": null,
+                    "auth_status": "unknown",
+                    "reason": "Browser profile presence cannot prove authentication; a harness turn verifies the session on a blank ChatGPT page.",
                 }),
                 other => json!({
                     "backend": other,
