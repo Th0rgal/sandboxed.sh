@@ -58,6 +58,8 @@ struct Settings {
     python_path: String,
     profile_dir: PathBuf,
     browser: String,
+    proxy_server: Option<String>,
+    display: Option<String>,
     timeout: Duration,
     headless: bool,
 }
@@ -94,6 +96,37 @@ fn lock_profile(profile_dir: &Path) -> Result<ProfileLock, String> {
 
 fn parse_bool_setting(key: &str, default: bool) -> bool {
     crate::api::mission_runner::get_backend_bool_setting("chatgpt_ui", key).unwrap_or(default)
+}
+
+fn validate_proxy_server(value: &str) -> Result<(), String> {
+    let parsed =
+        url::Url::parse(value).map_err(|_| "chatgpt_ui proxy_server must be a URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
+        return Err("chatgpt_ui proxy_server must use http, https, socks5, or socks5h".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("chatgpt_ui proxy_server must not contain credentials".to_string());
+    }
+    Ok(())
+}
+
+fn validate_display(value: &str) -> Result<(), String> {
+    let Some(rest) = value.strip_prefix(':') else {
+        return Err("chatgpt_ui display must use X11 syntax such as :93".to_string());
+    };
+    let mut parts = rest.split('.');
+    let display = parts.next().unwrap_or_default();
+    let screen = parts.next();
+    if display.is_empty()
+        || !display.chars().all(|character| character.is_ascii_digit())
+        || screen.is_some_and(|value| {
+            value.is_empty() || !value.chars().all(|character| character.is_ascii_digit())
+        })
+        || parts.next().is_some()
+    {
+        return Err("chatgpt_ui display must use X11 syntax such as :93".to_string());
+    }
+    Ok(())
 }
 
 fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
@@ -141,14 +174,32 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
     if !matches!(browser.as_str(), "chromium" | "firefox" | "webkit") {
         return Err("chatgpt_ui browser must be chromium, firefox, or webkit".to_string());
     }
+    let proxy_server = get_backend_string_setting("chatgpt_ui", "proxy_server")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(proxy_server) = proxy_server.as_deref() {
+        validate_proxy_server(proxy_server)?;
+    }
+    let headless = parse_bool_setting("headless", true);
+    let display = get_backend_string_setting("chatgpt_ui", "display")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if !headless {
+        let display = display
+            .as_deref()
+            .ok_or_else(|| "chatgpt_ui display is required when headless is false".to_string())?;
+        validate_display(display)?;
+    }
     Ok(Settings {
         driver_path,
         python_path: get_backend_string_setting("chatgpt_ui", "python_path")
             .unwrap_or_else(|| "python3".to_string()),
         profile_dir: canonical_profile,
         browser,
+        proxy_server,
+        display,
         timeout: Duration::from_secs(timeout_secs),
-        headless: parse_bool_setting("headless", true),
+        headless,
     })
 }
 
@@ -183,7 +234,11 @@ pub async fn run_chatgpt_ui_turn(
         .arg("--browser")
         .arg(&settings.browser)
         .arg("--headless")
-        .arg(if settings.headless { "true" } else { "false" })
+        .arg(if settings.headless { "true" } else { "false" });
+    if let Some(proxy_server) = settings.proxy_server.as_deref() {
+        command.arg("--proxy-server").arg(proxy_server);
+    }
+    command
         .current_dir(work_dir)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -193,6 +248,9 @@ pub async fn run_chatgpt_ui_turn(
         // filesystem details. Do not ingest it into mission logs.
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    if let Some(display) = settings.display.as_deref() {
+        command.env("DISPLAY", display);
+    }
     #[cfg(unix)]
     command.process_group(0);
     let mut child = match command.spawn() {
@@ -495,5 +553,21 @@ mod tests {
         );
         assert!(validate_completion(true, " ", 0, true).is_err());
         assert!(validate_completion(true, "done", 0, false).is_err());
+    }
+
+    #[test]
+    fn validates_proxy_server_without_embedded_credentials() {
+        assert!(validate_proxy_server("socks5://127.0.0.1:10880").is_ok());
+        assert!(validate_proxy_server("https://proxy.example.com:8443").is_ok());
+        assert!(validate_proxy_server("ftp://proxy.example.com").is_err());
+        assert!(validate_proxy_server("socks5://user:secret@127.0.0.1:10880").is_err());
+    }
+
+    #[test]
+    fn validates_x11_display_without_accepting_shell_syntax() {
+        assert!(validate_display(":93").is_ok());
+        assert!(validate_display(":93.0").is_ok());
+        assert!(validate_display("localhost:93").is_err());
+        assert!(validate_display(":93;touch /tmp/nope").is_err());
     }
 }

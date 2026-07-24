@@ -20,6 +20,8 @@ const { refreshBackendConfigs, backendConfigsFixture } = vi.hoisted(() => ({
         profile_dir: null,
         driver_path: null,
         python_path: null,
+        proxy_server: null,
+        display: null,
         model: null,
         timeout_secs: 900,
         headless: true,
@@ -106,6 +108,10 @@ describe('BackendsPage ChatGPT UI settings', () => {
     expect(screen.getByLabelText('Python executable')).toHaveValue(
       '/opt/sandboxed-sh/chatgpt-ui-venv/bin/python'
     );
+    expect(screen.getByLabelText('X11 display')).toHaveValue(':93');
+    fireEvent.change(screen.getByLabelText('Browser proxy server'), {
+      target: { value: 'socks5://127.0.0.1:10880' },
+    });
     expect(screen.getByText('Runtime paths configured')).toBeVisible();
 
     fireEvent.click(screen.getByRole('button', { name: 'Save ChatGPT UI' }));
@@ -117,7 +123,10 @@ describe('BackendsPage ChatGPT UI settings', () => {
           profile_dir: '/var/lib/sandboxed-sh/chatgpt-profile',
           driver_path: '/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py',
           python_path: '/opt/sandboxed-sh/chatgpt-ui-venv/bin/python',
+          proxy_server: 'socks5://127.0.0.1:10880',
+          display: ':93',
           browser: 'chromium',
+          headless: false,
           timeout_secs: 900,
         }),
         { enabled: true }

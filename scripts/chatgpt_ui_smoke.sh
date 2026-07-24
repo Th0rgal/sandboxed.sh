@@ -11,6 +11,8 @@ model=${2:-}
 artifact=${3:-}
 python_bin=${CHATGPT_UI_PYTHON:-python3}
 driver=${CHATGPT_UI_DRIVER:-"$(dirname "$0")/chatgpt_ui_driver.py"}
+proxy_server=${CHATGPT_UI_PROXY:-}
+headless=${CHATGPT_UI_HEADLESS:-true}
 if [[ $profile_dir != /* || ! -d $profile_dir ]]; then
   echo "profile directory must be an existing absolute path" >&2
   exit 2
@@ -29,10 +31,19 @@ if [[ ! -f $driver ]]; then
   exit 2
 fi
 
+driver_args=(
+  "$driver"
+  --profile-dir "$profile_dir"
+  --browser chromium
+  --headless "$headless"
+)
+if [[ -n $proxy_server ]]; then
+  driver_args+=(--proxy-server "$proxy_server")
+fi
+
 printf '{"type":"run","message":"Reply with exactly: SANDBOXED_CHATGPT_UI_SMOKE_OK","model":%s,"timeout_ms":120000}\n' \
   "$("$python_bin" -c 'import json,sys; print(json.dumps(sys.argv[1] or None))' "$model")" |
-  "$python_bin" "$driver" \
-    --profile-dir "$profile_dir" --browser chromium --headless true |
+  "$python_bin" "${driver_args[@]}" |
   "$python_bin" -c '
 import json, pathlib, sys
 events = [json.loads(line) for line in sys.stdin if line.strip()]

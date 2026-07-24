@@ -57,7 +57,9 @@ Configure the backend through `PUT /api/backends/chatgpt_ui/config`:
     "driver_path": "/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py",
     "python_path": "/opt/sandboxed-sh/chatgpt-ui-venv/bin/python",
     "browser": "chromium",
-    "headless": true,
+    "proxy_server": "socks5://127.0.0.1:10880",
+    "headless": false,
+    "display": ":93",
     "timeout_secs": 900,
     "model": "GPT-5.6 Pro"
   }
@@ -67,6 +69,11 @@ Configure the backend through `PUT /api/backends/chatgpt_ui/config`:
 `profile_dir` must exist, be absolute, and be outside the sandboxed.sh working
 directory. `driver_path` must be the absolute installed path of the included
 driver script.
+`proxy_server` is optional and applies only to the browser process. Supported
+schemes are `http`, `https`, `socks5`, and `socks5h`; URLs containing embedded
+credentials are rejected.
+When anti-bot checks reject headless Chromium, set `headless` to `false` and
+configure `display` with a dedicated Xvfb display such as `:93`.
 Timeouts are clamped to 30–7200 seconds. A cross-process profile lock rejects
 concurrent use; configure a distinct dedicated profile for each concurrent
 mission.
@@ -84,6 +91,8 @@ For a one-turn operator smoke test:
 ```bash
 CHATGPT_UI_PYTHON=/opt/sandboxed-sh/chatgpt-ui-venv/bin/python \
 CHATGPT_UI_DRIVER=/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py \
+CHATGPT_UI_PROXY=socks5://127.0.0.1:10880 \
+CHATGPT_UI_HEADLESS=false DISPLAY=:93 \
   scripts/chatgpt_ui_smoke.sh \
   /var/lib/sandboxed-sh/chatgpt-profile "GPT-5.6 Pro"
 ```
@@ -92,7 +101,9 @@ Run without a model argument to test the account's current UI default.
 `CHATGPT_UI_PYTHON` must point at the interpreter where Playwright was
 installed; the smoke script otherwise uses `python3`. `CHATGPT_UI_DRIVER` is
 optional when running the script from the repository, where the adjacent
-driver is selected automatically.
+driver is selected automatically. `CHATGPT_UI_PROXY` is optional and should
+match `proxy_server` when the account requires a stable external egress.
+`CHATGPT_UI_HEADLESS=false` requires a working `DISPLAY`.
 
 ## Diagnostics
 

@@ -80,6 +80,7 @@ async def close_context_quietly(context) -> None:
 async def establish_fresh_chat(page) -> int:
     """Prove an authenticated, settled blank chat before observing responses."""
     await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60_000)
+    emit("diagnostic", message="stage=page_loaded")
     login = page.get_by_role("button", name=re.compile(r"log in|sign in", re.I)).first
     if "/auth/" in page.url or (await login.count() and await login.is_visible()):
         raise PermissionError("login required")
@@ -99,16 +100,19 @@ async def establish_fresh_chat(page) -> int:
             break
     if not authenticated:
         raise PermissionError("authenticated account control not found")
+    emit("diagnostic", message="stage=account_confirmed")
 
-    new_chat = page.get_by_role("link", name=re.compile(r"new chat", re.I)).first
-    if await new_chat.count() and await new_chat.is_visible():
-        await new_chat.click()
-    await page.wait_for_url(re.compile(r"^https://chatgpt\.com/(?:\?.*)?$"), timeout=20_000)
+    # A direct navigation to the root is the stable new-chat primitive. The
+    # sidebar's "New chat" control is rollout-dependent and can be a button,
+    # link, or client-side action that does not emit a navigation event.
+    await assert_blank_chat(page)
+    emit("diagnostic", message="stage=blank_route")
 
     composer = page.locator("#prompt-textarea").first
     if not await composer.count():
         composer = page.get_by_role("textbox").last
     await composer.wait_for(state="visible", timeout=20_000)
+    emit("diagnostic", message="stage=composer_ready")
     # Let hydration and lazy conversation rendering settle before taking the
     # baseline. Nothing from this page is emitted before the prompt is sent.
     await page.wait_for_timeout(2_000)
@@ -135,6 +139,7 @@ async def run(args, request) -> None:
     emit("diagnostic", message=f"compatibility={COMPAT_VERSION}; browser={args.browser}")
 
     context = None
+    stage = "launch"
     try:
         async with async_playwright() as playwright:
             browser_type = getattr(playwright, args.browser, None)
@@ -142,11 +147,16 @@ async def run(args, request) -> None:
                 fail("invalid_config", f"unsupported browser: {args.browser}")
                 return
             try:
+                launch_options = {
+                    "user_data_dir": str(Path(args.profile_dir).resolve()),
+                    "headless": args.headless == "true",
+                    "viewport": {"width": 1440, "height": 1000},
+                    "args": ["--disable-background-networking"],
+                }
+                if args.proxy_server:
+                    launch_options["proxy"] = {"server": args.proxy_server}
                 context = await browser_type.launch_persistent_context(
-                    user_data_dir=str(Path(args.profile_dir).resolve()),
-                    headless=args.headless == "true",
-                    viewport={"width": 1440, "height": 1000},
-                    args=["--disable-background-networking"],
+                    **launch_options,
                 )
             except Exception:
                 fail(
@@ -156,17 +166,23 @@ async def run(args, request) -> None:
                 return
 
             page = context.pages[0] if context.pages else await context.new_page()
+            stage = "fresh_chat"
             baseline = await establish_fresh_chat(page)
+            stage = "model_selection"
             model_used = await choose_model(page, requested_model)
+            stage = "blank_chat_check"
             await assert_blank_chat(page)
+            stage = "composer"
             composer = page.locator("#prompt-textarea").first
             if not await composer.count():
                 composer = page.get_by_role("textbox").last
             await composer.fill(message)
+            stage = "send"
             send = page.get_by_role("button", name=re.compile(r"send", re.I)).last
             await send.wait_for(state="visible", timeout=10_000)
             await send.click()
 
+            stage = "response"
             last = ""
             stable = 0
             deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
@@ -195,7 +211,7 @@ async def run(args, request) -> None:
     except Exception as exc:
         fail(
             "compatibility",
-            f"{COMPAT_VERSION}: UI check failed ({type(exc).__name__}); verify selectors against a blank, non-private chat",
+            f"{COMPAT_VERSION}: UI check failed at {stage} ({type(exc).__name__}); verify selectors against a blank, non-private chat",
         )
     finally:
         if context is not None:
@@ -207,6 +223,7 @@ def main() -> None:
     parser.add_argument("--profile-dir", required=True)
     parser.add_argument("--browser", choices=("chromium", "firefox", "webkit"), default="chromium")
     parser.add_argument("--headless", choices=("true", "false"), default="true")
+    parser.add_argument("--proxy-server")
     args = parser.parse_args()
     try:
         request = json.loads(sys.stdin.readline())
