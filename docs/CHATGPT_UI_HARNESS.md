@@ -3,6 +3,8 @@
 `chatgpt_ui` runs a mission turn through the operator's existing ChatGPT web
 session. It consumes the subscription allowance shown in that account's web UI,
 not Codex CLI/API allowance. This is browser automation, not an OpenAI API.
+It does not reuse OpenAI/Codex OAuth credentials from backend settings: login
+state lives only in the dedicated Playwright browser profile configured below.
 
 ## Status and limitations
 
@@ -29,6 +31,8 @@ account:
 python3 -m venv /opt/sandboxed-sh/chatgpt-ui-venv
 /opt/sandboxed-sh/chatgpt-ui-venv/bin/pip install playwright
 /opt/sandboxed-sh/chatgpt-ui-venv/bin/playwright install chromium
+install -D -m 0755 scripts/chatgpt_ui_driver.py \
+  /opt/sandboxed-sh/scripts/chatgpt_ui_driver.py
 ```
 
 Create a dedicated profile directory outside repositories and mission
@@ -78,10 +82,17 @@ not independently prove backend model identity or deep-research capabilities.
 For a one-turn operator smoke test:
 
 ```bash
-scripts/chatgpt_ui_smoke.sh /var/lib/sandboxed-sh/chatgpt-profile "GPT-5.6 Pro"
+CHATGPT_UI_PYTHON=/opt/sandboxed-sh/chatgpt-ui-venv/bin/python \
+CHATGPT_UI_DRIVER=/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py \
+  scripts/chatgpt_ui_smoke.sh \
+  /var/lib/sandboxed-sh/chatgpt-profile "GPT-5.6 Pro"
 ```
 
 Run without a model argument to test the account's current UI default.
+`CHATGPT_UI_PYTHON` must point at the interpreter where Playwright was
+installed; the smoke script otherwise uses `python3`. `CHATGPT_UI_DRIVER` is
+optional when running the script from the repository, where the adjacent
+driver is selected automatically.
 
 ## Diagnostics
 
