@@ -216,6 +216,11 @@ export function NewMissionDialog({
     () => listBackendAgents('grok'),
     { revalidateOnFocus: true, dedupingInterval: 5000 }
   );
+  const { data: chatgptUiAgents, mutate: mutateChatgptUiAgents } = useSWR<BackendAgent[]>(
+    open && enabledBackends.some(b => b.id === 'chatgpt_ui') ? 'backend-chatgpt-ui-agents' : null,
+    () => listBackendAgents('chatgpt_ui'),
+    { revalidateOnFocus: true, dedupingInterval: 5000 }
+  );
 
   // SWR: fallback for opencode agents
   const { data: agentsPayload, mutate: mutateAgentsPayload } = useSWR(open ? 'opencode-agents' : null, getVisibleAgents, {
@@ -280,6 +285,10 @@ export function NewMissionDialog({
           { id: 'build', name: 'Build' },
           { id: 'plan', name: 'Plan' },
         ];
+      } else if (backend.id === 'chatgpt_ui') {
+        agents = chatgptUiAgents || [
+          { id: 'chat', name: 'ChatGPT web conversation' },
+        ];
       }
 
       // Use agent.id for CLI value, agent.name for display (consistent across all backends)
@@ -295,7 +304,7 @@ export function NewMissionDialog({
     }
 
     return result;
-  }, [enabledBackends, opencodeAgents, claudecodeAgents, codexAgents, geminiAgents, grokAgents, agentsPayload, config, claudeCodeLibConfig]);
+  }, [enabledBackends, opencodeAgents, claudecodeAgents, codexAgents, geminiAgents, grokAgents, chatgptUiAgents, agentsPayload, config, claudeCodeLibConfig]);
 
   // Group agents by backend for display
   const agentsByBackend = useMemo(() => {
@@ -575,6 +584,7 @@ export function NewMissionDialog({
       mutateCodexAgents?.(),
       mutateGeminiAgents?.(),
       mutateGrokAgents?.(),
+      mutateChatgptUiAgents?.(),
       mutateAgentsPayload?.(),
       mutateConfig?.(),
     ]);

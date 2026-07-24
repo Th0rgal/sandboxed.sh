@@ -3779,7 +3779,7 @@ async fn run_mission_turn(
             // session and --session/--continue must fire.
             is_continuation || has_opencode_session,
         ),
-        "grok" | "codex" => (
+        "grok" | "codex" | "chatgpt_ui" => (
             if is_goal_mode {
                 user_message.clone()
             } else {

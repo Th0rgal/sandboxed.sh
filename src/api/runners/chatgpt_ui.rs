@@ -25,7 +25,8 @@ use crate::api::mission_runner::{get_backend_string_setting, get_backend_u64_set
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DriverEvent {
     Diagnostic {
-        message: String,
+        #[serde(rename = "message")]
+        _message: String,
     },
     TextDelta {
         content: String,
@@ -110,6 +111,9 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
     let driver_path = get_backend_string_setting("chatgpt_ui", "driver_path")
         .map(PathBuf::from)
         .ok_or_else(|| "chatgpt_ui driver_path is required".to_string())?;
+    if !driver_path.is_absolute() {
+        return Err("chatgpt_ui driver_path must be an absolute path".to_string());
+    }
     if !driver_path.is_file() {
         return Err(format!(
             "chatgpt_ui browser driver not found: {}",
@@ -127,16 +131,21 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
             );
         }
     }
-    let timeout_secs = get_backend_u64_setting("chatgpt_ui", "timeout_secs")
-        .unwrap_or(900)
-        .clamp(30, 7200);
+    let timeout_secs = get_backend_u64_setting("chatgpt_ui", "timeout_secs").unwrap_or(900);
+    if !(30..=7200).contains(&timeout_secs) {
+        return Err("chatgpt_ui timeout_secs must be between 30 and 7200".to_string());
+    }
+    let browser = get_backend_string_setting("chatgpt_ui", "browser")
+        .unwrap_or_else(|| "chromium".to_string());
+    if !matches!(browser.as_str(), "chromium" | "firefox" | "webkit") {
+        return Err("chatgpt_ui browser must be chromium, firefox, or webkit".to_string());
+    }
     Ok(Settings {
         driver_path,
         python_path: get_backend_string_setting("chatgpt_ui", "python_path")
             .unwrap_or_else(|| "python3".to_string()),
-        profile_dir,
-        browser: get_backend_string_setting("chatgpt_ui", "browser")
-            .unwrap_or_else(|| "chromium".to_string()),
+        profile_dir: canonical_profile,
+        browser,
         timeout: Duration::from_secs(timeout_secs),
         headless: parse_bool_setting("headless", true),
     })
@@ -205,7 +214,7 @@ pub async fn run_chatgpt_ui_turn(
             .await
             .is_err()
         {
-            let _ = child.kill().await;
+            terminate_child_tree(&mut child).await;
             return AgentResult::failure("failed to send request to chatgpt_ui driver", 0)
                 .with_terminal_reason(TerminalReason::LlmError);
         }
@@ -246,28 +255,46 @@ pub async fn run_chatgpt_ui_turn(
                 let line = match line {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
-                    Err(error) => return AgentResult::failure(format!("chatgpt_ui stream read failed: {error}"), 0)
-                        .with_terminal_reason(TerminalReason::LlmError),
+                    Err(error) => {
+                        terminate_child_tree(&mut child).await;
+                        return AgentResult::failure(format!("chatgpt_ui stream read failed: {error}"), 0)
+                            .with_terminal_reason(TerminalReason::LlmError);
+                    }
                 };
                 let event: DriverEvent = match serde_json::from_str(&line) {
                     Ok(event) => event,
                     Err(error) => {
-                        tracing::warn!(error = %error, "Ignoring invalid chatgpt_ui driver event");
-                        continue;
+                        terminate_child_tree(&mut child).await;
+                        return AgentResult::failure(
+                            format!("chatgpt_ui emitted an invalid protocol event: {error}"), 0
+                        ).with_terminal_reason(TerminalReason::LlmError);
                     }
                 };
                 match event {
-                    DriverEvent::Diagnostic { message } => tracing::info!(mission_id = %mission_id, "{message}"),
+                    // Diagnostics are deliberately not logged: a future
+                    // third-party UI selector must not accidentally turn
+                    // account or page text into server logs.
+                    DriverEvent::Diagnostic { .. } => tracing::debug!(mission_id = %mission_id, "chatgpt_ui driver diagnostic received"),
                     DriverEvent::TextDelta { content } => {
                         output = content;
                         let _ = events_tx.send(AgentEvent::TextDelta { content: output.clone(), mission_id: Some(mission_id) });
                     }
                     DriverEvent::ToolCall { id, name, args } => {
-                        pending_tools.insert(id.clone(), name.clone());
+                        if pending_tools.insert(id.clone(), name.clone()).is_some() {
+                            terminate_child_tree(&mut child).await;
+                            return AgentResult::failure(
+                                "chatgpt_ui emitted a duplicate unresolved tool call id", 0
+                            ).with_terminal_reason(TerminalReason::LlmError);
+                        }
                         let _ = events_tx.send(AgentEvent::ToolCall { tool_call_id: id, name, args, mission_id: Some(mission_id) });
                     }
                     DriverEvent::ToolResult { id, name, result } => {
-                        pending_tools.remove(&id);
+                        if pending_tools.remove(&id).as_deref() != Some(name.as_str()) {
+                            terminate_child_tree(&mut child).await;
+                            return AgentResult::failure(
+                                "chatgpt_ui emitted an unmatched tool result", 0
+                            ).with_terminal_reason(TerminalReason::LlmError);
+                        }
                         let _ = events_tx.send(AgentEvent::ToolResult { tool_call_id: id, name, result, mission_id: Some(mission_id) });
                     }
                     DriverEvent::Complete { content, model } => {
@@ -294,8 +321,24 @@ pub async fn run_chatgpt_ui_turn(
     let status = tokio::select! {
         _ = cancel.cancelled() => {
             terminate_child_tree(&mut child).await;
-            return AgentResult::failure("Mission cancelled", 0)
-                .with_terminal_reason(TerminalReason::Cancelled);
+            let shutdown = crate::api::routes::is_shutdown_initiated();
+            return AgentResult::failure(
+                if shutdown {
+                    "Server restart — paused. Click Resume to continue."
+                } else {
+                    "Mission cancelled"
+                }, 0
+            ).with_terminal_reason(if shutdown {
+                TerminalReason::ServerShutdown
+            } else {
+                TerminalReason::Cancelled
+            });
+        }
+        _ = &mut deadline => {
+            terminate_child_tree(&mut child).await;
+            return AgentResult::failure(
+                format!("chatgpt_ui timed out after {} seconds", settings.timeout.as_secs()), 0
+            ).with_terminal_reason(TerminalReason::LlmError);
         }
         status = tokio::time::timeout(Duration::from_secs(5), child.wait()) => status,
     };
@@ -331,19 +374,22 @@ pub async fn run_chatgpt_ui_turn(
 async fn terminate_child_tree(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
+        let process_group = -(pid as i32);
         unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
+            libc::kill(process_group, libc::SIGTERM);
         }
-        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        let exited = tokio::time::timeout(Duration::from_secs(2), child.wait())
             .await
-            .is_ok()
-        {
-            return;
-        }
+            .is_ok();
+        // The group leader can exit before Chromium descendants. Always send
+        // SIGKILL to the original process group after the grace period; ESRCH
+        // simply means the group is already empty.
         unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
+            libc::kill(process_group, libc::SIGKILL);
         }
-        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        if !exited {
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        }
         return;
     }
     let _ = child.kill().await;

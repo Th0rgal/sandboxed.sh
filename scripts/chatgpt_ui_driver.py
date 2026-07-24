@@ -11,6 +11,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 COMPAT_VERSION = "chatgpt-ui-v1"
 CHATGPT_URL = "https://chatgpt.com/"
@@ -41,35 +42,71 @@ async def choose_model(page, requested: str) -> str:
             continue
     else:
         raise RuntimeError("model picker not found")
-    option = page.get_by_text(requested, exact=True).last
-    try:
-        await option.wait_for(state="visible", timeout=5000)
-        await option.click()
-    except Exception as exc:
-        raise RuntimeError("requested model is not visibly available") from exc
-    return requested
+    # Keep the lookup inside the picker overlay. A global text lookup could
+    # click a same-named private conversation in the sidebar.
+    overlays = [
+        page.get_by_role("menu").last,
+        page.get_by_role("dialog").last,
+        page.locator('[data-radix-popper-content-wrapper]:visible').last,
+    ]
+    for overlay in overlays:
+        try:
+            if await overlay.is_visible(timeout=1000):
+                option = overlay.get_by_text(requested, exact=True).last
+                await option.wait_for(state="visible", timeout=3000)
+                await option.click()
+                return requested
+        except Exception:
+            continue
+    raise RuntimeError("requested model is not visibly available in the model picker")
+
+
+async def assert_blank_chat(page) -> None:
+    """Reject any route or rendered content that could belong to a prior chat."""
+    parsed = urlparse(page.url)
+    if parsed.netloc != "chatgpt.com" or parsed.path not in ("", "/"):
+        raise RuntimeError("new-chat navigation did not reach a blank route")
+    if await page.locator('[data-message-author-role="assistant"]').count():
+        raise RuntimeError("fresh-chat baseline contains prior content")
 
 
 async def establish_fresh_chat(page) -> int:
-    """Open a blank chat and prove no assistant content predates this turn."""
+    """Prove an authenticated, settled blank chat before observing responses."""
     await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60_000)
     login = page.get_by_role("button", name=re.compile(r"log in|sign in", re.I)).first
     if "/auth/" in page.url or (await login.count() and await login.is_visible()):
         raise PermissionError("login required")
 
+    # Anonymous ChatGPT can expose a working composer, so its presence is not
+    # authentication evidence. Require an account-only control and fail closed
+    # when a UI rollout makes that evidence unavailable.
+    account_controls = page.locator(
+        '[data-testid="accounts-profile-button"], '
+        'button[aria-label*="account" i], '
+        'button[aria-label*="profile" i]'
+    )
+    authenticated = False
+    for index in range(await account_controls.count()):
+        if await account_controls.nth(index).is_visible():
+            authenticated = True
+            break
+    if not authenticated:
+        raise PermissionError("authenticated account control not found")
+
     new_chat = page.get_by_role("link", name=re.compile(r"new chat", re.I)).first
     if await new_chat.count() and await new_chat.is_visible():
         await new_chat.click()
-        await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_url(re.compile(r"^https://chatgpt\.com/(?:\?.*)?$"), timeout=20_000)
 
     composer = page.locator("#prompt-textarea").first
     if not await composer.count():
         composer = page.get_by_role("textbox").last
     await composer.wait_for(state="visible", timeout=20_000)
-    baseline = await page.locator('[data-message-author-role="assistant"]').count()
-    if baseline:
-        raise RuntimeError("fresh-chat baseline contains prior content")
-    return baseline
+    # Let hydration and lazy conversation rendering settle before taking the
+    # baseline. Nothing from this page is emitted before the prompt is sent.
+    await page.wait_for_timeout(2_000)
+    await assert_blank_chat(page)
+    return 0
 
 
 async def run(args, request) -> None:
@@ -114,6 +151,7 @@ async def run(args, request) -> None:
             page = context.pages[0] if context.pages else await context.new_page()
             baseline = await establish_fresh_chat(page)
             model_used = await choose_model(page, requested_model)
+            await assert_blank_chat(page)
             composer = page.locator("#prompt-textarea").first
             if not await composer.count():
                 composer = page.get_by_role("textbox").last
