@@ -22670,7 +22670,7 @@ mod tests {
             .heartbeat_mission_run(
                 run.run_id,
                 run.generation,
-                MissionExecutionState::Running,
+                MissionExecutionState::WaitingRemoteJob,
                 None,
             )
             .await
