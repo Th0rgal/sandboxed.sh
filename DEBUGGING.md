@@ -2,14 +2,74 @@
 
 ## Remote Servers
 
-| Server     | SSH                                        | Domain                          |
-| ---------- | ------------------------------------------ | ------------------------------- |
-| **Thomas** | `ssh -i ~/.ssh/cursor root@95.216.112.253` | https://agent-backend.thomas.md |
-| **Ben**    | `ssh -i ~/.ssh/cursor root@88.99.4.254`    | https://fricobackend.relens.ai  |
+| Server | SSH | Domain |
+| --- | --- | --- |
+| **Thomas / agent-core** | `ssh -i ~/.ssh/paloma root@65.109.98.246` | https://agent-backend.thomas.md |
+| **Thomas / old-agent compute** | `ssh -i ~/.ssh/paloma root@95.216.112.253` | Sandboxed node only |
+| **Ben** | `ssh -i ~/.ssh/paloma root@88.99.4.254` | https://fricobackend.relens.ai |
 
-## Backend Services (Thomas)
+## Backend Services (Thomas / agent-core)
 
-Thomas's server runs two sandboxed.sh instances plus the Hermes assistant stack:
+`agent-core` (`65.109.98.246`, Tailscale `100.107.113.19`) is the only Thomas
+control plane. It runs the two sandboxed.sh instances plus the Hermes assistant
+stack. Hermes's server inventory calls it **`agent-core`**; the historical
+`sepolia.rpc.starknet.id` name is only a compatibility DNS alias.
+
+`old-agent` (`95.216.112.253`) is intentionally still powered on, but only as a
+leaf compute host. Its Sandboxed node ID is **`old-agent`** and exposes port
+3088 only to `65.109.98.246`. Its former sandboxed.sh, Hermes, fleet-daemon, and
+nginx control-plane services remain stopped and disabled. Do not use it as a
+scheduler, relay, or rollback control plane.
+
+Network routing is direct:
+
+- `agent-core` reaches DGX Spark over Tailscale at `100.77.4.93:3088`. There is
+  no production SSH tunnel through `old-agent`.
+- Ashur, Babylon, Nippur, and `old-agent` expose their Sandboxed node API only
+  to the public address `65.109.98.246`.
+- The Paloma SSH key on `agent-core` is authorized for operational reads on
+  Ashur, Babylon, Nippur, DGX, and `old-agent`; `disk-sentinel` exercises these
+  direct paths.
+- DNS already points the production endpoints at `agent-core`. The current
+  Cloudflare automation token still returns `Invalid API Token`; rotate it
+  before the next DNS mutation. Do not reintroduce an `old-agent` relay as a
+  workaround.
+
+### Disk sentinel
+
+The production cron runs:
+
+```text
+/srv/sandboxed-storage/staging/agent-core/hermes/.hermes/scripts/disk-sentinel.sh
+```
+
+Keep its mirrored operator copy in
+`/srv/sandboxed-storage/staging/agent-core/hermes/scripts/` identical. It checks
+`agent-core` locally, then Ashur, Babylon, Nippur, DGX Spark, and `old-agent`
+over direct SSH. It must not contain the retired CI runner or route DGX through
+`old-agent`.
+
+Remote SSH is deliberately non-interactive and fail-closed:
+
+- Ashur, Babylon, Nippur, and `old-agent` use
+  `/var/lib/hermes-assistant/.ssh/paloma`.
+- DGX uses `/root/.ssh/agent-core-dgx-tunnel` directly; despite the historical
+  filename, this is now a direct Tailscale SSH identity.
+- Every host key must already be pinned in `/root/.ssh/known_hosts`; do not
+  solve a sentinel incident with `StrictHostKeyChecking=no`.
+
+When several hosts suddenly report `DISK UNKNOWN`, first execute the script
+manually on `agent-core`. Check the explicit identity path and pinned host key
+for each failing entry before diagnosing a simultaneous fleet outage:
+
+```bash
+ssh -i ~/.ssh/paloma root@65.109.98.246 \
+  '/srv/sandboxed-storage/staging/agent-core/hermes/.hermes/scripts/disk-sentinel.sh'
+```
+
+No output means every monitored filesystem is reachable and below its alert
+threshold. The current cron job ID is `6bfc537e6dc9`; a manual cron execution
+must also finish successfully before closing the incident.
 
 | Service | Port | Domain | Binary |
 |---------|------|--------|--------|
@@ -32,7 +92,7 @@ Thomas's server runs two sandboxed.sh instances plus the Hermes assistant stack:
   Unit: `/etc/systemd/system/hermes-dashboard.service` (`hermes dashboard
   --no-open --host 127.0.0.1 --port 9130 --skip-build`, same `HERMES_HOME`
   `/var/lib/hermes-assistant` as the gateway so sessions/memory are shared,
-  auth via `HERMES_DASHBOARD_SESSION_TOKEN` = same key, stub web dist at
+  auth via `HERMES_DASHBOARD_SESSION_TOKEN` = same key, production web dist at
   `/var/lib/hermes-assistant/web_dist`). The nginx location pins
   `Host 127.0.0.1:9130` (host-header check) and must NOT add `X-Forwarded-For`
   (the WS gate requires a loopback peer).
@@ -52,10 +112,9 @@ Hermes gotchas:
   `HERMES_DASHBOARD_SESSION_TOKEN`, and the desktop's `connection.json` together.
 
 ```bash
-# Production
+# Production inspection. Deploy/restart through the guarded endpoint below.
 systemctl status sandboxed-sh-prod
 journalctl -u sandboxed-sh-prod -f
-systemctl restart sandboxed-sh-prod
 
 # Development
 systemctl status sandboxed-sh-dev
@@ -66,16 +125,17 @@ systemctl restart sandboxed-sh-dev
 **Paths (Production):**
 
 - Binary: `/usr/local/bin/sandboxed-sh-prod`
-- Config: `/etc/sandboxed_sh/sandboxed_sh.env`
+- Config: `/etc/open_agent/open_agent.env`
 - Service: `/etc/systemd/system/sandboxed-sh-prod.service`
-- Data: `/root/.sandboxed-sh/`
+- Data root: `/srv/sandboxed-storage/staging/agent-core`
 
 **Paths (Development):**
 
 - Binary: `/usr/local/bin/sandboxed-sh-dev`
-- Config: `/etc/sandboxed_sh/sandboxed_sh_dev.env`
+- Config: `/etc/open_agent/open_agent_dev.env`
 - Service: `/etc/systemd/system/sandboxed-sh-dev.service`
-- Data: `/root/.sandboxed-sh-dev/`
+- Data root: inspect `WORKING_DIR`/storage settings in the dev environment file;
+  never infer it from the production path.
 
 ### Investigating Unexpected Service Stops
 
@@ -155,20 +215,20 @@ Sync source code and build directly on the server:
 ```bash
 # Sync source (backend-only; avoids copying dashboard/ which deploys via Vercel)
 rsync -avz --exclude 'target' --exclude '.git' --exclude 'dashboard' \
-  -e "ssh -i ~/.ssh/cursor" \
-  /Users/thomas/work/open_agent/ root@95.216.112.253:/opt/sandboxed-sh-dev/
+  -e "ssh -i ~/.ssh/paloma" \
+  /Users/thomas/work/open_agent/ root@65.109.98.246:/opt/sandboxed-sh-dev/
 
 # If you need the dashboard on the server for debugging, remove the dashboard exclude:
 # rsync -avz --exclude 'target' --exclude '.git' --exclude 'dashboard/node_modules' --exclude 'dashboard/.next' \
-#   -e "ssh -i ~/.ssh/cursor" \
-#   /Users/thomas/work/open_agent/ root@95.216.112.253:/opt/sandboxed-sh-dev/
+#   -e "ssh -i ~/.ssh/paloma" \
+#   /Users/thomas/work/open_agent/ root@65.109.98.246:/opt/sandboxed-sh-dev/
 
 # Build on server (debug mode)
-ssh -i ~/.ssh/cursor root@95.216.112.253 "cd /opt/sandboxed-sh-dev && source ~/.cargo/env && cargo build"
+ssh -i ~/.ssh/paloma root@65.109.98.246 "cd /opt/sandboxed-sh-dev && source ~/.cargo/env && cargo build"
 
 # Copy binaries (main + MCP tools) and restart
 # Note: stop service first to avoid "Text file busy" when replacing MCP binaries.
-ssh -i ~/.ssh/cursor root@95.216.112.253 "systemctl stop sandboxed-sh-dev && \
+ssh -i ~/.ssh/paloma root@65.109.98.246 "systemctl stop sandboxed-sh-dev && \
   cp /opt/sandboxed-sh-dev/target/debug/sandboxed-sh /usr/local/bin/sandboxed-sh-dev && \
   cp /opt/sandboxed-sh-dev/target/debug/workspace-mcp /usr/local/bin/ && \
   cp /opt/sandboxed-sh-dev/target/debug/desktop-mcp /usr/local/bin/ && \
@@ -185,16 +245,17 @@ curl https://agent-backend-dev.thomas.md/api/health
 # Build (debug mode - always use this)
 cargo build
 
-# Deploy to Thomas (dev first, then promote to prod)
-scp -i ~/.ssh/cursor target/debug/sandboxed_sh root@95.216.112.253:/usr/local/bin/sandboxed-sh-dev
-ssh -i ~/.ssh/cursor root@95.216.112.253 "systemctl restart sandboxed-sh-dev"
+# Deploy to Thomas / agent-core (dev first, then promote to prod)
+scp -i ~/.ssh/paloma target/debug/sandboxed_sh root@65.109.98.246:/usr/local/bin/sandboxed-sh-dev
+ssh -i ~/.ssh/paloma root@65.109.98.246 "systemctl restart sandboxed-sh-dev"
 
-# After testing, promote to production
-ssh -i ~/.ssh/cursor root@95.216.112.253 "cp /usr/local/bin/sandboxed-sh-dev /usr/local/bin/sandboxed-sh-prod && systemctl restart sandboxed-sh-prod"
+# After testing, deploy production through POST /api/system/deploy with
+# target_environment=prod and expected_service=sandboxed-sh-prod.service.
+# Never copy over the live production binary or run an unguarded raw restart.
 
 # Deploy to Ben
-scp -i ~/.ssh/cursor target/debug/sandboxed_sh root@88.99.4.254:/usr/local/bin/sandboxed-sh
-ssh -i ~/.ssh/cursor root@88.99.4.254 "systemctl restart sandboxed-sh"
+scp -i ~/.ssh/paloma target/debug/sandboxed_sh root@88.99.4.254:/usr/local/bin/sandboxed-sh
+ssh -i ~/.ssh/paloma root@88.99.4.254 "systemctl restart sandboxed-sh"
 ```
 
 **Faster compilation tips:**
@@ -273,7 +334,7 @@ A refusal surfaces a message that explains the next step:
 For a dev-only restart without rebuilding, use the explicit service command:
 
 ```bash
-ssh -i ~/.ssh/cursor root@95.216.112.253 "systemctl restart sandboxed-sh-dev"
+ssh -i ~/.ssh/paloma root@65.109.98.246 "systemctl restart sandboxed-sh-dev"
 ```
 
 Do not call `deploy_sandboxed_sh` from a prod mission unless you intend to
@@ -292,14 +353,14 @@ the one command we actually want it to run.
 ### Step 1 — identify the agent key
 
 ```bash
-ssh -i ~/.ssh/cursor root@95.216.112.253 \
+ssh -i ~/.ssh/paloma root@65.109.98.246 \
   'cat /root/.ssh/authorized_keys'
 ```
 
 The agent key is the one whose fingerprint matches the `SSH_PRIVATE_KEY_B64`
 baked into mission containers (it's a fixed key, not per-mission). Look
 for the entry that has *no* `command="..."` restriction and isn't your own
-`cursor` admin key.
+`paloma` admin key.
 
 ### Step 2 — restrict it
 
@@ -433,7 +494,7 @@ should show `model_effort: high`.
 
 **MCPs show "Failed to spawn process" error:** The MCP binaries (`workspace-mcp`, `desktop-mcp`, `orchestrator-mcp`) need to be installed to `/usr/local/bin/`. After building, copy them:
 ```bash
-ssh -i ~/.ssh/cursor root@95.216.112.253 "cp /opt/sandboxed-sh-dev/target/debug/workspace-mcp /usr/local/bin/ && \
+ssh -i ~/.ssh/paloma root@65.109.98.246 "cp /opt/sandboxed-sh-dev/target/debug/workspace-mcp /usr/local/bin/ && \
   cp /opt/sandboxed-sh-dev/target/debug/desktop-mcp /usr/local/bin/ && \
   cp /opt/sandboxed-sh-dev/target/debug/orchestrator-mcp /usr/local/bin/"
 ```
@@ -455,7 +516,7 @@ machinectl list   # For container workspaces
 
 **Proxy issues:**
 
-- Thomas uses nginx: `/etc/nginx/sites-available/`
+- Thomas / agent-core uses nginx: `/etc/nginx/sites-available/`
 - Ben uses Caddy: `/etc/caddy/Caddyfile`
 
 ## Mission Debug Runbook
