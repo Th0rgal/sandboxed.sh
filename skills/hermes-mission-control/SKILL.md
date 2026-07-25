@@ -77,6 +77,13 @@ Match the signal to the fix. The health `recommendation` usually tells you which
   the answer is Y, move on to Z"), or switch model.
 - **Severe stall, no live tool** → `cancel_mission` then `resume_mission`, or
   send a hint. A `warning` stall with a tool running is fine — leave it.
+- **Running `chatgpt_ui` mission** → event silence alone is never stall
+  evidence. GPT Pro can expose only `Pro thinking` until visible answer text
+  begins. While the run is non-terminal and its durable heartbeat advances,
+  wait for the driver's result or explicit absolute timeout. Do **not** cancel,
+  resume, or submit a replacement: the browser profile is exclusive and the
+  duplicate would either waste the in-flight answer or contend for the same
+  profile.
 - **Idle but goal not done (gave up early)** → the #1 failure mode. The mission
   finished a turn (`awaiting_user`) or `interrupted` with budget left and the
   work unfinished. **Push it to continue**, don't let it sit:
@@ -119,7 +126,9 @@ Match the signal to the fix. The health `recommendation` usually tells you which
    mission ID before doing anything else.
 3. Treat the call as asynchronous. Poll `get_mission_health` or
    `get_mission_digest`; do not repeatedly submit replacements while the same
-   mission is active.
+   mission is active. A fresh durable run heartbeat is the liveness proof;
+   `seconds_since_activity` only measures visible UI events and may remain stale
+   during a long hidden Pro reasoning phase.
 4. Read the completed text from the mission events. If the response generated
    files, call `list_mission_shared_files`, then `download_shared_file` for each
    file you actually need.
