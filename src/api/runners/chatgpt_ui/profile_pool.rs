@@ -3,8 +3,7 @@
 //! Every ChatGPT UI turn leases exactly one profile directory through an
 //! advisory file lock. Slots that keep failing in ways that a retry cannot fix
 //! (logged-out profile, broken browser launch, repeated UI incompatibility)
-//! are quarantined for a cooldown so healthy slots are preferred. The pool
-//! fails open: when every slot is quarantined, leases are still granted.
+//! are quarantined for a cooldown so unhealthy slots are not retried blindly.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -106,7 +105,11 @@ fn quarantine_for(kind: SlotFailureKind, consecutive_failures: u32) -> Option<Du
 fn record_slot_failure_at(profile_dir: &Path, kind: SlotFailureKind, now: Instant) {
     let mut slots = registry().lock().expect("profile pool registry poisoned");
     let health = slots.entry(profile_dir.to_path_buf()).or_default();
-    health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    health.consecutive_failures = if health.last_failure == Some(kind) {
+        health.consecutive_failures.saturating_add(1)
+    } else {
+        1
+    };
     health.last_failure = Some(kind);
     if let Some(cooldown) = quarantine_for(kind, health.consecutive_failures) {
         let until = now + cooldown;
@@ -166,13 +169,16 @@ pub async fn acquire_profile(
     let mut announced_wait = false;
     loop {
         let now = Instant::now();
-        // Prefer healthy slots, but fail open: a fully quarantined pool still
-        // grants leases so a transient outage cannot deadlock every mission.
-        let all_quarantined = profile_dirs
-            .iter()
-            .all(|profile_dir| is_quarantined_at(profile_dir, now));
-        for (slot, profile_dir) in profile_dirs.iter().enumerate() {
-            if !all_quarantined && is_quarantined_at(profile_dir, now) {
+        let mut candidates = profile_dirs.iter().enumerate().collect::<Vec<_>>();
+        // A compatibility failure is not quarantined until it repeats, but a
+        // clean alternative must still win the next lease. This lets a
+        // controller perform its single different-slot retry without making
+        // one transient selector miss sideline the profile for ten minutes.
+        candidates.sort_by_key(|(_, profile_dir)| {
+            slot_health_at(profile_dir, now).last_failure.is_some()
+        });
+        for (slot, profile_dir) in candidates {
+            if is_quarantined_at(profile_dir, now) {
                 continue;
             }
             match try_lock_profile(profile_dir) {
@@ -220,6 +226,7 @@ pub enum ProfileSlotState {
     Available,
     InUse,
     Quarantined,
+    Unavailable,
 }
 
 /// Privacy-safe snapshot of one pool slot: exposes only the directory
@@ -248,13 +255,12 @@ pub fn pool_snapshot(profile_dirs: &[PathBuf]) -> Vec<ProfileSlotStatus> {
                 .and_then(|until| until.checked_duration_since(now));
             // A momentary probe lock is released immediately and cannot
             // starve waiting missions, which retry every two seconds.
-            let in_use = matches!(try_lock_profile(profile_dir), Ok(None));
-            let state = if in_use {
-                ProfileSlotState::InUse
-            } else if quarantine_remaining.is_some() {
-                ProfileSlotState::Quarantined
-            } else {
-                ProfileSlotState::Available
+            let lock_state = try_lock_profile(profile_dir);
+            let state = match lock_state {
+                Ok(None) => ProfileSlotState::InUse,
+                Ok(Some(_)) if quarantine_remaining.is_some() => ProfileSlotState::Quarantined,
+                Ok(Some(_)) => ProfileSlotState::Available,
+                Err(_) => ProfileSlotState::Unavailable,
             };
             ProfileSlotStatus {
                 slot: index + 1,
@@ -340,17 +346,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fully_quarantined_pool_fails_open() {
+    async fn compatibility_failure_prefers_a_different_clean_slot() {
         let root = tempfile::tempdir().unwrap();
-        let only_profile = root.path().join("profile-1");
-        std::fs::create_dir(&only_profile).unwrap();
-        reset_registry_for_tests(std::slice::from_ref(&only_profile));
-        record_slot_failure(&only_profile, SlotFailureKind::Launch);
+        let first_profile = root.path().join("profile-1");
+        let second_profile = root.path().join("profile-2");
+        std::fs::create_dir(&first_profile).unwrap();
+        std::fs::create_dir(&second_profile).unwrap();
+        reset_registry_for_tests(&[first_profile.clone(), second_profile.clone()]);
+        record_slot_failure(&first_profile, SlotFailureKind::Compatibility);
         let (events_tx, _) = broadcast::channel(8);
         let cancel = CancellationToken::new();
 
         let (slot, selected, _lease) = acquire_profile(
-            std::slice::from_ref(&only_profile),
+            &[first_profile.clone(), second_profile.clone()],
             Uuid::new_v4(),
             &events_tx,
             &cancel,
@@ -358,8 +366,31 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(slot, 0);
-        assert_eq!(selected, only_profile);
+        assert_eq!(slot, 1);
+        assert_eq!(selected, second_profile);
+        reset_registry_for_tests(&[first_profile]);
+    }
+
+    #[tokio::test]
+    async fn fully_quarantined_pool_waits_until_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let only_profile = root.path().join("profile-1");
+        std::fs::create_dir(&only_profile).unwrap();
+        reset_registry_for_tests(std::slice::from_ref(&only_profile));
+        record_slot_failure(&only_profile, SlotFailureKind::Launch);
+        let (events_tx, _) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = acquire_profile(
+            std::slice::from_ref(&only_profile),
+            Uuid::new_v4(),
+            &events_tx,
+            &cancel,
+        )
+        .await;
+
+        assert!(result.is_err());
         reset_registry_for_tests(&[only_profile]);
     }
 
@@ -398,6 +429,22 @@ mod tests {
 
         record_slot_success(&profile);
         assert!(!is_quarantined_at(&profile, now));
+        reset_registry_for_tests(&[profile]);
+    }
+
+    #[test]
+    fn compatibility_threshold_counts_only_consecutive_compatibility_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        reset_registry_for_tests(std::slice::from_ref(&profile));
+        let now = Instant::now();
+
+        record_slot_failure_at(&profile, SlotFailureKind::Compatibility, now);
+        record_slot_failure_at(&profile, SlotFailureKind::Compatibility, now);
+        record_slot_failure_at(&profile, SlotFailureKind::Launch, now);
+        assert_eq!(slot_health_at(&profile, now).consecutive_failures, 1);
+
         reset_registry_for_tests(&[profile]);
     }
 
@@ -443,6 +490,16 @@ mod tests {
             assert!(!status.profile_name.contains('/'));
         }
         reset_registry_for_tests(&[busy, sick, free]);
+    }
+
+    #[test]
+    fn pool_snapshot_never_reports_an_unlockable_slot_as_available() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_parent = root.path().join("missing").join("profile");
+
+        let snapshot = pool_snapshot(&[missing_parent]);
+
+        assert_eq!(snapshot[0].state, ProfileSlotState::Unavailable);
     }
 
     #[tokio::test]

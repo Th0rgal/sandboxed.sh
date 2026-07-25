@@ -46,7 +46,7 @@ impl SingletonCleanup {
 
     /// Whether the profile is safe to hand to a fresh browser launch.
     pub fn profile_is_launchable(self) -> bool {
-        matches!(self, Self::Clean | Self::Removed(_) | Self::Unrecognized)
+        matches!(self, Self::Clean | Self::Removed(_))
     }
 }
 

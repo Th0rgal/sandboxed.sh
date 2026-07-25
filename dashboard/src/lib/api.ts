@@ -3286,7 +3286,7 @@ export async function getBackendConfig(
 export interface ChatgptUiProfilePoolSlot {
   slot: number;
   profile_name: string;
-  state: "available" | "in_use" | "quarantined";
+  state: "available" | "in_use" | "quarantined" | "unavailable";
   consecutive_failures: number;
   quarantine_remaining_secs?: number | null;
   last_failure?: string | null;

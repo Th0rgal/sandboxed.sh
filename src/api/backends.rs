@@ -739,22 +739,15 @@ pub struct ChatgptUiProfilePoolResponse {
 /// GET /api/backends/chatgpt_ui/profile-pool — per-slot pool state
 /// (available / in use / quarantined) for the ChatGPT UI browser pool.
 pub async fn chatgpt_ui_profile_pool(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Extension(_user): Extension<AuthUser>,
-) -> Json<ChatgptUiProfilePoolResponse> {
-    let mut profile_dirs: Vec<std::path::PathBuf> =
-        crate::api::mission_runner::get_backend_string_setting("chatgpt_ui", "profile_dir")
-            .into_iter()
-            .chain(crate::api::mission_runner::get_backend_string_list_setting(
-                "chatgpt_ui",
-                "profile_dirs",
-            ))
-            .map(std::path::PathBuf::from)
-            .collect();
-    profile_dirs.dedup();
-    Json(ChatgptUiProfilePoolResponse {
+) -> Result<Json<ChatgptUiProfilePoolResponse>, (StatusCode, String)> {
+    let profile_dirs =
+        crate::api::runners::chatgpt_ui::configured_profile_dirs(&state.config.working_dir)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(ChatgptUiProfilePoolResponse {
         slots: crate::api::runners::chatgpt_ui::profile_pool::pool_snapshot(&profile_dirs),
-    })
+    }))
 }
 
 #[cfg(test)]

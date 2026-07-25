@@ -754,7 +754,8 @@ export default function BackendsPage() {
                             'rounded-full px-2 py-0.5',
                             slot.state === 'available' && 'bg-emerald-500/10 text-emerald-300',
                             slot.state === 'in_use' && 'bg-indigo-500/10 text-indigo-300',
-                            slot.state === 'quarantined' && 'bg-amber-500/10 text-amber-300'
+                            slot.state === 'quarantined' && 'bg-amber-500/10 text-amber-300',
+                            slot.state === 'unavailable' && 'bg-rose-500/10 text-rose-300'
                           )}
                         >
                           {slot.state === 'in_use' ? 'in use' : slot.state}

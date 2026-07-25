@@ -234,7 +234,7 @@ fn validate_display(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
+pub(crate) fn configured_profile_dirs(app_working_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut configured_profiles = get_backend_string_setting("chatgpt_ui", "profile_dir")
         .into_iter()
         .chain(get_backend_string_list_setting(
@@ -246,18 +246,6 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
     configured_profiles.dedup();
     if configured_profiles.is_empty() {
         return Err("chatgpt_ui profile_dir or profile_dirs is required".to_string());
-    }
-    let driver_path = get_backend_string_setting("chatgpt_ui", "driver_path")
-        .map(PathBuf::from)
-        .ok_or_else(|| "chatgpt_ui driver_path is required".to_string())?;
-    if !driver_path.is_absolute() {
-        return Err("chatgpt_ui driver_path must be an absolute path".to_string());
-    }
-    if !driver_path.is_file() {
-        return Err(format!(
-            "chatgpt_ui browser driver not found: {}",
-            driver_path.display()
-        ));
     }
     let canonical_working_dir = app_working_dir.canonicalize().ok();
     let mut profile_dirs = Vec::with_capacity(configured_profiles.len());
@@ -286,6 +274,23 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
         if !profile_dirs.contains(&canonical_profile) {
             profile_dirs.push(canonical_profile);
         }
+    }
+    Ok(profile_dirs)
+}
+
+fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
+    let profile_dirs = configured_profile_dirs(app_working_dir)?;
+    let driver_path = get_backend_string_setting("chatgpt_ui", "driver_path")
+        .map(PathBuf::from)
+        .ok_or_else(|| "chatgpt_ui driver_path is required".to_string())?;
+    if !driver_path.is_absolute() {
+        return Err("chatgpt_ui driver_path must be an absolute path".to_string());
+    }
+    if !driver_path.is_file() {
+        return Err(format!(
+            "chatgpt_ui browser driver not found: {}",
+            driver_path.display()
+        ));
     }
     let timeout_secs = get_backend_u64_setting("chatgpt_ui", "timeout_secs").unwrap_or(14_400);
     if !(30..=86_400).contains(&timeout_secs) {
@@ -366,9 +371,13 @@ pub async fn run_chatgpt_ui_turn(
                 SingletonCleanup::ActiveProcess => {
                     "chatgpt_ui profile is held by a live browser process outside the profile pool; close it before retrying"
                 }
-                _ => {
+                SingletonCleanup::ForeignHost => {
                     "chatgpt_ui profile holds a SingletonLock from another host; remove it manually if that browser is gone"
                 }
+                SingletonCleanup::Unrecognized => {
+                    "chatgpt_ui profile has an unrecognized Chromium SingletonLock; inspect it manually before retrying"
+                }
+                SingletonCleanup::Clean | SingletonCleanup::Removed(_) => unreachable!(),
             };
             return AgentResult::failure(message, 0)
                 .with_terminal_reason(TerminalReason::LlmError)
@@ -378,9 +387,6 @@ pub async fn run_chatgpt_ui_turn(
                     "classification_source": "structured",
                 }));
         }
-        // From here the pool owns any singleton state this run leaves behind,
-        // even across a crash or a container hostname change.
-        chromium_cleanup::claim_singleton_ownership(&profile_dir);
     }
     let download_dir = match prepare_download_dir(work_dir).await {
         Ok(path) => path,
@@ -419,10 +425,17 @@ pub async fn run_chatgpt_ui_turn(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
+            profile_pool::record_slot_failure(&profile_dir, SlotFailureKind::Launch);
             return AgentResult::failure(format!("failed to start chatgpt_ui driver: {error}"), 0)
-                .with_terminal_reason(TerminalReason::LlmError)
+                .with_terminal_reason(TerminalReason::LlmError);
         }
     };
+    if settings.browser == "chromium" {
+        // Claim ownership only after the driver was successfully spawned. A
+        // pre-spawn marker could authorize a later run to remove singleton
+        // state that this pool never created.
+        chromium_cleanup::claim_singleton_ownership(&profile_dir);
+    }
     #[cfg(unix)]
     let process_group = child.id().map(|pid| -(pid as i32));
 
