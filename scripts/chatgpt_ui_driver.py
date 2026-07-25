@@ -21,6 +21,19 @@ CHATGPT_URL = "https://chatgpt.com/"
 MAX_DOWNLOAD_FILES = 8
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 MODEL_PICKER_READY_TIMEOUT_MS = 15_000
+SEND_CONTROL_TESTIDS = (
+    '[data-testid="send-button"]',
+    '[data-testid="composer-send-button"]',
+)
+STOP_CONTROL_TESTIDS = (
+    '[data-testid="stop-button"]',
+    '[data-testid="composer-stop-button"]',
+)
+# Anchored so unrelated page chrome ("Resend", "Nonstop…") cannot match; the
+# lookup is additionally scoped to the composer form, keeping controls such as
+# a sidebar "Send feedback" out of reach.
+SEND_BUTTON_NAME = re.compile(r"^send\b", re.I)
+STOP_BUTTON_NAME = re.compile(r"^stop\b", re.I)
 INTELLIGENCE_LABELS = ("Instant", "5.5", "Medium", "High", "Extra High", "Pro")
 PRO_MODEL_ALIASES = {
     "gpt-5.6-pro",
@@ -44,6 +57,28 @@ def model_selection(requested: str) -> tuple[str, str]:
     if normalized in PRO_MODEL_ALIASES:
         return "Pro", "gpt-5.6-pro"
     return requested.strip(), requested.strip()
+
+
+async def locate_composer_control(page, testid_selectors, accessible_name):
+    """Find a composer control by stable test id, else composer-scoped role.
+
+    Returns ``(locator_or_none, used_fallback)``. Never scans the whole page
+    by loose text, which could match private sidebar content.
+    """
+    for selector in testid_selectors:
+        control = page.locator(selector).last
+        try:
+            if await control.count() and await control.is_visible():
+                return control, False
+        except Exception:
+            continue
+    control = page.locator("form").get_by_role("button", name=accessible_name).last
+    try:
+        if await control.count() and await control.is_visible():
+            return control, True
+    except Exception:
+        pass
+    return None, False
 
 
 async def choose_intelligence_model(page, label: str) -> bool:
@@ -385,13 +420,24 @@ async def run(args, request) -> None:
                 composer = page.get_by_role("textbox").last
             await composer.fill(message)
             stage = "send"
-            send = page.get_by_role("button", name=re.compile(r"send", re.I)).last
-            await send.wait_for(state="visible", timeout=10_000)
+            send = None
+            for _ in range(20):  # allow ~10 seconds for the control to attach
+                send, used_fallback = await locate_composer_control(
+                    page, SEND_CONTROL_TESTIDS, SEND_BUTTON_NAME
+                )
+                if send is not None:
+                    if used_fallback:
+                        emit("diagnostic", message="stage=send_button_fallback")
+                    break
+                await asyncio.sleep(0.5)
+            if send is None:
+                raise RuntimeError("composer send control not found")
             await send.click()
 
             stage = "response"
             last = ""
             stable = 0
+            stop_fallback_reported = False
             deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
             while asyncio.get_running_loop().time() < deadline:
                 responses = page.locator('[data-message-author-role="assistant"]')
@@ -403,8 +449,13 @@ async def run(args, request) -> None:
                         emit("text_delta", content=text)
                     elif text:
                         stable += 1
-                stop = page.get_by_role("button", name=re.compile(r"stop", re.I)).last
-                stop_visible = await stop.count() and await stop.is_visible()
+                stop, stop_fallback = await locate_composer_control(
+                    page, STOP_CONTROL_TESTIDS, STOP_BUTTON_NAME
+                )
+                if stop_fallback and not stop_fallback_reported:
+                    stop_fallback_reported = True
+                    emit("diagnostic", message="stage=stop_button_fallback")
+                stop_visible = stop is not None
                 if last and count > baseline and not stop_visible and stable >= 2:
                     if download_dir is not None:
                         stage = "artifacts"
