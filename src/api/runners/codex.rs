@@ -115,6 +115,7 @@ pub(crate) fn codex_turn_requires_tool_activity(
 ) -> bool {
     let user_request = current_user_request_for_tool_activity(user_message);
     let user = user_request.to_ascii_lowercase();
+    let actionable_user = user_without_negated_tool_clauses(&user);
     let assistant = assistant_message.trim().to_ascii_lowercase();
 
     let deferred_action_prefixes = [
@@ -153,7 +154,9 @@ pub(crate) fn codex_turn_requires_tool_activity(
     // fix failures." still request execution; the advisory heuristic
     // must not bypass the imperative half. Only short-circuit when no
     // explicit imperative follow-up is present.
-    if user_looks_advisory(&user) && !user_has_imperative_execution_request(&user) {
+    if user_looks_advisory(&actionable_user)
+        && !user_has_imperative_execution_request(&actionable_user)
+    {
         return false;
     }
 
@@ -196,7 +199,7 @@ pub(crate) fn codex_turn_requires_tool_activity(
     ];
     if explicit_tool_markers
         .iter()
-        .any(|marker| user.contains(marker))
+        .any(|marker| actionable_user.contains(marker))
     {
         return true;
     }
@@ -229,8 +232,67 @@ pub(crate) fn codex_turn_requires_tool_activity(
 
     action_markers
         .iter()
-        .any(|action| contains_ascii_word(&user, action))
-        && object_markers.iter().any(|object| user.contains(object))
+        .any(|action| contains_ascii_word(&actionable_user, action))
+        && object_markers
+            .iter()
+            .any(|object| actionable_user.contains(object))
+}
+
+/// Remove clauses that explicitly prohibit tool activity before applying the
+/// keyword heuristic.
+///
+/// Prompts used for auth/model smoke tests commonly say things like
+/// "Do not call tools or modify files. Reply with exactly: OK". Looking only
+/// for `modify files` turns a correct text-only response into a false
+/// `Stalled` failure. A positive clause after "but" remains actionable:
+/// "Do not edit files, but run the tests" must still require tool activity.
+fn user_without_negated_tool_clauses(user_lower: &str) -> String {
+    let clause_separated = user_lower
+        .replace(" but ", ". but ")
+        .replace(" however, ", ". however, ");
+    let mut actionable = String::with_capacity(clause_separated.len());
+
+    for clause in clause_separated.split_inclusive(['.', '!', '?', ';', '\n']) {
+        let trimmed = clause.trim_start();
+        let directive = trimmed
+            .strip_prefix("but ")
+            .or_else(|| trimmed.strip_prefix("however, "))
+            .unwrap_or(trimmed);
+        let negated = [
+            "do not ",
+            "don't ",
+            "dont ",
+            "never ",
+            "must not ",
+            "should not ",
+            "please do not ",
+            "please don't ",
+            "please dont ",
+            "please never ",
+            "you must not ",
+            "you should not ",
+            "kindly do not ",
+            "kindly don't ",
+            "kindly dont ",
+            "no tool ",
+            "no tools ",
+            "without calling ",
+            "without using ",
+            "without running ",
+            "without editing ",
+            "without modifying ",
+        ]
+        .iter()
+        .any(|prefix| directive.starts_with(prefix));
+
+        if negated {
+            actionable.push(' ');
+        } else {
+            actionable.push_str(clause);
+        }
+    }
+
+    actionable
 }
 
 pub(crate) fn codex_is_goal_request(user_message: &str) -> bool {
