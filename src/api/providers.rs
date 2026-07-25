@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -48,6 +49,7 @@ struct KimiModelCache {
 }
 
 static KIMI_MODEL_CACHE: OnceLock<RwLock<KimiModelCache>> = OnceLock::new();
+static KIMI_CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
 const KIMI_MODEL_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const RETIRED_KIMI_MODEL_IDS: &[&str] = &["kimi-k2.6", "kimi-k2-thinking"];
 
@@ -1399,9 +1401,18 @@ pub(crate) async fn invalidate_kimi_model_cache(provider: &crate::ai_providers::
     }
 }
 
+pub(crate) fn advance_kimi_catalog_generation() {
+    KIMI_CATALOG_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+fn kimi_catalog_generation() -> u64 {
+    KIMI_CATALOG_GENERATION.load(Ordering::Acquire)
+}
+
 /// Re-populate Kimi's shared catalog after a reconnect without blocking the
 /// OAuth callback. The caller removes the old entry before spawning this task.
 pub(crate) async fn refresh_connected_kimi_catalog(catalog: ModelCatalog, provider: AIProvider) {
+    let catalog_generation = kimi_catalog_generation();
     match fetch_kimi_models(&provider).await {
         Ok(models) => {
             let checked_at = chrono::Utc::now();
@@ -1417,7 +1428,20 @@ pub(crate) async fn refresh_connected_kimi_catalog(catalog: ModelCatalog, provid
                     )
                 })
                 .collect();
+            let cache = kimi_model_cache().read().await;
+            if kimi_catalog_generation() != catalog_generation {
+                tracing::debug!(
+                    provider_id = %provider.id,
+                    "Discarded Kimi catalog from an obsolete preference generation"
+                );
+                return;
+            }
+            // Keep the generation read-lock until the catalog write commits.
+            // Preference reconciliation advances cache generations before it
+            // takes the catalog write-lock, so the final state cannot be an
+            // obsolete account snapshot.
             catalog.write().await.insert("kimi".to_string(), entries);
+            drop(cache);
         }
         Err(error) => {
             tracing::warn!(
@@ -1827,10 +1851,18 @@ async fn refresh_catalog_once(
     ai_providers: &AIProviderStore,
     working_dir: &Path,
 ) -> (usize, usize) {
-    let fetched = fetch_model_catalog(ai_providers, working_dir).await;
+    let (mut fetched, fetched_kimi_generation) =
+        fetch_model_catalog(ai_providers, working_dir).await;
+    let mut current = catalog.write().await;
+    if kimi_catalog_generation() != fetched_kimi_generation {
+        fetched.remove("kimi");
+        if let Some(kimi) = current.get("kimi").cloned() {
+            fetched.insert("kimi".to_string(), kimi);
+        }
+    }
     let provider_count = fetched.len();
     let model_count: usize = fetched.values().map(|v| v.len()).sum();
-    *catalog.write().await = fetched;
+    *current = fetched;
     (provider_count, model_count)
 }
 
@@ -1899,10 +1931,10 @@ pub async fn refresh_model_catalog(
     })
 }
 
-pub async fn fetch_model_catalog(
+async fn fetch_model_catalog(
     ai_providers: &AIProviderStore,
     _working_dir: &Path,
-) -> HashMap<String, Vec<CatalogEntry>> {
+) -> (HashMap<String, Vec<CatalogEntry>>, u64) {
     // Kimi access tokens are short-lived. Refresh a due store credential
     // synchronously before taking the provider snapshot so the initial catalog
     // probe cannot race the independent refresh task at startup.
@@ -1919,6 +1951,7 @@ pub async fn fetch_model_catalog(
         );
     }
 
+    let catalog_generation = kimi_catalog_generation();
     let providers_list = ai_providers.list().await;
     let mut result = HashMap::new();
 
@@ -2212,7 +2245,7 @@ pub async fn fetch_model_catalog(
         }
     }
 
-    result
+    (result, catalog_generation)
 }
 
 /// Check if a JSON value contains valid auth credentials.

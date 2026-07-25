@@ -8105,6 +8105,8 @@ async fn update_provider(
     }
     .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
 
+    let refresh_kimi_catalog = existing.provider_type == ProviderType::Kimi
+        && (req.priority.is_some() || req.enabled.is_some() || req.base_url.is_some());
     let uuid = existing.id;
     let mut updated = existing.clone();
     if let Some(name) = req.name {
@@ -8170,6 +8172,9 @@ async fn update_provider(
     if pt != ProviderType::Custom {
         sync_store_to_opencode(&state.ai_providers, &state.config.working_dir, pt).await;
     }
+    if refresh_kimi_catalog {
+        reconcile_preferred_kimi_catalog(&state).await;
+    }
 
     if pt == ProviderType::Xai && result.enabled && provider_targets_grok(&result) {
         if let Err(e) = state.backend_configs.set_enabled("grok", true).await {
@@ -8220,6 +8225,11 @@ async fn delete_provider(
 
     let provider_type = provider.provider_type;
     let uuid = provider.id;
+    if provider_type == ProviderType::Kimi {
+        // The row will no longer be addressable after deletion; fence any
+        // in-flight probe and discard its account-specific snapshot first.
+        crate::api::providers::invalidate_kimi_model_cache(&provider).await;
+    }
 
     // Delete from AIProviderStore
     if !state.ai_providers.delete(uuid).await {
@@ -8234,6 +8244,9 @@ async fn delete_provider(
             provider_type,
         )
         .await;
+    }
+    if provider_type == ProviderType::Kimi {
+        reconcile_preferred_kimi_catalog(&state).await;
     }
 
     // Clear default if this was the default
@@ -8259,6 +8272,30 @@ async fn delete_provider(
         StatusCode::OK,
         format!("Provider {} deleted successfully", id),
     ))
+}
+
+/// Reconcile the shared Kimi picker catalog after an operator changes which
+/// stored account is preferred. Workspace config and live discovery must use
+/// the same account; otherwise account-specific future models can be exposed
+/// by the picker but omitted from the mission's generated provider block.
+async fn reconcile_preferred_kimi_catalog(state: &super::routes::AppState) {
+    crate::api::providers::advance_kimi_catalog_generation();
+    let providers = state.ai_providers.get_all_by_type(ProviderType::Kimi).await;
+    // Fence every account because a periodic probe for the previously
+    // preferred row may already be in flight while a different row is being
+    // promoted. Only a probe started after this preference generation may
+    // repopulate the shared catalog.
+    for provider in &providers {
+        crate::api::providers::invalidate_kimi_model_cache(provider).await;
+    }
+    let preferred = crate::api::providers::preferred_usable_kimi_provider(&providers);
+    state.model_catalog.write().await.remove("kimi");
+    if let Some(provider) = preferred {
+        let catalog = Arc::clone(&state.model_catalog);
+        tokio::spawn(async move {
+            crate::api::providers::refresh_connected_kimi_catalog(catalog, provider).await;
+        });
+    }
 }
 
 /// POST /api/ai/providers/:id/auth - Initiate authentication for a provider.
@@ -8786,16 +8823,10 @@ async fn upsert_kimi_oauth_provider(
         )
     })?;
 
-    // The same local row can be reconnected to a different upstream account.
-    // Remove both account-specific cache layers before asynchronously probing
-    // the fresh credentials, so old entitlements are never exposed meanwhile.
-    crate::api::providers::invalidate_kimi_model_cache(&stored).await;
-    state.model_catalog.write().await.remove("kimi");
-    let catalog = Arc::clone(&state.model_catalog);
-    let catalog_provider = stored.clone();
-    tokio::spawn(async move {
-        crate::api::providers::refresh_connected_kimi_catalog(catalog, catalog_provider).await;
-    });
+    // The same local row can be reconnected to a different upstream account,
+    // and a newly connected row can become preferred. Fence all old probes and
+    // rebuild the shared catalog from the newly preferred account.
+    reconcile_preferred_kimi_catalog(state).await;
 
     if let Err(e) =
         update_provider_backends(&state.config.working_dir, ProviderType::Kimi.id(), backends)
