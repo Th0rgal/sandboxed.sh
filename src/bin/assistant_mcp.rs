@@ -2068,7 +2068,8 @@ impl AssistantMcp {
         let events = events.as_array().unwrap_or(&empty);
         let analysis = analyze_trace_events(events);
         let last_assistant = self.last_assistant_message(&id).await;
-        let mut recommendation = build_recommendation(&status, &live, &analysis);
+        let backend = mission.get("backend").and_then(Value::as_str);
+        let mut recommendation = build_recommendation(&status, backend, &live, &analysis);
         if let Some(warning) = &live_warning {
             recommendation =
                 format!("{recommendation} (Note: live runner state unavailable — {warning})");
@@ -2684,7 +2685,12 @@ fn analyze_trace_events(events: &[Value]) -> TraceAnalysis {
 }
 
 /// Synthesize a single actionable next-step hint for the babysitter.
-fn build_recommendation(status: &str, live: &Value, analysis: &TraceAnalysis) -> String {
+fn build_recommendation(
+    status: &str,
+    backend: Option<&str>,
+    live: &Value,
+    analysis: &TraceAnalysis,
+) -> String {
     if analysis.signals.contains("rate_limited") || analysis.signals.contains("capacity_limited") {
         return "Provider is rate-limiting or at capacity. Switch to a different backend/provider \
                 with update_mission_settings, or wait and resume_mission."
@@ -2721,6 +2727,16 @@ fn build_recommendation(status: &str, live: &Value, analysis: &TraceAnalysis) ->
         .get("health")
         .and_then(|health| health.get("severity"))
         .and_then(Value::as_str);
+    let live_state = live.get("state").and_then(Value::as_str);
+    if backend == Some("chatgpt_ui") && live_state == Some("running") {
+        return "ChatGPT UI Pro is still generating. The web UI may expose only a generic \
+                `Pro thinking` marker until the final answer begins, so event silence is not \
+                evidence of a stall. The driver has its own absolute timeout and the durable \
+                run heartbeat proves ownership. Do not cancel, resume, or submit another \
+                ChatGPT UI mission while this run is non-terminal; wait for its result or \
+                explicit timeout."
+            .to_string();
+    }
     if health_status == Some("stalled") {
         let seconds = live
             .get("seconds_since_activity")
@@ -3147,7 +3163,7 @@ mod tests {
         analysis.signals.insert("rate_limited");
         analysis.loop_tool = Some("read_file".to_string());
         analysis.loop_repeats = 5;
-        let rec = build_recommendation("active", &Value::Null, &analysis);
+        let rec = build_recommendation("active", None, &Value::Null, &analysis);
         assert!(rec.contains("rate-limiting") || rec.contains("capacity"));
     }
 
@@ -3158,8 +3174,23 @@ mod tests {
             "seconds_since_activity": 600,
             "health": {"status": "stalled", "severity": "severe"}
         });
-        let rec = build_recommendation("active", &live, &analysis);
+        let rec = build_recommendation("active", None, &live, &analysis);
         assert!(rec.contains("stalled"));
+    }
+
+    #[test]
+    fn recommendation_does_not_cancel_running_chatgpt_ui_for_event_silence() {
+        let analysis = TraceAnalysis::default();
+        let live = json!({
+            "state": "running",
+            "seconds_since_activity": 686,
+            "heartbeat_at": "2026-07-25T10:45:00Z",
+            "health": {"status": "stalled", "severity": "severe"}
+        });
+        let rec = build_recommendation("active", Some("chatgpt_ui"), &live, &analysis);
+        assert!(rec.contains("Pro thinking"));
+        assert!(rec.contains("Do not cancel"));
+        assert!(rec.contains("explicit timeout"));
     }
 
     #[test]
@@ -3168,7 +3199,7 @@ mod tests {
         // in src/api/control.rs). The recommendation must steer the babysitter
         // away from calling resume_mission, otherwise it gets a hard failure.
         let analysis = TraceAnalysis::default();
-        let rec = build_recommendation("not_feasible", &Value::Null, &analysis);
+        let rec = build_recommendation("not_feasible", None, &Value::Null, &analysis);
         assert!(
             !rec.contains("resume_mission with a hint"),
             "recommendation must not suggest resume_mission for not_feasible, got: {rec}"
@@ -3183,7 +3214,7 @@ mod tests {
     fn recommendation_still_recommends_resume_for_resumable_statuses() {
         for status in ["interrupted", "blocked", "failed"] {
             let analysis = TraceAnalysis::default();
-            let rec = build_recommendation(status, &Value::Null, &analysis);
+            let rec = build_recommendation(status, None, &Value::Null, &analysis);
             assert!(
                 rec.contains("resume_mission"),
                 "expected resume_mission recommendation for status {status}, got: {rec}"
