@@ -314,24 +314,25 @@ pub(crate) async fn write_opencode_config(
                                     error = %error,
                                     "Failed to discover Kimi models; using configured fallback catalog"
                                 );
-                                provider
-                                    .custom_models
-                                    .as_ref()
-                                    .filter(|models| !models.is_empty())
-                                    .map(|models| {
-                                        models
-                                            .iter()
-                                            .map(|model| crate::api::providers::ProviderModel {
-                                                id: model.id.clone(),
-                                                name: model
-                                                    .name
-                                                    .clone()
-                                                    .unwrap_or_else(|| model.id.clone()),
-                                                description: None,
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_else(crate::api::providers::kimi_fallback_models)
+                                let mut models = crate::api::providers::kimi_fallback_models();
+                                if let Some(configured) = provider.custom_models.as_ref() {
+                                    for model in configured {
+                                        if model.id.trim().is_empty()
+                                            || models.iter().any(|existing| existing.id == model.id)
+                                        {
+                                            continue;
+                                        }
+                                        models.push(crate::api::providers::ProviderModel {
+                                            id: model.id.clone(),
+                                            name: model
+                                                .name
+                                                .clone()
+                                                .unwrap_or_else(|| model.id.clone()),
+                                            description: None,
+                                        });
+                                    }
+                                }
+                                models
                             }
                         };
                         let mut models_map = serde_json::Map::new();
@@ -1429,6 +1430,47 @@ mod tests {
         );
         assert!(config["provider"]["kimi"]["models"]["k3"].is_object());
         assert!(config["provider"]["kimi"]["models"]["kimi-k2.6"].is_null());
+    }
+
+    #[tokio::test]
+    async fn kimi_offline_config_merges_fallback_and_operator_models() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mission_dir = temp.path().join("mission");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let mut provider = AIProvider::new(ProviderType::Kimi, "Kimi".to_string());
+        // No OAuth token makes discovery fail immediately without a network
+        // request, exercising resilient offline generation.
+        provider.custom_models = Some(vec![crate::ai_providers::CustomModel {
+            id: "k4-operator-preview".to_string(),
+            name: Some("K4 Operator Preview".to_string()),
+            context_limit: None,
+            output_limit: None,
+        }]);
+        let providers = vec![provider];
+
+        write_opencode_config(
+            &mission_dir,
+            Vec::new(),
+            temp.path(),
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            Some(&providers),
+        )
+        .await
+        .unwrap();
+
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mission_dir.join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(config["provider"]["kimi"]["models"]["k3"].is_object());
+        assert_eq!(
+            config["provider"]["kimi"]["models"]["k4-operator-preview"]["name"],
+            "K4 Operator Preview"
+        );
     }
 
     #[test]
