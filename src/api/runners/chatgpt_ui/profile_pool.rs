@@ -186,8 +186,18 @@ pub async fn acquire_profile(
                 Ok(Some(lock)) => return Ok((slot, profile_dir.clone(), lock)),
                 Ok(None) => {}
                 Err(error) => {
-                    return Err(AgentResult::failure(error, 0)
-                        .with_terminal_reason(TerminalReason::LlmError))
+                    // A broken lock path is local to this profile. Keep the
+                    // pool available when another configured slot is healthy;
+                    // if every slot is unavailable, the ordinary wait/cancel
+                    // path below fails closed without selecting one.
+                    tracing::warn!(
+                        profile_name = profile_dir
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("profile"),
+                        error = %error,
+                        "ChatGPT UI profile slot is unavailable"
+                    );
                 }
             }
         }
@@ -318,6 +328,29 @@ mod tests {
 
         assert_eq!(slot, 1);
         assert_eq!(selected, second_profile);
+    }
+
+    #[tokio::test]
+    async fn unavailable_slot_does_not_block_a_healthy_alternative() {
+        let root = tempfile::tempdir().unwrap();
+        let unavailable = root.path().join("missing-parent").join("profile-1");
+        let healthy = root.path().join("profile-2");
+        std::fs::create_dir(&healthy).unwrap();
+        reset_registry_for_tests(&[unavailable.clone(), healthy.clone()]);
+        let (events_tx, _) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+
+        let (slot, selected, _lease) = acquire_profile(
+            &[unavailable, healthy.clone()],
+            Uuid::new_v4(),
+            &events_tx,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(slot, 1);
+        assert_eq!(selected, healthy);
     }
 
     #[tokio::test]
