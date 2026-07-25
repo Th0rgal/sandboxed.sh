@@ -35,6 +35,16 @@ static CODEX_MODEL_PROBE_CACHE: OnceLock<RwLock<HashMap<String, CodexProbeCacheE
 
 const CODEX_MODEL_PROBE_TTL: Duration = Duration::from_secs(10 * 60);
 
+#[derive(Debug, Clone)]
+struct KimiModelCacheEntry {
+    route_fingerprint: u64,
+    models: Vec<ProviderModel>,
+    expires_at: Instant,
+}
+
+static KIMI_MODEL_CACHE: OnceLock<RwLock<Option<KimiModelCacheEntry>>> = OnceLock::new();
+const KIMI_MODEL_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+
 /// Provider IDs that are part of the default catalog and should not be duplicated
 /// from the AIProviderStore.
 pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
@@ -46,6 +56,7 @@ pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
     "cerebras",
     "zai",
     "minimax",
+    "kimi",
 ];
 
 /// Upper bound on models merged for a single provider from live `/v1/models`
@@ -169,6 +180,35 @@ pub struct ProviderModel {
     /// Optional description
     #[serde(default)]
     pub description: Option<String>,
+}
+
+/// Models documented for Kimi Code and returned by its coding `/v1/models`
+/// endpoint as of July 2026. These are only a resilient startup fallback:
+/// connected accounts are refreshed from the live endpoint, so future Kimi
+/// models become selectable without a Sandboxed.sh release.
+pub(crate) fn kimi_fallback_models() -> Vec<ProviderModel> {
+    vec![
+        ProviderModel {
+            id: "kimi-for-coding".to_string(),
+            name: "K2.7 Coding".to_string(),
+            description: Some("Stable Kimi K2.7 coding alias".to_string()),
+        },
+        ProviderModel {
+            id: "kimi-for-coding-highspeed".to_string(),
+            name: "K2.7 Coding Highspeed".to_string(),
+            description: Some("High-speed Kimi K2.7 coding alias".to_string()),
+        },
+        ProviderModel {
+            id: "k3".to_string(),
+            name: "K3".to_string(),
+            description: Some("Kimi K3 with up to a 1M-token context window".to_string()),
+        },
+        ProviderModel {
+            id: "k3-256k".to_string(),
+            name: "K3-256K".to_string(),
+            description: Some("Kimi K3 with a 256K-token context window".to_string()),
+        },
+    ]
 }
 
 /// A provider configuration.
@@ -1132,27 +1172,7 @@ fn default_providers_config() -> ProvidersConfig {
                 name: "Kimi (Subscription)".to_string(),
                 billing: "subscription".to_string(),
                 description: "Kimi Code via Moonshot OAuth (device login)".to_string(),
-                models: vec![
-                    ProviderModel {
-                        id: "kimi-for-coding".to_string(),
-                        name: "Kimi for Coding".to_string(),
-                        description: Some(
-                            "Stable coding alias that tracks the latest Kimi coding model \
-                             (recommended)"
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "kimi-k2.6".to_string(),
-                        name: "Kimi K2.6".to_string(),
-                        description: Some("Latest Kimi K2 model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "kimi-k2-thinking".to_string(),
-                        name: "Kimi K2 Thinking".to_string(),
-                        description: Some("Extended-reasoning Kimi K2 variant".to_string()),
-                    },
-                ],
+                models: kimi_fallback_models(),
             },
         ],
     }
@@ -1212,6 +1232,25 @@ pub async fn fetch_openai_compatible_models(
     models_query: Option<&str>,
     sort_results_by_id: bool,
 ) -> Result<Vec<ProviderModel>, String> {
+    fetch_openai_compatible_models_with_headers(
+        base_url,
+        api_key,
+        prefix_filters,
+        models_query,
+        sort_results_by_id,
+        &[],
+    )
+    .await
+}
+
+async fn fetch_openai_compatible_models_with_headers(
+    base_url: &str,
+    api_key: &str,
+    prefix_filters: &[&str],
+    models_query: Option<&str>,
+    sort_results_by_id: bool,
+    extra_headers: &[(&str, &str)],
+) -> Result<Vec<ProviderModel>, String> {
     let client = reqwest::Client::new();
     let base = base_url.trim_end_matches('/');
     let url = match models_query.filter(|query| !query.is_empty()) {
@@ -1219,10 +1258,14 @@ pub async fn fetch_openai_compatible_models(
         None => format!("{base}/models"),
     };
 
-    let resp = client
+    let mut request = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", api_key))
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10));
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+    let resp = request
         .send()
         .await
         .map_err(|e| format!("HTTP request failed: {}", e))?;
@@ -1236,6 +1279,14 @@ pub async fn fetch_openai_compatible_models(
         .await
         .map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
+    parse_openai_compatible_models(body, prefix_filters, sort_results_by_id)
+}
+
+fn parse_openai_compatible_models(
+    body: serde_json::Value,
+    prefix_filters: &[&str],
+    sort_results_by_id: bool,
+) -> Result<Vec<ProviderModel>, String> {
     let data = body
         .get("data")
         .and_then(|d| d.as_array())
@@ -1273,6 +1324,66 @@ pub async fn fetch_openai_compatible_models(
     if sort_results_by_id {
         models.sort_by(|a, b| a.id.cmp(&b.id));
     }
+    Ok(models)
+}
+
+fn kimi_model_cache() -> &'static RwLock<Option<KimiModelCacheEntry>> {
+    KIMI_MODEL_CACHE.get_or_init(|| RwLock::new(None))
+}
+
+/// Discover the models available to a connected Kimi Code account.
+///
+/// Kimi is an OpenAI-compatible provider but requires its coding-agent
+/// User-Agent on catalog requests. Cache successful responses briefly so
+/// preparing many mission workspaces does not hit the subscription endpoint
+/// once per mission. The cache key includes the route and a non-secret token
+/// fingerprint, so an OAuth refresh or endpoint change triggers discovery.
+pub(crate) async fn fetch_kimi_models(
+    provider: &crate::ai_providers::AIProvider,
+) -> Result<Vec<ProviderModel>, String> {
+    if provider.provider_type != ProviderType::Kimi {
+        return Err("Cannot fetch Kimi models for a non-Kimi provider".to_string());
+    }
+    let access_token = provider
+        .oauth
+        .as_ref()
+        .map(|oauth| oauth.access_token.trim())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| "Kimi OAuth access token is missing".to_string())?;
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or(crate::api::ai_providers::KIMI_API_BASE_URL);
+    let route_fingerprint = hash_u64(&format!("{base_url}\0{access_token}"));
+
+    {
+        let cache = kimi_model_cache().read().await;
+        if let Some(entry) = cache.as_ref() {
+            if entry.route_fingerprint == route_fingerprint && entry.expires_at > Instant::now() {
+                return Ok(entry.models.clone());
+            }
+        }
+    }
+
+    let models = fetch_openai_compatible_models_with_headers(
+        base_url,
+        access_token,
+        &[],
+        None,
+        true,
+        &[("User-Agent", crate::api::ai_providers::KIMI_USER_AGENT)],
+    )
+    .await?;
+    if models.is_empty() {
+        return Err("Kimi model catalog was empty".to_string());
+    }
+
+    *kimi_model_cache().write().await = Some(KimiModelCacheEntry {
+        route_fingerprint,
+        models: models.clone(),
+        expires_at: Instant::now() + KIMI_MODEL_CACHE_TTL,
+    });
     Ok(models)
 }
 
@@ -1637,6 +1748,8 @@ pub async fn fetch_model_catalog(
         /// Set for prefix-less, large catalogs (OpenRouter) to keep the
         /// routing picker bounded; `None` means no cap.
         max_models: Option<usize>,
+        /// Provider-specific headers required by the catalog endpoint.
+        extra_headers: Vec<(&'static str, &'static str)>,
     }
 
     let targets = vec![
@@ -1649,6 +1762,7 @@ pub async fn fetch_model_catalog(
             sort_results_by_id: true,
             allow_unauthenticated: false,
             max_models: None,
+            extra_headers: vec![],
         },
         FetchTarget {
             provider_type: ProviderType::OpenRouter,
@@ -1660,6 +1774,7 @@ pub async fn fetch_model_catalog(
             sort_results_by_id: false,
             allow_unauthenticated: true,
             max_models: Some(MAX_CATALOG_MODELS_PER_PROVIDER),
+            extra_headers: vec![],
         },
         FetchTarget {
             provider_type: ProviderType::Xai,
@@ -1670,6 +1785,7 @@ pub async fn fetch_model_catalog(
             sort_results_by_id: true,
             allow_unauthenticated: false,
             max_models: None,
+            extra_headers: vec![],
         },
         FetchTarget {
             provider_type: ProviderType::Cerebras,
@@ -1680,6 +1796,7 @@ pub async fn fetch_model_catalog(
             sort_results_by_id: true,
             allow_unauthenticated: false,
             max_models: None,
+            extra_headers: vec![],
         },
         FetchTarget {
             provider_type: ProviderType::Zai,
@@ -1690,6 +1807,7 @@ pub async fn fetch_model_catalog(
             sort_results_by_id: true,
             allow_unauthenticated: false,
             max_models: None,
+            extra_headers: vec![],
         },
         FetchTarget {
             provider_type: ProviderType::Minimax,
@@ -1700,6 +1818,18 @@ pub async fn fetch_model_catalog(
             sort_results_by_id: true,
             allow_unauthenticated: false,
             max_models: None,
+            extra_headers: vec![],
+        },
+        FetchTarget {
+            provider_type: ProviderType::Kimi,
+            provider_id: "kimi",
+            base_url: crate::api::ai_providers::KIMI_API_BASE_URL,
+            prefix_filters: vec![],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
+            max_models: None,
+            extra_headers: vec![("User-Agent", crate::api::ai_providers::KIMI_USER_AGENT)],
         },
     ];
 
@@ -1762,6 +1892,7 @@ pub async fn fetch_model_catalog(
         let models_query = target.models_query.map(str::to_string);
         let sort_results_by_id = target.sort_results_by_id;
         let allow_unauthenticated = target.allow_unauthenticated;
+        let extra_headers = target.extra_headers;
         let prefix_filters: Vec<String> = target
             .prefix_filters
             .iter()
@@ -1777,12 +1908,13 @@ pub async fn fetch_model_catalog(
             match api_key {
                 Some(api_key) => {
                     let filters: Vec<&str> = prefix_filters.iter().map(|s| s.as_str()).collect();
-                    match fetch_openai_compatible_models(
+                    match fetch_openai_compatible_models_with_headers(
                         &base_url,
                         &api_key,
                         &filters,
                         models_query.as_deref(),
                         sort_results_by_id,
+                        &extra_headers,
                     )
                     .await
                     {
@@ -2469,6 +2601,44 @@ mod tests {
         // Acronyms <= 3 chars get uppercased
         assert_eq!(model_id_to_display_name("gpt-4"), "GPT 4");
         assert_eq!(model_id_to_display_name("glm-4.6v-flash"), "GLM 4.6v Flash");
+    }
+
+    #[test]
+    fn kimi_fallback_catalog_matches_current_coding_models() {
+        let ids: Vec<String> = kimi_fallback_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "kimi-for-coding",
+                "kimi-for-coding-highspeed",
+                "k3",
+                "k3-256k"
+            ]
+        );
+        assert!(!ids.iter().any(|id| id == "kimi-k2.6"));
+        assert!(!ids.iter().any(|id| id == "kimi-k2-thinking"));
+    }
+
+    #[test]
+    fn openai_compatible_catalog_parser_accepts_future_kimi_models() {
+        let models = parse_openai_compatible_models(
+            serde_json::json!({
+                "data": [
+                    {"id": "k3", "display_name": "K3"},
+                    {"id": "k4-future", "display_name": "K4 Future"}
+                ]
+            }),
+            &[],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(models[0].id, "k3");
+        assert_eq!(models[1].id, "k4-future");
+        assert_eq!(models[1].name, "K4 Future");
     }
 
     #[test]

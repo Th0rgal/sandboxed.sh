@@ -280,7 +280,10 @@ pub(crate) async fn write_opencode_config(
                         let mut options = serde_json::Map::new();
                         options.insert(
                             "baseURL".to_string(),
-                            json!(crate::api::ai_providers::KIMI_API_BASE_URL),
+                            json!(provider
+                                .base_url
+                                .as_deref()
+                                .unwrap_or(crate::api::ai_providers::KIMI_API_BASE_URL)),
                         );
                         if let Some(oauth) = &provider.oauth {
                             if !oauth.access_token.trim().is_empty() {
@@ -288,23 +291,54 @@ pub(crate) async fn write_opencode_config(
                             }
                         }
                         let mut headers = serde_json::Map::new();
-                        headers.insert("User-Agent".to_string(), json!("KimiCLI/1.5"));
+                        headers.insert(
+                            "User-Agent".to_string(),
+                            json!(crate::api::ai_providers::KIMI_USER_AGENT),
+                        );
                         options.insert("headers".to_string(), serde_json::Value::Object(headers));
                         provider_config
                             .insert("options".to_string(), serde_json::Value::Object(options));
 
+                        // Kimi's catalog is account-aware and evolves independently
+                        // from Sandboxed.sh. Discover it through the same OAuth
+                        // credentials used for inference so newly released models
+                        // are immediately valid in OpenCode mission configs. Keep
+                        // configured/fallback models only for transient catalog
+                        // failures and first-time/offline workspace preparation.
+                        let models = match crate::api::providers::fetch_kimi_models(provider).await
+                        {
+                            Ok(models) => models,
+                            Err(error) => {
+                                tracing::warn!(
+                                    provider_id = %provider.id,
+                                    error = %error,
+                                    "Failed to discover Kimi models; using configured fallback catalog"
+                                );
+                                provider
+                                    .custom_models
+                                    .as_ref()
+                                    .filter(|models| !models.is_empty())
+                                    .map(|models| {
+                                        models
+                                            .iter()
+                                            .map(|model| crate::api::providers::ProviderModel {
+                                                id: model.id.clone(),
+                                                name: model
+                                                    .name
+                                                    .clone()
+                                                    .unwrap_or_else(|| model.id.clone()),
+                                                description: None,
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_else(crate::api::providers::kimi_fallback_models)
+                            }
+                        };
                         let mut models_map = serde_json::Map::new();
-                        for (model_id, model_name) in [
-                            ("kimi-for-coding", "Kimi for Coding"),
-                            ("kimi-k2.6", "Kimi K2.6"),
-                            ("kimi-k2-thinking", "Kimi K2 Thinking"),
-                        ] {
+                        for model in models {
                             let mut model_config = serde_json::Map::new();
-                            model_config.insert("name".to_string(), json!(model_name));
-                            models_map.insert(
-                                model_id.to_string(),
-                                serde_json::Value::Object(model_config),
-                            );
+                            model_config.insert("name".to_string(), json!(model.name));
+                            models_map.insert(model.id, serde_json::Value::Object(model_config));
                         }
                         provider_config
                             .insert("models".to_string(), serde_json::Value::Object(models_map));
@@ -1327,6 +1361,75 @@ pub async fn write_backend_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn kimi_opencode_config_discovers_future_models_from_live_catalog() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let bytes = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..bytes]).to_ascii_lowercase();
+            assert!(request.starts_with("get /models "));
+            assert!(request.contains("authorization: bearer test-kimi-future-token"));
+            assert!(request.contains("user-agent: kimicli/1.5"));
+
+            let body = serde_json::json!({
+                "data": [
+                    {"id": "k3", "display_name": "K3"},
+                    {"id": "k4-future", "display_name": "K4 Future"}
+                ]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mission_dir = temp.path().join("mission");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let mut provider = AIProvider::new(ProviderType::Kimi, "Kimi".to_string());
+        provider.base_url = Some(format!("http://{address}"));
+        provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+            refresh_token: "test-refresh".to_string(),
+            access_token: "test-kimi-future-token".to_string(),
+            expires_at: i64::MAX,
+        });
+        let providers = vec![provider];
+
+        write_opencode_config(
+            &mission_dir,
+            Vec::new(),
+            temp.path(),
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            Some(&providers),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mission_dir.join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config["provider"]["kimi"]["models"]["k4-future"]["name"],
+            "K4 Future"
+        );
+        assert!(config["provider"]["kimi"]["models"]["k3"].is_object());
+        assert!(config["provider"]["kimi"]["models"]["kimi-k2.6"].is_null());
+    }
 
     #[test]
     fn codex_generated_state_is_mission_scoped() {

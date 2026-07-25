@@ -8440,7 +8440,7 @@ const KIMI_TOKEN_URL: &str = "https://auth.kimi.com/api/oauth/token";
 pub(crate) const KIMI_API_BASE_URL: &str = "https://api.kimi.com/coding/v1";
 /// The coding endpoint returns 403 unless the User-Agent matches a known
 /// coding-agent pattern, so pin it to the Kimi CLI's UA.
-const KIMI_USER_AGENT: &str = "KimiCLI/1.5";
+pub(crate) const KIMI_USER_AGENT: &str = "KimiCLI/1.5";
 const KIMI_DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 #[derive(Clone)]
