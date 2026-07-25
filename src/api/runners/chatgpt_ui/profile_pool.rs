@@ -93,6 +93,44 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, SlotHealth>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProfileRetryRequirement {
+    excluded_slot: usize,
+    require_healthy: bool,
+}
+
+fn mission_retry_requirements() -> &'static Mutex<HashMap<Uuid, ProfileRetryRequirement>> {
+    static REQUIREMENTS: OnceLock<Mutex<HashMap<Uuid, ProfileRetryRequirement>>> = OnceLock::new();
+    REQUIREMENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Require one mission to avoid a profile slot selected by its prior attempt.
+///
+/// The board scheduler calls this before delivering the retry prompt. The
+/// exclusion is consumed when the new mission begins acquiring a lease and
+/// remains in force for that acquisition's complete wait loop.
+pub(crate) fn exclude_profile_for_mission(mission_id: Uuid, profile_slot: usize) {
+    mission_retry_requirements()
+        .lock()
+        .expect("profile retry requirement registry poisoned")
+        .insert(
+            mission_id,
+            ProfileRetryRequirement {
+                excluded_slot: profile_slot,
+                require_healthy: true,
+            },
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn take_excluded_profile_for_tests(mission_id: Uuid) -> Option<usize> {
+    mission_retry_requirements()
+        .lock()
+        .expect("profile retry requirement registry poisoned")
+        .remove(&mission_id)
+        .map(|requirement| requirement.excluded_slot)
+}
+
 fn quarantine_for(kind: SlotFailureKind, consecutive_failures: u32) -> Option<Duration> {
     match kind {
         SlotFailureKind::Auth => Some(AUTH_QUARANTINE),
@@ -146,6 +184,7 @@ fn slot_health_at(profile_dir: &Path, now: Instant) -> SlotHealth {
     *health
 }
 
+#[cfg(test)]
 fn is_quarantined_at(profile_dir: &Path, now: Instant) -> bool {
     slot_health_at(profile_dir, now)
         .quarantined_until
@@ -167,6 +206,10 @@ pub async fn acquire_profile(
     events_tx: &broadcast::Sender<AgentEvent>,
     cancel: &CancellationToken,
 ) -> Result<(usize, PathBuf, ProfileLock), AgentResult> {
+    let retry_requirement = mission_retry_requirements()
+        .lock()
+        .expect("profile retry requirement registry poisoned")
+        .remove(&mission_id);
     let mut announced_wait = false;
     loop {
         let now = Instant::now();
@@ -179,15 +222,34 @@ pub async fn acquire_profile(
             slot_health_at(profile_dir, now).last_failure.is_some()
         });
         for (slot, profile_dir) in candidates {
-            if is_quarantined_at(profile_dir, now) {
+            let health = slot_health_at(profile_dir, now);
+            if retry_requirement.is_some_and(|requirement| {
+                slot == requirement.excluded_slot
+                    || (requirement.require_healthy && health.last_failure.is_some())
+            }) {
+                continue;
+            }
+            if health.quarantined_until.is_some_and(|until| until > now) {
                 continue;
             }
             match try_lock_profile(profile_dir) {
                 Ok(Some(lock)) => return Ok((slot, profile_dir.clone(), lock)),
                 Ok(None) => {}
                 Err(error) => {
-                    return Err(AgentResult::failure(error, 0)
-                        .with_terminal_reason(TerminalReason::LlmError))
+                    // A broken lock path is local to this profile. Keep the
+                    // pool available when another configured slot is healthy;
+                    // if every slot is unavailable, the ordinary wait/cancel
+                    // path below fails closed without selecting one.
+                    if !announced_wait {
+                        tracing::warn!(
+                            profile_name = profile_dir
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("profile"),
+                            error = %error,
+                            "ChatGPT UI profile slot is unavailable"
+                        );
+                    }
                 }
             }
         }
@@ -321,6 +383,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unavailable_slot_does_not_block_a_healthy_alternative() {
+        let root = tempfile::tempdir().unwrap();
+        let unavailable = root.path().join("missing-parent").join("profile-1");
+        let healthy = root.path().join("profile-2");
+        std::fs::create_dir(&healthy).unwrap();
+        reset_registry_for_tests(&[unavailable.clone(), healthy.clone()]);
+        let (events_tx, _) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+
+        let (slot, selected, _lease) = acquire_profile(
+            &[unavailable, healthy.clone()],
+            Uuid::new_v4(),
+            &events_tx,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(slot, 1);
+        assert_eq!(selected, healthy);
+    }
+
+    #[tokio::test]
     async fn quarantined_slot_is_skipped_while_a_healthy_slot_exists() {
         let root = tempfile::tempdir().unwrap();
         let first_profile = root.path().join("profile-1");
@@ -370,6 +455,50 @@ mod tests {
         assert_eq!(slot, 1);
         assert_eq!(selected, second_profile);
         reset_registry_for_tests(&[first_profile]);
+    }
+
+    #[tokio::test]
+    async fn compatibility_retry_never_reuses_excluded_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let failed_profile = root.path().join("profile-1");
+        let sick_alternative = root.path().join("profile-2");
+        let busy_healthy_alternative = root.path().join("profile-3");
+        std::fs::create_dir(&failed_profile).unwrap();
+        std::fs::create_dir(&sick_alternative).unwrap();
+        std::fs::create_dir(&busy_healthy_alternative).unwrap();
+        let profiles = vec![
+            failed_profile.clone(),
+            sick_alternative.clone(),
+            busy_healthy_alternative.clone(),
+        ];
+        reset_registry_for_tests(&profiles);
+        record_slot_failure(&sick_alternative, SlotFailureKind::Compatibility);
+        let busy_lease = try_lock_profile(&busy_healthy_alternative)
+            .unwrap()
+            .unwrap();
+        let mission_id = Uuid::new_v4();
+        exclude_profile_for_mission(mission_id, 0);
+        let (events_tx, _) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+        let acquire_cancel = cancel.clone();
+        let acquire_profiles = profiles.clone();
+
+        let acquisition = tokio::spawn(async move {
+            acquire_profile(&acquire_profiles, mission_id, &events_tx, &acquire_cancel).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!acquisition.is_finished());
+
+        drop(busy_lease);
+        let (slot, selected, _lease) = tokio::time::timeout(Duration::from_secs(3), acquisition)
+            .await
+            .expect("acquisition should finish")
+            .expect("acquisition task should not panic")
+            .expect("alternative profile should be selected");
+        assert_eq!(slot, 2);
+        assert_eq!(selected, busy_healthy_alternative);
+        cancel.cancel();
+        reset_registry_for_tests(&profiles);
     }
 
     #[tokio::test]
