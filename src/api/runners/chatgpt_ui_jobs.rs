@@ -233,7 +233,7 @@ fn ledger_mode(path: &Path) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
     #[cfg(not(unix))]
     {
