@@ -43,6 +43,15 @@ export interface AIProviderStatus {
   message?: string;
 }
 
+export type OpenAIAuthSurfaceStatus = "connected" | "needs_reauth" | "not_configured";
+
+export interface OpenAIAuthStatus {
+  /** ChatGPT subscription OAuth used by the Codex backend. */
+  codex_oauth: OpenAIAuthSurfaceStatus;
+  /** API key used by api.openai.com (billing/organization is separate). */
+  api_platform: OpenAIAuthSurfaceStatus;
+}
+
 export interface AIProviderAuthMethod {
   label: string;
   type: "oauth" | "api";
@@ -81,6 +90,8 @@ export interface AIProvider {
   uses_oauth: boolean;
   auth_methods: AIProviderAuthMethod[];
   status: AIProviderStatus;
+  /** Independent OpenAI authentication surfaces; only present for OpenAI providers. */
+  openai_auth?: OpenAIAuthStatus;
   use_for_backends: string[];
   /** Account identifier (email) from the connected OAuth account */
   account_email?: string | null;

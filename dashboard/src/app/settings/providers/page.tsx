@@ -66,6 +66,18 @@ function getProviderConfig(type: string) {
   return providerConfig[type] || providerConfig.custom;
 }
 
+function authSurfaceLabel(status: 'connected' | 'needs_reauth' | 'not_configured'): string {
+  if (status === 'connected') return 'Connected';
+  if (status === 'needs_reauth') return 'Reconnect';
+  return 'Not configured';
+}
+
+function authSurfaceColor(status: 'connected' | 'needs_reauth' | 'not_configured'): string {
+  if (status === 'connected') return 'text-emerald-400/70';
+  if (status === 'needs_reauth') return 'text-amber-400/80';
+  return 'text-white/30';
+}
+
 const defaultProviderTypes: AIProviderTypeInfo[] = [
   { id: 'anthropic', name: 'Anthropic', uses_oauth: true, env_var: 'ANTHROPIC_API_KEY' },
   { id: 'openai', name: 'OpenAI', uses_oauth: true, env_var: 'OPENAI_API_KEY' },
@@ -892,6 +904,16 @@ export default function ProvidersPage() {
                             {provider.account_email && (
                               <span className="text-[11px] text-white/35 truncate block">
                                 {provider.account_email}
+                              </span>
+                            )}
+                            {provider.openai_auth && (
+                              <span className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
+                                <span className={authSurfaceColor(provider.openai_auth.codex_oauth)}>
+                                  Codex OAuth: {authSurfaceLabel(provider.openai_auth.codex_oauth)}
+                                </span>
+                                <span className={authSurfaceColor(provider.openai_auth.api_platform)}>
+                                  API Platform: {authSurfaceLabel(provider.openai_auth.api_platform)}
+                                </span>
                               </span>
                             )}
                           </div>
