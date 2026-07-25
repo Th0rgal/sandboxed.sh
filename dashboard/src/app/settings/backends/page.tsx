@@ -7,6 +7,7 @@ import {
   listBackends,
   updateBackendConfig,
   getProviderForBackend,
+  getChatgptUiProfilePool,
   getHealth,
   getSettings,
   updateSettings,
@@ -152,6 +153,14 @@ export default function BackendsPage() {
     'claudecode-provider',
     () => getProviderForBackend('claudecode'),
     { revalidateOnFocus: false }
+  );
+
+  const { data: chatgptUiPool } = useSWR(
+    activeBackendTab === 'chatgpt_ui' && chatgptUiIsConfigured
+      ? 'chatgpt-ui-profile-pool'
+      : null,
+    getChatgptUiProfilePool,
+    { revalidateOnFocus: false, refreshInterval: 15000 }
   );
 
   useEffect(() => {
@@ -731,6 +740,46 @@ export default function BackendsPage() {
                   One authenticated profile per line. Each concurrent GPT Pro mission leases one free profile; missions wait when the pool is full.
                 </p>
               </div>
+              {chatgptUiIsConfigured && (chatgptUiPool?.slots.length ?? 0) > 0 && (
+                <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-4" data-testid="chatgpt-ui-pool-status">
+                  <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">
+                    Profile pool status
+                  </p>
+                  <ul className="mt-3 space-y-2">
+                    {chatgptUiPool!.slots.map((slot) => (
+                      <li key={slot.slot} className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-mono text-white/70">{slot.profile_name}</span>
+                        <span
+                          className={cn(
+                            'rounded-full px-2 py-0.5',
+                            slot.state === 'available' && 'bg-emerald-500/10 text-emerald-300',
+                            slot.state === 'in_use' && 'bg-indigo-500/10 text-indigo-300',
+                            slot.state === 'quarantined' && 'bg-amber-500/10 text-amber-300'
+                          )}
+                        >
+                          {slot.state === 'in_use' ? 'in use' : slot.state}
+                        </span>
+                        {slot.state === 'quarantined' && (
+                          <span className="text-white/35">
+                            {slot.last_failure ? `${slot.last_failure} failure` : 'failure'}
+                            {typeof slot.quarantine_remaining_secs === 'number'
+                              ? ` · retry in ${Math.max(1, Math.ceil(slot.quarantine_remaining_secs / 60))} min`
+                              : ''}
+                          </span>
+                        )}
+                        {slot.state !== 'quarantined' && slot.consecutive_failures > 0 && (
+                          <span className="text-white/35">
+                            {slot.consecutive_failures} recent failure{slot.consecutive_failures === 1 ? '' : 's'}
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="mt-2 text-xs text-white/30">
+                    Slots quarantine automatically after auth, launch, or repeated compatibility failures and rejoin the pool when the cooldown ends.
+                  </p>
+                </div>
+              )}
               <div>
                 <label htmlFor="chatgpt-ui-driver-path" className="block text-xs text-white/60 mb-1.5">Driver path</label>
                 <input id="chatgpt-ui-driver-path" type="text" value={chatgptUiForm.driver_path} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, driver_path: e.target.value }))} placeholder="/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />

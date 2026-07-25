@@ -727,6 +727,36 @@ pub async fn get_backend_quota(
     Ok(Json(quotas))
 }
 
+/// Active ChatGPT UI profile-slot telemetry.
+///
+/// Slot names are directory basenames only; full operator paths and profile
+/// contents are never exposed here.
+#[derive(Debug, Serialize)]
+pub struct ChatgptUiProfilePoolResponse {
+    pub slots: Vec<crate::api::runners::chatgpt_ui::profile_pool::ProfileSlotStatus>,
+}
+
+/// GET /api/backends/chatgpt_ui/profile-pool — per-slot pool state
+/// (available / in use / quarantined) for the ChatGPT UI browser pool.
+pub async fn chatgpt_ui_profile_pool(
+    State(_state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+) -> Json<ChatgptUiProfilePoolResponse> {
+    let mut profile_dirs: Vec<std::path::PathBuf> =
+        crate::api::mission_runner::get_backend_string_setting("chatgpt_ui", "profile_dir")
+            .into_iter()
+            .chain(crate::api::mission_runner::get_backend_string_list_setting(
+                "chatgpt_ui",
+                "profile_dirs",
+            ))
+            .map(std::path::PathBuf::from)
+            .collect();
+    profile_dirs.dedup();
+    Json(ChatgptUiProfilePoolResponse {
+        slots: crate::api::runners::chatgpt_ui::profile_pool::pool_snapshot(&profile_dirs),
+    })
+}
+
 #[cfg(test)]
 mod quota_tests {
     use super::*;

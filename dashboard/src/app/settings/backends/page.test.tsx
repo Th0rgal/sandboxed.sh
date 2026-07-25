@@ -5,8 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import BackendsPage from './page';
 import { updateBackendConfig } from '@/lib/api';
 
-const { refreshBackendConfigs, backendConfigsFixture } = vi.hoisted(() => ({
+const { refreshBackendConfigs, getChatgptUiProfilePoolMock, backendConfigsFixture } = vi.hoisted(() => ({
   refreshBackendConfigs: vi.fn(),
+  getChatgptUiProfilePoolMock: vi.fn(),
   backendConfigsFixture: {
     opencode: {
       enabled: true,
@@ -53,6 +54,7 @@ vi.mock('@/lib/api', () => ({
   ]),
   updateBackendConfig: vi.fn().mockResolvedValue({ message: 'saved' }),
   getProviderForBackend: vi.fn().mockResolvedValue({ configured: false }),
+  getChatgptUiProfilePool: getChatgptUiProfilePoolMock,
   getHealth: vi.fn().mockResolvedValue({ version: '1.3.0' }),
   getSettings: vi.fn().mockResolvedValue({
     max_parallel_missions: 1,
@@ -82,6 +84,8 @@ describe('BackendsPage ChatGPT UI settings', () => {
   beforeEach(() => {
     mockedUpdateBackendConfig.mockClear();
     refreshBackendConfigs.mockClear();
+    getChatgptUiProfilePoolMock.mockReset();
+    getChatgptUiProfilePoolMock.mockResolvedValue({ slots: [] });
   });
 
   afterEach(() => {
@@ -137,5 +141,44 @@ describe('BackendsPage ChatGPT UI settings', () => {
       );
     });
     expect(refreshBackendConfigs).toHaveBeenCalled();
+  });
+
+  it('shows profile pool slot health once runtime paths are configured', async () => {
+    getChatgptUiProfilePoolMock.mockResolvedValue({
+      slots: [
+        {
+          slot: 1,
+          profile_name: 'chatgpt-profile',
+          state: 'in_use',
+          consecutive_failures: 0,
+        },
+        {
+          slot: 2,
+          profile_name: 'chatgpt-profile-2',
+          state: 'quarantined',
+          consecutive_failures: 1,
+          quarantine_remaining_secs: 1700,
+          last_failure: 'auth',
+        },
+      ],
+    });
+
+    renderPage();
+
+    fireEvent.click(screen.getByRole('button', { name: 'ChatGPT UI (experimental)' }));
+
+    expect(screen.queryByTestId('chatgpt-ui-pool-status')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Use production defaults' }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('chatgpt-ui-pool-status')).toBeVisible();
+    });
+    expect(screen.getByText('chatgpt-profile')).toBeVisible();
+    expect(screen.getByText('in use')).toBeVisible();
+    expect(screen.getByText('chatgpt-profile-2')).toBeVisible();
+    expect(screen.getByText('quarantined')).toBeVisible();
+    expect(screen.getByText(/auth failure/)).toBeVisible();
+    expect(screen.getByText(/retry in 29 min/)).toBeVisible();
   });
 });
