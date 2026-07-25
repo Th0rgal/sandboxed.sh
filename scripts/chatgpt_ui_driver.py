@@ -53,7 +53,7 @@ async def choose_intelligence_model(page, label: str) -> bool:
     # Wait for the composer-scoped control instead of snapshotting its count
     # immediately and incorrectly falling back to the legacy model picker.
     picker_buttons = page.locator(
-        'form button.__composer-pill[aria-haspopup="menu"]'
+        'form button.__composer-pill[aria-haspopup="menu"]:visible'
     )
     try:
         await picker_buttons.first.wait_for(
