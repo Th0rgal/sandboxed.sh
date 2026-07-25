@@ -31,11 +31,13 @@ const SETTINGS_BACKEND_NAMES: Record<SettingsBackendId, string> = {
 
 const CHATGPT_UI_PRODUCTION_DEFAULTS = {
   profile_dir: '/var/lib/sandboxed-sh/chatgpt-profile',
+  profile_dirs: '',
   driver_path: '/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py',
   python_path: '/opt/sandboxed-sh/chatgpt-ui-venv/bin/python',
   proxy_server: 'socks5://127.0.0.1:10880',
   display: ':93',
   model: 'gpt-5.6-pro',
+  timeout_secs: 14400,
   headless: false,
 };
 
@@ -103,12 +105,13 @@ export default function BackendsPage() {
   });
   const [chatgptUiForm, setChatgptUiForm] = useState({
     profile_dir: '',
+    profile_dirs: '',
     driver_path: '',
     python_path: 'python3',
     proxy_server: '',
     display: '',
     model: '',
-    timeout_secs: 900,
+    timeout_secs: 14400,
     headless: true,
     enabled: false,
   });
@@ -139,7 +142,7 @@ export default function BackendsPage() {
     name: backends.find((backend) => backend.id === id)?.name || SETTINGS_BACKEND_NAMES[id],
   }));
   const chatgptUiIsConfigured = Boolean(
-    chatgptUiForm.profile_dir.trim()
+    (chatgptUiForm.profile_dir.trim() || chatgptUiForm.profile_dirs.trim())
       && chatgptUiForm.driver_path.trim()
       && chatgptUiForm.python_path.trim()
   );
@@ -187,12 +190,15 @@ export default function BackendsPage() {
     const settings = chatgptUiBackendConfig.settings as Record<string, unknown>;
     setChatgptUiForm({
       profile_dir: typeof settings.profile_dir === 'string' ? settings.profile_dir : '',
+      profile_dirs: Array.isArray(settings.profile_dirs)
+        ? settings.profile_dirs.filter((value): value is string => typeof value === 'string').join('\n')
+        : '',
       driver_path: typeof settings.driver_path === 'string' ? settings.driver_path : '',
       python_path: typeof settings.python_path === 'string' ? settings.python_path : 'python3',
       proxy_server: typeof settings.proxy_server === 'string' ? settings.proxy_server : '',
       display: typeof settings.display === 'string' ? settings.display : '',
       model: typeof settings.model === 'string' ? settings.model : '',
-      timeout_secs: typeof settings.timeout_secs === 'number' ? settings.timeout_secs : 900,
+      timeout_secs: typeof settings.timeout_secs === 'number' ? settings.timeout_secs : 14400,
       headless: settings.headless !== false,
       enabled: chatgptUiBackendConfig.enabled,
     });
@@ -331,6 +337,10 @@ export default function BackendsPage() {
         'chatgpt_ui',
         {
           profile_dir: chatgptUiForm.profile_dir,
+          profile_dirs: chatgptUiForm.profile_dirs
+            .split('\n')
+            .map((value) => value.trim())
+            .filter((value, index, values) => value.length > 0 && values.indexOf(value) === index),
           driver_path: chatgptUiForm.driver_path || null,
           python_path: chatgptUiForm.python_path || 'python3',
           proxy_server: chatgptUiForm.proxy_server || null,
@@ -708,6 +718,20 @@ export default function BackendsPage() {
                 </p>
               </div>
               <div>
+                <label htmlFor="chatgpt-ui-profile-dirs" className="block text-xs text-white/60 mb-1.5">Additional browser profile pool</label>
+                <textarea
+                  id="chatgpt-ui-profile-dirs"
+                  value={chatgptUiForm.profile_dirs}
+                  onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, profile_dirs: e.target.value }))}
+                  placeholder={'/var/lib/sandboxed-sh/chatgpt-profile-2\n/var/lib/sandboxed-sh/chatgpt-profile-3'}
+                  rows={3}
+                  className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 font-mono text-sm text-white focus:outline-none focus:border-indigo-500/50"
+                />
+                <p className="mt-1.5 text-xs text-white/30">
+                  One authenticated profile per line. Each concurrent GPT Pro mission leases one free profile; missions wait when the pool is full.
+                </p>
+              </div>
+              <div>
                 <label htmlFor="chatgpt-ui-driver-path" className="block text-xs text-white/60 mb-1.5">Driver path</label>
                 <input id="chatgpt-ui-driver-path" type="text" value={chatgptUiForm.driver_path} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, driver_path: e.target.value }))} placeholder="/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
               </div>
@@ -736,7 +760,10 @@ export default function BackendsPage() {
                 </div>
                 <div>
                   <label htmlFor="chatgpt-ui-timeout" className="block text-xs text-white/60 mb-1.5">Timeout (seconds)</label>
-                  <input id="chatgpt-ui-timeout" type="number" min={30} max={7200} value={chatgptUiForm.timeout_secs} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, timeout_secs: Number(e.target.value) }))} className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                  <input id="chatgpt-ui-timeout" type="number" min={30} max={86400} value={chatgptUiForm.timeout_secs} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, timeout_secs: Number(e.target.value) }))} className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                  <p className="mt-1.5 text-xs text-white/30">
+                    Default 4 hours for long GPT Pro research; maximum 24 hours.
+                  </p>
                 </div>
               </div>
               <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
@@ -745,7 +772,7 @@ export default function BackendsPage() {
               </label>
               <button
                 onClick={handleSaveChatgptUiBackend}
-                disabled={savingBackend || !chatgptUiIsConfigured || (!chatgptUiForm.headless && !chatgptUiForm.display) || chatgptUiForm.timeout_secs < 30 || chatgptUiForm.timeout_secs > 7200}
+                disabled={savingBackend || !chatgptUiIsConfigured || (!chatgptUiForm.headless && !chatgptUiForm.display) || chatgptUiForm.timeout_secs < 30 || chatgptUiForm.timeout_secs > 86400}
                 className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {savingBackend ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}

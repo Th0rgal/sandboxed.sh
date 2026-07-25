@@ -29,7 +29,7 @@ use super::control::MissionStatus;
 #[allow(unused_imports)]
 use super::control::*;
 use super::mission_runner::TOOL_CALL_STALL_GRACE_SECS;
-use super::mission_store::{MissionExecutionState, MissionStore};
+use super::mission_store::{MissionExecutionState, MissionRun, MissionStore};
 
 mod bg_autoresume;
 
@@ -349,6 +349,21 @@ fn detached_run_proves_durable_liveness(state: MissionExecutionState) -> bool {
     state == MissionExecutionState::WaitingRemoteJob
 }
 
+fn chatgpt_ui_run_proves_liveness(run: &MissionRun, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if run.execution_state == MissionExecutionState::Stopping || run.execution_state.is_terminal() {
+        return false;
+    }
+    chrono::DateTime::parse_from_rfc3339(&run.heartbeat_at)
+        .ok()
+        .map(|heartbeat| {
+            (now - heartbeat.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0)
+                <= 60
+        })
+        .unwrap_or(false)
+}
+
 async fn mission_has_detached_durable_run(
     mission_store: &dyn MissionStore,
     mission_id: Uuid,
@@ -439,6 +454,28 @@ pub(crate) async fn stuck_mission_watchdog_loop(
         for info in &running_list {
             if info.seconds_since_activity < STUCK_SECONDS {
                 continue;
+            }
+            let is_chatgpt_ui = info.backend_id.as_deref() == Some("chatgpt_ui");
+            if is_chatgpt_ui {
+                match mission_store.get_active_mission_run(info.mission_id).await {
+                    Ok(Some(run)) if chatgpt_ui_run_proves_liveness(&run, chrono::Utc::now()) => {
+                        tracing::debug!(
+                            mission_id = %info.mission_id,
+                            seconds_since_activity = info.seconds_since_activity,
+                            "Stuck-mission watchdog: fresh ChatGPT UI run heartbeat proves liveness"
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            mission_id = %info.mission_id,
+                            %error,
+                            "Stuck-mission watchdog: cannot inspect ChatGPT UI run; deferring cancellation"
+                        );
+                        continue;
+                    }
+                }
             }
             if execution_state_proves_durable_liveness(&info.state) {
                 tracing::debug!(
@@ -809,5 +846,31 @@ mod tests {
         assert!(!detached_run_proves_durable_liveness(
             MissionExecutionState::WaitingTool
         ));
+    }
+
+    #[test]
+    fn fresh_chatgpt_ui_run_heartbeat_proves_liveness_until_driver_timeout() {
+        let now = chrono::Utc::now();
+        let mut run = MissionRun {
+            run_id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            generation: 1,
+            execution_state: MissionExecutionState::Running,
+            owner_actor_id: "control:test".to_string(),
+            scope_unit: None,
+            started_at: now.to_rfc3339(),
+            heartbeat_at: (now - chrono::Duration::seconds(30)).to_rfc3339(),
+            stopping_at: None,
+            ended_at: None,
+            terminal_reason: None,
+        };
+        assert!(chatgpt_ui_run_proves_liveness(&run, now));
+
+        run.heartbeat_at = (now - chrono::Duration::seconds(61)).to_rfc3339();
+        assert!(!chatgpt_ui_run_proves_liveness(&run, now));
+
+        run.heartbeat_at = now.to_rfc3339();
+        run.execution_state = MissionExecutionState::Stopping;
+        assert!(!chatgpt_ui_run_proves_liveness(&run, now));
     }
 }

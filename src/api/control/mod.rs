@@ -250,10 +250,17 @@ fn projected_running_health(
     seconds_since_activity: u64,
     tool_call_in_flight: bool,
     waiting_remote_job: bool,
+    backend: Option<&str>,
 ) -> super::mission_runner::MissionHealth {
-    if waiting_remote_job {
+    if waiting_remote_job
+        || (backend == Some("chatgpt_ui")
+            && state == super::mission_runner::MissionRunState::Running)
+    {
         // A fresh durable remote-job heartbeat is process-backed liveness, not
         // the provisional unmatched-tool hint that expires after ten minutes.
+        // ChatGPT UI is likewise bounded by its driver's absolute timeout, but
+        // Pro may expose no visible answer events during a long reasoning
+        // phase. Its run heartbeat, rather than DOM text, is execution truth.
         return super::mission_runner::MissionHealth::Healthy;
     }
     super::mission_runner::running_health(state, seconds_since_activity, tool_call_in_flight)
@@ -2549,6 +2556,10 @@ async fn get_running_missions(
         let mut row = actor_by_mission.remove(&run.mission_id).unwrap_or_else(|| {
             super::mission_runner::RunningMissionInfo {
                 mission_id: run.mission_id,
+                // A detached durable row does not prove which backend process
+                // owns the in-flight turn. Do not infer it from mutable
+                // next-turn mission settings.
+                backend_id: None,
                 state: run.execution_state.as_str().to_string(),
                 queue_len: 0,
                 history_len: 0,
@@ -14061,6 +14072,10 @@ async fn control_actor_loop(
     // Track which mission the main `running` task is actually working on.
     // This is different from `current_mission` which can change when user creates a new mission.
     let mut running_mission_id: Option<Uuid> = None;
+    // Backend captured for the currently executing primary turn. Updating a
+    // mission's settings while it runs must not change watchdog semantics for
+    // that in-flight process.
+    let mut running_backend_id: Option<String> = None;
     let mut running_run: Option<MissionRun> = None;
     let mut execution_heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     execution_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -14361,6 +14376,7 @@ async fn control_actor_loop(
                 if let Some(run) = running_run.clone() {
                     leases.push((
                         run,
+                        running_backend_id.clone(),
                         main_runner_active_tool_calls
                             .load(std::sync::atomic::Ordering::Relaxed),
                         main_runner_last_activity.elapsed().as_secs(),
@@ -14370,6 +14386,7 @@ async fn control_actor_loop(
                     runner.durable_run.clone().map(|run| {
                         (
                             run,
+                            Some(runner.backend_id.clone()),
                             runner
                                 .active_tool_calls
                                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -14395,7 +14412,7 @@ async fn control_actor_loop(
                         }
                     }
                 };
-                for (run, active_tool_calls, idle_secs) in leases {
+                for (run, backend_id, active_tool_calls, idle_secs) in leases {
                     let mut live_registered_tools = 0usize;
                     let mut has_registered_user_wait = false;
                     let has_durable_remote_job = remote_jobs_by_mission.contains(&run.mission_id);
@@ -14466,6 +14483,15 @@ async fn control_actor_loop(
                         && state != MissionExecutionState::WaitingRemoteJob
                         && live_registered_tools == 0
                     {
+                        if backend_id.as_deref() == Some("chatgpt_ui") {
+                            tracing::debug!(
+                                mission_id = %run.mission_id,
+                                run_id = %run.run_id,
+                                idle_secs,
+                                "Keeping ChatGPT UI run alive until its managed absolute timeout"
+                            );
+                            continue;
+                        }
                         tracing::warn!(
                             mission_id = %run.mission_id,
                             run_id = %run.run_id,
@@ -15573,6 +15599,7 @@ async fn control_actor_loop(
                                 let agent_override = per_msg_agent.or(mission_agent);
                                 running_cancel = Some(cancel.clone());
                                 running_mission_id = mission_id;
+                                running_backend_id = backend_id.clone();
                                 // Reset activity tracking when new task starts
                                 main_runner_last_activity = std::time::Instant::now();
                                 main_runner_activity = None;
@@ -15591,6 +15618,7 @@ async fn control_actor_loop(
                                     Err(error) => {
                                         running_cancel = None;
                                         running_mission_id = None;
+                                        running_backend_id = None;
                                         // The queue dequeue was already persisted, but no
                                         // run owns this delivery. Roll back the just-appended
                                         // history entry and release the deterministic message
@@ -16471,6 +16499,7 @@ async fn control_actor_loop(
                                         > 0;
                                 running_list.push(super::mission_runner::RunningMissionInfo {
                                     mission_id,
+                                    backend_id: running_backend_id.clone(),
                                     state: state_label.to_string(),
                                     queue_len: queue.len(),
                                     history_len: history.len(),
@@ -16481,6 +16510,7 @@ async fn control_actor_loop(
                                         seconds_since_activity,
                                         tool_call_in_flight,
                                         waiting_remote_job,
+                                        running_backend_id.as_deref(),
                                     ),
                                     expected_deliverables: 0,
                                     current_activity: main_runner_activity.clone(),
@@ -16854,6 +16884,7 @@ async fn control_actor_loop(
                                         running_cancel = Some(cancel.clone());
                                         // Capture which mission this task is working on (the resumed mission)
                                         running_mission_id = Some(mission_id);
+                                        running_backend_id = backend_id.clone();
                                         // Reset activity tracking so stall detection starts fresh
                                         main_runner_last_activity = std::time::Instant::now();
                                         main_runner_activity = None;
@@ -16872,6 +16903,7 @@ async fn control_actor_loop(
                                             Err(error) => {
                                                 running_cancel = None;
                                                 running_mission_id = None;
+                                                running_backend_id = None;
                                                 let _ = respond.send(Err(format!(
                                                     "Failed to acquire mission run lease: {error}"
                                                 )));
@@ -17307,6 +17339,7 @@ async fn control_actor_loop(
                     running = None;
                     running_cancel = None;
                     running_mission_id = None;
+                    running_backend_id = None;
                     main_runner_activity = None;
                     main_runner_active_tool_calls
                         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -17932,6 +17965,7 @@ async fn control_actor_loop(
                     // Per-message agent overrides mission agent
                     let agent_override = per_msg_agent.or(mission_agent);
                     running_mission_id = mission_id;
+                    running_backend_id = backend_id.clone();
                     // Reset activity tracking when new task starts
                     main_runner_last_activity = std::time::Instant::now();
                     main_runner_activity = None;
@@ -18584,6 +18618,7 @@ async fn control_actor_loop(
                 }
                 running_cancel = None;
                 running_mission_id = None;
+                running_backend_id = None;
                 main_runner_activity = None;
                 main_runner_active_tool_calls
                     .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -27714,6 +27749,7 @@ Investigate <service/> failures.
             600,
             true,
             true,
+            None,
         );
         assert!(matches!(
             health,
@@ -27725,10 +27761,26 @@ Investigate <service/> failures.
             600,
             true,
             false,
+            None,
         );
         assert!(matches!(
             without_remote_job,
             crate::api::mission_runner::MissionHealth::Stalled { .. }
+        ));
+    }
+
+    #[test]
+    fn chatgpt_ui_hidden_reasoning_keeps_projected_health_healthy() {
+        let health = projected_running_health(
+            crate::api::mission_runner::MissionRunState::Running,
+            STUCK_SECONDS * 2,
+            false,
+            false,
+            Some("chatgpt_ui"),
+        );
+        assert!(matches!(
+            health,
+            crate::api::mission_runner::MissionHealth::Healthy
         ));
     }
 

@@ -2691,6 +2691,16 @@ fn build_recommendation(
     live: &Value,
     analysis: &TraceAnalysis,
 ) -> String {
+    let live_state = live.get("state").and_then(Value::as_str);
+    if backend == Some("chatgpt_ui") && live_state == Some("running") {
+        return "ChatGPT UI Pro is still generating. The web UI may expose only a generic \
+                `Pro thinking` marker until the final answer begins, so event silence is not \
+                evidence of a stall. The driver has its own absolute timeout and the durable \
+                run heartbeat proves ownership. Do not cancel, resume, or submit another \
+                ChatGPT UI mission while this run is non-terminal; wait for its result or \
+                explicit timeout."
+            .to_string();
+    }
     if analysis.signals.contains("rate_limited") || analysis.signals.contains("capacity_limited") {
         return "Provider is rate-limiting or at capacity. Switch to a different backend/provider \
                 with update_mission_settings, or wait and resume_mission."
@@ -2727,16 +2737,6 @@ fn build_recommendation(
         .get("health")
         .and_then(|health| health.get("severity"))
         .and_then(Value::as_str);
-    let live_state = live.get("state").and_then(Value::as_str);
-    if backend == Some("chatgpt_ui") && live_state == Some("running") {
-        return "ChatGPT UI Pro is still generating. The web UI may expose only a generic \
-                `Pro thinking` marker until the final answer begins, so event silence is not \
-                evidence of a stall. The driver has its own absolute timeout and the durable \
-                run heartbeat proves ownership. Do not cancel, resume, or submit another \
-                ChatGPT UI mission while this run is non-terminal; wait for its result or \
-                explicit timeout."
-            .to_string();
-    }
     if health_status == Some("stalled") {
         let seconds = live
             .get("seconds_since_activity")
@@ -3180,7 +3180,10 @@ mod tests {
 
     #[test]
     fn recommendation_does_not_cancel_running_chatgpt_ui_for_event_silence() {
-        let analysis = TraceAnalysis::default();
+        let mut analysis = TraceAnalysis::default();
+        // A previous generation's terminal transport error can remain in the
+        // bounded trace window. It must not preempt a healthy replacement run.
+        analysis.signals.insert("network_error");
         let live = json!({
             "state": "running",
             "seconds_since_activity": 686,
