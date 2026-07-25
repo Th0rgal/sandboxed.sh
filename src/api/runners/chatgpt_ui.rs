@@ -26,8 +26,7 @@ use crate::api::mission_runner::{get_backend_string_setting, get_backend_u64_set
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DriverEvent {
     Diagnostic {
-        #[serde(rename = "message")]
-        _message: String,
+        message: String,
     },
     TextDelta {
         content: String,
@@ -413,10 +412,14 @@ pub async fn run_chatgpt_ui_turn(
                     }
                 };
                 match event {
-                    // Diagnostics are deliberately not logged: a future
-                    // third-party UI selector must not accidentally turn
-                    // account or page text into server logs.
-                    DriverEvent::Diagnostic { .. } => tracing::debug!(mission_id = %mission_id, "chatgpt_ui driver diagnostic received"),
+                    // The bundled driver emits only static compatibility and
+                    // stage markers here. It must never place account, page,
+                    // prompt, or response text in a diagnostic event.
+                    DriverEvent::Diagnostic { message } => tracing::debug!(
+                        mission_id = %mission_id,
+                        diagnostic = %message,
+                        "chatgpt_ui driver diagnostic received"
+                    ),
                     DriverEvent::TextDelta { content } => {
                         output = content;
                         let _ = events_tx.send(AgentEvent::TextDelta { content: output.clone(), mission_id: Some(mission_id) });
