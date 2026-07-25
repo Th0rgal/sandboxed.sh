@@ -81,3 +81,7 @@ ios_dashboard/SandboxedDashboard.xcodeproj/*
 
 # Android simulator run artifacts
 android_dashboard/test-artifacts/
+
+# Codex agent scratch (worktrees + tmp)
+.codex-worktrees/
+.codex_tmp/
