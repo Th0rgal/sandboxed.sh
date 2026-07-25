@@ -1729,9 +1729,10 @@ pub fn get_api_key_for_provider(
                 }
             }
             // OAuth access tokens can also be used as bearer tokens for some APIs.
-            // Grok Build OAuth is CLI-only here; it is not a replacement for
-            // XAI_API_KEY on xAI's OpenAI-compatible API.
-            if provider_type != ProviderType::Xai {
+            // ChatGPT/Codex and Grok Build OAuth are CLI/subscription credentials;
+            // neither is a replacement for an API Platform key on the respective
+            // OpenAI-compatible API.
+            if !matches!(provider_type, ProviderType::OpenAI | ProviderType::Xai) {
                 if let Some(ref oauth) = provider.oauth {
                     if !oauth.access_token.is_empty() {
                         return Some(oauth.access_token.clone());
@@ -1767,13 +1768,8 @@ pub fn get_api_key_for_provider(
             if let Ok(auth) = serde_json::from_str::<serde_json::Value>(&contents) {
                 for key in &auth_keys {
                     if let Some(entry) = auth.get(*key) {
-                        // Check for API key fields
-                        for field in &["key", "api_key", "apiKey"] {
-                            if let Some(val) = entry.get(*field).and_then(|v| v.as_str()) {
-                                if !val.is_empty() {
-                                    return Some(val.to_string());
-                                }
-                            }
+                        if let Some(api_key) = provider_auth_entry_api_key(provider_type, entry) {
+                            return Some(api_key);
                         }
                     }
                 }
@@ -1787,12 +1783,8 @@ pub fn get_api_key_for_provider(
         .join(format!("{}.json", provider_type.id()));
     if let Ok(contents) = std::fs::read_to_string(&provider_auth_file) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
-            for field in &["key", "api_key", "apiKey"] {
-                if let Some(val) = value.get(*field).and_then(|v| v.as_str()) {
-                    if !val.is_empty() {
-                        return Some(val.to_string());
-                    }
-                }
+            if let Some(api_key) = provider_auth_entry_api_key(provider_type, &value) {
+                return Some(api_key);
             }
         }
     }
@@ -1807,6 +1799,29 @@ pub fn get_api_key_for_provider(
     }
 
     None
+}
+
+fn provider_auth_entry_api_key(
+    provider_type: ProviderType,
+    entry: &serde_json::Value,
+) -> Option<String> {
+    let auth_type = entry
+        .get("type")
+        .or_else(|| entry.get("auth_mode"))
+        .and_then(|value| value.as_str());
+    if matches!(provider_type, ProviderType::OpenAI | ProviderType::Xai)
+        && matches!(auth_type, Some("oauth" | "chatgpt" | "oidc"))
+    {
+        return None;
+    }
+
+    ["key", "api_key", "apiKey"].iter().find_map(|field| {
+        entry
+            .get(*field)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// Resolve an actual Anthropic API key for `/v1/models`.
@@ -1838,6 +1853,24 @@ fn get_anthropic_models_api_key(
 ) -> Option<String> {
     get_enabled_store_api_key(ProviderType::Anthropic, ai_providers)
         .or_else(|| get_api_key_for_provider(ProviderType::Anthropic, &[]))
+}
+
+/// Resolve credentials for an OpenAI-compatible `/v1/models` catalog.
+///
+/// OpenAI ChatGPT OAuth tokens authenticate the Codex subscription endpoint,
+/// not `api.openai.com`. Passing that token to the API Platform model catalog
+/// yields a misleading 401 even while Codex is healthy. Only a real API key
+/// may be used for OpenAI's Platform catalog.
+fn get_openai_compatible_models_api_key(
+    provider_type: ProviderType,
+    ai_providers: &[crate::ai_providers::AIProvider],
+) -> Option<String> {
+    if provider_type == ProviderType::OpenAI {
+        return get_enabled_store_api_key(provider_type, ai_providers)
+            .or_else(|| get_api_key_for_provider(provider_type, &[]));
+    }
+
+    get_api_key_for_provider(provider_type, ai_providers)
 }
 
 /// Fetch model lists from all supported provider APIs concurrently.
@@ -2042,7 +2075,7 @@ async fn fetch_model_catalog(
     let target_keys: Vec<(FetchTarget, Option<String>)> = targets
         .into_iter()
         .map(|t| {
-            let key = get_api_key_for_provider(t.provider_type, &providers_list);
+            let key = get_openai_compatible_models_api_key(t.provider_type, &providers_list);
             (t, key)
         })
         .collect();
@@ -3039,6 +3072,46 @@ mod tests {
         assert_eq!(
             get_enabled_store_api_key(ProviderType::Anthropic, &[api]).as_deref(),
             Some("sk-ant-api-key")
+        );
+    }
+
+    #[test]
+    fn openai_platform_catalog_key_ignores_codex_oauth_only_accounts() {
+        let mut oauth =
+            crate::ai_providers::AIProvider::new(ProviderType::OpenAI, "Codex OAuth".into());
+        oauth.oauth = Some(crate::ai_providers::OAuthCredentials {
+            access_token: "chatgpt-oauth-access-token".into(),
+            refresh_token: "chatgpt-oauth-refresh-token".into(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 60_000,
+        });
+        assert_eq!(
+            get_openai_compatible_models_api_key(ProviderType::OpenAI, &[oauth]),
+            None
+        );
+
+        let mut api =
+            crate::ai_providers::AIProvider::new(ProviderType::OpenAI, "API Platform".into());
+        api.api_key = Some("sk-openai-api-key".into());
+        assert_eq!(
+            get_openai_compatible_models_api_key(ProviderType::OpenAI, &[api]).as_deref(),
+            Some("sk-openai-api-key")
+        );
+
+        let legacy_oauth = serde_json::json!({
+            "type": "oauth",
+            "key": "legacy-chatgpt-access-token"
+        });
+        assert_eq!(
+            provider_auth_entry_api_key(ProviderType::OpenAI, &legacy_oauth),
+            None
+        );
+        let platform_key = serde_json::json!({
+            "type": "api_key",
+            "key": "sk-openai-api-key"
+        });
+        assert_eq!(
+            provider_auth_entry_api_key(ProviderType::OpenAI, &platform_key).as_deref(),
+            Some("sk-openai-api-key")
         );
     }
 

@@ -9198,6 +9198,42 @@ mod tests {
     }
 
     #[test]
+    fn codex_turn_requires_tool_activity_respects_negated_tool_instructions() {
+        assert!(!codex_turn_requires_tool_activity(
+            "OAuth recovery smoke test. Do not call tools or modify files. Reply with exactly: CODEX_OAUTH_SMOKE_OK.",
+            "CODEX_OAUTH_SMOKE_OK"
+        ));
+        assert!(!codex_turn_requires_tool_activity(
+            "Never edit the workspace. Reply with the current diagnosis only.",
+            "The workspace remains unchanged."
+        ));
+        assert!(!codex_turn_requires_tool_activity(
+            "Reply with exactly OK; please don't use tools or modify files.",
+            "OK"
+        ));
+        assert!(!codex_turn_requires_tool_activity(
+            "You must not edit files. Give a text-only answer.",
+            "Here is the answer."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_keeps_positive_clause_after_negation() {
+        assert!(codex_turn_requires_tool_activity(
+            "Do not edit files, but run the test suite once.",
+            "The files will remain unchanged."
+        ));
+        assert!(codex_turn_requires_tool_activity(
+            "Never modify the repository. However, execute cargo test and report the result.",
+            "I will leave the repository unchanged."
+        ));
+        assert!(codex_turn_requires_tool_activity(
+            "Without delay, run the test suite.",
+            "I will start immediately."
+        ));
+    }
+
+    #[test]
     fn codex_turn_requires_tool_activity_allows_advisory_verbs() {
         // User asks "how to run tests" — advisory, even though "run " appears.
         assert!(!codex_turn_requires_tool_activity(

@@ -823,6 +823,136 @@ mod grok_oauth_tests {
     }
 }
 
+#[cfg(test)]
+mod openai_provider_status_tests {
+    use super::{
+        build_response_from_store, merge_oauth_callback_credentials,
+        oauth_refresh_token_fingerprint, AuthSurfaceStatusResponse, ProviderStatusResponse,
+    };
+    use crate::ai_providers::{AIProvider, OAuthCredentials, ProviderType};
+
+    fn oauth_credentials() -> OAuthCredentials {
+        OAuthCredentials {
+            access_token: "openai-access-token".to_string(),
+            refresh_token: "openai-refresh-token".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000,
+        }
+    }
+
+    #[test]
+    fn openai_oauth_only_reports_codex_connected_and_platform_not_configured() {
+        let mut provider = AIProvider::new(ProviderType::OpenAI, "OpenAI OAuth".to_string());
+        provider.oauth = Some(oauth_credentials());
+
+        let response = build_response_from_store(&provider);
+        let openai_auth = response.openai_auth.as_ref().expect("OpenAI auth surfaces");
+
+        assert!(matches!(response.status, ProviderStatusResponse::Connected));
+        assert_eq!(
+            openai_auth.codex_oauth,
+            AuthSurfaceStatusResponse::Connected
+        );
+        assert_eq!(
+            openai_auth.api_platform,
+            AuthSurfaceStatusResponse::NotConfigured
+        );
+        let json = serde_json::to_value(&response).expect("serialize provider response");
+        assert_eq!(json["status"]["type"], "connected");
+        assert_eq!(json["openai_auth"]["codex_oauth"], "connected");
+        assert_eq!(json["openai_auth"]["api_platform"], "not_configured");
+    }
+
+    #[test]
+    fn openai_api_key_only_reports_platform_connected_and_codex_not_configured() {
+        let mut provider = AIProvider::new(ProviderType::OpenAI, "OpenAI API".to_string());
+        provider.api_key = Some("sk-openai-api-key".to_string());
+
+        let response = build_response_from_store(&provider);
+        let openai_auth = response.openai_auth.as_ref().expect("OpenAI auth surfaces");
+
+        assert!(matches!(response.status, ProviderStatusResponse::Connected));
+        assert_eq!(
+            openai_auth.codex_oauth,
+            AuthSurfaceStatusResponse::NotConfigured
+        );
+        assert_eq!(
+            openai_auth.api_platform,
+            AuthSurfaceStatusResponse::Connected
+        );
+    }
+
+    #[test]
+    fn rejected_openai_oauth_does_not_hide_healthy_platform_key() {
+        let mut provider = AIProvider::new(ProviderType::OpenAI, "OpenAI mixed".to_string());
+        provider.api_key = Some("sk-openai-api-key".to_string());
+        provider.oauth = Some(oauth_credentials());
+        provider.rejected_oauth_refresh_fingerprint =
+            Some(oauth_refresh_token_fingerprint("openai-refresh-token"));
+
+        let response = build_response_from_store(&provider);
+        let openai_auth = response.openai_auth.as_ref().expect("OpenAI auth surfaces");
+
+        assert!(matches!(response.status, ProviderStatusResponse::Connected));
+        assert_eq!(
+            openai_auth.codex_oauth,
+            AuthSurfaceStatusResponse::NeedsReauth
+        );
+        assert_eq!(
+            openai_auth.api_platform,
+            AuthSurfaceStatusResponse::Connected
+        );
+    }
+
+    #[test]
+    fn empty_openai_credentials_are_not_reported_as_connected() {
+        let mut provider = AIProvider::new(ProviderType::OpenAI, "OpenAI empty".to_string());
+        provider.api_key = Some("   ".to_string());
+        provider.oauth = Some(OAuthCredentials {
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_at: 0,
+        });
+
+        let response = build_response_from_store(&provider);
+        let openai_auth = response.openai_auth.as_ref().expect("OpenAI auth surfaces");
+
+        assert!(matches!(
+            response.status,
+            ProviderStatusResponse::NeedsAuth { .. }
+        ));
+        assert_eq!(
+            openai_auth.codex_oauth,
+            AuthSurfaceStatusResponse::NotConfigured
+        );
+        assert_eq!(
+            openai_auth.api_platform,
+            AuthSurfaceStatusResponse::NotConfigured
+        );
+    }
+
+    #[test]
+    fn oauth_reconnect_preserves_or_attaches_platform_key_on_same_account() {
+        let mut existing = AIProvider::new(ProviderType::OpenAI, "OpenAI".to_string());
+        existing.api_key = Some("existing-platform-key".to_string());
+        let mut oauth_callback = AIProvider::new(ProviderType::OpenAI, "OpenAI".to_string());
+        oauth_callback.oauth = Some(oauth_credentials());
+
+        merge_oauth_callback_credentials(&mut existing, &oauth_callback);
+
+        assert_eq!(existing.api_key.as_deref(), Some("existing-platform-key"));
+        assert!(existing.oauth.is_some());
+
+        oauth_callback.api_key = Some("newly-minted-platform-key".to_string());
+        merge_oauth_callback_credentials(&mut existing, &oauth_callback);
+
+        assert_eq!(
+            existing.api_key.as_deref(),
+            Some("newly-minted-platform-key")
+        );
+        assert!(existing.oauth.is_some());
+    }
+}
+
 async fn forward_grok_login_lines<R>(stream: R, sender: mpsc::UnboundedSender<String>)
 where
     R: AsyncRead + Unpin,
@@ -3446,6 +3576,12 @@ pub struct ProviderResponse {
     pub uses_oauth: bool,
     pub auth_methods: Vec<AuthMethod>,
     pub status: ProviderStatusResponse,
+    /// OpenAI exposes two independent authentication surfaces. ChatGPT OAuth
+    /// powers Codex subscription models, while an API Platform key powers
+    /// `api.openai.com`. Keep their state separate so a missing Platform
+    /// organization does not make a healthy Codex OAuth account look broken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_auth: Option<OpenAIAuthStatusResponse>,
     /// Which backends this provider is used for (e.g., ["opencode", "claudecode"])
     pub use_for_backends: Vec<String>,
     /// Account identifier (email or username) from the connected OAuth account
@@ -3453,6 +3589,20 @@ pub struct ProviderResponse {
     pub account_email: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct OpenAIAuthStatusResponse {
+    pub codex_oauth: AuthSurfaceStatusResponse,
+    pub api_platform: AuthSurfaceStatusResponse,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthSurfaceStatusResponse {
+    Connected,
+    NeedsReauth,
+    NotConfigured,
 }
 
 #[derive(Debug, Serialize)]
@@ -3544,6 +3694,12 @@ fn build_provider_response(
         Some(AuthKind::ApiKey) | Some(AuthKind::OAuth) => ProviderStatusResponse::Connected,
         None => ProviderStatusResponse::NeedsAuth { auth_url: None },
     };
+    let openai_auth = openai_auth_status(
+        provider_type,
+        matches!(auth, Some(AuthKind::ApiKey)),
+        matches!(auth, Some(AuthKind::OAuth)),
+        false,
+    );
 
     // Most providers are only usable via OpenCode, but we still store and render
     // `use_for_backends` generically so the UI can express intent and we can grow
@@ -3569,6 +3725,7 @@ fn build_provider_response(
         uses_oauth: provider_type.uses_oauth(),
         auth_methods: provider_type.auth_methods(),
         status,
+        openai_auth,
         use_for_backends,
         account_email,
         created_at: now,
@@ -3580,8 +3737,13 @@ fn build_provider_response(
 /// Used for all provider types now that everything is stored in AIProviderStore.
 fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> ProviderResponse {
     let pt = provider.provider_type;
-    let has_api_key = provider.api_key.is_some();
-    let has_oauth = provider.oauth.is_some();
+    let has_api_key = provider
+        .api_key
+        .as_ref()
+        .is_some_and(|key| !key.trim().is_empty());
+    let has_oauth = provider.oauth.as_ref().is_some_and(|oauth| {
+        !oauth.access_token.trim().is_empty() || !oauth.refresh_token.trim().is_empty()
+    });
     let oauth_expired = provider
         .oauth
         .as_ref()
@@ -3609,6 +3771,7 @@ fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> Prov
     } else {
         ProviderStatusResponse::NeedsAuth { auth_url: None }
     };
+    let openai_auth = openai_auth_status(pt, has_api_key, has_oauth, oauth_refresh_rejected);
     let use_for_backends = provider
         .use_for_backends
         .clone()
@@ -3633,11 +3796,41 @@ fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> Prov
         uses_oauth: pt.uses_oauth(),
         auth_methods: pt.auth_methods(),
         status,
+        openai_auth,
         use_for_backends,
         account_email: provider.account_email.clone(),
         created_at: provider.created_at,
         updated_at: provider.updated_at,
     }
+}
+
+fn openai_auth_status(
+    provider_type: ProviderType,
+    has_api_key: bool,
+    has_oauth: bool,
+    oauth_refresh_rejected: bool,
+) -> Option<OpenAIAuthStatusResponse> {
+    if provider_type != ProviderType::OpenAI {
+        return None;
+    }
+
+    let codex_oauth = if has_oauth && oauth_refresh_rejected {
+        AuthSurfaceStatusResponse::NeedsReauth
+    } else if has_oauth {
+        AuthSurfaceStatusResponse::Connected
+    } else {
+        AuthSurfaceStatusResponse::NotConfigured
+    };
+    let api_platform = if has_api_key {
+        AuthSurfaceStatusResponse::Connected
+    } else {
+        AuthSurfaceStatusResponse::NotConfigured
+    };
+
+    Some(OpenAIAuthStatusResponse {
+        codex_oauth,
+        api_platform,
+    })
 }
 
 /// Sync the highest-priority enabled provider of a given type from the store
@@ -9060,6 +9253,35 @@ async fn oauth_authorize(
 }
 
 /// POST /api/ai/providers/:id/oauth/callback - Exchange OAuth code for credentials.
+struct OAuthCallbackInnerResponse {
+    response: ProviderResponse,
+    openai_api_platform_key: Option<String>,
+}
+
+impl OAuthCallbackInnerResponse {
+    fn oauth_only(response: ProviderResponse) -> Self {
+        Self {
+            response,
+            openai_api_platform_key: None,
+        }
+    }
+}
+
+fn merge_oauth_callback_credentials(
+    existing: &mut crate::ai_providers::AIProvider,
+    callback: &crate::ai_providers::AIProvider,
+) {
+    // OAuth reconnect must not erase an independently configured API key.
+    // Conversely, when the OAuth exchange minted a Platform key, attach it to
+    // the same account row as the fresh Codex OAuth credentials.
+    if callback.api_key.is_some() {
+        existing.api_key = callback.api_key.clone();
+    }
+    if callback.oauth.is_some() {
+        existing.oauth = callback.oauth.clone();
+    }
+}
+
 async fn oauth_callback(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -9068,7 +9290,8 @@ async fn oauth_callback(
     let use_for_backends = req.use_for_backends.clone();
     let provider_type_id = id.clone();
     match oauth_callback_inner(State(state.clone()), AxumPath(id), Json(req)).await {
-        Ok(json) => {
+        Ok(callback) => {
+            let json = Json(callback.response);
             // Resolve the provider type. The add-provider flow passes a
             // provider-type id ("anthropic", ...); the reconnect button passes
             // the stored provider's *UUID*, which `ProviderType::from_id` does
@@ -9122,17 +9345,20 @@ async fn oauth_callback(
                 let mut provider = crate::ai_providers::AIProvider::new(provider_type, name);
                 provider.use_for_backends = Some(backends);
                 provider.account_email = account_email;
+                provider.api_key = callback.openai_api_platform_key;
 
                 // Extract credentials from auth.json
                 if let Some(entry) = auth_entry {
                     let auth_type = entry.get("type").and_then(|v| v.as_str());
                     match auth_type {
                         Some("api_key") | Some("api") => {
-                            provider.api_key = entry
-                                .get("key")
-                                .or_else(|| entry.get("api_key"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
+                            if provider.api_key.is_none() {
+                                provider.api_key = entry
+                                    .get("key")
+                                    .or_else(|| entry.get("api_key"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                            }
                         }
                         Some("oauth") => {
                             let refresh = entry
@@ -9179,10 +9405,7 @@ async fn oauth_callback(
                     // returned nothing (e.g. a failed auth.json sync that still
                     // reported success), keep the existing creds rather than
                     // wiping a row the user just re-authorized.
-                    if provider.api_key.is_some() || provider.oauth.is_some() {
-                        existing.api_key = provider.api_key.clone();
-                        existing.oauth = provider.oauth.clone();
-                    }
+                    merge_oauth_callback_credentials(&mut existing, &provider);
                     existing.use_for_backends = provider.use_for_backends.clone();
                     existing.enabled = true;
                     // Only overwrite the display name/email when the new
@@ -9217,7 +9440,7 @@ async fn oauth_callback_inner(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
     Json(req): Json<OAuthCallbackRequest>,
-) -> Result<Json<ProviderResponse>, (axum::http::StatusCode, String)> {
+) -> Result<OAuthCallbackInnerResponse, (axum::http::StatusCode, String)> {
     // Resolve provider type from UUID or type ID
     let provider_type = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
         state
@@ -9254,7 +9477,7 @@ async fn oauth_callback_inner(
         let response =
             upsert_grok_oauth_provider(&state, &entry, req.use_for_backends.clone(), target_id)
                 .await?;
-        return Ok(Json(response));
+        return Ok(OAuthCallbackInnerResponse::oauth_only(response));
     }
 
     if provider_type == ProviderType::Kimi {
@@ -9281,7 +9504,7 @@ async fn oauth_callback_inner(
                     target_id,
                 )
                 .await?;
-                return Ok(Json(response));
+                return Ok(OAuthCallbackInnerResponse::oauth_only(response));
             }
             Some(KimiDeviceStatus::Expired) => {
                 KIMI_DEVICE_FLOWS.lock().unwrap().remove(&id);
@@ -9527,7 +9750,7 @@ async fn oauth_callback_inner(
 
                 tracing::info!("Created API key for provider: {} ({})", response.name, id);
 
-                Ok(Json(response))
+                Ok(OAuthCallbackInnerResponse::oauth_only(response))
             } else {
                 // Store OAuth credentials (Claude Pro/Max mode)
                 let refresh_token = token_data["refresh_token"].as_str().ok_or_else(|| {
@@ -9646,7 +9869,7 @@ async fn oauth_callback_inner(
                     account_email.clone(),
                 );
 
-                Ok(Json(response))
+                Ok(OAuthCallbackInnerResponse::oauth_only(response))
             }
         }
         ProviderType::OpenAI => {
@@ -9742,37 +9965,39 @@ async fn oauth_callback_inner(
                 tracing::error!("Failed to save provider backends: {}", e);
             }
 
-            // If the user wants to use Codex, Codex CLI requires an API key. In the Codex CLI
-            // flow, this is minted by exchanging the id_token for an OpenAI API key.
+            // ChatGPT OAuth is already sufficient for Codex subscription
+            // inference. Opportunistically mint a separate API Platform key
+            // when the account has a Platform organization; failure must not
+            // downgrade the healthy Codex OAuth surface.
+            let mut openai_api_platform_key = None;
             if backends.iter().any(|b| b == "codex") {
-                let id_token = token_data.get("id_token").and_then(|v| v.as_str());
-                let id_token = id_token.ok_or_else(|| {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        "OpenAI OAuth token response did not include id_token; cannot mint API key for Codex. Try reconnecting."
-                            .to_string(),
-                    )
-                })?;
-
-                match exchange_openai_id_token_for_api_key(&client, id_token).await {
-                    Ok(api_key) => {
-                        if let Err(e) = upsert_openai_api_key_in_ai_providers(
-                            &state.config.working_dir,
-                            &api_key,
-                        ) {
-                            tracing::error!("Failed to save OpenAI API key for Codex: {}", e);
-                            return Err((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Failed to save OpenAI API key for Codex".to_string(),
-                            ));
+                match token_data.get("id_token").and_then(|v| v.as_str()) {
+                    Some(id_token) => {
+                        match exchange_openai_id_token_for_api_key(&client, id_token).await {
+                            Ok(api_key) => {
+                                tracing::info!(
+                                    "Minted OpenAI API Platform key alongside Codex OAuth"
+                                );
+                                openai_api_platform_key = Some(api_key);
+                            }
+                            Err(e) => {
+                                // Don't fail the entire OAuth callback – the OAuth credentials
+                                // are already saved and usable for ChatGPT/Codex subscription
+                                // models. API Platform access is a separate capability and
+                                // remains unavailable until an organization/API key exists.
+                                tracing::warn!(
+                                    "OpenAI OAuth saved and Codex subscription access remains available; \
+                                     API Platform key was not configured: {}",
+                                    e
+                                );
+                            }
                         }
-                        tracing::info!("Minted and stored OpenAI API key for Codex via OAuth");
                     }
-                    Err(e) => {
-                        // Don't fail the entire OAuth callback – the OAuth credentials
-                        // are already saved and usable for OpenCode.  The API-key
-                        // minting can be retried later (e.g. on the next Codex mission).
-                        tracing::warn!("Failed to mint OpenAI API key for Codex (credentials saved, Codex may not work until platform org is set up): {}", e);
+                    None => {
+                        tracing::warn!(
+                            "OpenAI OAuth saved and Codex subscription access remains available; \
+                             token response had no id_token, so API Platform key was not configured"
+                        );
                     }
                 }
             }
@@ -9799,7 +10024,10 @@ async fn oauth_callback_inner(
                 account_email,
             );
 
-            Ok(Json(response))
+            Ok(OAuthCallbackInnerResponse {
+                response,
+                openai_api_platform_key,
+            })
         }
         ProviderType::Google => {
             // Parse the callback input (URL or code)
@@ -9948,7 +10176,7 @@ async fn oauth_callback_inner(
 
             tracing::info!("Google OAuth credentials saved for provider: {}", id);
 
-            Ok(Json(response))
+            Ok(OAuthCallbackInnerResponse::oauth_only(response))
         }
         _ => Err((
             axum::http::StatusCode::BAD_REQUEST,
