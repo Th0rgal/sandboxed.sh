@@ -256,11 +256,16 @@ pub(crate) async fn write_opencode_config(
         // providers it is not an OpenCode built-in, so it needs an explicit
         // provider block (OpenAI-compatible npm package + base URL + creds).
         if let Some(providers) = custom_providers {
+            let preferred_kimi_id =
+                crate::api::providers::preferred_usable_kimi_provider(providers)
+                    .map(|provider| provider.id);
             let provider_blocks: Vec<_> = providers
                 .iter()
                 .filter(|p| {
-                    matches!(p.provider_type, ProviderType::Custom | ProviderType::Kimi)
-                        && p.enabled
+                    p.enabled
+                        && (p.provider_type == ProviderType::Custom
+                            || (p.provider_type == ProviderType::Kimi
+                                && preferred_kimi_id == Some(p.id)))
                 })
                 .collect();
 
@@ -280,7 +285,10 @@ pub(crate) async fn write_opencode_config(
                         let mut options = serde_json::Map::new();
                         options.insert(
                             "baseURL".to_string(),
-                            json!(crate::api::ai_providers::KIMI_API_BASE_URL),
+                            json!(provider
+                                .base_url
+                                .as_deref()
+                                .unwrap_or(crate::api::ai_providers::KIMI_API_BASE_URL)),
                         );
                         if let Some(oauth) = &provider.oauth {
                             if !oauth.access_token.trim().is_empty() {
@@ -288,23 +296,52 @@ pub(crate) async fn write_opencode_config(
                             }
                         }
                         let mut headers = serde_json::Map::new();
-                        headers.insert("User-Agent".to_string(), json!("KimiCLI/1.5"));
+                        headers.insert(
+                            "User-Agent".to_string(),
+                            json!(crate::api::ai_providers::KIMI_USER_AGENT),
+                        );
                         options.insert("headers".to_string(), serde_json::Value::Object(headers));
                         provider_config
                             .insert("options".to_string(), serde_json::Value::Object(options));
 
+                        // Live discovery is owned by the background provider
+                        // catalog refresh. Workspace creation only consumes its
+                        // last snapshot, so an unavailable Kimi endpoint can
+                        // never block mission startup.
+                        let models = match crate::api::providers::cached_kimi_models(provider).await
+                        {
+                            Some(models) => models,
+                            None => {
+                                tracing::debug!(
+                                    provider_id = %provider.id,
+                                    "No cached Kimi catalog; using configured fallback catalog"
+                                );
+                                let mut models = crate::api::providers::kimi_fallback_models();
+                                if let Some(configured) = provider.custom_models.as_ref() {
+                                    for model in configured {
+                                        if model.id.trim().is_empty()
+                                            || models.iter().any(|existing| existing.id == model.id)
+                                        {
+                                            continue;
+                                        }
+                                        models.push(crate::api::providers::ProviderModel {
+                                            id: model.id.clone(),
+                                            name: model
+                                                .name
+                                                .clone()
+                                                .unwrap_or_else(|| model.id.clone()),
+                                            description: None,
+                                        });
+                                    }
+                                }
+                                models
+                            }
+                        };
                         let mut models_map = serde_json::Map::new();
-                        for (model_id, model_name) in [
-                            ("kimi-for-coding", "Kimi for Coding"),
-                            ("kimi-k2.6", "Kimi K2.6"),
-                            ("kimi-k2-thinking", "Kimi K2 Thinking"),
-                        ] {
+                        for model in models {
                             let mut model_config = serde_json::Map::new();
-                            model_config.insert("name".to_string(), json!(model_name));
-                            models_map.insert(
-                                model_id.to_string(),
-                                serde_json::Value::Object(model_config),
-                            );
+                            model_config.insert("name".to_string(), json!(model.name));
+                            models_map.insert(model.id, serde_json::Value::Object(model_config));
                         }
                         provider_config
                             .insert("models".to_string(), serde_json::Value::Object(models_map));
@@ -1327,6 +1364,245 @@ pub async fn write_backend_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn kimi_opencode_config_discovers_future_models_from_live_catalog() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let bytes = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..bytes]).to_ascii_lowercase();
+            assert!(request.starts_with("get /models "));
+            assert!(request.contains("authorization: bearer test-kimi-future-token"));
+            assert!(request.contains("user-agent: kimicli/1.5"));
+
+            let body = serde_json::json!({
+                "data": [
+                    {"id": "k3", "display_name": "K3"},
+                    {"id": "k4-future", "display_name": "K4 Future"}
+                ]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mission_dir = temp.path().join("mission");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let mut provider = AIProvider::new(ProviderType::Kimi, "Kimi".to_string());
+        provider.base_url = Some(format!("http://{address}"));
+        provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+            refresh_token: "test-refresh".to_string(),
+            access_token: "test-kimi-future-token".to_string(),
+            expires_at: i64::MAX,
+        });
+        let mut providers = vec![provider];
+
+        // The background provider catalog owns network discovery. Prime its
+        // cache explicitly, rotate the short-lived access token, then verify
+        // workspace preparation still consumes the account's cached snapshot.
+        crate::api::providers::fetch_kimi_models(&providers[0])
+            .await
+            .unwrap();
+        server.await.unwrap();
+        providers[0].oauth.as_mut().unwrap().access_token = "test-kimi-rotated-token".to_string();
+        assert!(
+            crate::api::providers::cached_kimi_models(&providers[0])
+                .await
+                .is_some(),
+            "routine access-token rotation must retain the account catalog"
+        );
+
+        write_opencode_config(
+            &mission_dir,
+            Vec::new(),
+            temp.path(),
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            Some(&providers),
+        )
+        .await
+        .unwrap();
+
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mission_dir.join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config["provider"]["kimi"]["models"]["k4-future"]["name"],
+            "K4 Future"
+        );
+        assert!(config["provider"]["kimi"]["models"]["k3"].is_object());
+        assert!(config["provider"]["kimi"]["models"]["kimi-k2.6"].is_null());
+
+        crate::api::providers::invalidate_kimi_model_cache(&providers[0]).await;
+        assert!(
+            crate::api::providers::cached_kimi_models(&providers[0])
+                .await
+                .is_none(),
+            "account reconnect must invalidate the previous catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn kimi_workspace_config_never_waits_for_live_catalog() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mission_dir = temp.path().join("mission");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let mut provider = AIProvider::new(ProviderType::Kimi, "Kimi".to_string());
+        provider.base_url = Some("http://192.0.2.1:9".to_string());
+        provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+            refresh_token: "unreachable-refresh".to_string(),
+            access_token: "unreachable-unique-access-token".to_string(),
+            expires_at: i64::MAX,
+        });
+        let providers = vec![provider];
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            write_opencode_config(
+                &mission_dir,
+                Vec::new(),
+                temp.path(),
+                WorkspaceType::Host,
+                &HashMap::new(),
+                None,
+                None,
+                None,
+                Some(&providers),
+            ),
+        )
+        .await
+        .expect("workspace config must not perform live Kimi I/O")
+        .unwrap();
+
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mission_dir.join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(config["provider"]["kimi"]["models"]["k3"].is_object());
+        assert!(config["provider"]["kimi"]["models"]["k3-256k"].is_object());
+    }
+
+    #[tokio::test]
+    async fn kimi_workspace_config_uses_the_catalog_selected_account() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mission_dir = temp.path().join("mission");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+
+        let mut preferred = AIProvider::new(ProviderType::Kimi, "Preferred Kimi".to_string());
+        preferred.priority = 0;
+        preferred.oauth = Some(crate::ai_providers::OAuthCredentials {
+            refresh_token: "preferred-refresh".to_string(),
+            access_token: "preferred-access".to_string(),
+            expires_at: i64::MAX,
+        });
+        preferred.custom_models = Some(vec![crate::ai_providers::CustomModel {
+            id: "preferred-only".to_string(),
+            name: Some("Preferred only".to_string()),
+            context_limit: None,
+            output_limit: None,
+        }]);
+
+        let mut secondary = AIProvider::new(ProviderType::Kimi, "Secondary Kimi".to_string());
+        secondary.priority = 10;
+        secondary.oauth = Some(crate::ai_providers::OAuthCredentials {
+            refresh_token: "secondary-refresh".to_string(),
+            access_token: "secondary-access".to_string(),
+            expires_at: i64::MAX,
+        });
+        secondary.custom_models = Some(vec![crate::ai_providers::CustomModel {
+            id: "secondary-only".to_string(),
+            name: Some("Secondary only".to_string()),
+            context_limit: None,
+            output_limit: None,
+        }]);
+
+        // Put the secondary account last to reproduce the old overwrite bug.
+        let providers = vec![preferred, secondary];
+        write_opencode_config(
+            &mission_dir,
+            Vec::new(),
+            temp.path(),
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            Some(&providers),
+        )
+        .await
+        .unwrap();
+
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mission_dir.join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config["provider"]["kimi"]["options"]["apiKey"],
+            "preferred-access"
+        );
+        assert!(config["provider"]["kimi"]["models"]["preferred-only"].is_object());
+        assert!(config["provider"]["kimi"]["models"]["secondary-only"].is_null());
+    }
+
+    #[tokio::test]
+    async fn kimi_offline_config_merges_fallback_and_operator_models() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mission_dir = temp.path().join("mission");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let mut provider = AIProvider::new(ProviderType::Kimi, "Kimi".to_string());
+        // No catalog snapshot exercises resilient offline generation without
+        // performing network I/O on the workspace path.
+        provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+            refresh_token: "offline-refresh".to_string(),
+            access_token: "offline-access".to_string(),
+            expires_at: i64::MAX,
+        });
+        provider.custom_models = Some(vec![crate::ai_providers::CustomModel {
+            id: "k4-operator-preview".to_string(),
+            name: Some("K4 Operator Preview".to_string()),
+            context_limit: None,
+            output_limit: None,
+        }]);
+        let providers = vec![provider];
+
+        write_opencode_config(
+            &mission_dir,
+            Vec::new(),
+            temp.path(),
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            Some(&providers),
+        )
+        .await
+        .unwrap();
+
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mission_dir.join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(config["provider"]["kimi"]["models"]["k3"].is_object());
+        assert_eq!(
+            config["provider"]["kimi"]["models"]["k4-operator-preview"]["name"],
+            "K4 Operator Preview"
+        );
+    }
 
     #[test]
     fn codex_generated_state_is_mission_scoped() {

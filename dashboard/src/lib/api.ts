@@ -3283,6 +3283,27 @@ export async function getBackendConfig(
   );
 }
 
+export interface ChatgptUiProfilePoolSlot {
+  slot: number;
+  profile_name: string;
+  state: "available" | "in_use" | "quarantined" | "unavailable";
+  consecutive_failures: number;
+  quarantine_remaining_secs?: number | null;
+  last_failure?: string | null;
+}
+
+export interface ChatgptUiProfilePoolResponse {
+  slots: ChatgptUiProfilePoolSlot[];
+}
+
+// Get ChatGPT UI profile pool slot telemetry
+export async function getChatgptUiProfilePool(): Promise<ChatgptUiProfilePoolResponse> {
+  return apiGet(
+    "/api/backends/chatgpt_ui/profile-pool",
+    "Failed to get ChatGPT UI profile pool status",
+  );
+}
+
 // Update backend configuration
 export async function updateBackendConfig(
   backendId: string,

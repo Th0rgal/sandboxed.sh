@@ -1,0 +1,70 @@
+{
+  "policy": "chatgpt-ui-pool",
+  "version": "1.0.0",
+  "source_of_truth": {
+    "runtime": "src/api/runners/chatgpt_ui/mod.rs",
+    "pool": "src/api/runners/chatgpt_ui/profile_pool.rs",
+    "driver": "scripts/chatgpt_ui_driver.py",
+    "operator_doc": "docs/CHATGPT_UI_HARNESS.md",
+    "policy_doc": "docs/policy/CHATGPT_UI_POOL_POLICY.md",
+    "skill": "skills/hermes-mission-control/SKILL.md"
+  },
+  "capacity": {
+    "source": "profile_dirs",
+    "static_limit": null,
+    "slot_exclusivity": "cross_process_file_lock",
+    "acquire_strategy": "first_healthy_available"
+  },
+  "lanes": {
+    "read_only_pro": {
+      "allowed": true,
+      "model": "gpt-5.6-pro",
+      "writer": false,
+      "concurrent": true,
+      "requires_disjoint_slots": true
+    }
+  },
+  "retry": {
+    "compatibility_failure": {
+      "signal": "compatibility=chatgpt-ui-v2",
+      "max_automatic_retries": 1,
+      "require_different_slot": true,
+      "require_healthy_slot": true
+    },
+    "auth_failure": {
+      "signal": "auth_required",
+      "max_automatic_retries": 0,
+      "operator_action_required": true,
+      "slot_quarantine_secs": 1800
+    },
+    "rate_limited": {
+      "signal": "rate_limited",
+      "max_automatic_retries": 0,
+      "wait_for_allowance_recovery": true
+    },
+    "browser_launch": {
+      "signal": "browser_launch",
+      "quarantine_selected_profile": false
+    }
+  },
+  "writers": {
+    "max_concurrent_per_workspace": 1,
+    "chatgpt_ui_may_write": false
+  },
+  "lean": {
+    "independent_validation_required": true,
+    "validator_must_differ_from_writer": true,
+    "validation_before_write": true
+  },
+  "runtime_limits": {
+    "timeout_secs": {
+      "default": 14400,
+      "min": 30,
+      "max": 86400
+    },
+    "artifacts_per_turn": {
+      "max_files": 8,
+      "max_total_bytes": 52428800
+    }
+  }
+}

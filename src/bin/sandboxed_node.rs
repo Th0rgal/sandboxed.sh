@@ -625,35 +625,19 @@ mod tests {
             mission_id,
             node_id: state.node_id.clone(),
             lease_token: create_lease_token(&claims, &state.shared_token).expect("lease token"),
-            command: "while [ ! -e release ]; do sleep 0.01; done".to_string(),
+            command: "true".to_string(),
         };
-        let mission_dir = work_root.path().join(mission_id.to_string());
-        tokio::fs::create_dir_all(&mission_dir)
+        // Hold the shared permit directly. Spawning a shell and polling
+        // active_leases made this admission test race with process startup and
+        // teardown under a heavily parallel test runner; heartbeat coverage
+        // separately verifies the execute bookkeeping around a real process.
+        let _held_permit = Arc::clone(&state.admission)
+            .acquire_owned()
             .await
-            .expect("mission dir");
-
-        let running = tokio::spawn(execute(
-            State(Arc::clone(&state)),
-            headers.clone(),
-            Json(request()),
-        ));
-        for _ in 0..100 {
-            if state.active_leases.load(Ordering::Acquire) == 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert_eq!(state.active_leases.load(Ordering::Acquire), 1);
+            .expect("capacity permit");
 
         let rejected = execute(State(Arc::clone(&state)), headers, Json(request())).await;
         assert_eq!(rejected.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
-        tokio::fs::write(mission_dir.join("release"), b"")
-            .await
-            .expect("release running command");
-        let _ = running
-            .await
-            .expect("execute task")
-            .expect("execute response");
     }
 
     #[tokio::test]
