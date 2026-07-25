@@ -8800,55 +8800,15 @@ async fn upsert_kimi_oauth_provider(
 pub fn spawn_kimi_oauth_refresh_loop(state: Arc<super::routes::AppState>) {
     tokio::spawn(async move {
         loop {
+            // Run immediately at startup, then every five minutes. Reuse the
+            // same serialized store refresh path as catalog discovery so
+            // rotating refresh tokens cannot race.
+            let (_, refreshed) =
+                refresh_due_store_oauth(&state.ai_providers, ProviderType::Kimi, 600_000).await;
+            if refreshed > 0 {
+                tracing::info!(refreshed, "Refreshed Kimi OAuth credentials");
+            }
             tokio::time::sleep(Duration::from_secs(300)).await;
-
-            // Only do work if a Kimi provider exists.
-            if state
-                .ai_providers
-                .get_all_by_type(ProviderType::Kimi)
-                .await
-                .is_empty()
-            {
-                continue;
-            }
-            let Some(entry) = read_oauth_token_entry(ProviderType::Kimi) else {
-                continue;
-            };
-            // Refresh only when within 10 minutes of expiry.
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            if entry.expires_at > now_ms + 600_000 || entry.refresh_token.trim().is_empty() {
-                continue;
-            }
-
-            let client = reqwest::Client::new();
-            match refresh_kimi_oauth_tokens(&client, &entry.refresh_token).await {
-                Ok((access, refresh, expires_at)) => {
-                    if let Err(e) =
-                        sync_to_opencode_auth(ProviderType::Kimi, &refresh, &access, expires_at)
-                    {
-                        tracing::warn!("Failed to persist refreshed Kimi token: {e}");
-                    }
-                    // Update store rows so the chain resolver sees the fresh token.
-                    for mut acct in state.ai_providers.get_all_by_type(ProviderType::Kimi).await {
-                        if acct.oauth.is_some() {
-                            acct.oauth = Some(crate::ai_providers::OAuthCredentials {
-                                refresh_token: refresh.clone(),
-                                access_token: access.clone(),
-                                expires_at,
-                            });
-                            let id = acct.id;
-                            state.ai_providers.update(id, acct).await;
-                        }
-                    }
-                    tracing::info!("Refreshed Kimi OAuth token (expires_at={expires_at})");
-                }
-                Err(OAuthRefreshError::InvalidGrant(msg)) => {
-                    tracing::warn!("Kimi refresh token invalid; user must re-authenticate: {msg}");
-                }
-                Err(e) => {
-                    tracing::debug!("Kimi token refresh failed: {e}");
-                }
-            }
         }
     });
 }
@@ -10065,6 +10025,7 @@ pub async fn refresh_oauth_token_internal(
             // **Solution #2: OpenAI may also rotate refresh tokens**
             Ok((new_access, new_refresh, expires_at))
         }
+        ProviderType::Kimi => refresh_kimi_oauth_tokens(&client, refresh_token).await,
         ProviderType::Google => {
             // Google refresh token request
             let token_response = client

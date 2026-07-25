@@ -299,20 +299,17 @@ pub(crate) async fn write_opencode_config(
                         provider_config
                             .insert("options".to_string(), serde_json::Value::Object(options));
 
-                        // Kimi's catalog is account-aware and evolves independently
-                        // from Sandboxed.sh. Discover it through the same OAuth
-                        // credentials used for inference so newly released models
-                        // are immediately valid in OpenCode mission configs. Keep
-                        // configured/fallback models only for transient catalog
-                        // failures and first-time/offline workspace preparation.
-                        let models = match crate::api::providers::fetch_kimi_models(provider).await
+                        // Live discovery is owned by the background provider
+                        // catalog refresh. Workspace creation only consumes its
+                        // last snapshot, so an unavailable Kimi endpoint can
+                        // never block mission startup.
+                        let models = match crate::api::providers::cached_kimi_models(provider).await
                         {
-                            Ok(models) => models,
-                            Err(error) => {
-                                tracing::warn!(
+                            Some(models) => models,
+                            None => {
+                                tracing::debug!(
                                     provider_id = %provider.id,
-                                    error = %error,
-                                    "Failed to discover Kimi models; using configured fallback catalog"
+                                    "No cached Kimi catalog; using configured fallback catalog"
                                 );
                                 let mut models = crate::api::providers::kimi_fallback_models();
                                 if let Some(configured) = provider.custom_models.as_ref() {
@@ -1405,6 +1402,14 @@ mod tests {
         });
         let providers = vec![provider];
 
+        // The background provider catalog owns network discovery. Prime its
+        // cache explicitly, then verify workspace preparation only consumes
+        // the cached snapshot.
+        crate::api::providers::fetch_kimi_models(&providers[0])
+            .await
+            .unwrap();
+        server.await.unwrap();
+
         write_opencode_config(
             &mission_dir,
             Vec::new(),
@@ -1418,7 +1423,6 @@ mod tests {
         )
         .await
         .unwrap();
-        server.await.unwrap();
 
         let config: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(mission_dir.join("opencode.json")).unwrap(),
@@ -1430,6 +1434,46 @@ mod tests {
         );
         assert!(config["provider"]["kimi"]["models"]["k3"].is_object());
         assert!(config["provider"]["kimi"]["models"]["kimi-k2.6"].is_null());
+    }
+
+    #[tokio::test]
+    async fn kimi_workspace_config_never_waits_for_live_catalog() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mission_dir = temp.path().join("mission");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let mut provider = AIProvider::new(ProviderType::Kimi, "Kimi".to_string());
+        provider.base_url = Some("http://192.0.2.1:9".to_string());
+        provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+            refresh_token: "unreachable-refresh".to_string(),
+            access_token: "unreachable-unique-access-token".to_string(),
+            expires_at: i64::MAX,
+        });
+        let providers = vec![provider];
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            write_opencode_config(
+                &mission_dir,
+                Vec::new(),
+                temp.path(),
+                WorkspaceType::Host,
+                &HashMap::new(),
+                None,
+                None,
+                None,
+                Some(&providers),
+            ),
+        )
+        .await
+        .expect("workspace config must not perform live Kimi I/O")
+        .unwrap();
+
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mission_dir.join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(config["provider"]["kimi"]["models"]["k3"].is_object());
+        assert!(config["provider"]["kimi"]["models"]["k3-256k"].is_object());
     }
 
     #[tokio::test]

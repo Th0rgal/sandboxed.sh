@@ -1340,16 +1340,9 @@ fn kimi_model_cache() -> &'static RwLock<Option<KimiModelCacheEntry>> {
     KIMI_MODEL_CACHE.get_or_init(|| RwLock::new(None))
 }
 
-/// Discover the models available to a connected Kimi Code account.
-///
-/// Kimi is an OpenAI-compatible provider but requires its coding-agent
-/// User-Agent on catalog requests. Cache successful responses briefly so
-/// preparing many mission workspaces does not hit the subscription endpoint
-/// once per mission. The cache key includes the route and a non-secret token
-/// fingerprint, so an OAuth refresh or endpoint change triggers discovery.
-pub(crate) async fn fetch_kimi_models(
+fn kimi_route_fingerprint(
     provider: &crate::ai_providers::AIProvider,
-) -> Result<Vec<ProviderModel>, String> {
+) -> Result<(u64, &str, &str), String> {
     if provider.provider_type != ProviderType::Kimi {
         return Err("Cannot fetch Kimi models for a non-Kimi provider".to_string());
     }
@@ -1364,7 +1357,41 @@ pub(crate) async fn fetch_kimi_models(
         .as_deref()
         .filter(|url| !url.trim().is_empty())
         .unwrap_or(crate::api::ai_providers::KIMI_API_BASE_URL);
-    let route_fingerprint = hash_u64(&format!("{base_url}\0{access_token}"));
+    Ok((
+        hash_u64(&format!("{base_url}\0{access_token}")),
+        base_url,
+        access_token,
+    ))
+}
+
+/// Return the last account-specific Kimi catalog without performing I/O.
+///
+/// Workspace preparation is latency-sensitive and must not wait on a provider
+/// outage. The background model-catalog refresher owns live discovery; callers
+/// on the workspace path use this snapshot or fall back immediately.
+pub(crate) async fn cached_kimi_models(
+    provider: &crate::ai_providers::AIProvider,
+) -> Option<Vec<ProviderModel>> {
+    let (route_fingerprint, _, _) = kimi_route_fingerprint(provider).ok()?;
+    kimi_model_cache()
+        .read()
+        .await
+        .as_ref()
+        .filter(|entry| entry.route_fingerprint == route_fingerprint)
+        .map(|entry| entry.models.clone())
+}
+
+/// Discover the models available to a connected Kimi Code account.
+///
+/// Kimi is an OpenAI-compatible provider but requires its coding-agent
+/// User-Agent on catalog requests. Cache successful responses briefly so
+/// preparing many mission workspaces does not hit the subscription endpoint
+/// once per mission. The cache key includes the route and a non-secret token
+/// fingerprint, so an OAuth refresh or endpoint change triggers discovery.
+pub(crate) async fn fetch_kimi_models(
+    provider: &crate::ai_providers::AIProvider,
+) -> Result<Vec<ProviderModel>, String> {
+    let (route_fingerprint, base_url, access_token) = kimi_route_fingerprint(provider)?;
 
     let stale_models = {
         let cache = kimi_model_cache().read().await;
@@ -1772,6 +1799,22 @@ pub async fn fetch_model_catalog(
     ai_providers: &AIProviderStore,
     _working_dir: &Path,
 ) -> HashMap<String, Vec<CatalogEntry>> {
+    // Kimi access tokens are short-lived. Refresh a due store credential
+    // synchronously before taking the provider snapshot so the initial catalog
+    // probe cannot race the independent refresh task at startup.
+    let (_, refreshed) = crate::api::ai_providers::refresh_due_store_oauth(
+        ai_providers,
+        ProviderType::Kimi,
+        10 * 60 * 1000,
+    )
+    .await;
+    if refreshed > 0 {
+        tracing::info!(
+            refreshed,
+            "Refreshed Kimi OAuth credentials before model catalog discovery"
+        );
+    }
+
     let providers_list = ai_providers.list().await;
     let mut result = HashMap::new();
 
