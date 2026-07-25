@@ -6,6 +6,10 @@ not Codex CLI/API allowance. This is browser automation, not an OpenAI API.
 It does not reuse OpenAI/Codex OAuth credentials from backend settings: login
 state lives only in the dedicated Playwright browser profile configured below.
 
+Operational pool policy (capacity, read-only Pro lanes, retry and writer
+rules) is versioned in [`policy/CHATGPT_UI_POOL_POLICY.md`](policy/CHATGPT_UI_POOL_POLICY.md)
+and machine-checked by `scripts/policy_lint.py`.
+
 ## Status and limitations
 
 - The integration is experimental and opt-in. ChatGPT markup, rollout flags,
@@ -78,7 +82,7 @@ schemes are `http`, `https`, `socks5`, and `socks5h`; URLs containing embedded
 credentials are rejected.
 When anti-bot checks reject headless Chromium, set `headless` to `false` and
 configure `display` with a dedicated Xvfb display such as `:93`.
-Timeouts are clamped to 30–7200 seconds. A cross-process profile lock rejects
+Timeouts are clamped to 30–86400 seconds. A cross-process profile lock rejects
 concurrent use; configure a distinct dedicated profile for each concurrent
 mission.
 

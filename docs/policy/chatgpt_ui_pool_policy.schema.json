@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Th0rgal/sandboxed.sh/docs/policy/chatgpt_ui_pool_policy.schema.json",
+  "title": "ChatGPT UI pool operational policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "policy",
+    "version",
+    "source_of_truth",
+    "capacity",
+    "lanes",
+    "retry",
+    "writers",
+    "lean",
+    "runtime_limits"
+  ],
+  "properties": {
+    "policy": { "const": "chatgpt-ui-pool" },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "source_of_truth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtime", "driver", "operator_doc", "policy_doc", "skill"],
+      "properties": {
+        "runtime": { "type": "string" },
+        "driver": { "type": "string" },
+        "operator_doc": { "type": "string" },
+        "policy_doc": { "type": "string" },
+        "skill": { "type": "string" }
+      }
+    },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "static_limit", "slot_exclusivity", "acquire_strategy"],
+      "properties": {
+        "source": { "const": "profile_dirs" },
+        "static_limit": { "type": "null" },
+        "slot_exclusivity": { "const": "cross_process_file_lock" },
+        "acquire_strategy": { "const": "first_free_slot" }
+      }
+    },
+    "lanes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["read_only_pro"],
+      "properties": {
+        "read_only_pro": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed", "model", "writer", "concurrent", "requires_disjoint_slots"],
+          "properties": {
+            "allowed": { "const": true },
+            "model": { "type": "string" },
+            "writer": { "const": false },
+            "concurrent": { "const": true },
+            "requires_disjoint_slots": { "const": true }
+          }
+        }
+      }
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["compatibility_failure", "auth_failure", "rate_limited"],
+      "properties": {
+        "compatibility_failure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["signal", "max_automatic_retries", "require_different_slot", "require_healthy_slot"],
+          "properties": {
+            "signal": { "const": "compatibility=chatgpt-ui-v2" },
+            "max_automatic_retries": { "const": 1 },
+            "require_different_slot": { "const": true },
+            "require_healthy_slot": { "const": true }
+          }
+        },
+        "auth_failure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["signal", "max_automatic_retries", "operator_action_required"],
+          "properties": {
+            "signal": { "const": "auth_required" },
+            "max_automatic_retries": { "const": 0 },
+            "operator_action_required": { "const": true }
+          }
+        },
+        "rate_limited": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["signal", "max_automatic_retries", "wait_for_allowance_recovery"],
+          "properties": {
+            "signal": { "const": "rate_limited" },
+            "max_automatic_retries": { "const": 0 },
+            "wait_for_allowance_recovery": { "const": true }
+          }
+        }
+      }
+    },
+    "writers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_concurrent_per_workspace", "chatgpt_ui_may_write"],
+      "properties": {
+        "max_concurrent_per_workspace": { "const": 1 },
+        "chatgpt_ui_may_write": { "const": false }
+      }
+    },
+    "lean": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["independent_validation_required", "validator_must_differ_from_writer", "validation_before_write"],
+      "properties": {
+        "independent_validation_required": { "const": true },
+        "validator_must_differ_from_writer": { "const": true },
+        "validation_before_write": { "const": true }
+      }
+    },
+    "runtime_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeout_secs", "artifacts_per_turn"],
+      "properties": {
+        "timeout_secs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["default", "min", "max"],
+          "properties": {
+            "default": { "type": "integer", "minimum": 1 },
+            "min": { "type": "integer", "minimum": 1 },
+            "max": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "artifacts_per_turn": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_files", "max_total_bytes"],
+          "properties": {
+            "max_files": { "type": "integer", "minimum": 1 },
+            "max_total_bytes": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    }
+  }
+}

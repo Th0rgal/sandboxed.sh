@@ -150,6 +150,20 @@ jobs:
       - name: Validate capability matrix and surface contract evidence
         run: scripts/check-capability-matrix.sh
 
+  policy-lint:
+    name: Policy Lint
+    runs-on: ubuntu-latest
+    # Skip CI on draft PRs unless explicitly requested
+    if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Lint ChatGPT UI pool policy
+        run: python3 scripts/policy_lint.py
+
+      - name: Run policy lint unit tests
+        run: python3 -m unittest scripts/test_policy_lint.py
+
   dashboard-test:
     name: Dashboard Unit Tests
     runs-on: ubuntu-latest

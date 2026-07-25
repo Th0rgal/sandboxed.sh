@@ -6,6 +6,10 @@ description: >
   to exhaust its budget instead of giving up, and send targeted hints. Trigger
   terms: mission, sandboxed.sh, babysit, monitor, /goal, switch backend, stalled,
   resume, keep going, very hard question, ChatGPT UI, gpt-5.6-pro.
+version: 1.0.0
+metadata:
+  policy: chatgpt-ui-pool
+  policy_version: 1.0.0
 ---
 
 # Hermes Mission Control
@@ -139,6 +143,37 @@ When a model "isn't working," first prove it's the **model** and not the
 **transport** (check `get_mission_diagnostics` for 429/network errors) before
 concluding the model is too weak. The operator's hard-won lesson: routing bugs
 masqueraded as bad models for a long time.
+
+## ChatGPT UI pool policy (policy_version 1.0.0)
+
+Binding rules for every `chatgpt_ui` mission you start or manage. The
+authoritative versioned policy is `docs/policy/CHATGPT_UI_POOL_POLICY.md` in
+the sandboxed.sh repo (machine-checked by `scripts/policy_lint.py` in CI);
+this section must stay in sync with it.
+
+- **Live capacity.** Pool capacity is the number of configured
+  `chatgpt_ui` profile slots (`profile_dirs`), each guarded by an exclusive
+  cross-process lock. Read the live configuration; never assume a fixed slot
+  count, and never queue a duplicate mission against a locked slot.
+- **Read-only Pro lanes.** Concurrent `gpt-5.6-pro` consultations are fine
+  **only** with `writer: false` and **only** on disjoint slots (distinct
+  profiles). A `chatgpt_ui` mission never writes repositories or owns a PR.
+- **Compatibility failure → retry once, elsewhere.** On a
+  `compatibility=chatgpt-ui-v2` failure, retry at most once, on a *different*
+  healthy slot (unlocked, no auth/rate-limit signals). Never the same slot;
+  if the retry fails too, escalate to the operator.
+- **Auth failure → never blind-retry.** `auth_required` is terminal until an
+  operator re-provisions login in that profile. Zero automatic retries, and
+  treat the slot as unhealthy until re-provisioned.
+- **Rate limited → wait.** Zero automatic retries; allowance must recover.
+  Do not shuffle the request across slots of the same account.
+- **Never concurrent writers.** At most one writer mission per workspace.
+  Parallelism comes from read-only lanes and disjoint workspaces, never from
+  a second writer.
+- **Lean writers validate first.** Before any writer commits Lean changes,
+  the change must pass validation run independently of that writer (separate
+  mission or reviewer lane). Pro-lane advice feeds validation; it never
+  replaces it.
 
 ## Operating principles
 
