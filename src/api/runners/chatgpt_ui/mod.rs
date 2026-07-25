@@ -566,7 +566,14 @@ pub async fn run_chatgpt_ui_turn(
                             profile_pool::record_slot_failure(&profile_dir, kind);
                         }
                         terminate_child_tree(&mut child).await;
-                        return AgentResult::failure(format!("chatgpt_ui: {message}"), 0)
+                        let message = if code.as_deref() == Some("compatibility") {
+                            format!(
+                                "chatgpt_ui: compatibility=chatgpt-ui-v2; profile_slot={profile_slot}; {message}"
+                            )
+                        } else {
+                            format!("chatgpt_ui: {message}")
+                        };
+                        return AgentResult::failure(message, 0)
                             .with_terminal_reason(reason)
                             .with_data(serde_json::json!({
                                 "provider_error_source": "chatgpt_ui_driver",
