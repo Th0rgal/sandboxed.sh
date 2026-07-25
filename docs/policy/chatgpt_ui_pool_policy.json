@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "source_of_truth": {
     "runtime": "src/api/runners/chatgpt_ui/mod.rs",
+    "pool": "src/api/runners/chatgpt_ui/profile_pool.rs",
     "driver": "scripts/chatgpt_ui_driver.py",
     "operator_doc": "docs/CHATGPT_UI_HARNESS.md",
     "policy_doc": "docs/policy/CHATGPT_UI_POOL_POLICY.md",
@@ -33,7 +34,8 @@
     "auth_failure": {
       "signal": "auth_required",
       "max_automatic_retries": 0,
-      "operator_action_required": true
+      "operator_action_required": true,
+      "slot_quarantine_secs": 1800
     },
     "rate_limited": {
       "signal": "rate_limited",

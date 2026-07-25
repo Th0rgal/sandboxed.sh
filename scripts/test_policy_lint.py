@@ -13,6 +13,7 @@ from scripts.policy_lint import (
     POLICY_DOC,
     POLICY_JSON,
     POLICY_SCHEMA,
+    POOL_SOURCE,
     RUNTIME_SOURCE,
     SKILL_DOC,
     lint,
@@ -25,6 +26,7 @@ LINTED_FILES = (
     POLICY_DOC,
     HARNESS_DOC,
     RUNTIME_SOURCE,
+    POOL_SOURCE,
     DRIVER_SOURCE,
     SKILL_DOC,
 )
@@ -68,6 +70,14 @@ class PolicyLintMutationTest(unittest.TestCase):
             lambda p: p["retry"]["auth_failure"].__setitem__("max_automatic_retries", 1)
         )
         self.assert_error("retry.auth_failure.max_automatic_retries")
+
+    def test_auth_quarantine_must_match_pool_runtime(self):
+        self.mutate_policy(
+            lambda p: p["retry"]["auth_failure"].__setitem__(
+                "slot_quarantine_secs", 900
+            )
+        )
+        self.assert_error("retry.auth_failure.slot_quarantine_secs")
 
     def test_global_browser_launch_must_not_quarantine_a_profile(self):
         self.mutate_policy(
@@ -122,6 +132,12 @@ class PolicyLintMutationTest(unittest.TestCase):
             lambda p: p["lanes"]["read_only_pro"].__setitem__("writer", True)
         )
         self.assert_error("lanes.read_only_pro.writer")
+
+    def test_pro_lane_model_is_pinned(self):
+        self.mutate_policy(
+            lambda p: p["lanes"]["read_only_pro"].__setitem__("model", "gpt-4o")
+        )
+        self.assert_error("lanes.read_only_pro.model")
 
     def test_lean_validation_must_stay_independent(self):
         self.mutate_policy(
@@ -180,6 +196,17 @@ class PolicyLintMutationTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.assert_error("version 0.0.1")
+
+    def test_policy_doc_runtime_table_must_match(self):
+        doc = self.root / POLICY_DOC
+        doc.write_text(
+            doc.read_text(encoding="utf-8").replace(
+                "| `timeout_secs` default | 14400 |",
+                "| `timeout_secs` default | 900 |",
+            ),
+            encoding="utf-8",
+        )
+        self.assert_error("timeout_secs default")
 
     def test_skill_must_declare_matching_policy_version(self):
         skill = self.root / SKILL_DOC

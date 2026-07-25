@@ -24,9 +24,10 @@
     "source_of_truth": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["runtime", "driver", "operator_doc", "policy_doc", "skill"],
+      "required": ["runtime", "pool", "driver", "operator_doc", "policy_doc", "skill"],
       "properties": {
         "runtime": { "type": "string" },
+        "pool": { "type": "string" },
         "driver": { "type": "string" },
         "operator_doc": { "type": "string" },
         "policy_doc": { "type": "string" },
@@ -82,11 +83,12 @@
         "auth_failure": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["signal", "max_automatic_retries", "operator_action_required"],
+          "required": ["signal", "max_automatic_retries", "operator_action_required", "slot_quarantine_secs"],
           "properties": {
             "signal": { "const": "auth_required" },
             "max_automatic_retries": { "const": 0 },
-            "operator_action_required": { "const": true }
+            "operator_action_required": { "const": true },
+            "slot_quarantine_secs": { "const": 1800 }
           }
         },
         "rate_limited": {

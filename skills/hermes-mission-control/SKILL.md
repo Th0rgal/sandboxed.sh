@@ -165,9 +165,11 @@ this section must stay in sync with it.
   healthy slot (unlocked, no auth/rate-limit signals). Never the same slot;
   confirm that alternate slot from live pool telemetry before retrying. If the
   retry fails too, escalate to the operator.
-- **Auth failure → never blind-retry.** `auth_required` is terminal until an
-  operator re-provisions login in that profile. Zero automatic retries, and
-  treat the slot as unhealthy until re-provisioned.
+- **Auth failure → never blind-retry.** `auth_required` is terminal for that
+  mission and gets zero automatic retries. The slot is quarantined for 30
+  minutes; cooldown expiry permits a later explicit recovery attempt but does
+  not prove the login was repaired. Never use an auth-failed slot for the
+  one compatibility retry.
 - **Rate limited → wait.** Zero automatic retries; allowance must recover.
   Do not shuffle the request across slots of the same account.
 - **Global browser launch failure → preserve the pool.** A generic

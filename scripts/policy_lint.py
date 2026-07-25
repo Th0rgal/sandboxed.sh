@@ -22,6 +22,7 @@ POLICY_SCHEMA = Path("docs/policy/chatgpt_ui_pool_policy.schema.json")
 POLICY_DOC = Path("docs/policy/CHATGPT_UI_POOL_POLICY.md")
 HARNESS_DOC = Path("docs/CHATGPT_UI_HARNESS.md")
 RUNTIME_SOURCE = Path("src/api/runners/chatgpt_ui/mod.rs")
+POOL_SOURCE = Path("src/api/runners/chatgpt_ui/profile_pool.rs")
 DRIVER_SOURCE = Path("scripts/chatgpt_ui_driver.py")
 SKILL_DOC = Path("skills/hermes-mission-control/SKILL.md")
 
@@ -73,6 +74,7 @@ def check_invariants(policy, errors):
     cannot be loosened to weaken them."""
     rules = [
         ("source_of_truth.runtime", str(RUNTIME_SOURCE)),
+        ("source_of_truth.pool", str(POOL_SOURCE)),
         ("source_of_truth.driver", str(DRIVER_SOURCE)),
         ("source_of_truth.operator_doc", str(HARNESS_DOC)),
         ("source_of_truth.policy_doc", str(POLICY_DOC)),
@@ -81,6 +83,7 @@ def check_invariants(policy, errors):
         ("capacity.static_limit", None),
         ("capacity.acquire_strategy", "first_healthy_available"),
         ("lanes.read_only_pro.allowed", True),
+        ("lanes.read_only_pro.model", "gpt-5.6-pro"),
         ("lanes.read_only_pro.writer", False),
         ("lanes.read_only_pro.concurrent", True),
         ("lanes.read_only_pro.requires_disjoint_slots", True),
@@ -89,6 +92,7 @@ def check_invariants(policy, errors):
         ("retry.compatibility_failure.require_healthy_slot", True),
         ("retry.auth_failure.max_automatic_retries", 0),
         ("retry.auth_failure.operator_action_required", True),
+        ("retry.auth_failure.slot_quarantine_secs", 1800),
         ("retry.rate_limited.max_automatic_retries", 0),
         ("retry.browser_launch.signal", "browser_launch"),
         ("retry.browser_launch.quarantine_selected_profile", False),
@@ -162,6 +166,26 @@ def check_runtime_constants(repo_root, policy, errors):
         )
 
 
+def check_pool_constants(repo_root, policy, errors):
+    source = (repo_root / POOL_SOURCE).read_text(encoding="utf-8")
+    match = re.search(
+        r"AUTH_QUARANTINE:\s*Duration\s*=\s*Duration::from_secs\(([0-9_]+)\s*\*\s*([0-9_]+)\)",
+        source,
+    )
+    if not match:
+        errors.append(f"{POOL_SOURCE}: cannot locate AUTH_QUARANTINE")
+        return
+    runtime_secs = rust_int(match.group(1)) * rust_int(match.group(2))
+    policy_secs = (
+        policy.get("retry", {}).get("auth_failure", {}).get("slot_quarantine_secs")
+    )
+    if policy_secs != runtime_secs:
+        errors.append(
+            f"retry.auth_failure.slot_quarantine_secs {policy_secs} != "
+            f"runtime {runtime_secs}"
+        )
+
+
 def check_driver_signal(repo_root, policy, errors):
     driver = (repo_root / DRIVER_SOURCE).read_text(encoding="utf-8")
     match = re.search(r'COMPAT_VERSION\s*=\s*"([^"]+)"', driver)
@@ -190,6 +214,45 @@ def check_harness_doc(repo_root, policy, errors):
             errors.append(
                 f"{HARNESS_DOC}: states clamp {low}-{high}, policy says "
                 f"{timeout.get('min')}-{timeout.get('max')}"
+            )
+
+
+def check_policy_doc_limits(repo_root, policy, errors):
+    doc = (repo_root / POLICY_DOC).read_text(encoding="utf-8")
+    limits = policy.get("runtime_limits", {})
+    timeout = limits.get("timeout_secs", {})
+    artifacts = limits.get("artifacts_per_turn", {})
+    checks = [
+        (
+            "timeout_secs default",
+            r"\|\s*`timeout_secs` default\s*\|\s*([0-9_]+)\s*\|",
+            (timeout.get("default"),),
+        ),
+        (
+            "timeout_secs accepted range",
+            r"\|\s*`timeout_secs` accepted range\s*\|\s*([0-9_]+)[–-]([0-9_]+)\s*\|",
+            (timeout.get("min"), timeout.get("max")),
+        ),
+        (
+            "Artifact files per turn",
+            r"\|\s*Artifact files per turn\s*\|\s*([0-9_]+)\s*\|",
+            (artifacts.get("max_files"),),
+        ),
+        (
+            "Artifact bytes per turn",
+            r"\|\s*Artifact bytes per turn\s*\|\s*([0-9_]+)(?:\s+\([^|]+\))?\s*\|",
+            (artifacts.get("max_total_bytes"),),
+        ),
+    ]
+    for label, pattern, expected in checks:
+        match = re.search(pattern, doc)
+        if not match:
+            errors.append(f"{POLICY_DOC}: cannot locate {label!r} table row")
+            continue
+        actual = tuple(rust_int(value) for value in match.groups())
+        if actual != expected:
+            errors.append(
+                f"{POLICY_DOC}: {label} states {actual}, policy says {expected}"
             )
 
 
@@ -251,8 +314,10 @@ def lint(repo_root: Path) -> list[str]:
     check_invariants(policy, errors)
     for check in (
         check_runtime_constants,
+        check_pool_constants,
         check_driver_signal,
         check_harness_doc,
+        check_policy_doc_limits,
         check_versions,
     ):
         try:

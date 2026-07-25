@@ -56,11 +56,13 @@ single retry.
 
 ## 4. Auth failures: never blind-retry
 
-`auth_required` is terminal until an operator re-provisions login
-interactively in the affected profile. Zero automatic retries — a blind retry
-cannot re-authenticate, wastes a slot, and can trip anti-automation controls.
-The same applies per-slot: an auth-failed slot is unhealthy and must not be
-selected for compatibility retries until re-provisioned.
+`auth_required` is terminal for the mission and gets zero automatic retries —
+a blind retry cannot re-authenticate, wastes a slot, and can trip
+anti-automation controls. The affected profile is quarantined for 1800 seconds
+(30 minutes). After that cooldown it may be selected by a new, explicitly
+requested mission so an operator-reprovisioned login can recover; cooldown
+expiry alone is not proof that authentication was repaired. A slot whose last
+failure is auth must not be selected for a compatibility retry.
 
 ## 5. Rate limits: wait, do not churn
 
