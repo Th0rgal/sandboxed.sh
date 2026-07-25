@@ -1410,6 +1410,12 @@ mod tests {
             .unwrap();
         server.await.unwrap();
         providers[0].oauth.as_mut().unwrap().access_token = "test-kimi-rotated-token".to_string();
+        assert!(
+            crate::api::providers::cached_kimi_models(&providers[0])
+                .await
+                .is_some(),
+            "routine access-token rotation must retain the account catalog"
+        );
 
         write_opencode_config(
             &mission_dir,
@@ -1435,6 +1441,14 @@ mod tests {
         );
         assert!(config["provider"]["kimi"]["models"]["k3"].is_object());
         assert!(config["provider"]["kimi"]["models"]["kimi-k2.6"].is_null());
+
+        crate::api::providers::invalidate_kimi_model_cache(&providers[0]).await;
+        assert!(
+            crate::api::providers::cached_kimi_models(&providers[0])
+                .await
+                .is_none(),
+            "account reconnect must invalidate the previous catalog"
+        );
     }
 
     #[tokio::test]

@@ -8696,6 +8696,7 @@ async fn refresh_kimi_oauth_tokens(
         ("client_id", KIMI_CLIENT_ID),
         ("refresh_token", refresh_token),
     ]))
+    .timeout(Duration::from_secs(10))
     .send()
     .await
     .map_err(|e| OAuthRefreshError::Other(format!("Failed to refresh Kimi token: {e}")))?;
@@ -8784,6 +8785,17 @@ async fn upsert_kimi_oauth_provider(
             "Failed to save Kimi OAuth provider".to_string(),
         )
     })?;
+
+    // The same local row can be reconnected to a different upstream account.
+    // Remove both account-specific cache layers before asynchronously probing
+    // the fresh credentials, so old entitlements are never exposed meanwhile.
+    crate::api::providers::invalidate_kimi_model_cache(&stored).await;
+    state.model_catalog.write().await.remove("kimi");
+    let catalog = Arc::clone(&state.model_catalog);
+    let catalog_provider = stored.clone();
+    tokio::spawn(async move {
+        crate::api::providers::refresh_connected_kimi_catalog(catalog, catalog_provider).await;
+    });
 
     if let Err(e) =
         update_provider_backends(&state.config.working_dir, ProviderType::Kimi.id(), backends)

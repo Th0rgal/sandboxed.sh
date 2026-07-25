@@ -37,12 +37,11 @@ const CODEX_MODEL_PROBE_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone)]
 struct KimiModelCacheEntry {
-    route_fingerprint: u64,
     models: Vec<ProviderModel>,
     expires_at: Instant,
 }
 
-static KIMI_MODEL_CACHE: OnceLock<RwLock<Option<KimiModelCacheEntry>>> = OnceLock::new();
+static KIMI_MODEL_CACHE: OnceLock<RwLock<HashMap<u64, KimiModelCacheEntry>>> = OnceLock::new();
 const KIMI_MODEL_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const RETIRED_KIMI_MODEL_IDS: &[&str] = &["kimi-k2.6", "kimi-k2-thinking"];
 
@@ -1336,8 +1335,8 @@ fn parse_openai_compatible_models(
     Ok(models)
 }
 
-fn kimi_model_cache() -> &'static RwLock<Option<KimiModelCacheEntry>> {
-    KIMI_MODEL_CACHE.get_or_init(|| RwLock::new(None))
+fn kimi_model_cache() -> &'static RwLock<HashMap<u64, KimiModelCacheEntry>> {
+    KIMI_MODEL_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn kimi_route_fingerprint(
@@ -1376,9 +1375,48 @@ pub(crate) async fn cached_kimi_models(
     kimi_model_cache()
         .read()
         .await
-        .as_ref()
-        .filter(|entry| entry.route_fingerprint == route_fingerprint)
+        .get(&route_fingerprint)
         .map(|entry| entry.models.clone())
+}
+
+/// Drop the cached catalog before replacing a Kimi provider's credentials.
+///
+/// Reconnect keeps the local provider UUID but may select a different upstream
+/// account with different model entitlements.
+pub(crate) async fn invalidate_kimi_model_cache(provider: &crate::ai_providers::AIProvider) {
+    if let Ok((route_fingerprint, _, _)) = kimi_route_fingerprint(provider) {
+        kimi_model_cache().write().await.remove(&route_fingerprint);
+    }
+}
+
+/// Re-populate Kimi's shared catalog after a reconnect without blocking the
+/// OAuth callback. The caller removes the old entry before spawning this task.
+pub(crate) async fn refresh_connected_kimi_catalog(catalog: ModelCatalog, provider: AIProvider) {
+    match fetch_kimi_models(&provider).await {
+        Ok(models) => {
+            let checked_at = chrono::Utc::now();
+            let entries = models
+                .into_iter()
+                .map(|model| {
+                    CatalogEntry::from_provider_model(
+                        "kimi",
+                        model,
+                        CatalogSource::ProviderApi,
+                        CatalogAvailability::Available,
+                        checked_at,
+                    )
+                })
+                .collect();
+            catalog.write().await.insert("kimi".to_string(), entries);
+        }
+        Err(error) => {
+            tracing::warn!(
+                provider_id = %provider.id,
+                error = %error,
+                "Failed to refresh Kimi catalog after account reconnect"
+            );
+        }
+    }
 }
 
 fn preferred_usable_kimi_provider(providers: &[AIProvider]) -> Option<AIProvider> {
@@ -1410,15 +1448,11 @@ pub(crate) async fn fetch_kimi_models(
 
     let stale_models = {
         let cache = kimi_model_cache().read().await;
-        if let Some(entry) = cache.as_ref() {
-            if entry.route_fingerprint == route_fingerprint && entry.expires_at > Instant::now() {
+        if let Some(entry) = cache.get(&route_fingerprint) {
+            if entry.expires_at > Instant::now() {
                 return Ok(entry.models.clone());
             }
-            if entry.route_fingerprint == route_fingerprint {
-                Some(entry.models.clone())
-            } else {
-                None
-            }
+            Some(entry.models.clone())
         } else {
             None
         }
@@ -1438,11 +1472,13 @@ pub(crate) async fn fetch_kimi_models(
         Ok(_) => {
             if let Some(models) = stale_models {
                 tracing::warn!("Kimi model catalog was empty; reusing stale catalog");
-                *kimi_model_cache().write().await = Some(KimiModelCacheEntry {
+                kimi_model_cache().write().await.insert(
                     route_fingerprint,
-                    models: models.clone(),
-                    expires_at: Instant::now() + Duration::from_secs(60),
-                });
+                    KimiModelCacheEntry {
+                        models: models.clone(),
+                        expires_at: Instant::now() + Duration::from_secs(60),
+                    },
+                );
                 return Ok(models);
             }
             return Err("Kimi model catalog was empty".to_string());
@@ -1453,22 +1489,26 @@ pub(crate) async fn fetch_kimi_models(
                     error = %error,
                     "Kimi model discovery failed; reusing stale catalog"
                 );
-                *kimi_model_cache().write().await = Some(KimiModelCacheEntry {
+                kimi_model_cache().write().await.insert(
                     route_fingerprint,
-                    models: models.clone(),
-                    expires_at: Instant::now() + Duration::from_secs(60),
-                });
+                    KimiModelCacheEntry {
+                        models: models.clone(),
+                        expires_at: Instant::now() + Duration::from_secs(60),
+                    },
+                );
                 return Ok(models);
             }
             return Err(error);
         }
     };
 
-    *kimi_model_cache().write().await = Some(KimiModelCacheEntry {
+    kimi_model_cache().write().await.insert(
         route_fingerprint,
-        models: models.clone(),
-        expires_at: Instant::now() + KIMI_MODEL_CACHE_TTL,
-    });
+        KimiModelCacheEntry {
+            models: models.clone(),
+            expires_at: Instant::now() + KIMI_MODEL_CACHE_TTL,
+        },
+    );
     Ok(models)
 }
 
