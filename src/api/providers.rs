@@ -1381,6 +1381,20 @@ pub(crate) async fn cached_kimi_models(
         .map(|entry| entry.models.clone())
 }
 
+fn preferred_usable_kimi_provider(providers: &[AIProvider]) -> Option<AIProvider> {
+    providers
+        .iter()
+        .filter(|provider| {
+            provider.provider_type == ProviderType::Kimi
+                && provider.enabled
+                && provider.oauth.as_ref().is_some_and(|oauth| {
+                    !oauth.access_token.trim().is_empty() && !oauth.refresh_token.trim().is_empty()
+                })
+        })
+        .min_by_key(|provider| (provider.priority, provider.id))
+        .cloned()
+}
+
 /// Discover the models available to a connected Kimi Code account.
 ///
 /// Kimi is an OpenAI-compatible provider but requires its coding-agent
@@ -1953,11 +1967,7 @@ pub async fn fetch_model_catalog(
     // Kimi has an OpenAI-compatible catalog but requires its coding User-Agent.
     // Use the shared, credential-aware cache so startup refresh also primes
     // mission workspace generation.
-    let kimi_provider = providers_list
-        .iter()
-        .filter(|provider| provider.provider_type == ProviderType::Kimi && provider.enabled)
-        .min_by_key(|provider| (provider.priority, provider.id))
-        .cloned();
+    let kimi_provider = preferred_usable_kimi_provider(&providers_list);
     let kimi_handle = tokio::spawn(async move {
         match kimi_provider {
             Some(provider) => match fetch_kimi_models(&provider).await {
@@ -2699,6 +2709,24 @@ fn is_grok_backend_model_id(model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kimi_catalog_skips_a_higher_priority_account_without_oauth() {
+        let mut disconnected = AIProvider::new(ProviderType::Kimi, "Disconnected Kimi".to_string());
+        disconnected.priority = 0;
+
+        let mut connected = AIProvider::new(ProviderType::Kimi, "Connected Kimi".to_string());
+        connected.priority = 10;
+        connected.oauth = Some(crate::ai_providers::OAuthCredentials {
+            access_token: "connected-access".to_string(),
+            refresh_token: "connected-refresh".to_string(),
+            expires_at: i64::MAX,
+        });
+
+        let selected = preferred_usable_kimi_provider(&[disconnected, connected.clone()])
+            .expect("connected Kimi account should remain selectable");
+        assert_eq!(selected.id, connected.id);
+    }
 
     #[test]
     fn test_model_id_to_display_name() {
