@@ -15,7 +15,9 @@
 //! - The telemetry snapshot exposes even less: no conversation route and no
 //!   fingerprint, only states, counters, and the profile basename.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -24,6 +26,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const JOB_SCHEMA_VERSION: u32 = 1;
+
+/// Serialize record replacements within the backend process. A mission retry,
+/// dashboard reconciliation, and shutdown handling can otherwise all perform
+/// read/modify/write cycles against the same record and lose the newest state.
+static JOB_LEDGER_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// A submitted prompt stays resumable for this long; afterwards reconciliation
 /// abandons it. Generous on purpose: Pro runs are budgeted in hours.
@@ -153,19 +160,99 @@ pub fn load_job(app_working_dir: &Path, mission_id: Uuid) -> Option<JobRecord> {
     Some(record)
 }
 
-pub fn save_job(app_working_dir: &Path, record: &JobRecord) -> Result<(), String> {
+fn save_job_unlocked(app_working_dir: &Path, record: &JobRecord) -> Result<(), String> {
     let dir = jobs_dir(app_working_dir);
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("cannot create ChatGPT UI job ledger directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot secure ChatGPT UI job ledger directory: {error}"))?;
+    }
     let path = job_path(app_working_dir, record.mission_id);
-    let tmp = dir.join(format!(".{}.tmp", record.mission_id));
+    // A unique temporary name avoids collisions if an old process is still
+    // unwinding while its replacement reconciles the same mission.
+    let tmp = dir.join(format!(".{}.{}.tmp", record.mission_id, Uuid::new_v4()));
     let payload = serde_json::to_vec_pretty(record)
         .map_err(|error| format!("cannot serialize ChatGPT UI job record: {error}"))?;
-    std::fs::write(&tmp, payload)
-        .map_err(|error| format!("cannot write ChatGPT UI job record: {error}"))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|error| format!("cannot commit ChatGPT UI job record: {error}"))?;
-    Ok(())
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let write_result = (|| -> Result<(), String> {
+        let mut file = options
+            .open(&tmp)
+            .map_err(|error| format!("cannot create ChatGPT UI job record: {error}"))?;
+        file.write_all(&payload)
+            .map_err(|error| format!("cannot write ChatGPT UI job record: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("cannot sync ChatGPT UI job record: {error}"))?;
+        drop(file);
+        std::fs::rename(&tmp, &path)
+            .map_err(|error| format!("cannot commit ChatGPT UI job record: {error}"))?;
+        // Persist the rename itself across a host crash on platforms where a
+        // directory can be opened and synced.
+        #[cfg(unix)]
+        std::fs::File::open(&dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("cannot sync ChatGPT UI job ledger directory: {error}"))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_result
+}
+
+pub fn save_job(app_working_dir: &Path, record: &JobRecord) -> Result<(), String> {
+    let _guard = JOB_LEDGER_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    save_job_unlocked(app_working_dir, record)
+}
+
+fn update_job<F: FnOnce(&mut JobRecord)>(app_working_dir: &Path, mission_id: Uuid, apply: F) {
+    let _guard = JOB_LEDGER_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(mut record) = load_job(app_working_dir, mission_id) {
+        apply(&mut record);
+        record.updated_at = Utc::now();
+        if let Err(error) = save_job_unlocked(app_working_dir, &record) {
+            tracing::warn!(mission_id = %mission_id, error = %error, "failed to update ChatGPT UI job record");
+        }
+    }
+}
+
+#[cfg(test)]
+fn ledger_mode(path: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        0
+    }
+}
+
+#[cfg(test)]
+fn assert_private_ledger_permissions(app_working_dir: &Path, mission_id: Uuid) {
+    #[cfg(unix)]
+    {
+        assert_eq!(ledger_mode(&jobs_dir(app_working_dir)), 0o700);
+        assert_eq!(ledger_mode(&job_path(app_working_dir, mission_id)), 0o600);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app_working_dir, mission_id);
+    }
 }
 
 /// Persist the moment a prompt provably lives in a conversation. This is the
@@ -199,16 +286,6 @@ pub fn record_submitted(
     };
     save_job(app_working_dir, &record)?;
     Ok(record)
-}
-
-fn update_job<F: FnOnce(&mut JobRecord)>(app_working_dir: &Path, mission_id: Uuid, apply: F) {
-    if let Some(mut record) = load_job(app_working_dir, mission_id) {
-        apply(&mut record);
-        record.updated_at = Utc::now();
-        if let Err(error) = save_job(app_working_dir, &record) {
-            tracing::warn!(mission_id = %mission_id, error = %error, "failed to update ChatGPT UI job record");
-        }
-    }
 }
 
 pub fn mark_completed(app_working_dir: &Path, mission_id: Uuid) {
@@ -381,6 +458,7 @@ mod tests {
         let fingerprint = prompt_fingerprint("prompt", Some("Pro"));
         let record = submit(root.path(), mission_id, &fingerprint);
         assert_eq!(record.attempts, 1);
+        assert_private_ledger_permissions(root.path(), mission_id);
 
         let loaded = load_job(root.path(), mission_id).unwrap();
         assert_eq!(loaded.state, JobState::Submitted);
@@ -471,6 +549,26 @@ mod tests {
         let record = load_job(root.path(), mission_id).unwrap();
         assert_eq!(record.state, JobState::Completed);
         assert!(!resumable_job(&record, &fingerprint, Utc::now()));
+    }
+
+    #[test]
+    fn concurrent_resume_updates_do_not_lose_attempts() {
+        let root = tempfile::tempdir().unwrap();
+        let app_working_dir = root.path().to_path_buf();
+        let mission_id = Uuid::new_v4();
+        submit(&app_working_dir, mission_id, "fingerprint");
+
+        let handles = (0..8)
+            .map(|_| {
+                let app_working_dir = app_working_dir.clone();
+                std::thread::spawn(move || touch_resume_attempt(&app_working_dir, mission_id))
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(load_job(&app_working_dir, mission_id).unwrap().attempts, 9);
     }
 
     #[test]

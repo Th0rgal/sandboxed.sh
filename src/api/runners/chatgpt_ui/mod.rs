@@ -6,7 +6,7 @@
 pub mod chromium_cleanup;
 pub mod profile_pool;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -288,7 +288,21 @@ pub(crate) fn configured_profile_dirs(app_working_dir: &Path) -> Result<Vec<Path
             profile_dirs.push(canonical_profile);
         }
     }
+    validate_unique_profile_basenames(&profile_dirs)?;
     Ok(profile_dirs)
+}
+
+fn validate_unique_profile_basenames(profile_dirs: &[PathBuf]) -> Result<(), String> {
+    let mut names = HashSet::with_capacity(profile_dirs.len());
+    for profile_dir in profile_dirs {
+        let name = profile_basename(profile_dir);
+        if !names.insert(name) {
+            return Err(format!(
+                "chatgpt_ui profile directories must have unique basenames; duplicate: {name}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
@@ -343,15 +357,12 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
     })
 }
 
-/// Outcome of one driver attempt. Resume-pointer failures are recoverable
-/// inside the same turn (fall back to a fresh submission); everything else is
-/// terminal for the turn.
+/// Outcome of one driver attempt. A resume-pointer failure is terminal for the
+/// turn: an invalid pointer does not prove that the original prompt was never
+/// submitted, so automatically starting over could duplicate multi-hour work.
 enum DriveOutcome {
     Terminal(AgentResult),
-    /// The persisted conversation pointer is unusable (`resume_not_found` or
-    /// `resume_mismatch`). The prompt is provably absent from the referenced
-    /// conversation, so a fresh submission stays idempotent.
-    ResumeInvalid(&'static str),
+    ResumeUnresolved(&'static str),
 }
 
 fn profile_basename(profile_dir: &Path) -> &str {
@@ -402,49 +413,47 @@ pub async fn run_chatgpt_ui_turn(
         }
     };
 
-    loop {
-        let attempt_resume = resume_record.take();
-        // Conversations are account-scoped: a resume must reuse the profile
-        // that submitted the prompt, or give up on the pointer entirely. The
-        // pinned path locks the slot directly instead of going through the
-        // pool scan — quarantine and retry-slot exclusions must not reroute a
-        // reattach to an account that cannot see the conversation.
-        let acquisition = if let Some(record) = attempt_resume.as_ref() {
-            match settings
-                .profile_dirs
-                .iter()
-                .position(|dir| profile_basename(dir) == record.profile)
-            {
-                Some(index) => {
-                    let pinned = settings.profile_dirs[index].clone();
-                    acquire_pinned_profile(&pinned, mission_id, &events_tx, &cancel)
-                        .await
-                        .map(|lock| (index, pinned, lock))
-                }
-                None => {
-                    jobs::mark_abandoned(app_working_dir, mission_id, "profile_unavailable");
-                    continue;
-                }
+    let attempt_resume = resume_record.take();
+    // Conversations are account-scoped: a resume must reuse the profile
+    // that submitted the prompt, or give up on the pointer entirely. The
+    // pinned path locks the slot directly instead of going through the
+    // pool scan — quarantine and retry-slot exclusions must not reroute a
+    // reattach to an account that cannot see the conversation.
+    let acquisition = if let Some(record) = attempt_resume.as_ref() {
+        match settings
+            .profile_dirs
+            .iter()
+            .position(|dir| profile_basename(dir) == record.profile)
+        {
+            Some(index) => {
+                let pinned = settings.profile_dirs[index].clone();
+                acquire_pinned_profile(&pinned, mission_id, &events_tx, &cancel)
+                    .await
+                    .map(|lock| (index, pinned, lock))
             }
-        } else {
-            profile_pool::acquire_profile(&settings.profile_dirs, mission_id, &events_tx, &cancel)
-                .await
-        };
-        let (profile_slot, profile_dir, _profile_lock) = match acquisition {
-            Ok(lease) => lease,
-            Err(result) => return result,
-        };
-        if settings.browser == "chromium" {
-            let owned = chromium_cleanup::pool_owns_singletons(&profile_dir);
-            let outcome = chromium_cleanup::cleanup_profile_singletons(&profile_dir, owned);
-            tracing::debug!(
-                mission_id = %mission_id,
-                outcome = outcome.as_str(),
-                "chatgpt_ui pre-launch profile singleton cleanup"
-            );
-            if !outcome.profile_is_launchable() {
-                profile_pool::record_slot_failure(&profile_dir, SlotFailureKind::Launch);
-                let message = match outcome {
+            None => {
+                jobs::note_attempt_error(app_working_dir, mission_id, "profile_unavailable");
+                return unresolved_resume_result("profile_unavailable");
+            }
+        }
+    } else {
+        profile_pool::acquire_profile(&settings.profile_dirs, mission_id, &events_tx, &cancel).await
+    };
+    let (profile_slot, profile_dir, _profile_lock) = match acquisition {
+        Ok(lease) => lease,
+        Err(result) => return result,
+    };
+    if settings.browser == "chromium" {
+        let owned = chromium_cleanup::pool_owns_singletons(&profile_dir);
+        let outcome = chromium_cleanup::cleanup_profile_singletons(&profile_dir, owned);
+        tracing::debug!(
+            mission_id = %mission_id,
+            outcome = outcome.as_str(),
+            "chatgpt_ui pre-launch profile singleton cleanup"
+        );
+        if !outcome.profile_is_launchable() {
+            profile_pool::record_slot_failure(&profile_dir, SlotFailureKind::Launch);
+            let message = match outcome {
                     SingletonCleanup::ActiveProcess => {
                         "chatgpt_ui profile is held by a live browser process outside the profile pool; close it before retrying"
                     }
@@ -456,46 +465,56 @@ pub async fn run_chatgpt_ui_turn(
                     }
                     SingletonCleanup::Clean | SingletonCleanup::Removed(_) => unreachable!(),
                 };
-                return AgentResult::failure(message, 0)
-                    .with_terminal_reason(TerminalReason::LlmError)
-                    .with_data(serde_json::json!({
-                        "provider_error_source": "chatgpt_ui_profile_pool",
-                        "failure_class": FailureClass::TransportError,
-                        "classification_source": "structured",
-                    }));
-            }
-        }
-        match drive_once(
-            &settings,
-            work_dir,
-            &download_dir,
-            message,
-            model,
-            mission_id,
-            &events_tx,
-            &cancel,
-            app_working_dir,
-            &fingerprint,
-            prior_attempts,
-            profile_slot,
-            &profile_dir,
-            attempt_resume.as_ref(),
-        )
-        .await
-        {
-            DriveOutcome::Terminal(result) => return result,
-            DriveOutcome::ResumeInvalid(code) => {
-                jobs::mark_abandoned(app_working_dir, mission_id, code);
-                prior_attempts = attempt_resume.map(|record| record.attempts).unwrap_or(0);
-                let _ = events_tx.send(AgentEvent::MissionActivity {
-                    label: "ChatGPT UI conversation could not be reattached — submitting fresh."
-                        .to_string(),
-                    tool_name: "chatgpt_ui_durability".to_string(),
-                    mission_id: Some(mission_id),
-                });
-            }
+            return AgentResult::failure(message, 0)
+                .with_terminal_reason(TerminalReason::LlmError)
+                .with_data(serde_json::json!({
+                    "provider_error_source": "chatgpt_ui_profile_pool",
+                    "failure_class": FailureClass::TransportError,
+                    "classification_source": "structured",
+                }));
         }
     }
+    match drive_once(
+        &settings,
+        work_dir,
+        &download_dir,
+        message,
+        model,
+        mission_id,
+        &events_tx,
+        &cancel,
+        app_working_dir,
+        &fingerprint,
+        prior_attempts,
+        profile_slot,
+        &profile_dir,
+        attempt_resume.as_ref(),
+    )
+    .await
+    {
+        DriveOutcome::Terminal(result) => result,
+        DriveOutcome::ResumeUnresolved(code) => {
+            jobs::note_attempt_error(app_working_dir, mission_id, code);
+            unresolved_resume_result(code)
+        }
+    }
+}
+
+fn unresolved_resume_result(code: &str) -> AgentResult {
+    AgentResult::failure(
+        format!(
+            "chatgpt_ui could not safely reattach the existing conversation ({code}); no fresh prompt was submitted"
+        ),
+        0,
+    )
+    .with_terminal_reason(TerminalReason::LlmError)
+    .with_data(serde_json::json!({
+        "provider_error_source": "chatgpt_ui_durability",
+        "failure_class": FailureClass::TransportError,
+        "classification_source": "structured",
+        "resume_resolution": code,
+        "fresh_prompt_submitted": false,
+    }))
 }
 
 /// Cancel-aware wait for one specific profile slot. Used only for resume:
@@ -804,11 +823,12 @@ async fn drive_once(
                         terminate_child_tree(&mut child).await;
                         let code_str = code.as_deref().unwrap_or("");
                         if resume.is_some() {
-                            // An unusable pointer is not a slot failure: the
-                            // caller falls back to a fresh submission.
+                            // An unusable pointer is not proof that the prompt
+                            // was never submitted. Preserve the durable record
+                            // and fail closed instead of duplicating the work.
                             match code_str {
-                                "resume_not_found" => return DriveOutcome::ResumeInvalid("resume_not_found"),
-                                "resume_mismatch" => return DriveOutcome::ResumeInvalid("resume_mismatch"),
+                                "resume_not_found" => return DriveOutcome::ResumeUnresolved("resume_not_found"),
+                                "resume_mismatch" => return DriveOutcome::ResumeUnresolved("resume_mismatch"),
                                 _ => {}
                             }
                         }
@@ -1133,6 +1153,41 @@ mod tests {
             "slot-a"
         );
         assert_eq!(profile_basename(Path::new("/")), "profile");
+    }
+
+    #[test]
+    fn duplicate_profile_basenames_are_rejected() {
+        let profiles = vec![
+            PathBuf::from("/profiles/account-a/slot"),
+            PathBuf::from("/profiles/account-b/slot"),
+        ];
+        assert!(validate_unique_profile_basenames(&profiles)
+            .unwrap_err()
+            .contains("duplicate: slot"));
+    }
+
+    #[test]
+    fn distinct_profile_basenames_are_accepted() {
+        let profiles = vec![
+            PathBuf::from("/profiles/account-a/slot-a"),
+            PathBuf::from("/profiles/account-b/slot-b"),
+        ];
+        validate_unique_profile_basenames(&profiles).unwrap();
+    }
+
+    #[test]
+    fn unresolved_resume_fails_closed_without_fresh_submission() {
+        let result = unresolved_resume_result("resume_mismatch");
+        assert!(!result.success);
+        assert!(result.output.contains("no fresh prompt was submitted"));
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|data| data.get("fresh_prompt_submitted"))
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]
