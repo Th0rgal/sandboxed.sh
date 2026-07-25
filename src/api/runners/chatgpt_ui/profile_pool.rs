@@ -2,7 +2,7 @@
 //!
 //! Every ChatGPT UI turn leases exactly one profile directory through an
 //! advisory file lock. Slots that keep failing in ways that a retry cannot fix
-//! (logged-out profile, broken browser launch, repeated UI incompatibility)
+//! (logged-out profile, profile-local Chromium singleton conflict, repeated UI incompatibility)
 //! are quarantined for a cooldown so unhealthy slots are not retried blindly.
 
 use std::collections::HashMap;
@@ -63,8 +63,9 @@ pub fn try_lock_profile(profile_dir: &Path) -> Result<Option<ProfileLock>, Strin
 pub enum SlotFailureKind {
     /// The profile is logged out; retries cannot recover it.
     Auth,
-    /// The browser could not launch or the profile is held by a foreign
-    /// browser process.
+    /// The profile is held by a live, foreign-host, or unrecognized Chromium
+    /// singleton. Undifferentiated browser launch failures are host-global and
+    /// must not be recorded against a slot.
     Launch,
     /// The driver failed a UI compatibility check on this profile.
     Compatibility,

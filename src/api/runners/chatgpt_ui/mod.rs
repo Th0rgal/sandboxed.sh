@@ -168,7 +168,11 @@ fn classify_driver_error(
         Some("browser_launch") => (
             TerminalReason::LlmError,
             FailureClass::TransportError,
-            Some(SlotFailureKind::Launch),
+            // The driver cannot currently distinguish a profile-local launch
+            // problem from a global Playwright/browser installation failure.
+            // Quarantining the selected profile here would eventually poison
+            // every slot for one host-wide outage.
+            None,
         ),
         Some("compatibility") => (
             TerminalReason::LlmError,
@@ -425,7 +429,6 @@ pub async fn run_chatgpt_ui_turn(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            profile_pool::record_slot_failure(&profile_dir, SlotFailureKind::Launch);
             return AgentResult::failure(format!("failed to start chatgpt_ui driver: {error}"), 0)
                 .with_terminal_reason(TerminalReason::LlmError);
         }
@@ -815,11 +818,7 @@ mod tests {
         );
         assert_eq!(
             classify_driver_error(Some("browser_launch")),
-            (
-                TerminalReason::LlmError,
-                FailureClass::TransportError,
-                Some(SlotFailureKind::Launch)
-            )
+            (TerminalReason::LlmError, FailureClass::TransportError, None)
         );
         assert_eq!(
             classify_driver_error(Some("compatibility")),
