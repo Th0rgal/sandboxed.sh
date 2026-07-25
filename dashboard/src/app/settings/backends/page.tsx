@@ -8,6 +8,7 @@ import {
   updateBackendConfig,
   getProviderForBackend,
   getChatgptUiProfilePool,
+  getChatgptUiDurability,
   getHealth,
   getSettings,
   updateSettings,
@@ -160,6 +161,14 @@ export default function BackendsPage() {
       ? 'chatgpt-ui-profile-pool'
       : null,
     getChatgptUiProfilePool,
+    { revalidateOnFocus: false, refreshInterval: 15000 }
+  );
+
+  const { data: chatgptUiDurability } = useSWR(
+    activeBackendTab === 'chatgpt_ui' && chatgptUiIsConfigured
+      ? 'chatgpt-ui-durability'
+      : null,
+    getChatgptUiDurability,
     { revalidateOnFocus: false, refreshInterval: 15000 }
   );
 
@@ -778,6 +787,47 @@ export default function BackendsPage() {
                   </ul>
                   <p className="mt-2 text-xs text-white/30">
                     Slots quarantine automatically after auth, launch, or repeated compatibility failures and rejoin the pool when the cooldown ends.
+                  </p>
+                </div>
+              )}
+              {chatgptUiIsConfigured && (chatgptUiDurability?.jobs.length ?? 0) > 0 && (
+                <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-4" data-testid="chatgpt-ui-durability-status">
+                  <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">
+                    Long-running job durability
+                  </p>
+                  <ul className="mt-3 space-y-2">
+                    {chatgptUiDurability!.jobs.map((job) => (
+                      <li key={job.mission_id} className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-mono text-white/70">{job.mission_id.slice(0, 8)}</span>
+                        <span
+                          className={cn(
+                            'rounded-full px-2 py-0.5',
+                            job.state === 'submitted' && 'bg-indigo-500/10 text-indigo-300',
+                            job.state === 'completed' && 'bg-emerald-500/10 text-emerald-300',
+                            job.state === 'abandoned' && 'bg-rose-500/10 text-rose-300'
+                          )}
+                        >
+                          {job.state}
+                        </span>
+                        {job.state === 'submitted' && (
+                          <span className="text-white/35">
+                            {job.resumable ? 'resumable' : 'not resumable'}
+                          </span>
+                        )}
+                        <span className="text-white/35">
+                          profile {job.profile} · attempt {job.attempts} ·{' '}
+                          {job.age_secs >= 3600
+                            ? `${Math.floor(job.age_secs / 3600)} h old`
+                            : `${Math.max(1, Math.floor(job.age_secs / 60))} min old`}
+                        </span>
+                        {job.last_error_code && (
+                          <span className="text-amber-300/70">{job.last_error_code}</span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="mt-2 text-xs text-white/30">
+                    Submitted GPT Pro conversations survive restarts and reattach on retry. Only opaque state is stored — never prompts, responses, or reasoning.
                   </p>
                 </div>
               )}

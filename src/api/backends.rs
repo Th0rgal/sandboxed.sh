@@ -750,6 +750,34 @@ pub async fn chatgpt_ui_profile_pool(
     }))
 }
 
+/// Durable ChatGPT UI job-ledger health.
+///
+/// Summaries expose only job state, counters, and allowlisted error codes.
+/// Conversation routes, prompt fingerprints, and message content are never
+/// serialized here.
+#[derive(Debug, Serialize)]
+pub struct ChatgptUiDurabilityResponse {
+    pub jobs: Vec<crate::api::runners::chatgpt_ui_jobs::JobStatusSummary>,
+}
+
+/// GET /api/backends/chatgpt_ui/durability — persisted long-turn job records
+/// used for restart/disconnect reconciliation of ChatGPT UI missions.
+pub async fn chatgpt_ui_durability(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+) -> Result<Json<ChatgptUiDurabilityResponse>, (StatusCode, String)> {
+    let working_dir = state.config.working_dir.clone();
+    let jobs = tokio::task::spawn_blocking(move || {
+        // Reconcile on read so the dashboard reflects stale-job expiry even
+        // when no new turn has run since a restart.
+        let _ = crate::api::runners::chatgpt_ui_jobs::reconcile_jobs(&working_dir);
+        crate::api::runners::chatgpt_ui_jobs::jobs_snapshot(&working_dir)
+    })
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(ChatgptUiDurabilityResponse { jobs }))
+}
+
 #[cfg(test)]
 mod quota_tests {
     use super::*;

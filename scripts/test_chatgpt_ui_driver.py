@@ -11,10 +11,13 @@ from scripts.chatgpt_ui_driver import (
     STOP_CONTROL_TESTIDS,
     choose_intelligence_model,
     close_context_quietly,
+    conversation_path_from_url,
     download_control_key,
     downloadable_href,
     locate_composer_control,
     model_selection,
+    normalized_prompt,
+    resume_conversation_path,
     safe_download_name,
 )
 
@@ -208,6 +211,56 @@ class ChatGptUiDriverTests(unittest.TestCase):
         self.assertIsNone(
             download_control_key("BUTTON", None, "report.pdf", "generic", "report.pdf")
         )
+
+    def test_conversation_path_is_only_extracted_from_chatgpt_routes(self) -> None:
+        self.assertEqual(
+            conversation_path_from_url("https://chatgpt.com/c/abc123def456"),
+            "/c/abc123def456",
+        )
+        self.assertEqual(
+            conversation_path_from_url(
+                "https://chat.openai.com/c/0a1b2c3d-4e5f-6789-abcd-ef0123456789"
+            ),
+            "/c/0a1b2c3d-4e5f-6789-abcd-ef0123456789",
+        )
+        # Non-conversation routes, foreign hosts, and short ids never become
+        # durability pointers.
+        self.assertIsNone(conversation_path_from_url("https://chatgpt.com/"))
+        self.assertIsNone(conversation_path_from_url("https://chatgpt.com/c/short"))
+        self.assertIsNone(
+            conversation_path_from_url("https://evil.example/c/abc123def456")
+        )
+        self.assertIsNone(
+            conversation_path_from_url("https://chatgpt.com/share/abc123def456")
+        )
+        self.assertIsNone(
+            conversation_path_from_url("https://chatgpt.com/c/abc123def456/extra")
+        )
+
+    def test_resume_requests_only_accept_opaque_conversation_routes(self) -> None:
+        self.assertEqual(
+            resume_conversation_path({"conversation_path": "/c/abc123def456"}),
+            "/c/abc123def456",
+        )
+        self.assertIsNone(resume_conversation_path(None))
+        self.assertIsNone(resume_conversation_path("/c/abc123def456"))
+        self.assertIsNone(resume_conversation_path({"conversation_path": "/settings"}))
+        self.assertIsNone(
+            resume_conversation_path({"conversation_path": "/c/../../etc/passwd"})
+        )
+        self.assertIsNone(
+            resume_conversation_path(
+                {"conversation_path": "https://chatgpt.com/c/abc123def456"}
+            )
+        )
+
+    def test_prompt_identity_is_whitespace_insensitive_and_in_memory_only(
+        self,
+    ) -> None:
+        self.assertEqual(
+            normalized_prompt("hello\n  world\t"), normalized_prompt(" hello world")
+        )
+        self.assertNotEqual(normalized_prompt("hello"), normalized_prompt("hello!"))
 
 
 if __name__ == "__main__":

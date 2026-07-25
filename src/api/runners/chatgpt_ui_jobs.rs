@@ -86,7 +86,9 @@ pub struct ReconcileSummary {
 }
 
 pub fn jobs_dir(app_working_dir: &Path) -> PathBuf {
-    app_working_dir.join(".sandboxed-sh").join("chatgpt-ui-jobs")
+    app_working_dir
+        .join(".sandboxed-sh")
+        .join("chatgpt-ui-jobs")
 }
 
 fn job_path(app_working_dir: &Path, mission_id: Uuid) -> PathBuf {
@@ -272,7 +274,7 @@ fn read_all_records(app_working_dir: &Path) -> Vec<JobRecord> {
             records.push(record);
         }
     }
-    records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
     records
 }
 
@@ -317,7 +319,10 @@ pub fn jobs_snapshot(app_working_dir: &Path) -> Vec<JobStatusSummary> {
             profile: record.profile.clone(),
             model: record.model.clone(),
             age_secs: age_of(&record, now).as_secs(),
-            updated_secs_ago: (now - record.updated_at).to_std().unwrap_or_default().as_secs(),
+            updated_secs_ago: (now - record.updated_at)
+                .to_std()
+                .unwrap_or_default()
+                .as_secs(),
             resumable: resumable_job(&record, &record.prompt_sha256, now),
             last_error_code: record.last_error_code.clone(),
         })
@@ -364,7 +369,9 @@ mod tests {
         assert!(!valid_conversation_path("/settings"));
         assert!(!valid_conversation_path("/c/../../etc/passwd"));
         assert!(!valid_conversation_path("/c/id with spaces"));
-        assert!(!valid_conversation_path("https://chatgpt.com/c/0123456789abcdef"));
+        assert!(!valid_conversation_path(
+            "https://chatgpt.com/c/0123456789abcdef"
+        ));
     }
 
     #[test]

@@ -3304,6 +3304,32 @@ export async function getChatgptUiProfilePool(): Promise<ChatgptUiProfilePoolRes
   );
 }
 
+// Privacy-reduced durable job record: states, counters, and allowlisted error
+// codes only. Conversation routes and prompt fingerprints are never returned.
+export interface ChatgptUiDurabilityJob {
+  mission_id: string;
+  state: "submitted" | "completed" | "abandoned";
+  attempts: number;
+  profile: string;
+  model?: string | null;
+  age_secs: number;
+  updated_secs_ago: number;
+  resumable: boolean;
+  last_error_code?: string | null;
+}
+
+export interface ChatgptUiDurabilityResponse {
+  jobs: ChatgptUiDurabilityJob[];
+}
+
+// Get ChatGPT UI durable job ledger health
+export async function getChatgptUiDurability(): Promise<ChatgptUiDurabilityResponse> {
+  return apiGet(
+    "/api/backends/chatgpt_ui/durability",
+    "Failed to get ChatGPT UI durability status",
+  );
+}
+
 // Update backend configuration
 export async function updateBackendConfig(
   backendId: string,

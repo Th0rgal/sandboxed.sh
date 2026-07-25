@@ -573,7 +573,7 @@ async fn drive_once(
     command
         .arg(&settings.driver_path)
         .arg("--profile-dir")
-        .arg(&profile_dir)
+        .arg(profile_dir)
         .arg("--browser")
         .arg(&settings.browser)
         .arg("--headless")
@@ -609,7 +609,7 @@ async fn drive_once(
         // Claim ownership only after the driver was successfully spawned. A
         // pre-spawn marker could authorize a later run to remove singleton
         // state that this pool never created.
-        chromium_cleanup::claim_singleton_ownership(&profile_dir);
+        chromium_cleanup::claim_singleton_ownership(profile_dir);
     }
     #[cfg(unix)]
     let process_group = child.id().map(|pid| -(pid as i32));
@@ -924,9 +924,9 @@ async fn drive_once(
         // Best effort: freshly killed descendants may briefly linger as
         // zombies, in which case the ownership marker defers this sweep to
         // the next lease's pre-launch cleanup.
-        let outcome = chromium_cleanup::cleanup_profile_singletons(&profile_dir, true);
+        let outcome = chromium_cleanup::cleanup_profile_singletons(profile_dir, true);
         if outcome.profile_is_launchable() {
-            chromium_cleanup::release_singleton_ownership(&profile_dir);
+            chromium_cleanup::release_singleton_ownership(profile_dir);
         }
         tracing::debug!(
             mission_id = %mission_id,
@@ -1087,6 +1087,52 @@ mod tests {
             None
         );
         assert_eq!(safe_driver_diagnostic("prompt=private text"), None);
+    }
+
+    #[test]
+    fn parses_submitted_event_with_opaque_conversation_pointer() {
+        let event: DriverEvent =
+            serde_json::from_str(r#"{"type":"submitted","conversation_path":"/c/abc123def456"}"#)
+                .unwrap();
+        match event {
+            DriverEvent::Submitted { conversation_path } => {
+                assert_eq!(conversation_path, "/c/abc123def456");
+            }
+            other => panic!("expected submitted event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn durability_diagnostics_are_allowlisted_and_freeform_variants_are_not() {
+        assert_eq!(
+            safe_driver_diagnostic("stage=resume_route"),
+            Some("stage=resume_route")
+        );
+        assert_eq!(
+            safe_driver_diagnostic("stage=resume_verified"),
+            Some("stage=resume_verified")
+        );
+        assert_eq!(
+            safe_driver_diagnostic("stage=conversation_ref_unavailable"),
+            Some("stage=conversation_ref_unavailable")
+        );
+        // Anything carrying extra payload must be dropped, even with a known
+        // stage prefix — conversation ids and prompt text must never land in
+        // server logs via diagnostics.
+        assert_eq!(safe_driver_diagnostic("stage=resume_route /c/abc123"), None);
+        assert_eq!(
+            safe_driver_diagnostic("stage=resume_verified message=hello"),
+            None
+        );
+    }
+
+    #[test]
+    fn profile_basename_uses_directory_name_only() {
+        assert_eq!(
+            profile_basename(Path::new("/var/lib/chatgpt/profiles/slot-a")),
+            "slot-a"
+        );
+        assert_eq!(profile_basename(Path::new("/")), "profile");
     }
 
     #[test]
