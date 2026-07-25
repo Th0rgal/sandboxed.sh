@@ -69,6 +69,14 @@ class PolicyLintMutationTest(unittest.TestCase):
         )
         self.assert_error("retry.auth_failure.max_automatic_retries")
 
+    def test_global_browser_launch_must_not_quarantine_a_profile(self):
+        self.mutate_policy(
+            lambda p: p["retry"]["browser_launch"].__setitem__(
+                "quarantine_selected_profile", True
+            )
+        )
+        self.assert_error("retry.browser_launch.quarantine_selected_profile")
+
     def test_compatibility_retry_is_exactly_once(self):
         self.mutate_policy(
             lambda p: p["retry"]["compatibility_failure"].__setitem__(
@@ -88,6 +96,20 @@ class PolicyLintMutationTest(unittest.TestCase):
     def test_capacity_must_stay_live(self):
         self.mutate_policy(lambda p: p["capacity"].__setitem__("static_limit", 6))
         self.assert_error("capacity.static_limit")
+
+    def test_acquire_strategy_must_match_health_aware_pool(self):
+        self.mutate_policy(
+            lambda p: p["capacity"].__setitem__("acquire_strategy", "first_free_slot")
+        )
+        self.assert_error("capacity.acquire_strategy")
+
+    def test_source_of_truth_paths_are_pinned(self):
+        self.mutate_policy(
+            lambda p: p["source_of_truth"].__setitem__(
+                "runtime", "src/api/runners/chatgpt_ui.rs"
+            )
+        )
+        self.assert_error("source_of_truth.runtime")
 
     def test_writers_must_not_be_concurrent(self):
         self.mutate_policy(

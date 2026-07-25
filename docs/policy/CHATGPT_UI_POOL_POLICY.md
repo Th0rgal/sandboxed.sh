@@ -7,8 +7,9 @@ for the `chatgpt_ui` backend pool. The machine-readable form lives beside it in
 [`chatgpt_ui_pool_policy.json`](chatgpt_ui_pool_policy.json), validated against
 [`chatgpt_ui_pool_policy.schema.json`](chatgpt_ui_pool_policy.schema.json) by
 `scripts/policy_lint.py` in CI. The linter also cross-checks the numeric limits
-below against the runtime source (`src/api/runners/chatgpt_ui.rs`), so this
-policy cannot silently drift from live behavior.
+below against the runtime source (`src/api/runners/chatgpt_ui/mod.rs`) and
+pins every source-of-truth path, so this policy cannot silently drift from live
+behavior.
 
 Operator setup and diagnostics live in
 [`../CHATGPT_UI_HARNESS.md`](../CHATGPT_UI_HARNESS.md). Hermes-facing operating
@@ -22,9 +23,12 @@ entries (deduplicated, canonicalized). There is no static capacity constant in
 policy or code, and none may be introduced in prose: schedulers and assistants
 must read the live configuration rather than assuming a fixed slot count.
 Each slot is one dedicated browser profile guarded by a cross-process
-exclusive file lock; acquisition takes the first free slot in configured order.
-If every slot is locked, the correct behavior is to wait or fail fast — never
-to reuse a locked profile or submit a duplicate mission against the same slot.
+exclusive file lock. Acquisition prefers the first available slot with no
+recorded failure, preserving configured order among equivalent candidates.
+A compatibility-failed slot remains usable, but a clean alternative wins the
+next lease. Locked, quarantined, and unavailable slots are never reused; when
+none is healthy and available, the runtime waits until a slot recovers or the
+mission is cancelled.
 
 ## 2. Read-only Pro lanes: concurrent, disjoint
 
@@ -45,6 +49,11 @@ UI contract broke for that profile, an immediate identical attempt just burns
 allowance. If the retry also fails, escalate to the operator; the driver
 contract likely needs updating.
 
+The runtime preference for a clean alternative supports this policy but does
+not authorize a retry by itself. The controller must confirm from live pool
+telemetry that a different healthy slot is available before submitting the
+single retry.
+
 ## 4. Auth failures: never blind-retry
 
 `auth_required` is terminal until an operator re-provisions login
@@ -59,6 +68,11 @@ selected for compatibility retries until re-provisioned.
 allowance to recover; sandboxed.sh cannot read or predict subscription quota.
 Moving the same request to another slot on the same account does not help and
 is not permitted as an automatic response.
+
+An undifferentiated `browser_launch` error is a host-level transport failure:
+it may mean Playwright or Chromium is unavailable globally, so it must not
+quarantine the selected profile. Only a proven profile-local Chromium
+singleton conflict is recorded as a slot-local launch failure.
 
 ## 6. Writers: never concurrent
 

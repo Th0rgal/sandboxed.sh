@@ -41,7 +41,7 @@
         "source": { "const": "profile_dirs" },
         "static_limit": { "type": "null" },
         "slot_exclusivity": { "const": "cross_process_file_lock" },
-        "acquire_strategy": { "const": "first_free_slot" }
+        "acquire_strategy": { "const": "first_healthy_available" }
       }
     },
     "lanes": {
@@ -66,7 +66,7 @@
     "retry": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["compatibility_failure", "auth_failure", "rate_limited"],
+      "required": ["compatibility_failure", "auth_failure", "rate_limited", "browser_launch"],
       "properties": {
         "compatibility_failure": {
           "type": "object",
@@ -97,6 +97,15 @@
             "signal": { "const": "rate_limited" },
             "max_automatic_retries": { "const": 0 },
             "wait_for_allowance_recovery": { "const": true }
+          }
+        },
+        "browser_launch": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["signal", "quarantine_selected_profile"],
+          "properties": {
+            "signal": { "const": "browser_launch" },
+            "quarantine_selected_profile": { "const": false }
           }
         }
       }

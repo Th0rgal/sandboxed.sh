@@ -154,19 +154,26 @@ this section must stay in sync with it.
 - **Live capacity.** Pool capacity is the number of configured
   `chatgpt_ui` profile slots (`profile_dirs`), each guarded by an exclusive
   cross-process lock. Read the live configuration; never assume a fixed slot
-  count, and never queue a duplicate mission against a locked slot.
+  count, and never queue a duplicate mission against a locked slot. The pool
+  prefers clean profiles and waits when every slot is locked, quarantined, or
+  unavailable; it never fails open onto an unhealthy profile.
 - **Read-only Pro lanes.** Concurrent `gpt-5.6-pro` consultations are fine
   **only** with `writer: false` and **only** on disjoint slots (distinct
   profiles). A `chatgpt_ui` mission never writes repositories or owns a PR.
 - **Compatibility failure → retry once, elsewhere.** On a
   `compatibility=chatgpt-ui-v2` failure, retry at most once, on a *different*
   healthy slot (unlocked, no auth/rate-limit signals). Never the same slot;
-  if the retry fails too, escalate to the operator.
+  confirm that alternate slot from live pool telemetry before retrying. If the
+  retry fails too, escalate to the operator.
 - **Auth failure → never blind-retry.** `auth_required` is terminal until an
   operator re-provisions login in that profile. Zero automatic retries, and
   treat the slot as unhealthy until re-provisioned.
 - **Rate limited → wait.** Zero automatic retries; allowance must recover.
   Do not shuffle the request across slots of the same account.
+- **Global browser launch failure → preserve the pool.** A generic
+  `browser_launch` failure can be a host-wide Chromium/Playwright problem and
+  does not make the selected profile unhealthy. Only a proven profile-local
+  Chromium singleton conflict quarantines that slot.
 - **Never concurrent writers.** At most one writer mission per workspace.
   Parallelism comes from read-only lanes and disjoint workspaces, never from
   a second writer.

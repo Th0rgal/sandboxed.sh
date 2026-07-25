@@ -21,7 +21,7 @@ POLICY_JSON = Path("docs/policy/chatgpt_ui_pool_policy.json")
 POLICY_SCHEMA = Path("docs/policy/chatgpt_ui_pool_policy.schema.json")
 POLICY_DOC = Path("docs/policy/CHATGPT_UI_POOL_POLICY.md")
 HARNESS_DOC = Path("docs/CHATGPT_UI_HARNESS.md")
-RUNTIME_SOURCE = Path("src/api/runners/chatgpt_ui.rs")
+RUNTIME_SOURCE = Path("src/api/runners/chatgpt_ui/mod.rs")
 DRIVER_SOURCE = Path("scripts/chatgpt_ui_driver.py")
 SKILL_DOC = Path("skills/hermes-mission-control/SKILL.md")
 
@@ -72,8 +72,14 @@ def check_invariants(policy, errors):
     """Non-negotiable pool rules, pinned in code so the schema alone
     cannot be loosened to weaken them."""
     rules = [
+        ("source_of_truth.runtime", str(RUNTIME_SOURCE)),
+        ("source_of_truth.driver", str(DRIVER_SOURCE)),
+        ("source_of_truth.operator_doc", str(HARNESS_DOC)),
+        ("source_of_truth.policy_doc", str(POLICY_DOC)),
+        ("source_of_truth.skill", str(SKILL_DOC)),
         ("capacity.source", "profile_dirs"),
         ("capacity.static_limit", None),
+        ("capacity.acquire_strategy", "first_healthy_available"),
         ("lanes.read_only_pro.allowed", True),
         ("lanes.read_only_pro.writer", False),
         ("lanes.read_only_pro.concurrent", True),
@@ -84,6 +90,8 @@ def check_invariants(policy, errors):
         ("retry.auth_failure.max_automatic_retries", 0),
         ("retry.auth_failure.operator_action_required", True),
         ("retry.rate_limited.max_automatic_retries", 0),
+        ("retry.browser_launch.signal", "browser_launch"),
+        ("retry.browser_launch.quarantine_selected_profile", False),
         ("writers.max_concurrent_per_workspace", 1),
         ("writers.chatgpt_ui_may_write", False),
         ("lean.independent_validation_required", True),

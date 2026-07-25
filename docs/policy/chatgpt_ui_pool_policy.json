@@ -2,7 +2,7 @@
   "policy": "chatgpt-ui-pool",
   "version": "1.0.0",
   "source_of_truth": {
-    "runtime": "src/api/runners/chatgpt_ui.rs",
+    "runtime": "src/api/runners/chatgpt_ui/mod.rs",
     "driver": "scripts/chatgpt_ui_driver.py",
     "operator_doc": "docs/CHATGPT_UI_HARNESS.md",
     "policy_doc": "docs/policy/CHATGPT_UI_POOL_POLICY.md",
@@ -12,7 +12,7 @@
     "source": "profile_dirs",
     "static_limit": null,
     "slot_exclusivity": "cross_process_file_lock",
-    "acquire_strategy": "first_free_slot"
+    "acquire_strategy": "first_healthy_available"
   },
   "lanes": {
     "read_only_pro": {
@@ -39,6 +39,10 @@
       "signal": "rate_limited",
       "max_automatic_retries": 0,
       "wait_for_allowance_recovery": true
+    },
+    "browser_launch": {
+      "signal": "browser_launch",
+      "quarantine_selected_profile": false
     }
   },
   "writers": {
