@@ -127,6 +127,18 @@ class PolicyLintMutationTest(unittest.TestCase):
         )
         self.assert_error("writers.max_concurrent_per_workspace")
 
+    def test_boolean_const_rejects_integer_zero(self):
+        self.mutate_policy(
+            lambda p: p["writers"].__setitem__("chatgpt_ui_may_write", 0)
+        )
+        self.assert_error("expected const False, got 0")
+
+    def test_integer_invariant_rejects_boolean_true(self):
+        self.mutate_policy(
+            lambda p: p["writers"].__setitem__("max_concurrent_per_workspace", True)
+        )
+        self.assert_error("expected 1, got True")
+
     def test_pro_lane_must_be_read_only(self):
         self.mutate_policy(
             lambda p: p["lanes"]["read_only_pro"].__setitem__("writer", True)
@@ -173,15 +185,15 @@ class PolicyLintMutationTest(unittest.TestCase):
         )
         self.assert_error("retry.compatibility_failure.signal")
 
-    def test_stale_harness_doc_clamp_is_caught(self):
+    def test_stale_harness_doc_timeout_range_is_caught(self):
         doc = self.root / HARNESS_DOC
         doc.write_text(
             doc.read_text(encoding="utf-8").replace(
-                "clamped to 30–86400 seconds", "clamped to 30–7200 seconds"
+                "must be between 30–86400 seconds", "must be between 30–7200 seconds"
             ),
             encoding="utf-8",
         )
-        self.assert_error("states clamp 30-7200")
+        self.assert_error("states accepted range 30-7200")
 
     def test_policy_doc_version_must_match(self):
         doc = self.root / POLICY_DOC

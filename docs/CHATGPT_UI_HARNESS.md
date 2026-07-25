@@ -82,9 +82,9 @@ schemes are `http`, `https`, `socks5`, and `socks5h`; URLs containing embedded
 credentials are rejected.
 When anti-bot checks reject headless Chromium, set `headless` to `false` and
 configure `display` with a dedicated Xvfb display such as `:93`.
-Timeouts are clamped to 30–86400 seconds. A cross-process profile lock rejects
-concurrent use; configure a distinct dedicated profile for each concurrent
-mission.
+Timeouts must be between 30–86400 seconds; values outside that accepted range
+are rejected before launch. A cross-process profile lock rejects concurrent use;
+configure a distinct dedicated profile for each concurrent mission.
 
 ## Model selection
 

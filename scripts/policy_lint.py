@@ -35,10 +35,15 @@ JSON_TYPES = {
 }
 
 
+def json_values_equal(actual, expected):
+    """Compare JSON values without Python's bool/int equality coercion."""
+    return type(actual) is type(expected) and actual == expected
+
+
 def validate_schema(instance, schema, path, errors):
     """Validate the JSON Schema subset used by the policy schema."""
     if "const" in schema:
-        if instance != schema["const"]:
+        if not json_values_equal(instance, schema["const"]):
             errors.append(f"{path}: expected const {schema['const']!r}, got {instance!r}")
         return
     expected = schema.get("type")
@@ -110,7 +115,7 @@ def check_invariants(policy, errors):
                 break
             node = node[part]
         else:
-            if node != expected:
+            if not json_values_equal(node, expected):
                 errors.append(f"invariant {dotted}: expected {expected!r}, got {node!r}")
 
 
@@ -205,14 +210,14 @@ def check_driver_signal(repo_root, policy, errors):
 def check_harness_doc(repo_root, policy, errors):
     doc = (repo_root / HARNESS_DOC).read_text(encoding="utf-8")
     timeout = policy.get("runtime_limits", {}).get("timeout_secs", {})
-    match = re.search(r"clamped to ([0-9]+)[–-]([0-9]+) seconds", doc)
+    match = re.search(r"must be between ([0-9]+)[–-]([0-9]+) seconds", doc)
     if not match:
-        errors.append(f"{HARNESS_DOC}: cannot locate timeout clamp statement")
+        errors.append(f"{HARNESS_DOC}: cannot locate timeout validation statement")
     else:
         low, high = int(match.group(1)), int(match.group(2))
         if (timeout.get("min"), timeout.get("max")) != (low, high):
             errors.append(
-                f"{HARNESS_DOC}: states clamp {low}-{high}, policy says "
+                f"{HARNESS_DOC}: states accepted range {low}-{high}, policy says "
                 f"{timeout.get('min')}-{timeout.get('max')}"
             )
 
