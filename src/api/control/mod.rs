@@ -5831,18 +5831,8 @@ fn normalize_model_override_for_backend(backend: Option<&str>, raw_model: &str) 
             if backend == Some("codex") && model_id == "gpt-5.6" {
                 return Some("gpt-5.6-sol".to_string());
             }
-            if backend == Some("claudecode") {
-                return Some(crate::library::normalize_claude_code_default_model(Some(
-                    model_id.to_string(),
-                )));
-            }
             return Some(model_id.to_string());
         }
-    }
-    if backend == Some("claudecode") {
-        return Some(crate::library::normalize_claude_code_default_model(Some(
-            trimmed.to_string(),
-        )));
     }
     Some(trimmed.to_string())
 }
@@ -19341,11 +19331,7 @@ async fn run_single_control_turn(
     let requested_model = model_override;
     let requested_model_effort = model_effort;
     if let Some(ref model) = requested_model {
-        config.default_model = Some(if is_claudecode {
-            crate::library::normalize_claude_code_default_model(Some(model.clone()))
-        } else {
-            model.clone()
-        });
+        config.default_model = Some(model.clone());
     } else if is_claudecode && config.default_model.is_some() {
         config.default_model = config
             .default_model
@@ -26567,7 +26553,7 @@ And the report:
         );
         assert_eq!(
             normalize_model_override_for_backend(Some("claudecode"), "anthropic/claude-opus-4-8"),
-            Some("claude-opus-5".to_string())
+            Some("claude-opus-4-8".to_string())
         );
         assert_eq!(
             normalize_model_override_for_backend(Some("codex"), "   "),

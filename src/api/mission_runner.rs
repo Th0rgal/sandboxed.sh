@@ -3474,11 +3474,7 @@ async fn run_mission_turn(
         config.opencode_agent = Some(agent.clone());
     }
     if let Some(ref model) = model_override {
-        config.default_model = Some(if backend_id == "claudecode" {
-            crate::library::normalize_claude_code_default_model(Some(model.clone()))
-        } else {
-            model.clone()
-        });
+        config.default_model = Some(model.clone());
     } else if backend_id == "claudecode" {
         config.default_model = config
             .default_model
