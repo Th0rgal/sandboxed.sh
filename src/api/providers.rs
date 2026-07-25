@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,23 @@ static CODEX_MODEL_PROBE_CACHE: OnceLock<RwLock<HashMap<String, CodexProbeCacheE
 
 const CODEX_MODEL_PROBE_TTL: Duration = Duration::from_secs(10 * 60);
 
+#[derive(Debug, Clone)]
+struct KimiModelCacheEntry {
+    models: Vec<ProviderModel>,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct KimiModelCache {
+    entries: HashMap<u64, KimiModelCacheEntry>,
+    generations: HashMap<u64, u64>,
+}
+
+static KIMI_MODEL_CACHE: OnceLock<RwLock<KimiModelCache>> = OnceLock::new();
+static KIMI_CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
+const KIMI_MODEL_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const RETIRED_KIMI_MODEL_IDS: &[&str] = &["kimi-k2.6", "kimi-k2-thinking"];
+
 /// Provider IDs that are part of the default catalog and should not be duplicated
 /// from the AIProviderStore.
 pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
@@ -46,6 +64,7 @@ pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
     "cerebras",
     "zai",
     "minimax",
+    "kimi",
 ];
 
 /// Upper bound on models merged for a single provider from live `/v1/models`
@@ -171,6 +190,35 @@ pub struct ProviderModel {
     pub description: Option<String>,
 }
 
+/// Models documented for Kimi Code and returned by its coding `/v1/models`
+/// endpoint as of July 2026. These are only a resilient startup fallback:
+/// connected accounts are refreshed from the live endpoint, so future Kimi
+/// models become selectable without a Sandboxed.sh release.
+pub(crate) fn kimi_fallback_models() -> Vec<ProviderModel> {
+    vec![
+        ProviderModel {
+            id: "kimi-for-coding".to_string(),
+            name: "K2.7 Coding".to_string(),
+            description: Some("Stable Kimi K2.7 coding alias".to_string()),
+        },
+        ProviderModel {
+            id: "kimi-for-coding-highspeed".to_string(),
+            name: "K2.7 Coding Highspeed".to_string(),
+            description: Some("High-speed Kimi K2.7 coding alias".to_string()),
+        },
+        ProviderModel {
+            id: "k3".to_string(),
+            name: "K3".to_string(),
+            description: Some("Kimi K3 with up to a 1M-token context window".to_string()),
+        },
+        ProviderModel {
+            id: "k3-256k".to_string(),
+            name: "K3-256K".to_string(),
+            description: Some("Kimi K3 with a 256K-token context window".to_string()),
+        },
+    ]
+}
+
 /// A provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
@@ -255,7 +303,7 @@ pub(crate) async fn catalog_model_options_for_state(
     let working_dir = state.config.working_dir.to_string_lossy().to_string();
     let mut config = load_providers_config(&working_dir);
 
-    let cached = state.model_catalog.read().await;
+    let cached = state.model_catalog.read().await.clone();
     merge_cached_provider_models(&mut config, &cached, include_unverified);
 
     let mut configured = get_configured_provider_ids(state.config.working_dir.as_path());
@@ -282,7 +330,7 @@ pub(crate) async fn catalog_model_options_for_state(
         config.providers
     };
     merge_store_provider_models(&mut providers, &store_providers, !configured_only);
-    apply_live_custom_provider_models(
+    apply_live_authoritative_provider_models(
         &mut providers,
         &store_providers,
         &cached,
@@ -374,6 +422,14 @@ fn merge_default_provider_models(config: &mut ProvidersConfig) {
             .iter_mut()
             .find(|provider| provider.id == default_provider.id)
         {
+            // Old generated/provider configuration survives binary upgrades.
+            // Do not let Kimi's retired hardcoded entries remain selectable
+            // forever merely because defaults use additive merge semantics.
+            if existing.id == "kimi" {
+                existing
+                    .models
+                    .retain(|model| !RETIRED_KIMI_MODEL_IDS.contains(&model.id.as_str()));
+            }
             merge_provider_models(&mut existing.models, default_provider.models);
             continue;
         }
@@ -1132,27 +1188,7 @@ fn default_providers_config() -> ProvidersConfig {
                 name: "Kimi (Subscription)".to_string(),
                 billing: "subscription".to_string(),
                 description: "Kimi Code via Moonshot OAuth (device login)".to_string(),
-                models: vec![
-                    ProviderModel {
-                        id: "kimi-for-coding".to_string(),
-                        name: "Kimi for Coding".to_string(),
-                        description: Some(
-                            "Stable coding alias that tracks the latest Kimi coding model \
-                             (recommended)"
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "kimi-k2.6".to_string(),
-                        name: "Kimi K2.6".to_string(),
-                        description: Some("Latest Kimi K2 model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "kimi-k2-thinking".to_string(),
-                        name: "Kimi K2 Thinking".to_string(),
-                        description: Some("Extended-reasoning Kimi K2 variant".to_string()),
-                    },
-                ],
+                models: kimi_fallback_models(),
             },
         ],
     }
@@ -1212,6 +1248,25 @@ pub async fn fetch_openai_compatible_models(
     models_query: Option<&str>,
     sort_results_by_id: bool,
 ) -> Result<Vec<ProviderModel>, String> {
+    fetch_openai_compatible_models_with_headers(
+        base_url,
+        api_key,
+        prefix_filters,
+        models_query,
+        sort_results_by_id,
+        &[],
+    )
+    .await
+}
+
+async fn fetch_openai_compatible_models_with_headers(
+    base_url: &str,
+    api_key: &str,
+    prefix_filters: &[&str],
+    models_query: Option<&str>,
+    sort_results_by_id: bool,
+    extra_headers: &[(&str, &str)],
+) -> Result<Vec<ProviderModel>, String> {
     let client = reqwest::Client::new();
     let base = base_url.trim_end_matches('/');
     let url = match models_query.filter(|query| !query.is_empty()) {
@@ -1219,10 +1274,14 @@ pub async fn fetch_openai_compatible_models(
         None => format!("{base}/models"),
     };
 
-    let resp = client
+    let mut request = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", api_key))
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10));
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+    let resp = request
         .send()
         .await
         .map_err(|e| format!("HTTP request failed: {}", e))?;
@@ -1236,6 +1295,14 @@ pub async fn fetch_openai_compatible_models(
         .await
         .map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
+    parse_openai_compatible_models(body, prefix_filters, sort_results_by_id)
+}
+
+fn parse_openai_compatible_models(
+    body: serde_json::Value,
+    prefix_filters: &[&str],
+    sort_results_by_id: bool,
+) -> Result<Vec<ProviderModel>, String> {
     let data = body
         .get("data")
         .and_then(|d| d.as_array())
@@ -1274,6 +1341,248 @@ pub async fn fetch_openai_compatible_models(
         models.sort_by(|a, b| a.id.cmp(&b.id));
     }
     Ok(models)
+}
+
+fn kimi_model_cache() -> &'static RwLock<KimiModelCache> {
+    KIMI_MODEL_CACHE.get_or_init(|| RwLock::new(KimiModelCache::default()))
+}
+
+fn kimi_route_fingerprint(
+    provider: &crate::ai_providers::AIProvider,
+) -> Result<(u64, &str, &str), String> {
+    if provider.provider_type != ProviderType::Kimi {
+        return Err("Cannot fetch Kimi models for a non-Kimi provider".to_string());
+    }
+    let access_token = provider
+        .oauth
+        .as_ref()
+        .map(|oauth| oauth.access_token.trim())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| "Kimi OAuth access token is missing".to_string())?;
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or(crate::api::ai_providers::KIMI_API_BASE_URL);
+    Ok((
+        hash_u64(&format!("{}\0{base_url}", provider.id)),
+        base_url,
+        access_token,
+    ))
+}
+
+/// Return the last account-specific Kimi catalog without performing I/O.
+///
+/// Workspace preparation is latency-sensitive and must not wait on a provider
+/// outage. The background model-catalog refresher owns live discovery; callers
+/// on the workspace path use this snapshot or fall back immediately.
+pub(crate) async fn cached_kimi_models(
+    provider: &crate::ai_providers::AIProvider,
+) -> Option<Vec<ProviderModel>> {
+    let (route_fingerprint, _, _) = kimi_route_fingerprint(provider).ok()?;
+    kimi_model_cache()
+        .read()
+        .await
+        .entries
+        .get(&route_fingerprint)
+        .map(|entry| entry.models.clone())
+}
+
+/// Drop the cached catalog before replacing a Kimi provider's credentials.
+///
+/// Reconnect keeps the local provider UUID but may select a different upstream
+/// account with different model entitlements.
+pub(crate) async fn invalidate_kimi_model_cache(provider: &crate::ai_providers::AIProvider) {
+    if let Ok((route_fingerprint, _, _)) = kimi_route_fingerprint(provider) {
+        let mut cache = kimi_model_cache().write().await;
+        cache.entries.remove(&route_fingerprint);
+        let generation = cache.generations.entry(route_fingerprint).or_default();
+        *generation = generation.wrapping_add(1);
+    }
+}
+
+pub(crate) fn advance_kimi_catalog_generation() {
+    KIMI_CATALOG_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+fn kimi_catalog_generation() -> u64 {
+    KIMI_CATALOG_GENERATION.load(Ordering::Acquire)
+}
+
+/// Re-populate Kimi's shared catalog after a reconnect without blocking the
+/// OAuth callback. The caller removes the old entry before spawning this task.
+pub(crate) async fn refresh_connected_kimi_catalog(catalog: ModelCatalog, provider: AIProvider) {
+    let catalog_generation = kimi_catalog_generation();
+    match fetch_kimi_models(&provider).await {
+        Ok(models) => {
+            let checked_at = chrono::Utc::now();
+            let entries = models
+                .into_iter()
+                .map(|model| {
+                    CatalogEntry::from_provider_model(
+                        "kimi",
+                        model,
+                        CatalogSource::ProviderApi,
+                        CatalogAvailability::Available,
+                        checked_at,
+                    )
+                })
+                .collect();
+            let cache = kimi_model_cache().read().await;
+            if kimi_catalog_generation() != catalog_generation {
+                tracing::debug!(
+                    provider_id = %provider.id,
+                    "Discarded Kimi catalog from an obsolete preference generation"
+                );
+                return;
+            }
+            // Keep the generation read-lock until the catalog write commits.
+            // Preference reconciliation advances cache generations before it
+            // takes the catalog write-lock, so the final state cannot be an
+            // obsolete account snapshot.
+            catalog.write().await.insert("kimi".to_string(), entries);
+            drop(cache);
+        }
+        Err(error) => {
+            tracing::warn!(
+                provider_id = %provider.id,
+                error = %error,
+                "Failed to refresh Kimi catalog after account reconnect"
+            );
+        }
+    }
+}
+
+pub(crate) fn preferred_usable_kimi_provider(providers: &[AIProvider]) -> Option<AIProvider> {
+    providers
+        .iter()
+        .filter(|provider| {
+            provider.provider_type == ProviderType::Kimi
+                && provider.enabled
+                && provider.oauth.as_ref().is_some_and(|oauth| {
+                    !oauth.access_token.trim().is_empty() && !oauth.refresh_token.trim().is_empty()
+                })
+        })
+        .min_by_key(|provider| (provider.priority, provider.id))
+        .cloned()
+}
+
+/// Discover the models available to a connected Kimi Code account.
+///
+/// Kimi is an OpenAI-compatible provider but requires its coding-agent
+/// User-Agent on catalog requests. Cache successful responses briefly so
+/// preparing many mission workspaces does not hit the subscription endpoint
+/// once per mission. The cache key includes the stable provider identity and
+/// route, so normal OAuth token rotation does not hide a catalog that is still
+/// valid for that account.
+pub(crate) async fn fetch_kimi_models(
+    provider: &crate::ai_providers::AIProvider,
+) -> Result<Vec<ProviderModel>, String> {
+    let (route_fingerprint, base_url, access_token) = kimi_route_fingerprint(provider)?;
+
+    let (stale_models, probe_generation) = {
+        let cache = kimi_model_cache().read().await;
+        if let Some(entry) = cache.entries.get(&route_fingerprint) {
+            if entry.expires_at > Instant::now() {
+                return Ok(entry.models.clone());
+            }
+            (
+                Some(entry.models.clone()),
+                cache
+                    .generations
+                    .get(&route_fingerprint)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+        } else {
+            (
+                None,
+                cache
+                    .generations
+                    .get(&route_fingerprint)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+        }
+    };
+
+    let discovered = fetch_openai_compatible_models_with_headers(
+        base_url,
+        access_token,
+        &[],
+        None,
+        true,
+        &[("User-Agent", crate::api::ai_providers::KIMI_USER_AGENT)],
+    )
+    .await;
+    let models = match discovered {
+        Ok(models) if !models.is_empty() => models,
+        Ok(_) => {
+            if let Some(models) = stale_models {
+                tracing::warn!("Kimi model catalog was empty; reusing stale catalog");
+                store_kimi_models_if_current(
+                    route_fingerprint,
+                    probe_generation,
+                    models.clone(),
+                    Duration::from_secs(60),
+                )
+                .await?;
+                return Ok(models);
+            }
+            return Err("Kimi model catalog was empty".to_string());
+        }
+        Err(error) => {
+            if let Some(models) = stale_models {
+                tracing::warn!(
+                    error = %error,
+                    "Kimi model discovery failed; reusing stale catalog"
+                );
+                store_kimi_models_if_current(
+                    route_fingerprint,
+                    probe_generation,
+                    models.clone(),
+                    Duration::from_secs(60),
+                )
+                .await?;
+                return Ok(models);
+            }
+            return Err(error);
+        }
+    };
+
+    store_kimi_models_if_current(
+        route_fingerprint,
+        probe_generation,
+        models.clone(),
+        KIMI_MODEL_CACHE_TTL,
+    )
+    .await?;
+    Ok(models)
+}
+
+async fn store_kimi_models_if_current(
+    route_fingerprint: u64,
+    probe_generation: u64,
+    models: Vec<ProviderModel>,
+    ttl: Duration,
+) -> Result<(), String> {
+    let mut cache = kimi_model_cache().write().await;
+    let current_generation = cache
+        .generations
+        .get(&route_fingerprint)
+        .copied()
+        .unwrap_or_default();
+    if current_generation != probe_generation {
+        return Err("Kimi account changed while its model catalog was being fetched".to_string());
+    }
+    cache.entries.insert(
+        route_fingerprint,
+        KimiModelCacheEntry {
+            models,
+            expires_at: Instant::now() + ttl,
+        },
+    );
+    Ok(())
 }
 
 /// Fetch models from the Anthropic /v1/models endpoint.
@@ -1542,10 +1851,18 @@ async fn refresh_catalog_once(
     ai_providers: &AIProviderStore,
     working_dir: &Path,
 ) -> (usize, usize) {
-    let fetched = fetch_model_catalog(ai_providers, working_dir).await;
+    let (mut fetched, fetched_kimi_generation) =
+        fetch_model_catalog(ai_providers, working_dir).await;
+    let mut current = catalog.write().await;
+    if kimi_catalog_generation() != fetched_kimi_generation {
+        fetched.remove("kimi");
+        if let Some(kimi) = current.get("kimi").cloned() {
+            fetched.insert("kimi".to_string(), kimi);
+        }
+    }
     let provider_count = fetched.len();
     let model_count: usize = fetched.values().map(|v| v.len()).sum();
-    *catalog.write().await = fetched;
+    *current = fetched;
     (provider_count, model_count)
 }
 
@@ -1614,10 +1931,27 @@ pub async fn refresh_model_catalog(
     })
 }
 
-pub async fn fetch_model_catalog(
+async fn fetch_model_catalog(
     ai_providers: &AIProviderStore,
     _working_dir: &Path,
-) -> HashMap<String, Vec<CatalogEntry>> {
+) -> (HashMap<String, Vec<CatalogEntry>>, u64) {
+    // Kimi access tokens are short-lived. Refresh a due store credential
+    // synchronously before taking the provider snapshot so the initial catalog
+    // probe cannot race the independent refresh task at startup.
+    let (_, refreshed) = crate::api::ai_providers::refresh_due_store_oauth(
+        ai_providers,
+        ProviderType::Kimi,
+        10 * 60 * 1000,
+    )
+    .await;
+    if refreshed > 0 {
+        tracing::info!(
+            refreshed,
+            "Refreshed Kimi OAuth credentials before model catalog discovery"
+        );
+    }
+
+    let catalog_generation = kimi_catalog_generation();
     let providers_list = ai_providers.list().await;
     let mut result = HashMap::new();
 
@@ -1753,8 +2087,31 @@ pub async fn fetch_model_catalog(
         }
     });
 
+    // Kimi has an OpenAI-compatible catalog but requires its coding User-Agent.
+    // Use the shared, credential-aware cache so startup refresh also primes
+    // mission workspace generation.
+    let kimi_provider = preferred_usable_kimi_provider(&providers_list);
+    let kimi_handle = tokio::spawn(async move {
+        match kimi_provider {
+            Some(provider) => match fetch_kimi_models(&provider).await {
+                Ok(models) => {
+                    tracing::info!("Fetched {} models from Kimi API", models.len());
+                    Some(("kimi".to_string(), models))
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to fetch Kimi models: {}", error);
+                    None
+                }
+            },
+            None => {
+                tracing::debug!("No Kimi OAuth account, skipping model fetch");
+                None
+            }
+        }
+    });
+
     // Fetch OpenAI-compatible providers concurrently
-    let mut handles = vec![anthropic_handle];
+    let mut handles = vec![anthropic_handle, kimi_handle];
     for (target, key) in target_keys {
         let provider_id = target.provider_id.to_string();
         let base_url = target.base_url.to_string();
@@ -1888,7 +2245,7 @@ pub async fn fetch_model_catalog(
         }
     }
 
-    result
+    (result, catalog_generation)
 }
 
 /// Check if a JSON value contains valid auth credentials.
@@ -1986,31 +2343,43 @@ fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String>
 /// and descriptions. Only includes providers that are actually configured
 /// and authenticated. This endpoint is used by the frontend to render
 /// a grouped model selector.
-/// Replace each custom provider's operator-configured `custom_models` with the
-/// live model list fetched from its `/v1/models` (cached in `model_catalog`).
-/// Built-in providers are left untouched — they keep MERGE semantics so a
-/// subscription probe can't hide valid defaults. Custom providers (self-hosted
-/// OpenAI-compatible routers like the dgx-spark-router) instead treat the
-/// router's reported models as the source of truth.
-fn apply_live_custom_provider_models(
+/// Replace authoritative provider catalogs with their live `/v1/models` list.
+///
+/// Custom routers and Kimi return complete model catalogs, so merging would
+/// leave removed/renamed models selectable forever. Other built-in providers
+/// retain additive semantics because some subscription probes expose only a
+/// subset of valid choices.
+fn apply_live_authoritative_provider_models(
     providers: &mut [Provider],
     store_providers: &[crate::ai_providers::AIProvider],
     cached: &HashMap<String, Vec<CatalogEntry>>,
     include_unverified: bool,
 ) {
-    let custom_provider_ids: HashSet<String> = store_providers
+    let mut authoritative_provider_ids: HashSet<String> = store_providers
         .iter()
         .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
         .map(|p| sanitize_custom_provider_id(&p.name))
         .collect();
+    if store_providers
+        .iter()
+        .any(|p| p.provider_type == ProviderType::Kimi && p.enabled)
+    {
+        authoritative_provider_ids.insert("kimi".to_string());
+    }
     for provider in providers.iter_mut() {
-        if !custom_provider_ids.contains(&provider.id) {
+        if !authoritative_provider_ids.contains(&provider.id) {
             continue;
         }
         if let Some(entries) = cached.get(&provider.id) {
             let live: Vec<ProviderModel> = entries
                 .iter()
-                .filter(|e| include_unverified || e.is_selectable_by_default())
+                .filter(|entry| {
+                    if provider.id == "kimi" {
+                        entry.availability == CatalogAvailability::Available
+                    } else {
+                        include_unverified || entry.is_selectable_by_default()
+                    }
+                })
                 .map(CatalogEntry::to_provider_model)
                 .collect();
             if !live.is_empty() {
@@ -2030,7 +2399,7 @@ pub async fn list_providers(
     // Extend hardcoded defaults with the dynamic catalog. Some subscription
     // catalog probes can return only a currently-selected model, so replacing
     // the defaults would hide valid choices such as newly released Claude Opus.
-    let cached = state.model_catalog.read().await;
+    let cached = state.model_catalog.read().await.clone();
     merge_cached_provider_models(&mut config, &cached, query.include_unverified);
 
     // Get the set of configured provider IDs
@@ -2050,7 +2419,7 @@ pub async fn list_providers(
     let store_providers = state.ai_providers.list().await;
     merge_store_provider_models(&mut providers, &store_providers, query.include_all);
 
-    apply_live_custom_provider_models(
+    apply_live_authoritative_provider_models(
         &mut providers,
         &store_providers,
         &cached,
@@ -2095,9 +2464,8 @@ pub async fn list_backend_model_options(
     let mut config = load_providers_config(&working_dir);
 
     // Extend hardcoded defaults with the dynamic catalog.
-    let cached = state.model_catalog.read().await;
+    let cached = state.model_catalog.read().await.clone();
     merge_cached_provider_models(&mut config, &cached, query.include_unverified);
-    drop(cached);
 
     let configured = get_configured_provider_ids(state.config.working_dir.as_path());
     let mut providers = if query.include_all {
@@ -2112,6 +2480,13 @@ pub async fn list_backend_model_options(
 
     let store_providers = state.ai_providers.list().await;
     merge_store_provider_models(&mut providers, &store_providers, query.include_all);
+    apply_live_authoritative_provider_models(
+        &mut providers,
+        &store_providers,
+        &cached,
+        query.include_unverified,
+    );
+    drop(cached);
 
     let mut backends: std::collections::HashMap<String, Vec<BackendModelOption>> =
         std::collections::HashMap::new();
@@ -2244,14 +2619,15 @@ pub async fn validate_model_override(
     let mut config = load_providers_config(&working_dir);
 
     // Extend hardcoded defaults with the dynamic catalog.
-    let cached = state.model_catalog.read().await;
+    let cached = state.model_catalog.read().await.clone();
     merge_cached_provider_models(&mut config, &cached, true);
-    drop(cached);
 
     // Load all providers (including configured and non-default)
     let mut providers = config.providers;
     let store_providers = state.ai_providers.list().await;
     merge_store_provider_models(&mut providers, &store_providers, true);
+    apply_live_authoritative_provider_models(&mut providers, &store_providers, &cached, true);
+    drop(cached);
 
     match backend {
         "opencode" => {
@@ -2458,6 +2834,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn kimi_catalog_skips_a_higher_priority_account_without_oauth() {
+        let mut disconnected = AIProvider::new(ProviderType::Kimi, "Disconnected Kimi".to_string());
+        disconnected.priority = 0;
+
+        let mut connected = AIProvider::new(ProviderType::Kimi, "Connected Kimi".to_string());
+        connected.priority = 10;
+        connected.oauth = Some(crate::ai_providers::OAuthCredentials {
+            access_token: "connected-access".to_string(),
+            refresh_token: "connected-refresh".to_string(),
+            expires_at: i64::MAX,
+        });
+
+        let selected = preferred_usable_kimi_provider(&[disconnected, connected.clone()])
+            .expect("connected Kimi account should remain selectable");
+        assert_eq!(selected.id, connected.id);
+    }
+
+    #[tokio::test]
+    async fn kimi_catalog_rejects_a_result_from_before_reconnect() {
+        let mut provider = AIProvider::new(ProviderType::Kimi, "Kimi".to_string());
+        provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+            access_token: "old-account-access".to_string(),
+            refresh_token: "old-account-refresh".to_string(),
+            expires_at: i64::MAX,
+        });
+        provider.base_url = Some("https://example.invalid".to_string());
+
+        let (route_fingerprint, _, _) = kimi_route_fingerprint(&provider).unwrap();
+        let probe_generation = kimi_model_cache()
+            .read()
+            .await
+            .generations
+            .get(&route_fingerprint)
+            .copied()
+            .unwrap_or_default();
+
+        invalidate_kimi_model_cache(&provider).await;
+        let result = store_kimi_models_if_current(
+            route_fingerprint,
+            probe_generation,
+            vec![ProviderModel {
+                id: "old-account-only".to_string(),
+                name: "Old account only".to_string(),
+                description: None,
+            }],
+            KIMI_MODEL_CACHE_TTL,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(cached_kimi_models(&provider).await.is_none());
+    }
+
+    #[test]
     fn test_model_id_to_display_name() {
         assert_eq!(model_id_to_display_name("glm-5"), "GLM 5");
         assert_eq!(model_id_to_display_name("grok-4-fast"), "Grok 4 Fast");
@@ -2469,6 +2899,109 @@ mod tests {
         // Acronyms <= 3 chars get uppercased
         assert_eq!(model_id_to_display_name("gpt-4"), "GPT 4");
         assert_eq!(model_id_to_display_name("glm-4.6v-flash"), "GLM 4.6v Flash");
+    }
+
+    #[test]
+    fn kimi_fallback_catalog_matches_current_coding_models() {
+        let ids: Vec<String> = kimi_fallback_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "kimi-for-coding",
+                "kimi-for-coding-highspeed",
+                "k3",
+                "k3-256k"
+            ]
+        );
+        assert!(!ids.iter().any(|id| id == "kimi-k2.6"));
+        assert!(!ids.iter().any(|id| id == "kimi-k2-thinking"));
+    }
+
+    #[test]
+    fn provider_config_upgrade_removes_retired_kimi_models() {
+        let mut config = ProvidersConfig {
+            providers: vec![Provider {
+                id: "kimi".to_string(),
+                name: "Kimi".to_string(),
+                billing: "subscription".to_string(),
+                description: "stale config".to_string(),
+                models: vec![
+                    ProviderModel {
+                        id: "kimi-k2.6".to_string(),
+                        name: "Kimi K2.6".to_string(),
+                        description: None,
+                    },
+                    ProviderModel {
+                        id: "operator-model".to_string(),
+                        name: "Operator model".to_string(),
+                        description: None,
+                    },
+                ],
+            }],
+        };
+
+        merge_default_provider_models(&mut config);
+
+        let ids: Vec<&str> = config.providers[0]
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(!ids.contains(&"kimi-k2.6"));
+        assert!(ids.contains(&"operator-model"));
+        assert!(ids.contains(&"k3"));
+    }
+
+    #[test]
+    fn live_kimi_catalog_replaces_fallback_and_removed_models() {
+        let mut providers = default_providers_config().providers;
+        let kimi_account =
+            crate::ai_providers::AIProvider::new(ProviderType::Kimi, "Kimi".to_string());
+        let cached = HashMap::from([(
+            "kimi".to_string(),
+            vec![CatalogEntry::from_provider_model(
+                "kimi",
+                ProviderModel {
+                    id: "k4-future".to_string(),
+                    name: "K4 Future".to_string(),
+                    description: None,
+                },
+                CatalogSource::ProviderApi,
+                CatalogAvailability::Available,
+                chrono::Utc::now(),
+            )],
+        )]);
+
+        apply_live_authoritative_provider_models(&mut providers, &[kimi_account], &cached, true);
+
+        let kimi = providers
+            .iter()
+            .find(|provider| provider.id == "kimi")
+            .unwrap();
+        assert_eq!(kimi.models.len(), 1);
+        assert_eq!(kimi.models[0].id, "k4-future");
+    }
+
+    #[test]
+    fn openai_compatible_catalog_parser_accepts_future_kimi_models() {
+        let models = parse_openai_compatible_models(
+            serde_json::json!({
+                "data": [
+                    {"id": "k3", "display_name": "K3"},
+                    {"id": "k4-future", "display_name": "K4 Future"}
+                ]
+            }),
+            &[],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(models[0].id, "k3");
+        assert_eq!(models[1].id, "k4-future");
+        assert_eq!(models[1].name, "K4 Future");
     }
 
     #[test]

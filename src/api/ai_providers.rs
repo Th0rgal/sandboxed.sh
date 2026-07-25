@@ -8105,6 +8105,8 @@ async fn update_provider(
     }
     .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
 
+    let refresh_kimi_catalog = existing.provider_type == ProviderType::Kimi
+        && (req.priority.is_some() || req.enabled.is_some() || req.base_url.is_some());
     let uuid = existing.id;
     let mut updated = existing.clone();
     if let Some(name) = req.name {
@@ -8170,6 +8172,9 @@ async fn update_provider(
     if pt != ProviderType::Custom {
         sync_store_to_opencode(&state.ai_providers, &state.config.working_dir, pt).await;
     }
+    if refresh_kimi_catalog {
+        reconcile_preferred_kimi_catalog(&state).await;
+    }
 
     if pt == ProviderType::Xai && result.enabled && provider_targets_grok(&result) {
         if let Err(e) = state.backend_configs.set_enabled("grok", true).await {
@@ -8220,6 +8225,11 @@ async fn delete_provider(
 
     let provider_type = provider.provider_type;
     let uuid = provider.id;
+    if provider_type == ProviderType::Kimi {
+        // The row will no longer be addressable after deletion; fence any
+        // in-flight probe and discard its account-specific snapshot first.
+        crate::api::providers::invalidate_kimi_model_cache(&provider).await;
+    }
 
     // Delete from AIProviderStore
     if !state.ai_providers.delete(uuid).await {
@@ -8234,6 +8244,9 @@ async fn delete_provider(
             provider_type,
         )
         .await;
+    }
+    if provider_type == ProviderType::Kimi {
+        reconcile_preferred_kimi_catalog(&state).await;
     }
 
     // Clear default if this was the default
@@ -8259,6 +8272,30 @@ async fn delete_provider(
         StatusCode::OK,
         format!("Provider {} deleted successfully", id),
     ))
+}
+
+/// Reconcile the shared Kimi picker catalog after an operator changes which
+/// stored account is preferred. Workspace config and live discovery must use
+/// the same account; otherwise account-specific future models can be exposed
+/// by the picker but omitted from the mission's generated provider block.
+async fn reconcile_preferred_kimi_catalog(state: &super::routes::AppState) {
+    crate::api::providers::advance_kimi_catalog_generation();
+    let providers = state.ai_providers.get_all_by_type(ProviderType::Kimi).await;
+    // Fence every account because a periodic probe for the previously
+    // preferred row may already be in flight while a different row is being
+    // promoted. Only a probe started after this preference generation may
+    // repopulate the shared catalog.
+    for provider in &providers {
+        crate::api::providers::invalidate_kimi_model_cache(provider).await;
+    }
+    let preferred = crate::api::providers::preferred_usable_kimi_provider(&providers);
+    state.model_catalog.write().await.remove("kimi");
+    if let Some(provider) = preferred {
+        let catalog = Arc::clone(&state.model_catalog);
+        tokio::spawn(async move {
+            crate::api::providers::refresh_connected_kimi_catalog(catalog, provider).await;
+        });
+    }
 }
 
 /// POST /api/ai/providers/:id/auth - Initiate authentication for a provider.
@@ -8440,7 +8477,7 @@ const KIMI_TOKEN_URL: &str = "https://auth.kimi.com/api/oauth/token";
 pub(crate) const KIMI_API_BASE_URL: &str = "https://api.kimi.com/coding/v1";
 /// The coding endpoint returns 403 unless the User-Agent matches a known
 /// coding-agent pattern, so pin it to the Kimi CLI's UA.
-const KIMI_USER_AGENT: &str = "KimiCLI/1.5";
+pub(crate) const KIMI_USER_AGENT: &str = "KimiCLI/1.5";
 const KIMI_DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 #[derive(Clone)]
@@ -8696,6 +8733,7 @@ async fn refresh_kimi_oauth_tokens(
         ("client_id", KIMI_CLIENT_ID),
         ("refresh_token", refresh_token),
     ]))
+    .timeout(Duration::from_secs(10))
     .send()
     .await
     .map_err(|e| OAuthRefreshError::Other(format!("Failed to refresh Kimi token: {e}")))?;
@@ -8785,6 +8823,11 @@ async fn upsert_kimi_oauth_provider(
         )
     })?;
 
+    // The same local row can be reconnected to a different upstream account,
+    // and a newly connected row can become preferred. Fence all old probes and
+    // rebuild the shared catalog from the newly preferred account.
+    reconcile_preferred_kimi_catalog(state).await;
+
     if let Err(e) =
         update_provider_backends(&state.config.working_dir, ProviderType::Kimi.id(), backends)
     {
@@ -8800,55 +8843,15 @@ async fn upsert_kimi_oauth_provider(
 pub fn spawn_kimi_oauth_refresh_loop(state: Arc<super::routes::AppState>) {
     tokio::spawn(async move {
         loop {
+            // Run immediately at startup, then every five minutes. Reuse the
+            // same serialized store refresh path as catalog discovery so
+            // rotating refresh tokens cannot race.
+            let (_, refreshed) =
+                refresh_due_store_oauth(&state.ai_providers, ProviderType::Kimi, 600_000).await;
+            if refreshed > 0 {
+                tracing::info!(refreshed, "Refreshed Kimi OAuth credentials");
+            }
             tokio::time::sleep(Duration::from_secs(300)).await;
-
-            // Only do work if a Kimi provider exists.
-            if state
-                .ai_providers
-                .get_all_by_type(ProviderType::Kimi)
-                .await
-                .is_empty()
-            {
-                continue;
-            }
-            let Some(entry) = read_oauth_token_entry(ProviderType::Kimi) else {
-                continue;
-            };
-            // Refresh only when within 10 minutes of expiry.
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            if entry.expires_at > now_ms + 600_000 || entry.refresh_token.trim().is_empty() {
-                continue;
-            }
-
-            let client = reqwest::Client::new();
-            match refresh_kimi_oauth_tokens(&client, &entry.refresh_token).await {
-                Ok((access, refresh, expires_at)) => {
-                    if let Err(e) =
-                        sync_to_opencode_auth(ProviderType::Kimi, &refresh, &access, expires_at)
-                    {
-                        tracing::warn!("Failed to persist refreshed Kimi token: {e}");
-                    }
-                    // Update store rows so the chain resolver sees the fresh token.
-                    for mut acct in state.ai_providers.get_all_by_type(ProviderType::Kimi).await {
-                        if acct.oauth.is_some() {
-                            acct.oauth = Some(crate::ai_providers::OAuthCredentials {
-                                refresh_token: refresh.clone(),
-                                access_token: access.clone(),
-                                expires_at,
-                            });
-                            let id = acct.id;
-                            state.ai_providers.update(id, acct).await;
-                        }
-                    }
-                    tracing::info!("Refreshed Kimi OAuth token (expires_at={expires_at})");
-                }
-                Err(OAuthRefreshError::InvalidGrant(msg)) => {
-                    tracing::warn!("Kimi refresh token invalid; user must re-authenticate: {msg}");
-                }
-                Err(e) => {
-                    tracing::debug!("Kimi token refresh failed: {e}");
-                }
-            }
         }
     });
 }
@@ -10065,6 +10068,7 @@ pub async fn refresh_oauth_token_internal(
             // **Solution #2: OpenAI may also rotate refresh tokens**
             Ok((new_access, new_refresh, expires_at))
         }
+        ProviderType::Kimi => refresh_kimi_oauth_tokens(&client, refresh_token).await,
         ProviderType::Google => {
             // Google refresh token request
             let token_response = client
