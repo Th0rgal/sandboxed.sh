@@ -1358,7 +1358,7 @@ fn kimi_route_fingerprint(
         .filter(|url| !url.trim().is_empty())
         .unwrap_or(crate::api::ai_providers::KIMI_API_BASE_URL);
     Ok((
-        hash_u64(&format!("{base_url}\0{access_token}")),
+        hash_u64(&format!("{}\0{base_url}", provider.id)),
         base_url,
         access_token,
     ))
@@ -1400,8 +1400,9 @@ fn preferred_usable_kimi_provider(providers: &[AIProvider]) -> Option<AIProvider
 /// Kimi is an OpenAI-compatible provider but requires its coding-agent
 /// User-Agent on catalog requests. Cache successful responses briefly so
 /// preparing many mission workspaces does not hit the subscription endpoint
-/// once per mission. The cache key includes the route and a non-secret token
-/// fingerprint, so an OAuth refresh or endpoint change triggers discovery.
+/// once per mission. The cache key includes the stable provider identity and
+/// route, so normal OAuth token rotation does not hide a catalog that is still
+/// valid for that account.
 pub(crate) async fn fetch_kimi_models(
     provider: &crate::ai_providers::AIProvider,
 ) -> Result<Vec<ProviderModel>, String> {

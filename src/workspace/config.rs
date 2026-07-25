@@ -1400,15 +1400,16 @@ mod tests {
             access_token: "test-kimi-future-token".to_string(),
             expires_at: i64::MAX,
         });
-        let providers = vec![provider];
+        let mut providers = vec![provider];
 
         // The background provider catalog owns network discovery. Prime its
-        // cache explicitly, then verify workspace preparation only consumes
-        // the cached snapshot.
+        // cache explicitly, rotate the short-lived access token, then verify
+        // workspace preparation still consumes the account's cached snapshot.
         crate::api::providers::fetch_kimi_models(&providers[0])
             .await
             .unwrap();
         server.await.unwrap();
+        providers[0].oauth.as_mut().unwrap().access_token = "test-kimi-rotated-token".to_string();
 
         write_opencode_config(
             &mission_dir,
