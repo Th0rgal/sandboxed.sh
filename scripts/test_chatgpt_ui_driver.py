@@ -81,7 +81,8 @@ class ChatGptUiDriverTests(unittest.TestCase):
 
         self.assertTrue(selected)
         self.assertEqual(
-            page.selector, 'form button.__composer-pill[aria-haspopup="menu"]'
+            page.selector,
+            'form button.__composer-pill[aria-haspopup="menu"]:visible',
         )
         self.assertEqual(
             button.wait_timeout, ("visible", MODEL_PICKER_READY_TIMEOUT_MS)

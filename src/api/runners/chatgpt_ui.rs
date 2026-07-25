@@ -169,6 +169,24 @@ fn parse_bool_setting(key: &str, default: bool) -> bool {
     crate::api::mission_runner::get_backend_bool_setting("chatgpt_ui", key).unwrap_or(default)
 }
 
+fn safe_driver_diagnostic(message: &str) -> Option<&str> {
+    match message {
+        "compatibility=chatgpt-ui-v2; browser=chromium"
+        | "compatibility=chatgpt-ui-v2; browser=firefox"
+        | "compatibility=chatgpt-ui-v2; browser=webkit"
+        | "stage=page_loaded"
+        | "stage=account_confirmed"
+        | "stage=blank_route"
+        | "stage=composer_ready"
+        | "stage=composer_model_picker_not_ready"
+        | "stage=model_already_selected"
+        | "stage=composer_model_option_unavailable"
+        | "stage=artifact_size_limit"
+        | "stage=artifact_download_skipped" => Some(message),
+        _ => None,
+    }
+}
+
 fn validate_proxy_server(value: &str) -> Result<(), String> {
     let parsed =
         url::Url::parse(value).map_err(|_| "chatgpt_ui proxy_server must be a URL".to_string())?;
@@ -412,14 +430,22 @@ pub async fn run_chatgpt_ui_turn(
                     }
                 };
                 match event {
-                    // The bundled driver emits only static compatibility and
-                    // stage markers here. It must never place account, page,
-                    // prompt, or response text in a diagnostic event.
-                    DriverEvent::Diagnostic { message } => tracing::debug!(
-                        mission_id = %mission_id,
-                        diagnostic = %message,
-                        "chatgpt_ui driver diagnostic received"
-                    ),
+                    DriverEvent::Diagnostic { message } => {
+                        if let Some(diagnostic) = safe_driver_diagnostic(&message) {
+                            tracing::debug!(
+                                mission_id = %mission_id,
+                                diagnostic,
+                                "chatgpt_ui driver diagnostic received"
+                            );
+                        } else {
+                            // Driver paths are operator-configurable. Never
+                            // copy an unrecognized payload into server logs.
+                            tracing::debug!(
+                                mission_id = %mission_id,
+                                "chatgpt_ui driver emitted an unrecognized diagnostic"
+                            );
+                        }
+                    }
                     DriverEvent::TextDelta { content } => {
                         output = content;
                         let _ = events_tx.send(AgentEvent::TextDelta { content: output.clone(), mission_id: Some(mission_id) });
@@ -660,6 +686,23 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(artifact, DriverEvent::Artifact { .. }));
+    }
+
+    #[test]
+    fn driver_diagnostics_are_allowlisted_before_logging() {
+        assert_eq!(
+            safe_driver_diagnostic("stage=model_already_selected"),
+            Some("stage=model_already_selected")
+        );
+        assert_eq!(
+            safe_driver_diagnostic("compatibility=chatgpt-ui-v2; browser=chromium"),
+            Some("compatibility=chatgpt-ui-v2; browser=chromium")
+        );
+        assert_eq!(
+            safe_driver_diagnostic("stage=page_loaded account=user@example.com"),
+            None
+        );
+        assert_eq!(safe_driver_diagnostic("prompt=private text"), None);
     }
 
     #[test]
