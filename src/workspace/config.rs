@@ -256,11 +256,16 @@ pub(crate) async fn write_opencode_config(
         // providers it is not an OpenCode built-in, so it needs an explicit
         // provider block (OpenAI-compatible npm package + base URL + creds).
         if let Some(providers) = custom_providers {
+            let preferred_kimi_id =
+                crate::api::providers::preferred_usable_kimi_provider(providers)
+                    .map(|provider| provider.id);
             let provider_blocks: Vec<_> = providers
                 .iter()
                 .filter(|p| {
-                    matches!(p.provider_type, ProviderType::Custom | ProviderType::Kimi)
-                        && p.enabled
+                    p.enabled
+                        && (p.provider_type == ProviderType::Custom
+                            || (p.provider_type == ProviderType::Kimi
+                                && preferred_kimi_id == Some(p.id)))
                 })
                 .collect();
 
@@ -1492,13 +1497,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kimi_workspace_config_uses_the_catalog_selected_account() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mission_dir = temp.path().join("mission");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+
+        let mut preferred = AIProvider::new(ProviderType::Kimi, "Preferred Kimi".to_string());
+        preferred.priority = 0;
+        preferred.oauth = Some(crate::ai_providers::OAuthCredentials {
+            refresh_token: "preferred-refresh".to_string(),
+            access_token: "preferred-access".to_string(),
+            expires_at: i64::MAX,
+        });
+        preferred.custom_models = Some(vec![crate::ai_providers::CustomModel {
+            id: "preferred-only".to_string(),
+            name: Some("Preferred only".to_string()),
+            context_limit: None,
+            output_limit: None,
+        }]);
+
+        let mut secondary = AIProvider::new(ProviderType::Kimi, "Secondary Kimi".to_string());
+        secondary.priority = 10;
+        secondary.oauth = Some(crate::ai_providers::OAuthCredentials {
+            refresh_token: "secondary-refresh".to_string(),
+            access_token: "secondary-access".to_string(),
+            expires_at: i64::MAX,
+        });
+        secondary.custom_models = Some(vec![crate::ai_providers::CustomModel {
+            id: "secondary-only".to_string(),
+            name: Some("Secondary only".to_string()),
+            context_limit: None,
+            output_limit: None,
+        }]);
+
+        // Put the secondary account last to reproduce the old overwrite bug.
+        let providers = vec![preferred, secondary];
+        write_opencode_config(
+            &mission_dir,
+            Vec::new(),
+            temp.path(),
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            Some(&providers),
+        )
+        .await
+        .unwrap();
+
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mission_dir.join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config["provider"]["kimi"]["options"]["apiKey"],
+            "preferred-access"
+        );
+        assert!(config["provider"]["kimi"]["models"]["preferred-only"].is_object());
+        assert!(config["provider"]["kimi"]["models"]["secondary-only"].is_null());
+    }
+
+    #[tokio::test]
     async fn kimi_offline_config_merges_fallback_and_operator_models() {
         let temp = tempfile::TempDir::new().unwrap();
         let mission_dir = temp.path().join("mission");
         std::fs::create_dir_all(&mission_dir).unwrap();
         let mut provider = AIProvider::new(ProviderType::Kimi, "Kimi".to_string());
-        // No OAuth token makes discovery fail immediately without a network
-        // request, exercising resilient offline generation.
+        // No catalog snapshot exercises resilient offline generation without
+        // performing network I/O on the workspace path.
+        provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+            refresh_token: "offline-refresh".to_string(),
+            access_token: "offline-access".to_string(),
+            expires_at: i64::MAX,
+        });
         provider.custom_models = Some(vec![crate::ai_providers::CustomModel {
             id: "k4-operator-preview".to_string(),
             name: Some("K4 Operator Preview".to_string()),
