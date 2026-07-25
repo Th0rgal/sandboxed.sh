@@ -20,6 +20,7 @@ COMPAT_VERSION = "chatgpt-ui-v2"
 CHATGPT_URL = "https://chatgpt.com/"
 MAX_DOWNLOAD_FILES = 8
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+MODEL_PICKER_READY_TIMEOUT_MS = 15_000
 INTELLIGENCE_LABELS = ("Instant", "5.5", "Medium", "High", "Extra High", "Pro")
 PRO_MODEL_ALIASES = {
     "gpt-5.6-pro",
@@ -47,7 +48,21 @@ def model_selection(requested: str) -> tuple[str, str]:
 
 async def choose_intelligence_model(page, label: str) -> bool:
     """Select a current composer intelligence option without touching the sidebar."""
-    picker_buttons = page.locator('button.__composer-pill[aria-haspopup="menu"]')
+    # The current ChatGPT shell hydrates the composer in two phases: the
+    # textbox can be ready several seconds before the model pill is attached.
+    # Wait for the composer-scoped control instead of snapshotting its count
+    # immediately and incorrectly falling back to the legacy model picker.
+    picker_buttons = page.locator(
+        'form button.__composer-pill[aria-haspopup="menu"]'
+    )
+    try:
+        await picker_buttons.first.wait_for(
+            state="visible", timeout=MODEL_PICKER_READY_TIMEOUT_MS
+        )
+    except Exception:
+        emit("diagnostic", message="stage=composer_model_picker_not_ready")
+        return False
+
     for index in range(await picker_buttons.count()):
         button = picker_buttons.nth(index)
         try:
@@ -56,6 +71,9 @@ async def choose_intelligence_model(page, label: str) -> bool:
             current = (await button.inner_text()).strip()
             if current not in INTELLIGENCE_LABELS:
                 continue
+            if current == label:
+                emit("diagnostic", message="stage=model_already_selected")
+                return True
             await button.click()
             overlay = page.locator(
                 '[data-testid="composer-intelligence-picker-content"]:visible'
@@ -69,6 +87,7 @@ async def choose_intelligence_model(page, label: str) -> bool:
             return True
         except Exception:
             continue
+    emit("diagnostic", message="stage=composer_model_option_unavailable")
     return False
 
 

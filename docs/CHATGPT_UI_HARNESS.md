@@ -118,6 +118,10 @@ match `proxy_server` when the account requires a stable external egress.
   blank page; directory presence is never treated as proof of authentication.
 - `requested model is not visibly available`: verify the exact current label
   and account entitlement; UI rollouts are account-specific.
+- `stage=composer_model_picker_not_ready`: the authenticated composer appeared,
+  but its lazily hydrated model control did not become visible within 15
+  seconds. Retry once after checking the browser/proxy path; do not silently
+  use the current default model.
 - `compatibility=chatgpt-ui-v2`: the versioned selector/download contract
   failed. Capture
   only a clean, new chat with no sidebar identity or private history visible.
