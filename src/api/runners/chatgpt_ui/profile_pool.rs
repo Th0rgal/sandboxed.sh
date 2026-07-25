@@ -190,14 +190,16 @@ pub async fn acquire_profile(
                     // pool available when another configured slot is healthy;
                     // if every slot is unavailable, the ordinary wait/cancel
                     // path below fails closed without selecting one.
-                    tracing::warn!(
-                        profile_name = profile_dir
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("profile"),
-                        error = %error,
-                        "ChatGPT UI profile slot is unavailable"
-                    );
+                    if !announced_wait {
+                        tracing::warn!(
+                            profile_name = profile_dir
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("profile"),
+                            error = %error,
+                            "ChatGPT UI profile slot is unavailable"
+                        );
+                    }
                 }
             }
         }
