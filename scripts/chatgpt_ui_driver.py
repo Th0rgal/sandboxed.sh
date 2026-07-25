@@ -41,6 +41,18 @@ PRO_MODEL_ALIASES = {
     "gpt-5.6 pro",
     "gpt 5.6-pro",
 }
+# Opaque conversation route: `/c/<id>`. This is the only page-derived value the
+# durability protocol ever emits — never titles, prompts, or response text.
+CONVERSATION_PATH_RE = re.compile(r"^/c/[A-Za-z0-9-]{8,64}$")
+CHATGPT_HOSTS = {"chatgpt.com", "chat.openai.com"}
+
+
+class ResumeNotFound(Exception):
+    """The recorded conversation route is not reachable from this profile."""
+
+
+class ResumeMismatch(Exception):
+    """The conversation exists but does not hold exactly this prompt."""
 
 
 def emit(event_type: str, **payload) -> None:
@@ -49,6 +61,34 @@ def emit(event_type: str, **payload) -> None:
 
 def fail(code: str, message: str) -> None:
     emit("error", code=code, message=message)
+
+
+def conversation_path_from_url(url: str) -> str | None:
+    """Return the opaque `/c/<id>` route for a ChatGPT conversation URL."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.netloc.lower() not in CHATGPT_HOSTS:
+        return None
+    if CONVERSATION_PATH_RE.fullmatch(parsed.path or ""):
+        return parsed.path
+    return None
+
+
+def resume_conversation_path(resume) -> str | None:
+    """Validate a resume request and return its conversation route."""
+    if not isinstance(resume, dict):
+        return None
+    path = resume.get("conversation_path")
+    if isinstance(path, str) and CONVERSATION_PATH_RE.fullmatch(path):
+        return path
+    return None
+
+
+def normalized_prompt(text: str) -> str:
+    """Whitespace-insensitive prompt identity used only in memory."""
+    return " ".join(text.split())
 
 
 def model_selection(requested: str) -> tuple[str, str]:
@@ -305,10 +345,8 @@ async def close_context_quietly(context) -> None:
         pass
 
 
-async def establish_fresh_chat(page) -> int:
-    """Prove an authenticated, settled blank chat before observing responses."""
-    await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60_000)
-    emit("diagnostic", message="stage=page_loaded")
+async def verify_authentication(page) -> None:
+    """Require account-only evidence of an authenticated session."""
     login = page.get_by_role("button", name=re.compile(r"log in|sign in", re.I)).first
     if "/auth/" in page.url or (await login.count() and await login.is_visible()):
         raise PermissionError("login required")
@@ -321,14 +359,52 @@ async def establish_fresh_chat(page) -> int:
         'button[aria-label*="account" i], '
         'button[aria-label*="profile" i]'
     )
-    authenticated = False
     for index in range(await account_controls.count()):
         if await account_controls.nth(index).is_visible():
-            authenticated = True
-            break
-    if not authenticated:
-        raise PermissionError("authenticated account control not found")
-    emit("diagnostic", message="stage=account_confirmed")
+            emit("diagnostic", message="stage=account_confirmed")
+            return
+    raise PermissionError("authenticated account control not found")
+
+
+async def establish_resumed_chat(page, conversation_path: str, message: str) -> int:
+    """Reattach to a recorded conversation and prove it holds this prompt.
+
+    All verification happens in memory; nothing from the page is emitted. The
+    conversation is expected to hold exactly one user message (mission turns
+    always start from a blank chat), and that message must equal the prompt
+    this run was asked to submit — otherwise reattaching would return someone
+    else's response.
+    """
+    await page.goto(
+        f"https://chatgpt.com{conversation_path}",
+        wait_until="domcontentloaded",
+        timeout=60_000,
+    )
+    emit("diagnostic", message="stage=resume_route")
+    await verify_authentication(page)
+    # Unknown or deleted conversations redirect away from the recorded route.
+    await page.wait_for_timeout(2_000)
+    parsed = urlparse(page.url)
+    if parsed.netloc.lower() not in CHATGPT_HOSTS or parsed.path != conversation_path:
+        raise ResumeNotFound()
+    user_messages = page.locator('[data-message-author-role="user"]')
+    count = await user_messages.count()
+    if count == 0:
+        raise ResumeNotFound()
+    if count != 1:
+        raise ResumeMismatch()
+    text = await user_messages.first.inner_text()
+    if normalized_prompt(text) != normalized_prompt(message):
+        raise ResumeMismatch()
+    emit("diagnostic", message="stage=resume_verified")
+    return 0
+
+
+async def establish_fresh_chat(page) -> int:
+    """Prove an authenticated, settled blank chat before observing responses."""
+    await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60_000)
+    emit("diagnostic", message="stage=page_loaded")
+    await verify_authentication(page)
 
     # A direct navigation to the root is the stable new-chat primitive. The
     # sidebar's "New chat" control is rollout-dependent and can be a button,
@@ -366,6 +442,17 @@ async def run(args, request) -> None:
         30_000, min(int(request.get("timeout_ms", 14_400_000)), 86_400_000)
     )
     requested_model = request.get("model") or ""
+    durability = request.get("durability") is True
+    resume_request = request.get("resume")
+    resume_path = None
+    if resume_request is not None:
+        resume_path = resume_conversation_path(resume_request)
+        if resume_path is None:
+            fail(
+                "invalid_request",
+                "resume.conversation_path must be an opaque /c/<id> route",
+            )
+            return
     requested_download_dir = request.get("download_dir")
     download_dir = None
     if requested_download_dir is not None:
@@ -408,38 +495,56 @@ async def run(args, request) -> None:
                 return
 
             page = context.pages[0] if context.pages else await context.new_page()
-            stage = "fresh_chat"
-            baseline = await establish_fresh_chat(page)
-            stage = "model_selection"
-            model_used = await choose_model(page, requested_model)
-            stage = "blank_chat_check"
-            await assert_blank_chat(page)
-            stage = "composer"
-            composer = page.locator("#prompt-textarea").first
-            if not await composer.count():
-                composer = page.get_by_role("textbox").last
-            await composer.fill(message)
-            stage = "send"
-            send = None
-            for _ in range(20):  # allow ~10 seconds for the control to attach
-                send, used_fallback = await locate_composer_control(
-                    page, SEND_CONTROL_TESTIDS, SEND_BUTTON_NAME
+            if resume_path is not None:
+                stage = "resume"
+                baseline = await establish_resumed_chat(page, resume_path, message)
+                # The prompt was submitted by a prior run; the picker state it
+                # used is part of the conversation and must not be touched.
+                model_used = (
+                    model_selection(requested_model)[1] if requested_model else ""
                 )
-                if send is not None:
-                    if used_fallback:
-                        emit("diagnostic", message="stage=send_button_fallback")
-                    break
-                await asyncio.sleep(0.5)
-            if send is None:
-                raise RuntimeError("composer send control not found")
-            await send.click()
+            else:
+                stage = "fresh_chat"
+                baseline = await establish_fresh_chat(page)
+                stage = "model_selection"
+                model_used = await choose_model(page, requested_model)
+                stage = "blank_chat_check"
+                await assert_blank_chat(page)
+                stage = "composer"
+                composer = page.locator("#prompt-textarea").first
+                if not await composer.count():
+                    composer = page.get_by_role("textbox").last
+                await composer.fill(message)
+                stage = "send"
+                send = None
+                for _ in range(20):  # allow ~10 seconds for the control to attach
+                    send, used_fallback = await locate_composer_control(
+                        page, SEND_CONTROL_TESTIDS, SEND_BUTTON_NAME
+                    )
+                    if send is not None:
+                        if used_fallback:
+                            emit("diagnostic", message="stage=send_button_fallback")
+                        break
+                    await asyncio.sleep(0.5)
+                if send is None:
+                    raise RuntimeError("composer send control not found")
+                await send.click()
 
             stage = "response"
             last = ""
             stable = 0
             stop_fallback_reported = False
+            submitted_emitted = resume_path is not None
             deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
             while asyncio.get_running_loop().time() < deadline:
+                if durability and not submitted_emitted:
+                    # The URL flips to the opaque conversation route once the
+                    # prompt is accepted. That route is the only durable
+                    # pointer this driver ever reports.
+                    submitted_route = conversation_path_from_url(page.url)
+                    if submitted_route is not None:
+                        submitted_emitted = True
+                        emit("submitted", conversation_path=submitted_route)
                 responses = page.locator('[data-message-author-role="assistant"]')
                 count = await responses.count()
                 if count > baseline:
@@ -457,6 +562,11 @@ async def run(args, request) -> None:
                     emit("diagnostic", message="stage=stop_button_fallback")
                 stop_visible = stop is not None
                 if last and count > baseline and not stop_visible and stable >= 2:
+                    if durability and not submitted_emitted:
+                        emit(
+                            "diagnostic",
+                            message="stage=conversation_ref_unavailable",
+                        )
                     if download_dir is not None:
                         stage = "artifacts"
                         await collect_downloads(
@@ -470,6 +580,16 @@ async def run(args, request) -> None:
         fail(
             "auth_required",
             "ChatGPT login is required in the configured profile; provision it interactively",
+        )
+    except ResumeNotFound:
+        fail(
+            "resume_not_found",
+            "the recorded conversation is not reachable from this profile",
+        )
+    except ResumeMismatch:
+        fail(
+            "resume_mismatch",
+            "the recorded conversation does not hold exactly this prompt",
         )
     except Exception as exc:
         fail(

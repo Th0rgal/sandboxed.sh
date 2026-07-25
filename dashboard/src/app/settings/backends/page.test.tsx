@@ -5,9 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import BackendsPage from './page';
 import { updateBackendConfig } from '@/lib/api';
 
-const { refreshBackendConfigs, getChatgptUiProfilePoolMock, backendConfigsFixture } = vi.hoisted(() => ({
+const { refreshBackendConfigs, getChatgptUiProfilePoolMock, getChatgptUiDurabilityMock, backendConfigsFixture } = vi.hoisted(() => ({
   refreshBackendConfigs: vi.fn(),
   getChatgptUiProfilePoolMock: vi.fn(),
+  getChatgptUiDurabilityMock: vi.fn(),
   backendConfigsFixture: {
     opencode: {
       enabled: true,
@@ -55,6 +56,7 @@ vi.mock('@/lib/api', () => ({
   updateBackendConfig: vi.fn().mockResolvedValue({ message: 'saved' }),
   getProviderForBackend: vi.fn().mockResolvedValue({ configured: false }),
   getChatgptUiProfilePool: getChatgptUiProfilePoolMock,
+  getChatgptUiDurability: getChatgptUiDurabilityMock,
   getHealth: vi.fn().mockResolvedValue({ version: '1.3.0' }),
   getSettings: vi.fn().mockResolvedValue({
     max_parallel_missions: 1,
@@ -86,6 +88,8 @@ describe('BackendsPage ChatGPT UI settings', () => {
     refreshBackendConfigs.mockClear();
     getChatgptUiProfilePoolMock.mockReset();
     getChatgptUiProfilePoolMock.mockResolvedValue({ slots: [] });
+    getChatgptUiDurabilityMock.mockReset();
+    getChatgptUiDurabilityMock.mockResolvedValue({ jobs: [] });
   });
 
   afterEach(() => {
@@ -180,5 +184,56 @@ describe('BackendsPage ChatGPT UI settings', () => {
     expect(screen.getByText('quarantined')).toBeVisible();
     expect(screen.getByText(/auth failure/)).toBeVisible();
     expect(screen.getByText(/retry in 29 min/)).toBeVisible();
+  });
+
+  it('shows durable job health without exposing conversation data', async () => {
+    getChatgptUiDurabilityMock.mockResolvedValue({
+      jobs: [
+        {
+          mission_id: 'a1b2c3d4-0000-0000-0000-000000000000',
+          state: 'submitted',
+          attempts: 2,
+          profile: 'chatgpt-profile',
+          model: 'gpt-5.6-pro',
+          age_secs: 7200,
+          updated_secs_ago: 120,
+          resumable: true,
+          last_error_code: 'driver_crash',
+        },
+        {
+          mission_id: 'e5f6a7b8-0000-0000-0000-000000000000',
+          state: 'completed',
+          attempts: 1,
+          profile: 'chatgpt-profile-2',
+          model: 'gpt-5.6-pro',
+          age_secs: 300,
+          updated_secs_ago: 60,
+          resumable: false,
+          last_error_code: null,
+        },
+      ],
+    });
+
+    renderPage();
+
+    fireEvent.click(screen.getByRole('button', { name: 'ChatGPT UI (experimental)' }));
+
+    expect(screen.queryByTestId('chatgpt-ui-durability-status')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Use production defaults' }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('chatgpt-ui-durability-status')).toBeVisible();
+    });
+    expect(screen.getByText('a1b2c3d4')).toBeVisible();
+    expect(screen.getByText('submitted')).toBeVisible();
+    expect(screen.getByText('resumable')).toBeVisible();
+    expect(screen.getByText(/profile chatgpt-profile · attempt 2 · 2 h old/)).toBeVisible();
+    expect(screen.getByText('driver_crash')).toBeVisible();
+    expect(screen.getByText('e5f6a7b8')).toBeVisible();
+    expect(screen.getByText('completed')).toBeVisible();
+    const panel = screen.getByTestId('chatgpt-ui-durability-status');
+    expect(panel.textContent).not.toContain('/c/');
+    expect(panel.textContent).not.toMatch(/[0-9a-f]{64}/);
   });
 });

@@ -1207,6 +1207,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(backends_api::chatgpt_ui_profile_pool),
         )
         .route(
+            "/api/backends/chatgpt_ui/durability",
+            get(backends_api::chatgpt_ui_durability),
+        )
+        .route(
             "/api/backends/:id/agents",
             get(backends_api::list_backend_agents),
         )
