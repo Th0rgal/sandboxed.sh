@@ -5,6 +5,7 @@ import {
   Brain,
   ChevronDown,
   ChevronRight,
+  Clock,
   Loader,
   Plus,
   Send,
@@ -460,7 +461,7 @@ export function HermesThread({ className }: { className?: string }) {
         )}
         {!historyLoading && items.length === 0 && (
           <div className="mt-16 text-center">
-            <p className="text-sm text-white/60">Talk to Hermes</p>
+            <p className="text-sm text-white/60">What should Hermes handle?</p>
             <p className="mx-auto mt-1 max-w-sm text-xs text-white/35">
               Your assistant can start missions, check on running ones and
               answer questions about your fleet. Mission IDs it mentions become
@@ -522,6 +523,41 @@ export function HermesThread({ className }: { className?: string }) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Hermes annotates durable deliveries (cron, callbacks) with a bracketed
+ * prefix on the message text, e.g. "[Cron delivery: Beal roadmap — current
+ * Desktop session] …". The prefix comes from upstream Hermes, so we lift it
+ * into a visual divider here instead of showing it inline. */
+const DELIVERY_PREFIX = /^\[([A-Za-z]+) delivery:\s*([^\]]*)\]\s*/;
+
+function parseDelivery(
+  content: string,
+): { kind: string; label: string; body: string } | null {
+  const match = DELIVERY_PREFIX.exec(content);
+  if (!match) return null;
+  // "— current Desktop session" is routing boilerplate, not a title.
+  const label = match[2].replace(/\s*—\s*current\s+.*?session\s*$/i, "").trim();
+  return { kind: match[1], label, body: content.slice(match[0].length) };
+}
+
+function DeliveryDivider({ kind, label }: { kind: string; label: string }) {
+  return (
+    <div className="flex items-center gap-3 pt-2">
+      <div className="h-px flex-1 bg-[rgb(var(--foreground)/0.08)]" />
+      <span className="flex min-w-0 items-center gap-1.5 rounded-full border border-[rgb(var(--foreground)/0.08)] bg-[rgb(var(--foreground)/0.03)] px-2.5 py-0.5 text-[11px] text-[rgb(var(--foreground)/0.5)]">
+        <Clock className="h-3 w-3 shrink-0 text-[rgb(var(--foreground)/0.4)]" />
+        <span className="shrink-0">{kind}</span>
+        {label && (
+          <>
+            <span className="shrink-0 text-[rgb(var(--foreground)/0.35)]">·</span>
+            <span className="truncate">{label}</span>
+          </>
+        )}
+      </span>
+      <div className="h-px flex-1 bg-[rgb(var(--foreground)/0.08)]" />
     </div>
   );
 }
@@ -593,19 +629,25 @@ function HermesRow({ item }: { item: ChatItem }) {
   }
 
   // assistant
+  const delivery = parseDelivery(item.content);
   return (
-    <div className="flex justify-start gap-2">
-      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-500/15 ring-1 ring-inset ring-indigo-400/25">
-        <Brain className="h-3.5 w-3.5 text-indigo-300" />
+    <>
+      {delivery && (
+        <DeliveryDivider kind={delivery.kind} label={delivery.label} />
+      )}
+      <div className="flex justify-start gap-2">
+        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-500/15 ring-1 ring-inset ring-indigo-400/25">
+          <Brain className="h-3.5 w-3.5 text-indigo-300" />
+        </div>
+        <div className="max-w-[85%] rounded-2xl rounded-tl-md border border-[rgb(var(--foreground)/0.08)] bg-[rgb(var(--foreground)/0.03)] px-3 py-2">
+          <LazyMarkdownContent
+            content={delivery ? delivery.body : item.content}
+            className="text-sm"
+            missionLinks
+          />
+        </div>
       </div>
-      <div className="max-w-[85%] rounded-2xl rounded-tl-md border border-[rgb(var(--foreground)/0.08)] bg-[rgb(var(--foreground)/0.03)] px-3 py-2">
-        <LazyMarkdownContent
-          content={item.content}
-          className="text-sm"
-          missionLinks
-        />
-      </div>
-    </div>
+    </>
   );
 }
 

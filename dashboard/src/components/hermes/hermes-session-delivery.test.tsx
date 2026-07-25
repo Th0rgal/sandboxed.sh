@@ -1,4 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
@@ -55,6 +62,7 @@ describe("Hermes Desktop durable delivery", () => {
   });
 
   afterEach(() => {
+    cleanup();
     intervalSpy.mockRestore();
     vi.clearAllMocks();
   });
@@ -99,5 +107,32 @@ describe("Hermes Desktop durable delivery", () => {
     expect(
       await screen.findByText("The build finished successfully."),
     ).toBeInTheDocument();
+  });
+
+  test("lifts the delivery prefix into a divider pill", async () => {
+    mockedMessages.mockResolvedValue([
+      {
+        id: 1,
+        role: "user",
+        content: "Wait until the build finishes",
+      },
+      {
+        id: 2,
+        role: "assistant",
+        content:
+          "[Cron delivery: Beal roadmap progression — current Desktop session] Changement — PR #8",
+      },
+    ]);
+
+    render(<HermesThread />);
+
+    fireEvent.click(screen.getByText("New conversation"));
+    fireEvent.click(await screen.findByText("Build watcher"));
+
+    expect(
+      await screen.findByText("Beal roadmap progression"),
+    ).toBeInTheDocument();
+    expect(await screen.findByText(/Changement — PR #8/)).toBeInTheDocument();
+    expect(screen.queryByText(/\[Cron delivery:/)).not.toBeInTheDocument();
   });
 });
