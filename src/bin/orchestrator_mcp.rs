@@ -716,7 +716,7 @@ impl OrchestratorMcp {
                         },
                         "model_override": {
                             "type": "string",
-                            "description": "Exact account-supported model ID. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.6-terra', recommended with medium effort) for codex, Gemini models for gemini, Grok models for grok, 'provider/model' format for opencode. Never invent variants such as 'gpt-5.5-sol'."
+                            "description": "Exact account-supported model ID. Must match the backend: Claude models (e.g. 'claude-opus-5') for claudecode, GPT models (e.g. 'gpt-5.6-terra', recommended with medium effort) for codex, Gemini models for gemini, Grok models for grok, 'provider/model' format for opencode. Never invent variants such as 'gpt-5.5-sol'."
                         },
                         "model_effort": {
                             "type": "string",

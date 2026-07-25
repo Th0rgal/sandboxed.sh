@@ -3474,7 +3474,16 @@ async fn run_mission_turn(
         config.opencode_agent = Some(agent.clone());
     }
     if let Some(ref model) = model_override {
-        config.default_model = Some(model.clone());
+        config.default_model = Some(if backend_id == "claudecode" {
+            crate::library::normalize_claude_code_default_model(Some(model.clone()))
+        } else {
+            model.clone()
+        });
+    } else if backend_id == "claudecode" {
+        config.default_model = config
+            .default_model
+            .take()
+            .map(|model| crate::library::normalize_claude_code_default_model(Some(model)));
     }
     // Get config profile: mission's config_profile takes priority over workspace's
     let workspace_config_profile = if let Some(ws_id) = workspace_id {
@@ -3512,7 +3521,7 @@ async fn run_mission_turn(
         config.default_model = Some(resolve_gemini_default_model());
     } else if backend_id == "grok" && model_override.is_none() {
         // Pin Grok Build to its own default model. Without this the global
-        // DEFAULT_MODEL (typically `anthropic/claude-opus-4-8`) flows
+        // DEFAULT_MODEL (typically `anthropic/claude-opus-5`) flows
         // through to `--model` and the grok CLI rejects it as "unknown
         // model id" — the mission then fails on the first turn with a
         // confusing chdir error from the rejected-CLI path. See prod

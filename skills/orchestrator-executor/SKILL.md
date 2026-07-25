@@ -22,7 +22,7 @@ are stuck.
 create_worker_mission(
   title: "Advisor",
   backend: "claudecode",
-  model_override: "claude-opus-4-8",   // or the strongest model available — check get_backend_auth_status
+  model_override: "claude-opus-5",     // current Claude Code default — check get_backend_auth_status
   prompt: "You are my persistent advisor for this mission: <one-paragraph mission summary>. Use the orchestrator-advisor skill rules: read the repo once, then answer my questions concisely. First question: <your first question>"
 )
 ```

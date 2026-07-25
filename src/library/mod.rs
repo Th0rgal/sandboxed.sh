@@ -2054,7 +2054,10 @@ impl LibraryStore {
             .await
             .context("Failed to read claudecode config")?;
 
-        serde_json::from_str(&content).context("Failed to parse claudecode config")
+        let mut config: ClaudeCodeConfig =
+            serde_json::from_str(&content).context("Failed to parse claudecode config")?;
+        config.default_model = Some(normalize_claude_code_default_model(config.default_model));
+        Ok(config)
     }
 
     /// Get Claude Code raw settings.json from a profile as untyped JSON.
@@ -2073,7 +2076,23 @@ impl LibraryStore {
         let content = fs::read_to_string(&path)
             .await
             .context("Failed to read claudecode settings")?;
-        serde_json::from_str(&content).context("Failed to parse claudecode settings")
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&content).context("Failed to parse claudecode settings")?;
+        if let Some(object) = settings.as_object_mut() {
+            for key in ["default_model", "model"] {
+                let configured = object
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                if configured.is_some() {
+                    object.insert(
+                        key.to_string(),
+                        serde_json::Value::String(normalize_claude_code_default_model(configured)),
+                    );
+                }
+            }
+        }
+        Ok(settings)
     }
 
     /// Get Codex raw config.toml from a profile as a plain string.
@@ -2348,6 +2367,42 @@ impl LibraryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn claudecode_config_defaults_to_opus_5_and_upgrades_opus_48() {
+        assert_eq!(
+            ClaudeCodeConfig::default().default_model.as_deref(),
+            Some("claude-opus-5")
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
+        let config_dir = temp
+            .path()
+            .join(CONFIGS_DIR)
+            .join(DEFAULT_PROFILE)
+            .join(".claudecode");
+        fs::create_dir_all(&config_dir).await.unwrap();
+        fs::write(
+            config_dir.join("settings.json"),
+            serde_json::json!({
+                "default_model": "anthropic/claude-opus-4-8",
+                "hidden_agents": []
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let typed = store.get_claudecode_config().await.unwrap();
+        assert_eq!(typed.default_model.as_deref(), Some("claude-opus-5"));
+
+        let raw = store
+            .get_claudecode_raw_settings_for_profile(DEFAULT_PROFILE)
+            .await
+            .unwrap();
+        assert_eq!(raw["default_model"], "claude-opus-5");
+    }
 
     #[test]
     fn test_parse_frontmatter() {

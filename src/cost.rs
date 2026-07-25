@@ -92,6 +92,11 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         pricing: pricing(10_000, 50_000, Some(12_500), Some(1_000)),
     },
     PricingEntry {
+        canonical: "claude-opus-5",
+        aliases: &["claude-opus-5", "claude-5-opus"],
+        pricing: pricing(5_000, 25_000, Some(6_250), Some(500)),
+    },
+    PricingEntry {
         canonical: "claude-opus-4-8",
         aliases: &["claude-opus-4-8", "claude-4-8-opus"],
         pricing: pricing(5_000, 25_000, Some(6_250), Some(500)),
@@ -567,6 +572,7 @@ mod tests {
             "claude-3-5-sonnet"
         );
         assert_eq!(normalize_model("claude-opus-4-7"), "claude-opus-4-7");
+        assert_eq!(normalize_model("claude-5-opus"), "claude-opus-5");
         assert_eq!(
             normalize_model("claude-opus-4-5-20251101"),
             "claude-opus-4-5"
@@ -618,6 +624,7 @@ mod tests {
     fn test_pricing_for_known_models() {
         assert!(pricing_for_model("claude-3-5-sonnet").is_some());
         assert!(pricing_for_model("claude-opus-4-7").is_some());
+        assert!(pricing_for_model("claude-opus-5").is_some());
         assert!(pricing_for_model("claude-opus-4-5").is_some());
         assert!(pricing_for_model("claude-sonnet-4-5").is_some());
         assert!(pricing_for_model("claude-haiku-4-5").is_some());

@@ -2267,6 +2267,7 @@ fn rewrite_model(body: &[u8], new_model: &str) -> Result<bytes::Bytes, String> {
 /// `top_k`) when extended thinking is active, so we strip them for these IDs.
 fn anthropic_model_omits_sampling_params(model_id: &str) -> bool {
     model_id.contains("claude-fable-5")
+        || model_id.contains("claude-opus-5")
         || model_id.contains("claude-opus-4-8")
         || model_id.contains("claude-opus-4-7")
 }
@@ -2391,6 +2392,22 @@ fn anthropic_body_drop_thinking_and_disable(body: &[u8]) -> Result<bytes::Bytes,
             "thinking".to_string(),
             serde_json::json!({ "type": "disabled" }),
         );
+        // Opus 5 rejects disabled thinking at xhigh/max effort. This recovery
+        // path deliberately disables thinking for one turn, so cap an
+        // incompatible explicit effort instead of turning a recoverable stale
+        // signature into a second 400.
+        if let Some(output_config) = obj
+            .get_mut("output_config")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            let incompatible = output_config
+                .get("effort")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|effort| matches!(effort, "xhigh" | "max"));
+            if incompatible {
+                output_config.insert("effort".to_string(), serde_json::json!("high"));
+            }
+        }
         // Sampling params are valid again once thinking is disabled, but the
         // original request already omitted them for these models; leave as-is.
     }
@@ -5961,7 +5978,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_cli_proxy_rewrite_drops_deprecated_opus_47_sampling_params() {
+    fn anthropic_cli_proxy_rewrite_drops_opus_5_sampling_params() {
         let body = serde_json::json!({
             "model": "opus",
             "messages": [{ "role": "user", "content": "ok" }],
@@ -5973,12 +5990,12 @@ mod tests {
         });
         let payload = rewrite_model_for_anthropic_cli_proxy(
             serde_json::to_vec(&body).unwrap().as_slice(),
-            "claude-opus-4-7",
+            "claude-opus-5",
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(payload.as_ref()).unwrap();
 
-        assert_eq!(value["model"], "claude-opus-4-7");
+        assert_eq!(value["model"], "claude-opus-5");
         assert!(value.get("temperature").is_none());
         assert!(value.get("top_p").is_none());
         assert!(value.get("top_k").is_none());
@@ -6080,9 +6097,10 @@ mod tests {
     #[test]
     fn drop_thinking_and_disable_strips_and_disables() {
         let body = serde_json::json!({
-            "model": "claude-opus-4-8",
+            "model": "claude-opus-5",
             "max_tokens": 16,
             "thinking": { "type": "enabled", "budget_tokens": 2048 },
+            "output_config": { "effort": "max" },
             "messages": [
                 { "role": "user", "content": "hi" },
                 { "role": "assistant", "content": [
@@ -6096,6 +6114,7 @@ mod tests {
                 .unwrap();
         let value: serde_json::Value = serde_json::from_slice(out.as_ref()).unwrap();
         assert_eq!(value["thinking"], serde_json::json!({ "type": "disabled" }));
+        assert_eq!(value["output_config"]["effort"], "high");
         let blocks = value["messages"][1]["content"].as_array().unwrap();
         assert!(blocks.iter().all(|b| b["type"] != "thinking"));
         assert!(blocks.iter().any(|b| b["type"] == "text"));

@@ -18,7 +18,7 @@ use uuid::Uuid;
 pub struct AgentConfig {
     pub id: Uuid,
     pub name: String,
-    /// Model ID (e.g., "claude-opus-4-5-20251101")
+    /// Model ID (e.g., "claude-opus-5")
     pub model_id: String,
     /// MCP server names from library to enable
     #[serde(default)]

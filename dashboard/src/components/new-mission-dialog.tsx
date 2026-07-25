@@ -14,6 +14,7 @@ import { toast } from '@/components/toast';
 const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok', 'chatgpt_ui'] as const;
 const CHATGPT_UI_BACKEND_ID = 'chatgpt_ui';
 const CHATGPT_UI_CANONICAL_MODEL = 'gpt-5.6-pro';
+const CLAUDE_CODE_DEFAULT_MODEL = 'claude-opus-5';
 
 // Kept in sync with src/api/control.rs `normalize_model_effort_for_backend`.
 // Codex and Claude Code both accept the GPT reasoning-effort ladder. Other
@@ -895,7 +896,11 @@ export function NewMissionDialog({
                   onChange={(e) => setModelOverride(e.target.value)}
                   className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none disabled:opacity-60 [&>option]:bg-slate-800 [&>option]:text-white [&>optgroup]:bg-slate-900 [&>optgroup]:text-white/70"
                 >
-                  <option value="">No override (use default)</option>
+                  <option value="">
+                    {selectedBackend === 'claudecode'
+                      ? `No override (Claude Opus 5 · ${CLAUDE_CODE_DEFAULT_MODEL})`
+                      : 'No override (use default)'}
+                  </option>
                   {(() => {
                     if (modelOptionsLoading || providersLoading) {
                       return (
@@ -946,7 +951,7 @@ export function NewMissionDialog({
                 <p className="text-xs text-white/30 mt-1.5">
                   {selectedBackend === 'opencode'
                     ? 'Use provider/model format (e.g., openai/gpt-5.6-sol).'
-                    : 'Use the raw model ID (e.g., gpt-5.6-sol or claude-fable-5).'}
+                    : 'Use the raw model ID (e.g., gpt-5.6-sol or claude-opus-5).'}
                 </p>
               </div>
             )}

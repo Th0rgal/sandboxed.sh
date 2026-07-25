@@ -101,6 +101,23 @@ describe('NewMissionDialog', () => {
     expect(openSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('shows Claude Opus 5 as the Claude Code default', async () => {
+    vi.mocked(listBackends).mockResolvedValue([
+      { id: 'claudecode', name: 'Claude Code' },
+    ]);
+    const onCreate = vi.fn().mockResolvedValue({ id: 'claude-mission' });
+
+    renderDialog(onCreate);
+
+    fireEvent.click(screen.getByRole('button', { name: /new mission/i }));
+
+    expect(
+      await screen.findByRole('option', {
+        name: 'No override (Claude Opus 5 · claude-opus-5)',
+      })
+    ).toBeVisible();
+  });
+
   it('uses one host-only canonical Pro option for ChatGPT UI missions', async () => {
     vi.mocked(listBackends).mockResolvedValue([
       { id: 'chatgpt_ui', name: 'ChatGPT UI (experimental)' },

@@ -111,11 +111,20 @@ function normalizeJson(value: unknown): string {
   return JSON.stringify(sortKeys(value));
 }
 
+const CLAUDE_CODE_DEFAULT_MODEL = 'claude-opus-5';
+
 const coerceClaudeCodeConfig = (value: Record<string, unknown> | null): ClaudeCodeConfig => {
   if (!value) {
-    return { default_model: null, default_agent: null, hidden_agents: [] };
+    return { default_model: CLAUDE_CODE_DEFAULT_MODEL, default_agent: null, hidden_agents: [] };
   }
-  const defaultModel = typeof value.default_model === 'string' ? value.default_model : null;
+  const configuredModel = typeof value.default_model === 'string'
+    ? value.default_model.trim()
+    : '';
+  const defaultModel =
+    !configuredModel ||
+    ['claude-opus-4-8', 'claude-opus-4.8', 'anthropic/claude-opus-4-8', 'anthropic/claude-opus-4.8'].includes(configuredModel)
+      ? CLAUDE_CODE_DEFAULT_MODEL
+      : configuredModel;
   const defaultAgent = typeof value.default_agent === 'string' ? value.default_agent : null;
   const hiddenAgentsRaw = value.hidden_agents;
   const hiddenAgents = Array.isArray(hiddenAgentsRaw)
