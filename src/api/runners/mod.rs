@@ -6,6 +6,7 @@
 //! shrink down to orchestration (dispatch, retry/fallback, TerminalReason).
 
 pub(crate) mod chatgpt_ui;
+pub(crate) mod chatgpt_ui_jobs;
 pub(crate) mod claudecode;
 pub(crate) mod codex;
 pub(crate) mod errors;

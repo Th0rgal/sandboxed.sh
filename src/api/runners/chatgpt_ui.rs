@@ -23,6 +23,7 @@ use crate::api::control::AgentEvent;
 use crate::api::mission_runner::{
     get_backend_string_list_setting, get_backend_string_setting, get_backend_u64_setting,
 };
+use crate::api::runners::chatgpt_ui_jobs as jobs;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -46,6 +47,11 @@ enum DriverEvent {
     Complete {
         content: String,
         model: Option<String>,
+    },
+    /// The prompt provably lives in a conversation. `conversation_path` is an
+    /// opaque `/c/<id>` route — a durability pointer, never content.
+    Submitted {
+        conversation_path: String,
     },
     Artifact {
         path: String,
@@ -246,7 +252,10 @@ fn safe_driver_diagnostic(message: &str) -> Option<&str> {
         | "stage=model_already_selected"
         | "stage=composer_model_option_unavailable"
         | "stage=artifact_size_limit"
-        | "stage=artifact_download_skipped" => Some(message),
+        | "stage=artifact_download_skipped"
+        | "stage=conversation_ref_unavailable"
+        | "stage=resume_route"
+        | "stage=resume_verified" => Some(message),
         _ => None,
     }
 }
@@ -373,6 +382,24 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
     })
 }
 
+/// Outcome of one driver attempt. Resume-pointer failures are recoverable
+/// inside the same turn (fall back to a fresh submission); everything else is
+/// terminal for the turn.
+enum DriveOutcome {
+    Terminal(AgentResult),
+    /// The persisted conversation pointer is unusable (`resume_not_found` or
+    /// `resume_mismatch`). The prompt is provably absent from the referenced
+    /// conversation, so a fresh submission stays idempotent.
+    ResumeInvalid(&'static str),
+}
+
+fn profile_basename(profile_dir: &Path) -> &str {
+    profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("profile")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_chatgpt_ui_turn(
     work_dir: &Path,
@@ -389,11 +416,24 @@ pub async fn run_chatgpt_ui_turn(
             return AgentResult::failure(error, 0).with_terminal_reason(TerminalReason::AuthError)
         }
     };
-    let (profile_slot, profile_dir, _profile_lock) =
-        match acquire_profile(&settings.profile_dirs, mission_id, &events_tx, &cancel).await {
-            Ok(lease) => lease,
-            Err(result) => return result,
-        };
+    let fingerprint = jobs::prompt_fingerprint(message, model);
+    let _ = jobs::reconcile_jobs(app_working_dir);
+    let mut prior_attempts = 0u32;
+    let mut resume_record = match jobs::load_job(app_working_dir, mission_id) {
+        Some(record) if jobs::resumable_job(&record, &fingerprint, chrono::Utc::now()) => {
+            Some(record)
+        }
+        Some(record) => {
+            prior_attempts = record.attempts;
+            if record.state == jobs::JobState::Submitted {
+                // Same mission, different prompt: the old submission can no
+                // longer be reattached to this turn.
+                jobs::mark_abandoned(app_working_dir, mission_id, "superseded");
+            }
+            None
+        }
+        None => None,
+    };
     let download_dir = match prepare_download_dir(work_dir).await {
         Ok(path) => path,
         Err(error) => {
@@ -401,6 +441,89 @@ pub async fn run_chatgpt_ui_turn(
         }
     };
 
+    loop {
+        let attempt_resume = resume_record.take();
+        // Conversations are account-scoped: a resume must reuse the profile
+        // that submitted the prompt, or give up on the pointer entirely.
+        let acquisition = if let Some(record) = attempt_resume.as_ref() {
+            match settings
+                .profile_dirs
+                .iter()
+                .position(|dir| profile_basename(dir) == record.profile)
+            {
+                Some(index) => {
+                    let pinned = settings.profile_dirs[index].clone();
+                    acquire_profile(
+                        std::slice::from_ref(&pinned),
+                        mission_id,
+                        &events_tx,
+                        &cancel,
+                    )
+                    .await
+                    .map(|(_, dir, lock)| (index, dir, lock))
+                }
+                None => {
+                    jobs::mark_abandoned(app_working_dir, mission_id, "profile_unavailable");
+                    continue;
+                }
+            }
+        } else {
+            acquire_profile(&settings.profile_dirs, mission_id, &events_tx, &cancel).await
+        };
+        let (profile_slot, profile_dir, _profile_lock) = match acquisition {
+            Ok(lease) => lease,
+            Err(result) => return result,
+        };
+        match drive_once(
+            &settings,
+            work_dir,
+            &download_dir,
+            message,
+            model,
+            mission_id,
+            &events_tx,
+            &cancel,
+            app_working_dir,
+            &fingerprint,
+            prior_attempts,
+            profile_slot,
+            &profile_dir,
+            attempt_resume.as_ref(),
+        )
+        .await
+        {
+            DriveOutcome::Terminal(result) => return result,
+            DriveOutcome::ResumeInvalid(code) => {
+                jobs::mark_abandoned(app_working_dir, mission_id, code);
+                prior_attempts = attempt_resume.map(|record| record.attempts).unwrap_or(0);
+                let _ = events_tx.send(AgentEvent::MissionActivity {
+                    label: "ChatGPT UI conversation could not be reattached — submitting fresh."
+                        .to_string(),
+                    tool_name: "chatgpt_ui_durability".to_string(),
+                    mission_id: Some(mission_id),
+                });
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_once(
+    settings: &Settings,
+    work_dir: &Path,
+    download_dir: &Path,
+    message: &str,
+    model: Option<&str>,
+    mission_id: Uuid,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    cancel: &CancellationToken,
+    app_working_dir: &Path,
+    fingerprint: &str,
+    prior_attempts: u32,
+    profile_slot: usize,
+    profile_dir: &Path,
+    resume: Option<&jobs::JobRecord>,
+) -> DriveOutcome {
     let mut command = Command::new(&settings.python_path);
     command
         .arg(&settings.driver_path)
@@ -431,20 +554,36 @@ pub async fn run_chatgpt_ui_turn(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return AgentResult::failure(format!("failed to start chatgpt_ui driver: {error}"), 0)
-                .with_terminal_reason(TerminalReason::LlmError)
+            return DriveOutcome::Terminal(
+                AgentResult::failure(format!("failed to start chatgpt_ui driver: {error}"), 0)
+                    .with_terminal_reason(TerminalReason::LlmError),
+            )
         }
     };
     #[cfg(unix)]
     let process_group = child.id().map(|pid| -(pid as i32));
 
-    let request = serde_json::json!({
+    // The prompt itself is passed to the driver over stdin only; the durable
+    // ledger never sees it (a fingerprint stands in for identity).
+    let mut request = serde_json::json!({
         "type": "run",
         "message": message,
         "model": model,
         "timeout_ms": settings.timeout.as_millis() as u64,
         "download_dir": download_dir,
+        "durability": true,
     });
+    if let Some(record) = resume {
+        request["resume"] = serde_json::json!({
+            "conversation_path": record.conversation_path,
+        });
+        jobs::touch_resume_attempt(app_working_dir, mission_id);
+        let _ = events_tx.send(AgentEvent::MissionActivity {
+            label: "Reattaching to the in-flight ChatGPT conversation…".to_string(),
+            tool_name: "chatgpt_ui_durability".to_string(),
+            mission_id: Some(mission_id),
+        });
+    }
     if let Some(mut stdin) = child.stdin.take() {
         if stdin
             .write_all(format!("{request}\n").as_bytes())
@@ -452,8 +591,10 @@ pub async fn run_chatgpt_ui_turn(
             .is_err()
         {
             terminate_child_tree(&mut child).await;
-            return AgentResult::failure("failed to send request to chatgpt_ui driver", 0)
-                .with_terminal_reason(TerminalReason::LlmError);
+            return DriveOutcome::Terminal(
+                AgentResult::failure("failed to send request to chatgpt_ui driver", 0)
+                    .with_terminal_reason(TerminalReason::LlmError),
+            );
         }
     }
 
@@ -464,6 +605,10 @@ pub async fn run_chatgpt_ui_turn(
     let mut pending_tools: HashMap<String, String> = HashMap::new();
     let mut artifact_receipts: Vec<(String, String)> = Vec::new();
     let mut completed = false;
+    // Once true, the prompt provably lives in a conversation: from here on,
+    // every non-complete exit must leave the ledger record resumable so a
+    // retried turn reattaches instead of resubmitting.
+    let mut submitted_recorded = resume.is_some();
     let deadline_at = Instant::now() + settings.timeout;
     let deadline = tokio::time::sleep_until(deadline_at);
     tokio::pin!(deadline);
@@ -472,21 +617,32 @@ pub async fn run_chatgpt_ui_turn(
         tokio::select! {
             _ = cancel.cancelled() => {
                 terminate_child_tree(&mut child).await;
-                return AgentResult::failure(
-                    if crate::api::routes::is_shutdown_initiated() {
+                let shutdown = crate::api::routes::is_shutdown_initiated();
+                if submitted_recorded {
+                    jobs::note_attempt_error(
+                        app_working_dir,
+                        mission_id,
+                        if shutdown { "server_shutdown" } else { "cancelled" },
+                    );
+                }
+                return DriveOutcome::Terminal(AgentResult::failure(
+                    if shutdown {
                         "Server restart — paused. Click Resume to continue."
                     } else {
                         "Mission cancelled"
                     }, 0
-                ).with_terminal_reason(if crate::api::routes::is_shutdown_initiated() {
+                ).with_terminal_reason(if shutdown {
                     TerminalReason::ServerShutdown
                 } else {
                     TerminalReason::Cancelled
-                });
+                }));
             }
             _ = &mut deadline => {
                 kill_child_tree(&mut child).await;
-                return timeout_result(settings.timeout);
+                if submitted_recorded {
+                    jobs::note_attempt_error(app_working_dir, mission_id, "timeout");
+                }
+                return DriveOutcome::Terminal(timeout_result(settings.timeout));
             }
             line = lines.next_line() => {
                 let line = match line {
@@ -494,17 +650,25 @@ pub async fn run_chatgpt_ui_turn(
                     Ok(None) => break,
                     Err(error) => {
                         terminate_child_tree(&mut child).await;
-                        return AgentResult::failure(format!("chatgpt_ui stream read failed: {error}"), 0)
-                            .with_terminal_reason(TerminalReason::LlmError);
+                        if submitted_recorded {
+                            jobs::note_attempt_error(app_working_dir, mission_id, "stream_error");
+                        }
+                        return DriveOutcome::Terminal(
+                            AgentResult::failure(format!("chatgpt_ui stream read failed: {error}"), 0)
+                                .with_terminal_reason(TerminalReason::LlmError),
+                        );
                     }
                 };
                 let event: DriverEvent = match serde_json::from_str(&line) {
                     Ok(event) => event,
                     Err(error) => {
                         terminate_child_tree(&mut child).await;
-                        return AgentResult::failure(
+                        if submitted_recorded {
+                            jobs::note_attempt_error(app_working_dir, mission_id, "driver_protocol");
+                        }
+                        return DriveOutcome::Terminal(AgentResult::failure(
                             format!("chatgpt_ui emitted an invalid protocol event: {error}"), 0
-                        ).with_terminal_reason(TerminalReason::LlmError);
+                        ).with_terminal_reason(TerminalReason::LlmError));
                     }
                 };
                 match event {
@@ -531,18 +695,24 @@ pub async fn run_chatgpt_ui_turn(
                     DriverEvent::ToolCall { id, name, args } => {
                         if pending_tools.insert(id.clone(), name.clone()).is_some() {
                             terminate_child_tree(&mut child).await;
-                            return AgentResult::failure(
+                            if submitted_recorded {
+                                jobs::note_attempt_error(app_working_dir, mission_id, "driver_protocol");
+                            }
+                            return DriveOutcome::Terminal(AgentResult::failure(
                                 "chatgpt_ui emitted a duplicate unresolved tool call id", 0
-                            ).with_terminal_reason(TerminalReason::LlmError);
+                            ).with_terminal_reason(TerminalReason::LlmError));
                         }
                         let _ = events_tx.send(AgentEvent::ToolCall { tool_call_id: id, name, args, mission_id: Some(mission_id) });
                     }
                     DriverEvent::ToolResult { id, name, result } => {
                         if pending_tools.remove(&id).as_deref() != Some(name.as_str()) {
                             terminate_child_tree(&mut child).await;
-                            return AgentResult::failure(
+                            if submitted_recorded {
+                                jobs::note_attempt_error(app_working_dir, mission_id, "driver_protocol");
+                            }
+                            return DriveOutcome::Terminal(AgentResult::failure(
                                 "chatgpt_ui emitted an unmatched tool result", 0
-                            ).with_terminal_reason(TerminalReason::LlmError);
+                            ).with_terminal_reason(TerminalReason::LlmError));
                         }
                         let _ = events_tx.send(AgentEvent::ToolResult { tool_call_id: id, name, result, mission_id: Some(mission_id) });
                     }
@@ -555,10 +725,50 @@ pub async fn run_chatgpt_ui_turn(
                     DriverEvent::Artifact { path, name, .. } => {
                         artifact_receipts.push((path, name));
                     }
+                    DriverEvent::Submitted { conversation_path } => {
+                        if resume.is_none() && !submitted_recorded {
+                            match jobs::record_submitted(
+                                app_working_dir,
+                                mission_id,
+                                fingerprint,
+                                model,
+                                profile_basename(profile_dir),
+                                &conversation_path,
+                                prior_attempts,
+                            ) {
+                                Ok(_) => submitted_recorded = true,
+                                Err(error) => {
+                                    // Not fatal: the turn continues, it is
+                                    // simply not durable across restarts.
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        error = %error,
+                                        "chatgpt_ui durability record rejected"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     DriverEvent::Error { code, message } => {
-                        let reason = if code.as_deref() == Some("auth_required") {
+                        terminate_child_tree(&mut child).await;
+                        let code_str = code.as_deref().unwrap_or("");
+                        if resume.is_some() {
+                            match code_str {
+                                "resume_not_found" => return DriveOutcome::ResumeInvalid("resume_not_found"),
+                                "resume_mismatch" => return DriveOutcome::ResumeInvalid("resume_mismatch"),
+                                _ => {}
+                            }
+                        }
+                        if submitted_recorded {
+                            jobs::note_attempt_error(
+                                app_working_dir,
+                                mission_id,
+                                if code_str.is_empty() { "other" } else { code_str },
+                            );
+                        }
+                        let reason = if code_str == "auth_required" {
                             TerminalReason::AuthError
-                        } else if code.as_deref() == Some("rate_limited") {
+                        } else if code_str == "rate_limited" {
                             TerminalReason::RateLimited
                         } else {
                             TerminalReason::LlmError
@@ -570,14 +780,13 @@ pub async fn run_chatgpt_ui_turn(
                             }
                             _ => crate::agents::FailureClass::ProviderError,
                         };
-                        terminate_child_tree(&mut child).await;
-                        return AgentResult::failure(format!("chatgpt_ui: {message}"), 0)
+                        return DriveOutcome::Terminal(AgentResult::failure(format!("chatgpt_ui: {message}"), 0)
                             .with_terminal_reason(reason)
                             .with_data(serde_json::json!({
                                 "provider_error_source": "chatgpt_ui_driver",
                                 "failure_class": failure_class,
                                 "classification_source": "structured",
-                            }));
+                            })));
                     }
                 }
             }
@@ -586,13 +795,23 @@ pub async fn run_chatgpt_ui_turn(
     let remaining = deadline_at.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         kill_child_tree(&mut child).await;
-        return timeout_result(settings.timeout);
+        if submitted_recorded {
+            jobs::note_attempt_error(app_working_dir, mission_id, "timeout");
+        }
+        return DriveOutcome::Terminal(timeout_result(settings.timeout));
     }
     let status = tokio::select! {
         _ = cancel.cancelled() => {
             terminate_child_tree(&mut child).await;
             let shutdown = crate::api::routes::is_shutdown_initiated();
-            return AgentResult::failure(
+            if submitted_recorded {
+                jobs::note_attempt_error(
+                    app_working_dir,
+                    mission_id,
+                    if shutdown { "server_shutdown" } else { "cancelled" },
+                );
+            }
+            return DriveOutcome::Terminal(AgentResult::failure(
                 if shutdown {
                     "Server restart — paused. Click Resume to continue."
                 } else {
@@ -602,28 +821,44 @@ pub async fn run_chatgpt_ui_turn(
                 TerminalReason::ServerShutdown
             } else {
                 TerminalReason::Cancelled
-            });
+            }));
         }
         _ = &mut deadline => {
             kill_child_tree(&mut child).await;
-            return timeout_result(settings.timeout);
+            if submitted_recorded {
+                jobs::note_attempt_error(app_working_dir, mission_id, "timeout");
+            }
+            return DriveOutcome::Terminal(timeout_result(settings.timeout));
         }
         status = tokio::time::timeout(remaining.min(Duration::from_secs(5)), child.wait()) => status,
     };
     let status = match status {
         Ok(Ok(status)) => Some(status),
         Ok(Err(error)) => {
-            return AgentResult::failure(format!("chatgpt_ui driver wait failed: {error}"), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
+            if submitted_recorded {
+                jobs::note_attempt_error(app_working_dir, mission_id, "driver_exit");
+            }
+            return DriveOutcome::Terminal(
+                AgentResult::failure(format!("chatgpt_ui driver wait failed: {error}"), 0)
+                    .with_terminal_reason(TerminalReason::LlmError),
+            );
         }
         Err(_) => {
             if Instant::now() >= deadline_at {
                 kill_child_tree(&mut child).await;
-                return timeout_result(settings.timeout);
+                if submitted_recorded {
+                    jobs::note_attempt_error(app_working_dir, mission_id, "timeout");
+                }
+                return DriveOutcome::Terminal(timeout_result(settings.timeout));
             }
             terminate_child_tree(&mut child).await;
-            return AgentResult::failure("chatgpt_ui driver did not exit after completion", 0)
-                .with_terminal_reason(TerminalReason::LlmError);
+            if submitted_recorded {
+                jobs::note_attempt_error(app_working_dir, mission_id, "driver_exit");
+            }
+            return DriveOutcome::Terminal(
+                AgentResult::failure("chatgpt_ui driver did not exit after completion", 0)
+                    .with_terminal_reason(TerminalReason::LlmError),
+            );
         }
     };
     // A well-behaved driver closes its browser before exiting, but enforce
@@ -640,7 +875,12 @@ pub async fn run_chatgpt_ui_turn(
         pending_tools.len(),
         status.is_some_and(|status| status.success()),
     ) {
-        return AgentResult::failure(message, 0).with_terminal_reason(TerminalReason::LlmError);
+        if submitted_recorded {
+            jobs::note_attempt_error(app_working_dir, mission_id, "driver_exit");
+        }
+        return DriveOutcome::Terminal(
+            AgentResult::failure(message, 0).with_terminal_reason(TerminalReason::LlmError),
+        );
     }
     const MAX_ARTIFACT_FILES: usize = 8;
     const MAX_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
@@ -666,6 +906,9 @@ pub async fn run_chatgpt_ui_turn(
             }
         }
     }
+    if submitted_recorded {
+        jobs::mark_completed(app_working_dir, mission_id);
+    }
     let mut result = AgentResult::success(output, 0)
         .with_terminal_reason(TerminalReason::TurnComplete)
         .with_data(serde_json::json!({
@@ -674,11 +917,15 @@ pub async fn run_chatgpt_ui_turn(
             "profile_slot": profile_slot + 1,
             "artifact_count": artifact_count,
             "artifact_bytes": artifact_bytes,
+            "durability": {
+                "resumed": resume.is_some(),
+                "durable": submitted_recorded,
+            },
         }));
     if let Some(model) = model_used {
         result = result.with_model(model);
     }
-    result
+    DriveOutcome::Terminal(result)
 }
 
 fn validate_completion(
