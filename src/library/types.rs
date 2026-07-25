@@ -483,10 +483,29 @@ pub struct ClaudeCodeAttribution {
 
 /// Claude Code configuration stored in the Library.
 /// Controls default model, agent preferences, and visibility for Claude Code backend.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub const CLAUDE_CODE_DEFAULT_MODEL: &str = "claude-opus-5";
+
+pub fn normalize_claude_code_default_model(model: Option<String>) -> String {
+    let configured = model.unwrap_or_default();
+    let trimmed = configured.trim();
+    if trimmed.is_empty()
+        || matches!(
+            trimmed,
+            "claude-opus-4-8"
+                | "claude-opus-4.8"
+                | "anthropic/claude-opus-4-8"
+                | "anthropic/claude-opus-4.8"
+        )
+    {
+        return CLAUDE_CODE_DEFAULT_MODEL.to_string();
+    }
+    trimmed.to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeCodeConfig {
     /// Default model to use for Claude Code missions.
-    /// Example: "claude-sonnet-4-20250514", "claude-opus-4-20250514"
+    /// Example: "claude-sonnet-5", "claude-opus-5"
     #[serde(default)]
     pub default_model: Option<String>,
     /// Default agent to pre-select for Claude Code missions.
@@ -500,6 +519,17 @@ pub struct ClaudeCodeConfig {
     /// Set commit/pr to empty strings to disable co-author attribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution: Option<ClaudeCodeAttribution>,
+}
+
+impl Default for ClaudeCodeConfig {
+    fn default() -> Self {
+        Self {
+            default_model: Some(CLAUDE_CODE_DEFAULT_MODEL.to_string()),
+            default_agent: None,
+            hidden_agents: Vec::new(),
+            attribution: None,
+        }
+    }
 }
 
 /// Codex configuration metadata stored in the Library.

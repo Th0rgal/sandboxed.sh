@@ -420,7 +420,9 @@ impl Config {
             .transpose()?
             .unwrap_or(true);
 
-        let default_model = std::env::var("DEFAULT_MODEL").ok();
+        let default_model = std::env::var("DEFAULT_MODEL")
+            .ok()
+            .map(upgrade_legacy_anthropic_default_model);
 
         // WORKING_DIR: default working directory for relative paths.
         // In production (release build), default to /root. In dev, default to current directory.
@@ -725,5 +727,36 @@ fn parse_bool(value: &str) -> Result<bool, String> {
         "1" | "true" | "t" | "yes" | "y" | "on" => Ok(true),
         "0" | "false" | "f" | "no" | "n" | "off" => Ok(false),
         other => Err(format!("expected boolean-like value, got: {}", other)),
+    }
+}
+
+fn upgrade_legacy_anthropic_default_model(model: String) -> String {
+    match model.trim() {
+        "claude-opus-4-8" | "claude-opus-4.8" => "claude-opus-5".to_string(),
+        "anthropic/claude-opus-4-8" | "anthropic/claude-opus-4.8" => {
+            "anthropic/claude-opus-5".to_string()
+        }
+        _ => model,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upgrade_legacy_anthropic_default_model;
+
+    #[test]
+    fn upgrades_legacy_anthropic_default_model() {
+        assert_eq!(
+            upgrade_legacy_anthropic_default_model("anthropic/claude-opus-4-8".to_string()),
+            "anthropic/claude-opus-5"
+        );
+        assert_eq!(
+            upgrade_legacy_anthropic_default_model("claude-opus-4.8".to_string()),
+            "claude-opus-5"
+        );
+        assert_eq!(
+            upgrade_legacy_anthropic_default_model("claude-sonnet-5".to_string()),
+            "claude-sonnet-5"
+        );
     }
 }

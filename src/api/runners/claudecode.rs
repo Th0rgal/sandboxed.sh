@@ -977,8 +977,8 @@ pub fn run_claudecode_turn<'a>(
         }
 
         if let Some(m) = model {
-            // Claude Code expects bare model IDs (e.g. "claude-opus-4-7"),
-            // not provider-prefixed ones (e.g. "anthropic/claude-opus-4-7").
+            // Claude Code expects bare model IDs (e.g. "claude-opus-5"),
+            // not provider-prefixed ones (e.g. "anthropic/claude-opus-5").
             let bare = m.strip_prefix("anthropic/").unwrap_or(m);
             args.push("--model".to_string());
             args.push(bare.to_string());

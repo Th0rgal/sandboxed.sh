@@ -2782,38 +2782,28 @@ pub(crate) async fn resolve_claudecode_default_model(
     config_profile: Option<&str>,
 ) -> Option<String> {
     // Keep this fallback aligned with Anthropic's model catalog:
-    // https://docs.anthropic.com/en/docs/about-claude/models/overview
-    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-fable-5";
-
+    // https://platform.claude.com/docs/en/about-claude/models/overview
     let lib = {
         let guard = library.read().await;
         guard.clone()
     };
 
     let Some(lib) = lib else {
-        return Some(CLAUDECODE_DEFAULT_MODEL.to_string());
+        return Some(crate::library::CLAUDE_CODE_DEFAULT_MODEL.to_string());
     };
 
     let profile = config_profile.unwrap_or("default");
     match lib.get_claudecode_config_for_profile(profile).await {
-        Ok(config) => {
-            let configured = config.default_model.and_then(|model| {
-                let trimmed = model.trim().to_string();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed)
-                }
-            });
-            configured.or_else(|| Some(CLAUDECODE_DEFAULT_MODEL.to_string()))
-        }
+        Ok(config) => Some(crate::library::normalize_claude_code_default_model(
+            config.default_model,
+        )),
         Err(err) => {
             tracing::warn!(
                 "Failed to load Claude Code config from library (profile: {}): {}",
                 profile,
                 err
             );
-            Some(CLAUDECODE_DEFAULT_MODEL.to_string())
+            Some(crate::library::CLAUDE_CODE_DEFAULT_MODEL.to_string())
         }
     }
 }
@@ -19342,6 +19332,11 @@ async fn run_single_control_turn(
     let requested_model_effort = model_effort;
     if let Some(ref model) = requested_model {
         config.default_model = Some(model.clone());
+    } else if is_claudecode && config.default_model.is_some() {
+        config.default_model = config
+            .default_model
+            .take()
+            .map(|model| crate::library::normalize_claude_code_default_model(Some(model)));
     } else if is_claudecode && config.default_model.is_none() {
         if let Some(default_model) =
             resolve_claudecode_default_model(&library, effective_config_profile.as_deref()).await
@@ -26557,8 +26552,38 @@ And the report:
             Some("claude-opus-4-7".to_string())
         );
         assert_eq!(
+            normalize_model_override_for_backend(Some("claudecode"), "anthropic/claude-opus-4-8"),
+            Some("claude-opus-4-8".to_string())
+        );
+        assert_eq!(
             normalize_model_override_for_backend(Some("codex"), "   "),
             None
+        );
+    }
+
+    #[test]
+    fn claudecode_default_is_opus_5_and_upgrades_legacy_opus_48() {
+        assert_eq!(
+            crate::library::normalize_claude_code_default_model(None),
+            "claude-opus-5"
+        );
+        assert_eq!(
+            crate::library::normalize_claude_code_default_model(Some(
+                "claude-opus-4-8".to_string()
+            )),
+            "claude-opus-5"
+        );
+        assert_eq!(
+            crate::library::normalize_claude_code_default_model(Some(
+                "anthropic/claude-opus-4.8".to_string()
+            )),
+            "claude-opus-5"
+        );
+        assert_eq!(
+            crate::library::normalize_claude_code_default_model(Some(
+                "claude-sonnet-5".to_string()
+            )),
+            "claude-sonnet-5"
         );
     }
 

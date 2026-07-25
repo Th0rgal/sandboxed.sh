@@ -60,7 +60,7 @@ const OPENROUTER_PROVIDER_ID: &str = "open-router";
 /// Best-effort seed slugs kept in the default config; prioritized when capping
 /// the models.dev OpenRouter catalog (which has no popularity sort).
 const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
-    "anthropic/claude-opus-4.8",
+    "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-4.6",
     "google/gemini-3.1-pro-preview",
     "openai/gpt-5.6",
@@ -726,7 +726,15 @@ fn default_providers_config() -> ProvidersConfig {
                 description: "Included in Claude Max".to_string(),
                 models: vec![
                     // Check Anthropic's current model IDs here:
-                    // https://docs.anthropic.com/en/docs/about-claude/models/overview
+                    // https://platform.claude.com/docs/en/about-claude/models/overview
+                    ProviderModel {
+                        id: "claude-opus-5".to_string(),
+                        name: "Claude Opus 5".to_string(),
+                        description: Some(
+                            "Default for complex agentic coding, adaptive thinking, 1M context"
+                                .to_string(),
+                        ),
+                    },
                     ProviderModel {
                         id: "claude-fable-5".to_string(),
                         name: "Claude Fable 5".to_string(),
@@ -739,7 +747,7 @@ fn default_providers_config() -> ProvidersConfig {
                         id: "claude-opus-4-8".to_string(),
                         name: "Claude Opus 4.8".to_string(),
                         description: Some(
-                            "Latest Opus model, recommended for hard coding and agentic tasks"
+                            "Previous-generation Opus model retained for explicit compatibility"
                                 .to_string(),
                         ),
                     },
@@ -888,12 +896,12 @@ fn default_providers_config() -> ProvidersConfig {
                     // The live catalog is merged from models.dev and /v1/models
                     // when available; these keep the picker useful before the
                     // background catalog finishes. IDs verified against
-                    // OpenRouter's public catalog on 2026-06-17 — treat as
+                    // OpenRouter's public catalog on 2026-07-25 — treat as
                     // best-effort seeds that the live catalog supersedes (slugs
                     // can drift as models are retired).
                     ProviderModel {
-                        id: "anthropic/claude-opus-4.8".to_string(),
-                        name: "Claude Opus 4.8".to_string(),
+                        id: "anthropic/claude-opus-5".to_string(),
+                        name: "Claude Opus 5".to_string(),
                         description: Some("Anthropic Claude via OpenRouter".to_string()),
                     },
                     ProviderModel {
@@ -2310,7 +2318,7 @@ pub async fn validate_model_override(
                     Ok(())
                 } else {
                     Err(format!(
-                        "Anthropic provider not configured. Expected a Claude model ID (e.g., 'claude-opus-4-7'), got '{}'",
+                        "Anthropic provider not configured. Expected a Claude model ID (e.g., 'claude-opus-5'), got '{}'",
                         model_override
                     ))
                 }
@@ -2464,17 +2472,18 @@ mod tests {
     }
 
     #[test]
-    fn default_anthropic_catalog_includes_opus_47() {
+    fn default_anthropic_catalog_leads_with_opus_5() {
         let defaults = default_providers_config();
         let anthropic = defaults
             .providers
             .iter()
             .find(|provider| provider.id == "anthropic")
             .expect("anthropic provider");
+        assert_eq!(anthropic.models[0].id, "claude-opus-5");
         assert!(anthropic
             .models
             .iter()
-            .any(|model| model.id == "claude-opus-4-7"));
+            .any(|model| model.id == "claude-opus-4-8"));
     }
 
     #[test]
@@ -2557,7 +2566,7 @@ mod tests {
         assert!(openrouter
             .models
             .iter()
-            .any(|model| model.id == "anthropic/claude-opus-4.8"));
+            .any(|model| model.id == "anthropic/claude-opus-5"));
         assert!(openrouter.models.iter().all(|model| model.id.contains('/')));
     }
 
@@ -2582,7 +2591,7 @@ mod tests {
         let mut entries: Vec<CatalogEntry> = (0..150)
             .map(|i| make(&format!("vendor/model-{i:03}")))
             .collect();
-        entries.push(make("anthropic/claude-opus-4.8"));
+        entries.push(make("anthropic/claude-opus-5"));
         entries.push(make("openai/gpt-5.6"));
         entries.push(make("openai/gpt-5.5"));
 
@@ -2592,7 +2601,7 @@ mod tests {
             OPENROUTER_SEED_MODEL_IDS,
         );
         assert_eq!(capped.len(), MAX_CATALOG_MODELS_PER_PROVIDER);
-        assert_eq!(capped[0].id, "anthropic/claude-opus-4.8");
+        assert_eq!(capped[0].id, "anthropic/claude-opus-5");
         assert!(capped.iter().any(|entry| entry.id == "openai/gpt-5.6"));
         assert!(capped.iter().any(|entry| entry.id == "openai/gpt-5.5"));
     }
@@ -2698,7 +2707,7 @@ mod tests {
         assert!(anthropic
             .models
             .iter()
-            .any(|model| model.id == "claude-opus-4-7"));
+            .any(|model| model.id == "claude-opus-5"));
     }
 
     #[test]
@@ -2730,7 +2739,7 @@ mod tests {
         assert!(anthropic
             .models
             .iter()
-            .any(|model| model.id == "claude-opus-4-7"));
+            .any(|model| model.id == "claude-opus-5"));
         assert_eq!(
             anthropic
                 .models

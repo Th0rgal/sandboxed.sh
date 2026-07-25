@@ -285,7 +285,7 @@ Configure your mission:
    - **Custom agents** - Native agents configured in `.opencode/agents/`
 
 3. **Model Override (optional)** - Force a specific model for this mission:
-   - **Claude Code**: use a raw model ID (e.g., `claude-opus-4-7`)
+   - **Claude Code**: use a raw model ID (e.g., `claude-opus-5`)
    - **Codex**: use a raw model ID (e.g., `gpt-5.5` or `gpt-5.3-codex`)
    - **Gemini**: use a raw model ID (e.g., `gemini-3.1-pro-preview`)
    - **Grok**: use the canonical raw CLI model ID `grok-4.5`; availability is

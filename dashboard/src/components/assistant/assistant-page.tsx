@@ -1707,7 +1707,11 @@ export default function AssistantPage() {
                   onChange={(e) => setCreateModelOverride(e.target.value)}
                   className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50 text-sm [&>option]:bg-slate-800 [&>option]:text-white [&>optgroup]:bg-slate-900 [&>optgroup]:text-white/70"
                 >
-                  <option value="">No override (use default)</option>
+                  <option value="">
+                    {createBackend === 'claudecode'
+                      ? 'No override (configured default; fallback claude-opus-5)'
+                      : 'No override (use default)'}
+                  </option>
                   {(() => {
                     const groupedOptions = new Map<string, Array<{ value: string; label: string; description?: string }>>();
                     for (const option of modelOptions) {
@@ -1899,7 +1903,11 @@ export default function AssistantPage() {
                   onChange={(e) => setEditModelOverride(e.target.value)}
                   className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50 text-sm [&>option]:bg-slate-800 [&>option]:text-white [&>optgroup]:bg-slate-900 [&>optgroup]:text-white/70"
                 >
-                  <option value="">No override (use default)</option>
+                  <option value="">
+                    {(editBackend || 'claudecode') === 'claudecode'
+                      ? 'No override (configured default; fallback claude-opus-5)'
+                      : 'No override (use default)'}
+                  </option>
                   {(() => {
                     const groupedOptions = new Map<string, Array<{ value: string; label: string; description?: string }>>();
                     for (const option of editModelOptions) {
