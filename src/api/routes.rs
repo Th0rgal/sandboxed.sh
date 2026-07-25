@@ -330,11 +330,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                 }),
                 "chatgpt_ui" => serde_json::json!({
                     "profile_dir": null,
+                    "profile_dirs": [],
                     "driver_path": null,
                     "python_path": "python3",
                     "browser": "chromium",
                     "headless": true,
-                    "timeout_secs": 900,
+                    "timeout_secs": 14400,
                     "model": null
                 }),
                 _ => serde_json::json!({}),

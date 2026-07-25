@@ -327,7 +327,9 @@ async def run(args, request) -> None:
     if not isinstance(message, str) or not message.strip():
         fail("invalid_request", "message must be a non-empty string")
         return
-    timeout_ms = max(30_000, min(int(request.get("timeout_ms", 900_000)), 7_200_000))
+    timeout_ms = max(
+        30_000, min(int(request.get("timeout_ms", 14_400_000)), 86_400_000)
+    )
     requested_model = request.get("model") or ""
     requested_download_dir = request.get("download_dir")
     download_dir = None

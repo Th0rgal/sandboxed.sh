@@ -18,6 +18,7 @@ const { refreshBackendConfigs, backendConfigsFixture } = vi.hoisted(() => ({
       enabled: false,
       settings: {
         profile_dir: null,
+        profile_dirs: [],
         driver_path: null,
         python_path: null,
         proxy_server: null,
@@ -122,6 +123,7 @@ describe('BackendsPage ChatGPT UI settings', () => {
         'chatgpt_ui',
         expect.objectContaining({
           profile_dir: '/var/lib/sandboxed-sh/chatgpt-profile',
+          profile_dirs: [],
           driver_path: '/opt/sandboxed-sh/scripts/chatgpt_ui_driver.py',
           python_path: '/opt/sandboxed-sh/chatgpt-ui-venv/bin/python',
           proxy_server: 'socks5://127.0.0.1:10880',
@@ -129,7 +131,7 @@ describe('BackendsPage ChatGPT UI settings', () => {
           model: 'gpt-5.6-pro',
           browser: 'chromium',
           headless: false,
-          timeout_secs: 900,
+          timeout_secs: 14400,
         }),
         { enabled: true }
       );

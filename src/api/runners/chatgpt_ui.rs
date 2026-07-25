@@ -20,7 +20,9 @@ use uuid::Uuid;
 
 use crate::agents::{AgentResult, TerminalReason};
 use crate::api::control::AgentEvent;
-use crate::api::mission_runner::{get_backend_string_setting, get_backend_u64_setting};
+use crate::api::mission_runner::{
+    get_backend_string_list_setting, get_backend_string_setting, get_backend_u64_setting,
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -63,7 +65,7 @@ enum DriverEvent {
 struct Settings {
     driver_path: PathBuf,
     python_path: String,
-    profile_dir: PathBuf,
+    profile_dirs: Vec<PathBuf>,
     browser: String,
     proxy_server: Option<String>,
     display: Option<String>,
@@ -79,7 +81,7 @@ impl Drop for ProfileLock {
     }
 }
 
-fn lock_profile(profile_dir: &Path) -> Result<ProfileLock, String> {
+fn try_lock_profile(profile_dir: &Path) -> Result<Option<ProfileLock>, String> {
     let name = profile_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -95,10 +97,59 @@ fn lock_profile(profile_dir: &Path) -> Result<ProfileLock, String> {
         .write(true)
         .open(&lock_path)
         .map_err(|error| format!("cannot create ChatGPT UI profile lock: {error}"))?;
-    file.try_lock_exclusive().map_err(|_| {
-        "ChatGPT UI profile is already in use; each concurrent mission needs a separate profile directory".to_string()
-    })?;
-    Ok(ProfileLock(file))
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(ProfileLock(file))),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(format!("cannot lock ChatGPT UI profile: {error}")),
+    }
+}
+
+async fn acquire_profile(
+    profile_dirs: &[PathBuf],
+    mission_id: Uuid,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    cancel: &CancellationToken,
+) -> Result<(usize, PathBuf, ProfileLock), AgentResult> {
+    let mut announced_wait = false;
+    loop {
+        for (slot, profile_dir) in profile_dirs.iter().enumerate() {
+            match try_lock_profile(profile_dir) {
+                Ok(Some(lock)) => return Ok((slot, profile_dir.clone(), lock)),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(AgentResult::failure(error, 0)
+                        .with_terminal_reason(TerminalReason::LlmError))
+                }
+            }
+        }
+        if !announced_wait {
+            let _ = events_tx.send(AgentEvent::MissionActivity {
+                label: "Waiting for a ChatGPT UI browser slot…".to_string(),
+                tool_name: "chatgpt_ui_profile_pool".to_string(),
+                mission_id: Some(mission_id),
+            });
+            announced_wait = true;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                let shutdown = crate::api::routes::is_shutdown_initiated();
+                return Err(AgentResult::failure(
+                    if shutdown {
+                        "Server restart — paused while waiting for a ChatGPT UI browser slot."
+                    } else {
+                        "Mission cancelled while waiting for a ChatGPT UI browser slot"
+                    },
+                    0,
+                )
+                .with_terminal_reason(if shutdown {
+                    TerminalReason::ServerShutdown
+                } else {
+                    TerminalReason::Cancelled
+                }));
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
+    }
 }
 
 async fn prepare_download_dir(work_dir: &Path) -> Result<PathBuf, String> {
@@ -165,6 +216,19 @@ fn validate_artifact_receipt(
     ))
 }
 
+fn timeout_result(timeout: Duration) -> AgentResult {
+    AgentResult::failure(
+        format!("chatgpt_ui timed out after {} seconds", timeout.as_secs()),
+        0,
+    )
+    .with_terminal_reason(TerminalReason::LlmError)
+    .with_data(serde_json::json!({
+        "provider_error_source": "chatgpt_ui_driver",
+        "failure_class": crate::agents::FailureClass::ProviderError,
+        "classification_source": "structured",
+    }))
+}
+
 fn parse_bool_setting(key: &str, default: bool) -> bool {
     crate::api::mission_runner::get_backend_bool_setting("chatgpt_ui", key).unwrap_or(default)
 }
@@ -219,17 +283,17 @@ fn validate_display(value: &str) -> Result<(), String> {
 }
 
 fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
-    let profile = get_backend_string_setting("chatgpt_ui", "profile_dir")
-        .ok_or_else(|| "chatgpt_ui profile_dir is required".to_string())?;
-    let profile_dir = PathBuf::from(profile);
-    if !profile_dir.is_absolute() {
-        return Err("chatgpt_ui profile_dir must be an absolute path".to_string());
-    }
-    if !profile_dir.is_dir() {
-        return Err(format!(
-            "chatgpt_ui profile_dir does not exist or is not a directory: {}",
-            profile_dir.display()
-        ));
+    let mut configured_profiles = get_backend_string_setting("chatgpt_ui", "profile_dir")
+        .into_iter()
+        .chain(get_backend_string_list_setting(
+            "chatgpt_ui",
+            "profile_dirs",
+        ))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    configured_profiles.dedup();
+    if configured_profiles.is_empty() {
+        return Err("chatgpt_ui profile_dir or profile_dirs is required".to_string());
     }
     let driver_path = get_backend_string_setting("chatgpt_ui", "driver_path")
         .map(PathBuf::from)
@@ -243,20 +307,37 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
             driver_path.display()
         ));
     }
-    let canonical_profile = profile_dir
-        .canonicalize()
-        .map_err(|error| format!("failed to resolve chatgpt_ui profile_dir: {error}"))?;
-    if let Ok(canonical_working_dir) = app_working_dir.canonicalize() {
-        if canonical_profile.starts_with(canonical_working_dir) {
+    let canonical_working_dir = app_working_dir.canonicalize().ok();
+    let mut profile_dirs = Vec::with_capacity(configured_profiles.len());
+    for profile_dir in configured_profiles {
+        if !profile_dir.is_absolute() {
+            return Err("chatgpt_ui profile directories must be absolute paths".to_string());
+        }
+        if !profile_dir.is_dir() {
+            return Err(format!(
+                "chatgpt_ui profile directory does not exist or is not a directory: {}",
+                profile_dir.display()
+            ));
+        }
+        let canonical_profile = profile_dir
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve chatgpt_ui profile directory: {error}"))?;
+        if canonical_working_dir
+            .as_ref()
+            .is_some_and(|working_dir| canonical_profile.starts_with(working_dir))
+        {
             return Err(
-                "chatgpt_ui profile_dir must be outside the sandboxed.sh working directory"
+                "chatgpt_ui profile directories must be outside the sandboxed.sh working directory"
                     .to_string(),
             );
         }
+        if !profile_dirs.contains(&canonical_profile) {
+            profile_dirs.push(canonical_profile);
+        }
     }
-    let timeout_secs = get_backend_u64_setting("chatgpt_ui", "timeout_secs").unwrap_or(900);
-    if !(30..=7200).contains(&timeout_secs) {
-        return Err("chatgpt_ui timeout_secs must be between 30 and 7200".to_string());
+    let timeout_secs = get_backend_u64_setting("chatgpt_ui", "timeout_secs").unwrap_or(14_400);
+    if !(30..=86_400).contains(&timeout_secs) {
+        return Err("chatgpt_ui timeout_secs must be between 30 and 86400".to_string());
     }
     let browser = get_backend_string_setting("chatgpt_ui", "browser")
         .unwrap_or_else(|| "chromium".to_string());
@@ -283,7 +364,7 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
         driver_path,
         python_path: get_backend_string_setting("chatgpt_ui", "python_path")
             .unwrap_or_else(|| "python3".to_string()),
-        profile_dir: canonical_profile,
+        profile_dirs,
         browser,
         proxy_server,
         display,
@@ -308,12 +389,11 @@ pub async fn run_chatgpt_ui_turn(
             return AgentResult::failure(error, 0).with_terminal_reason(TerminalReason::AuthError)
         }
     };
-    let _profile_lock = match lock_profile(&settings.profile_dir) {
-        Ok(lock) => lock,
-        Err(error) => {
-            return AgentResult::failure(error, 0).with_terminal_reason(TerminalReason::LlmError)
-        }
-    };
+    let (profile_slot, profile_dir, _profile_lock) =
+        match acquire_profile(&settings.profile_dirs, mission_id, &events_tx, &cancel).await {
+            Ok(lease) => lease,
+            Err(result) => return result,
+        };
     let download_dir = match prepare_download_dir(work_dir).await {
         Ok(path) => path,
         Err(error) => {
@@ -325,7 +405,7 @@ pub async fn run_chatgpt_ui_turn(
     command
         .arg(&settings.driver_path)
         .arg("--profile-dir")
-        .arg(&settings.profile_dir)
+        .arg(&profile_dir)
         .arg("--browser")
         .arg(&settings.browser)
         .arg("--headless")
@@ -406,9 +486,7 @@ pub async fn run_chatgpt_ui_turn(
             }
             _ = &mut deadline => {
                 kill_child_tree(&mut child).await;
-                return AgentResult::failure(
-                    format!("chatgpt_ui timed out after {} seconds", settings.timeout.as_secs()), 0
-                ).with_terminal_reason(TerminalReason::LlmError);
+                return timeout_result(settings.timeout);
             }
             line = lines.next_line() => {
                 let line = match line {
@@ -508,14 +586,7 @@ pub async fn run_chatgpt_ui_turn(
     let remaining = deadline_at.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         kill_child_tree(&mut child).await;
-        return AgentResult::failure(
-            format!(
-                "chatgpt_ui timed out after {} seconds",
-                settings.timeout.as_secs()
-            ),
-            0,
-        )
-        .with_terminal_reason(TerminalReason::LlmError);
+        return timeout_result(settings.timeout);
     }
     let status = tokio::select! {
         _ = cancel.cancelled() => {
@@ -535,9 +606,7 @@ pub async fn run_chatgpt_ui_turn(
         }
         _ = &mut deadline => {
             kill_child_tree(&mut child).await;
-            return AgentResult::failure(
-                format!("chatgpt_ui timed out after {} seconds", settings.timeout.as_secs()), 0
-            ).with_terminal_reason(TerminalReason::LlmError);
+            return timeout_result(settings.timeout);
         }
         status = tokio::time::timeout(remaining.min(Duration::from_secs(5)), child.wait()) => status,
     };
@@ -550,14 +619,7 @@ pub async fn run_chatgpt_ui_turn(
         Err(_) => {
             if Instant::now() >= deadline_at {
                 kill_child_tree(&mut child).await;
-                return AgentResult::failure(
-                    format!(
-                        "chatgpt_ui timed out after {} seconds",
-                        settings.timeout.as_secs()
-                    ),
-                    0,
-                )
-                .with_terminal_reason(TerminalReason::LlmError);
+                return timeout_result(settings.timeout);
             }
             terminate_child_tree(&mut child).await;
             return AgentResult::failure("chatgpt_ui driver did not exit after completion", 0)
@@ -609,6 +671,7 @@ pub async fn run_chatgpt_ui_turn(
         .with_data(serde_json::json!({
             "backend": "chatgpt_ui",
             "usage_source": "chatgpt_web_subscription",
+            "profile_slot": profile_slot + 1,
             "artifact_count": artifact_count,
             "artifact_bytes": artifact_bytes,
         }));
@@ -706,14 +769,54 @@ mod tests {
     }
 
     #[test]
+    fn timeout_is_a_structured_provider_failure() {
+        let result = timeout_result(Duration::from_secs(900));
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+        assert_eq!(result.output, "chatgpt_ui timed out after 900 seconds");
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|data| data.get("failure_class"))
+                .and_then(serde_json::Value::as_str),
+            Some("provider_error")
+        );
+    }
+
+    #[test]
     fn profile_lock_is_exclusive_and_reusable() {
         let root = tempfile::tempdir().unwrap();
         let profile = root.path().join("profile");
         std::fs::create_dir(&profile).unwrap();
-        let first = lock_profile(&profile).unwrap();
-        assert!(lock_profile(&profile).is_err());
+        let first = try_lock_profile(&profile).unwrap().unwrap();
+        assert!(try_lock_profile(&profile).unwrap().is_none());
         drop(first);
-        assert!(lock_profile(&profile).is_ok());
+        assert!(try_lock_profile(&profile).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn profile_pool_uses_the_next_free_authenticated_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let first_profile = root.path().join("profile-1");
+        let second_profile = root.path().join("profile-2");
+        std::fs::create_dir(&first_profile).unwrap();
+        std::fs::create_dir(&second_profile).unwrap();
+        let _first_lease = try_lock_profile(&first_profile).unwrap().unwrap();
+        let (events_tx, _) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+
+        let (slot, selected, _lease) = acquire_profile(
+            &[first_profile, second_profile.clone()],
+            Uuid::new_v4(),
+            &events_tx,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(slot, 1);
+        assert_eq!(selected, second_profile);
     }
 
     #[test]

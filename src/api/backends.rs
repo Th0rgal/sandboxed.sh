@@ -324,32 +324,30 @@ pub async fn update_backend_config(
                 .get("profile_dir")
                 .and_then(|value| value.as_str())
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "profile_dir is required".to_string(),
-                    )
-                })?;
-            let profile_path = std::path::Path::new(profile);
-            if !profile_path.is_absolute() {
+                .filter(|value| !value.is_empty());
+            let profile_dirs = settings
+                .get("profile_dirs")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if profile.is_none() && profile_dirs.is_empty() {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "profile_dir must be an absolute path".to_string(),
+                    "profile_dir or profile_dirs is required".to_string(),
                 ));
             }
-            if !profile_path.is_dir() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "profile_dir must name an existing directory".to_string(),
-                ));
-            }
-            let canonical_profile = profile_path.canonicalize().map_err(|error| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to resolve profile_dir: {error}"),
-                )
-            })?;
+            let stored_profile = profile.map(str::to_string);
+            let stored_profile_dirs = profile_dirs
+                .iter()
+                .map(|profile| (*profile).to_string())
+                .collect::<Vec<_>>();
             let canonical_working_dir =
                 state.config.working_dir.canonicalize().map_err(|error| {
                     (
@@ -357,11 +355,32 @@ pub async fn update_backend_config(
                         format!("failed to resolve server working directory: {error}"),
                     )
                 })?;
-            if canonical_profile.starts_with(&canonical_working_dir) {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "profile_dir must be outside the sandboxed.sh working directory".to_string(),
-                ));
+            for profile in profile.into_iter().chain(profile_dirs) {
+                let profile_path = std::path::Path::new(profile);
+                if !profile_path.is_absolute() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "ChatGPT UI profile directories must be absolute paths".to_string(),
+                    ));
+                }
+                if !profile_path.is_dir() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("ChatGPT UI profile directory does not exist: {profile}"),
+                    ));
+                }
+                let canonical_profile = profile_path.canonicalize().map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("failed to resolve ChatGPT UI profile directory: {error}"),
+                    )
+                })?;
+                if canonical_profile.starts_with(&canonical_working_dir) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "ChatGPT UI profile directories must be outside the sandboxed.sh working directory".to_string(),
+                    ));
+                }
             }
             let driver_path = settings
                 .get("driver_path")
@@ -395,11 +414,11 @@ pub async fn update_backend_config(
             let timeout_secs = settings
                 .get("timeout_secs")
                 .and_then(|value| value.as_u64())
-                .unwrap_or(900);
-            if !(30..=7200).contains(&timeout_secs) {
+                .unwrap_or(14_400);
+            if !(30..=86_400).contains(&timeout_secs) {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "timeout_secs must be between 30 and 7200".to_string(),
+                    "timeout_secs must be between 30 and 86400".to_string(),
                 ));
             }
             let browser = settings
@@ -484,7 +503,8 @@ pub async fn update_backend_config(
                 }
             }
             serde_json::json!({
-                "profile_dir": canonical_profile,
+                "profile_dir": stored_profile,
+                "profile_dirs": stored_profile_dirs,
                 "driver_path": driver_path,
                 "python_path": python_path,
                 "browser": browser,

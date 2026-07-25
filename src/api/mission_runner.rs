@@ -3948,6 +3948,31 @@ pub(crate) fn get_backend_string_setting(backend_id: &str, key: &str) -> Option<
     None
 }
 
+/// Read a string-array setting from a backend's config entry.
+pub(crate) fn get_backend_string_list_setting(backend_id: &str, key: &str) -> Vec<String> {
+    let Some(configs) = read_backend_configs() else {
+        return Vec::new();
+    };
+    configs
+        .into_iter()
+        .find_map(|config| {
+            (config.get("id")?.as_str()? == backend_id).then(|| {
+                config
+                    .get("settings")
+                    .and_then(|settings| settings.get(key))
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
 /// Read an unsigned integer setting from a backend's config entry.
 pub(crate) fn get_backend_u64_setting(backend_id: &str, key: &str) -> Option<u64> {
     let configs = read_backend_configs()?;
@@ -8536,6 +8561,10 @@ fn find_subslice(haystack: &[char], needle: &str, from: usize) -> Option<usize> 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RunningMissionInfo {
     pub mission_id: Uuid,
+    /// Backend captured when this runner started. Mission settings may change
+    /// concurrently, but those changes apply only to a later turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_id: Option<String>,
     pub state: String,
     pub queue_len: usize,
     pub history_len: usize,
@@ -8573,6 +8602,7 @@ impl From<&MissionRunner> for RunningMissionInfo {
             > 0;
         Self {
             mission_id: runner.mission_id,
+            backend_id: Some(runner.backend_id.clone()),
             state: match runner.state {
                 MissionRunState::Queued => "queued".to_string(),
                 MissionRunState::Running => "running".to_string(),
@@ -8583,7 +8613,15 @@ impl From<&MissionRunner> for RunningMissionInfo {
             history_len: runner.history.len(),
             seconds_since_activity,
             tool_call_in_flight,
-            health: running_health(runner.state, seconds_since_activity, tool_call_in_flight),
+            health: if runner.backend_id == "chatgpt_ui" && runner.state == MissionRunState::Running
+            {
+                // GPT Pro can keep its visible DOM at `Pro thinking` for the
+                // whole hidden reasoning phase. The runner/driver owns an
+                // absolute deadline, so DOM-event age is not stall evidence.
+                MissionHealth::Healthy
+            } else {
+                running_health(runner.state, seconds_since_activity, tool_call_in_flight)
+            },
             expected_deliverables: runner.deliverables.deliverables.len(),
             current_activity: runner.current_activity.clone(),
             subtask_total: runner.subtasks.len(),
