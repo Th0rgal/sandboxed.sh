@@ -5,10 +5,15 @@ import unittest
 
 from scripts.chatgpt_ui_driver import (
     MODEL_PICKER_READY_TIMEOUT_MS,
+    SEND_BUTTON_NAME,
+    SEND_CONTROL_TESTIDS,
+    STOP_BUTTON_NAME,
+    STOP_CONTROL_TESTIDS,
     choose_intelligence_model,
     close_context_quietly,
     download_control_key,
     downloadable_href,
+    locate_composer_control,
     model_selection,
     safe_download_name,
 )
@@ -61,6 +66,46 @@ class ComposerPage:
         return self.picker
 
 
+class FakeControl:
+    def __init__(self, visible: bool) -> None:
+        self.visible = visible
+
+    @property
+    def last(self):
+        return self
+
+    async def count(self) -> int:
+        return 1 if self.visible else 0
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+
+class FakeComposerForm:
+    def __init__(self, control: FakeControl) -> None:
+        self.control = control
+        self.requested_role = None
+        self.requested_name = None
+
+    def get_by_role(self, role, name=None):
+        self.requested_role = role
+        self.requested_name = name
+        return self.control
+
+
+class FakeComposerPage:
+    def __init__(self, testid_visible: bool, fallback_visible: bool) -> None:
+        self.testid_control = FakeControl(testid_visible)
+        self.form = FakeComposerForm(FakeControl(fallback_visible))
+        self.selectors = []
+
+    def locator(self, selector):
+        self.selectors.append(selector)
+        if selector == "form":
+            return self.form
+        return self.testid_control
+
+
 class ChatGptUiDriverTests(unittest.TestCase):
     def test_cleanup_preserves_existing_protocol_result(self) -> None:
         asyncio.run(close_context_quietly(ClosedContext()))
@@ -88,6 +133,48 @@ class ChatGptUiDriverTests(unittest.TestCase):
             button.wait_timeout, ("visible", MODEL_PICKER_READY_TIMEOUT_MS)
         )
         self.assertFalse(button.clicked)
+
+    def test_composer_control_prefers_stable_test_ids(self) -> None:
+        page = FakeComposerPage(testid_visible=True, fallback_visible=True)
+
+        control, used_fallback = asyncio.run(
+            locate_composer_control(page, SEND_CONTROL_TESTIDS, SEND_BUTTON_NAME)
+        )
+
+        self.assertIs(control, page.testid_control)
+        self.assertFalse(used_fallback)
+        self.assertNotIn("form", page.selectors)
+
+    def test_composer_control_falls_back_to_the_composer_scoped_role(self) -> None:
+        page = FakeComposerPage(testid_visible=False, fallback_visible=True)
+
+        control, used_fallback = asyncio.run(
+            locate_composer_control(page, STOP_CONTROL_TESTIDS, STOP_BUTTON_NAME)
+        )
+
+        self.assertIs(control, page.form.control)
+        self.assertTrue(used_fallback)
+        self.assertEqual(page.form.requested_role, "button")
+        self.assertIs(page.form.requested_name, STOP_BUTTON_NAME)
+        self.assertEqual(page.selectors[-1], "form")
+
+    def test_composer_control_reports_absence_instead_of_guessing(self) -> None:
+        page = FakeComposerPage(testid_visible=False, fallback_visible=False)
+
+        control, used_fallback = asyncio.run(
+            locate_composer_control(page, SEND_CONTROL_TESTIDS, SEND_BUTTON_NAME)
+        )
+
+        self.assertIsNone(control)
+        self.assertFalse(used_fallback)
+
+    def test_composer_control_names_are_anchored(self) -> None:
+        self.assertIsNotNone(SEND_BUTTON_NAME.match("Send prompt"))
+        self.assertIsNotNone(SEND_BUTTON_NAME.match("Send"))
+        self.assertIsNone(SEND_BUTTON_NAME.match("Resend message"))
+        self.assertIsNone(SEND_BUTTON_NAME.match("Sending options"))
+        self.assertIsNotNone(STOP_BUTTON_NAME.match("Stop generating"))
+        self.assertIsNone(STOP_BUTTON_NAME.match("Nonstop mode"))
 
     def test_download_links_are_limited_to_chatgpt_artifact_surfaces(self) -> None:
         self.assertTrue(downloadable_href("sandbox:/mnt/data/report.pdf"))

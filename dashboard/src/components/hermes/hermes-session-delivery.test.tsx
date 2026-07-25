@@ -49,7 +49,7 @@ describe("Hermes Desktop durable delivery", () => {
       timeout?: number,
     ) => {
       polls.push({ handler: handler as () => void, timeout });
-        return 1 as unknown as ReturnType<typeof window.setInterval>;
+      return 1 as unknown as ReturnType<typeof window.setInterval>;
     }) as unknown as typeof window.setInterval);
     intervalSpy = spy;
   });
@@ -59,45 +59,54 @@ describe("Hermes Desktop durable delivery", () => {
     vi.clearAllMocks();
   });
 
-  test("shows a callback appended to the active API session", async () => {
-    render(<HermesThread />);
+  test(
+    "shows a callback appended to the active API session",
+    async () => {
+      render(<HermesThread />);
 
-    fireEvent.click(screen.getByText("New conversation"));
-    fireEvent.click(await screen.findByText("Build watcher"));
+      fireEvent.click(screen.getByText("New conversation"));
+      fireEvent.click(await screen.findByText("Build watcher"));
 
-    expect(
-      await screen.findByText("I will report back here."),
-    ).toBeInTheDocument();
-    await waitFor(() =>
-      expect(polls.some(({ timeout }) => timeout === 5_000)).toBe(true),
-    );
+      expect(
+        await screen.findByText("I will report back here."),
+      ).toBeInTheDocument();
+      await waitFor(
+        () => expect(polls.some(({ timeout }) => timeout === 5_000)).toBe(true),
+        { timeout: 5_000 },
+      );
 
-    mockedMessages.mockResolvedValue([
-      {
-        id: 1,
-        role: "user",
-        content: "Wait until the build finishes",
-      },
-      {
-        id: 2,
-        role: "assistant",
-        content: "I will report back here.",
-      },
-      {
-        id: 3,
-        role: "assistant",
-        content: "The build finished successfully.",
-      },
-    ]);
+      // Isolate the callback refresh from the initial session load. React may
+      // perform extra effect work under load/StrictMode, so an absolute call
+      // count from render is inherently racy.
+      mockedMessages.mockClear();
+      mockedMessages.mockResolvedValue([
+        {
+          id: 1,
+          role: "user",
+          content: "Wait until the build finishes",
+        },
+        {
+          id: 2,
+          role: "assistant",
+          content: "I will report back here.",
+        },
+        {
+          id: 3,
+          role: "assistant",
+          content: "The build finished successfully.",
+        },
+      ]);
 
-    const poll = polls.find(({ timeout }) => timeout === 5_000)?.handler;
-    await act(async () => {
-      poll?.();
-    });
-    await waitFor(() => expect(mockedMessages).toHaveBeenCalledTimes(2));
+      const poll = polls.find(({ timeout }) => timeout === 5_000)?.handler;
+      await act(async () => {
+        poll?.();
+      });
+      await waitFor(() => expect(mockedMessages).toHaveBeenCalledTimes(1));
 
-    expect(
-      await screen.findByText("The build finished successfully."),
-    ).toBeInTheDocument();
-  });
+      expect(
+        await screen.findByText("The build finished successfully."),
+      ).toBeInTheDocument();
+    },
+    10_000,
+  );
 });

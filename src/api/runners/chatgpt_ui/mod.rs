@@ -3,13 +3,14 @@
 //! The browser helper speaks NDJSON on stdout. Browser profiles remain outside
 //! mission workspaces and are referenced by an operator-supplied absolute path.
 
+pub mod chromium_cleanup;
+pub mod profile_pool;
+
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use fs2::FileExt;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -18,11 +19,13 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::agents::{AgentResult, TerminalReason};
+use crate::agents::{AgentResult, FailureClass, TerminalReason};
 use crate::api::control::AgentEvent;
 use crate::api::mission_runner::{
     get_backend_string_list_setting, get_backend_string_setting, get_backend_u64_setting,
 };
+use chromium_cleanup::SingletonCleanup;
+use profile_pool::SlotFailureKind;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -71,85 +74,6 @@ struct Settings {
     display: Option<String>,
     timeout: Duration,
     headless: bool,
-}
-
-struct ProfileLock(File);
-
-impl Drop for ProfileLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
-    }
-}
-
-fn try_lock_profile(profile_dir: &Path) -> Result<Option<ProfileLock>, String> {
-    let name = profile_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("profile");
-    let lock_path = profile_dir
-        .parent()
-        .unwrap_or_else(|| Path::new("/"))
-        .join(format!(".{name}.sandboxed-chatgpt-ui.lock"));
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| format!("cannot create ChatGPT UI profile lock: {error}"))?;
-    match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(ProfileLock(file))),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(error) => Err(format!("cannot lock ChatGPT UI profile: {error}")),
-    }
-}
-
-async fn acquire_profile(
-    profile_dirs: &[PathBuf],
-    mission_id: Uuid,
-    events_tx: &broadcast::Sender<AgentEvent>,
-    cancel: &CancellationToken,
-) -> Result<(usize, PathBuf, ProfileLock), AgentResult> {
-    let mut announced_wait = false;
-    loop {
-        for (slot, profile_dir) in profile_dirs.iter().enumerate() {
-            match try_lock_profile(profile_dir) {
-                Ok(Some(lock)) => return Ok((slot, profile_dir.clone(), lock)),
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(AgentResult::failure(error, 0)
-                        .with_terminal_reason(TerminalReason::LlmError))
-                }
-            }
-        }
-        if !announced_wait {
-            let _ = events_tx.send(AgentEvent::MissionActivity {
-                label: "Waiting for a ChatGPT UI browser slot…".to_string(),
-                tool_name: "chatgpt_ui_profile_pool".to_string(),
-                mission_id: Some(mission_id),
-            });
-            announced_wait = true;
-        }
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                let shutdown = crate::api::routes::is_shutdown_initiated();
-                return Err(AgentResult::failure(
-                    if shutdown {
-                        "Server restart — paused while waiting for a ChatGPT UI browser slot."
-                    } else {
-                        "Mission cancelled while waiting for a ChatGPT UI browser slot"
-                    },
-                    0,
-                )
-                .with_terminal_reason(if shutdown {
-                    TerminalReason::ServerShutdown
-                } else {
-                    TerminalReason::Cancelled
-                }));
-            }
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-        }
-    }
 }
 
 async fn prepare_download_dir(work_dir: &Path) -> Result<PathBuf, String> {
@@ -229,6 +153,36 @@ fn timeout_result(timeout: Duration) -> AgentResult {
     }))
 }
 
+/// Map a structured driver error code onto a terminal reason, a failure
+/// class, and — when the failure is slot-local — a profile-pool health record.
+fn classify_driver_error(
+    code: Option<&str>,
+) -> (TerminalReason, FailureClass, Option<SlotFailureKind>) {
+    match code {
+        Some("auth_required") => (
+            TerminalReason::AuthError,
+            FailureClass::AuthError,
+            Some(SlotFailureKind::Auth),
+        ),
+        Some("rate_limited") => (TerminalReason::RateLimited, FailureClass::RateLimited, None),
+        Some("browser_launch") => (
+            TerminalReason::LlmError,
+            FailureClass::TransportError,
+            // The driver cannot currently distinguish a profile-local launch
+            // problem from a global Playwright/browser installation failure.
+            // Quarantining the selected profile here would eventually poison
+            // every slot for one host-wide outage.
+            None,
+        ),
+        Some("compatibility") => (
+            TerminalReason::LlmError,
+            FailureClass::ProviderError,
+            Some(SlotFailureKind::Compatibility),
+        ),
+        _ => (TerminalReason::LlmError, FailureClass::ProviderError, None),
+    }
+}
+
 fn parse_bool_setting(key: &str, default: bool) -> bool {
     crate::api::mission_runner::get_backend_bool_setting("chatgpt_ui", key).unwrap_or(default)
 }
@@ -242,6 +196,8 @@ fn safe_driver_diagnostic(message: &str) -> Option<&str> {
         | "stage=account_confirmed"
         | "stage=blank_route"
         | "stage=composer_ready"
+        | "stage=send_button_fallback"
+        | "stage=stop_button_fallback"
         | "stage=composer_model_picker_not_ready"
         | "stage=model_already_selected"
         | "stage=composer_model_option_unavailable"
@@ -282,7 +238,7 @@ fn validate_display(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
+pub(crate) fn configured_profile_dirs(app_working_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut configured_profiles = get_backend_string_setting("chatgpt_ui", "profile_dir")
         .into_iter()
         .chain(get_backend_string_list_setting(
@@ -294,18 +250,6 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
     configured_profiles.dedup();
     if configured_profiles.is_empty() {
         return Err("chatgpt_ui profile_dir or profile_dirs is required".to_string());
-    }
-    let driver_path = get_backend_string_setting("chatgpt_ui", "driver_path")
-        .map(PathBuf::from)
-        .ok_or_else(|| "chatgpt_ui driver_path is required".to_string())?;
-    if !driver_path.is_absolute() {
-        return Err("chatgpt_ui driver_path must be an absolute path".to_string());
-    }
-    if !driver_path.is_file() {
-        return Err(format!(
-            "chatgpt_ui browser driver not found: {}",
-            driver_path.display()
-        ));
     }
     let canonical_working_dir = app_working_dir.canonicalize().ok();
     let mut profile_dirs = Vec::with_capacity(configured_profiles.len());
@@ -334,6 +278,23 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
         if !profile_dirs.contains(&canonical_profile) {
             profile_dirs.push(canonical_profile);
         }
+    }
+    Ok(profile_dirs)
+}
+
+fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
+    let profile_dirs = configured_profile_dirs(app_working_dir)?;
+    let driver_path = get_backend_string_setting("chatgpt_ui", "driver_path")
+        .map(PathBuf::from)
+        .ok_or_else(|| "chatgpt_ui driver_path is required".to_string())?;
+    if !driver_path.is_absolute() {
+        return Err("chatgpt_ui driver_path must be an absolute path".to_string());
+    }
+    if !driver_path.is_file() {
+        return Err(format!(
+            "chatgpt_ui browser driver not found: {}",
+            driver_path.display()
+        ));
     }
     let timeout_secs = get_backend_u64_setting("chatgpt_ui", "timeout_secs").unwrap_or(14_400);
     if !(30..=86_400).contains(&timeout_secs) {
@@ -389,11 +350,48 @@ pub async fn run_chatgpt_ui_turn(
             return AgentResult::failure(error, 0).with_terminal_reason(TerminalReason::AuthError)
         }
     };
-    let (profile_slot, profile_dir, _profile_lock) =
-        match acquire_profile(&settings.profile_dirs, mission_id, &events_tx, &cancel).await {
-            Ok(lease) => lease,
-            Err(result) => return result,
-        };
+    let (profile_slot, profile_dir, _profile_lock) = match profile_pool::acquire_profile(
+        &settings.profile_dirs,
+        mission_id,
+        &events_tx,
+        &cancel,
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(result) => return result,
+    };
+    if settings.browser == "chromium" {
+        let owned = chromium_cleanup::pool_owns_singletons(&profile_dir);
+        let outcome = chromium_cleanup::cleanup_profile_singletons(&profile_dir, owned);
+        tracing::debug!(
+            mission_id = %mission_id,
+            outcome = outcome.as_str(),
+            "chatgpt_ui pre-launch profile singleton cleanup"
+        );
+        if !outcome.profile_is_launchable() {
+            profile_pool::record_slot_failure(&profile_dir, SlotFailureKind::Launch);
+            let message = match outcome {
+                SingletonCleanup::ActiveProcess => {
+                    "chatgpt_ui profile is held by a live browser process outside the profile pool; close it before retrying"
+                }
+                SingletonCleanup::ForeignHost => {
+                    "chatgpt_ui profile holds a SingletonLock from another host; remove it manually if that browser is gone"
+                }
+                SingletonCleanup::Unrecognized => {
+                    "chatgpt_ui profile has an unrecognized Chromium SingletonLock; inspect it manually before retrying"
+                }
+                SingletonCleanup::Clean | SingletonCleanup::Removed(_) => unreachable!(),
+            };
+            return AgentResult::failure(message, 0)
+                .with_terminal_reason(TerminalReason::LlmError)
+                .with_data(serde_json::json!({
+                    "provider_error_source": "chatgpt_ui_profile_pool",
+                    "failure_class": FailureClass::TransportError,
+                    "classification_source": "structured",
+                }));
+        }
+    }
     let download_dir = match prepare_download_dir(work_dir).await {
         Ok(path) => path,
         Err(error) => {
@@ -432,9 +430,15 @@ pub async fn run_chatgpt_ui_turn(
         Ok(child) => child,
         Err(error) => {
             return AgentResult::failure(format!("failed to start chatgpt_ui driver: {error}"), 0)
-                .with_terminal_reason(TerminalReason::LlmError)
+                .with_terminal_reason(TerminalReason::LlmError);
         }
     };
+    if settings.browser == "chromium" {
+        // Claim ownership only after the driver was successfully spawned. A
+        // pre-spawn marker could authorize a later run to remove singleton
+        // state that this pool never created.
+        chromium_cleanup::claim_singleton_ownership(&profile_dir);
+    }
     #[cfg(unix)]
     let process_group = child.id().map(|pid| -(pid as i32));
 
@@ -556,22 +560,20 @@ pub async fn run_chatgpt_ui_turn(
                         artifact_receipts.push((path, name));
                     }
                     DriverEvent::Error { code, message } => {
-                        let reason = if code.as_deref() == Some("auth_required") {
-                            TerminalReason::AuthError
-                        } else if code.as_deref() == Some("rate_limited") {
-                            TerminalReason::RateLimited
-                        } else {
-                            TerminalReason::LlmError
-                        };
-                        let failure_class = match reason {
-                            TerminalReason::AuthError => crate::agents::FailureClass::AuthError,
-                            TerminalReason::RateLimited => {
-                                crate::agents::FailureClass::RateLimited
-                            }
-                            _ => crate::agents::FailureClass::ProviderError,
-                        };
+                        let (reason, failure_class, slot_failure) =
+                            classify_driver_error(code.as_deref());
+                        if let Some(kind) = slot_failure {
+                            profile_pool::record_slot_failure(&profile_dir, kind);
+                        }
                         terminate_child_tree(&mut child).await;
-                        return AgentResult::failure(format!("chatgpt_ui: {message}"), 0)
+                        let message = if code.as_deref() == Some("compatibility") {
+                            format!(
+                                "chatgpt_ui: compatibility=chatgpt-ui-v2; profile_slot={profile_slot}; {message}"
+                            )
+                        } else {
+                            format!("chatgpt_ui: {message}")
+                        };
+                        return AgentResult::failure(message, 0)
                             .with_terminal_reason(reason)
                             .with_data(serde_json::json!({
                                 "provider_error_source": "chatgpt_ui_driver",
@@ -634,6 +636,20 @@ pub async fn run_chatgpt_ui_turn(
             libc::kill(process_group, libc::SIGKILL);
         }
     }
+    if settings.browser == "chromium" {
+        // Best effort: freshly killed descendants may briefly linger as
+        // zombies, in which case the ownership marker defers this sweep to
+        // the next lease's pre-launch cleanup.
+        let outcome = chromium_cleanup::cleanup_profile_singletons(&profile_dir, true);
+        if outcome.profile_is_launchable() {
+            chromium_cleanup::release_singleton_ownership(&profile_dir);
+        }
+        tracing::debug!(
+            mission_id = %mission_id,
+            outcome = outcome.as_str(),
+            "chatgpt_ui post-run profile singleton cleanup"
+        );
+    }
     if let Err(message) = validate_completion(
         completed,
         &output,
@@ -666,6 +682,7 @@ pub async fn run_chatgpt_ui_turn(
             }
         }
     }
+    profile_pool::record_slot_success(&profile_dir);
     let mut result = AgentResult::success(output, 0)
         .with_terminal_reason(TerminalReason::TurnComplete)
         .with_data(serde_json::json!({
@@ -762,6 +779,14 @@ mod tests {
             Some("compatibility=chatgpt-ui-v2; browser=chromium")
         );
         assert_eq!(
+            safe_driver_diagnostic("stage=send_button_fallback"),
+            Some("stage=send_button_fallback")
+        );
+        assert_eq!(
+            safe_driver_diagnostic("stage=stop_button_fallback"),
+            Some("stage=stop_button_fallback")
+        );
+        assert_eq!(
             safe_driver_diagnostic("stage=page_loaded account=user@example.com"),
             None
         );
@@ -785,38 +810,39 @@ mod tests {
     }
 
     #[test]
-    fn profile_lock_is_exclusive_and_reusable() {
-        let root = tempfile::tempdir().unwrap();
-        let profile = root.path().join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        let first = try_lock_profile(&profile).unwrap().unwrap();
-        assert!(try_lock_profile(&profile).unwrap().is_none());
-        drop(first);
-        assert!(try_lock_profile(&profile).unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn profile_pool_uses_the_next_free_authenticated_slot() {
-        let root = tempfile::tempdir().unwrap();
-        let first_profile = root.path().join("profile-1");
-        let second_profile = root.path().join("profile-2");
-        std::fs::create_dir(&first_profile).unwrap();
-        std::fs::create_dir(&second_profile).unwrap();
-        let _first_lease = try_lock_profile(&first_profile).unwrap().unwrap();
-        let (events_tx, _) = broadcast::channel(8);
-        let cancel = CancellationToken::new();
-
-        let (slot, selected, _lease) = acquire_profile(
-            &[first_profile, second_profile.clone()],
-            Uuid::new_v4(),
-            &events_tx,
-            &cancel,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(slot, 1);
-        assert_eq!(selected, second_profile);
+    fn driver_error_codes_map_to_failure_classes_and_slot_health() {
+        assert_eq!(
+            classify_driver_error(Some("auth_required")),
+            (
+                TerminalReason::AuthError,
+                FailureClass::AuthError,
+                Some(SlotFailureKind::Auth)
+            )
+        );
+        assert_eq!(
+            classify_driver_error(Some("rate_limited")),
+            (TerminalReason::RateLimited, FailureClass::RateLimited, None)
+        );
+        assert_eq!(
+            classify_driver_error(Some("browser_launch")),
+            (TerminalReason::LlmError, FailureClass::TransportError, None)
+        );
+        assert_eq!(
+            classify_driver_error(Some("compatibility")),
+            (
+                TerminalReason::LlmError,
+                FailureClass::ProviderError,
+                Some(SlotFailureKind::Compatibility)
+            )
+        );
+        assert_eq!(
+            classify_driver_error(Some("timeout")),
+            (TerminalReason::LlmError, FailureClass::ProviderError, None)
+        );
+        assert_eq!(
+            classify_driver_error(None),
+            (TerminalReason::LlmError, FailureClass::ProviderError, None)
+        );
     }
 
     #[test]
