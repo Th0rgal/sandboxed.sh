@@ -304,6 +304,128 @@ def check_versions(repo_root, policy, errors):
         )
 
 
+def check_skill_policy_rules(repo_root, policy, errors):
+    skill = (repo_root / SKILL_DOC).read_text(encoding="utf-8")
+    match = re.search(
+        r"^## ChatGPT UI pool policy \(policy_version [^)]+\)\n(?P<section>.*?)(?=^## )",
+        skill,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        errors.append(f"{SKILL_DOC}: missing ChatGPT UI pool policy section")
+        return
+    section = match.group("section")
+
+    def bullet(label, next_label=None):
+        end = (
+            rf"(?=\n- \*\*{re.escape(next_label)})"
+            if next_label is not None
+            else r"(?=\n## |\Z)"
+        )
+        found = re.search(
+            rf"- \*\*{re.escape(label)}.*?{end}",
+            section,
+            re.DOTALL,
+        )
+        return found.group(0) if found else ""
+
+    retry = policy.get("retry", {})
+    lanes = policy.get("lanes", {}).get("read_only_pro", {})
+    writers = policy.get("writers", {})
+    auth = retry.get("auth_failure", {})
+    compat = retry.get("compatibility_failure", {})
+    rate = retry.get("rate_limited", {})
+    browser = retry.get("browser_launch", {})
+    checks = [
+        (
+            "Live capacity.",
+            bullet("Live capacity.", "Read-only Pro lanes."),
+            [
+                f"`{policy.get('capacity', {}).get('source')}`",
+                "never assume a fixed slot count",
+                "never fails open onto an unhealthy profile",
+            ],
+        ),
+        (
+            "Read-only Pro lanes.",
+            bullet("Read-only Pro lanes.", "Compatibility failure → retry once, elsewhere."),
+            [
+                f"`{lanes.get('model')}`",
+                f"`writer: {str(lanes.get('writer')).lower()}`",
+                "disjoint slots",
+            ],
+        ),
+        (
+            "Compatibility failure → retry once, elsewhere.",
+            bullet(
+                "Compatibility failure → retry once, elsewhere.",
+                "Auth failure → never blind-retry.",
+            ),
+            [
+                f"`{compat.get('signal')}`",
+                f"retry at most {compat.get('max_automatic_retries')} time",
+                "different",
+                "healthy slot",
+                "Never the same slot",
+            ],
+        ),
+        (
+            "Auth failure → never blind-retry.",
+            bullet("Auth failure → never blind-retry.", "Rate limited → wait."),
+            [
+                f"`{auth.get('signal')}`",
+                f"{auth.get('max_automatic_retries')} automatic retries",
+                f"{auth.get('slot_quarantine_secs', 0) // 60} minutes",
+                "does not prove the login was repaired",
+            ],
+        ),
+        (
+            "Rate limited → wait.",
+            bullet("Rate limited → wait.", "Global browser launch failure → preserve the pool."),
+            [
+                f"{rate.get('max_automatic_retries')} automatic retries",
+                "allowance must recover",
+                "Do not shuffle",
+            ],
+        ),
+        (
+            "Global browser launch failure → preserve the pool.",
+            bullet(
+                "Global browser launch failure → preserve the pool.",
+                "Never concurrent writers.",
+            ),
+            [
+                f"`{browser.get('signal')}`",
+                "does not make the selected profile unhealthy",
+                "profile-local",
+            ],
+        ),
+        (
+            "Never concurrent writers.",
+            bullet("Never concurrent writers.", "Lean writers validate first."),
+            [
+                f"At most {writers.get('max_concurrent_per_workspace')} writer",
+                "never from a second writer",
+            ],
+        ),
+        (
+            "Lean writers validate first.",
+            bullet("Lean writers validate first."),
+            ["independently", "separate mission or reviewer lane", "never replaces it"],
+        ),
+    ]
+    for label, text, fragments in checks:
+        if not text:
+            errors.append(f"{SKILL_DOC}: missing binding rule {label!r}")
+            continue
+        normalized = " ".join(text.split())
+        for fragment in fragments:
+            if " ".join(fragment.split()) not in normalized:
+                errors.append(
+                    f"{SKILL_DOC}: binding rule {label!r} must contain {fragment!r}"
+                )
+
+
 def lint(repo_root: Path) -> list[str]:
     errors: list[str] = []
     try:
@@ -324,6 +446,7 @@ def lint(repo_root: Path) -> list[str]:
         check_harness_doc,
         check_policy_doc_limits,
         check_versions,
+        check_skill_policy_rules,
     ):
         try:
             check(repo_root, policy, errors)

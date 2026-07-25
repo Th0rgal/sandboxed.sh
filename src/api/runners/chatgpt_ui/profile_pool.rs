@@ -122,6 +122,15 @@ pub(crate) fn exclude_profile_for_mission(mission_id: Uuid, profile_slot: usize)
         );
 }
 
+#[cfg(test)]
+pub(crate) fn take_excluded_profile_for_tests(mission_id: Uuid) -> Option<usize> {
+    mission_retry_requirements()
+        .lock()
+        .expect("profile retry requirement registry poisoned")
+        .remove(&mission_id)
+        .map(|requirement| requirement.excluded_slot)
+}
+
 fn quarantine_for(kind: SlotFailureKind, consecutive_failures: u32) -> Option<Duration> {
     match kind {
         SlotFailureKind::Auth => Some(AUTH_QUARANTINE),

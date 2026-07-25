@@ -998,6 +998,33 @@ async fn replay_pending_board_outbox(
             }
             continue;
         }
+        if matches!(item.delivery_kind.as_str(), "spawn" | "retry") {
+            if let Some(task_id) = item.task_id {
+                match mission_store.get_board_task(task_id).await {
+                    Ok(Some(task)) => {
+                        if let Some(profile_slot) = task
+                            .prior_result_digest
+                            .as_deref()
+                            .and_then(chatgpt_ui_compatibility_profile_slot)
+                        {
+                            crate::api::runners::chatgpt_ui::profile_pool::exclude_profile_for_mission(
+                                target,
+                                profile_slot,
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            task = %task_id,
+                            target = %target,
+                            "board: could not restore ChatGPT UI retry requirement before outbox replay: {error}"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
         let _ = dispatch_board_outbox_item(
             mission_store,
             cmd_tx,
@@ -2006,8 +2033,12 @@ mod tests {
             .await
             .expect("list task")
             .remove(0);
+        task.backend = "chatgpt_ui".into();
         task.status = BoardTaskStatus::Running;
         task.worker_mission_id = Some(worker.id);
+        task.prior_result_digest = Some(
+            "chatgpt_ui: compatibility=chatgpt-ui-v2; profile_slot=4; selector mismatch".into(),
+        );
         task.attempts = 1;
         store
             .save_board_task(&task)
@@ -2061,6 +2092,13 @@ mod tests {
             .expect("pending outbox");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].idempotency_key, retry_key);
+        assert_eq!(
+            crate::api::runners::chatgpt_ui::profile_pool::take_excluded_profile_for_tests(
+                worker.id
+            ),
+            Some(4),
+            "durable replay must restore the different-slot requirement before dispatch"
+        );
     }
 
     #[test]

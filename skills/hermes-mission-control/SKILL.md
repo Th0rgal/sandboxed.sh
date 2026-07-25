@@ -161,22 +161,22 @@ this section must stay in sync with it.
   **only** with `writer: false` and **only** on disjoint slots (distinct
   profiles). A `chatgpt_ui` mission never writes repositories or owns a PR.
 - **Compatibility failure → retry once, elsewhere.** On a
-  `compatibility=chatgpt-ui-v2` failure, retry at most once, on a *different*
+  `compatibility=chatgpt-ui-v2` failure, retry at most 1 time, on a *different*
   healthy slot (unlocked, no auth/rate-limit signals). Never the same slot;
   confirm that alternate slot from live pool telemetry before retrying. If the
   retry fails too, escalate to the operator.
 - **Auth failure → never blind-retry.** `auth_required` is terminal for that
-  mission and gets zero automatic retries. The slot is quarantined for 30
+  mission and gets 0 automatic retries. The slot is quarantined for 30
   minutes; cooldown expiry permits a later explicit recovery attempt but does
   not prove the login was repaired. Never use an auth-failed slot for the
   one compatibility retry.
-- **Rate limited → wait.** Zero automatic retries; allowance must recover.
+- **Rate limited → wait.** 0 automatic retries; allowance must recover.
   Do not shuffle the request across slots of the same account.
 - **Global browser launch failure → preserve the pool.** A generic
   `browser_launch` failure can be a host-wide Chromium/Playwright problem and
   does not make the selected profile unhealthy. Only a proven profile-local
   Chromium singleton conflict quarantines that slot.
-- **Never concurrent writers.** At most one writer mission per workspace.
+- **Never concurrent writers.** At most 1 writer mission per workspace.
   Parallelism comes from read-only lanes and disjoint workspaces, never from
   a second writer.
 - **Lean writers validate first.** Before any writer commits Lean changes,

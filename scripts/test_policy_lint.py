@@ -237,6 +237,26 @@ class PolicyLintMutationTest(unittest.TestCase):
         skill.write_text(content, encoding="utf-8")
         self.assert_error("missing frontmatter 'version:'")
 
+    def test_skill_retry_rule_must_match_machine_policy(self):
+        skill = self.root / SKILL_DOC
+        skill.write_text(
+            skill.read_text(encoding="utf-8").replace(
+                "retry at most 1 time", "retry up to 5 times"
+            ),
+            encoding="utf-8",
+        )
+        self.assert_error("retry at most 1 time")
+
+    def test_skill_auth_rule_must_match_machine_policy(self):
+        skill = self.root / SKILL_DOC
+        skill.write_text(
+            skill.read_text(encoding="utf-8").replace(
+                "gets 0 automatic retries", "gets 1 automatic retry"
+            ),
+            encoding="utf-8",
+        )
+        self.assert_error("0 automatic retries")
+
 
 if __name__ == "__main__":
     unittest.main()
