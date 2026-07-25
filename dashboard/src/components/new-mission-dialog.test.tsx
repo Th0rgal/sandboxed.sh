@@ -113,7 +113,7 @@ describe('NewMissionDialog', () => {
 
     expect(
       await screen.findByRole('option', {
-        name: 'No override (Claude Opus 5 · claude-opus-5)',
+        name: 'No override (configured default; fallback claude-opus-5)',
       })
     ).toBeVisible();
   });

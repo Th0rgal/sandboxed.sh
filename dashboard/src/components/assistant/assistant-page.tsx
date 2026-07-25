@@ -1709,7 +1709,7 @@ export default function AssistantPage() {
                 >
                   <option value="">
                     {createBackend === 'claudecode'
-                      ? 'No override (Claude Opus 5 · claude-opus-5)'
+                      ? 'No override (configured default; fallback claude-opus-5)'
                       : 'No override (use default)'}
                   </option>
                   {(() => {
@@ -1905,7 +1905,7 @@ export default function AssistantPage() {
                 >
                   <option value="">
                     {(editBackend || 'claudecode') === 'claudecode'
-                      ? 'No override (Claude Opus 5 · claude-opus-5)'
+                      ? 'No override (configured default; fallback claude-opus-5)'
                       : 'No override (use default)'}
                   </option>
                   {(() => {

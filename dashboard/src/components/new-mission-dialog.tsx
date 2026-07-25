@@ -898,7 +898,7 @@ export function NewMissionDialog({
                 >
                   <option value="">
                     {selectedBackend === 'claudecode'
-                      ? `No override (Claude Opus 5 · ${CLAUDE_CODE_DEFAULT_MODEL})`
+                      ? `No override (configured default; fallback ${CLAUDE_CODE_DEFAULT_MODEL})`
                       : 'No override (use default)'}
                   </option>
                   {(() => {
