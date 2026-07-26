@@ -5834,6 +5834,11 @@ fn normalize_model_override_for_backend(backend: Option<&str>, raw_model: &str) 
     if trimmed.is_empty() {
         return None;
     }
+    if backend == Some("opencode") {
+        return Some(
+            crate::api::runners::opencode::normalize_opencode_model_id(trimmed).into_owned(),
+        );
+    }
     if backend == Some("codex") && trimmed == "gpt-5.6" {
         return Some("gpt-5.6-sol".to_string());
     }
@@ -26573,6 +26578,18 @@ And the report:
         assert_eq!(
             normalize_model_override_for_backend(Some("opencode"), " openai/gpt-5-codex "),
             Some("openai/gpt-5-codex".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_model_override_for_backend_maps_legacy_kimi_aliases() {
+        assert_eq!(
+            normalize_model_override_for_backend(Some("opencode"), "kimi-k3"),
+            Some("kimi/k3".to_string())
+        );
+        assert_eq!(
+            normalize_model_override_for_backend(Some("opencode"), " KIMI-K3-256K "),
+            Some("kimi/k3-256k".to_string())
         );
     }
 
