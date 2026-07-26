@@ -32,6 +32,21 @@ const PROXY_STREAM_RECENT: std::time::Duration = std::time::Duration::from_secs(
 /// stopped consuming its own LLM stream).
 const PROXY_STREAM_INACTIVITY_CAP: std::time::Duration = std::time::Duration::from_secs(1800);
 
+/// Convert legacy controller-facing OpenCode model aliases into the canonical
+/// `provider/model` ids required by the OpenCode CLI.
+///
+/// Older Hermes skills used `kimi-k3`. OpenCode parses a slash-less value as
+/// a provider name with an empty model and fails with `Model not found:
+/// kimi-k3/`, even when the Kimi subscription itself is healthy.
+pub(crate) fn normalize_opencode_model_id(model: &str) -> Cow<'_, str> {
+    let model = model.trim();
+    match model.to_ascii_lowercase().as_str() {
+        "kimi-k3" => Cow::Borrowed("kimi/k3"),
+        "kimi-k3-256k" => Cow::Borrowed("kimi/k3-256k"),
+        _ => Cow::Borrowed(model),
+    }
+}
+
 /// Execute a turn using OpenCode CLI backend.
 ///
 /// For Host workspaces: spawns the CLI directly on the host.
@@ -105,7 +120,8 @@ pub async fn run_opencode_turn(
             std::env::var("OPENCODE_DEFAULT_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
-        });
+        })
+        .map(|model| normalize_opencode_model_id(&model).into_owned());
     let auth_state = detect_opencode_provider_auth(Some(app_working_dir));
     let has_openai = auth_state.has_openai;
     let has_anthropic = auth_state.has_anthropic;
@@ -254,7 +270,8 @@ pub async fn run_opencode_turn(
     let mut total_output_tokens: u64 = 0;
     let mut total_cache_creation_input_tokens: u64 = 0;
     let mut total_cache_read_input_tokens: u64 = 0;
-    let agent_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent);
+    let agent_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent)
+        .map(|model| normalize_opencode_model_id(&model).into_owned());
     if resolved_model.is_none() {
         resolved_model = agent_model.clone();
     }
@@ -2117,7 +2134,18 @@ fn opencode_path(
 
 #[cfg(test)]
 mod path_tests {
-    use super::{opencode_model_argument, opencode_path};
+    use super::{normalize_opencode_model_id, opencode_model_argument, opencode_path};
+
+    #[test]
+    fn legacy_kimi_k3_aliases_are_canonicalized() {
+        assert_eq!(normalize_opencode_model_id("kimi-k3"), "kimi/k3");
+        assert_eq!(
+            normalize_opencode_model_id(" KIMI-K3-256K "),
+            "kimi/k3-256k"
+        );
+        assert_eq!(normalize_opencode_model_id("kimi/k3"), "kimi/k3");
+        assert_eq!(normalize_opencode_model_id("zai/glm-5"), "zai/glm-5");
+    }
 
     #[test]
     fn grok_cli_model_keeps_its_full_proxy_chain_id() {
