@@ -485,6 +485,7 @@ CREATE TABLE IF NOT EXISTS missions (
     agent TEXT,
     model_override TEXT,
     model_effort TEXT,
+    fast_mode INTEGER NOT NULL DEFAULT 0,
     backend TEXT NOT NULL DEFAULT 'opencode',
     config_profile TEXT,
     created_at TEXT NOT NULL,
@@ -1453,6 +1454,20 @@ impl SqliteMissionStore {
             tracing::info!("Running migration: adding 'model_effort' column to missions table");
             conn.execute("ALTER TABLE missions ADD COLUMN model_effort TEXT", [])
                 .map_err(|e| format!("Failed to add model_effort column: {}", e))?;
+        }
+
+        let has_fast_mode_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'fast_mode'")
+            .map_err(|e| format!("Failed to check for fast_mode column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_fast_mode_column {
+            tracing::info!("Running migration: adding 'fast_mode' column to missions table");
+            conn.execute(
+                "ALTER TABLE missions ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("Failed to add fast_mode column: {}", e))?;
         }
 
         // Check if 'short_description' column exists in missions table
@@ -2728,7 +2743,8 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(mission_mode, 'task') as mission_mode,
                             COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
                             COALESCE(priority, 0) as priority, not_before, deadline, paused_at,
-                            project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at
+                            project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at,
+                            COALESCE(fast_mode, 0) as fast_mode
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2763,6 +2779,7 @@ impl MissionStore for SqliteMissionStore {
                         agent: row.get(10)?,
                         model_override: row.get(11)?,
                         model_effort: row.get(12)?,
+                        fast_mode: row.get::<_, i32>(41)? != 0,
                         backend,
                         config_profile,
                         history: vec![], // Loaded separately if needed
@@ -2856,7 +2873,8 @@ impl MissionStore for SqliteMissionStore {
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
                             COALESCE(priority, 0) as priority, not_before, deadline, paused_at,
-                            project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at FROM missions WHERE id = ?1",
+                            project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at,
+                            COALESCE(fast_mode, 0) as fast_mode FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -2888,6 +2906,7 @@ impl MissionStore for SqliteMissionStore {
                         agent: row.get(10)?,
                         model_override: row.get(11)?,
                         model_effort: row.get(12)?,
+                        fast_mode: row.get::<_, i32>(41)? != 0,
                         backend,
                         config_profile,
                         history: vec![],
@@ -3285,6 +3304,7 @@ impl MissionStore for SqliteMissionStore {
         agent: Option<&str>,
         model_override: Option<&str>,
         model_effort: Option<&str>,
+        fast_mode: bool,
         backend: Option<&str>,
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
@@ -3331,6 +3351,7 @@ impl MissionStore for SqliteMissionStore {
             agent: agent.map(|s| s.to_string()),
             model_override: model_override.map(|s| s.to_string()),
             model_effort: model_effort.map(|s| s.to_string()),
+            fast_mode,
             backend: backend.clone(),
             config_profile: config_profile.map(|s| s.to_string()),
             history: vec![],
@@ -3362,8 +3383,8 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective, last_status_change_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective, last_status_change_at, fast_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
                 params![
                     m.id.to_string(),
                     status_to_string(m.status),
@@ -3389,6 +3410,7 @@ impl MissionStore for SqliteMissionStore {
                     if m.goal_mode { 1i64 } else { 0i64 },
                     m.goal_objective,
                     m.created_at,
+                    if m.fast_mode { 1i64 } else { 0i64 },
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -3406,7 +3428,7 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn
-                .prepare("SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, session_id, terminal_reason, parent_mission_id, working_directory, COALESCE(mission_mode, 'task') as mission_mode FROM missions WHERE parent_mission_id = ?1")
+                .prepare("SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, session_id, terminal_reason, parent_mission_id, working_directory, COALESCE(mission_mode, 'task') as mission_mode, COALESCE(fast_mode, 0) as fast_mode FROM missions WHERE parent_mission_id = ?1")
                 .map_err(|e| e.to_string())?;
             let missions = stmt
                 .query_map(params![parent_id_str], |row| {
@@ -3424,6 +3446,7 @@ impl MissionStore for SqliteMissionStore {
                         agent: row.get(9)?,
                         model_override: row.get(10)?,
                         model_effort: row.get(11)?,
+                        fast_mode: row.get::<_, i32>(23)? != 0,
                         backend: row.get::<_, String>(12)?,
                         config_profile: row.get(13)?,
                         history: vec![],
@@ -3440,8 +3463,8 @@ impl MissionStore for SqliteMissionStore {
                         mission_mode: row.get::<_, Option<String>>(22)?
                             .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
                             .unwrap_or_default(),
-                            goal_mode: row.get::<_, i32>(23).unwrap_or(0) != 0,
-                            goal_objective: row.get(24).ok().flatten(),
+                            goal_mode: false,
+                            goal_objective: None,
                             first_viewed_at: None,
                             scheduling: Default::default(),
                             project: MissionProject::default(),
@@ -3811,6 +3834,7 @@ impl MissionStore for SqliteMissionStore {
         agent: Option<Option<&str>>,
         model_override: Option<Option<&str>>,
         model_effort: Option<Option<&str>>,
+        fast_mode: Option<bool>,
         config_profile: Option<Option<&str>>,
         session_id: &str,
     ) -> Result<Mission, String> {
@@ -3820,6 +3844,7 @@ impl MissionStore for SqliteMissionStore {
         let agent_set = agent.is_some();
         let model_override_set = model_override.is_some();
         let model_effort_set = model_effort.is_some();
+        let fast_mode_set = fast_mode.is_some();
         let config_profile_set = config_profile.is_some();
         let backend = backend.map(ToString::to_string);
         let agent = agent.flatten().map(ToString::to_string);
@@ -3838,13 +3863,14 @@ impl MissionStore for SqliteMissionStore {
                          agent = CASE WHEN ?3 THEN ?4 ELSE agent END,
                          model_override = CASE WHEN ?5 THEN ?6 ELSE model_override END,
                          model_effort = CASE WHEN ?7 THEN ?8 ELSE model_effort END,
-                         config_profile = CASE WHEN ?9 THEN ?10 ELSE config_profile END,
-                         session_id = ?11,
+                         fast_mode = CASE WHEN ?9 THEN ?10 ELSE fast_mode END,
+                         config_profile = CASE WHEN ?11 THEN ?12 ELSE config_profile END,
+                         session_id = ?13,
                          resumable = 0,
                          interrupted_at = NULL,
                          terminal_reason = NULL,
-                         updated_at = ?12
-                     WHERE id = ?13",
+                         updated_at = ?14
+                     WHERE id = ?15",
                     params![
                         backend_set,
                         backend,
@@ -3854,6 +3880,8 @@ impl MissionStore for SqliteMissionStore {
                         model_override,
                         model_effort_set,
                         model_effort,
+                        fast_mode_set,
+                        fast_mode,
                         config_profile_set,
                         config_profile,
                         session_id,
@@ -4331,6 +4359,7 @@ impl MissionStore for SqliteMissionStore {
                         agent: row.get(5)?,
                         model_override: row.get(6)?,
                         model_effort: None, // Not needed for stale mission checks
+                        fast_mode: false,
                         backend,
                         config_profile: None, // Not needed for stale mission checks
                         history: vec![],
@@ -4407,6 +4436,7 @@ impl MissionStore for SqliteMissionStore {
                         agent: row.get(5)?,
                         model_override: row.get(6)?,
                         model_effort: None, // Not needed for active mission checks
+                        fast_mode: false,
                         backend,
                         config_profile: None, // Not needed for active mission checks
                         history: vec![],
@@ -4543,6 +4573,7 @@ impl MissionStore for SqliteMissionStore {
                         agent: row.get(5)?,
                         model_override: row.get(6)?,
                         model_effort: None,
+                        fast_mode: false,
                         backend,
                         config_profile: None,
                         history: vec![],
@@ -7059,6 +7090,7 @@ impl MissionStore for SqliteMissionStore {
                         agent: row.get(4).unwrap_or_default(),
                         model_override: None,
                         model_effort: None,
+                        fast_mode: false,
                         backend: row.get(5).unwrap_or_else(|_| "claudecode".to_string()),
                         config_profile: None,
                         history: vec![],
@@ -10240,8 +10272,8 @@ impl MissionStore for SqliteMissionStore {
                 .map(|t| format!("{t} (imported)"))
                 .or_else(|| Some("Imported mission".to_string()));
             tx.execute(
-                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, workspace_name, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, desktop_sessions, session_id, terminal_reason, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, workspace_name, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, desktop_sessions, session_id, terminal_reason, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective, fast_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
                 rusqlite::params![
                     new_mission_id.to_string(),
                     status_str,
@@ -10277,6 +10309,7 @@ impl MissionStore for SqliteMissionStore {
                     mission_mode_str,
                     if mission.goal_mode { 1i64 } else { 0i64 },
                     mission.goal_objective.clone(),
+                    if mission.fast_mode { 1i64 } else { 0i64 },
                 ],
             )
             .map_err(|e| format!("Failed to insert mission: {e}"))?;
@@ -11587,6 +11620,52 @@ mod tests {
     use rusqlite::params;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn codex_fast_mode_round_trips_and_updates() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission_with_parent(
+                Some("fast codex"),
+                None,
+                None,
+                Some("gpt-5.6-sol"),
+                Some("low"),
+                true,
+                Some("codex"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create fast mission");
+        assert!(
+            store
+                .get_mission(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .fast_mode
+        );
+
+        let updated = store
+            .update_mission_run_settings(
+                mission.id,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                "new-session",
+            )
+            .await
+            .expect("disable fast mode");
+        assert!(!updated.fast_mode);
+    }
 
     #[tokio::test]
     async fn status_events_global_feed_paginates_by_timestamp() {

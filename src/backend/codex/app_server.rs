@@ -121,6 +121,8 @@ pub struct ThreadStartParams {
     pub cwd: Option<String>,
     #[serde(rename = "reasoningEffort", skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(rename = "serviceTier", skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     /// Goals require non-ephemeral threads (`thread_goal_handlers.rs:33-42`).
     /// Leave `None` so codex picks the default (non-ephemeral).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -701,6 +703,22 @@ mod tests {
         };
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains("\"threadId\":\"abc\""));
+    }
+
+    #[test]
+    fn thread_start_params_serialize_fast_service_tier() {
+        let params = ThreadStartParams {
+            model: Some("gpt-5.6-sol".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            service_tier: Some("fast".to_string()),
+            cwd: Some("/tmp/workspace".to_string()),
+            ephemeral: None,
+            approval_policy: Some("never".to_string()),
+            sandbox: Some("danger-full-access".to_string()),
+        };
+        let value = serde_json::to_value(params).unwrap();
+        assert_eq!(value["serviceTier"], "fast");
+        assert_eq!(value["model"], "gpt-5.6-sol");
     }
 
     #[test]

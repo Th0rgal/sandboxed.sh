@@ -737,7 +737,18 @@ mod stall_guard_tests {
 
     async fn mk(store: &Arc<dyn MissionStore>, parent: Option<Uuid>) -> Uuid {
         store
-            .create_mission_with_parent(Some("m"), None, None, None, None, None, None, parent, None)
+            .create_mission_with_parent(
+                Some("m"),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                parent,
+                None,
+            )
             .await
             .expect("create")
             .id
@@ -5688,6 +5699,9 @@ pub struct CreateMissionRequest {
     pub model_override: Option<String>,
     /// Optional model effort override (supports: low, medium, high, xhigh, max)
     pub model_effort: Option<String>,
+    /// Enable Codex fast service tier for supported GPT models.
+    #[serde(default)]
+    pub fast_mode: bool,
     /// Config profile to use for this mission (overrides workspace's default profile)
     pub config_profile: Option<String>,
     /// Backend to use for this mission ("opencode" or "claudecode")
@@ -5781,6 +5795,8 @@ pub struct UpdateMissionSettingsRequest {
     /// Model effort. Omit to leave unchanged, null/empty string to clear.
     #[serde(default, deserialize_with = "deserialize_string_patch")]
     pub model_effort: Option<Option<String>>,
+    /// Codex fast service tier. Omit to leave unchanged.
+    pub fast_mode: Option<bool>,
     /// Config profile. Omit to leave unchanged, null/empty string to clear.
     #[serde(default, deserialize_with = "deserialize_string_patch")]
     pub config_profile: Option<Option<String>>,
@@ -5814,6 +5830,32 @@ fn supported_model_efforts_for_backend(backend: Option<&str>) -> &'static str {
         Some("codex") => "low, medium, high, xhigh, max",
         _ => "none",
     }
+}
+
+fn codex_fast_mode_model_supported(model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return false;
+    };
+    let model = model.rsplit('/').next().unwrap_or(model);
+    ["gpt-5.6", "gpt-5.5", "gpt-5.4"]
+        .iter()
+        .any(|prefix| model == *prefix || model.starts_with(&format!("{prefix}-")))
+}
+
+fn validate_fast_mode(backend: &str, model: Option<&str>, fast_mode: bool) -> Result<(), String> {
+    if !fast_mode {
+        return Ok(());
+    }
+    if backend != "codex" {
+        return Err("fast_mode is only supported by the Codex backend".to_string());
+    }
+    if !codex_fast_mode_model_supported(model) {
+        return Err(format!(
+            "fast_mode requires an explicit supported model; use a GPT-5.6, GPT-5.5, or GPT-5.4 model (received '{}')",
+            model.unwrap_or("none")
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_string_patch(value: Option<Option<String>>) -> Option<Option<String>> {
@@ -6568,6 +6610,7 @@ pub async fn create_mission(
         agent: None,
         model_override: None,
         model_effort: None,
+        fast_mode: false,
         config_profile: None,
         backend: None,
         parent_mission_id: None,
@@ -6747,6 +6790,13 @@ pub async fn create_mission(
             return Err((StatusCode::BAD_REQUEST, e));
         }
     }
+
+    validate_fast_mode(
+        backend.as_deref().unwrap_or("unknown"),
+        model_override.as_deref(),
+        req.fast_mode,
+    )
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
     // If no model_override specified, resolve from config profile for Claude Code
     if backend.as_deref() == Some("claudecode") && model_override.is_none() {
@@ -6938,6 +6988,7 @@ pub async fn create_mission(
             agent,
             model_override,
             model_effort,
+            fast_mode: req.fast_mode,
             backend,
             config_profile: effective_config_profile,
             parent_mission_id: req.parent_mission_id,
@@ -8825,6 +8876,7 @@ pub async fn update_mission_settings(
     let agent = normalize_string_patch(req.agent);
     let mut model_override = normalize_string_patch(req.model_override);
     let mut model_effort = normalize_string_patch(req.model_effort);
+    let mut fast_mode = req.fast_mode;
     let config_profile = normalize_string_patch(req.config_profile);
 
     if backend_changed && model_override.is_none() {
@@ -8832,6 +8884,9 @@ pub async fn update_mission_settings(
     }
     if backend_changed && model_effort.is_none() {
         model_effort = Some(None);
+    }
+    if backend_changed && fast_mode.is_none() {
+        fast_mode = Some(false);
     }
     if !matches!(effective_backend.as_str(), "codex" | "claudecode") {
         model_effort = Some(None);
@@ -8900,6 +8955,14 @@ pub async fn update_mission_settings(
         }
     }
 
+    let effective_fast_mode = fast_mode.unwrap_or(current.fast_mode);
+    validate_fast_mode(
+        &effective_backend,
+        effective_model.as_deref(),
+        effective_fast_mode,
+    )
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
     if effective_backend == "claudecode" && effective_model.is_none() {
         if let Some(default_model) =
             resolve_claudecode_default_model(&state.library, effective_config_profile.as_deref())
@@ -8928,6 +8991,7 @@ pub async fn update_mission_settings(
             agent,
             model_override,
             model_effort,
+            fast_mode,
             config_profile,
             session_id,
             respond: tx,
@@ -10298,6 +10362,7 @@ pub async fn clone_mission(
         model_effort: overrides
             .model_effort
             .or_else(|| source.model_effort.clone()),
+        fast_mode: source.fast_mode,
         config_profile: source.config_profile.clone(),
         backend: overrides.backend.or_else(|| Some(source.backend.clone())),
         parent_mission_id,
@@ -14261,6 +14326,7 @@ async fn control_actor_loop(
             None,
             None,
             None,
+            false,
             None,
             None,
             None,
@@ -14279,6 +14345,7 @@ async fn control_actor_loop(
         agent: Option<&str>,
         model_override: Option<&str>,
         model_effort: Option<&str>,
+        fast_mode: bool,
         backend: Option<&str>,
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
@@ -14292,6 +14359,7 @@ async fn control_actor_loop(
                 agent,
                 model_override,
                 model_effort,
+                fast_mode,
                 backend,
                 config_profile,
                 parent_mission_id,
@@ -15092,6 +15160,7 @@ async fn control_actor_loop(
                                                 mission.config_profile.clone(),
                                                 mission.model_override.clone(),
                                                 mission.model_effort.clone(),
+                                                mission.fast_mode,
                                             );
                                             runner.working_directory = mission.working_directory.clone();
                                             runner.user_id = Some(session_user_id.clone());
@@ -15548,7 +15617,7 @@ async fn control_actor_loop(
                                 // Use the mission ID that was captured when message was queued
                                 // This prevents race conditions where current_mission changes between queueing and execution
                                 let mission_id = msg_target_mid;
-                                let (workspace_id, model_override, model_effort, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
+                                let (workspace_id, model_override, model_effort, fast_mode, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
                                     match mission_store.get_mission(mid).await {
                                         Ok(Some(mission)) => {
                                             if let Err(error) = activate_mission_for_message(
@@ -15575,6 +15644,7 @@ async fn control_actor_loop(
                                                 Some(mission.workspace_id),
                                                 mission.model_override.clone(),
                                                 mission.model_effort.clone(),
+                                                mission.fast_mode,
                                                 mission.agent.clone(),
                                                 Some(mission.backend.clone()),
                                                 mission.session_id.clone(),
@@ -15586,7 +15656,7 @@ async fn control_actor_loop(
                                                 "Mission {} not found while resolving workspace",
                                                 mid
                                             );
-                                            (None, None, None, None, None, None, None)
+                                            (None, None, None, false, None, None, None, None)
                                         }
                                         Err(e) => {
                                             tracing::warn!(
@@ -15594,11 +15664,11 @@ async fn control_actor_loop(
                                                 mid,
                                                 e
                                             );
-                                            (None, None, None, None, None, None, None)
+                                            (None, None, None, false, None, None, None, None)
                                         }
                                     }
                                 } else {
-                                    (None, None, None, None, None, None, None)
+                                    (None, None, None, false, None, None, None, None)
                                 };
                                 // Per-message agent overrides mission agent
                                 let agent_override = per_msg_agent.or(mission_agent);
@@ -15679,6 +15749,7 @@ async fn control_actor_loop(
                                         backend_id,
                                         model_override,
                                         model_effort,
+                                        fast_mode,
                                         agent_override,
                                         session_id,
                                         false, // force_session_resume: regular message, not a resume
@@ -15778,7 +15849,7 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, scheduling, requires_local_disk, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, fast_mode, backend, config_profile, parent_mission_id, working_directory, scheduling, requires_local_disk, respond } => {
                         // Disk preflight: refuse new missions when the root
                         // filesystem is critically full instead of letting
                         // workers die mid-flight on ENOSPC. Actor-level so
@@ -15807,6 +15878,7 @@ async fn control_actor_loop(
                             agent.as_deref(),
                             model_override.as_deref(),
                             model_effort.as_deref(),
+                            fast_mode,
                             backend.as_deref(),
                             config_profile.as_deref(),
                             parent_mission_id,
@@ -15899,7 +15971,7 @@ async fn control_actor_loop(
                         }
                         let _ = respond.send(result);
                     }
-                    ControlCommand::UpdateMissionSettings { id, backend, agent, model_override, model_effort, config_profile, session_id, respond } => {
+                    ControlCommand::UpdateMissionSettings { id, backend, agent, model_override, model_effort, fast_mode, config_profile, session_id, respond } => {
                         let main_running = running.is_some() && running_mission_id == Some(id);
                         let parallel_running = parallel_runners
                             .get(&id)
@@ -15936,6 +16008,7 @@ async fn control_actor_loop(
                                 agent.as_ref().map(|value| value.as_deref()),
                                 model_override.as_ref().map(|value| value.as_deref()),
                                 model_effort.as_ref().map(|value| value.as_deref()),
+                                fast_mode,
                                 config_profile.as_ref().map(|value| value.as_deref()),
                                 &session_id,
                             )
@@ -15948,6 +16021,7 @@ async fn control_actor_loop(
                                 agent: updated.agent.clone(),
                                 model_override: updated.model_override.clone(),
                                 model_effort: updated.model_effort.clone(),
+                                fast_mode: updated.fast_mode,
                                 config_profile: updated.config_profile.clone(),
                                 session_id: updated.session_id.clone(),
                                 updated_at: updated.updated_at.clone(),
@@ -16061,6 +16135,7 @@ async fn control_actor_loop(
                                 mission.config_profile.clone(),
                                 mission.model_override.clone(),
                                 mission.model_effort.clone(),
+                                mission.fast_mode,
                             );
                             runner.working_directory = mission.working_directory.clone();
                             runner.user_id = Some(session_user_id.clone());
@@ -16689,6 +16764,7 @@ async fn control_actor_loop(
                                         mission.config_profile.clone(),
                                         mission.model_override.clone(),
                                         mission.model_effort.clone(),
+                                        mission.fast_mode,
                                     );
                                     runner.working_directory = mission.working_directory.clone();
                                     runner.user_id = Some(session_user_id.clone());
@@ -16882,6 +16958,7 @@ async fn control_actor_loop(
                                         let backend_id = Some(mission.backend.clone());
                                         let model_override = mission.model_override.clone();
                                         let model_effort = mission.model_effort.clone();
+                                        let fast_mode = mission.fast_mode;
                                         // Resume uses mission agent (no per-message override for resumes)
                                         let agent_override = mission.agent.clone();
                                         let session_id = mission.session_id.clone();
@@ -16936,6 +17013,7 @@ async fn control_actor_loop(
                                                 backend_id,
                                                 model_override,
                                                 model_effort,
+                                                fast_mode,
                                                 agent_override,
                                                 session_id,
                                                 true, // force_session_resume: this is a resume operation
@@ -17937,12 +18015,13 @@ async fn control_actor_loop(
                     // Use the mission ID that was captured when message was queued.
                     // This prevents races where current_mission changes between
                     // queueing and execution.
-                    let (workspace_id, model_override, model_effort, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
+                    let (workspace_id, model_override, model_effort, fast_mode, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
                         match mission_store.get_mission(mid).await {
                             Ok(Some(mission)) => (
                                 Some(mission.workspace_id),
                                 mission.model_override.clone(),
                                 mission.model_effort.clone(),
+                                mission.fast_mode,
                                 mission.agent.clone(),
                                 Some(mission.backend.clone()),
                                 mission.session_id.clone(),
@@ -17953,7 +18032,7 @@ async fn control_actor_loop(
                                     "Mission {} not found while resolving workspace",
                                     mid
                                 );
-                                (None, None, None, None, None, None, None)
+                                (None, None, None, false, None, None, None, None)
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -17961,11 +18040,11 @@ async fn control_actor_loop(
                                     mid,
                                     e
                                 );
-                                (None, None, None, None, None, None, None)
+                                (None, None, None, false, None, None, None, None)
                             }
                         }
                     } else {
-                        (None, None, None, None, None, None, None)
+                        (None, None, None, false, None, None, None, None)
                     };
                     // Per-message agent overrides mission agent
                     let agent_override = per_msg_agent.or(mission_agent);
@@ -17999,6 +18078,7 @@ async fn control_actor_loop(
                             backend_id,
                             model_override,
                             model_effort,
+                            fast_mode,
                             agent_override,
                             session_id,
                             false, // force_session_resume: continuation turn, not a resume
@@ -19353,6 +19433,7 @@ async fn run_single_control_turn(
     backend_id: Option<String>,
     model_override: Option<String>,
     model_effort: Option<String>,
+    fast_mode: bool,
     agent_override: Option<String>,
     session_id: Option<String>,
     force_session_resume: bool,
@@ -19552,6 +19633,7 @@ async fn run_single_control_turn(
                     message: &user_message,
                     model: config.default_model.as_deref(),
                     model_effort: requested_model_effort.as_deref(),
+                    fast_mode,
                     agent: config.opencode_agent.as_deref(),
                     mission_id: mid,
                     events_tx: events_tx.clone(),
@@ -19592,6 +19674,7 @@ async fn run_single_control_turn(
                         .as_deref()
                         .or(config.default_model.as_deref()),
                     model_effort: None,
+                    fast_mode: false,
                     agent: None,
                     mission_id: mid,
                     events_tx: events_tx.clone(),
@@ -19637,6 +19720,7 @@ async fn run_single_control_turn(
                     message: codex_message,
                     model: requested_codex_model,
                     model_effort: requested_model_effort.as_deref(),
+                    fast_mode,
                     agent: config.opencode_agent.as_deref(),
                     mission_id: mid,
                     events_tx: events_tx.clone(),
@@ -19662,6 +19746,7 @@ async fn run_single_control_turn(
                     message: &convo,
                     model: config.default_model.as_deref(),
                     model_effort: None,
+                    fast_mode: false,
                     agent: config.opencode_agent.as_deref(),
                     mission_id: mid,
                     events_tx: events_tx.clone(),
@@ -19691,6 +19776,7 @@ async fn run_single_control_turn(
                         .as_deref()
                         .or(config.default_model.as_deref()),
                     model_effort: None,
+                    fast_mode: false,
                     agent: None,
                     mission_id: mid,
                     events_tx: events_tx.clone(),
@@ -19762,6 +19848,7 @@ async fn run_single_control_turn(
                     message: &opencode_message_owned,
                     model: config.default_model.as_deref(),
                     model_effort: requested_model_effort.as_deref(),
+                    fast_mode: false,
                     agent: config.opencode_agent.as_deref(),
                     mission_id: mid,
                     events_tx: events_tx.clone(),
@@ -24192,6 +24279,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 None,
                 None,
                 Some(boss.id),
@@ -24206,6 +24294,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 None,
                 None,
                 Some(worker.id),
@@ -24242,6 +24331,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 None,
                 None,
                 Some(boss.id),
@@ -26721,6 +26811,17 @@ And the report:
     }
 
     #[test]
+    fn fast_mode_accepts_supported_codex_models_only() {
+        assert!(validate_fast_mode("codex", Some("gpt-5.6-sol"), true).is_ok());
+        assert!(validate_fast_mode("codex", Some("gpt-5.5"), true).is_ok());
+        assert!(validate_fast_mode("codex", Some("gpt-5.4-mini"), true).is_ok());
+        assert!(validate_fast_mode("codex", None, true).is_err());
+        assert!(validate_fast_mode("claudecode", Some("gpt-5.6-sol"), true).is_err());
+        assert!(validate_fast_mode("codex", Some("gpt-5.3-codex"), true).is_err());
+        assert!(validate_fast_mode("codex", Some("gpt-5.3-codex"), false).is_ok());
+    }
+
+    #[test]
     fn test_native_backend_agent_only_accepts_native_harness_names() {
         assert_eq!(native_backend_agent("codex"), Some("codex"));
         assert_eq!(native_backend_agent(" Codex "), Some("codex"));
@@ -26783,6 +26884,7 @@ And the report:
             agent: None,
             model_override: None,
             model_effort: None,
+            fast_mode: false,
             backend: "claudecode".to_string(),
             config_profile: None,
             history: Vec::new(),
@@ -26819,6 +26921,7 @@ And the report:
             agent: None,
             model_override: None,
             model_effort: None,
+            fast_mode: false,
             backend: "claudecode".to_string(),
             config_profile: None,
             history: Vec::new(),
@@ -26870,6 +26973,7 @@ And the report:
             agent: None,
             model_override: None,
             model_effort: None,
+            fast_mode: false,
             backend: "codex".to_string(),
             config_profile: None,
             history: Vec::new(),
@@ -26918,6 +27022,7 @@ And the report:
             agent: None,
             model_override: None,
             model_effort: None,
+            fast_mode: false,
             backend: "codex".to_string(),
             config_profile: None,
             history: Vec::new(),
@@ -26966,6 +27071,7 @@ And the report:
             agent: None,
             model_override: None,
             model_effort: None,
+            fast_mode: false,
             backend: "codex".to_string(),
             config_profile: None,
             history: Vec::new(),
@@ -27014,6 +27120,7 @@ And the report:
             agent: None,
             model_override: None,
             model_effort: None,
+            fast_mode: false,
             backend: "codex".to_string(),
             config_profile: None,
             history: Vec::new(),
@@ -27146,6 +27253,7 @@ And the report:
             agent: None,
             model_override: None,
             model_effort: None,
+            fast_mode: false,
             backend: "codex".to_string(),
             config_profile: None,
             history: Vec::new(),
@@ -27519,6 +27627,7 @@ Investigate <service/> failures.
             None,
             None,
             None,
+            false,
         );
         let parallel_message_id = Uuid::new_v4();
         runner.queue_message(
@@ -27559,6 +27668,7 @@ Investigate <service/> failures.
             None,
             None,
             None,
+            false,
         );
         let message_id = Uuid::new_v4();
         runner.queue_message(

@@ -576,6 +576,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
     codex_message: &str,
     requested_model: Option<&str>,
     model_effort: Option<&str>,
+    fast_mode: bool,
     agent: Option<&str>,
     mission_id: Uuid,
     events_tx: broadcast::Sender<AgentEvent>,
@@ -593,6 +594,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                 codex_message,
                 requested_model,
                 model_effort,
+                fast_mode,
                 agent,
                 mission_id,
                 events_tx.clone(),
@@ -618,6 +620,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                     codex_message,
                     Some(fallback_model),
                     model_effort,
+                    fast_mode,
                     agent,
                     mission_id,
                     events_tx.clone(),
@@ -643,6 +646,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                     // with a 400. Retry on the requested (latest) model.
                     requested_model,
                     model_effort,
+                    fast_mode,
                     agent,
                     mission_id,
                     events_tx.clone(),
@@ -727,6 +731,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                     codex_message,
                     requested_model,
                     model_effort,
+                    fast_mode,
                     agent,
                     mission_id,
                     events_tx.clone(),
@@ -754,6 +759,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                         codex_message,
                         Some(fallback_model),
                         model_effort,
+                        fast_mode,
                         agent,
                         mission_id,
                         events_tx.clone(),
@@ -781,6 +787,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                         // (latest) model instead.
                         requested_model,
                         model_effort,
+                        fast_mode,
                         agent,
                         mission_id,
                         events_tx.clone(),
@@ -868,6 +875,7 @@ pub async fn run_codex_turn(
     user_message: &str,
     model: Option<&str>,
     model_effort: Option<&str>,
+    fast_mode: bool,
     agent: Option<&str>,
     mission_id: Uuid,
     events_tx: broadcast::Sender<AgentEvent>,
@@ -889,6 +897,7 @@ pub async fn run_codex_turn(
         requested_model = ?model,
         resolved_model = ?resolved_model,
         model_effort = ?model_effort,
+        fast_mode,
         agent = ?agent,
         "Starting Codex turn"
     );
@@ -1019,6 +1028,7 @@ pub async fn run_codex_turn(
     let codex_config = crate::backend::codex::client::CodexConfig {
         cli_path,
         model_effort: model_effort.map(|s| s.to_string()),
+        fast_mode,
         cancel_token: Some(cancel.clone()),
         extra_env,
         external_chatgpt_auth: prepared_oauth_account.as_ref().map(|account| {
