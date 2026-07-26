@@ -272,6 +272,7 @@ impl MissionStore for FileMissionStore {
         agent: Option<&str>,
         model_override: Option<&str>,
         model_effort: Option<&str>,
+        fast_mode: bool,
         backend: Option<&str>,
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
@@ -301,6 +302,7 @@ impl MissionStore for FileMissionStore {
             agent: agent.map(|s| s.to_string()),
             model_override: model_override.map(|s| s.to_string()),
             model_effort: model_effort.map(|s| s.to_string()),
+            fast_mode,
             backend: backend.unwrap_or("claudecode").to_string(),
             config_profile: config_profile.map(|s| s.to_string()),
             history: vec![],
@@ -528,6 +530,7 @@ impl MissionStore for FileMissionStore {
         agent: Option<Option<&str>>,
         model_override: Option<Option<&str>>,
         model_effort: Option<Option<&str>>,
+        fast_mode: Option<bool>,
         config_profile: Option<Option<&str>>,
         session_id: &str,
     ) -> Result<Mission, String> {
@@ -547,6 +550,9 @@ impl MissionStore for FileMissionStore {
         }
         if let Some(model_effort) = model_effort {
             mission.model_effort = model_effort.map(ToString::to_string);
+        }
+        if let Some(fast_mode) = fast_mode {
+            mission.fast_mode = fast_mode;
         }
         if let Some(config_profile) = config_profile {
             mission.config_profile = config_profile.map(ToString::to_string);
@@ -1008,6 +1014,7 @@ mod tests {
             .update_mission_run_settings(
                 mission.id,
                 Some("codex"),
+                None,
                 None,
                 None,
                 None,

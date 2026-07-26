@@ -2610,6 +2610,9 @@ pub struct MissionRunner {
     /// Model effort override for this mission (e.g. low/medium/high/xhigh/max)
     pub model_effort: Option<String>,
 
+    /// Request Codex fast service tier for supported GPT models.
+    pub fast_mode: bool,
+
     /// Message queue for this mission
     pub queue: VecDeque<QueuedMessage>,
 
@@ -2701,6 +2704,7 @@ impl MissionRunner {
         config_profile: Option<String>,
         model_override: Option<String>,
         model_effort: Option<String>,
+        fast_mode: bool,
     ) -> Self {
         Self {
             mission_id,
@@ -2712,6 +2716,7 @@ impl MissionRunner {
             agent_override,
             model_override,
             model_effort,
+            fast_mode,
             queue: VecDeque::new(),
             inflight_message: None,
             history: Vec::new(),
@@ -3012,6 +3017,7 @@ impl MissionRunner {
         let agent_override = self.agent_override.clone();
         let model_override = self.model_override.clone();
         let model_effort = self.model_effort.clone();
+        let fast_mode = self.fast_mode;
         let backend_id = self.backend_id.clone();
         let session_id = self.session_id.clone();
         let config_profile = self.config_profile.clone();
@@ -3067,6 +3073,7 @@ impl MissionRunner {
                 agent_override,
                 model_override,
                 model_effort,
+                fast_mode,
                 secrets,
                 session_id,
                 config_profile,
@@ -3443,6 +3450,7 @@ async fn run_mission_turn(
     agent_override: Option<String>,
     model_override: Option<String>,
     model_effort: Option<String>,
+    fast_mode: bool,
     secrets: Option<Arc<SecretsStore>>,
     session_id: Option<String>,
     mission_config_profile: Option<String>,
@@ -3821,6 +3829,7 @@ async fn run_mission_turn(
                     message: &turn_message,
                     model: config.default_model.as_deref(),
                     model_effort: model_effort.as_deref(),
+                    fast_mode,
                     agent: effective_agent.as_deref(),
                     mission_id,
                     events_tx: events_tx.clone(),
@@ -12230,6 +12239,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let message_id = Uuid::new_v4();
         runner.queue_message(
@@ -12275,6 +12285,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         runner.queue_message(Uuid::new_v4(), "queued follow-up".to_string(), None, None);
 
@@ -12296,6 +12307,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         runner.state = MissionRunState::Running;
         runner.running_handle = Some(tokio::spawn(async {
@@ -12323,6 +12335,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         runner.cancel();

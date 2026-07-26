@@ -322,6 +322,9 @@ pub struct Mission {
     /// Optional model effort override (e.g. low/medium/high/xhigh/max)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_effort: Option<String>,
+    /// Request Codex fast service tier for supported GPT models.
+    #[serde(default)]
+    pub fast_mode: bool,
     /// Backend to use for this mission ("opencode" or "claudecode")
     #[serde(default = "default_backend")]
     pub backend: String,
@@ -1862,6 +1865,7 @@ pub trait MissionStore: Send + Sync {
             agent,
             model_override,
             model_effort,
+            false,
             backend,
             config_profile,
             None,
@@ -1878,6 +1882,7 @@ pub trait MissionStore: Send + Sync {
         agent: Option<&str>,
         model_override: Option<&str>,
         model_effort: Option<&str>,
+        fast_mode: bool,
         backend: Option<&str>,
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
@@ -1935,6 +1940,7 @@ pub trait MissionStore: Send + Sync {
         agent: Option<Option<&str>>,
         model_override: Option<Option<&str>>,
         model_effort: Option<Option<&str>>,
+        fast_mode: Option<bool>,
         config_profile: Option<Option<&str>>,
         session_id: &str,
     ) -> Result<Mission, String>;
@@ -3813,6 +3819,7 @@ mod tests {
             agent: None,
             model_override: None,
             model_effort: None,
+            fast_mode: false,
             backend: default_backend(),
             config_profile: None,
             history: vec![],

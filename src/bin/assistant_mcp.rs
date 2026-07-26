@@ -138,6 +138,8 @@ struct StartMissionParams {
     #[serde(default)]
     model_effort: Option<String>,
     #[serde(default)]
+    fast_mode: Option<bool>,
+    #[serde(default)]
     config_profile: Option<String>,
     #[serde(default)]
     agent: Option<String>,
@@ -427,6 +429,8 @@ struct UpdateSettingsParams {
     model_override: Option<String>,
     #[serde(default)]
     model_effort: Option<String>,
+    #[serde(default)]
+    fast_mode: Option<bool>,
     #[serde(default)]
     agent: Option<String>,
     #[serde(default)]
@@ -937,7 +941,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "start_mission".to_string(),
-                description: "Create a new sandboxed.sh mission and send its initial prompt. Set backend explicitly when possible. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Mark PR-changing work with writer=true; the API rejects concurrent writers for the same PR.".to_string(),
+                description: "Create a new sandboxed.sh mission and send its initial prompt. Set backend explicitly when possible. For Codex GPT-5.6/5.5/5.4, set fast_mode=true to request the native fast service tier; this consumes ChatGPT credits faster. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Mark PR-changing work with writer=true; the API rejects concurrent writers for the same PR.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -948,6 +952,7 @@ impl AssistantMcp {
                         "backend": {"type": "string", "enum": ["opencode", "claudecode", "codex", "gemini", "grok", "chatgpt_ui"]},
                         "model_override": {"type": "string", "description": "Exact account-supported model ID. For ChatGPT UI Pro use the canonical ID gpt-5.6-pro; the harness verifies the visible Pro picker option. For Codex Terra use gpt-5.6-terra with medium effort. Never invent variants such as gpt-5.5-sol."},
                         "model_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
+                        "fast_mode": {"type": "boolean", "description": "Enable Codex fast mode (service tier fast). Requires backend=codex and an explicit GPT-5.6, GPT-5.5, or GPT-5.4 model_override. Uses ChatGPT credits faster."},
                         "config_profile": {"type": "string"},
                         "agent": {"type": "string"},
                         "project": {"type": "string", "description": "Stable project id (e.g. \"verity\")."},
@@ -1224,7 +1229,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "update_mission_settings".to_string(),
-                description: "Change a mission's run settings for its NEXT turn: switch backend (claudecode/codex/opencode/gemini/grok/chatgpt_ui), model, reasoning effort, or agent. Applies between turns — the mission must be idle (awaiting_user/acknowledged/interrupted), not actively running. If it is running, cancel_mission first (or wait), then update, then send_message_to_mission or resume_mission to kick the next turn. Note: model_effort only applies to claudecode and codex (low/medium/high/xhigh/max).".to_string(),
+                description: "Change a mission's run settings for its NEXT turn: switch backend (claudecode/codex/opencode/gemini/grok/chatgpt_ui), model, reasoning effort, fast mode, or agent. Applies between turns — the mission must be idle (awaiting_user/acknowledged/interrupted), not actively running. If it is running, cancel_mission first (or wait), then update, then send_message_to_mission or resume_mission to kick the next turn. model_effort applies to claudecode/codex; fast_mode applies only to Codex GPT-5.6/5.5/5.4 and consumes ChatGPT credits faster.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -1233,6 +1238,7 @@ impl AssistantMcp {
                         "backend": {"type": "string", "enum": ["opencode", "claudecode", "codex", "gemini", "grok", "chatgpt_ui"]},
                         "model_override": {"type": "string", "description": "Model id. Empty string clears it. When backend changes this is reset unless set explicitly."},
                         "model_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
+                        "fast_mode": {"type": "boolean", "description": "Enable or disable Codex fast mode for future turns. Only backend=codex with GPT-5.6/5.5/5.4."},
                         "agent": {"type": "string", "description": "Agent name. Empty string clears it."},
                         "config_profile": {"type": "string"}
                     }
@@ -1451,6 +1457,7 @@ impl AssistantMcp {
             "backend": backend,
             "model_override": params.model_override,
             "model_effort": params.model_effort,
+            "fast_mode": params.fast_mode.unwrap_or(false),
             "config_profile": params.config_profile,
             "agent": params.agent,
             // Atomic create+start: the API stores the prompt as the mission's
@@ -1879,6 +1886,9 @@ impl AssistantMcp {
         if let Some(model_effort) = params.model_effort {
             body.insert("model_effort".to_string(), json!(model_effort));
         }
+        if let Some(fast_mode) = params.fast_mode {
+            body.insert("fast_mode".to_string(), json!(fast_mode));
+        }
         if let Some(agent) = params.agent {
             body.insert("agent".to_string(), json!(agent));
         }
@@ -1887,7 +1897,7 @@ impl AssistantMcp {
         }
         if body.is_empty() {
             return Err("No settings provided. Set at least one of: backend, \
-                        model_override, model_effort, agent, config_profile."
+                        model_override, model_effort, fast_mode, agent, config_profile."
                 .to_string());
         }
         let response = self
@@ -2467,6 +2477,8 @@ fn compact_mission_summary(mission: Value) -> Value {
         "mission_mode": mission.get("mission_mode").cloned().unwrap_or(Value::Null),
         "backend": mission.get("backend").cloned().unwrap_or(Value::Null),
         "model_override": mission.get("model_override").cloned().unwrap_or(Value::Null),
+        "model_effort": mission.get("model_effort").cloned().unwrap_or(Value::Null),
+        "fast_mode": mission.get("fast_mode").cloned().unwrap_or(json!(false)),
         "workspace_id": mission.get("workspace_id").cloned().unwrap_or(Value::Null),
         "workspace_name": mission.get("workspace_name").cloned().unwrap_or(Value::Null),
         "short_description": mission.get("short_description").cloned().unwrap_or(Value::Null),
@@ -3285,6 +3297,19 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&json!("confirm")));
+        }
+    }
+
+    #[test]
+    fn mission_tools_expose_codex_fast_mode() {
+        let tools = AssistantMcp::tools();
+        for name in ["start_mission", "update_mission_settings"] {
+            let schema = &tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"))
+                .input_schema;
+            assert_eq!(schema["properties"]["fast_mode"]["type"], "boolean");
         }
     }
 

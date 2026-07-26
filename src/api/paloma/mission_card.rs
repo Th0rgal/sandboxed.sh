@@ -277,6 +277,7 @@ mod tests {
             agent: None,
             model_override: None,
             model_effort: None,
+            fast_mode: false,
             backend: "claudecode".to_string(),
             config_profile: None,
             history: vec![],

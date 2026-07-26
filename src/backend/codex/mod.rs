@@ -209,9 +209,13 @@ async fn send_message_streaming_app_server(
     // rotation we use app-server's external token mode instead: the backend
     // supplies an access token at startup and answers refresh requests under
     // our per-account lock.
+    let mut enabled_features = vec!["goals".to_string()];
+    if cfg.fast_mode {
+        enabled_features.push("fast_mode".to_string());
+    }
     let app_cfg = AppServerConfig {
         cli_path: cfg.cli_path.clone(),
-        enabled_features: vec!["goals".to_string()],
+        enabled_features,
         default_model: cfg.default_model.clone(),
         model_effort: cfg.model_effort.clone(),
         env: cfg.extra_env.clone(),
@@ -272,6 +276,7 @@ async fn send_message_streaming_app_server(
         model: resolved_model,
         cwd: Some(thread_cwd),
         reasoning_effort: cfg.model_effort.clone(),
+        service_tier: cfg.fast_mode.then(|| "fast".to_string()),
         ephemeral: None,
         // Match exec-mode's `--dangerously-bypass-approvals-and-sandbox`.
         // Without these, codex defaults to `on-request` + `read-only`, which
