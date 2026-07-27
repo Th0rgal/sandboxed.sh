@@ -42,6 +42,7 @@ pub struct SettingsResponse {
     pub auto_cleanup_orphans_enabled: Option<bool>,
     pub ask_assistant_model: Option<String>,
     pub metadata_model: Option<String>,
+    pub harness_versions: Option<crate::settings::HarnessVersionPolicy>,
 }
 
 impl From<Settings> for SettingsResponse {
@@ -57,6 +58,7 @@ impl From<Settings> for SettingsResponse {
             auto_cleanup_orphans_enabled: settings.auto_cleanup_orphans_enabled,
             ask_assistant_model: settings.ask_assistant_model,
             metadata_model: settings.metadata_model,
+            harness_versions: settings.harness_versions,
         }
     }
 }
@@ -87,6 +89,10 @@ pub struct UpdateSettingsRequest {
     /// `ask_assistant_model`; only routable values are honored at runtime.
     #[serde(default)]
     pub metadata_model: Option<Option<String>>,
+    /// Harness CLI version pins for container bootstrap. Double-Option so a
+    /// present `null` clears every pin.
+    #[serde(default)]
+    pub harness_versions: Option<Option<crate::settings::HarnessVersionPolicy>>,
 }
 
 /// Request to update library remote specifically.
@@ -253,6 +259,25 @@ async fn update_settings(
     if let Some(value) = req.ask_assistant_model {
         // Normalize empty string to None (fall back to env/default).
         new_settings.ask_assistant_model = value.filter(|s| !s.trim().is_empty());
+    }
+    if let Some(value) = req.harness_versions {
+        // Normalize empty pins away; an all-empty policy clears the field.
+        new_settings.harness_versions = value
+            .map(|mut policy| {
+                let trim = |v: &mut Option<String>| {
+                    *v = v
+                        .take()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                };
+                trim(&mut policy.claude_code);
+                trim(&mut policy.codex);
+                trim(&mut policy.gemini);
+                trim(&mut policy.opencode);
+                trim(&mut policy.grok);
+                policy
+            })
+            .filter(|p| *p != crate::settings::HarnessVersionPolicy::default());
     }
 
     state
