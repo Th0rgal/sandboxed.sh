@@ -27,6 +27,7 @@ const { refreshBackendConfigs, getChatgptUiProfilePoolMock, getChatgptUiDurabili
         display: null,
         model: null,
         timeout_secs: 900,
+        launch_interval_secs: 30,
         headless: true,
       },
     },
@@ -125,6 +126,7 @@ describe('BackendsPage ChatGPT UI settings', () => {
       'socks5://127.0.0.1:10880'
     );
     expect(screen.getByLabelText('Canonical model ID')).toHaveValue('gpt-5.6-pro');
+    expect(screen.getByLabelText('Launch spacing (seconds)')).toHaveValue(30);
     expect(screen.getByText('Runtime paths configured')).toBeVisible();
 
     fireEvent.click(screen.getByRole('button', { name: 'Save ChatGPT UI' }));
@@ -143,6 +145,7 @@ describe('BackendsPage ChatGPT UI settings', () => {
           browser: 'chromium',
           headless: false,
           timeout_secs: 14400,
+          launch_interval_secs: 30,
         }),
         { enabled: true }
       );

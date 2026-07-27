@@ -421,6 +421,16 @@ pub async fn update_backend_config(
                     "timeout_secs must be between 30 and 86400".to_string(),
                 ));
             }
+            let launch_interval_secs = settings
+                .get("launch_interval_secs")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(30);
+            if !(5..=300).contains(&launch_interval_secs) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "launch_interval_secs must be between 5 and 300".to_string(),
+                ));
+            }
             let browser = settings
                 .get("browser")
                 .and_then(|value| value.as_str())
@@ -511,6 +521,7 @@ pub async fn update_backend_config(
                 "headless": headless,
                 "display": display,
                 "timeout_secs": timeout_secs,
+                "launch_interval_secs": launch_interval_secs,
                 "model": model,
                 "proxy_server": proxy_server,
             })

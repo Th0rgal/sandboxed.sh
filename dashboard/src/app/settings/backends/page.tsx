@@ -40,6 +40,7 @@ const CHATGPT_UI_PRODUCTION_DEFAULTS = {
   display: ':93',
   model: 'gpt-5.6-pro',
   timeout_secs: 14400,
+  launch_interval_secs: 30,
   headless: false,
 };
 
@@ -114,6 +115,7 @@ export default function BackendsPage() {
     display: '',
     model: '',
     timeout_secs: 14400,
+    launch_interval_secs: 30,
     headless: true,
     enabled: false,
   });
@@ -217,6 +219,7 @@ export default function BackendsPage() {
       display: typeof settings.display === 'string' ? settings.display : '',
       model: typeof settings.model === 'string' ? settings.model : '',
       timeout_secs: typeof settings.timeout_secs === 'number' ? settings.timeout_secs : 14400,
+      launch_interval_secs: typeof settings.launch_interval_secs === 'number' ? settings.launch_interval_secs : 30,
       headless: settings.headless !== false,
       enabled: chatgptUiBackendConfig.enabled,
     });
@@ -366,6 +369,7 @@ export default function BackendsPage() {
           browser: 'chromium',
           headless: chatgptUiForm.headless,
           timeout_secs: chatgptUiForm.timeout_secs,
+          launch_interval_secs: chatgptUiForm.launch_interval_secs,
           model: chatgptUiForm.model || null,
         },
         { enabled: chatgptUiForm.enabled }
@@ -864,7 +868,7 @@ export default function BackendsPage() {
                   Required for visible Chromium when anti-bot checks reject headless mode.
                 </p>
               </div>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                 <div>
                   <label htmlFor="chatgpt-ui-model" className="block text-xs text-white/60 mb-1.5">Canonical model ID</label>
                   <input id="chatgpt-ui-model" type="text" value={chatgptUiForm.model} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, model: e.target.value }))} placeholder="gpt-5.6-pro" className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
@@ -876,6 +880,13 @@ export default function BackendsPage() {
                     Default 4 hours for long GPT Pro research; maximum 24 hours.
                   </p>
                 </div>
+                <div>
+                  <label htmlFor="chatgpt-ui-launch-interval" className="block text-xs text-white/60 mb-1.5">Launch spacing (seconds)</label>
+                  <input id="chatgpt-ui-launch-interval" type="number" min={5} max={300} value={chatgptUiForm.launch_interval_secs} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, launch_interval_secs: Number(e.target.value) }))} className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                  <p className="mt-1.5 text-xs text-white/30">
+                    Spaces account-level browser launches; long Pro turns still run concurrently.
+                  </p>
+                </div>
               </div>
               <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
                 <input type="checkbox" checked={chatgptUiForm.headless} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, headless: e.target.checked }))} />
@@ -883,7 +894,7 @@ export default function BackendsPage() {
               </label>
               <button
                 onClick={handleSaveChatgptUiBackend}
-                disabled={savingBackend || !chatgptUiIsConfigured || (!chatgptUiForm.headless && !chatgptUiForm.display) || chatgptUiForm.timeout_secs < 30 || chatgptUiForm.timeout_secs > 86400}
+                disabled={savingBackend || !chatgptUiIsConfigured || (!chatgptUiForm.headless && !chatgptUiForm.display) || chatgptUiForm.timeout_secs < 30 || chatgptUiForm.timeout_secs > 86400 || chatgptUiForm.launch_interval_secs < 5 || chatgptUiForm.launch_interval_secs > 300}
                 className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {savingBackend ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
