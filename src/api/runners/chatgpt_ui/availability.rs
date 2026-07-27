@@ -151,7 +151,16 @@ pub fn configure(profile_dirs: &[PathBuf], app_working_dir: &Path) {
         .lock()
         .expect("ChatGPT UI availability registry poisoned");
     if let Some(entry) = entries.get_mut(&key) {
-        entry.profile_dirs = profile_dirs.to_vec();
+        // Retain prior members for the lifetime of this process. A settings
+        // refresh can remove a profile while an already-running browser turn
+        // still owns it; a later failure from that turn must continue to open
+        // the account-wide gate. Process restart naturally clears mappings
+        // once no old turns can still report.
+        for profile_dir in profile_dirs {
+            if !entry.profile_dirs.contains(profile_dir) {
+                entry.profile_dirs.push(profile_dir.clone());
+            }
+        }
         return;
     }
     let status = std::fs::read(&path)
@@ -436,5 +445,30 @@ mod tests {
         assert_eq!(snapshot.state, AvailabilityState::Cooldown);
         assert_eq!(snapshot.reason, Some(AvailabilityReason::RateLimited));
         reset_for_tests(&profiles);
+    }
+
+    #[test]
+    fn settings_refresh_retains_profiles_owned_by_in_flight_turns() {
+        let root = tempfile::tempdir().unwrap();
+        let retained = root.path().join("profiles/retained");
+        let removed = root.path().join("profiles/removed");
+        std::fs::create_dir_all(&retained).unwrap();
+        std::fs::create_dir_all(&removed).unwrap();
+        let original_profiles = vec![retained.clone(), removed.clone()];
+        configure(&original_profiles, root.path());
+        mark_available(&original_profiles);
+
+        configure(std::slice::from_ref(&retained), root.path());
+        open_cooldown(
+            &removed,
+            AvailabilityReason::RateLimited,
+            Duration::from_secs(600),
+        );
+
+        assert_eq!(
+            status(std::slice::from_ref(&retained)).state,
+            AvailabilityState::Cooldown
+        );
+        reset_for_tests(std::slice::from_ref(&retained));
     }
 }

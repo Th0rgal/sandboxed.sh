@@ -596,6 +596,7 @@ pub async fn run_chatgpt_ui_turn(
     {
         return result;
     }
+    let paced_transition_id = availability::status(&settings.profile_dirs).transition_id;
     // The configured profiles share one ChatGPT account in normal
     // deployments. Pace navigation/submission starts for that account pool;
     // already-running Pro conversations remain fully concurrent.
@@ -654,6 +655,23 @@ pub async fn run_chatgpt_ui_turn(
             .await
     {
         return result;
+    }
+    // Missions may already have reserved launch turns when another browser
+    // opens a cooldown. Recovery wakes those queued acquisitions together, so
+    // reserve a fresh launch turn whenever the availability generation changed
+    // and preserve account-wide spacing after the probe succeeds.
+    if availability::status(&settings.profile_dirs).transition_id != paced_transition_id {
+        if let Err(result) = profile_pool::wait_for_launch_turn(
+            &settings.profile_dirs[0],
+            settings.launch_interval,
+            mission_id,
+            &events_tx,
+            &cancel,
+        )
+        .await
+        {
+            return result;
+        }
     }
     if settings.browser == "chromium" {
         let owned = chromium_cleanup::pool_owns_singletons(&profile_dir);
