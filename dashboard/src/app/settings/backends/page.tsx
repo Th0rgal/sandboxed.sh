@@ -882,7 +882,7 @@ export default function BackendsPage() {
                 </div>
                 <div>
                   <label htmlFor="chatgpt-ui-launch-interval" className="block text-xs text-white/60 mb-1.5">Launch spacing (seconds)</label>
-                  <input id="chatgpt-ui-launch-interval" type="number" min={5} max={300} value={chatgptUiForm.launch_interval_secs} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, launch_interval_secs: Number(e.target.value) }))} className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
+                  <input id="chatgpt-ui-launch-interval" type="number" min={5} max={300} step={1} value={chatgptUiForm.launch_interval_secs} onChange={(e) => setChatgptUiForm((prev) => ({ ...prev, launch_interval_secs: Number(e.target.value) }))} className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50" />
                   <p className="mt-1.5 text-xs text-white/30">
                     Spaces account-level browser launches; long Pro turns still run concurrently.
                   </p>
@@ -894,7 +894,7 @@ export default function BackendsPage() {
               </label>
               <button
                 onClick={handleSaveChatgptUiBackend}
-                disabled={savingBackend || !chatgptUiIsConfigured || (!chatgptUiForm.headless && !chatgptUiForm.display) || chatgptUiForm.timeout_secs < 30 || chatgptUiForm.timeout_secs > 86400 || chatgptUiForm.launch_interval_secs < 5 || chatgptUiForm.launch_interval_secs > 300}
+                disabled={savingBackend || !chatgptUiIsConfigured || (!chatgptUiForm.headless && !chatgptUiForm.display) || chatgptUiForm.timeout_secs < 30 || chatgptUiForm.timeout_secs > 86400 || !Number.isInteger(chatgptUiForm.launch_interval_secs) || chatgptUiForm.launch_interval_secs < 5 || chatgptUiForm.launch_interval_secs > 300}
                 className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {savingBackend ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}

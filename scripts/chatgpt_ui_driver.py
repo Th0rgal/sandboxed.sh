@@ -146,7 +146,9 @@ async def raise_if_rate_limited(page) -> None:
     Keep this exact and narrow: arbitrary page text is private conversation
     data and must neither be logged nor used for fuzzy classification.
     """
-    heading = page.get_by_text(RATE_LIMIT_HEADING, exact=True).first
+    heading = page.get_by_role(
+        "heading", name=RATE_LIMIT_HEADING, exact=True
+    ).first
     try:
         if await heading.count() and await heading.is_visible():
             raise RateLimited()
@@ -155,13 +157,21 @@ async def raise_if_rate_limited(page) -> None:
     except Exception:
         # A missing/transient locator is not rate-limit evidence.
         pass
-    # Some ChatGPT rollouts render the warning inside a portal whose heading
-    # is not exposed as an exact text locator. Check only the two stable,
-    # non-conversation phrases in memory; never log or emit the page body.
+    # Some ChatGPT rollouts render the warning inside a portal without heading
+    # semantics. Scope the fallback to modal surfaces so quoted conversation
+    # text can never open the account-wide circuit.
     try:
-        body_text = await page.locator("body").inner_text(timeout=2_000)
-        if RATE_LIMIT_HEADING in body_text and "temporarily limited access" in body_text:
-            raise RateLimited()
+        dialogs = page.locator('[role="dialog"], [aria-modal="true"]')
+        for index in range(await dialogs.count()):
+            dialog = dialogs.nth(index)
+            if not await dialog.is_visible():
+                continue
+            dialog_text = await dialog.inner_text(timeout=2_000)
+            if (
+                RATE_LIMIT_HEADING in dialog_text
+                and "temporarily limited access" in dialog_text
+            ):
+                raise RateLimited()
     except RateLimited:
         raise
     except Exception:

@@ -86,6 +86,9 @@ class FakeControl:
     def first(self):
         return self
 
+    def nth(self, _index):
+        return self
+
     async def count(self) -> int:
         return 1 if self.visible else 0
 
@@ -119,8 +122,9 @@ class FakeComposerForm:
 
 
 class FakeComposerPage:
-    class Body:
+    class Dialog(FakeControl):
         def __init__(self, rate_limited: bool) -> None:
+            super().__init__(rate_limited)
             self.rate_limited = rate_limited
 
         async def inner_text(self, timeout) -> str:
@@ -154,16 +158,19 @@ class FakeComposerPage:
         self.selectors.append(selector)
         if selector == "form":
             return self.form
-        if selector == "body":
-            return self.Body(self.rate_limited)
+        if selector == '[role="dialog"], [aria-modal="true"]':
+            return self.Dialog(self.rate_limited)
         return self.testid_control
 
     async def wait_for_timeout(self, _timeout) -> None:
         return None
 
-    def get_by_text(self, text, exact=False):
+    def get_by_role(self, role, name=None, exact=False):
         return FakeControl(
-            self.rate_limited and text == "Too many requests" and exact
+            self.rate_limited
+            and role == "heading"
+            and name == "Too many requests"
+            and exact
         )
 
 
@@ -217,7 +224,9 @@ class HydratingConversationPage:
     async def wait_for_timeout(self, _timeout) -> None:
         self.waits += 1
 
-    def get_by_role(self, role, name=None):
+    def get_by_role(self, role, name=None, exact=False):
+        if role == "heading":
+            return HydratingLocator([0])
         if role == "button" and name is not None:
             return self.login
         return self.composer
