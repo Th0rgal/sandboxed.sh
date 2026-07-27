@@ -6,10 +6,10 @@ description: >
   to exhaust its budget instead of giving up, and send targeted hints. Trigger
   terms: mission, sandboxed.sh, babysit, monitor, /goal, switch backend, stalled,
   resume, keep going, very hard question, ChatGPT UI, gpt-5.6-pro.
-version: 1.2.0
+version: 1.3.0
 metadata:
   policy: chatgpt-ui-pool
-  policy_version: 1.2.0
+  policy_version: 1.3.0
 ---
 
 # Hermes Mission Control
@@ -150,7 +150,7 @@ When a model "isn't working," first prove it's the **model** and not the
 concluding the model is too weak. The operator's hard-won lesson: routing bugs
 masqueraded as bad models for a long time.
 
-## ChatGPT UI pool policy (policy_version 1.2.0)
+## ChatGPT UI pool policy (policy_version 1.3.0)
 
 Binding rules for every `chatgpt_ui` mission you start or manage. The
 authoritative versioned policy is `docs/policy/CHATGPT_UI_POOL_POLICY.md` in
@@ -181,6 +181,12 @@ this section must stay in sync with it.
   global circuit. New turns wait without leasing a profile. Treat the pool as
   unavailable until the circuit closes; capacity callbacks must not
   redispatch into it.
+- **Availability is probe-gated.** Before starting, resuming, or redispatching
+  any `chatgpt_ui` mission, call `get_chatgpt_ui_pool_status` and require
+  `availability.state == available`. `cooldown` and `probing` are both
+  unavailable. Cooldown expiry does not authorize work: sandboxed.sh runs one
+  bounded browser probe that never enters or submits a prompt, and only probe
+  success changes the state back to `available`.
 - **Follow-ups preserve the discussion.** A later turn on a completed
   `chatgpt_ui` mission continues the same ChatGPT conversation on its owning
   profile. Resume or message the existing mission when the question depends on

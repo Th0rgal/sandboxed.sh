@@ -3299,7 +3299,17 @@ export interface ChatgptUiProfilePoolResponse {
   backend_circuit?: {
     open: boolean;
     retry_after_secs?: number | null;
-    reason?: "compatibility" | "transport" | null;
+    reason?: "compatibility" | "transport" | "rate_limited" | null;
+  };
+  availability?: {
+    state: "available" | "cooldown" | "probing";
+    reason?: "compatibility" | "transport" | "rate_limited" | null;
+    unavailable_since?: string | null;
+    retry_at?: string | null;
+    retry_after_secs?: number | null;
+    transition_id: number;
+    last_probe_at?: string | null;
+    recovered_at?: string | null;
   };
 }
 

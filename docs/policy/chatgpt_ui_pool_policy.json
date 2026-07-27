@@ -1,6 +1,6 @@
 {
   "policy": "chatgpt-ui-pool",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "source_of_truth": {
     "runtime": "src/api/runners/chatgpt_ui/mod.rs",
     "pool": "src/api/runners/chatgpt_ui/profile_pool.rs",
@@ -48,7 +48,10 @@
       "signal": "rate_limited",
       "max_automatic_retries": 0,
       "wait_for_allowance_recovery": true,
-      "account_cooldown_secs": 600
+      "account_cooldown_secs": 600,
+      "recovery_probe_required": true,
+      "probe_timeout_secs": 30,
+      "probe_submits_prompt": false
     },
     "browser_launch": {
       "signal": "browser_launch",

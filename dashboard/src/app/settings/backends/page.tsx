@@ -765,12 +765,14 @@ export default function BackendsPage() {
                   </p>
                   {chatgptUiPool!.backend_circuit?.open && (
                     <div className="mt-3 rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200" data-testid="chatgpt-ui-compatibility-circuit">
-                      Backend cooldown active
-                      {chatgptUiPool!.backend_circuit.reason
-                        ? ` · ${chatgptUiPool!.backend_circuit.reason}`
+                      {chatgptUiPool!.availability?.state === 'probing'
+                        ? 'Recovery probe in progress'
+                        : 'Backend cooldown active'}
+                      {(chatgptUiPool!.availability?.reason ?? chatgptUiPool!.backend_circuit.reason)
+                        ? ` · ${chatgptUiPool!.availability?.reason ?? chatgptUiPool!.backend_circuit.reason}`
                         : ''}
-                      {typeof chatgptUiPool!.backend_circuit.retry_after_secs === 'number'
-                        ? ` · probe in ${Math.max(1, Math.ceil(chatgptUiPool!.backend_circuit.retry_after_secs / 60))} min`
+                      {typeof (chatgptUiPool!.availability?.retry_after_secs ?? chatgptUiPool!.backend_circuit.retry_after_secs) === 'number'
+                        ? ` · probe in ${Math.max(1, Math.ceil((chatgptUiPool!.availability?.retry_after_secs ?? chatgptUiPool!.backend_circuit.retry_after_secs)! / 60))} min`
                         : ''}
                     </div>
                   )}

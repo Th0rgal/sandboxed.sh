@@ -914,6 +914,11 @@ impl AssistantMcp {
                 }),
             },
             ToolDefinition {
+                name: "get_chatgpt_ui_pool_status".to_string(),
+                description: "Get privacy-safe ChatGPT UI slot telemetry and the persistent backend availability gate. Before starting, resuming, or redispatching a chatgpt_ui mission, require availability.state=available; cooldown and probing states must wait for the backend recovery probe.".to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
                 name: "list_mission_shared_files".to_string(),
                 description: "List files and screenshots shared by assistant messages in a sandboxed.sh mission, including bounded files downloaded from a ChatGPT UI response.".to_string(),
                 input_schema: json!({
@@ -1373,6 +1378,13 @@ impl AssistantMcp {
             .json()
             .await
             .map_err(|error| format!("Failed to parse mission events: {error}"))
+    }
+
+    async fn get_chatgpt_ui_pool_status(&self) -> Result<Value, String> {
+        let response = self
+            .api_get("/api/backends/chatgpt_ui/profile-pool")
+            .await?;
+        Self::response_value(response, "fetch ChatGPT UI pool status").await
     }
 
     async fn list_mission_shared_files(
@@ -2215,6 +2227,7 @@ impl AssistantMcp {
                     .map_err(|error| format!("Invalid params: {error}"))?;
                 self.get_mission_events(params).await
             }
+            "get_chatgpt_ui_pool_status" => self.get_chatgpt_ui_pool_status().await,
             "list_mission_shared_files" => {
                 let params: MissionSharedFilesParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
@@ -3303,6 +3316,9 @@ mod tests {
     #[test]
     fn mission_tools_expose_codex_fast_mode() {
         let tools = AssistantMcp::tools();
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == "get_chatgpt_ui_pool_status"));
         for name in ["start_mission", "update_mission_settings"] {
             let schema = &tools
                 .iter()

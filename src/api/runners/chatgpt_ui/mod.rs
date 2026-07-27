@@ -3,6 +3,7 @@
 //! The browser helper speaks NDJSON on stdout. Browser profiles remain outside
 //! mission workspaces and are referenced by an operator-supplied absolute path.
 
+pub mod availability;
 pub mod chromium_cleanup;
 pub mod profile_pool;
 
@@ -51,6 +52,7 @@ enum DriverEvent {
         content: String,
         model: Option<String>,
     },
+    ProbeReady,
     /// The prompt provably lives in a conversation. `conversation_path` is an
     /// opaque `/c/<id>` route — a durability pointer, never content.
     Submitted {
@@ -314,6 +316,7 @@ fn validate_unique_profile_basenames(profile_dirs: &[PathBuf]) -> Result<(), Str
 
 fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
     let profile_dirs = configured_profile_dirs(app_working_dir)?;
+    availability::configure(&profile_dirs, app_working_dir);
     let driver_path = get_backend_string_setting("chatgpt_ui", "driver_path")
         .map(PathBuf::from)
         .ok_or_else(|| "chatgpt_ui driver_path is required".to_string())?;
@@ -368,6 +371,159 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
         launch_interval: Duration::from_secs(launch_interval_secs),
         headless,
     })
+}
+
+const RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Start the single backend-wide recovery worker. Cooldown expiry only makes a
+/// probe eligible; this worker is the sole path that can mark the backend
+/// available again without submitting user content.
+pub(crate) fn spawn_recovery_probe(app_working_dir: PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            let settings = match validated_settings(&app_working_dir) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    tracing::debug!(error = %error, "ChatGPT UI recovery probe is not configured");
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
+            };
+            if !availability::claim_probe(&settings.profile_dirs) {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            let Some((_slot, profile_dir, profile_lock)) =
+                profile_pool::try_acquire_recovery_profile(&settings.profile_dirs)
+            else {
+                availability::release_probe(&settings.profile_dirs);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            };
+
+            if settings.browser == "chromium" {
+                let owned = chromium_cleanup::pool_owns_singletons(&profile_dir);
+                let cleanup = chromium_cleanup::cleanup_profile_singletons(&profile_dir, owned);
+                if !cleanup.profile_is_launchable() {
+                    profile_pool::record_slot_failure(&profile_dir, SlotFailureKind::Launch);
+                    availability::release_probe(&settings.profile_dirs);
+                    tokio::time::sleep(settings.launch_interval).await;
+                    continue;
+                }
+            }
+
+            let outcome = run_recovery_probe(&settings, &profile_dir, &app_working_dir).await;
+            drop(profile_lock);
+            let mut next_delay = Duration::from_secs(5);
+            match outcome {
+                Ok(()) => {
+                    profile_pool::record_slot_success(&profile_dir);
+                    availability::mark_available(&settings.profile_dirs);
+                    tracing::info!("ChatGPT UI recovery probe succeeded; backend is available");
+                }
+                Err(code) if code == "rate_limited" => {
+                    profile_pool::record_backend_rate_limit(&profile_dir);
+                }
+                Err(code) if code == "auth_required" => {
+                    profile_pool::record_slot_failure(&profile_dir, SlotFailureKind::Auth);
+                    availability::release_probe(&settings.profile_dirs);
+                    next_delay = settings.launch_interval;
+                }
+                Err(code) if code == "compatibility" => {
+                    profile_pool::record_slot_failure(&profile_dir, SlotFailureKind::Compatibility);
+                    availability::open_cooldown(
+                        &profile_dir,
+                        availability::AvailabilityReason::Compatibility,
+                        Duration::from_secs(5 * 60),
+                    );
+                }
+                Err(_) => {
+                    availability::open_cooldown(
+                        &profile_dir,
+                        availability::AvailabilityReason::Transport,
+                        Duration::from_secs(5 * 60),
+                    );
+                }
+            }
+            tokio::time::sleep(next_delay).await;
+        }
+    });
+}
+
+async fn run_recovery_probe(
+    settings: &Settings,
+    profile_dir: &Path,
+    app_working_dir: &Path,
+) -> Result<(), String> {
+    let mut command = Command::new(&settings.python_path);
+    command
+        .arg(&settings.driver_path)
+        .arg("--profile-dir")
+        .arg(profile_dir)
+        .arg("--browser")
+        .arg(&settings.browser)
+        .arg("--headless")
+        .arg(if settings.headless { "true" } else { "false" });
+    if let Some(proxy_server) = settings.proxy_server.as_deref() {
+        command.arg("--proxy-server").arg(proxy_server);
+    }
+    command
+        .current_dir(app_working_dir)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if let Some(display) = settings.display.as_deref() {
+        command.env("DISPLAY", display);
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(|_| "browser_launch".to_string())?;
+    if settings.browser == "chromium" {
+        chromium_cleanup::claim_singleton_ownership(profile_dir);
+    }
+    let request = serde_json::json!({
+        "type": "probe",
+        "model": "gpt-5.6-pro",
+        "timeout_ms": RECOVERY_PROBE_TIMEOUT.as_millis() as u64,
+    });
+    let Some(mut stdin) = child.stdin.take() else {
+        terminate_child_tree(&mut child).await;
+        return Err("driver_protocol".to_string());
+    };
+    if stdin
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .is_err()
+    {
+        terminate_child_tree(&mut child).await;
+        return Err("driver_protocol".to_string());
+    }
+    drop(stdin);
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let outcome = tokio::time::timeout(RECOVERY_PROBE_TIMEOUT, async {
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => match serde_json::from_str::<DriverEvent>(&line) {
+                    Ok(DriverEvent::ProbeReady) => return Ok(()),
+                    Ok(DriverEvent::Error { code, .. }) => {
+                        return Err(code.unwrap_or_else(|| "driver_error".to_string()))
+                    }
+                    Ok(DriverEvent::Diagnostic { .. }) => {}
+                    Ok(_) | Err(_) => return Err("driver_protocol".to_string()),
+                },
+                Ok(None) | Err(_) => return Err("driver_protocol".to_string()),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err("timeout".to_string()));
+    terminate_child_tree(&mut child).await;
+    outcome
 }
 
 /// Outcome of one driver attempt. A resume-pointer failure is terminal for the
@@ -431,6 +587,15 @@ pub async fn run_chatgpt_ui_turn(
 
     let attempt_resume = resume_record.take();
     let attempt_continuation = continuation_record.take();
+    // This gate is deliberately before both normal and pinned acquisition.
+    // A durable continuation must not bypass an account-wide cooldown merely
+    // because it already owns a conversation route.
+    if let Err(result) =
+        availability::wait_until_available(&settings.profile_dirs, mission_id, &events_tx, &cancel)
+            .await
+    {
+        return result;
+    }
     // The configured profiles share one ChatGPT account in normal
     // deployments. Pace navigation/submission starts for that account pool;
     // already-running Pro conversations remain fully concurrent.
@@ -840,6 +1005,16 @@ async fn drive_once(
                         model_used = model.or(model_used);
                         completed = true;
                         break;
+                    }
+                    DriverEvent::ProbeReady => {
+                        terminate_child_tree(&mut child).await;
+                        return DriveOutcome::Terminal(
+                            AgentResult::failure(
+                                "chatgpt_ui emitted a recovery-only event during a mission turn",
+                                0,
+                            )
+                            .with_terminal_reason(TerminalReason::LlmError),
+                        );
                     }
                     DriverEvent::Artifact { path, name, .. } => {
                         artifact_receipts.push((path, name));

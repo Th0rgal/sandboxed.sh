@@ -581,8 +581,9 @@ async def run(args, request) -> None:
         )
         return
 
+    probe_only = request.get("type") == "probe"
     message = request.get("message")
-    if not isinstance(message, str) or not message.strip():
+    if not probe_only and (not isinstance(message, str) or not message.strip()):
         fail("invalid_request", "message must be a non-empty string")
         return
     timeout_ms = max(
@@ -655,6 +656,15 @@ async def run(args, request) -> None:
                 return
 
             page = context.pages[0] if context.pages else await context.new_page()
+            if probe_only:
+                stage = "recovery_probe"
+                await establish_fresh_chat(page)
+                stage = "model_selection"
+                await choose_model(page, requested_model)
+                await raise_if_rate_limited(page)
+                await assert_blank_chat(page)
+                emit("probe_ready")
+                return
             if resume_path is not None:
                 stage = "resume"
                 baseline = await establish_resumed_chat(page, resume_path, message)

@@ -106,12 +106,15 @@
         "rate_limited": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["signal", "max_automatic_retries", "wait_for_allowance_recovery", "account_cooldown_secs"],
+          "required": ["signal", "max_automatic_retries", "wait_for_allowance_recovery", "account_cooldown_secs", "recovery_probe_required", "probe_timeout_secs", "probe_submits_prompt"],
           "properties": {
             "signal": { "const": "rate_limited" },
             "max_automatic_retries": { "const": 0 },
             "wait_for_allowance_recovery": { "const": true },
-            "account_cooldown_secs": { "const": 600 }
+            "account_cooldown_secs": { "const": 600 },
+            "recovery_probe_required": { "const": true },
+            "probe_timeout_secs": { "const": 30 },
+            "probe_submits_prompt": { "const": false }
           }
         },
         "browser_launch": {

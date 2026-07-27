@@ -834,6 +834,7 @@ pub async fn get_backend_quota(
 pub struct ChatgptUiProfilePoolResponse {
     pub slots: Vec<crate::api::runners::chatgpt_ui::profile_pool::ProfileSlotStatus>,
     pub backend_circuit: crate::api::runners::chatgpt_ui::profile_pool::BackendCircuitStatus,
+    pub availability: crate::api::runners::chatgpt_ui::availability::AvailabilityStatus,
 }
 
 /// GET /api/backends/chatgpt_ui/profile-pool — per-slot pool state
@@ -845,11 +846,16 @@ pub async fn chatgpt_ui_profile_pool(
     let profile_dirs =
         crate::api::runners::chatgpt_ui::configured_profile_dirs(&state.config.working_dir)
             .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    crate::api::runners::chatgpt_ui::availability::configure(
+        &profile_dirs,
+        &state.config.working_dir,
+    );
     Ok(Json(ChatgptUiProfilePoolResponse {
         slots: crate::api::runners::chatgpt_ui::profile_pool::pool_snapshot(&profile_dirs),
         backend_circuit: crate::api::runners::chatgpt_ui::profile_pool::backend_circuit_status(
             &profile_dirs,
         ),
+        availability: crate::api::runners::chatgpt_ui::availability::status(&profile_dirs),
     }))
 }
 

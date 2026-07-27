@@ -1,6 +1,6 @@
 # ChatGPT UI pool operational policy
 
-Version: 1.2.0
+Version: 1.3.0
 
 This document is the human-readable form of the versioned operational policy
 for the `chatgpt_ui` backend pool. The machine-readable form lives beside it in
@@ -74,8 +74,12 @@ redispatch into it.
 
 One exact ChatGPT “Too many requests” interstitial is conclusive account-wide
 evidence and opens a ten-minute circuit immediately. A completion from a turn
-that was already running does not close this rate-limit circuit; only its timed
-cooldown does. The controller must not redispatch rate-limited work meanwhile.
+that was already running does not close this rate-limit circuit. Cooldown expiry
+moves the persistent gate to `probing`, not `available`; a single-flight,
+30-second browser probe must verify authenticated Pro composer readiness
+without entering or submitting a prompt. New, resumed, and conversation-pinned
+turns remain blocked until that probe succeeds, including across a backend
+restart. The controller must not redispatch rate-limited work meanwhile.
 
 The runtime preference for a clean alternative supports this policy but does
 not authorize a retry by itself. The controller must confirm from live pool
@@ -97,7 +101,9 @@ failure is auth must not be selected for a compatibility retry.
 `rate_limited` gets zero automatic retries. Wait for the account's UI
 allowance to recover; sandboxed.sh cannot read or predict subscription quota.
 Moving the same request to another slot on the same account does not help and
-is not permitted as an automatic response.
+is not permitted as an automatic response. Hermes must read
+`get_chatgpt_ui_pool_status` before any ChatGPT UI dispatch and require
+`availability.state == available`.
 
 An undifferentiated `browser_launch` error is a host-level transport failure:
 it may mean Playwright or Chromium is unavailable globally, so it must not

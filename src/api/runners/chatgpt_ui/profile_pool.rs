@@ -17,6 +17,7 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::availability::{self, AvailabilityReason, AvailabilityState};
 use crate::agents::{AgentResult, TerminalReason};
 use crate::api::control::AgentEvent;
 
@@ -145,6 +146,15 @@ fn record_backend_failure_at(profile_dir: &Path, kind: BackendFailureKind, now: 
             .map_or(until, |existing| existing.max(until)),
     );
     circuit.reason = Some(kind);
+    availability::open_cooldown(
+        profile_dir,
+        match kind {
+            BackendFailureKind::Compatibility => AvailabilityReason::Compatibility,
+            BackendFailureKind::Transport => AvailabilityReason::Transport,
+            BackendFailureKind::RateLimited => AvailabilityReason::RateLimited,
+        },
+        GLOBAL_BACKEND_FAILURE_COOLDOWN,
+    );
     true
 }
 
@@ -207,6 +217,11 @@ pub fn record_backend_rate_limit(profile_dir: &Path) {
             .map_or(until, |existing| existing.max(until)),
     );
     circuit.reason = Some(BackendFailureKind::RateLimited);
+    availability::open_cooldown(
+        profile_dir,
+        AvailabilityReason::RateLimited,
+        GLOBAL_RATE_LIMIT_COOLDOWN,
+    );
     tracing::warn!(
         cooldown_secs = GLOBAL_RATE_LIMIT_COOLDOWN.as_secs(),
         "ChatGPT UI account circuit opened after an explicit rate-limit page"
@@ -414,6 +429,7 @@ pub(crate) fn reset_registry_for_tests(profile_dirs: &[PathBuf]) {
             gates.remove(&circuit_key(profile_dir));
         }
     }
+    availability::reset_for_tests(profile_dirs);
 }
 
 pub async fn acquire_profile(
@@ -429,42 +445,6 @@ pub async fn acquire_profile(
     let mut announced_wait = false;
     loop {
         let now = Instant::now();
-        if let Some(remaining) = profile_dirs
-            .first()
-            .and_then(|profile| backend_circuit_remaining_at(profile, now))
-        {
-            if !announced_wait {
-                let _ = events_tx.send(AgentEvent::MissionActivity {
-                    label: format!(
-                        "Waiting for ChatGPT UI backend recovery (about {}s)…",
-                        remaining.as_secs().max(1)
-                    ),
-                    tool_name: "chatgpt_ui_backend_circuit".to_string(),
-                    mission_id: Some(mission_id),
-                });
-                announced_wait = true;
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    let shutdown = crate::api::routes::is_shutdown_initiated();
-                    return Err(AgentResult::failure(
-                        if shutdown {
-                            "Server restart — paused while waiting for ChatGPT UI compatibility recovery."
-                        } else {
-                            "Mission cancelled while waiting for ChatGPT UI compatibility recovery"
-                        },
-                        0,
-                    )
-                    .with_terminal_reason(if shutdown {
-                        TerminalReason::ServerShutdown
-                    } else {
-                        TerminalReason::Cancelled
-                    }));
-                }
-                _ = tokio::time::sleep(remaining.min(Duration::from_secs(2))) => {}
-            }
-            continue;
-        }
         let mut candidates = profile_dirs.iter().enumerate().collect::<Vec<_>>();
         // A compatibility failure is not quarantined until it repeats, but a
         // clean alternative must still win the next lease. This lets a
@@ -568,6 +548,18 @@ pub struct BackendCircuitStatus {
 }
 
 pub fn backend_circuit_status(profile_dirs: &[PathBuf]) -> BackendCircuitStatus {
+    let availability = availability::status(profile_dirs);
+    if availability::is_configured(profile_dirs) {
+        return BackendCircuitStatus {
+            open: availability.state != AvailabilityState::Available,
+            retry_after_secs: availability.retry_after_secs,
+            reason: availability.reason.map(|reason| match reason {
+                AvailabilityReason::Compatibility => BackendFailureKind::Compatibility,
+                AvailabilityReason::Transport => BackendFailureKind::Transport,
+                AvailabilityReason::RateLimited => BackendFailureKind::RateLimited,
+            }),
+        };
+    }
     let remaining = profile_dirs
         .first()
         .and_then(|profile| backend_circuit_remaining_at(profile, Instant::now()));
@@ -583,6 +575,27 @@ pub fn backend_circuit_status(profile_dirs: &[PathBuf]) -> BackendCircuitStatus 
         retry_after_secs: remaining.map(|value| value.as_secs()),
         reason,
     }
+}
+
+/// Lease one healthy slot for the backend recovery worker without waiting.
+/// The caller owns the returned lock for the complete browser probe.
+pub fn try_acquire_recovery_profile(
+    profile_dirs: &[PathBuf],
+) -> Option<(usize, PathBuf, ProfileLock)> {
+    let now = Instant::now();
+    let mut candidates = profile_dirs.iter().enumerate().collect::<Vec<_>>();
+    candidates
+        .sort_by_key(|(_, profile_dir)| slot_health_at(profile_dir, now).last_failure.is_some());
+    for (slot, profile_dir) in candidates {
+        let health = slot_health_at(profile_dir, now);
+        if health.quarantined_until.is_some_and(|until| until > now) {
+            continue;
+        }
+        if let Ok(Some(lock)) = try_lock_profile(profile_dir) {
+            return Some((slot, profile_dir.clone(), lock));
+        }
+    }
+    None
 }
 
 pub fn pool_snapshot(profile_dirs: &[PathBuf]) -> Vec<ProfileSlotStatus> {

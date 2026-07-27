@@ -12420,7 +12420,10 @@ mod tests {
         let command = claudecode_install_command("2.1.140", true, Some("bun"))
             .expect("npm should produce an install command");
 
-        assert_eq!(command, "npm install -g @anthropic-ai/claude-code@2.1.140");
+        assert_eq!(
+            command,
+            "npm install -g @anthropic-ai/claude-code@'2.1.140'"
+        );
         assert!(!command.contains("bun install"));
     }
 }
