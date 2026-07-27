@@ -21,12 +21,7 @@ use crate::workspace_exec::WorkspaceExec;
 /// Stable Codex transport failures emitted by the app-server/ChatGPT stream.
 /// Keep this narrow so ordinary model or tool failures never become retryable.
 fn codex_transport_failure_stage(message: &str, tool_events_seen: usize) -> Option<&'static str> {
-    let lower = message.to_ascii_lowercase();
-    let is_transport = lower.contains("stream disconnected before completion")
-        || lower.contains("error sending request for url")
-        || lower.contains("connection reset by peer")
-        || lower.contains("connection closed before message completed");
-    if !is_transport {
+    if !is_codex_transport_error_message(message) {
         return None;
     }
     Some(if tool_events_seen == 0 {
@@ -34,6 +29,10 @@ fn codex_transport_failure_stage(message: &str, tool_events_seen: usize) -> Opti
     } else {
         "stream"
     })
+}
+
+fn codex_transport_reason_is_retryable(terminal_reason: Option<TerminalReason>) -> bool {
+    matches!(terminal_reason, Some(TerminalReason::LlmError))
 }
 
 fn codex_workspace_home_dir(workspace: &Workspace) -> PathBuf {
@@ -1105,13 +1104,15 @@ pub async fn run_codex_turn(
                 TerminalReason::LlmError
             };
             let mut result = AgentResult::failure(message.clone(), 0).with_terminal_reason(reason);
-            if let Some(stage) = codex_transport_failure_stage(&message, 0) {
-                result = result.with_data(serde_json::json!({
-                    "provider_error_source": "codex_app_server",
-                    "transport_failure_stage": stage,
-                    "failure_class": crate::agents::FailureClass::TransportError,
-                    "classification_source": "structured",
-                }));
+            if codex_transport_reason_is_retryable(Some(reason)) {
+                if let Some(stage) = codex_transport_failure_stage(&message, 0) {
+                    result = result.with_data(serde_json::json!({
+                        "provider_error_source": "codex_app_server",
+                        "transport_failure_stage": stage,
+                        "failure_class": crate::agents::FailureClass::TransportError,
+                        "classification_source": "structured",
+                    }));
+                }
             }
             return result;
         }
@@ -1119,6 +1120,7 @@ pub async fn run_codex_turn(
 
     // Process events until completion or cancellation
     let mut assistant_message = String::new();
+    let mut raw_error_message: Option<String> = None;
     let mut text_delta_coalescer = TextDeltaCoalescer::new();
     let mut text_delta_pending = false;
     let mut success = false;
@@ -1341,6 +1343,7 @@ pub async fn run_codex_turn(
                                 surfaced_message.clone(),
                             );
                             if recorded {
+                                raw_error_message = Some(message.clone());
                                 if pending_tools.is_empty() {
                                     tracing::error!("Codex error: {}", surfaced_message);
                                 } else {
@@ -1498,7 +1501,9 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
 
     let model_for_cost = resolved_model.as_deref();
     let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
-    let codex_transport_stage = codex_transport_failure_stage(&final_message, tool_events_seen);
+    let classification_message = raw_error_message.as_deref().unwrap_or(&final_message);
+    let codex_transport_stage =
+        codex_transport_failure_stage(classification_message, tool_events_seen);
 
     let mut result = if let Some(marker) = cancel_marker {
         // Cancellation outranks success/error classification: keep the partial
@@ -1519,11 +1524,11 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
         // configured account instead of surfacing the bare error.
         let reason = if stopped_before_required_tools || stopped_on_progress_update {
             TerminalReason::Stalled
-        } else if is_capacity_limited_error(&final_message) {
+        } else if is_capacity_limited_error(classification_message) {
             TerminalReason::CapacityLimited
-        } else if is_rate_limited_error(&final_message) {
+        } else if is_rate_limited_error(classification_message) {
             TerminalReason::RateLimited
-        } else if is_auth_error(&final_message) {
+        } else if is_auth_error(classification_message) {
             TerminalReason::AuthError
         } else if stopped_with_pending_tool_error {
             // This is a provider/stream disconnect after Codex emitted tool
@@ -1551,7 +1556,9 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
     if let Some(m) = resolved_model.as_deref() {
         result = result.with_model(m.to_string());
     }
-    if stopped_with_pending_tool_error {
+    if stopped_with_pending_tool_error
+        && codex_transport_reason_is_retryable(result.terminal_reason)
+    {
         let mut pending_tool_names = pending_tools.values().cloned().collect::<Vec<_>>();
         pending_tool_names.sort_unstable();
         pending_tool_names.dedup();
@@ -1562,7 +1569,7 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
             "failure_class": crate::agents::FailureClass::TransportError,
             "classification_source": "structured",
         }));
-    } else if !result.success {
+    } else if !result.success && codex_transport_reason_is_retryable(result.terminal_reason) {
         if let Some(stage) = codex_transport_stage {
             result = result.with_data(serde_json::json!({
                 "provider_error_source": "codex_app_server",
@@ -1578,7 +1585,8 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
 
 #[cfg(test)]
 mod tests {
-    use super::codex_transport_failure_stage;
+    use super::{codex_transport_failure_stage, codex_transport_reason_is_retryable};
+    use crate::agents::TerminalReason;
 
     #[test]
     fn classifies_codex_stream_disconnect_before_tools() {
@@ -1592,10 +1600,42 @@ mod tests {
     }
 
     #[test]
+    fn classifies_canonical_app_server_eof_signatures() {
+        assert_eq!(
+            codex_transport_failure_stage(
+                "Codex app-server stream closed before responding; no terminal event received",
+                0,
+            ),
+            Some("pre_tool_stream")
+        );
+        assert_eq!(
+            codex_transport_failure_stage(
+                "Codex app-server stream closed before mission terminated",
+                2,
+            ),
+            Some("stream")
+        );
+    }
+
+    #[test]
     fn keeps_ordinary_codex_failures_non_transport() {
         assert_eq!(
             codex_transport_failure_stage("lake build failed with exit status 1", 0),
             None
         );
+    }
+
+    #[test]
+    fn pending_tools_transport_never_overrides_provider_classification() {
+        assert!(codex_transport_reason_is_retryable(Some(
+            TerminalReason::LlmError
+        )));
+        for reason in [
+            TerminalReason::AuthError,
+            TerminalReason::RateLimited,
+            TerminalReason::CapacityLimited,
+        ] {
+            assert!(!codex_transport_reason_is_retryable(Some(reason)));
+        }
     }
 }

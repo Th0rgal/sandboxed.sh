@@ -1223,10 +1223,15 @@ impl AppServerEventTranslator {
                         .get("willRetry")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    events.push(ExecutionEvent::Error {
-                        message: message.clone(),
-                    });
-                    if !will_retry {
+                    if will_retry {
+                        tracing::warn!(
+                            %message,
+                            "Codex app-server reported a transient error and will retry internally"
+                        );
+                    } else {
+                        events.push(ExecutionEvent::Error {
+                            message: message.clone(),
+                        });
                         terminal = true;
                     }
                 }
@@ -1600,6 +1605,36 @@ mod tests {
         ));
         assert!(translator.pending_tool_ids().is_empty());
         assert!(translator.transport_failures(&interrupted).is_empty());
+    }
+
+    #[test]
+    fn app_server_retrying_error_is_not_exposed_as_terminal() {
+        let mut translator = AppServerEventTranslator::default();
+        let retrying = translator.handle_notification(
+            "error",
+            &json!({
+                "error": {"message": "stream disconnected before completion"},
+                "willRetry": true
+            }),
+            false,
+        );
+        assert!(!retrying.terminal);
+        assert!(retrying.events.is_empty());
+
+        let exhausted = translator.handle_notification(
+            "error",
+            &json!({
+                "error": {"message": "stream disconnected before completion"},
+                "willRetry": false
+            }),
+            false,
+        );
+        assert!(exhausted.terminal);
+        assert!(matches!(
+            exhausted.events.as_slice(),
+            [ExecutionEvent::Error { message }]
+                if message.contains("stream disconnected before completion")
+        ));
     }
 
     #[test]

@@ -4398,6 +4398,16 @@ fn is_codex_generic_exit_wrapper(message: &str) -> bool {
     message.contains("Codex CLI exited before completing the turn")
 }
 
+pub(crate) fn is_codex_transport_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("stream disconnected before completion")
+        || lower.contains("error sending request for url")
+        || lower.contains("connection reset by peer")
+        || lower.contains("connection closed before message completed")
+        || lower.contains("codex app-server stream closed before responding")
+        || lower.contains("codex app-server stream closed before mission terminated")
+}
+
 fn codex_pending_tools_error_message(
     message: &str,
     pending_tools: &HashMap<String, String>,
@@ -4421,7 +4431,13 @@ pub(crate) fn codex_error_message_to_surface(
     pending_tools: &HashMap<String, String>,
     message: &str,
 ) -> Option<String> {
-    if assistant_message.trim().is_empty() {
+    if is_codex_transport_error_message(message) && !assistant_message.trim().is_empty() {
+        Some(format!(
+            "{}\n\n[Codex transport error: {}]",
+            assistant_message.trim(),
+            message
+        ))
+    } else if assistant_message.trim().is_empty() {
         Some(message.to_string())
     } else if !pending_tools.is_empty() {
         Some(codex_pending_tools_error_message(message, pending_tools))
@@ -4435,11 +4451,17 @@ pub(crate) fn record_codex_error_message(
     message: String,
 ) -> bool {
     let new_is_generic_exit_wrapper = is_codex_generic_exit_wrapper(&message);
+    let new_is_transport = is_codex_transport_error_message(&message);
     let already_have_specific = error_message
         .as_deref()
         .is_some_and(|existing| !is_codex_generic_exit_wrapper(existing));
+    let already_have_pending_tool_failure = error_message
+        .as_deref()
+        .is_some_and(|existing| existing.starts_with(CODEX_PENDING_TOOLS_ERROR_PREFIX));
 
-    if new_is_generic_exit_wrapper && already_have_specific {
+    if (new_is_generic_exit_wrapper && already_have_specific)
+        || (new_is_transport && already_have_pending_tool_failure)
+    {
         false
     } else {
         *error_message = Some(message);
@@ -8813,8 +8835,8 @@ mod tests {
         ensure_opencode_provider_for_model, extract_codex_reset_window, extract_model_from_message,
         extract_opencode_session_id, extract_part_text, extract_str, extract_think_content,
         is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
-        is_opencode_session_id, is_provider_payload_error, is_rate_limited_error,
-        is_session_corruption_error, is_success_path_auth_error,
+        is_codex_transport_error_message, is_opencode_session_id, is_provider_payload_error,
+        is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
         is_success_path_provider_payload_error, is_success_path_rate_limited_error,
         is_tool_call_only_output, opencode_goal_terminal_status,
         opencode_idle_timeout_result_message, opencode_output_needs_fallback,
@@ -8833,7 +8855,8 @@ mod tests {
         ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
         ClaudeTurnWaitState, CopiedOpenCodeProbe, MissionHealth, MissionRunState, MissionRunner,
         MissionStallSeverity, OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
-        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        CODEX_PENDING_TOOLS_ERROR_PREFIX, CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS,
+        STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -9657,6 +9680,18 @@ mod tests {
     }
 
     #[test]
+    fn codex_post_response_transport_eof_is_preserved() {
+        let pending_tools = std::collections::HashMap::new();
+        let eof = "Codex app-server stream closed before mission terminated";
+
+        assert!(is_codex_transport_error_message(eof));
+        let surfaced = codex_error_message_to_surface("Partial response", &pending_tools, eof)
+            .expect("partial output plus EOF should be surfaced");
+        assert!(surfaced.starts_with("Partial response"));
+        assert!(surfaced.contains(eof));
+    }
+
+    #[test]
     fn codex_error_recording_keeps_specific_error_over_exit_wrapper() {
         let mut error_message =
             Some("Selected model is at capacity. Please try a different model.".to_string());
@@ -9670,6 +9705,21 @@ mod tests {
             error_message.as_deref(),
             Some("Selected model is at capacity. Please try a different model.")
         );
+    }
+
+    #[test]
+    fn codex_error_recording_keeps_pending_tool_failure_over_later_eof() {
+        let mut error_message = Some(format!(
+            "{CODEX_PENDING_TOOLS_ERROR_PREFIX} (bash): execution outcome unknown"
+        ));
+
+        assert!(!record_codex_error_message(
+            &mut error_message,
+            "Codex app-server stream closed before mission terminated".to_string(),
+        ));
+        assert!(error_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with(CODEX_PENDING_TOOLS_ERROR_PREFIX)));
     }
 
     #[test]
