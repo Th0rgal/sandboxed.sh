@@ -6886,7 +6886,11 @@ pub(crate) async fn ensure_claudecode_cli_available(
         ));
     }
 
-    // Use bun if available (faster), otherwise npm.
+    // Prefer npm for Claude Code when it is available. Claude Code ships a
+    // platform-native binary through its postinstall hook; npm handles that
+    // package reliably, while Bun can leave a JavaScript shim without the
+    // native binary or fail while resolving the platform manifest. This also
+    // matches the workspace bootstrap policy in `workspace/mod.rs`.
     //
     // Bun-specific quirks we have to handle:
     //   1. A prior install attempt may have left a dangling symlink at
@@ -6897,18 +6901,8 @@ pub(crate) async fn ensure_claudecode_cli_available(
     //      claude-code's postinstall (install.cjs) is what downloads the
     //      platform-native binary; without it the bin shim prints
     //      "claude native binary not installed." `bun pm -g trust` runs it.
-    let install_cmd = if let Some(bun) = bun_command.as_deref() {
-        format!(
-            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && for p in /root/.bun/bin/claude /root/.cache/.bun/bin/claude; do [ -L "$p" ] && [ ! -e "$p" ] && rm -f "$p"; done; {bun} install -g @anthropic-ai/claude-code@{ver} && {{ {bun} pm -g trust @anthropic-ai/claude-code 2>/dev/null || true; }}"#,
-            bun = shell_quote(bun),
-            ver = shell_quote(&desired_version)
-        )
-    } else {
-        format!(
-            "npm install -g @anthropic-ai/claude-code@{}",
-            shell_quote(&desired_version)
-        )
-    };
+    let install_cmd = claudecode_install_command(&desired_version, has_npm, bun_command.as_deref())
+        .expect("package manager availability was checked above");
 
     let args = vec!["-lc".to_string(), install_cmd.to_string()];
     let output = workspace_exec
@@ -6959,6 +6953,26 @@ pub(crate) async fn ensure_claudecode_cli_available(
         "Claude Code install completed but '{}' is still not available in workspace PATH. Checked: {:?}",
         cli_path, BUN_GLOBAL_CLAUDE_PATHS,
     ))
+}
+
+fn claudecode_install_command(
+    desired_version: &str,
+    has_npm: bool,
+    bun_command: Option<&str>,
+) -> Option<String> {
+    if has_npm {
+        return Some(format!(
+            "npm install -g @anthropic-ai/claude-code@{}",
+            shell_quote(desired_version)
+        ));
+    }
+    bun_command.map(|bun| {
+        format!(
+            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && for p in /root/.bun/bin/claude /root/.cache/.bun/bin/claude; do [ -L "$p" ] && [ ! -e "$p" ] && rm -f "$p"; done; {bun} install -g @anthropic-ai/claude-code@{ver} && {{ {bun} pm -g trust @anthropic-ai/claude-code 2>/dev/null || true; }}"#,
+            bun = shell_quote(bun),
+            ver = shell_quote(desired_version)
+        )
+    })
 }
 
 fn desired_claudecode_version() -> String {
@@ -8821,10 +8835,10 @@ mod tests {
     use super::{
         actual_cost_cents_from_total_cost_usd, apply_terminal_result_text, bind_command_params,
         classify_copied_opencode_probe, claudecode_idle_timeout_for_state,
-        claudecode_incomplete_turn_message, claudecode_malformed_startup_message,
-        claudecode_pre_turn_transport_message, claudecode_resume_current_session_message,
-        claudecode_transport_failure_data, claudecode_transport_failure_stage,
-        claudecode_transport_failure_stage_for_incomplete_turn,
+        claudecode_incomplete_turn_message, claudecode_install_command,
+        claudecode_malformed_startup_message, claudecode_pre_turn_transport_message,
+        claudecode_resume_current_session_message, claudecode_transport_failure_data,
+        claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
         claudecode_transport_recovery_strategy, clear_codex_account_cooldown,
         codex_account_cooldown_remaining, codex_chatgpt_fallback_for_result,
         codex_chatgpt_fallback_model, codex_cooldown_for_reason, codex_error_message_to_surface,
@@ -12399,5 +12413,17 @@ mod tests {
             Some(first_deadline),
             "an idempotent cancel retry must not postpone force-clear"
         );
+    }
+
+    #[test]
+    fn claude_install_prefers_npm_for_native_package_when_bun_is_also_present() {
+        let command = claudecode_install_command("2.1.140", true, Some("bun"))
+            .expect("npm should produce an install command");
+
+        assert_eq!(
+            command,
+            "npm install -g @anthropic-ai/claude-code@'2.1.140'"
+        );
+        assert!(!command.contains("bun install"));
     }
 }

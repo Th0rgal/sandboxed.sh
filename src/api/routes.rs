@@ -598,6 +598,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // crossings, recovery notice on the way back down.
     super::disk_watch::spawn(Arc::clone(&state));
 
+    // ChatGPT UI allowance recovery is backend-owned and single-flight. A
+    // cooldown never reopens mission traffic until this non-submitting probe
+    // proves the authenticated Pro composer is usable again.
+    super::runners::chatgpt_ui::spawn_recovery_probe(config.working_dir.clone());
+
     // Zombie-scope reaper: stops leftover sandboxed-exec-*.scope units whose
     // mission no longer needs a live harness (see scope_reaper docs).
     super::scope_reaper::spawn(Arc::clone(&state));
