@@ -18,6 +18,24 @@ use crate::cost::resolve_cost_cents_and_source;
 use crate::workspace::{Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
 
+/// Stable Codex transport failures emitted by the app-server/ChatGPT stream.
+/// Keep this narrow so ordinary model or tool failures never become retryable.
+fn codex_transport_failure_stage(message: &str, tool_events_seen: usize) -> Option<&'static str> {
+    let lower = message.to_ascii_lowercase();
+    let is_transport = lower.contains("stream disconnected before completion")
+        || lower.contains("error sending request for url")
+        || lower.contains("connection reset by peer")
+        || lower.contains("connection closed before message completed");
+    if !is_transport {
+        return None;
+    }
+    Some(if tool_events_seen == 0 {
+        "pre_tool_stream"
+    } else {
+        "stream"
+    })
+}
+
 fn codex_workspace_home_dir(workspace: &Workspace) -> PathBuf {
     match workspace.workspace_type {
         WorkspaceType::Container => workspace.path.join("root"),
@@ -1086,7 +1104,16 @@ pub async fn run_codex_turn(
             } else {
                 TerminalReason::LlmError
             };
-            return AgentResult::failure(message, 0).with_terminal_reason(reason);
+            let mut result = AgentResult::failure(message.clone(), 0).with_terminal_reason(reason);
+            if let Some(stage) = codex_transport_failure_stage(&message, 0) {
+                result = result.with_data(serde_json::json!({
+                    "provider_error_source": "codex_app_server",
+                    "transport_failure_stage": stage,
+                    "failure_class": crate::agents::FailureClass::TransportError,
+                    "classification_source": "structured",
+                }));
+            }
+            return result;
         }
     };
 
@@ -1471,6 +1498,7 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
 
     let model_for_cost = resolved_model.as_deref();
     let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
+    let codex_transport_stage = codex_transport_failure_stage(&final_message, tool_events_seen);
 
     let mut result = if let Some(marker) = cancel_marker {
         // Cancellation outranks success/error classification: keep the partial
@@ -1528,10 +1556,46 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
         pending_tool_names.sort_unstable();
         pending_tool_names.dedup();
         result = result.with_data(serde_json::json!({
+            "provider_error_source": "codex_app_server",
             "transport_failure_stage": "pending_tools",
             "pending_tools": pending_tool_names,
+            "failure_class": crate::agents::FailureClass::TransportError,
+            "classification_source": "structured",
         }));
+    } else if !result.success {
+        if let Some(stage) = codex_transport_stage {
+            result = result.with_data(serde_json::json!({
+                "provider_error_source": "codex_app_server",
+                "transport_failure_stage": stage,
+                "failure_class": crate::agents::FailureClass::TransportError,
+                "classification_source": "structured",
+            }));
+        }
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::codex_transport_failure_stage;
+
+    #[test]
+    fn classifies_codex_stream_disconnect_before_tools() {
+        assert_eq!(
+            codex_transport_failure_stage(
+                "stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)",
+                0,
+            ),
+            Some("pre_tool_stream")
+        );
+    }
+
+    #[test]
+    fn keeps_ordinary_codex_failures_non_transport() {
+        assert_eq!(
+            codex_transport_failure_stage("lake build failed with exit status 1", 0),
+            None
+        );
+    }
 }
