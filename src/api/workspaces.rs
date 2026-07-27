@@ -1115,10 +1115,9 @@ pub fn build_nspawn_command(
                      fi; ",
                 );
                 if tailnet_only {
+                    bootstrap_cmd.push_str(crate::workspace_exec::HOST0_GATEWAY_DISCOVERY);
                     bootstrap_cmd.push_str(
-                        "_oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
-                         _oa_gw=\"${_oa_ip%.*}.1\"; \
-                         if [ -n \"$_oa_ip\" ]; then \
+                        "if [ -n \"$_oa_gw\" ]; then \
                            ip route del default 2>/dev/null || true; \
                            ip route add default via \"$_oa_gw\" 2>/dev/null || true; \
                          fi; \

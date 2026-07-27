@@ -26,6 +26,20 @@ const ALLOW_TRANSIENT_CONTAINER_NSENTER_ENV: &str =
     "SANDBOXED_SH_ALLOW_TRANSIENT_CONTAINER_NSENTER";
 const NSENTER_USE_TARGET_ROOT_ENV: &str = "SANDBOXED_SH_NSENTER_USE_TARGET_ROOT";
 
+/// Discover the nspawn host-side gateway from `host0`'s connected IPv4 route.
+///
+/// nspawn allocates subnets of varying prefix lengths, so replacing the final
+/// octet with `.1` is incorrect (for example, `192.168.47.176/28` uses
+/// `192.168.47.177`). The host owns the first usable address in the connected
+/// subnet; derive that address from the kernel route instead.
+pub(crate) const HOST0_GATEWAY_DISCOVERY: &str =
+    "_oa_gw=$(ip -4 route show dev host0 proto kernel scope link 2>/dev/null | \
+     awk -F'[./ ]' 'NR == 1 { \
+       n = $1 * 16777216 + $2 * 65536 + $3 * 256 + $4 + 1; \
+       printf \"%d.%d.%d.%d\", int(n / 16777216) % 256, \
+         int(n / 65536) % 256, int(n / 256) % 256, n % 256 \
+     }'); ";
+
 fn replace_command_env(cmd: &mut Command, env: HashMap<String, String>) {
     cmd.env_clear().envs(env);
 }
@@ -621,6 +635,7 @@ mod tests {
         normalize_container_path, nspawn_directory_from_cmdline, persistent_nspawn_command,
         replace_command_env, resolv_conf_bind_args, synthesized_container_resolv_conf,
         MissionResourceCaps, WorkspaceExec, WorkspaceType, CA_BUNDLE_ENV_VARS,
+        HOST0_GATEWAY_DISCOVERY,
     };
     use std::collections::HashMap;
     use std::ffi::OsStr;
@@ -890,6 +905,23 @@ mod tests {
             .expect("bootstrap command should be present");
         assert!(clear_env < bootstrap);
         assert!(command.contains("tailscale set --exit-node="));
+        assert!(command.contains(HOST0_GATEWAY_DISCOVERY));
+        assert!(!command.contains("${_oa_ip%.*}.1"));
+    }
+
+    #[test]
+    fn host0_gateway_discovery_handles_non_24_nspawn_subnet() {
+        let script = format!(
+            "ip() {{ printf '%s\\n' '192.168.47.176/28 dev host0 proto kernel scope link src 192.168.47.183'; }}; \
+             {HOST0_GATEWAY_DISCOVERY} printf '%s' \"$_oa_gw\""
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .expect("run gateway discovery in POSIX shell");
+
+        assert!(output.status.success(), "script failed: {output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "192.168.47.177");
     }
 
     #[test]
@@ -1494,13 +1526,12 @@ impl WorkspaceExec {
             // tailnet_only mode: Use Tailscale for tailnet access only, route
             // regular internet traffic through the host gateway (not exit node).
             // This ensures the container can reach both tailnet devices AND the internet.
+            cmd.push_str(HOST0_GATEWAY_DISCOVERY);
             cmd.push_str(
                 "if command -v tailscale >/dev/null 2>&1; then \
                  tailscale set --exit-node= >/dev/null 2>&1 || true; \
                  fi; \
-                 _oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
-                 _oa_gw=\"${_oa_ip%.*}.1\"; \
-                 if [ -n \"$_oa_ip\" ]; then \
+                 if [ -n \"$_oa_gw\" ]; then \
                    ip route del default 2>/dev/null || true; \
                    ip route add default via \"$_oa_gw\" 2>/dev/null || true; \
                  fi; \
@@ -1511,11 +1542,10 @@ impl WorkspaceExec {
         } else {
             // exit_node mode: Fallback route only if DHCP/Tailscale didn't set one.
             // All traffic should go through Tailscale's exit node when properly configured.
+            cmd.push_str(HOST0_GATEWAY_DISCOVERY);
             cmd.push_str(
                 "if ! ip route show default 2>/dev/null | grep -q default; then \
-                 _oa_ip=$(ip -4 addr show host0 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1); \
-                 _oa_gw=\"${_oa_ip%.*}.1\"; \
-                 [ -n \"$_oa_ip\" ] && ip route add default via \"$_oa_gw\" 2>/dev/null || true; \
+                 [ -n \"$_oa_gw\" ] && ip route add default via \"$_oa_gw\" 2>/dev/null || true; \
                  fi; \
                  if [ ! -s /etc/resolv.conf ]; then \
                  printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf 2>/dev/null || true; \
