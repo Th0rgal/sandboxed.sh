@@ -1,6 +1,6 @@
 # ChatGPT UI pool operational policy
 
-Version: 1.1.0
+Version: 1.2.0
 
 This document is the human-readable form of the versioned operational policy
 for the `chatgpt_ui` backend pool. The machine-readable form lives beside it in
@@ -26,12 +26,19 @@ Each slot is one dedicated browser profile guarded by a cross-process
 exclusive file lock. Acquisition prefers the first available slot with no
 recorded failure, preserving configured order among equivalent candidates.
 A deployment may configure more than four slots; practical concurrency is the
-number of independently usable, authenticated profiles, not an implementation
-limit. Never point two slots at the same profile directory.
+number of usable authenticated profiles and the account's live allowance, not
+an implementation limit. Cloned profiles for one account share the same
+server-side rate limit. Never point two slots at the same profile directory.
 A compatibility-failed slot remains usable, but a clean alternative wins the
 next lease. Locked, quarantined, and unavailable slots are never reused; when
 none is healthy and available, the runtime waits until a slot recovers or the
 mission is cancelled.
+
+New browser launches for one profile pool are spaced by 30 seconds by default.
+This permits many multi-hour Pro conversations to overlap while avoiding a
+burst of navigation/send requests from every slot at once. The interval is
+configurable from 5–300 seconds; lowering it requires observed account evidence,
+not merely additional browser slots.
 
 ## 2. Read-only Pro lanes: concurrent, disjoint
 
@@ -64,6 +71,11 @@ remain queued and emit a cooldown activity instead of consuming another
 profile. One later successful turn closes the circuit immediately. Capacity
 callbacks must treat an open circuit as unavailable capacity and must not
 redispatch into it.
+
+One exact ChatGPT “Too many requests” interstitial is conclusive account-wide
+evidence and opens a ten-minute circuit immediately. A completion from a turn
+that was already running does not close this rate-limit circuit; only its timed
+cooldown does. The controller must not redispatch rate-limited work meanwhile.
 
 The runtime preference for a clean alternative supports this policy but does
 not authorize a retry by itself. The controller must confirm from live pool

@@ -1,6 +1,6 @@
 {
   "policy": "chatgpt-ui-pool",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "source_of_truth": {
     "runtime": "src/api/runners/chatgpt_ui/mod.rs",
     "pool": "src/api/runners/chatgpt_ui/profile_pool.rs",
@@ -13,7 +13,8 @@
     "source": "profile_dirs",
     "static_limit": null,
     "slot_exclusivity": "cross_process_file_lock",
-    "acquire_strategy": "first_healthy_available"
+    "acquire_strategy": "first_healthy_available",
+    "shared_account_launch_interval_secs": 30
   },
   "lanes": {
     "read_only_pro": {
@@ -46,7 +47,8 @@
     "rate_limited": {
       "signal": "rate_limited",
       "max_automatic_retries": 0,
-      "wait_for_allowance_recovery": true
+      "wait_for_allowance_recovery": true,
+      "account_cooldown_secs": 600
     },
     "browser_launch": {
       "signal": "browser_launch",

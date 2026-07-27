@@ -9,6 +9,7 @@ from scripts.chatgpt_ui_driver import (
     SEND_CONTROL_TESTIDS,
     STOP_BUTTON_NAME,
     STOP_CONTROL_TESTIDS,
+    RateLimited,
     TransportUnavailable,
     choose_intelligence_model,
     click_send_control,
@@ -17,9 +18,11 @@ from scripts.chatgpt_ui_driver import (
     conversation_path_from_url,
     download_control_key,
     downloadable_href,
+    establish_continued_chat,
     locate_composer_control,
     model_selection,
     normalized_prompt,
+    raise_if_rate_limited,
     resume_conversation_path,
     safe_download_name,
 )
@@ -80,6 +83,10 @@ class FakeControl:
     def last(self):
         return self
 
+    @property
+    def first(self):
+        return self
+
     async def count(self) -> int:
         return 1 if self.visible else 0
 
@@ -123,12 +130,17 @@ class FakeComposerPage:
             return type("Response", (), {"status": 403})()
 
     def __init__(
-        self, testid_visible: bool, fallback_visible: bool, network_reachable: bool = True
+        self,
+        testid_visible: bool,
+        fallback_visible: bool,
+        network_reachable: bool = True,
+        rate_limited: bool = False,
     ) -> None:
         self.testid_control = FakeControl(testid_visible)
         self.form = FakeComposerForm(FakeControl(fallback_visible))
         self.selectors = []
         self.request = self.Request(network_reachable)
+        self.rate_limited = rate_limited
 
     def locator(self, selector):
         self.selectors.append(selector)
@@ -139,10 +151,90 @@ class FakeComposerPage:
     async def wait_for_timeout(self, _timeout) -> None:
         return None
 
+    def get_by_text(self, text, exact=False):
+        return FakeControl(
+            self.rate_limited and text == "Too many requests" and exact
+        )
+
+
+class HydratingLocator:
+    def __init__(self, counts) -> None:
+        self.counts = iter(counts)
+        self.last = 0
+
+    @property
+    def first(self):
+        return self
+
+    def nth(self, _index):
+        return self
+
+    async def count(self) -> int:
+        self.last = next(self.counts, self.last)
+        return self.last
+
+    async def wait_for(self, **_kwargs) -> None:
+        return None
+
+    async def is_visible(self) -> bool:
+        return self.last > 0
+
+
+class HydratingConversationPage:
+    def __init__(self) -> None:
+        self.url = ""
+        self.user_messages = HydratingLocator([0, 0, 1])
+        self.assistant_messages = HydratingLocator([0, 1, 1])
+        self.composer = HydratingLocator([1])
+        self.login = HydratingLocator([0])
+        self.account = HydratingLocator([1])
+        self.waits = 0
+
+    async def goto(self, url, **_kwargs) -> None:
+        self.url = url
+
+    def locator(self, selector):
+        if selector == '[data-message-author-role="user"]':
+            return self.user_messages
+        if selector == '[data-message-author-role="assistant"]':
+            return self.assistant_messages
+        if selector == "#prompt-textarea":
+            return self.composer
+        if selector.startswith('[data-testid="accounts-profile-button"]'):
+            return self.account
+        raise AssertionError(selector)
+
+    async def wait_for_timeout(self, _timeout) -> None:
+        self.waits += 1
+
+    def get_by_role(self, role, name=None):
+        if role == "button" and name is not None:
+            return self.login
+        return self.composer
+
+    def get_by_text(self, _text, exact=False):
+        return HydratingLocator([0 if exact else 0])
+
 
 class ChatGptUiDriverTests(unittest.TestCase):
+    def test_explicit_rate_limit_heading_is_classified(self) -> None:
+        page = FakeComposerPage(False, False, rate_limited=True)
+
+        with self.assertRaises(RateLimited):
+            asyncio.run(raise_if_rate_limited(page))
+
     def test_cleanup_preserves_existing_protocol_result(self) -> None:
         asyncio.run(close_context_quietly(ClosedContext()))
+
+    def test_continuation_waits_for_history_hydration(self) -> None:
+        page = HydratingConversationPage()
+
+        baseline = asyncio.run(
+            establish_continued_chat(page, "/c/abc123def456")
+        )
+
+        self.assertEqual(baseline, 1)
+        self.assertGreaterEqual(page.waits, 2)
 
     def test_pro_model_alias_maps_to_current_verified_picker_option(self) -> None:
         self.assertEqual(model_selection("gpt-5.6-pro"), ("Pro", "gpt-5.6-pro"))

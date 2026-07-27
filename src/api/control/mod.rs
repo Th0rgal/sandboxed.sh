@@ -6205,9 +6205,19 @@ async fn mission_is_pr_writer_in_store(
 
 fn message_requests_pr_writer(mission: &Mission, content: &str) -> bool {
     mission.project.github_pr.is_some()
-        // A follow-up message is a new capability request. A persisted
-        // `pr-readonly` tag describes the old mandate and must not suppress an
-        // explicit later instruction to fix/commit/push.
+        // An explicit read-only capability is an authority boundary, not a
+        // prompt hint. In particular, the scheduler re-injects a pending
+        // mission's deferred initial goal as a message; inferring an upgrade
+        // from that text made read-only PR validators contend for the writer
+        // lease before their harness ever started. Callers that want to expand
+        // authority must first use the structured project update with
+        // `writer=true`, which replaces this tag with `pr-writer` under the
+        // durable lease lock.
+        && !mission
+            .project
+            .tags
+            .iter()
+            .any(|tag| tag == "pr-readonly")
         && inferred_pr_writer(None, None, Some(content))
 }
 
@@ -6476,7 +6486,34 @@ async fn activate_mission_for_message(
     // Keep the writer mutex until Active is persisted so a replacement writer
     // cannot race a terminal mission's message-based reactivation.
     let _pr_writer_guard =
-        acquire_pr_writer_lease_for_message(control_hub, store, mission, content).await?;
+        match acquire_pr_writer_lease_for_message(control_hub, store, mission, content).await {
+            Ok(guard) => guard,
+            Err(error)
+                if mission.status == MissionStatus::Pending
+                    && error.contains("PR writer lease is already held") =>
+            {
+                // A pending writer that conflicts with an existing durable writer
+                // cannot become runnable by retrying the same deferred goal. Make
+                // the deterministic rejection terminal and clear the goal so the
+                // scheduler does not emit the same error every cooldown interval.
+                let reason = "pr_writer_lease_conflict";
+                store
+                    .update_mission_status_with_reason(
+                        mission.id,
+                        MissionStatus::Interrupted,
+                        Some(reason),
+                    )
+                    .await?;
+                store.set_deferred_goal(mission.id, None).await?;
+                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    mission_id: mission.id,
+                    status: MissionStatus::Interrupted,
+                    summary: Some(format!("{reason}: {error}")),
+                });
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
 
     if message_activates_mission(mission.status) {
         store
@@ -23514,7 +23551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readonly_initial_goal_does_not_lease_but_followup_can_escalate() {
+    async fn readonly_authority_cannot_be_escalated_by_prompt_text() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
             .create_mission(
@@ -23545,8 +23582,15 @@ mod tests {
             &mission,
             Some("Fix and update the PR after review")
         ));
-        assert!(message_requests_pr_writer(
+        assert!(!message_requests_pr_writer(
             &mission,
+            "Fix and update the PR after review"
+        ));
+
+        let mut unclassified = mission.clone();
+        unclassified.project.tags.clear();
+        assert!(message_requests_pr_writer(
+            &unclassified,
             "Fix and update the PR after review"
         ));
     }
