@@ -41,8 +41,6 @@ pub struct HarnessVersionPolicy {
     pub gemini: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grok: Option<String>,
 }
 
 impl HarnessVersionPolicy {
@@ -477,6 +475,10 @@ mod tests {
         assert_eq!(back, policy);
         // Unpinned harnesses are omitted from the serialized form.
         assert!(!json.contains("gemini"));
+        // Grok's upstream installer only installs latest, so an old pin is
+        // ignored instead of being exposed as an enforceable setting.
+        let legacy: HarnessVersionPolicy = serde_json::from_str(r#"{"grok":"1.2.3"}"#).unwrap();
+        assert_eq!(legacy, HarnessVersionPolicy::default());
     }
 
     #[test]

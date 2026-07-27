@@ -3461,7 +3461,6 @@ fn render_harness_bootstrap_script(
         .replace("@CODEX_PIN@", &pin(&policy.codex))
         .replace("@GEMINI_PIN@", &pin(&policy.gemini))
         .replace("@OPENCODE_PIN@", &pin(&policy.opencode))
-        .replace("@GROK_PIN@", &pin(&policy.grok))
         .replace("@INSTALL_CLAUDECODE@", bool_str(flags.claudecode))
         .replace("@INSTALL_CODEX@", bool_str(flags.codex))
         .replace("@INSTALL_GEMINI@", bool_str(flags.gemini))
@@ -3562,7 +3561,6 @@ CLAUDE_CODE_VERSION="${SANDBOXED_SH_CLAUDECODE_VERSION:-@CLAUDE_VERSION@}"
 CODEX_VERSION="@CODEX_PIN@"
 GEMINI_VERSION="@GEMINI_PIN@"
 OPENCODE_VERSION="@OPENCODE_PIN@"
-GROK_VERSION="@GROK_PIN@"
 
 # Detect package manager: prefer bun, fallback to npm
 if command -v bun >/dev/null 2>&1; then
@@ -3585,6 +3583,15 @@ if [ "$PKG_MGR" = "bun" ] && command -v npm >/dev/null 2>&1; then
   NATIVE_PKG_MGR="npm"
 fi
 
+# Print the first semantic version token from a CLI's version banner. Comparing
+# this token exactly prevents a pin such as 0.4 from matching 0.48.0.
+installed_version() {
+  "$1" --version 2>/dev/null \
+    | head -n1 \
+    | grep -Eo '[0-9]+(\.[0-9]+){1,3}([+-][0-9A-Za-z.-]+)?' \
+    | head -n1
+}
+
 # needs_install <cli> <pin>: CLI missing, or version drifted off a non-empty pin.
 needs_install() {
   ni_cli="$1"
@@ -3592,9 +3599,13 @@ needs_install() {
   if ! command -v "$ni_cli" >/dev/null 2>&1; then
     return 0
   fi
-  if [ -n "$ni_pin" ] && ! "$ni_cli" --version 2>/dev/null | grep -F "$ni_pin" >/dev/null 2>&1; then
-    echo "[sandboxed] $ni_cli version drifted off pin $ni_pin; reinstalling"
-    return 0
+  if [ -n "$ni_pin" ]; then
+    ni_expected="${ni_pin#v}"
+    ni_installed="$(installed_version "$ni_cli" || true)"
+    if [ "$ni_installed" != "$ni_expected" ]; then
+      echo "[sandboxed] $ni_cli version $ni_installed drifted off pin $ni_pin; reinstalling"
+      return 0
+    fi
   fi
   return 1
 }
@@ -3645,9 +3656,8 @@ if [ "@INSTALL_OPENCODE@" = "true" ] && needs_install opencode "$OPENCODE_VERSIO
   fi
 fi
 
-if [ "@INSTALL_GROK@" = "true" ] && needs_install grok "$GROK_VERSION"; then
+if [ "@INSTALL_GROK@" = "true" ] && needs_install grok ""; then
   if command -v curl >/dev/null 2>&1; then
-    # x.ai's installer has no version pinning; a pin only decides when to rerun it.
     echo "[sandboxed] Installing Grok Build (installer fetches latest)..."
     if ! curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash; then
       echo "[sandboxed] Grok Build CLI install failed"
@@ -3718,7 +3728,7 @@ const HARNESS_VERSION_PROBE_SCRIPT: &str = r#"
 export PATH="/root/.bun/bin:/root/.cache/.bun/bin:/usr/local/bin:$PATH"
 for cli in claude codex opencode gemini grok; do
   if command -v "$cli" >/dev/null 2>&1; then
-    v="$("$cli" --version 2>/dev/null | head -n1 | tr -d '\r')"
+    v="$(timeout --signal=KILL 10s "$cli" --version 2>/dev/null | head -n1 | tr -d '\r')"
     printf 'sandboxed-harness-version:%s=%s\n' "$cli" "$v"
   fi
 done
@@ -3765,7 +3775,12 @@ pub async fn probe_workspace_harness_versions(
         "-c".to_string(),
         HARNESS_VERSION_PROBE_SCRIPT.to_string(),
     ];
-    let output = nspawn::execute_in_container(&workspace.path, &command, &config).await?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        nspawn::execute_in_container(&workspace.path, &command, &config),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("harness version probe timed out after 60 seconds"))??;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow::anyhow!(
@@ -4038,6 +4053,9 @@ mod tests {
         assert!(script.contains("GEMINI_VERSION=\"\""));
         assert!(script.contains("@openai/codex@"));
         assert!(script.contains("@google/gemini-cli@"));
+        assert!(script.contains("[ \"$ni_installed\" != \"$ni_expected\" ]"));
+        assert!(!script.contains("GROK_VERSION="));
+        assert!(script.contains("needs_install grok \"\""));
         assert!(!script.contains("@INSTALL_"));
         assert!(!script.contains("@CLAUDE_VERSION@"));
         assert!(!script.contains("@CODEX_PIN@"));

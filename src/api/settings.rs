@@ -274,7 +274,6 @@ async fn update_settings(
                 trim(&mut policy.codex);
                 trim(&mut policy.gemini);
                 trim(&mut policy.opencode);
-                trim(&mut policy.grok);
                 policy
             })
             .filter(|p| *p != crate::settings::HarnessVersionPolicy::default());
