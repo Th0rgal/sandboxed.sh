@@ -375,6 +375,36 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
 
 const RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+async fn wait_for_available_launch_turn(
+    settings: &Settings,
+    mission_id: Uuid,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    cancel: &CancellationToken,
+) -> Result<u64, AgentResult> {
+    loop {
+        availability::wait_until_available(&settings.profile_dirs, mission_id, events_tx, cancel)
+            .await?;
+        let transition_id = availability::status(&settings.profile_dirs).transition_id;
+        profile_pool::wait_for_launch_turn(
+            &settings.profile_dirs[0],
+            settings.launch_interval,
+            mission_id,
+            events_tx,
+            cancel,
+        )
+        .await?;
+        let after_pacing = availability::status(&settings.profile_dirs);
+        if after_pacing.state == availability::AvailabilityState::Available
+            && after_pacing.transition_id == transition_id
+        {
+            return Ok(transition_id);
+        }
+        // A cooldown opened while this mission waited for its launch turn.
+        // Discard that reservation and repeat availability plus pacing so a
+        // recovered queue cannot bypass account-wide launch spacing.
+    }
+}
+
 /// Start the single backend-wide recovery worker. Cooldown expiry only makes a
 /// probe eligible; this worker is the sole path that can mark the backend
 /// available again without submitting user content.
@@ -590,27 +620,14 @@ pub async fn run_chatgpt_ui_turn(
     // This gate is deliberately before both normal and pinned acquisition.
     // A durable continuation must not bypass an account-wide cooldown merely
     // because it already owns a conversation route.
-    if let Err(result) =
-        availability::wait_until_available(&settings.profile_dirs, mission_id, &events_tx, &cancel)
-            .await
-    {
-        return result;
-    }
-    let paced_transition_id = availability::status(&settings.profile_dirs).transition_id;
     // The configured profiles share one ChatGPT account in normal
     // deployments. Pace navigation/submission starts for that account pool;
     // already-running Pro conversations remain fully concurrent.
-    if let Err(result) = profile_pool::wait_for_launch_turn(
-        &settings.profile_dirs[0],
-        settings.launch_interval,
-        mission_id,
-        &events_tx,
-        &cancel,
-    )
-    .await
-    {
-        return result;
-    }
+    let paced_transition_id =
+        match wait_for_available_launch_turn(&settings, mission_id, &events_tx, &cancel).await {
+            Ok(transition_id) => transition_id,
+            Err(result) => return result,
+        };
     // Conversations are account-scoped: a resume must reuse the profile
     // that submitted the prompt, or give up on the pointer entirely. The
     // pinned path locks the slot directly instead of going through the
@@ -661,14 +678,8 @@ pub async fn run_chatgpt_ui_turn(
     // reserve a fresh launch turn whenever the availability generation changed
     // and preserve account-wide spacing after the probe succeeds.
     if availability::status(&settings.profile_dirs).transition_id != paced_transition_id {
-        if let Err(result) = profile_pool::wait_for_launch_turn(
-            &settings.profile_dirs[0],
-            settings.launch_interval,
-            mission_id,
-            &events_tx,
-            &cancel,
-        )
-        .await
+        if let Err(result) =
+            wait_for_available_launch_turn(&settings, mission_id, &events_tx, &cancel).await
         {
             return result;
         }

@@ -73,7 +73,9 @@ impl Default for AvailabilityStatus {
 struct Entry {
     status: AvailabilityStatus,
     state_path: PathBuf,
-    profile_dirs: Vec<PathBuf>,
+    current_profile_dirs: Vec<PathBuf>,
+    known_profile_dirs: Vec<PathBuf>,
+    known_configurations: Vec<Vec<PathBuf>>,
     probe_claimed: bool,
 }
 
@@ -82,12 +84,16 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Entry>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn pool_key(profile_dirs: &[PathBuf]) -> Option<PathBuf> {
-    profile_dirs.first().map(|profile| {
-        profile
-            .parent()
-            .unwrap_or_else(|| Path::new("/"))
-            .to_path_buf()
+fn entry_for_profiles_mut<'a>(
+    entries: &'a mut HashMap<PathBuf, Entry>,
+    profile_dirs: &[PathBuf],
+) -> Option<&'a mut Entry> {
+    entries.values_mut().find(|entry| {
+        entry.current_profile_dirs == profile_dirs
+            || entry
+                .known_configurations
+                .iter()
+                .any(|configuration| configuration == profile_dirs)
     })
 }
 
@@ -143,22 +149,30 @@ fn reconcile(entry: &mut Entry, now: DateTime<Utc>) {
 }
 
 pub fn configure(profile_dirs: &[PathBuf], app_working_dir: &Path) {
-    let Some(key) = pool_key(profile_dirs) else {
+    if profile_dirs.is_empty() {
         return;
-    };
+    }
     let path = state_path(app_working_dir);
     let mut entries = registry()
         .lock()
         .expect("ChatGPT UI availability registry poisoned");
-    if let Some(entry) = entries.get_mut(&key) {
+    if let Some(entry) = entries.get_mut(&path) {
         // Retain prior members for the lifetime of this process. A settings
         // refresh can remove a profile while an already-running browser turn
         // still owns it; a later failure from that turn must continue to open
         // the account-wide gate. Process restart naturally clears mappings
         // once no old turns can still report.
+        entry.current_profile_dirs = profile_dirs.to_vec();
+        if !entry
+            .known_configurations
+            .iter()
+            .any(|configuration| configuration == profile_dirs)
+        {
+            entry.known_configurations.push(profile_dirs.to_vec());
+        }
         for profile_dir in profile_dirs {
-            if !entry.profile_dirs.contains(profile_dir) {
-                entry.profile_dirs.push(profile_dir.clone());
+            if !entry.known_profile_dirs.contains(profile_dir) {
+                entry.known_profile_dirs.push(profile_dir.clone());
             }
         }
         return;
@@ -176,8 +190,10 @@ pub fn configure(profile_dirs: &[PathBuf], app_working_dir: &Path) {
         });
     let mut entry = Entry {
         status,
-        state_path: path,
-        profile_dirs: profile_dirs.to_vec(),
+        state_path: path.clone(),
+        current_profile_dirs: profile_dirs.to_vec(),
+        known_profile_dirs: profile_dirs.to_vec(),
+        known_configurations: vec![profile_dirs.to_vec()],
         // A process restart cannot inherit ownership of a prior probe.
         probe_claimed: false,
     };
@@ -185,17 +201,17 @@ pub fn configure(profile_dirs: &[PathBuf], app_working_dir: &Path) {
     if entry.status.state == AvailabilityState::Probing {
         entry.probe_claimed = false;
     }
-    entries.insert(key, entry);
+    entries.insert(path, entry);
 }
 
 pub fn status(profile_dirs: &[PathBuf]) -> AvailabilityStatus {
-    let Some(key) = pool_key(profile_dirs) else {
+    if profile_dirs.is_empty() {
         return AvailabilityStatus::default();
-    };
+    }
     let mut entries = registry()
         .lock()
         .expect("ChatGPT UI availability registry poisoned");
-    let Some(entry) = entries.get_mut(&key) else {
+    let Some(entry) = entry_for_profiles_mut(&mut entries, profile_dirs) else {
         return AvailabilityStatus::default();
     };
     reconcile(entry, Utc::now());
@@ -203,12 +219,13 @@ pub fn status(profile_dirs: &[PathBuf]) -> AvailabilityStatus {
 }
 
 pub fn is_configured(profile_dirs: &[PathBuf]) -> bool {
-    pool_key(profile_dirs).is_some_and(|key| {
-        registry()
+    entry_for_profiles_mut(
+        &mut registry()
             .lock()
-            .expect("ChatGPT UI availability registry poisoned")
-            .contains_key(&key)
-    })
+            .expect("ChatGPT UI availability registry poisoned"),
+        profile_dirs,
+    )
+    .is_some()
 }
 
 pub fn open_cooldown(profile_dir: &Path, reason: AvailabilityReason, cooldown: Duration) {
@@ -222,12 +239,24 @@ pub fn open_cooldown(profile_dir: &Path, reason: AvailabilityReason, cooldown: D
     // from different parents. Resolve the owning pool from the complete
     // configured membership instead of deriving an incompatible key from the
     // failing slot alone.
-    let Some(entry) = entries.values_mut().find(|entry| {
-        entry
-            .profile_dirs
-            .iter()
-            .any(|profile| profile == profile_dir)
-    }) else {
+    let owner = entries
+        .iter()
+        .find(|(_, entry)| {
+            entry
+                .current_profile_dirs
+                .iter()
+                .any(|profile| profile == profile_dir)
+        })
+        .or_else(|| {
+            entries.iter().find(|(_, entry)| {
+                entry
+                    .known_profile_dirs
+                    .iter()
+                    .any(|profile| profile == profile_dir)
+            })
+        })
+        .map(|(key, _)| key.clone());
+    let Some(entry) = owner.and_then(|key| entries.get_mut(&key)) else {
         return;
     };
     let was_available = entry.status.state == AvailabilityState::Available;
@@ -251,13 +280,13 @@ pub fn open_cooldown(profile_dir: &Path, reason: AvailabilityReason, cooldown: D
 }
 
 pub fn claim_probe(profile_dirs: &[PathBuf]) -> bool {
-    let Some(key) = pool_key(profile_dirs) else {
+    if profile_dirs.is_empty() {
         return false;
-    };
+    }
     let mut entries = registry()
         .lock()
         .expect("ChatGPT UI availability registry poisoned");
-    let Some(entry) = entries.get_mut(&key) else {
+    let Some(entry) = entry_for_profiles_mut(&mut entries, profile_dirs) else {
         return false;
     };
     reconcile(entry, Utc::now());
@@ -271,26 +300,25 @@ pub fn claim_probe(profile_dirs: &[PathBuf]) -> bool {
 }
 
 pub fn release_probe(profile_dirs: &[PathBuf]) {
-    let Some(key) = pool_key(profile_dirs) else {
+    if profile_dirs.is_empty() {
         return;
-    };
-    if let Some(entry) = registry()
+    }
+    let mut entries = registry()
         .lock()
-        .expect("ChatGPT UI availability registry poisoned")
-        .get_mut(&key)
-    {
+        .expect("ChatGPT UI availability registry poisoned");
+    if let Some(entry) = entry_for_profiles_mut(&mut entries, profile_dirs) {
         entry.probe_claimed = false;
     }
 }
 
 pub fn mark_available(profile_dirs: &[PathBuf]) {
-    let Some(key) = pool_key(profile_dirs) else {
+    if profile_dirs.is_empty() {
         return;
-    };
+    }
     let mut entries = registry()
         .lock()
         .expect("ChatGPT UI availability registry poisoned");
-    let Some(entry) = entries.get_mut(&key) else {
+    let Some(entry) = entry_for_profiles_mut(&mut entries, profile_dirs) else {
         return;
     };
     let now = Utc::now();
@@ -359,12 +387,10 @@ pub async fn wait_until_available(
 
 #[cfg(test)]
 pub(crate) fn reset_for_tests(profile_dirs: &[PathBuf]) {
-    if let Some(key) = pool_key(profile_dirs) {
-        registry()
-            .lock()
-            .expect("ChatGPT UI availability registry poisoned")
-            .remove(&key);
-    }
+    registry()
+        .lock()
+        .expect("ChatGPT UI availability registry poisoned")
+        .retain(|_, entry| entry.current_profile_dirs != profile_dirs);
 }
 
 #[cfg(test)]
@@ -454,7 +480,9 @@ mod tests {
         let removed = root.path().join("profiles/removed");
         std::fs::create_dir_all(&retained).unwrap();
         std::fs::create_dir_all(&removed).unwrap();
-        let original_profiles = vec![retained.clone(), removed.clone()];
+        // Remove the original first profile so a parent/first-profile-derived
+        // registry identity would change during the refresh.
+        let original_profiles = vec![removed.clone(), retained.clone()];
         configure(&original_profiles, root.path());
         mark_available(&original_profiles);
 
@@ -467,6 +495,10 @@ mod tests {
 
         assert_eq!(
             status(std::slice::from_ref(&retained)).state,
+            AvailabilityState::Cooldown
+        );
+        assert_eq!(
+            status(&original_profiles).state,
             AvailabilityState::Cooldown
         );
         reset_for_tests(std::slice::from_ref(&retained));
