@@ -146,7 +146,9 @@ async def raise_if_rate_limited(page) -> None:
     Keep this exact and narrow: arbitrary page text is private conversation
     data and must neither be logged nor used for fuzzy classification.
     """
-    heading = page.get_by_text(RATE_LIMIT_HEADING, exact=True).first
+    heading = page.get_by_role(
+        "heading", name=RATE_LIMIT_HEADING, exact=True
+    ).first
     try:
         if await heading.count() and await heading.is_visible():
             raise RateLimited()
@@ -154,6 +156,25 @@ async def raise_if_rate_limited(page) -> None:
         raise
     except Exception:
         # A missing/transient locator is not rate-limit evidence.
+        pass
+    # Some ChatGPT rollouts render the warning inside a portal without heading
+    # semantics. Scope the fallback to modal surfaces so quoted conversation
+    # text can never open the account-wide circuit.
+    try:
+        dialogs = page.locator('[role="dialog"], [aria-modal="true"]')
+        for index in range(await dialogs.count()):
+            dialog = dialogs.nth(index)
+            if not await dialog.is_visible():
+                continue
+            dialog_text = await dialog.inner_text(timeout=2_000)
+            if (
+                RATE_LIMIT_HEADING in dialog_text
+                and "temporarily limited access" in dialog_text
+            ):
+                raise RateLimited()
+    except RateLimited:
+        raise
+    except Exception:
         return
 
 
@@ -185,14 +206,11 @@ async def click_send_control(page) -> bool:
             if click_failures >= 2:
                 break
             await page.wait_for_timeout(1_000)
-    try:
-        await raise_if_rate_limited(page)
-        response = await page.request.get(CHATGPT_URL, timeout=10_000)
-        network_reachable = response.status > 0
-    except Exception:
-        network_reachable = False
-    if not network_reachable:
-        raise TransportUnavailable("ChatGPT is unreachable through the browser proxy")
+    await raise_if_rate_limited(page)
+    # Reaching this point means the authenticated ChatGPT shell and composer
+    # were already hydrated. A separate APIRequest probe does not share the
+    # persistent browser context reliably and used to misclassify a disabled
+    # send control as a proxy outage, triggering a harmful automatic retry.
     raise RuntimeError("composer send control is not actionable")
 
 

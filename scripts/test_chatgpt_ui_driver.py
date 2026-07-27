@@ -10,7 +10,6 @@ from scripts.chatgpt_ui_driver import (
     STOP_BUTTON_NAME,
     STOP_CONTROL_TESTIDS,
     RateLimited,
-    TransportUnavailable,
     choose_intelligence_model,
     click_send_control,
     close_context_quietly,
@@ -87,6 +86,9 @@ class FakeControl:
     def first(self):
         return self
 
+    def nth(self, _index):
+        return self
+
     async def count(self) -> int:
         return 1 if self.visible else 0
 
@@ -120,6 +122,16 @@ class FakeComposerForm:
 
 
 class FakeComposerPage:
+    class Dialog(FakeControl):
+        def __init__(self, rate_limited: bool) -> None:
+            super().__init__(rate_limited)
+            self.rate_limited = rate_limited
+
+        async def inner_text(self, timeout) -> str:
+            if self.rate_limited:
+                return "Too many requests\nWe've temporarily limited access to your conversations"
+            return ""
+
     class Request:
         def __init__(self, reachable: bool) -> None:
             self.reachable = reachable
@@ -146,14 +158,19 @@ class FakeComposerPage:
         self.selectors.append(selector)
         if selector == "form":
             return self.form
+        if selector == '[role="dialog"], [aria-modal="true"]':
+            return self.Dialog(self.rate_limited)
         return self.testid_control
 
     async def wait_for_timeout(self, _timeout) -> None:
         return None
 
-    def get_by_text(self, text, exact=False):
+    def get_by_role(self, role, name=None, exact=False):
         return FakeControl(
-            self.rate_limited and text == "Too many requests" and exact
+            self.rate_limited
+            and role == "heading"
+            and name == "Too many requests"
+            and exact
         )
 
 
@@ -207,7 +224,9 @@ class HydratingConversationPage:
     async def wait_for_timeout(self, _timeout) -> None:
         self.waits += 1
 
-    def get_by_role(self, role, name=None):
+    def get_by_role(self, role, name=None, exact=False):
+        if role == "heading":
+            return HydratingLocator([0])
         if role == "button" and name is not None:
             return self.login
         return self.composer
@@ -326,7 +345,7 @@ class ChatGptUiDriverTests(unittest.TestCase):
             all(not click.get("force", False) for click in page.testid_control.clicks)
         )
 
-    def test_send_click_classifies_shared_proxy_outage_as_transport(self) -> None:
+    def test_send_click_does_not_misclassify_context_probe_as_transport(self) -> None:
         page = FakeComposerPage(
             testid_visible=True,
             fallback_visible=False,
@@ -334,7 +353,7 @@ class ChatGptUiDriverTests(unittest.TestCase):
         )
         page.testid_control = ClickableControl(failures=2)
 
-        with self.assertRaises(TransportUnavailable):
+        with self.assertRaisesRegex(RuntimeError, "not actionable"):
             asyncio.run(click_send_control(page))
 
     def test_download_links_are_limited_to_chatgpt_artifact_surfaces(self) -> None:
