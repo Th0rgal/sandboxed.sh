@@ -734,6 +734,7 @@ pub async fn get_backend_quota(
 #[derive(Debug, Serialize)]
 pub struct ChatgptUiProfilePoolResponse {
     pub slots: Vec<crate::api::runners::chatgpt_ui::profile_pool::ProfileSlotStatus>,
+    pub backend_circuit: crate::api::runners::chatgpt_ui::profile_pool::BackendCircuitStatus,
 }
 
 /// GET /api/backends/chatgpt_ui/profile-pool — per-slot pool state
@@ -747,6 +748,9 @@ pub async fn chatgpt_ui_profile_pool(
             .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     Ok(Json(ChatgptUiProfilePoolResponse {
         slots: crate::api::runners::chatgpt_ui::profile_pool::pool_snapshot(&profile_dirs),
+        backend_circuit: crate::api::runners::chatgpt_ui::profile_pool::backend_circuit_status(
+            &profile_dirs,
+        ),
     }))
 }
 

@@ -6,7 +6,7 @@ After=network-online.target tailscaled.service
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/ssh -N -D 127.0.0.1:10880 -i /root/.ssh/agent-core-dgx-tunnel -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes root@100.77.4.93
+ExecStart=/usr/bin/ssh -N -D 127.0.0.1:10880 -i /root/.ssh/agent-core-dgx-tunnel -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=3 -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o TCPKeepAlive=yes -o StrictHostKeyChecking=yes root@100.77.4.93
 Restart=always
 RestartSec=3
 

@@ -41,6 +41,10 @@ PRO_MODEL_ALIASES = {
     "gpt-5.6 pro",
     "gpt 5.6-pro",
 }
+
+
+class TransportUnavailable(Exception):
+    pass
 # Opaque conversation route: `/c/<id>`. This is the only page-derived value the
 # durability protocol ever emits — never titles, prompts, or response text.
 CONVERSATION_PATH_RE = re.compile(r"^/c/[A-Za-z0-9-]{8,64}$")
@@ -59,8 +63,11 @@ def emit(event_type: str, **payload) -> None:
     print(json.dumps({"type": event_type, **payload}, separators=(",", ":")), flush=True)
 
 
-def fail(code: str, message: str) -> None:
-    emit("error", code=code, message=message)
+def fail(code: str, message: str, *, stage: str | None = None) -> None:
+    payload = {"code": code, "message": message}
+    if stage:
+        payload["stage"] = stage
+    emit("error", **payload)
 
 
 def conversation_path_from_url(url: str) -> str | None:
@@ -84,6 +91,11 @@ def resume_conversation_path(resume) -> str | None:
     if isinstance(path, str) and CONVERSATION_PATH_RE.fullmatch(path):
         return path
     return None
+
+
+def continued_conversation_path(conversation) -> str | None:
+    """Validate a completed-turn conversation affinity request."""
+    return resume_conversation_path(conversation)
 
 
 def normalized_prompt(text: str) -> str:
@@ -119,6 +131,44 @@ async def locate_composer_control(page, testid_selectors, accessible_name):
     except Exception:
         pass
     return None, False
+
+
+async def click_send_control(page) -> bool:
+    """Click the composer send control after proving it is actionable.
+
+    ChatGPT occasionally replaces the hydrated composer node while the prompt
+    is being filled. Re-resolve the locator once instead of letting Playwright
+    spend its full default timeout on a detached element. The trial click is
+    intentionally side-effect free; we never use force or an Enter fallback,
+    either of which could duplicate an ambiguously submitted prompt.
+    """
+    used_fallback = False
+    click_failures = 0
+    for _ in range(20):  # allow ~10 seconds for hydration to attach the control
+        control, fallback = await locate_composer_control(
+            page, SEND_CONTROL_TESTIDS, SEND_BUTTON_NAME
+        )
+        used_fallback = used_fallback or fallback
+        if control is None:
+            await page.wait_for_timeout(500)
+            continue
+        try:
+            await control.click(trial=True, timeout=5_000)
+            await control.click(timeout=8_000, no_wait_after=True)
+            return used_fallback
+        except Exception:
+            click_failures += 1
+            if click_failures >= 2:
+                break
+            await page.wait_for_timeout(1_000)
+    try:
+        response = await page.request.get(CHATGPT_URL, timeout=10_000)
+        network_reachable = response.status > 0
+    except Exception:
+        network_reachable = False
+    if not network_reachable:
+        raise TransportUnavailable("ChatGPT is unreachable through the browser proxy")
+    raise RuntimeError("composer send control is not actionable")
 
 
 async def choose_intelligence_model(page, label: str) -> bool:
@@ -400,6 +450,31 @@ async def establish_resumed_chat(page, conversation_path: str, message: str) -> 
     return 0
 
 
+async def establish_continued_chat(page, conversation_path: str) -> int:
+    """Open a mission-owned completed conversation for its next message."""
+    await page.goto(
+        f"https://chatgpt.com{conversation_path}",
+        wait_until="domcontentloaded",
+        timeout=60_000,
+    )
+    emit("diagnostic", message="stage=continuation_route")
+    await verify_authentication(page)
+    await page.wait_for_timeout(2_000)
+    parsed = urlparse(page.url)
+    if parsed.netloc.lower() not in CHATGPT_HOSTS or parsed.path != conversation_path:
+        raise ResumeNotFound()
+    user_messages = page.locator('[data-message-author-role="user"]')
+    responses = page.locator('[data-message-author-role="assistant"]')
+    if await user_messages.count() == 0 or await responses.count() == 0:
+        raise ResumeNotFound()
+    composer = page.locator("#prompt-textarea").first
+    if not await composer.count():
+        composer = page.get_by_role("textbox").last
+    await composer.wait_for(state="visible", timeout=20_000)
+    emit("diagnostic", message="stage=continuation_verified")
+    return await responses.count()
+
+
 async def establish_fresh_chat(page) -> int:
     """Prove an authenticated, settled blank chat before observing responses."""
     await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60_000)
@@ -444,13 +519,26 @@ async def run(args, request) -> None:
     requested_model = request.get("model") or ""
     durability = request.get("durability") is True
     resume_request = request.get("resume")
+    continuation_request = request.get("conversation")
     resume_path = None
+    continuation_path = None
+    if resume_request is not None and continuation_request is not None:
+        fail("invalid_request", "resume and conversation are mutually exclusive")
+        return
     if resume_request is not None:
         resume_path = resume_conversation_path(resume_request)
         if resume_path is None:
             fail(
                 "invalid_request",
                 "resume.conversation_path must be an opaque /c/<id> route",
+            )
+            return
+    if continuation_request is not None:
+        continuation_path = continued_conversation_path(continuation_request)
+        if continuation_path is None:
+            fail(
+                "invalid_request",
+                "conversation.conversation_path must be an opaque /c/<id> route",
             )
             return
     requested_download_dir = request.get("download_dir")
@@ -503,6 +591,19 @@ async def run(args, request) -> None:
                 model_used = (
                     model_selection(requested_model)[1] if requested_model else ""
                 )
+            elif continuation_path is not None:
+                stage = "continuation"
+                baseline = await establish_continued_chat(page, continuation_path)
+                stage = "model_selection"
+                model_used = await choose_model(page, requested_model)
+                stage = "composer"
+                composer = page.locator("#prompt-textarea").first
+                if not await composer.count():
+                    composer = page.get_by_role("textbox").last
+                await composer.fill(message)
+                stage = "send"
+                if await click_send_control(page):
+                    emit("diagnostic", message="stage=send_button_fallback")
             else:
                 stage = "fresh_chat"
                 baseline = await establish_fresh_chat(page)
@@ -516,19 +617,8 @@ async def run(args, request) -> None:
                     composer = page.get_by_role("textbox").last
                 await composer.fill(message)
                 stage = "send"
-                send = None
-                for _ in range(20):  # allow ~10 seconds for the control to attach
-                    send, used_fallback = await locate_composer_control(
-                        page, SEND_CONTROL_TESTIDS, SEND_BUTTON_NAME
-                    )
-                    if send is not None:
-                        if used_fallback:
-                            emit("diagnostic", message="stage=send_button_fallback")
-                        break
-                    await asyncio.sleep(0.5)
-                if send is None:
-                    raise RuntimeError("composer send control not found")
-                await send.click()
+                if await click_send_control(page):
+                    emit("diagnostic", message="stage=send_button_fallback")
 
             stage = "response"
             last = ""
@@ -583,7 +673,7 @@ async def run(args, request) -> None:
         )
     except ResumeNotFound:
         fail(
-            "resume_not_found",
+            "continuation_not_found" if stage == "continuation" else "resume_not_found",
             "the recorded conversation is not reachable from this profile",
         )
     except ResumeMismatch:
@@ -592,9 +682,17 @@ async def run(args, request) -> None:
             "the recorded conversation does not hold exactly this prompt",
         )
     except Exception as exc:
+        if isinstance(exc, TransportUnavailable):
+            fail(
+                "transport_unavailable",
+                "ChatGPT is unreachable through the configured browser proxy",
+                stage=stage,
+            )
+            return
         fail(
             "compatibility",
             f"{COMPAT_VERSION}: UI check failed at {stage} ({type(exc).__name__}); verify selectors against a blank, non-private chat",
+            stage=stage,
         )
     finally:
         if context is not None:

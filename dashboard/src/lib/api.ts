@@ -3294,6 +3294,11 @@ export interface ChatgptUiProfilePoolSlot {
 
 export interface ChatgptUiProfilePoolResponse {
   slots: ChatgptUiProfilePoolSlot[];
+  backend_circuit?: {
+    open: boolean;
+    retry_after_secs?: number | null;
+    reason?: "compatibility" | "transport" | null;
+  };
 }
 
 // Get ChatGPT UI profile pool slot telemetry

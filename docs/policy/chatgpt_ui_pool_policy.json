@@ -1,6 +1,6 @@
 {
   "policy": "chatgpt-ui-pool",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "source_of_truth": {
     "runtime": "src/api/runners/chatgpt_ui/mod.rs",
     "pool": "src/api/runners/chatgpt_ui/profile_pool.rs",
@@ -30,6 +30,12 @@
       "max_automatic_retries": 1,
       "require_different_slot": true,
       "require_healthy_slot": true
+    },
+    "backend_circuit": {
+      "transport_signal": "transport_unavailable",
+      "failure_window_secs": 180,
+      "distinct_slots": 2,
+      "cooldown_secs": 300
     },
     "auth_failure": {
       "signal": "auth_required",

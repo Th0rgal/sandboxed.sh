@@ -6,12 +6,28 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::agents::{AgentResult, CompletionConfidence, CompletionSignal, TerminalReason};
+use crate::agents::{
+    AgentResult, CompletionConfidence, CompletionSignal, FailureClass, TerminalReason, TurnOutcome,
+};
 use crate::api::control::AgentEvent;
 use crate::api::mission_runner::*;
 use crate::cost::resolve_cost_cents_and_source;
 use crate::workspace::Workspace;
 use crate::workspace_exec::WorkspaceExec;
+
+fn gemini_bootstrap_failure_class(error: &str) -> FailureClass {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("connectionrefused")
+        || normalized.contains("connection refused")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
+        || normalized.contains("network")
+    {
+        FailureClass::TransportError
+    } else {
+        FailureClass::AgentError
+    }
+}
 
 /// Run a single Gemini CLI turn for a mission.
 #[allow(clippy::too_many_arguments)]
@@ -72,8 +88,14 @@ pub async fn run_gemini_turn(
             Ok(path) => path,
             Err(e) => {
                 tracing::error!("Gemini CLI not available: {}", e);
-                return AgentResult::failure(format!("Gemini CLI not available: {}", e), 0)
-                    .with_terminal_reason(TerminalReason::LlmError);
+                let message = format!("Gemini CLI not available: {}", e);
+                return AgentResult::failure(message.clone(), 0).with_turn_outcome(
+                    TurnOutcome::Failed {
+                        reason: TerminalReason::LlmError,
+                        source: Some(gemini_bootstrap_failure_class(&e)),
+                        message: Some(message),
+                    },
+                );
             }
         };
 
@@ -641,4 +663,27 @@ fn env_google_api_key() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemini_bootstrap_connection_refusal_is_transport() {
+        assert_eq!(
+            gemini_bootstrap_failure_class(
+                "Gemini CLI install failed: ConnectionRefused downloading package manifest"
+            ),
+            FailureClass::TransportError
+        );
+    }
+
+    #[test]
+    fn gemini_missing_cli_without_network_signal_is_agent_error() {
+        assert_eq!(
+            gemini_bootstrap_failure_class("no package manager is available"),
+            FailureClass::AgentError
+        );
+    }
 }

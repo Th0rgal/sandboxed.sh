@@ -139,6 +139,7 @@ pub fn allowlisted_error_code(code: &str) -> &'static str {
         "invalid_config" => "invalid_config",
         "resume_not_found" => "resume_not_found",
         "resume_mismatch" => "resume_mismatch",
+        "continuation_not_found" => "continuation_not_found",
         "driver_protocol" => "driver_protocol",
         "driver_exit" => "driver_exit",
         "stream_error" => "stream_error",
@@ -328,6 +329,10 @@ pub fn resumable_job(record: &JobRecord, prompt_sha256: &str, now: DateTime<Utc>
         && record.prompt_sha256 == prompt_sha256
         && valid_conversation_path(&record.conversation_path)
         && age_of(record, now) <= RESUME_MAX_AGE
+}
+
+pub fn continuable_conversation(record: &JobRecord) -> bool {
+    record.state == JobState::Completed && valid_conversation_path(&record.conversation_path)
 }
 
 fn read_all_records(app_working_dir: &Path) -> Vec<JobRecord> {
@@ -549,6 +554,7 @@ mod tests {
         let record = load_job(root.path(), mission_id).unwrap();
         assert_eq!(record.state, JobState::Completed);
         assert!(!resumable_job(&record, &fingerprint, Utc::now()));
+        assert!(continuable_conversation(&record));
     }
 
     #[test]
