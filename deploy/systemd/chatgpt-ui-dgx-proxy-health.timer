@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically verify ChatGPT UI DGX egress
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+RandomizedDelaySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

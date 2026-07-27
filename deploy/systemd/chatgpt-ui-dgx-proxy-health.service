@@ -1,0 +1,7 @@
+[Unit]
+Description=Probe ChatGPT UI egress through the DGX Spark SOCKS tunnel
+After=chatgpt-ui-dgx-proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/sandboxed-sh/scripts/check_chatgpt_ui_proxy.sh
