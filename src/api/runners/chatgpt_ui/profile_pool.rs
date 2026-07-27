@@ -444,6 +444,10 @@ pub async fn acquire_profile(
         .remove(&mission_id);
     let mut announced_wait = false;
     loop {
+        // Availability can change while this mission is queued behind launch
+        // pacing or another profile lease. Recheck on every acquisition pass,
+        // not only once at the start of the turn.
+        availability::wait_until_available(profile_dirs, mission_id, events_tx, cancel).await?;
         let now = Instant::now();
         let mut candidates = profile_dirs.iter().enumerate().collect::<Vec<_>>();
         // A compatibility failure is not quarantined until it repeats, but a
@@ -465,7 +469,13 @@ pub async fn acquire_profile(
                 continue;
             }
             match try_lock_profile(profile_dir) {
-                Ok(Some(lock)) => return Ok((slot, profile_dir.clone(), lock)),
+                Ok(Some(lock)) => {
+                    if availability::status(profile_dirs).state == AvailabilityState::Available {
+                        return Ok((slot, profile_dir.clone(), lock));
+                    }
+                    drop(lock);
+                    break;
+                }
                 Ok(None) => {}
                 Err(error) => {
                     // A broken lock path is local to this profile. Keep the
@@ -672,6 +682,51 @@ mod tests {
 
         assert_eq!(slot, 1);
         assert_eq!(selected, second_profile);
+    }
+
+    #[tokio::test]
+    async fn queued_acquisition_rechecks_a_new_backend_cooldown() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile-1");
+        std::fs::create_dir(&profile).unwrap();
+        let profiles = vec![profile.clone()];
+        reset_registry_for_tests(&profiles);
+        availability::configure(&profiles, root.path());
+        availability::mark_available(&profiles);
+        let busy_lease = try_lock_profile(&profile).unwrap().unwrap();
+        let (events_tx, _) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+        let acquire_cancel = cancel.clone();
+        let acquire_profiles = profiles.clone();
+
+        let acquisition = tokio::spawn(async move {
+            acquire_profile(
+                &acquire_profiles,
+                Uuid::new_v4(),
+                &events_tx,
+                &acquire_cancel,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        availability::open_cooldown(
+            &profile,
+            AvailabilityReason::RateLimited,
+            Duration::from_secs(600),
+        );
+        drop(busy_lease);
+
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(!acquisition.is_finished());
+
+        availability::mark_available(&profiles);
+        let (_, selected, _lease) = tokio::time::timeout(Duration::from_secs(3), acquisition)
+            .await
+            .expect("acquisition should finish after recovery")
+            .expect("acquisition task should not panic")
+            .expect("profile should be selected after recovery");
+        assert_eq!(selected, profile);
+        reset_registry_for_tests(&profiles);
     }
 
     #[tokio::test]

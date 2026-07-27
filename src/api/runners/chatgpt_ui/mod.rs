@@ -375,6 +375,36 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
 
 const RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+async fn wait_for_available_launch_turn(
+    settings: &Settings,
+    mission_id: Uuid,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    cancel: &CancellationToken,
+) -> Result<u64, AgentResult> {
+    loop {
+        availability::wait_until_available(&settings.profile_dirs, mission_id, events_tx, cancel)
+            .await?;
+        let transition_id = availability::status(&settings.profile_dirs).transition_id;
+        profile_pool::wait_for_launch_turn(
+            &settings.profile_dirs[0],
+            settings.launch_interval,
+            mission_id,
+            events_tx,
+            cancel,
+        )
+        .await?;
+        let after_pacing = availability::status(&settings.profile_dirs);
+        if after_pacing.state == availability::AvailabilityState::Available
+            && after_pacing.transition_id == transition_id
+        {
+            return Ok(transition_id);
+        }
+        // A cooldown opened while this mission waited for its launch turn.
+        // Discard that reservation and repeat availability plus pacing so a
+        // recovered queue cannot bypass account-wide launch spacing.
+    }
+}
+
 /// Start the single backend-wide recovery worker. Cooldown expiry only makes a
 /// probe eligible; this worker is the sole path that can mark the backend
 /// available again without submitting user content.
@@ -590,55 +620,65 @@ pub async fn run_chatgpt_ui_turn(
     // This gate is deliberately before both normal and pinned acquisition.
     // A durable continuation must not bypass an account-wide cooldown merely
     // because it already owns a conversation route.
-    if let Err(result) =
-        availability::wait_until_available(&settings.profile_dirs, mission_id, &events_tx, &cancel)
-            .await
-    {
-        return result;
-    }
     // The configured profiles share one ChatGPT account in normal
     // deployments. Pace navigation/submission starts for that account pool;
     // already-running Pro conversations remain fully concurrent.
-    if let Err(result) = profile_pool::wait_for_launch_turn(
-        &settings.profile_dirs[0],
-        settings.launch_interval,
-        mission_id,
-        &events_tx,
-        &cancel,
-    )
-    .await
-    {
-        return result;
-    }
     // Conversations are account-scoped: a resume must reuse the profile
     // that submitted the prompt, or give up on the pointer entirely. The
     // pinned path locks the slot directly instead of going through the
     // pool scan — quarantine and retry-slot exclusions must not reroute a
     // reattach to an account that cannot see the conversation.
     let pinned_record = attempt_resume.as_ref().or(attempt_continuation.as_ref());
-    let acquisition = if let Some(record) = pinned_record {
-        match settings
-            .profile_dirs
-            .iter()
-            .position(|dir| profile_basename(dir) == record.profile)
+    let (profile_slot, profile_dir, _profile_lock) = loop {
+        let paced_transition_id = match wait_for_available_launch_turn(
+            &settings, mission_id, &events_tx, &cancel,
+        )
+        .await
         {
-            Some(index) => {
-                let pinned = settings.profile_dirs[index].clone();
-                acquire_pinned_profile(&pinned, mission_id, &events_tx, &cancel)
+            Ok(transition_id) => transition_id,
+            Err(result) => return result,
+        };
+        let acquisition = if let Some(record) = pinned_record {
+            match settings
+                .profile_dirs
+                .iter()
+                .position(|dir| profile_basename(dir) == record.profile)
+            {
+                Some(index) => {
+                    let pinned = settings.profile_dirs[index].clone();
+                    acquire_pinned_profile(
+                        &settings.profile_dirs,
+                        &pinned,
+                        mission_id,
+                        &events_tx,
+                        &cancel,
+                    )
                     .await
                     .map(|lock| (index, pinned, lock))
+                }
+                None => {
+                    jobs::note_attempt_error(app_working_dir, mission_id, "profile_unavailable");
+                    return unresolved_resume_result("profile_unavailable");
+                }
             }
-            None => {
-                jobs::note_attempt_error(app_working_dir, mission_id, "profile_unavailable");
-                return unresolved_resume_result("profile_unavailable");
-            }
+        } else {
+            profile_pool::acquire_profile(&settings.profile_dirs, mission_id, &events_tx, &cancel)
+                .await
+        };
+        let lease = match acquisition {
+            Ok(lease) => lease,
+            Err(result) => return result,
+        };
+        let after_acquisition = availability::status(&settings.profile_dirs);
+        if after_acquisition.state == availability::AvailabilityState::Available
+            && after_acquisition.transition_id == paced_transition_id
+        {
+            break lease;
         }
-    } else {
-        profile_pool::acquire_profile(&settings.profile_dirs, mission_id, &events_tx, &cancel).await
-    };
-    let (profile_slot, profile_dir, _profile_lock) = match acquisition {
-        Ok(lease) => lease,
-        Err(result) => return result,
+        // Never hold a profile while waiting for recovery: the single-flight
+        // probe may need this exact slot to reopen the backend. Dropping the
+        // lease before the next loop also forces fresh launch pacing.
+        drop(lease);
     };
     if settings.browser == "chromium" {
         let owned = chromium_cleanup::pool_owns_singletons(&profile_dir);
@@ -725,6 +765,7 @@ fn unresolved_resume_result(code: &str) -> AgentResult {
 /// health routing does not apply — either this slot frees up or the caller
 /// gives up via cancellation.
 async fn acquire_pinned_profile(
+    profile_dirs: &[PathBuf],
     profile_dir: &Path,
     mission_id: Uuid,
     events_tx: &broadcast::Sender<AgentEvent>,
@@ -732,8 +773,16 @@ async fn acquire_pinned_profile(
 ) -> Result<profile_pool::ProfileLock, AgentResult> {
     let mut announced_wait = false;
     loop {
+        availability::wait_until_available(profile_dirs, mission_id, events_tx, cancel).await?;
         match profile_pool::try_lock_profile(profile_dir) {
-            Ok(Some(lock)) => return Ok(lock),
+            Ok(Some(lock)) => {
+                if availability::status(profile_dirs).state
+                    == availability::AvailabilityState::Available
+                {
+                    return Ok(lock);
+                }
+                drop(lock);
+            }
             Ok(None) => {}
             Err(error) => {
                 // The record stays Submitted, so a later turn can still
