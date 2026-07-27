@@ -623,67 +623,63 @@ pub async fn run_chatgpt_ui_turn(
     // The configured profiles share one ChatGPT account in normal
     // deployments. Pace navigation/submission starts for that account pool;
     // already-running Pro conversations remain fully concurrent.
-    let paced_transition_id =
-        match wait_for_available_launch_turn(&settings, mission_id, &events_tx, &cancel).await {
-            Ok(transition_id) => transition_id,
-            Err(result) => return result,
-        };
     // Conversations are account-scoped: a resume must reuse the profile
     // that submitted the prompt, or give up on the pointer entirely. The
     // pinned path locks the slot directly instead of going through the
     // pool scan — quarantine and retry-slot exclusions must not reroute a
     // reattach to an account that cannot see the conversation.
     let pinned_record = attempt_resume.as_ref().or(attempt_continuation.as_ref());
-    let acquisition = if let Some(record) = pinned_record {
-        match settings
-            .profile_dirs
-            .iter()
-            .position(|dir| profile_basename(dir) == record.profile)
+    let (profile_slot, profile_dir, _profile_lock) = loop {
+        let paced_transition_id = match wait_for_available_launch_turn(
+            &settings, mission_id, &events_tx, &cancel,
+        )
+        .await
         {
-            Some(index) => {
-                let pinned = settings.profile_dirs[index].clone();
-                acquire_pinned_profile(
-                    &settings.profile_dirs,
-                    &pinned,
-                    mission_id,
-                    &events_tx,
-                    &cancel,
-                )
+            Ok(transition_id) => transition_id,
+            Err(result) => return result,
+        };
+        let acquisition = if let Some(record) = pinned_record {
+            match settings
+                .profile_dirs
+                .iter()
+                .position(|dir| profile_basename(dir) == record.profile)
+            {
+                Some(index) => {
+                    let pinned = settings.profile_dirs[index].clone();
+                    acquire_pinned_profile(
+                        &settings.profile_dirs,
+                        &pinned,
+                        mission_id,
+                        &events_tx,
+                        &cancel,
+                    )
+                    .await
+                    .map(|lock| (index, pinned, lock))
+                }
+                None => {
+                    jobs::note_attempt_error(app_working_dir, mission_id, "profile_unavailable");
+                    return unresolved_resume_result("profile_unavailable");
+                }
+            }
+        } else {
+            profile_pool::acquire_profile(&settings.profile_dirs, mission_id, &events_tx, &cancel)
                 .await
-                .map(|lock| (index, pinned, lock))
-            }
-            None => {
-                jobs::note_attempt_error(app_working_dir, mission_id, "profile_unavailable");
-                return unresolved_resume_result("profile_unavailable");
-            }
-        }
-    } else {
-        profile_pool::acquire_profile(&settings.profile_dirs, mission_id, &events_tx, &cancel).await
-    };
-    let (profile_slot, profile_dir, _profile_lock) = match acquisition {
-        Ok(lease) => lease,
-        Err(result) => return result,
-    };
-    // Close the launch-pacing/acquisition window too. Holding the profile lock
-    // here prevents this turn from losing its lease while a newly opened
-    // account cooldown blocks it before browser launch.
-    if let Err(result) =
-        availability::wait_until_available(&settings.profile_dirs, mission_id, &events_tx, &cancel)
-            .await
-    {
-        return result;
-    }
-    // Missions may already have reserved launch turns when another browser
-    // opens a cooldown. Recovery wakes those queued acquisitions together, so
-    // reserve a fresh launch turn whenever the availability generation changed
-    // and preserve account-wide spacing after the probe succeeds.
-    if availability::status(&settings.profile_dirs).transition_id != paced_transition_id {
-        if let Err(result) =
-            wait_for_available_launch_turn(&settings, mission_id, &events_tx, &cancel).await
+        };
+        let lease = match acquisition {
+            Ok(lease) => lease,
+            Err(result) => return result,
+        };
+        let after_acquisition = availability::status(&settings.profile_dirs);
+        if after_acquisition.state == availability::AvailabilityState::Available
+            && after_acquisition.transition_id == paced_transition_id
         {
-            return result;
+            break lease;
         }
-    }
+        // Never hold a profile while waiting for recovery: the single-flight
+        // probe may need this exact slot to reopen the backend. Dropping the
+        // lease before the next loop also forces fresh launch pacing.
+        drop(lease);
+    };
     if settings.browser == "chromium" {
         let owned = chromium_cleanup::pool_owns_singletons(&profile_dir);
         let outcome = chromium_cleanup::cleanup_profile_singletons(&profile_dir, owned);
