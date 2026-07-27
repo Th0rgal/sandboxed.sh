@@ -254,6 +254,23 @@ pub struct Workspace {
     /// so env injection does not re-read the connection file.
     #[serde(skip, default)]
     pub resolved_git_credentials: Option<git_credentials::GitCredentialConfig>,
+    /// Harness CLI versions last probed inside this container workspace
+    /// (after harness bootstrap on build/rebuild). None = never probed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_versions: Option<HarnessVersions>,
+}
+
+/// Harness CLI versions detected inside a container workspace.
+///
+/// Keyed by CLI name (`claude`, `codex`, `opencode`, `gemini`, `grok`); a CLI
+/// that is not installed is simply absent. The value is the first line of
+/// `<cli> --version`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessVersions {
+    /// When the probe ran.
+    pub probed_at: DateTime<Utc>,
+    /// CLI name → version line.
+    pub versions: std::collections::BTreeMap<String, String>,
 }
 
 impl Workspace {
@@ -495,6 +512,7 @@ impl Workspace {
             mcps_replace_defaults: true,
             config_profile: None,
             resolved_git_credentials: None,
+            harness_versions: None,
         }
     }
 
@@ -522,6 +540,7 @@ impl Workspace {
             mcps: Vec::new(),
             mcps_replace_defaults: true,
             resolved_git_credentials: None,
+            harness_versions: None,
         }
     }
 }
@@ -715,6 +734,7 @@ impl WorkspaceStore {
                     mcps_replace_defaults: true,
                     config_profile: None,
                     resolved_git_credentials: None,
+                    harness_versions: None,
                 };
 
                 orphaned.push(workspace);
@@ -3164,6 +3184,7 @@ pub async fn build_container_workspace(
     force_rebuild: bool,
     working_dir: &Path,
     library: Option<&LibraryStore>,
+    harness_policy: &crate::settings::HarnessVersionPolicy,
 ) -> anyhow::Result<()> {
     if workspace.workspace_type != WorkspaceType::Container {
         return Err(anyhow::anyhow!("Workspace is not a container type"));
@@ -3288,12 +3309,41 @@ pub async fn build_container_workspace(
                 return Err(e);
             }
             append_to_init_log(&workspace.path, "[sandboxed] Installing harnesses...\n");
-            if let Err(e) = bootstrap_workspace_harnesses(workspace).await {
+            if let Err(e) = bootstrap_workspace_harnesses(workspace, harness_policy).await {
                 tracing::warn!(
                     workspace = %workspace.name,
                     error = %e,
                     "Harness bootstrap failed; workspace will still be marked ready"
                 );
+            }
+            // Record which harness CLIs (and versions) actually exist inside
+            // the container, whether or not the bootstrap fully succeeded.
+            match probe_workspace_harness_versions(workspace).await {
+                Ok(Some(versions)) => {
+                    let summary = if versions.versions.is_empty() {
+                        "none detected".to_string()
+                    } else {
+                        versions
+                            .versions
+                            .iter()
+                            .map(|(cli, v)| format!("{}={}", cli, v))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    append_to_init_log(
+                        &workspace.path,
+                        &format!("[sandboxed] Harness versions: {}\n", summary),
+                    );
+                    workspace.harness_versions = Some(versions);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        error = %e,
+                        "Harness version probe failed"
+                    );
+                }
             }
             workspace.status = WorkspaceStatus::Ready;
             workspace.error_message = None;
@@ -3369,22 +3419,82 @@ async fn seed_shard_data(container_root: &Path) -> anyhow::Result<bool> {
 
 use crate::util::copy_dir_recursive;
 
-async fn bootstrap_workspace_harnesses(workspace: &Workspace) -> anyhow::Result<()> {
+/// Which harnesses the container bootstrap manages, from
+/// `SANDBOXED_SH_BOOTSTRAP_*` env vars (all default true).
+struct HarnessBootstrapFlags {
+    claudecode: bool,
+    codex: bool,
+    gemini: bool,
+    opencode: bool,
+    grok: bool,
+}
+
+impl HarnessBootstrapFlags {
+    fn from_env() -> Self {
+        Self {
+            claudecode: env_var_bool("SANDBOXED_SH_BOOTSTRAP_CLAUDECODE", true),
+            codex: env_var_bool("SANDBOXED_SH_BOOTSTRAP_CODEX", true),
+            gemini: env_var_bool("SANDBOXED_SH_BOOTSTRAP_GEMINI", true),
+            opencode: env_var_bool("SANDBOXED_SH_BOOTSTRAP_OPENCODE", true),
+            grok: env_var_bool("SANDBOXED_SH_BOOTSTRAP_GROK", true),
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.claudecode || self.codex || self.gemini || self.opencode || self.grok
+    }
+}
+
+/// Render the container harness-bootstrap script.
+///
+/// Placeholders are substituted with `str::replace` rather than `format!` so
+/// the shell's own `${...}` expansions and function bodies don't need brace
+/// escaping. Empty pins mean "install latest when missing"; a non-empty pin
+/// also reinstalls when `--version` stops matching it.
+fn render_harness_bootstrap_script(
+    policy: &crate::settings::HarnessVersionPolicy,
+    flags: &HarnessBootstrapFlags,
+) -> String {
+    let pin = |v: &Option<String>| v.clone().unwrap_or_default();
+    HARNESS_BOOTSTRAP_TEMPLATE
+        .replace("@CLAUDE_VERSION@", &policy.effective_claude_code())
+        .replace("@CODEX_PIN@", &pin(&policy.codex))
+        .replace("@GEMINI_PIN@", &pin(&policy.gemini))
+        .replace("@OPENCODE_PIN@", &pin(&policy.opencode))
+        .replace("@INSTALL_CLAUDECODE@", bool_str(flags.claudecode))
+        .replace("@INSTALL_CODEX@", bool_str(flags.codex))
+        .replace("@INSTALL_GEMINI@", bool_str(flags.gemini))
+        .replace("@INSTALL_OPENCODE@", bool_str(flags.opencode))
+        .replace("@INSTALL_GROK@", bool_str(flags.grok))
+}
+
+fn bool_str(v: bool) -> &'static str {
+    if v {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+async fn bootstrap_workspace_harnesses(
+    workspace: &Workspace,
+    policy: &crate::settings::HarnessVersionPolicy,
+) -> anyhow::Result<()> {
     if workspace.workspace_type != WorkspaceType::Container || !use_nspawn_for_workspace(workspace)
     {
         return Ok(());
     }
 
-    let install_claudecode = env_var_bool("SANDBOXED_SH_BOOTSTRAP_CLAUDECODE", true);
-    let install_opencode = env_var_bool("SANDBOXED_SH_BOOTSTRAP_OPENCODE", true);
-    let install_grok = env_var_bool("SANDBOXED_SH_BOOTSTRAP_GROK", true);
-
-    if !install_claudecode && !install_opencode && !install_grok {
+    let flags = HarnessBootstrapFlags::from_env();
+    if !flags.any() {
         return Ok(());
     }
 
-    let script = format!(
-        r#"#!/usr/bin/env bash
+    let script = render_harness_bootstrap_script(policy, &flags);
+    run_harness_bootstrap_script(workspace, script).await
+}
+
+const HARNESS_BOOTSTRAP_TEMPLATE: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 
 LOG=/var/log/sandboxed-init.log
@@ -3445,15 +3555,12 @@ if [ -x /root/.bun/bin/bun ] && ! command -v bun >/dev/null 2>&1; then
   echo "[sandboxed] Linked bun into /usr/local/bin"
 fi
 
-CLAUDE_CODE_VERSION="${{SANDBOXED_SH_CLAUDECODE_VERSION:-2.1.139}}"
-claude_needs_install=true
-if command -v claude >/dev/null 2>&1; then
-  if claude --version 2>&1 | grep -F "$CLAUDE_CODE_VERSION" >/dev/null 2>&1; then
-    claude_needs_install=false
-  else
-    echo "[sandboxed] Claude Code version mismatch; installing $CLAUDE_CODE_VERSION"
-  fi
-fi
+# Version policy, injected by render_harness_bootstrap_script. An empty pin
+# means "install latest when missing"; a pin also reinstalls on drift.
+CLAUDE_CODE_VERSION="${SANDBOXED_SH_CLAUDECODE_VERSION:-@CLAUDE_VERSION@}"
+CODEX_VERSION="@CODEX_PIN@"
+GEMINI_VERSION="@GEMINI_PIN@"
+OPENCODE_VERSION="@OPENCODE_PIN@"
 
 # Detect package manager: prefer bun, fallback to npm
 if command -v bun >/dev/null 2>&1; then
@@ -3462,49 +3569,96 @@ elif command -v npm >/dev/null 2>&1; then
   PKG_MGR="npm"
 else
   PKG_MGR=""
-  echo "[sandboxed] No package manager (bun/npm) found; skipping harness install"
+  echo "[sandboxed] No package manager (bun/npm) found; skipping npm-based harness installs"
 fi
 
-if [ -n "$PKG_MGR" ]; then
-  # --- Patched: claude-code via npm to dodge bun ELF wrapping bug.
-  #     bun global-install of @anthropic-ai/claude-code points the
-  #     `claude` exec at the precompiled ELF inside the platform sub-package
-  #     and bun then tries to interpret it as JavaScript at runtime
-  #     (`error: Unexpected at .../claude:1:1`). npm wraps platform packages
-  #     correctly, so use npm for claude even when bun is preferred elsewhere.
-  CLAUDE_PKG_MGR="$PKG_MGR"
-  if [ "$PKG_MGR" = "bun" ] && command -v npm >/dev/null 2>&1; then
-    CLAUDE_PKG_MGR="npm"
+# --- Patched: native-binary CLIs (claude, codex) via npm to dodge the bun ELF
+#     wrapping bug. bun global-install points the exec at the precompiled ELF
+#     inside the platform sub-package and then tries to interpret it as
+#     JavaScript at runtime (`error: Unexpected at .../claude:1:1`). npm wraps
+#     platform packages correctly, so prefer npm for those even when bun is
+#     the general package manager.
+NATIVE_PKG_MGR="$PKG_MGR"
+if [ "$PKG_MGR" = "bun" ] && command -v npm >/dev/null 2>&1; then
+  NATIVE_PKG_MGR="npm"
+fi
+
+# Print the first semantic version token from a CLI's version banner. Comparing
+# this token exactly prevents a pin such as 0.4 from matching 0.48.0.
+installed_version() {
+  "$1" --version 2>/dev/null \
+    | head -n1 \
+    | grep -Eo '[0-9]+(\.[0-9]+){1,3}([+-][0-9A-Za-z.-]+)?' \
+    | head -n1
+}
+
+# needs_install <cli> <pin>: CLI missing, or version drifted off a non-empty pin.
+needs_install() {
+  ni_cli="$1"
+  ni_pin="$2"
+  if ! command -v "$ni_cli" >/dev/null 2>&1; then
+    return 0
   fi
-  if [ "{install_claudecode}" = "true" ] && [ "$claude_needs_install" = "true" ]; then
-    echo "[sandboxed] Installing Claude Code $CLAUDE_CODE_VERSION via $CLAUDE_PKG_MGR..."
-    if ! $CLAUDE_PKG_MGR install -g @anthropic-ai/claude-code@"$CLAUDE_CODE_VERSION"; then
-      echo "[sandboxed] Claude Code install failed"
+  if [ -n "$ni_pin" ]; then
+    ni_expected="${ni_pin#v}"
+    ni_installed="$(installed_version "$ni_cli" || true)"
+    if [ "$ni_installed" != "$ni_expected" ]; then
+      echo "[sandboxed] $ni_cli version $ni_installed drifted off pin $ni_pin; reinstalling"
+      return 0
     fi
   fi
-  if [ "{install_opencode}" = "true" ] && ! command -v opencode >/dev/null 2>&1; then
-    if command -v curl >/dev/null 2>&1; then
-      echo "[sandboxed] Installing opencode..."
-      if curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path; then
-        if [ -x \"$HOME/.opencode/bin/opencode\" ]; then
-          if command -v install >/dev/null 2>&1; then
-            install -m 0755 \"$HOME/.opencode/bin/opencode\" /usr/local/bin/opencode || true
-          else
-            cp \"$HOME/.opencode/bin/opencode\" /usr/local/bin/opencode && chmod 755 /usr/local/bin/opencode || true
-          fi
-        fi
-      else
-        echo "[sandboxed] OpenCode CLI install failed"
+  return 1
+}
+
+if [ "@INSTALL_CLAUDECODE@" = "true" ] && [ -n "$NATIVE_PKG_MGR" ] && needs_install claude "$CLAUDE_CODE_VERSION"; then
+  echo "[sandboxed] Installing Claude Code $CLAUDE_CODE_VERSION via $NATIVE_PKG_MGR..."
+  if ! $NATIVE_PKG_MGR install -g @anthropic-ai/claude-code@"$CLAUDE_CODE_VERSION"; then
+    echo "[sandboxed] Claude Code install failed"
+  fi
+fi
+
+if [ "@INSTALL_CODEX@" = "true" ] && [ -n "$NATIVE_PKG_MGR" ] && needs_install codex "$CODEX_VERSION"; then
+  echo "[sandboxed] Installing Codex ${CODEX_VERSION:-latest} via $NATIVE_PKG_MGR..."
+  if ! $NATIVE_PKG_MGR install -g @openai/codex@"${CODEX_VERSION:-latest}"; then
+    echo "[sandboxed] Codex install failed"
+  fi
+fi
+
+if [ "@INSTALL_GEMINI@" = "true" ] && [ -n "$PKG_MGR" ] && needs_install gemini "$GEMINI_VERSION"; then
+  echo "[sandboxed] Installing Gemini CLI ${GEMINI_VERSION:-latest} via $PKG_MGR..."
+  if ! $PKG_MGR install -g @google/gemini-cli@"${GEMINI_VERSION:-latest}"; then
+    echo "[sandboxed] Gemini CLI install failed"
+  fi
+fi
+
+if [ "@INSTALL_OPENCODE@" = "true" ] && needs_install opencode "$OPENCODE_VERSION"; then
+  if command -v curl >/dev/null 2>&1; then
+    echo "[sandboxed] Installing opencode ${OPENCODE_VERSION:-latest}..."
+    opencode_install_ok=no
+    if [ -n "$OPENCODE_VERSION" ]; then
+      if curl -fsSL https://opencode.ai/install | VERSION="$OPENCODE_VERSION" bash -s -- --no-modify-path; then
+        opencode_install_ok=yes
       fi
     else
-      echo "[sandboxed] curl not found; skipping opencode install"
+      if curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path; then
+        opencode_install_ok=yes
+      fi
     fi
+    if [ "$opencode_install_ok" = "yes" ]; then
+      if [ -x "$HOME/.opencode/bin/opencode" ]; then
+        install -m 0755 "$HOME/.opencode/bin/opencode" /usr/local/bin/opencode || true
+      fi
+    else
+      echo "[sandboxed] OpenCode CLI install failed"
+    fi
+  else
+    echo "[sandboxed] curl not found; skipping opencode install"
   fi
 fi
 
-if [ "{install_grok}" = "true" ] && ! command -v grok >/dev/null 2>&1; then
+if [ "@INSTALL_GROK@" = "true" ] && needs_install grok ""; then
   if command -v curl >/dev/null 2>&1; then
-    echo "[sandboxed] Installing Grok Build..."
+    echo "[sandboxed] Installing Grok Build (installer fetches latest)..."
     if ! curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash; then
       echo "[sandboxed] Grok Build CLI install failed"
     fi
@@ -3514,9 +3668,9 @@ if [ "{install_grok}" = "true" ] && ! command -v grok >/dev/null 2>&1; then
 fi
 
 echo "[sandboxed] Harness bootstrap done"
-"#
-    );
+"#;
 
+async fn run_harness_bootstrap_script(workspace: &Workspace, script: String) -> anyhow::Result<()> {
     let script_path = workspace.path.join("sandboxed-bootstrap.sh");
     tokio::fs::write(&script_path, script).await?;
 
@@ -3563,6 +3717,82 @@ echo "[sandboxed] Harness bootstrap done"
     }
 
     Ok(())
+}
+
+/// Marker prefix for harness-version probe output lines.
+const HARNESS_VERSION_LINE_PREFIX: &str = "sandboxed-harness-version:";
+
+/// Shell snippet that prints one `sandboxed-harness-version:<cli>=<version>`
+/// line per installed harness CLI. Missing CLIs print nothing.
+const HARNESS_VERSION_PROBE_SCRIPT: &str = r#"
+export PATH="/root/.bun/bin:/root/.cache/.bun/bin:/usr/local/bin:$PATH"
+for cli in claude codex opencode gemini grok; do
+  if command -v "$cli" >/dev/null 2>&1; then
+    v="$(timeout --signal=KILL 10s "$cli" --version 2>/dev/null | head -n1 | tr -d '\r')"
+    printf 'sandboxed-harness-version:%s=%s\n' "$cli" "$v"
+  fi
+done
+"#;
+
+/// Parse `sandboxed-harness-version:<cli>=<version>` lines from probe output.
+fn parse_harness_version_output(stdout: &str) -> std::collections::BTreeMap<String, String> {
+    let mut versions = std::collections::BTreeMap::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.trim().strip_prefix(HARNESS_VERSION_LINE_PREFIX) {
+            if let Some((cli, version)) = rest.split_once('=') {
+                let version = version.trim();
+                if !version.is_empty() {
+                    versions.insert(cli.trim().to_string(), version.to_string());
+                }
+            }
+        }
+    }
+    versions
+}
+
+/// Probe which harness CLIs (and versions) exist inside a container
+/// workspace. Returns None for workspaces where the probe does not apply
+/// (host workspaces, container fallback without nspawn).
+pub async fn probe_workspace_harness_versions(
+    workspace: &Workspace,
+) -> anyhow::Result<Option<HarnessVersions>> {
+    if workspace.workspace_type != WorkspaceType::Container || !use_nspawn_for_workspace(workspace)
+    {
+        return Ok(None);
+    }
+
+    let shell = if workspace.path.join("bin/bash").exists() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+    let config = nspawn::NspawnConfig {
+        env: workspace.env_vars.clone(),
+        ..Default::default()
+    };
+    let command = vec![
+        shell.to_string(),
+        "-c".to_string(),
+        HARNESS_VERSION_PROBE_SCRIPT.to_string(),
+    ];
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        nspawn::execute_in_container(&workspace.path, &command, &config),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("harness version probe timed out after 60 seconds"))??;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "harness version probe failed: {}",
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(Some(HarnessVersions {
+        probed_at: Utc::now(),
+        versions: parse_harness_version_output(&stdout),
+    }))
 }
 
 async fn run_workspace_init_script(
@@ -3794,6 +4024,95 @@ pub async fn read_sandboxed_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn all_bootstrap_flags() -> HarnessBootstrapFlags {
+        HarnessBootstrapFlags {
+            claudecode: true,
+            codex: true,
+            gemini: true,
+            opencode: true,
+            grok: true,
+        }
+    }
+
+    #[test]
+    fn bootstrap_script_injects_pins_and_leaves_no_placeholders() {
+        let policy = crate::settings::HarnessVersionPolicy {
+            claude_code: Some("2.2.5".to_string()),
+            codex: Some("0.48.0".to_string()),
+            ..Default::default()
+        };
+        let script = render_harness_bootstrap_script(&policy, &all_bootstrap_flags());
+
+        // The env var can still override the settings pin at container level.
+        if std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION").is_err() {
+            assert!(script.contains("${SANDBOXED_SH_CLAUDECODE_VERSION:-2.2.5}"));
+        }
+        assert!(script.contains("CODEX_VERSION=\"0.48.0\""));
+        // Unpinned harnesses get an empty pin (= install latest when missing).
+        assert!(script.contains("GEMINI_VERSION=\"\""));
+        assert!(script.contains("@openai/codex@"));
+        assert!(script.contains("@google/gemini-cli@"));
+        assert!(script.contains("[ \"$ni_installed\" != \"$ni_expected\" ]"));
+        assert!(!script.contains("GROK_VERSION="));
+        assert!(script.contains("needs_install grok \"\""));
+        assert!(!script.contains("@INSTALL_"));
+        assert!(!script.contains("@CLAUDE_VERSION@"));
+        assert!(!script.contains("@CODEX_PIN@"));
+    }
+
+    #[test]
+    fn bootstrap_script_defaults_claude_pin_when_unpinned() {
+        if std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION").is_ok() {
+            return;
+        }
+        let script = render_harness_bootstrap_script(
+            &crate::settings::HarnessVersionPolicy::default(),
+            &all_bootstrap_flags(),
+        );
+        assert!(script.contains(crate::settings::DEFAULT_CLAUDE_CODE_VERSION));
+    }
+
+    #[test]
+    fn bootstrap_flags_disable_sections() {
+        let script = render_harness_bootstrap_script(
+            &crate::settings::HarnessVersionPolicy::default(),
+            &HarnessBootstrapFlags {
+                claudecode: true,
+                codex: false,
+                gemini: false,
+                opencode: true,
+                grok: true,
+            },
+        );
+        assert!(script.contains(
+            "[ \"true\" = \"true\" ] && [ -n \"$NATIVE_PKG_MGR\" ] && needs_install claude"
+        ));
+        assert!(script.contains(
+            "[ \"false\" = \"true\" ] && [ -n \"$NATIVE_PKG_MGR\" ] && needs_install codex"
+        ));
+    }
+
+    #[test]
+    fn harness_version_probe_output_parses() {
+        let stdout = "\
+noise line\n\
+sandboxed-harness-version:claude=2.1.139 (Claude Code)\n\
+sandboxed-harness-version:codex=codex-cli 0.48.0\n\
+sandboxed-harness-version:grok=\n";
+        let versions = parse_harness_version_output(stdout);
+        assert_eq!(
+            versions.get("claude").map(String::as_str),
+            Some("2.1.139 (Claude Code)")
+        );
+        assert_eq!(
+            versions.get("codex").map(String::as_str),
+            Some("codex-cli 0.48.0")
+        );
+        // Empty version (CLI present but --version failed) is omitted.
+        assert!(!versions.contains_key("grok"));
+        assert!(!versions.contains_key("noise"));
+    }
 
     #[test]
     fn verity_project_path_maps_to_container_checkout() {

@@ -19,6 +19,68 @@ static MAX_CONCURRENT_TASKS_CACHED: AtomicUsize = AtomicUsize::new(0);
 /// Default repo path for sandboxed.sh source (used for self-updates).
 pub const DEFAULT_SANDBOXED_REPO_PATH: &str = "/opt/sandboxed-sh/vaduz-v1";
 
+/// Fallback Claude Code version installed into container workspaces when no
+/// pin is configured (settings `harness_versions.claude_code` or the
+/// `SANDBOXED_SH_CLAUDECODE_VERSION` env var).
+pub const DEFAULT_CLAUDE_CODE_VERSION: &str = "2.1.139";
+
+/// Per-harness version pins for container workspace bootstrap.
+///
+/// `None` for a harness means "no pin": Claude Code falls back to
+/// [`DEFAULT_CLAUDE_CODE_VERSION`], the others install latest-if-missing.
+/// A pinned harness is reinstalled whenever `--version` stops matching the
+/// pin, so editing these (Settings UI / `PUT /api/settings`) takes effect on
+/// the next workspace build or rebuild without a redeploy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessVersionPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode: Option<String>,
+}
+
+impl HarnessVersionPolicy {
+    /// Effective Claude Code version: env override, then settings pin, then
+    /// the built-in default.
+    pub fn effective_claude_code(&self) -> String {
+        std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| self.claude_code.clone())
+            .unwrap_or_else(|| DEFAULT_CLAUDE_CODE_VERSION.to_string())
+    }
+}
+
+/// Globally cached harness version policy, refreshed whenever settings are
+/// loaded, updated, or reloaded. Lets code without a `SettingsStore` handle
+/// (e.g. the system component update checks) read the current pins.
+static HARNESS_VERSIONS_CACHED: std::sync::OnceLock<std::sync::RwLock<HarnessVersionPolicy>> =
+    std::sync::OnceLock::new();
+
+fn harness_versions_cell() -> &'static std::sync::RwLock<HarnessVersionPolicy> {
+    HARNESS_VERSIONS_CACHED.get_or_init(|| std::sync::RwLock::new(HarnessVersionPolicy::default()))
+}
+
+/// Current harness version policy from the global cache.
+pub fn harness_versions_cached() -> HarnessVersionPolicy {
+    harness_versions_cell()
+        .read()
+        .map(|p| p.clone())
+        .unwrap_or_default()
+}
+
+/// Refresh the global harness version cache.
+pub fn set_harness_versions_cached(policy: Option<&HarnessVersionPolicy>) {
+    if let Ok(mut cell) = harness_versions_cell().write() {
+        *cell = policy.cloned().unwrap_or_default();
+    }
+}
+
 /// Authentication settings managed via the dashboard.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthSettings {
@@ -79,6 +141,10 @@ pub struct Settings {
     /// None or non-routable the auto provider ladder picks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_model: Option<String>,
+    /// Version pins for harness CLIs installed into container workspaces.
+    /// When None, every harness uses its built-in default behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_versions: Option<HarnessVersionPolicy>,
 }
 
 /// In-memory store for global settings with disk persistence.
@@ -119,6 +185,8 @@ impl SettingsStore {
             Self::defaults_from_env()
         };
 
+        set_harness_versions_cached(settings.harness_versions.as_ref());
+
         Self {
             settings: RwLock::new(settings),
             storage_path,
@@ -153,7 +221,18 @@ impl SettingsStore {
             auto_cleanup_orphans_enabled: None,
             ask_assistant_model: std::env::var("ASK_ASSISTANT_MODEL").ok(),
             metadata_model: None,
+            harness_versions: None,
         }
+    }
+
+    /// Effective harness version policy (empty policy when unset).
+    pub async fn get_harness_versions(&self) -> HarnessVersionPolicy {
+        self.settings
+            .read()
+            .await
+            .harness_versions
+            .clone()
+            .unwrap_or_default()
     }
 
     /// Get the auto-cleanup enabled state.
@@ -269,6 +348,7 @@ impl SettingsStore {
 
     /// Update multiple settings at once.
     pub async fn update(&self, new_settings: Settings) -> Result<(), std::io::Error> {
+        set_harness_versions_cached(new_settings.harness_versions.as_ref());
         let mut settings = self.settings.write().await;
         *settings = new_settings;
         drop(settings);
@@ -291,6 +371,7 @@ impl SettingsStore {
             if let Some(limit) = settings.max_concurrent_tasks {
                 set_max_concurrent_tasks_cached(limit);
             }
+            set_harness_versions_cached(settings.harness_versions.as_ref());
             tracing::info!("Reloaded settings from {}", self.storage_path.display());
         }
         Ok(())
@@ -372,4 +453,49 @@ pub fn max_concurrent_tasks_cached_or(default: usize) -> usize {
 /// Values less than 1 are normalized to 1.
 pub fn set_max_concurrent_tasks_cached(max_concurrent_tasks: usize) {
     MAX_CONCURRENT_TASKS_CACHED.store(max_concurrent_tasks.max(1), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harness_version_policy_roundtrips_and_defaults() {
+        // Old settings files without the field still deserialize.
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.harness_versions.is_none());
+
+        let policy = HarnessVersionPolicy {
+            claude_code: Some("2.2.0".to_string()),
+            codex: Some("0.48.0".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: HarnessVersionPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, policy);
+        // Unpinned harnesses are omitted from the serialized form.
+        assert!(!json.contains("gemini"));
+        // Grok's upstream installer only installs latest, so an old pin is
+        // ignored instead of being exposed as an enforceable setting.
+        let legacy: HarnessVersionPolicy = serde_json::from_str(r#"{"grok":"1.2.3"}"#).unwrap();
+        assert_eq!(legacy, HarnessVersionPolicy::default());
+    }
+
+    #[test]
+    fn effective_claude_code_prefers_pin_over_default() {
+        let unpinned = HarnessVersionPolicy::default();
+        // Env var may leak from the host environment; only assert the
+        // settings-pin path when it is unset.
+        if std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION").is_err() {
+            assert_eq!(
+                unpinned.effective_claude_code(),
+                DEFAULT_CLAUDE_CODE_VERSION
+            );
+            let pinned = HarnessVersionPolicy {
+                claude_code: Some("9.9.9".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(pinned.effective_claude_code(), "9.9.9");
+        }
+    }
 }

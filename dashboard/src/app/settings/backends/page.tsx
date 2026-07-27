@@ -648,6 +648,11 @@ export default function BackendsPage() {
                 />
                 <p className="mt-1.5 text-xs text-white/30">
                   Path to the Claude CLI executable. Leave blank to use default from PATH.
+                  {claudecodeBackendConfig?.cli_version && (
+                    <span className="ml-1 text-white/45">
+                      Detected: {claudecodeBackendConfig.cli_version}
+                    </span>
+                  )}
                 </p>
               </div>
               <div className="flex items-center gap-2 pt-1">
@@ -928,6 +933,11 @@ export default function BackendsPage() {
                 />
                 <p className="mt-1.5 text-xs text-white/30">
                   Grok opens a browser for X authentication on first launch. In headless environments, configure an xAI provider for Grok Build.
+                  {grokBackendConfig?.cli_version && (
+                    <span className="ml-1 text-white/45">
+                      Detected: {grokBackendConfig.cli_version}
+                    </span>
+                  )}
                 </p>
               </div>
               <div className="flex items-center gap-2 pt-1">
