@@ -2719,10 +2719,8 @@ async fn check_claude_code_update(current_version: Option<&str>) -> Option<Strin
 }
 
 fn desired_claude_code_version() -> String {
-    std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "2.1.139".to_string())
+    // Env override → settings pin (harness_versions.claude_code) → default.
+    crate::settings::harness_versions_cached().effective_claude_code()
 }
 
 /// Check if there's a newer version of Codex available.

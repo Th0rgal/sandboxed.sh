@@ -29,6 +29,15 @@ export interface Workspace {
   shared_network?: boolean | null;
   tailscale_mode?: TailscaleMode | null;
   config_profile?: string | null;
+  /** Harness CLI versions last probed inside this container workspace. */
+  harness_versions?: WorkspaceHarnessVersions | null;
+}
+
+/** Harness CLI versions detected inside a container workspace after build. */
+export interface WorkspaceHarnessVersions {
+  probed_at: string;
+  /** CLI name (`claude`, `codex`, `opencode`, `gemini`, `grok`) → version. */
+  versions: Record<string, string>;
 }
 
 export type ContainerDistro =

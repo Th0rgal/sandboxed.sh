@@ -146,6 +146,10 @@ pub struct BackendConfig {
     /// Whether the CLI for this backend is available on the system
     #[serde(default)]
     pub cli_available: bool,
+    /// First line of `<cli> --version` on the host (None = unavailable or
+    /// version probe failed). Cached for a few minutes server-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_version: Option<String>,
     /// Whether authentication for this backend is configured (None = not applicable / not checked)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_configured: Option<bool>,
@@ -166,6 +170,76 @@ fn check_cli_available(cli_name: &str) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+/// TTL for the host CLI version cache. Version probes spawn the CLI itself
+/// (`--version`), which can take ~1s for node-based harnesses, so results are
+/// reused across requests.
+const CLI_VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+type CliVersionCache =
+    tokio::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Option<String>)>>;
+
+fn cli_version_cache() -> &'static CliVersionCache {
+    static CACHE: std::sync::OnceLock<CliVersionCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// First line of `<cli> --version` on the host, cached for
+/// [`CLI_VERSION_CACHE_TTL`]. Returns None when the CLI is missing, errors,
+/// or takes longer than 10s.
+async fn probe_host_cli_version(cli: &str) -> Option<String> {
+    {
+        let cache = cli_version_cache().lock().await;
+        if let Some((probed_at, version)) = cache.get(cli) {
+            if probed_at.elapsed() < CLI_VERSION_CACHE_TTL {
+                return version.clone();
+            }
+        }
+    }
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(cli).arg("--version").output(),
+    )
+    .await;
+    let version = match result {
+        Ok(Ok(output)) if output.status.success() => {
+            parse_cli_version_output(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => None,
+    };
+
+    cli_version_cache().lock().await.insert(
+        cli.to_string(),
+        (std::time::Instant::now(), version.clone()),
+    );
+    version
+}
+
+/// Extract the version from `--version` output: first non-empty line, trimmed.
+fn parse_cli_version_output(raw: &str) -> Option<String> {
+    raw.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// Pick the CLI to version-probe: explicit `cli_path` override first,
+/// otherwise the first declared name that is actually available.
+fn version_probe_target(settings: &serde_json::Value, declared: &[&'static str]) -> Option<String> {
+    if let Some(custom) = settings
+        .get("cli_path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(custom.to_string());
+    }
+    declared
+        .iter()
+        .find(|name| check_cli_available(name))
+        .map(|name| name.to_string())
 }
 
 /// Probe a backend's declared CLI names — true if any are on PATH.
@@ -229,6 +303,14 @@ pub async fn get_backend_config(
     } else {
         probe_backend_cli(&settings, cli_names)
     };
+    let cli_version = if cli_available && !cli_names.is_empty() {
+        match version_probe_target(&settings, cli_names) {
+            Some(cli) => probe_host_cli_version(&cli).await,
+            None => None,
+        }
+    } else {
+        None
+    };
 
     Ok(Json(BackendConfig {
         id: backend.id().to_string(),
@@ -236,6 +318,7 @@ pub async fn get_backend_config(
         enabled: config_entry.enabled,
         settings,
         cli_available,
+        cli_version,
         auth_configured,
     }))
 }
@@ -852,5 +935,39 @@ mod quota_tests {
         let n = normalizer_for("some-unknown-provider")(&snap);
         assert_eq!(n.window_kind, "requests");
         assert_eq!(n.used, Some(60));
+    }
+}
+
+#[cfg(test)]
+mod cli_version_tests {
+    use super::*;
+
+    #[test]
+    fn parse_cli_version_output_takes_first_nonempty_line() {
+        assert_eq!(
+            parse_cli_version_output("2.1.139 (Claude Code)\nextra\n"),
+            Some("2.1.139 (Claude Code)".to_string())
+        );
+        assert_eq!(
+            parse_cli_version_output("\n  codex-cli 0.48.0  \n"),
+            Some("codex-cli 0.48.0".to_string())
+        );
+        assert_eq!(parse_cli_version_output("\n \n"), None);
+    }
+
+    #[test]
+    fn version_probe_target_prefers_cli_path_override() {
+        let settings = serde_json::json!({"cli_path": "/opt/custom/claude"});
+        assert_eq!(
+            version_probe_target(&settings, &["claude"]),
+            Some("/opt/custom/claude".to_string())
+        );
+        // Blank override falls through to declared names (availability-gated,
+        // so a nonexistent declared CLI yields None).
+        let settings = serde_json::json!({"cli_path": "  "});
+        assert_eq!(
+            version_probe_target(&settings, &["definitely-not-a-real-cli-xyz"]),
+            None
+        );
     }
 }

@@ -3244,6 +3244,8 @@ export interface BackendConfig {
   settings: Record<string, unknown>;
   /** Whether the CLI for this backend is available on the system */
   cli_available?: boolean;
+  /** First line of `<cli> --version` on the host, when detected */
+  cli_version?: string;
   /** Whether authentication for this backend is configured (omitted when not applicable) */
   auth_configured?: boolean;
 }

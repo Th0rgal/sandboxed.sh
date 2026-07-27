@@ -162,6 +162,9 @@ pub struct WorkspaceResponse {
     pub config_profile: Option<String>,
     pub config: serde_json::Value,
     pub compute_policy: workspace::ComputePolicy,
+    /// Harness CLI versions last probed inside this container workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness_versions: Option<workspace::HarnessVersions>,
 }
 
 impl From<Workspace> for WorkspaceResponse {
@@ -189,6 +192,7 @@ impl From<Workspace> for WorkspaceResponse {
             config_profile: w.config_profile,
             config: w.config,
             compute_policy,
+            harness_versions: w.harness_versions,
         }
     }
 }
@@ -209,6 +213,9 @@ async fn merge_build_result(store: &workspace::WorkspaceStore, built: Workspace)
         latest.status = built.status;
         latest.error_message = built.error_message;
         latest.distro = built.distro;
+        if built.harness_versions.is_some() {
+            latest.harness_versions = built.harness_versions;
+        }
         store.update(latest).await;
     } else {
         store.update(built).await;
@@ -524,6 +531,7 @@ async fn create_workspace(
             mcps_replace_defaults,
             config_profile: config_profile.clone(),
             resolved_git_credentials: None,
+            harness_versions: None,
         },
         WorkspaceType::Container => {
             let mut ws = Workspace::new_container(req.name, path);
@@ -586,6 +594,7 @@ async fn create_workspace(
         let mut workspace_for_build = workspace.clone();
         // Get library for init script assembly
         let library = clone_library(&state.library).await;
+        let harness_policy = state.settings.get_harness_versions().await;
 
         tokio::spawn(async move {
             let result = crate::workspace::build_container_workspace(
@@ -594,6 +603,7 @@ async fn create_workspace(
                 false, // don't force rebuild
                 &working_dir,
                 library.as_deref(),
+                &harness_policy,
             )
             .await;
 
@@ -1190,6 +1200,7 @@ async fn build_workspace(
     let workspaces_store = Arc::clone(&state.workspaces);
     let working_dir = state.config.working_dir.clone();
     let mut workspace_for_build = workspace.clone();
+    let harness_policy = state.settings.get_harness_versions().await;
 
     tokio::spawn(async move {
         let result = crate::workspace::build_container_workspace(
@@ -1198,6 +1209,7 @@ async fn build_workspace(
             force_rebuild,
             &working_dir,
             library.as_deref(),
+            &harness_policy,
         )
         .await;
 
