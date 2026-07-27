@@ -223,8 +223,11 @@ class PolicyLintMutationTest(unittest.TestCase):
     def test_skill_must_declare_matching_policy_version(self):
         skill = self.root / SKILL_DOC
         skill.write_text(
-            skill.read_text(encoding="utf-8").replace(
-                "policy_version: 1.1.0", "policy_version: 0.9.0"
+            re.sub(
+                r"policy_version: [^\n]+",
+                "policy_version: 0.9.0",
+                skill.read_text(encoding="utf-8"),
+                count=1,
             ),
             encoding="utf-8",
         )
@@ -233,7 +236,7 @@ class PolicyLintMutationTest(unittest.TestCase):
     def test_skill_without_version_fails(self):
         skill = self.root / SKILL_DOC
         content = skill.read_text(encoding="utf-8")
-        content = content.replace("version: 1.1.0\n", "", 1)
+        content = re.sub(r"^version: [^\n]+\n", "", content, count=1, flags=re.MULTILINE)
         skill.write_text(content, encoding="utf-8")
         self.assert_error("missing frontmatter 'version:'")
 
