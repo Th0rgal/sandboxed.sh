@@ -10,6 +10,7 @@ from scripts.chatgpt_ui_driver import (
     STOP_BUTTON_NAME,
     STOP_CONTROL_TESTIDS,
     RateLimited,
+    RATE_LIMIT_MODAL_TESTID,
     choose_intelligence_model,
     click_send_control,
     close_context_quietly,
@@ -158,6 +159,8 @@ class FakeComposerPage:
         self.selectors.append(selector)
         if selector == "form":
             return self.form
+        if selector == f'[data-testid="{RATE_LIMIT_MODAL_TESTID}"]:visible':
+            return self.Dialog(self.rate_limited)
         if selector == '[role="dialog"], [aria-modal="true"]':
             return self.Dialog(self.rate_limited)
         return self.testid_control
@@ -211,6 +214,8 @@ class HydratingConversationPage:
         self.url = url
 
     def locator(self, selector):
+        if selector == f'[data-testid="{RATE_LIMIT_MODAL_TESTID}"]:visible':
+            return HydratingLocator([0])
         if selector == '[data-message-author-role="user"]':
             return self.user_messages
         if selector == '[data-message-author-role="assistant"]':
@@ -241,6 +246,16 @@ class ChatGptUiDriverTests(unittest.TestCase):
 
         with self.assertRaises(RateLimited):
             asyncio.run(raise_if_rate_limited(page))
+
+    def test_rate_limit_modal_testid_is_classified_before_picker_clicks(self) -> None:
+        page = FakeComposerPage(False, False, rate_limited=True)
+
+        with self.assertRaises(RateLimited):
+            asyncio.run(raise_if_rate_limited(page))
+
+        self.assertIn(
+            f'[data-testid="{RATE_LIMIT_MODAL_TESTID}"]:visible', page.selectors
+        )
 
     def test_cleanup_preserves_existing_protocol_result(self) -> None:
         asyncio.run(close_context_quietly(ClosedContext()))

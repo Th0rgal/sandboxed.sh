@@ -52,6 +52,7 @@ class RateLimited(Exception):
 
 
 RATE_LIMIT_HEADING = "Too many requests"
+RATE_LIMIT_MODAL_TESTID = "modal-conversation-history-rate-limit"
 # Opaque conversation route: `/c/<id>`. This is the only page-derived value the
 # durability protocol ever emits — never titles, prompts, or response text.
 CONVERSATION_PATH_RE = re.compile(r"^/c/[A-Za-z0-9-]{8,64}$")
@@ -146,6 +147,21 @@ async def raise_if_rate_limited(page) -> None:
     Keep this exact and narrow: arbitrary page text is private conversation
     data and must neither be logged nor used for fuzzy classification.
     """
+    # Current ChatGPT renders the account-wide limit as a modal whose overlay
+    # blocks every composer click. Its stable test id is stronger evidence
+    # than copy text and lets us classify the limit even while the modal body
+    # is still hydrating or its wording is being A/B tested.
+    modal = page.locator(
+        f'[data-testid="{RATE_LIMIT_MODAL_TESTID}"]:visible'
+    ).first
+    try:
+        if await modal.count() and await modal.is_visible():
+            raise RateLimited()
+    except RateLimited:
+        raise
+    except Exception:
+        pass
+
     heading = page.get_by_role(
         "heading", name=RATE_LIMIT_HEADING, exact=True
     ).first
@@ -255,6 +271,7 @@ async def choose_intelligence_model(page, label: str) -> bool:
             return True
         except Exception:
             continue
+    await raise_if_rate_limited(page)
     emit("diagnostic", message="stage=composer_model_option_unavailable")
     return False
 
@@ -283,6 +300,7 @@ async def choose_model(page, requested: str) -> str:
         except Exception:
             continue
     else:
+        await raise_if_rate_limited(page)
         raise RuntimeError("model picker not found")
     # Keep the lookup inside the picker overlay. A global text lookup could
     # click a same-named private conversation in the sidebar.
@@ -300,6 +318,7 @@ async def choose_model(page, requested: str) -> str:
                 return canonical_model
         except Exception:
             continue
+    await raise_if_rate_limited(page)
     raise RuntimeError("requested model is not visibly available in the model picker")
 
 
