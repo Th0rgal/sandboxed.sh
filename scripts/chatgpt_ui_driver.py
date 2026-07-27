@@ -154,6 +154,17 @@ async def raise_if_rate_limited(page) -> None:
         raise
     except Exception:
         # A missing/transient locator is not rate-limit evidence.
+        pass
+    # Some ChatGPT rollouts render the warning inside a portal whose heading
+    # is not exposed as an exact text locator. Check only the two stable,
+    # non-conversation phrases in memory; never log or emit the page body.
+    try:
+        body_text = await page.locator("body").inner_text(timeout=2_000)
+        if RATE_LIMIT_HEADING in body_text and "temporarily limited access" in body_text:
+            raise RateLimited()
+    except RateLimited:
+        raise
+    except Exception:
         return
 
 
@@ -185,14 +196,11 @@ async def click_send_control(page) -> bool:
             if click_failures >= 2:
                 break
             await page.wait_for_timeout(1_000)
-    try:
-        await raise_if_rate_limited(page)
-        response = await page.request.get(CHATGPT_URL, timeout=10_000)
-        network_reachable = response.status > 0
-    except Exception:
-        network_reachable = False
-    if not network_reachable:
-        raise TransportUnavailable("ChatGPT is unreachable through the browser proxy")
+    await raise_if_rate_limited(page)
+    # Reaching this point means the authenticated ChatGPT shell and composer
+    # were already hydrated. A separate APIRequest probe does not share the
+    # persistent browser context reliably and used to misclassify a disabled
+    # send control as a proxy outage, triggering a harmful automatic retry.
     raise RuntimeError("composer send control is not actionable")
 
 

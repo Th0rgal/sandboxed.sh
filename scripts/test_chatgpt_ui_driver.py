@@ -10,7 +10,6 @@ from scripts.chatgpt_ui_driver import (
     STOP_BUTTON_NAME,
     STOP_CONTROL_TESTIDS,
     RateLimited,
-    TransportUnavailable,
     choose_intelligence_model,
     click_send_control,
     close_context_quietly,
@@ -120,6 +119,15 @@ class FakeComposerForm:
 
 
 class FakeComposerPage:
+    class Body:
+        def __init__(self, rate_limited: bool) -> None:
+            self.rate_limited = rate_limited
+
+        async def inner_text(self, timeout) -> str:
+            if self.rate_limited:
+                return "Too many requests\nWe've temporarily limited access to your conversations"
+            return ""
+
     class Request:
         def __init__(self, reachable: bool) -> None:
             self.reachable = reachable
@@ -146,6 +154,8 @@ class FakeComposerPage:
         self.selectors.append(selector)
         if selector == "form":
             return self.form
+        if selector == "body":
+            return self.Body(self.rate_limited)
         return self.testid_control
 
     async def wait_for_timeout(self, _timeout) -> None:
@@ -326,7 +336,7 @@ class ChatGptUiDriverTests(unittest.TestCase):
             all(not click.get("force", False) for click in page.testid_control.clicks)
         )
 
-    def test_send_click_classifies_shared_proxy_outage_as_transport(self) -> None:
+    def test_send_click_does_not_misclassify_context_probe_as_transport(self) -> None:
         page = FakeComposerPage(
             testid_visible=True,
             fallback_visible=False,
@@ -334,7 +344,7 @@ class ChatGptUiDriverTests(unittest.TestCase):
         )
         page.testid_control = ClickableControl(failures=2)
 
-        with self.assertRaises(TransportUnavailable):
+        with self.assertRaisesRegex(RuntimeError, "not actionable"):
             asyncio.run(click_send_control(page))
 
     def test_download_links_are_limited_to_chatgpt_artifact_surfaces(self) -> None:
