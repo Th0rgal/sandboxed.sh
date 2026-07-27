@@ -1,6 +1,6 @@
 # ChatGPT UI pool operational policy
 
-Version: 1.0.0
+Version: 1.1.0
 
 This document is the human-readable form of the versioned operational policy
 for the `chatgpt_ui` backend pool. The machine-readable form lives beside it in
@@ -25,6 +25,9 @@ must read the live configuration rather than assuming a fixed slot count.
 Each slot is one dedicated browser profile guarded by a cross-process
 exclusive file lock. Acquisition prefers the first available slot with no
 recorded failure, preserving configured order among equivalent candidates.
+A deployment may configure more than four slots; practical concurrency is the
+number of independently usable, authenticated profiles, not an implementation
+limit. Never point two slots at the same profile directory.
 A compatibility-failed slot remains usable, but a clean alternative wins the
 next lease. Locked, quarantined, and unavailable slots are never reused; when
 none is healthy and available, the runtime waits until a slot recovers or the
@@ -39,6 +42,11 @@ runtime; policy additionally forbids intentionally queueing two lanes onto the
 same profile. A `chatgpt_ui` mission never owns repository writes, PRs, or
 coding-worker duties.
 
+Completed missions retain their ChatGPT conversation route. A later turn on
+the same mission reopens that exact conversation on its owning profile and
+adds the new prompt as a follow-up. If the route or profile can no longer be
+proved, the turn fails closed instead of silently starting a new discussion.
+
 ## 3. Compatibility failures: retry once, different healthy slot
 
 A failure carrying the `compatibility=chatgpt-ui-v2` diagnostic (the versioned
@@ -48,6 +56,14 @@ not showing auth or rate-limit signals). Never retry on the same slot — if the
 UI contract broke for that profile, an immediate identical attempt just burns
 allowance. If the retry also fails, escalate to the operator; the driver
 contract likely needs updating.
+
+Two distinct profiles reporting compatibility or `transport_unavailable`
+failures within 180 seconds are backend-wide evidence, not two independent
+unhealthy accounts. The runtime opens a five-minute backend circuit: new turns
+remain queued and emit a cooldown activity instead of consuming another
+profile. One later successful turn closes the circuit immediately. Capacity
+callbacks must treat an open circuit as unavailable capacity and must not
+redispatch into it.
 
 The runtime preference for a clean alternative supports this policy but does
 not authorize a retry by itself. The controller must confirm from live pool

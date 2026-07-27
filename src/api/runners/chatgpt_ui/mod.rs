@@ -67,6 +67,7 @@ enum DriverEvent {
     Error {
         code: Option<String>,
         message: String,
+        stage: Option<String>,
     },
 }
 
@@ -180,6 +181,9 @@ fn classify_driver_error(
             // every slot for one host-wide outage.
             None,
         ),
+        Some("transport_unavailable") => {
+            (TerminalReason::LlmError, FailureClass::TransportError, None)
+        }
         Some("compatibility") => (
             TerminalReason::LlmError,
             FailureClass::ProviderError,
@@ -211,7 +215,9 @@ fn safe_driver_diagnostic(message: &str) -> Option<&str> {
         | "stage=artifact_download_skipped"
         | "stage=conversation_ref_unavailable"
         | "stage=resume_route"
-        | "stage=resume_verified" => Some(message),
+        | "stage=resume_verified"
+        | "stage=continuation_route"
+        | "stage=continuation_verified" => Some(message),
         _ => None,
     }
 }
@@ -391,13 +397,16 @@ pub async fn run_chatgpt_ui_turn(
     let fingerprint = jobs::prompt_fingerprint(message, model);
     let _ = jobs::reconcile_jobs(app_working_dir);
     let mut prior_attempts = 0u32;
+    let mut continuation_record = None;
     let mut resume_record = match jobs::load_job(app_working_dir, mission_id) {
         Some(record) if jobs::resumable_job(&record, &fingerprint, chrono::Utc::now()) => {
             Some(record)
         }
         Some(record) => {
             prior_attempts = record.attempts;
-            if record.state == jobs::JobState::Submitted {
+            if jobs::continuable_conversation(&record) {
+                continuation_record = Some(record);
+            } else if record.state == jobs::JobState::Submitted {
                 // Same mission, different prompt: the old submission can no
                 // longer be reattached to this turn.
                 jobs::mark_abandoned(app_working_dir, mission_id, "superseded");
@@ -414,12 +423,14 @@ pub async fn run_chatgpt_ui_turn(
     };
 
     let attempt_resume = resume_record.take();
+    let attempt_continuation = continuation_record.take();
     // Conversations are account-scoped: a resume must reuse the profile
     // that submitted the prompt, or give up on the pointer entirely. The
     // pinned path locks the slot directly instead of going through the
     // pool scan — quarantine and retry-slot exclusions must not reroute a
     // reattach to an account that cannot see the conversation.
-    let acquisition = if let Some(record) = attempt_resume.as_ref() {
+    let pinned_record = attempt_resume.as_ref().or(attempt_continuation.as_ref());
+    let acquisition = if let Some(record) = pinned_record {
         match settings
             .profile_dirs
             .iter()
@@ -489,6 +500,7 @@ pub async fn run_chatgpt_ui_turn(
         profile_slot,
         &profile_dir,
         attempt_resume.as_ref(),
+        attempt_continuation.as_ref(),
     )
     .await
     {
@@ -587,6 +599,7 @@ async fn drive_once(
     profile_slot: usize,
     profile_dir: &Path,
     resume: Option<&jobs::JobRecord>,
+    continuation: Option<&jobs::JobRecord>,
 ) -> DriveOutcome {
     let mut command = Command::new(&settings.python_path);
     command
@@ -651,6 +664,16 @@ async fn drive_once(
         let _ = events_tx.send(AgentEvent::MissionActivity {
             label: "Reattaching to the in-flight ChatGPT conversation…".to_string(),
             tool_name: "chatgpt_ui_durability".to_string(),
+            mission_id: Some(mission_id),
+        });
+    }
+    if let Some(record) = continuation {
+        request["conversation"] = serde_json::json!({
+            "conversation_path": record.conversation_path,
+        });
+        let _ = events_tx.send(AgentEvent::MissionActivity {
+            label: "Continuing the mission's ChatGPT conversation…".to_string(),
+            tool_name: "chatgpt_ui_conversation".to_string(),
             mission_id: Some(mission_id),
         });
     }
@@ -819,16 +842,21 @@ async fn drive_once(
                             }
                         }
                     }
-                    DriverEvent::Error { code, message } => {
+                    DriverEvent::Error {
+                        code,
+                        message,
+                        stage,
+                    } => {
                         terminate_child_tree(&mut child).await;
                         let code_str = code.as_deref().unwrap_or("");
-                        if resume.is_some() {
+                        if resume.is_some() || continuation.is_some() {
                             // An unusable pointer is not proof that the prompt
                             // was never submitted. Preserve the durable record
                             // and fail closed instead of duplicating the work.
                             match code_str {
                                 "resume_not_found" => return DriveOutcome::ResumeUnresolved("resume_not_found"),
                                 "resume_mismatch" => return DriveOutcome::ResumeUnresolved("resume_mismatch"),
+                                "continuation_not_found" => return DriveOutcome::ResumeUnresolved("continuation_not_found"),
                                 _ => {}
                             }
                         }
@@ -836,6 +864,12 @@ async fn drive_once(
                             classify_driver_error(code.as_deref());
                         if let Some(kind) = slot_failure {
                             profile_pool::record_slot_failure(profile_dir, kind);
+                        }
+                        if code.as_deref() == Some("transport_unavailable") {
+                            profile_pool::record_backend_failure(
+                                profile_dir,
+                                profile_pool::BackendFailureKind::Transport,
+                            );
                         }
                         if submitted_recorded {
                             jobs::note_attempt_error(
@@ -846,7 +880,8 @@ async fn drive_once(
                         }
                         let message = if code.as_deref() == Some("compatibility") {
                             format!(
-                                "chatgpt_ui: compatibility=chatgpt-ui-v2; profile_slot={profile_slot}; {message}"
+                                "chatgpt_ui: compatibility=chatgpt-ui-v2; profile_slot={}; profile_index={profile_slot}; {message}",
+                                profile_slot + 1
                             )
                         } else {
                             format!("chatgpt_ui: {message}")
@@ -856,6 +891,7 @@ async fn drive_once(
                             .with_data(serde_json::json!({
                                 "provider_error_source": "chatgpt_ui_driver",
                                 "failure_class": failure_class,
+                                "driver_failure_stage": stage,
                                 "classification_source": "structured",
                             })));
                     }

@@ -9,8 +9,11 @@ from scripts.chatgpt_ui_driver import (
     SEND_CONTROL_TESTIDS,
     STOP_BUTTON_NAME,
     STOP_CONTROL_TESTIDS,
+    TransportUnavailable,
     choose_intelligence_model,
+    click_send_control,
     close_context_quietly,
+    continued_conversation_path,
     conversation_path_from_url,
     download_control_key,
     downloadable_href,
@@ -84,6 +87,19 @@ class FakeControl:
         return self.visible
 
 
+class ClickableControl(FakeControl):
+    def __init__(self, failures: int = 0) -> None:
+        super().__init__(True)
+        self.failures = failures
+        self.clicks = []
+
+    async def click(self, **kwargs) -> None:
+        self.clicks.append(kwargs)
+        if not kwargs.get("trial") and self.failures:
+            self.failures -= 1
+            raise TimeoutError("composer was replaced")
+
+
 class FakeComposerForm:
     def __init__(self, control: FakeControl) -> None:
         self.control = control
@@ -97,16 +113,31 @@ class FakeComposerForm:
 
 
 class FakeComposerPage:
-    def __init__(self, testid_visible: bool, fallback_visible: bool) -> None:
+    class Request:
+        def __init__(self, reachable: bool) -> None:
+            self.reachable = reachable
+
+        async def get(self, _url, timeout) -> object:
+            if not self.reachable:
+                raise TimeoutError("proxy unavailable")
+            return type("Response", (), {"status": 403})()
+
+    def __init__(
+        self, testid_visible: bool, fallback_visible: bool, network_reachable: bool = True
+    ) -> None:
         self.testid_control = FakeControl(testid_visible)
         self.form = FakeComposerForm(FakeControl(fallback_visible))
         self.selectors = []
+        self.request = self.Request(network_reachable)
 
     def locator(self, selector):
         self.selectors.append(selector)
         if selector == "form":
             return self.form
         return self.testid_control
+
+    async def wait_for_timeout(self, _timeout) -> None:
+        return None
 
 
 class ChatGptUiDriverTests(unittest.TestCase):
@@ -178,6 +209,41 @@ class ChatGptUiDriverTests(unittest.TestCase):
         self.assertIsNone(SEND_BUTTON_NAME.match("Sending options"))
         self.assertIsNotNone(STOP_BUTTON_NAME.match("Stop generating"))
         self.assertIsNone(STOP_BUTTON_NAME.match("Nonstop mode"))
+
+    def test_send_click_re_resolves_once_after_hydration_replacement(self) -> None:
+        page = FakeComposerPage(testid_visible=True, fallback_visible=False)
+        page.testid_control = ClickableControl(failures=1)
+
+        used_fallback = asyncio.run(click_send_control(page))
+
+        self.assertFalse(used_fallback)
+        self.assertEqual(len(page.testid_control.clicks), 4)
+        self.assertTrue(page.testid_control.clicks[0]["trial"])
+        self.assertTrue(page.testid_control.clicks[2]["trial"])
+        self.assertTrue(page.testid_control.clicks[-1]["no_wait_after"])
+
+    def test_send_click_never_forces_or_uses_keyboard_fallback(self) -> None:
+        page = FakeComposerPage(testid_visible=True, fallback_visible=False)
+        page.testid_control = ClickableControl(failures=2)
+
+        with self.assertRaisesRegex(RuntimeError, "not actionable"):
+            asyncio.run(click_send_control(page))
+
+        self.assertTrue(page.testid_control.clicks)
+        self.assertTrue(
+            all(not click.get("force", False) for click in page.testid_control.clicks)
+        )
+
+    def test_send_click_classifies_shared_proxy_outage_as_transport(self) -> None:
+        page = FakeComposerPage(
+            testid_visible=True,
+            fallback_visible=False,
+            network_reachable=False,
+        )
+        page.testid_control = ClickableControl(failures=2)
+
+        with self.assertRaises(TransportUnavailable):
+            asyncio.run(click_send_control(page))
 
     def test_download_links_are_limited_to_chatgpt_artifact_surfaces(self) -> None:
         self.assertTrue(downloadable_href("sandbox:/mnt/data/report.pdf"))
@@ -252,6 +318,10 @@ class ChatGptUiDriverTests(unittest.TestCase):
             resume_conversation_path(
                 {"conversation_path": "https://chatgpt.com/c/abc123def456"}
             )
+        )
+        self.assertEqual(
+            continued_conversation_path({"conversation_path": "/c/abc123def456"}),
+            "/c/abc123def456",
         )
 
     def test_prompt_identity_is_whitespace_insensitive_and_in_memory_only(

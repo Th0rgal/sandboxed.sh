@@ -67,7 +67,7 @@
     "retry": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["compatibility_failure", "auth_failure", "rate_limited", "browser_launch"],
+      "required": ["compatibility_failure", "backend_circuit", "auth_failure", "rate_limited", "browser_launch"],
       "properties": {
         "compatibility_failure": {
           "type": "object",
@@ -78,6 +78,17 @@
             "max_automatic_retries": { "const": 1 },
             "require_different_slot": { "const": true },
             "require_healthy_slot": { "const": true }
+          }
+        },
+        "backend_circuit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["transport_signal", "failure_window_secs", "distinct_slots", "cooldown_secs"],
+          "properties": {
+            "transport_signal": { "const": "transport_unavailable" },
+            "failure_window_secs": { "const": 180 },
+            "distinct_slots": { "const": 2 },
+            "cooldown_secs": { "const": 300 }
           }
         },
         "auth_failure": {

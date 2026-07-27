@@ -87,7 +87,10 @@ describe('BackendsPage ChatGPT UI settings', () => {
     mockedUpdateBackendConfig.mockClear();
     refreshBackendConfigs.mockClear();
     getChatgptUiProfilePoolMock.mockReset();
-    getChatgptUiProfilePoolMock.mockResolvedValue({ slots: [] });
+    getChatgptUiProfilePoolMock.mockResolvedValue({
+      slots: [],
+      backend_circuit: { open: false },
+    });
     getChatgptUiDurabilityMock.mockReset();
     getChatgptUiDurabilityMock.mockResolvedValue({ jobs: [] });
   });
@@ -149,6 +152,7 @@ describe('BackendsPage ChatGPT UI settings', () => {
 
   it('shows profile pool slot health once runtime paths are configured', async () => {
     getChatgptUiProfilePoolMock.mockResolvedValue({
+      backend_circuit: { open: true, retry_after_secs: 240, reason: 'transport' },
       slots: [
         {
           slot: 1,
@@ -184,6 +188,7 @@ describe('BackendsPage ChatGPT UI settings', () => {
     expect(screen.getByText('quarantined')).toBeVisible();
     expect(screen.getByText(/auth failure/)).toBeVisible();
     expect(screen.getByText(/retry in 29 min/)).toBeVisible();
+    expect(screen.getByTestId('chatgpt-ui-compatibility-circuit')).toHaveTextContent('probe in 4 min');
   });
 
   it('shows durable job health without exposing conversation data', async () => {

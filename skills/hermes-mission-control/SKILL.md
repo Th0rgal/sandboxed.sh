@@ -6,10 +6,10 @@ description: >
   to exhaust its budget instead of giving up, and send targeted hints. Trigger
   terms: mission, sandboxed.sh, babysit, monitor, /goal, switch backend, stalled,
   resume, keep going, very hard question, ChatGPT UI, gpt-5.6-pro.
-version: 1.0.0
+version: 1.1.0
 metadata:
   policy: chatgpt-ui-pool
-  policy_version: 1.0.0
+  policy_version: 1.1.0
 ---
 
 # Hermes Mission Control
@@ -144,7 +144,7 @@ When a model "isn't working," first prove it's the **model** and not the
 concluding the model is too weak. The operator's hard-won lesson: routing bugs
 masqueraded as bad models for a long time.
 
-## ChatGPT UI pool policy (policy_version 1.0.0)
+## ChatGPT UI pool policy (policy_version 1.1.0)
 
 Binding rules for every `chatgpt_ui` mission you start or manage. The
 authoritative versioned policy is `docs/policy/CHATGPT_UI_POOL_POLICY.md` in
@@ -154,7 +154,8 @@ this section must stay in sync with it.
 - **Live capacity.** Pool capacity is the number of configured
   `chatgpt_ui` profile slots (`profile_dirs`), each guarded by an exclusive
   cross-process lock. Read the live configuration; never assume a fixed slot
-  count, and never queue a duplicate mission against a locked slot. The pool
+  count (deployments may have well over four), and never queue a duplicate
+  mission against a locked slot. The pool
   prefers clean profiles and waits when every slot is locked, quarantined, or
   unavailable; it never fails open onto an unhealthy profile.
 - **Read-only Pro lanes.** Concurrent `gpt-5.6-pro` consultations are fine
@@ -165,6 +166,16 @@ this section must stay in sync with it.
   healthy slot (unlocked, no auth/rate-limit signals). Never the same slot;
   confirm that alternate slot from live pool telemetry before retrying. If the
   retry fails too, escalate to the operator.
+- **Backend-wide failure wave → stop dispatching.** Two distinct slots failing
+  compatibility or `transport_unavailable` within 3 minutes open a 5-minute
+  global circuit. New turns wait without leasing a profile. Treat the pool as
+  unavailable until the circuit closes; capacity callbacks must not
+  redispatch into it.
+- **Follow-ups preserve the discussion.** A later turn on a completed
+  `chatgpt_ui` mission continues the same ChatGPT conversation on its owning
+  profile. Resume or message the existing mission when the question depends on
+  prior context; create a new mission only for an independent lane. A missing
+  conversation route fails closed and must not be treated as a fresh success.
 - **Auth failure → never blind-retry.** `auth_required` is terminal for that
   mission and gets 0 automatic retries. The slot is quarantined for 30
   minutes; cooldown expiry permits a later explicit recovery attempt but does

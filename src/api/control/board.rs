@@ -92,8 +92,12 @@ enum AutomaticRetry {
 }
 
 fn chatgpt_ui_compatibility_profile_slot(output: &str) -> Option<usize> {
-    const MARKER: &str = "compatibility=chatgpt-ui-v2; profile_slot=";
-    let tail = output.split_once(MARKER)?.1;
+    const INDEX_MARKER: &str = "profile_index=";
+    const LEGACY_MARKER: &str = "compatibility=chatgpt-ui-v2; profile_slot=";
+    let tail = output
+        .split_once(INDEX_MARKER)
+        .or_else(|| output.split_once(LEGACY_MARKER))?
+        .1;
     let digits = tail
         .chars()
         .take_while(|character| character.is_ascii_digit())
@@ -2556,12 +2560,12 @@ mod tests {
         let task = mk("chatgpt-ui-policy", &[], BoardTaskStatus::Running, None);
         let mut task = task;
         task.backend = "chatgpt_ui".into();
-        let output = "chatgpt_ui: compatibility=chatgpt-ui-v2; profile_slot=3; selector mismatch";
+        let output = "chatgpt_ui: compatibility=chatgpt-ui-v2; profile_slot=3; profile_index=2; selector mismatch";
         assert_eq!(
             automatic_retry(&task, Some(TerminalReason::LlmError), output),
-            AutomaticRetry::DifferentChatGptUiProfile(3)
+            AutomaticRetry::DifferentChatGptUiProfile(2)
         );
-        assert_eq!(chatgpt_ui_compatibility_profile_slot(output), Some(3));
+        assert_eq!(chatgpt_ui_compatibility_profile_slot(output), Some(2));
     }
 
     #[test]

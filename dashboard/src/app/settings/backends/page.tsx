@@ -754,6 +754,17 @@ export default function BackendsPage() {
                   <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">
                     Profile pool status
                   </p>
+                  {chatgptUiPool!.backend_circuit?.open && (
+                    <div className="mt-3 rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200" data-testid="chatgpt-ui-compatibility-circuit">
+                      Backend cooldown active
+                      {chatgptUiPool!.backend_circuit.reason
+                        ? ` · ${chatgptUiPool!.backend_circuit.reason}`
+                        : ''}
+                      {typeof chatgptUiPool!.backend_circuit.retry_after_secs === 'number'
+                        ? ` · probe in ${Math.max(1, Math.ceil(chatgptUiPool!.backend_circuit.retry_after_secs / 60))} min`
+                        : ''}
+                    </div>
+                  )}
                   <ul className="mt-3 space-y-2">
                     {chatgptUiPool!.slots.map((slot) => (
                       <li key={slot.slot} className="flex flex-wrap items-center gap-2 text-xs">

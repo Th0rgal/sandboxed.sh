@@ -24,6 +24,9 @@ const AUTH_QUARANTINE: Duration = Duration::from_secs(30 * 60);
 const LAUNCH_QUARANTINE: Duration = Duration::from_secs(5 * 60);
 const COMPATIBILITY_QUARANTINE: Duration = Duration::from_secs(10 * 60);
 const COMPATIBILITY_QUARANTINE_THRESHOLD: u32 = 3;
+const GLOBAL_BACKEND_FAILURE_WINDOW: Duration = Duration::from_secs(3 * 60);
+const GLOBAL_BACKEND_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const GLOBAL_BACKEND_FAILURE_THRESHOLD: usize = 2;
 
 pub struct ProfileLock(File);
 
@@ -93,6 +96,87 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, SlotHealth>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Debug, Default)]
+struct BackendCircuit {
+    recent_slots: HashMap<PathBuf, (Instant, BackendFailureKind)>,
+    open_until: Option<Instant>,
+    reason: Option<BackendFailureKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendFailureKind {
+    Compatibility,
+    Transport,
+}
+
+fn backend_circuits() -> &'static Mutex<HashMap<PathBuf, BackendCircuit>> {
+    static CIRCUITS: OnceLock<Mutex<HashMap<PathBuf, BackendCircuit>>> = OnceLock::new();
+    CIRCUITS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn circuit_key(profile_dir: &Path) -> PathBuf {
+    profile_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .to_path_buf()
+}
+
+fn record_backend_failure_at(profile_dir: &Path, kind: BackendFailureKind, now: Instant) -> bool {
+    let mut circuits = backend_circuits()
+        .lock()
+        .expect("profile compatibility circuit poisoned");
+    let circuit = circuits.entry(circuit_key(profile_dir)).or_default();
+    circuit.recent_slots.retain(|_, (failure_at, _)| {
+        now.saturating_duration_since(*failure_at) <= GLOBAL_BACKEND_FAILURE_WINDOW
+    });
+    circuit
+        .recent_slots
+        .insert(profile_dir.to_path_buf(), (now, kind));
+    if circuit.recent_slots.len() < GLOBAL_BACKEND_FAILURE_THRESHOLD {
+        return false;
+    }
+    let until = now + GLOBAL_BACKEND_FAILURE_COOLDOWN;
+    circuit.open_until = Some(
+        circuit
+            .open_until
+            .map_or(until, |existing| existing.max(until)),
+    );
+    circuit.reason = Some(kind);
+    true
+}
+
+fn backend_circuit_remaining_at(profile_dir: &Path, now: Instant) -> Option<Duration> {
+    let key = circuit_key(profile_dir);
+    let mut circuits = backend_circuits()
+        .lock()
+        .expect("profile compatibility circuit poisoned");
+    let circuit = circuits.get_mut(&key)?;
+    let until = circuit.open_until?;
+    let Some(remaining) = until.checked_duration_since(now) else {
+        circuits.remove(&key);
+        return None;
+    };
+    Some(remaining)
+}
+
+fn clear_backend_circuit(profile_dir: &Path) {
+    backend_circuits()
+        .lock()
+        .expect("profile compatibility circuit poisoned")
+        .remove(&circuit_key(profile_dir));
+}
+
+pub fn record_backend_failure(profile_dir: &Path, kind: BackendFailureKind) {
+    if record_backend_failure_at(profile_dir, kind, Instant::now()) {
+        tracing::warn!(
+            failure_kind = ?kind,
+            cooldown_secs = GLOBAL_BACKEND_FAILURE_COOLDOWN.as_secs(),
+            "ChatGPT UI backend circuit opened after failures on distinct profile slots"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ProfileRetryRequirement {
     excluded_slot: usize,
@@ -158,6 +242,16 @@ fn record_slot_failure_at(profile_dir: &Path, kind: SlotFailureKind, now: Instan
                 .map_or(until, |existing| existing.max(until)),
         );
     }
+    drop(slots);
+    if kind == SlotFailureKind::Compatibility
+        && record_backend_failure_at(profile_dir, BackendFailureKind::Compatibility, now)
+    {
+        tracing::warn!(
+            failure_kind = ?BackendFailureKind::Compatibility,
+            cooldown_secs = GLOBAL_BACKEND_FAILURE_COOLDOWN.as_secs(),
+            "ChatGPT UI backend circuit opened after failures on distinct profile slots"
+        );
+    }
 }
 
 pub fn record_slot_failure(profile_dir: &Path, kind: SlotFailureKind) {
@@ -171,6 +265,11 @@ pub fn record_slot_failure(profile_dir: &Path, kind: SlotFailureKind) {
 pub fn record_slot_success(profile_dir: &Path) {
     let mut slots = registry().lock().expect("profile pool registry poisoned");
     slots.remove(profile_dir);
+    drop(slots);
+    // One completed turn is positive backend-wide evidence: the shared UI
+    // contract and transport are usable again, regardless of which profile
+    // observed the earlier compatibility wave.
+    clear_backend_circuit(profile_dir);
 }
 
 fn slot_health_at(profile_dir: &Path, now: Instant) -> SlotHealth {
@@ -198,6 +297,13 @@ pub(crate) fn reset_registry_for_tests(profile_dirs: &[PathBuf]) {
     for profile_dir in profile_dirs {
         slots.remove(profile_dir);
     }
+    drop(slots);
+    let mut circuits = backend_circuits()
+        .lock()
+        .expect("profile compatibility circuit poisoned");
+    for profile_dir in profile_dirs {
+        circuits.remove(&circuit_key(profile_dir));
+    }
 }
 
 pub async fn acquire_profile(
@@ -213,6 +319,42 @@ pub async fn acquire_profile(
     let mut announced_wait = false;
     loop {
         let now = Instant::now();
+        if let Some(remaining) = profile_dirs
+            .first()
+            .and_then(|profile| backend_circuit_remaining_at(profile, now))
+        {
+            if !announced_wait {
+                let _ = events_tx.send(AgentEvent::MissionActivity {
+                    label: format!(
+                        "Waiting for ChatGPT UI compatibility recovery (about {}s)…",
+                        remaining.as_secs().max(1)
+                    ),
+                    tool_name: "chatgpt_ui_backend_circuit".to_string(),
+                    mission_id: Some(mission_id),
+                });
+                announced_wait = true;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    let shutdown = crate::api::routes::is_shutdown_initiated();
+                    return Err(AgentResult::failure(
+                        if shutdown {
+                            "Server restart — paused while waiting for ChatGPT UI compatibility recovery."
+                        } else {
+                            "Mission cancelled while waiting for ChatGPT UI compatibility recovery"
+                        },
+                        0,
+                    )
+                    .with_terminal_reason(if shutdown {
+                        TerminalReason::ServerShutdown
+                    } else {
+                        TerminalReason::Cancelled
+                    }));
+                }
+                _ = tokio::time::sleep(remaining.min(Duration::from_secs(2))) => {}
+            }
+            continue;
+        }
         let mut candidates = profile_dirs.iter().enumerate().collect::<Vec<_>>();
         // A compatibility failure is not quarantined until it repeats, but a
         // clean alternative must still win the next lease. This lets a
@@ -304,6 +446,33 @@ pub struct ProfileSlotStatus {
     pub quarantine_remaining_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_failure: Option<SlotFailureKind>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendCircuitStatus {
+    pub open: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<BackendFailureKind>,
+}
+
+pub fn backend_circuit_status(profile_dirs: &[PathBuf]) -> BackendCircuitStatus {
+    let remaining = profile_dirs
+        .first()
+        .and_then(|profile| backend_circuit_remaining_at(profile, Instant::now()));
+    let reason = profile_dirs.first().and_then(|profile| {
+        backend_circuits()
+            .lock()
+            .expect("profile compatibility circuit poisoned")
+            .get(&circuit_key(profile))
+            .and_then(|circuit| circuit.reason)
+    });
+    BackendCircuitStatus {
+        open: remaining.is_some(),
+        retry_after_secs: remaining.map(|value| value.as_secs()),
+        reason,
+    }
 }
 
 pub fn pool_snapshot(profile_dirs: &[PathBuf]) -> Vec<ProfileSlotStatus> {
@@ -576,6 +745,60 @@ mod tests {
         assert_eq!(slot_health_at(&profile, now).consecutive_failures, 1);
 
         reset_registry_for_tests(&[profile]);
+    }
+
+    #[test]
+    fn distinct_profile_compatibility_wave_opens_backend_circuit() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("profile-1");
+        let second = root.path().join("profile-2");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let profiles = vec![first.clone(), second.clone()];
+        reset_registry_for_tests(&profiles);
+        let now = Instant::now();
+
+        record_slot_failure_at(&first, SlotFailureKind::Compatibility, now);
+        assert!(backend_circuit_remaining_at(&first, now).is_none());
+        record_slot_failure_at(&second, SlotFailureKind::Compatibility, now);
+
+        assert!(backend_circuit_remaining_at(&first, now).is_some());
+        reset_registry_for_tests(&profiles);
+    }
+
+    #[test]
+    fn repeated_failure_on_one_profile_does_not_claim_global_outage() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        reset_registry_for_tests(std::slice::from_ref(&profile));
+        let now = Instant::now();
+
+        record_slot_failure_at(&profile, SlotFailureKind::Compatibility, now);
+        record_slot_failure_at(&profile, SlotFailureKind::Compatibility, now);
+
+        assert!(backend_circuit_remaining_at(&profile, now).is_none());
+        reset_registry_for_tests(&[profile]);
+    }
+
+    #[test]
+    fn successful_turn_closes_backend_compatibility_circuit() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("profile-1");
+        let second = root.path().join("profile-2");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let profiles = vec![first.clone(), second.clone()];
+        reset_registry_for_tests(&profiles);
+        let now = Instant::now();
+        record_slot_failure_at(&first, SlotFailureKind::Compatibility, now);
+        record_slot_failure_at(&second, SlotFailureKind::Compatibility, now);
+        assert!(backend_circuit_remaining_at(&first, now).is_some());
+
+        record_slot_success(&first);
+
+        assert!(backend_circuit_remaining_at(&first, now).is_none());
+        reset_registry_for_tests(&profiles);
     }
 
     #[test]
