@@ -73,6 +73,7 @@ impl Default for AvailabilityStatus {
 struct Entry {
     status: AvailabilityStatus,
     state_path: PathBuf,
+    profile_dirs: Vec<PathBuf>,
     probe_claimed: bool,
 }
 
@@ -149,7 +150,8 @@ pub fn configure(profile_dirs: &[PathBuf], app_working_dir: &Path) {
     let mut entries = registry()
         .lock()
         .expect("ChatGPT UI availability registry poisoned");
-    if entries.contains_key(&key) {
+    if let Some(entry) = entries.get_mut(&key) {
+        entry.profile_dirs = profile_dirs.to_vec();
         return;
     }
     let status = std::fs::read(&path)
@@ -166,6 +168,7 @@ pub fn configure(profile_dirs: &[PathBuf], app_working_dir: &Path) {
     let mut entry = Entry {
         status,
         state_path: path,
+        profile_dirs: profile_dirs.to_vec(),
         // A process restart cannot inherit ownership of a prior probe.
         probe_claimed: false,
     };
@@ -200,17 +203,22 @@ pub fn is_configured(profile_dirs: &[PathBuf]) -> bool {
 }
 
 pub fn open_cooldown(profile_dir: &Path, reason: AvailabilityReason, cooldown: Duration) {
-    let key = profile_dir
-        .parent()
-        .unwrap_or_else(|| Path::new("/"))
-        .to_path_buf();
     let now = Utc::now();
     let retry_at = now
         + chrono::Duration::from_std(cooldown).unwrap_or_else(|_| chrono::Duration::minutes(10));
     let mut entries = registry()
         .lock()
         .expect("ChatGPT UI availability registry poisoned");
-    let Some(entry) = entries.get_mut(&key) else {
+    // A configured account pool may intentionally use profile directories
+    // from different parents. Resolve the owning pool from the complete
+    // configured membership instead of deriving an incompatible key from the
+    // failing slot alone.
+    let Some(entry) = entries.values_mut().find(|entry| {
+        entry
+            .profile_dirs
+            .iter()
+            .any(|profile| profile == profile_dir)
+    }) else {
         return;
     };
     let was_available = entry.status.state == AvailabilityState::Available;
@@ -404,6 +412,29 @@ mod tests {
 
         assert_eq!(status(&profiles).state, AvailabilityState::Probing);
         assert!(claim_probe(&profiles));
+        reset_for_tests(&profiles);
+    }
+
+    #[test]
+    fn failure_from_a_different_parent_opens_the_configured_pool() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("account-a/one");
+        let second = root.path().join("account-b/two");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let profiles = vec![first, second.clone()];
+        configure(&profiles, root.path());
+        mark_available(&profiles);
+
+        open_cooldown(
+            &second,
+            AvailabilityReason::RateLimited,
+            Duration::from_secs(600),
+        );
+
+        let snapshot = status(&profiles);
+        assert_eq!(snapshot.state, AvailabilityState::Cooldown);
+        assert_eq!(snapshot.reason, Some(AvailabilityReason::RateLimited));
         reset_for_tests(&profiles);
     }
 }

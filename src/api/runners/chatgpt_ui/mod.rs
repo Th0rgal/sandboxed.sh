@@ -624,9 +624,15 @@ pub async fn run_chatgpt_ui_turn(
         {
             Some(index) => {
                 let pinned = settings.profile_dirs[index].clone();
-                acquire_pinned_profile(&pinned, mission_id, &events_tx, &cancel)
-                    .await
-                    .map(|lock| (index, pinned, lock))
+                acquire_pinned_profile(
+                    &settings.profile_dirs,
+                    &pinned,
+                    mission_id,
+                    &events_tx,
+                    &cancel,
+                )
+                .await
+                .map(|lock| (index, pinned, lock))
             }
             None => {
                 jobs::note_attempt_error(app_working_dir, mission_id, "profile_unavailable");
@@ -640,6 +646,15 @@ pub async fn run_chatgpt_ui_turn(
         Ok(lease) => lease,
         Err(result) => return result,
     };
+    // Close the launch-pacing/acquisition window too. Holding the profile lock
+    // here prevents this turn from losing its lease while a newly opened
+    // account cooldown blocks it before browser launch.
+    if let Err(result) =
+        availability::wait_until_available(&settings.profile_dirs, mission_id, &events_tx, &cancel)
+            .await
+    {
+        return result;
+    }
     if settings.browser == "chromium" {
         let owned = chromium_cleanup::pool_owns_singletons(&profile_dir);
         let outcome = chromium_cleanup::cleanup_profile_singletons(&profile_dir, owned);
@@ -725,6 +740,7 @@ fn unresolved_resume_result(code: &str) -> AgentResult {
 /// health routing does not apply — either this slot frees up or the caller
 /// gives up via cancellation.
 async fn acquire_pinned_profile(
+    profile_dirs: &[PathBuf],
     profile_dir: &Path,
     mission_id: Uuid,
     events_tx: &broadcast::Sender<AgentEvent>,
@@ -732,8 +748,16 @@ async fn acquire_pinned_profile(
 ) -> Result<profile_pool::ProfileLock, AgentResult> {
     let mut announced_wait = false;
     loop {
+        availability::wait_until_available(profile_dirs, mission_id, events_tx, cancel).await?;
         match profile_pool::try_lock_profile(profile_dir) {
-            Ok(Some(lock)) => return Ok(lock),
+            Ok(Some(lock)) => {
+                if availability::status(profile_dirs).state
+                    == availability::AvailabilityState::Available
+                {
+                    return Ok(lock);
+                }
+                drop(lock);
+            }
             Ok(None) => {}
             Err(error) => {
                 // The record stays Submitted, so a later turn can still
