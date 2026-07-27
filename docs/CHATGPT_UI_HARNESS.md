@@ -68,7 +68,8 @@ Configure the backend through `PUT /api/backends/chatgpt_ui/config`:
     "proxy_server": "socks5://127.0.0.1:10880",
     "headless": false,
     "display": ":93",
-    "timeout_secs": 900,
+    "timeout_secs": 14400,
+    "launch_interval_secs": 30,
     "model": "gpt-5.6-pro"
   }
 }
@@ -85,6 +86,11 @@ configure `display` with a dedicated Xvfb display such as `:93`.
 Timeouts must be between 30–86400 seconds; values outside that accepted range
 are rejected before launch. A cross-process profile lock rejects concurrent use;
 configure a distinct dedicated profile for each concurrent mission.
+`launch_interval_secs` (default 30, accepted range 5–300) spaces new browser
+navigation/submission starts across the shared profile pool. It does not limit
+already-running Pro conversations. If ChatGPT renders its exact “Too many
+requests” interstitial, the runtime opens a ten-minute account-wide circuit;
+new turns wait instead of probing additional profiles.
 
 ## Model selection
 

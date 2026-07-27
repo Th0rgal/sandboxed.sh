@@ -37,12 +37,13 @@
     "capacity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["source", "static_limit", "slot_exclusivity", "acquire_strategy"],
+      "required": ["source", "static_limit", "slot_exclusivity", "acquire_strategy", "shared_account_launch_interval_secs"],
       "properties": {
         "source": { "const": "profile_dirs" },
         "static_limit": { "type": "null" },
         "slot_exclusivity": { "const": "cross_process_file_lock" },
-        "acquire_strategy": { "const": "first_healthy_available" }
+        "acquire_strategy": { "const": "first_healthy_available" },
+        "shared_account_launch_interval_secs": { "const": 30 }
       }
     },
     "lanes": {
@@ -105,11 +106,12 @@
         "rate_limited": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["signal", "max_automatic_retries", "wait_for_allowance_recovery"],
+          "required": ["signal", "max_automatic_retries", "wait_for_allowance_recovery", "account_cooldown_secs"],
           "properties": {
             "signal": { "const": "rate_limited" },
             "max_automatic_retries": { "const": 0 },
-            "wait_for_allowance_recovery": { "const": true }
+            "wait_for_allowance_recovery": { "const": true },
+            "account_cooldown_secs": { "const": 600 }
           }
         },
         "browser_launch": {

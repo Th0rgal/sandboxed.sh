@@ -45,6 +45,13 @@ PRO_MODEL_ALIASES = {
 
 class TransportUnavailable(Exception):
     pass
+
+
+class RateLimited(Exception):
+    """ChatGPT rendered its explicit account request-rate interstitial."""
+
+
+RATE_LIMIT_HEADING = "Too many requests"
 # Opaque conversation route: `/c/<id>`. This is the only page-derived value the
 # durability protocol ever emits — never titles, prompts, or response text.
 CONVERSATION_PATH_RE = re.compile(r"^/c/[A-Za-z0-9-]{8,64}$")
@@ -133,6 +140,23 @@ async def locate_composer_control(page, testid_selectors, accessible_name):
     return None, False
 
 
+async def raise_if_rate_limited(page) -> None:
+    """Detect the stable, account-wide ChatGPT rate-limit heading.
+
+    Keep this exact and narrow: arbitrary page text is private conversation
+    data and must neither be logged nor used for fuzzy classification.
+    """
+    heading = page.get_by_text(RATE_LIMIT_HEADING, exact=True).first
+    try:
+        if await heading.count() and await heading.is_visible():
+            raise RateLimited()
+    except RateLimited:
+        raise
+    except Exception:
+        # A missing/transient locator is not rate-limit evidence.
+        return
+
+
 async def click_send_control(page) -> bool:
     """Click the composer send control after proving it is actionable.
 
@@ -162,6 +186,7 @@ async def click_send_control(page) -> bool:
                 break
             await page.wait_for_timeout(1_000)
     try:
+        await raise_if_rate_limited(page)
         response = await page.request.get(CHATGPT_URL, timeout=10_000)
         network_reachable = response.status > 0
     except Exception:
@@ -431,6 +456,7 @@ async def establish_resumed_chat(page, conversation_path: str, message: str) -> 
         timeout=60_000,
     )
     emit("diagnostic", message="stage=resume_route")
+    await raise_if_rate_limited(page)
     await verify_authentication(page)
     # Unknown or deleted conversations redirect away from the recorded route.
     await page.wait_for_timeout(2_000)
@@ -458,14 +484,22 @@ async def establish_continued_chat(page, conversation_path: str) -> int:
         timeout=60_000,
     )
     emit("diagnostic", message="stage=continuation_route")
+    await raise_if_rate_limited(page)
     await verify_authentication(page)
-    await page.wait_for_timeout(2_000)
     parsed = urlparse(page.url)
     if parsed.netloc.lower() not in CHATGPT_HOSTS or parsed.path != conversation_path:
         raise ResumeNotFound()
     user_messages = page.locator('[data-message-author-role="user"]')
     responses = page.locator('[data-message-author-role="assistant"]')
-    if await user_messages.count() == 0 or await responses.count() == 0:
+    # The route and account shell settle before the historical messages are
+    # hydrated. A fixed two-second delay was flaky under concurrent profiles:
+    # the same conversation became visible on an immediate retry. Wait for
+    # positive evidence from both sides of the completed turn instead.
+    for _ in range(40):
+        if await user_messages.count() > 0 and await responses.count() > 0:
+            break
+        await page.wait_for_timeout(500)
+    else:
         raise ResumeNotFound()
     composer = page.locator("#prompt-textarea").first
     if not await composer.count():
@@ -479,6 +513,7 @@ async def establish_fresh_chat(page) -> int:
     """Prove an authenticated, settled blank chat before observing responses."""
     await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60_000)
     emit("diagnostic", message="stage=page_loaded")
+    await raise_if_rate_limited(page)
     await verify_authentication(page)
 
     # A direct navigation to the root is the stable new-chat primitive. The
@@ -627,6 +662,7 @@ async def run(args, request) -> None:
             submitted_emitted = resume_path is not None
             deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
             while asyncio.get_running_loop().time() < deadline:
+                await raise_if_rate_limited(page)
                 if durability and not submitted_emitted:
                     # The URL flips to the opaque conversation route once the
                     # prompt is accepted. That route is the only durable
@@ -670,6 +706,12 @@ async def run(args, request) -> None:
         fail(
             "auth_required",
             "ChatGPT login is required in the configured profile; provision it interactively",
+        )
+    except RateLimited:
+        fail(
+            "rate_limited",
+            "ChatGPT temporarily limited this account after requests were made too quickly; the shared account circuit is cooling down",
+            stage=stage,
         )
     except ResumeNotFound:
         fail(

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use serde::Serialize;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -26,6 +26,7 @@ const COMPATIBILITY_QUARANTINE: Duration = Duration::from_secs(10 * 60);
 const COMPATIBILITY_QUARANTINE_THRESHOLD: u32 = 3;
 const GLOBAL_BACKEND_FAILURE_WINDOW: Duration = Duration::from_secs(3 * 60);
 const GLOBAL_BACKEND_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const GLOBAL_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const GLOBAL_BACKEND_FAILURE_THRESHOLD: usize = 2;
 
 pub struct ProfileLock(File);
@@ -108,6 +109,7 @@ struct BackendCircuit {
 pub enum BackendFailureKind {
     Compatibility,
     Transport,
+    RateLimited,
 }
 
 fn backend_circuits() -> &'static Mutex<HashMap<PathBuf, BackendCircuit>> {
@@ -161,10 +163,21 @@ fn backend_circuit_remaining_at(profile_dir: &Path, now: Instant) -> Option<Dura
 }
 
 fn clear_backend_circuit(profile_dir: &Path) {
-    backend_circuits()
+    let key = circuit_key(profile_dir);
+    let mut circuits = backend_circuits()
         .lock()
-        .expect("profile compatibility circuit poisoned")
-        .remove(&circuit_key(profile_dir));
+        .expect("profile compatibility circuit poisoned");
+    // A turn that was already in flight can finish successfully after a
+    // different browser receives the account-wide rate-limit page. That does
+    // not prove new navigation/submission traffic is accepted again, so keep
+    // the timed rate-limit circuit until its cooldown expires.
+    if circuits
+        .get(&key)
+        .is_some_and(|circuit| circuit.reason == Some(BackendFailureKind::RateLimited))
+    {
+        return;
+    }
+    circuits.remove(&key);
 }
 
 pub fn record_backend_failure(profile_dir: &Path, kind: BackendFailureKind) {
@@ -174,6 +187,98 @@ pub fn record_backend_failure(profile_dir: &Path, kind: BackendFailureKind) {
             cooldown_secs = GLOBAL_BACKEND_FAILURE_COOLDOWN.as_secs(),
             "ChatGPT UI backend circuit opened after failures on distinct profile slots"
         );
+    }
+}
+
+/// Open the account-wide circuit immediately when ChatGPT itself renders its
+/// explicit rate-limit interstitial. Unlike a selector or transport miss,
+/// this is already conclusive shared-account evidence and must not be sampled
+/// on a second profile before slowing the fleet down.
+pub fn record_backend_rate_limit(profile_dir: &Path) {
+    let now = Instant::now();
+    let mut circuits = backend_circuits()
+        .lock()
+        .expect("profile compatibility circuit poisoned");
+    let circuit = circuits.entry(circuit_key(profile_dir)).or_default();
+    let until = now + GLOBAL_RATE_LIMIT_COOLDOWN;
+    circuit.open_until = Some(
+        circuit
+            .open_until
+            .map_or(until, |existing| existing.max(until)),
+    );
+    circuit.reason = Some(BackendFailureKind::RateLimited);
+    tracing::warn!(
+        cooldown_secs = GLOBAL_RATE_LIMIT_COOLDOWN.as_secs(),
+        "ChatGPT UI account circuit opened after an explicit rate-limit page"
+    );
+}
+
+fn launch_gates() -> &'static AsyncMutex<HashMap<PathBuf, Instant>> {
+    static GATES: OnceLock<AsyncMutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    GATES.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+/// Serialize browser launches for profiles that share one account pool while
+/// allowing already-submitted multi-hour turns to continue concurrently.
+/// This limits high-risk navigation/send bursts without imposing a low hard
+/// ceiling on the number of useful Pro conversations in flight.
+pub async fn wait_for_launch_turn(
+    profile_dir: &Path,
+    min_interval: Duration,
+    mission_id: Uuid,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    cancel: &CancellationToken,
+) -> Result<(), AgentResult> {
+    if min_interval.is_zero() {
+        return Ok(());
+    }
+    let key = circuit_key(profile_dir);
+    let mut announced_wait = false;
+    loop {
+        let wait = {
+            let mut gates = launch_gates().lock().await;
+            let now = Instant::now();
+            match gates
+                .get(&key)
+                .and_then(|next| next.checked_duration_since(now))
+            {
+                Some(wait) if !wait.is_zero() => wait,
+                _ => {
+                    gates.insert(key.clone(), now + min_interval);
+                    return Ok(());
+                }
+            }
+        };
+        if !announced_wait {
+            let _ = events_tx.send(AgentEvent::MissionActivity {
+                label: format!(
+                    "Pacing ChatGPT UI account traffic (about {}s)…",
+                    wait.as_secs().max(1)
+                ),
+                tool_name: "chatgpt_ui_launch_pacing".to_string(),
+                mission_id: Some(mission_id),
+            });
+            announced_wait = true;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                let shutdown = crate::api::routes::is_shutdown_initiated();
+                return Err(AgentResult::failure(
+                    if shutdown {
+                        "Server restart — paused while pacing ChatGPT UI account traffic."
+                    } else {
+                        "Mission cancelled while pacing ChatGPT UI account traffic"
+                    },
+                    0,
+                )
+                .with_terminal_reason(if shutdown {
+                    TerminalReason::ServerShutdown
+                } else {
+                    TerminalReason::Cancelled
+                }));
+            }
+            _ = tokio::time::sleep(wait.min(Duration::from_secs(2))) => {}
+        }
     }
 }
 
@@ -304,6 +409,11 @@ pub(crate) fn reset_registry_for_tests(profile_dirs: &[PathBuf]) {
     for profile_dir in profile_dirs {
         circuits.remove(&circuit_key(profile_dir));
     }
+    if let Ok(mut gates) = launch_gates().try_lock() {
+        for profile_dir in profile_dirs {
+            gates.remove(&circuit_key(profile_dir));
+        }
+    }
 }
 
 pub async fn acquire_profile(
@@ -326,7 +436,7 @@ pub async fn acquire_profile(
             if !announced_wait {
                 let _ = events_tx.send(AgentEvent::MissionActivity {
                     label: format!(
-                        "Waiting for ChatGPT UI compatibility recovery (about {}s)…",
+                        "Waiting for ChatGPT UI backend recovery (about {}s)…",
                         remaining.as_secs().max(1)
                     ),
                     tool_name: "chatgpt_ui_backend_circuit".to_string(),
@@ -778,6 +888,64 @@ mod tests {
         record_slot_failure_at(&profile, SlotFailureKind::Compatibility, now);
 
         assert!(backend_circuit_remaining_at(&profile, now).is_none());
+        reset_registry_for_tests(&[profile]);
+    }
+
+    #[test]
+    fn explicit_rate_limit_opens_account_circuit_immediately() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        reset_registry_for_tests(std::slice::from_ref(&profile));
+
+        record_backend_rate_limit(&profile);
+
+        let status = backend_circuit_status(std::slice::from_ref(&profile));
+        assert!(status.open);
+        assert_eq!(status.reason, Some(BackendFailureKind::RateLimited));
+        assert!(status.retry_after_secs.is_some_and(|seconds| seconds > 0));
+
+        record_slot_success(&profile);
+        assert!(backend_circuit_status(std::slice::from_ref(&profile)).open);
+        reset_registry_for_tests(&[profile]);
+    }
+
+    #[tokio::test]
+    async fn account_launches_are_serialized_by_minimum_interval() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        reset_registry_for_tests(std::slice::from_ref(&profile));
+        let (events_tx, _) = broadcast::channel(8);
+        let first_cancel = CancellationToken::new();
+        wait_for_launch_turn(
+            &profile,
+            Duration::from_millis(200),
+            Uuid::new_v4(),
+            &events_tx,
+            &first_cancel,
+        )
+        .await
+        .unwrap();
+
+        let second_cancel = CancellationToken::new();
+        let task_cancel = second_cancel.clone();
+        let task_profile = profile.clone();
+        let task_events = events_tx.clone();
+        let second = tokio::spawn(async move {
+            wait_for_launch_turn(
+                &task_profile,
+                Duration::from_millis(200),
+                Uuid::new_v4(),
+                &task_events,
+                &task_cancel,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!second.is_finished());
+        second_cancel.cancel();
+        assert!(second.await.unwrap().is_err());
         reset_registry_for_tests(&[profile]);
     }
 

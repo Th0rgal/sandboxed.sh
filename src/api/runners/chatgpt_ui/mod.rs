@@ -80,6 +80,7 @@ struct Settings {
     proxy_server: Option<String>,
     display: Option<String>,
     timeout: Duration,
+    launch_interval: Duration,
     headless: bool,
 }
 
@@ -329,6 +330,11 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
     if !(30..=86_400).contains(&timeout_secs) {
         return Err("chatgpt_ui timeout_secs must be between 30 and 86400".to_string());
     }
+    let launch_interval_secs =
+        get_backend_u64_setting("chatgpt_ui", "launch_interval_secs").unwrap_or(30);
+    if !(5..=300).contains(&launch_interval_secs) {
+        return Err("chatgpt_ui launch_interval_secs must be between 5 and 300".to_string());
+    }
     let browser = get_backend_string_setting("chatgpt_ui", "browser")
         .unwrap_or_else(|| "chromium".to_string());
     if !matches!(browser.as_str(), "chromium" | "firefox" | "webkit") {
@@ -359,6 +365,7 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
         proxy_server,
         display,
         timeout: Duration::from_secs(timeout_secs),
+        launch_interval: Duration::from_secs(launch_interval_secs),
         headless,
     })
 }
@@ -424,6 +431,20 @@ pub async fn run_chatgpt_ui_turn(
 
     let attempt_resume = resume_record.take();
     let attempt_continuation = continuation_record.take();
+    // The configured profiles share one ChatGPT account in normal
+    // deployments. Pace navigation/submission starts for that account pool;
+    // already-running Pro conversations remain fully concurrent.
+    if let Err(result) = profile_pool::wait_for_launch_turn(
+        &settings.profile_dirs[0],
+        settings.launch_interval,
+        mission_id,
+        &events_tx,
+        &cancel,
+    )
+    .await
+    {
+        return result;
+    }
     // Conversations are account-scoped: a resume must reuse the profile
     // that submitted the prompt, or give up on the pointer entirely. The
     // pinned path locks the slot directly instead of going through the
@@ -522,7 +543,12 @@ fn unresolved_resume_result(code: &str) -> AgentResult {
     .with_terminal_reason(TerminalReason::LlmError)
     .with_data(serde_json::json!({
         "provider_error_source": "chatgpt_ui_durability",
-        "failure_class": FailureClass::TransportError,
+        // The driver has already waited for the route to hydrate. If the
+        // mission-owned pointer still cannot be proved, fail closed and wait
+        // for operator/controller reconciliation. Classifying this as generic
+        // transport caused the control loop to auto-resume with a synthesized
+        // recovery prompt, changing the user's requested follow-up.
+        "failure_class": FailureClass::AgentError,
         "classification_source": "structured",
         "resume_resolution": code,
         "fresh_prompt_submitted": false,
@@ -871,6 +897,9 @@ async fn drive_once(
                                 profile_pool::BackendFailureKind::Transport,
                             );
                         }
+                        if code.as_deref() == Some("rate_limited") {
+                            profile_pool::record_backend_rate_limit(profile_dir);
+                        }
                         if submitted_recorded {
                             jobs::note_attempt_error(
                                 app_working_dir,
@@ -1118,6 +1147,22 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(artifact, DriverEvent::Artifact { .. }));
+    }
+
+    #[test]
+    fn unresolved_conversation_does_not_trigger_generic_transport_resume() {
+        let result = unresolved_resume_result("continuation_not_found");
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|data| data.get("failure_class"))
+                .and_then(serde_json::Value::as_str),
+            Some("agent_error")
+        );
     }
 
     #[test]

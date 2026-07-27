@@ -6,10 +6,10 @@ description: >
   to exhaust its budget instead of giving up, and send targeted hints. Trigger
   terms: mission, sandboxed.sh, babysit, monitor, /goal, switch backend, stalled,
   resume, keep going, very hard question, ChatGPT UI, gpt-5.6-pro.
-version: 1.1.0
+version: 1.2.0
 metadata:
   policy: chatgpt-ui-pool
-  policy_version: 1.1.0
+  policy_version: 1.2.0
 ---
 
 # Hermes Mission Control
@@ -150,7 +150,7 @@ When a model "isn't working," first prove it's the **model** and not the
 concluding the model is too weak. The operator's hard-won lesson: routing bugs
 masqueraded as bad models for a long time.
 
-## ChatGPT UI pool policy (policy_version 1.1.0)
+## ChatGPT UI pool policy (policy_version 1.2.0)
 
 Binding rules for every `chatgpt_ui` mission you start or manage. The
 authoritative versioned policy is `docs/policy/CHATGPT_UI_POOL_POLICY.md` in
@@ -164,6 +164,10 @@ this section must stay in sync with it.
   mission against a locked slot. The pool
   prefers clean profiles and waits when every slot is locked, quarantined, or
   unavailable; it never fails open onto an unhealthy profile.
+- **Pace shared-account starts.** Extra browser slots increase the number of
+  long Pro turns that can overlap, but profiles for one account share its
+  server-side request allowance. The runtime spaces new launches by 30 seconds
+  by default. Do not defeat this pacing or burst-dispatch manually.
 - **Read-only Pro lanes.** Concurrent `gpt-5.6-pro` consultations are fine
   **only** with `writer: false` and **only** on disjoint slots (distinct
   profiles). A `chatgpt_ui` mission never writes repositories or owns a PR.
@@ -188,7 +192,9 @@ this section must stay in sync with it.
   not prove the login was repaired. Never use an auth-failed slot for the
   one compatibility retry.
 - **Rate limited → wait.** 0 automatic retries; allowance must recover.
-  Do not shuffle the request across slots of the same account.
+  Do not shuffle the request across slots of the same account. One exact “Too
+  many requests” page opens a shared 10-minute circuit immediately; an older
+  in-flight turn completing does not close it.
 - **Global browser launch failure → preserve the pool.** A generic
   `browser_launch` failure can be a host-wide Chromium/Playwright problem and
   does not make the selected profile unhealthy. Only a proven profile-local
