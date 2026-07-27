@@ -99,12 +99,18 @@ Match the signal to the fix. The health `recommendation` usually tells you which
 ## Switching backends safely (between turns)
 
 1. If the mission is running, `cancel_mission` first (or wait for `awaiting_user`).
-2. `update_mission_settings(mission_id, backend, model_override?, model_effort?)`.
+2. Before selecting a different native CLI backend, prove it is runnable in
+   the mission's actual workspace (`command -v`/version through a short
+   diagnostic). Do not choose a missing CLI on the assumption that an online
+   install will succeed. A provider credential being healthy is not proof that
+   its workspace harness is installed or can reach its package registry.
+3. `update_mission_settings(mission_id, backend, model_override?, model_effort?)`.
    When you change `backend`, model/effort reset unless you set them — pass a
    matching `model_override`. `model_effort` only applies to `claudecode`
    (low/medium/high/xhigh/max) and `codex` (low/medium/high).
-3. `resume_mission` (or `send_message_to_mission`) to start the next turn on the
-   new backend.
+4. `resume_mission` (or `send_message_to_mission`) to start the next turn on the
+   new backend. Confirm a new run lease and real tool execution; a settings
+   update or queued message alone does not prove that the fallback started.
 
 ### Backend guide
 
