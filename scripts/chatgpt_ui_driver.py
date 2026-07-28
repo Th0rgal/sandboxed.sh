@@ -20,7 +20,11 @@ COMPAT_VERSION = "chatgpt-ui-v2"
 CHATGPT_URL = "https://chatgpt.com/"
 MAX_DOWNLOAD_FILES = 8
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
-MODEL_PICKER_READY_TIMEOUT_MS = 15_000
+# Account/bootstrap hydration can lag substantially behind the composer on the
+# current ChatGPT shell.  Keep this bounded, but do not classify a healthy
+# account as UI-incompatible merely because the intelligence pill missed the
+# old 15-second window.
+MODEL_PICKER_READY_TIMEOUT_MS = 45_000
 SEND_CONTROL_TESTIDS = (
     '[data-testid="send-button"]',
     '[data-testid="composer-send-button"]',
@@ -236,9 +240,11 @@ async def choose_intelligence_model(page, label: str) -> bool:
     # textbox can be ready several seconds before the model pill is attached.
     # Wait for the composer-scoped control instead of snapshotting its count
     # immediately and incorrectly falling back to the legacy model picker.
-    picker_buttons = page.locator(
-        'form button.__composer-pill[aria-haspopup="menu"]:visible'
-    )
+    # Scope to the composer and require a menu-bearing button, but do not
+    # depend on ChatGPT's private ``__composer-pill`` CSS class.  The visible
+    # label is still checked against the strict intelligence allowlist below,
+    # so unrelated composer menus cannot be selected.
+    picker_buttons = page.locator('form button[aria-haspopup="menu"]:visible')
     try:
         await picker_buttons.first.wait_for(
             state="visible", timeout=MODEL_PICKER_READY_TIMEOUT_MS

@@ -274,7 +274,7 @@ class ChatGptUiDriverTests(unittest.TestCase):
         self.assertEqual(model_selection("gpt-5.6-pro"), ("Pro", "gpt-5.6-pro"))
         self.assertEqual(model_selection("GPT-5.6 Pro"), ("Pro", "gpt-5.6-pro"))
         self.assertEqual(model_selection("Extra High"), ("Extra High", "Extra High"))
-        self.assertGreaterEqual(MODEL_PICKER_READY_TIMEOUT_MS, 10_000)
+        self.assertGreaterEqual(MODEL_PICKER_READY_TIMEOUT_MS, 45_000)
 
     def test_model_picker_waits_for_hydration_and_accepts_current_selection(
         self,
@@ -287,7 +287,7 @@ class ChatGptUiDriverTests(unittest.TestCase):
         self.assertTrue(selected)
         self.assertEqual(
             page.selector,
-            'form button.__composer-pill[aria-haspopup="menu"]:visible',
+            'form button[aria-haspopup="menu"]:visible',
         )
         self.assertEqual(
             button.wait_timeout, ("visible", MODEL_PICKER_READY_TIMEOUT_MS)
