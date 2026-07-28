@@ -15,7 +15,7 @@ use super::RemoteNodeError;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Current node protocol version reported by heartbeats.
-pub const NODE_PROTOCOL_VERSION: u32 = 3;
+pub const NODE_PROTOCOL_VERSION: u32 = 4;
 /// First protocol that reports `active_jobs` and `queued_jobs` in heartbeats.
 pub const NODE_JOB_COUNTER_PROTOCOL_VERSION: u32 = 2;
 
@@ -139,12 +139,24 @@ pub struct SourceBundleFile {
     pub path: String,
     pub sha256: String,
     pub data_base64: String,
+    /// Preserve the executable bit for local-only scripts. Absent on v1-v3
+    /// bundles, where files retain the checkout/default mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceBundle {
     pub manifest_sha256: String,
     pub files: Vec<SourceBundleFile>,
+    /// Tracked files removed by the local candidate. Renames are represented
+    /// as one deletion plus one regular file entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_paths: Vec<String>,
+    /// Digest covering deletions and executable-mode metadata. Required when
+    /// either feature is present so an intermediary cannot strip operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations_sha256: Option<String>,
 }
 
 /// One artifact produced by a build job, relative to the checkout root.
@@ -176,7 +188,7 @@ pub enum JobPayload {
     /// constrained `lake`/`lean`/`elan` argv, and reports artifact digests.
     /// See `src/node/lean.rs` for validation and execution.
     LeanBuild {
-        source: JobSource,
+        source: Box<JobSource>,
         /// Build cwd relative to the checkout root (validated: no traversal,
         /// no shell metacharacters). `None`/empty = checkout root.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -485,11 +497,11 @@ mod tests {
     #[test]
     fn lean_build_payload_round_trips_with_defaults() {
         let payload = JobPayload::LeanBuild {
-            source: JobSource {
+            source: Box::new(JobSource {
                 repo: "https://github.com/example/verity.git".to_string(),
                 commit: "a".repeat(40),
                 bundle: None,
-            },
+            }),
             cwd_rel: Some("morpho-verity".to_string()),
             command: vec!["lake".to_string(), "build".to_string()],
             timeout_secs: Some(3600),

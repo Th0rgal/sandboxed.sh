@@ -25,6 +25,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use uuid::Uuid;
 
 use super::routes::AppState;
@@ -371,7 +372,21 @@ fn remote_job_identity(
         source_bundle_digest: req
             .source_bundle
             .as_ref()
-            .map(|bundle| bundle.manifest_sha256.clone()),
+            .map(source_bundle_identity_digest),
+    }
+}
+
+fn source_bundle_identity_digest(bundle: &SourceBundle) -> String {
+    match bundle.operations_sha256.as_deref() {
+        None => bundle.manifest_sha256.clone(),
+        Some(operations) => {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(b"sandboxed-source-bundle-identity-v2\0");
+            hasher.update(bundle.manifest_sha256.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(operations.as_bytes());
+            hex::encode(hasher.finalize())
+        }
     }
 }
 
@@ -668,8 +683,17 @@ async fn finalize_remote_build_handle(
     job_id: Uuid,
     state: &str,
     exit_status: Option<i32>,
+    artifacts: Vec<ArtifactEntry>,
 ) -> bool {
-    match crate::remote_node::job_ledger::finalize(working_dir, job_id, state, exit_status).await {
+    match crate::remote_node::job_ledger::finalize_with_artifacts(
+        working_dir,
+        job_id,
+        state,
+        exit_status,
+        artifacts,
+    )
+    .await
+    {
         Ok(_) => true,
         Err(error) => {
             tracing::warn!(%job_id, ?error, "remote build receipt finalization failed; observation will retry");
@@ -722,6 +746,7 @@ fn spawn_remote_build_observer(
                             job_id,
                             "lost",
                             None,
+                            Vec::new(),
                         )
                         .await
                         {
@@ -747,6 +772,7 @@ fn spawn_remote_build_observer(
                         job_id,
                         &status.state,
                         status.exit_code,
+                        status.artifacts.clone(),
                     )
                     .await
                     {
@@ -755,8 +781,14 @@ fn spawn_remote_build_observer(
                     }
                 }
                 Err(error) if cancel_requested && error.is_not_found() => {
-                    if finalize_remote_build_handle(&state.config.working_dir, job_id, "lost", None)
-                        .await
+                    if finalize_remote_build_handle(
+                        &state.config.working_dir,
+                        job_id,
+                        "lost",
+                        None,
+                        Vec::new(),
+                    )
+                    .await
                     {
                         super::control::deliver_pending_remote_build_wakes(&state).await;
                         return;
@@ -826,7 +858,7 @@ async fn equivalent_remote_validation_response(
                             log_tail: "reused durable terminal receipt".to_string(),
                             node_id: receipt.node_id,
                             job_id: receipt.job_id,
-                            artifacts: Vec::new(),
+                            artifacts: receipt.artifacts,
                         }),
                     )
                         .into_response(),
@@ -971,11 +1003,11 @@ async fn submit_remote_build(
         mission_id: req.mission_id,
         lease_token,
         payload: JobPayload::LeanBuild {
-            source: JobSource {
+            source: Box::new(JobSource {
                 repo: req.repo.clone(),
                 commit: req.commit.clone(),
                 bundle: req.source_bundle.clone(),
-            },
+            }),
             cwd_rel: req.cwd_rel.clone(),
             command: req.command.clone(),
             timeout_secs: req.timeout_secs,
@@ -1162,6 +1194,7 @@ async fn submit_remote_build(
                 job_id,
                 &status.state,
                 status.exit_code,
+                status.artifacts.clone(),
             )
             .await
             {
@@ -1260,7 +1293,7 @@ fn remote_build_status_from_receipt(
         finished_at: Some(receipt.finished_at.to_rfc3339()),
         error: None,
         log_tail: Some("reused durable terminal receipt".to_string()),
-        artifacts: Vec::new(),
+        artifacts: receipt.artifacts,
     };
     RemoteBuildStatusResponse {
         status,
@@ -1416,6 +1449,7 @@ async fn get_remote_build(
             job_id,
             &status.state,
             status.exit_code,
+            status.artifacts.clone(),
         )
         .await
         {
@@ -1453,6 +1487,7 @@ mod tests {
                 Uuid::new_v4(),
                 "succeeded",
                 Some(0),
+                Vec::new(),
             )
             .await
         );
@@ -1762,6 +1797,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
                     toolchain: Some("leanprover/lean4:v4.19.0".to_string()),
                     source_bundle_digest: None,
                 },
+                artifacts: Vec::new(),
                 continuation_expected: false,
                 wake_required: false,
                 wake_delivered_at: None,
@@ -1984,8 +2020,14 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         git(&["config", "user.name", "Remote Build Test"]);
         git(&["config", "user.email", "remote-build@example.invalid"]);
         std::fs::write(repo.join("Theory/Proof.lean"), "old\n").unwrap();
+        std::fs::write(repo.join("Theory/Obsolete.lean"), "obsolete\n").unwrap();
         std::fs::write(repo.join("lean-toolchain"), "leanprover/lean4:v4.19.0\n").unwrap();
-        git(&["add", "Theory/Proof.lean", "lean-toolchain"]);
+        git(&[
+            "add",
+            "Theory/Proof.lean",
+            "Theory/Obsolete.lean",
+            "lean-toolchain",
+        ]);
         git(&[
             "-c",
             "commit.gpgsign=false",
@@ -2002,6 +2044,12 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         ]);
         std::fs::write(repo.join("Theory/Proof.lean"), "new proof\n").unwrap();
         std::fs::write(repo.join("Theory/Witness.lean"), "new witness\n").unwrap();
+        std::fs::remove_file(repo.join("Theory/Obsolete.lean")).unwrap();
+        let mut witness_permissions = std::fs::metadata(repo.join("Theory/Witness.lean"))
+            .unwrap()
+            .permissions();
+        witness_permissions.set_mode(0o755);
+        std::fs::set_permissions(repo.join("Theory/Witness.lean"), witness_permissions).unwrap();
 
         let fake_curl = bin.join("curl");
         std::fs::write(
@@ -2090,6 +2138,19 @@ printf '503'
             bundle.get("manifest_sha256").unwrap().as_str().unwrap(),
             crate::node::lean::bundle_manifest_sha256(&manifest)
         );
+        assert_eq!(
+            bundle.get("deleted_paths").unwrap().as_array().unwrap(),
+            &[serde_json::Value::String(
+                "Theory/Obsolete.lean".to_string()
+            )]
+        );
+        let decoded: SourceBundle = serde_json::from_value(bundle.clone()).unwrap();
+        let operations_digest = crate::node::lean::bundle_operations_sha256(&decoded);
+        assert_eq!(
+            decoded.operations_sha256.as_deref(),
+            Some(operations_digest.as_str())
+        );
+        assert_eq!(decoded.files[1].executable, Some(true));
     }
 
     #[cfg(unix)]

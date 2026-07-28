@@ -16,7 +16,7 @@
 #
 # Exit codes:
 #   remote build's exit code on success/failure of the build itself
-#   2   unsupported local deletion/symlink or oversized source overlay
+#   2   unsafe symlink or oversized source overlay
 #   75  remote build unavailable (EX_TEMPFAIL: placement failed / nodes down /
 #       not configured) — fall back to a local build
 set -u
@@ -70,13 +70,30 @@ def git_paths(*args):
     raw = subprocess.check_output(["git", "-C", str(repo_root), *args])
     return [item.decode("utf-8") for item in raw.split(b"\0") if item]
 
-deleted = git_paths("diff", "--name-only", "-z", "--diff-filter=DR", "HEAD")
-if deleted:
-    raise SystemExit(
-        "remote source bundles do not encode deletions or renames; commit/stash these paths first: "
-        + ", ".join(deleted[:8])
-    )
-tracked = git_paths("diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "HEAD")
+status_items = git_paths("diff", "--name-status", "-z", "--find-renames", "HEAD")
+tracked, deleted = [], []
+index = 0
+while index < len(status_items):
+    status = status_items[index]
+    index += 1
+    kind = status[:1]
+    if kind in {"R", "C"}:
+        if index + 1 >= len(status_items):
+            raise SystemExit("malformed git rename/copy status")
+        old_path, new_path = status_items[index:index + 2]
+        index += 2
+        if kind == "R":
+            deleted.append(old_path)
+        tracked.append(new_path)
+    else:
+        if index >= len(status_items):
+            raise SystemExit("malformed git status")
+        path = status_items[index]
+        index += 1
+        if kind == "D":
+            deleted.append(path)
+        else:
+            tracked.append(path)
 untracked = git_paths("ls-files", "--full-name", "--others", "--exclude-standard", "-z")
 untracked_source = [
     path for path in untracked
@@ -93,16 +110,20 @@ if ignored_untracked:
         file=sys.stderr,
     )
 paths = sorted(set(tracked + untracked_source))
+deleted = sorted(set(deleted) - set(paths))
 max_files = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_FILES", "256"))
 max_bytes = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES", str(1 << 20)))
 if max_files <= 0 or max_bytes <= 0:
     raise SystemExit("remote source bundle limits must be positive integers")
-if len(paths) > max_files:
-    raise SystemExit(f"source bundle has {len(paths)} files; maximum is {max_files}")
+if len(paths) + len(deleted) > max_files:
+    raise SystemExit(
+        f"source bundle has {len(paths) + len(deleted)} operations; maximum is {max_files}"
+    )
 files = []
 total = 0
 manifest = hashlib.sha256(b"sandboxed-source-bundle-v1\n")
-for rel in paths:
+operations = hashlib.sha256(b"sandboxed-source-bundle-ops-v1\n")
+def validate_path(rel):
     components = rel.split("/")
     if (
         not rel
@@ -116,6 +137,8 @@ for rel in paths:
         )
     ):
         raise SystemExit(f"unsafe source bundle path: {rel!r}")
+for rel in paths:
+    validate_path(rel)
     path = repo_root / rel
     if path.is_symlink() or not path.is_file():
         raise SystemExit(f"source bundle path must be a regular file, not a symlink: {rel}")
@@ -128,15 +151,29 @@ for rel in paths:
     manifest.update(b"\0")
     manifest.update(digest.encode())
     manifest.update(b"\n")
+    executable = bool(path.stat().st_mode & 0o111)
+    operations.update(b"file\0")
+    operations.update(rel.encode())
+    operations.update(b"\0")
+    operations.update(b"x" if executable else b"-")
+    operations.update(b"\n")
     files.append({
         "path": rel,
         "sha256": digest,
         "data_base64": base64.b64encode(data).decode("ascii"),
+        "executable": executable,
     })
-if files:
+for rel in deleted:
+    validate_path(rel)
+    operations.update(b"delete\0")
+    operations.update(rel.encode())
+    operations.update(b"\n")
+if files or deleted:
     req["source_bundle"] = {
         "manifest_sha256": manifest.hexdigest(),
         "files": files,
+        "deleted_paths": deleted,
+        "operations_sha256": operations.hexdigest(),
     }
 if cwd_rel:
     req["cwd_rel"] = cwd_rel

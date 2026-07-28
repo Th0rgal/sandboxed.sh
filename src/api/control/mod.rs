@@ -8480,6 +8480,7 @@ async fn poll_recovered_remote_build(
             {
                 let terminal_state = status.state.clone();
                 let terminal_exit_code = status.exit_code;
+                let terminal_artifacts = status.artifacts.clone();
                 state
                     .fleet
                     .record_outcome(crate::remote_node::DispatchOutcome {
@@ -8492,11 +8493,12 @@ async fn poll_recovered_remote_build(
                         started_at,
                         finished_at: Some(chrono::Utc::now()),
                     });
-                match crate::remote_node::job_ledger::finalize(
+                match crate::remote_node::job_ledger::finalize_with_artifacts(
                     &working_dir,
                     job_id,
                     &terminal_state,
                     terminal_exit_code,
+                    terminal_artifacts,
                 )
                 .await
                 {
@@ -11646,6 +11648,7 @@ async fn paloma_webhook_forwarder_loop(
                                 "finished_at": receipt.finished_at,
                                 "exit_status": receipt.exit_status,
                                 "identity": receipt.identity,
+                                "artifacts": receipt.artifacts,
                             })
                         }),
                     );

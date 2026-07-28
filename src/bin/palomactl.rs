@@ -72,6 +72,24 @@ fn run(args: Vec<String>) -> Result<()> {
             let plan = dispatch_plan(&root, project)?;
             println!("{}", serde_json::to_string_pretty(&plan)?);
         }
+        "validation-matrix" => {
+            let path = args
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root.join(".sandboxed/validation.toml"));
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("read validation matrix {}", path.display()))?;
+            let matrix: sandboxed_sh::api::validation::ValidationMatrix =
+                toml::from_str(&raw).context("parse validation matrix")?;
+            matrix.validate().map_err(|error| anyhow!(error))?;
+            println!("{}", serde_json::to_string_pretty(&matrix)?);
+        }
+        "cluster-lean-errors" => {
+            let path = args.get(1).ok_or_else(|| anyhow!("missing log path"))?;
+            let raw = fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+            let clusters = sandboxed_sh::api::validation::cluster_diagnostics(&raw);
+            println!("{}", serde_json::to_string_pretty(&clusters)?);
+        }
         _ => {
             print_usage();
             bail!("unknown command {command}");
@@ -82,7 +100,7 @@ fn run(args: Vec<String>) -> Result<()> {
 
 fn print_usage() {
     println!(
-        "usage:\n  palomactl status\n  palomactl reconcile\n  palomactl pr-gates <owner/repo> <number> [--worker-head <sha>]\n  palomactl set-mode <project> <mode> --until <iso>\n  palomactl dispatch-plan --project <slug>"
+        "usage:\n  palomactl status\n  palomactl reconcile\n  palomactl pr-gates <owner/repo> <number> [--worker-head <sha>]\n  palomactl set-mode <project> <mode> --until <iso>\n  palomactl dispatch-plan --project <slug>\n  palomactl validation-matrix [path]\n  palomactl cluster-lean-errors <log-path>"
     );
 }
 
