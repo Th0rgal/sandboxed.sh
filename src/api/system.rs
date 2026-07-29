@@ -1854,10 +1854,18 @@ async fn rotate_hermes_remote_key(
 
     let dashboard_service =
         (runtime_name == "hermes-assistant").then_some("hermes-dashboard.service");
+    // Queue the restart and return before systemd waits for Hermes's active
+    // conversation drain (which can legitimately take minutes). A blocking
+    // restart made rotation requests time out even after the env update and
+    // restart transaction had succeeded.
     let restart_result = if let Some(dashboard_service) = dashboard_service {
-        run_host_command("systemctl", &["restart", &service_name, dashboard_service]).await
+        run_host_command(
+            "systemctl",
+            &["restart", "--no-block", &service_name, dashboard_service],
+        )
+        .await
     } else {
-        run_host_command("systemctl", &["restart", &service_name]).await
+        run_host_command("systemctl", &["restart", "--no-block", &service_name]).await
     };
     let service_restarted = restart_result.map(|_| true).unwrap_or_else(|e| {
         tracing::warn!("Failed to restart Hermes services after key rotation: {e}");
