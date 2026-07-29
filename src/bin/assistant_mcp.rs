@@ -159,13 +159,6 @@ struct StartMissionParams {
     /// server derives grants only from its operator-owned environment.
     #[serde(default)]
     request_merge_authority: Option<bool>,
-    /// Injected by the Hermes MCP client. Deliberately absent from the public
-    /// tool schema so the model cannot choose its own provenance.
-    #[serde(default)]
-    origin_session_id: Option<String>,
-    /// Injected alongside `origin_session_id` for channel-level attribution.
-    #[serde(default)]
-    origin_platform: Option<String>,
     #[serde(default)]
     tags: Option<Vec<String>>,
     #[serde(default)]
@@ -190,8 +183,6 @@ fn mission_start_tags(
     tags: Option<Vec<String>>,
     request_merge_authority: bool,
     github_pr: Option<&str>,
-    origin_session_id: Option<&str>,
-    origin_platform: Option<&str>,
     merge_grant: Option<&MergeGrantConfig>,
 ) -> Result<Vec<String>, String> {
     let mut tags: Vec<String> = tags
@@ -209,21 +200,6 @@ fn mission_start_tags(
             && !tag.starts_with("origin-platform:")
     });
     tags.push("origin:hermes-assistant".to_string());
-    for (prefix, value) in [
-        ("origin-session", origin_session_id),
-        ("origin-platform", origin_platform),
-    ] {
-        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
-            if value.len() <= 128
-                && value.chars().all(|character| {
-                    character.is_ascii_alphanumeric()
-                        || matches!(character, '-' | '_' | ':' | '/' | '#' | '.')
-                })
-            {
-                tags.push(format!("{prefix}:{value}"));
-            }
-        }
-    }
 
     if !request_merge_authority {
         return Ok(tags);
@@ -1612,8 +1588,6 @@ impl AssistantMcp {
             params.tags,
             params.request_merge_authority.unwrap_or(false),
             params.github_pr.as_deref(),
-            params.origin_session_id.as_deref(),
-            params.origin_platform.as_deref(),
             MergeGrantConfig::from_environment().as_ref(),
         )?;
         let body = json!({
@@ -3588,8 +3562,6 @@ mod tests {
             ]),
             true,
             Some("lfglabs-dev/verity#2209"),
-            Some("20260729_080825_2df2a0"),
-            Some("desktop"),
             Some(&grant),
         )
         .unwrap();
@@ -3599,8 +3571,6 @@ mod tests {
             vec![
                 "verity",
                 "origin:hermes-assistant",
-                "origin-session:20260729_080825_2df2a0",
-                "origin-platform:desktop",
                 "merge-authority:granted",
                 "merge-authority-source:owner-standing-grant-2026-07-29",
                 "merge-authority-target:lfglabs-dev/verity#2209"
@@ -3614,13 +3584,9 @@ mod tests {
             authority_source: "owner-grant".to_string(),
             repositories: vec!["owner/repo".to_string()],
         };
-        assert!(mission_start_tags(None, true, Some("owner/repo#1"), None, None, None).is_err());
-        assert!(
-            mission_start_tags(None, true, Some("owner/repo"), None, None, Some(&grant)).is_err()
-        );
-        assert!(
-            mission_start_tags(None, true, Some("other/repo#1"), None, None, Some(&grant)).is_err()
-        );
+        assert!(mission_start_tags(None, true, Some("owner/repo#1"), None).is_err());
+        assert!(mission_start_tags(None, true, Some("owner/repo"), Some(&grant)).is_err());
+        assert!(mission_start_tags(None, true, Some("other/repo#1"), Some(&grant)).is_err());
         let tags = mission_start_tags(
             Some(vec![
                 "merge-authority:granted".to_string(),
@@ -3628,8 +3594,6 @@ mod tests {
             ]),
             false,
             Some("owner/repo#1"),
-            None,
-            None,
             Some(&grant),
         )
         .unwrap();
