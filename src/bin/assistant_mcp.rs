@@ -155,6 +155,13 @@ struct StartMissionParams {
     github_pr: Option<String>,
     #[serde(default)]
     writer: Option<bool>,
+    /// Whether this mission may perform the final guarded PR merge. Branch
+    /// write ownership and merge authority are deliberately separate.
+    #[serde(default)]
+    may_merge: Option<bool>,
+    /// Durable owner/campaign grant that authorizes `may_merge=true`.
+    #[serde(default)]
+    merge_authority_source: Option<String>,
     #[serde(default)]
     tags: Option<Vec<String>>,
     #[serde(default)]
@@ -173,6 +180,53 @@ fn native_backend_from_agent(agent: Option<&str>) -> Option<String> {
         "grok" => Some("grok".to_string()),
         _ => None,
     }
+}
+
+fn mission_start_tags(
+    tags: Option<Vec<String>>,
+    may_merge: bool,
+    merge_authority_source: Option<&str>,
+    github_pr: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut tags: Vec<String> = tags
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tag| tag.trim().to_string())
+        .filter(|tag| !tag.is_empty())
+        .collect();
+    tags.retain(|tag| {
+        tag != "origin:hermes-assistant"
+            && tag != "merge-authority:granted"
+            && !tag.starts_with("merge-authority-source:")
+    });
+    tags.push("origin:hermes-assistant".to_string());
+
+    let authority_source = merge_authority_source
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if !may_merge {
+        if authority_source.is_some() {
+            return Err("merge_authority_source requires may_merge=true".to_string());
+        }
+        return Ok(tags);
+    }
+
+    if github_pr.is_none_or(|value| value.trim().is_empty()) {
+        return Err("may_merge=true requires github_pr".to_string());
+    }
+    let authority_source = authority_source
+        .ok_or_else(|| "may_merge=true requires merge_authority_source".to_string())?;
+    if authority_source.len() > 128
+        || !authority_source.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | ':' | '/' | '#' | '.')
+        })
+    {
+        return Err("merge_authority_source must be a <=128 character audit slug".to_string());
+    }
+    tags.push("merge-authority:granted".to_string());
+    tags.push(format!("merge-authority-source:{authority_source}"));
+    Ok(tags)
 }
 
 #[derive(Debug, Deserialize)]
@@ -965,6 +1019,8 @@ impl AssistantMcp {
                         "intent": {"type": "string", "description": "Intent (e.g. \"review_merge_pr\")."},
                         "github_pr": {"type": "string", "description": "Associated PR ref (e.g. \"owner/repo#123\")."},
                         "writer": {"type": "boolean", "description": "Whether this mission may modify the associated PR branch. Concurrent writers for one PR are rejected."},
+                        "may_merge": {"type": "boolean", "description": "Whether this mission may perform the final guarded PR merge. Set only for a dedicated integrator covered by a durable owner/campaign grant."},
+                        "merge_authority_source": {"type": "string", "description": "Required with may_merge=true. Stable grant slug, for example owner-standing-grant-2026-07-29. Recorded in mission tags for audit provenance."},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "desired_state": {"type": "string", "description": "Track state, e.g. waiting_ci / waiting_review / blocked_external."},
                         "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."},
@@ -1463,6 +1519,12 @@ impl AssistantMcp {
         let backend = params
             .backend
             .or_else(|| native_backend_from_agent(params.agent.as_deref()));
+        let tags = mission_start_tags(
+            params.tags,
+            params.may_merge.unwrap_or(false),
+            params.merge_authority_source.as_deref(),
+            params.github_pr.as_deref(),
+        )?;
         let body = json!({
             "title": params.title,
             "workspace_id": workspace_id,
@@ -1484,7 +1546,7 @@ impl AssistantMcp {
             "intent": params.intent,
             "github_pr": params.github_pr,
             "writer": params.writer,
-            "tags": params.tags,
+            "tags": tags,
             "desired_state": params.desired_state,
             "next_check_at": params.next_check_at,
             "estimated_disk_gib": params.estimated_disk_gib,
@@ -3420,6 +3482,40 @@ mod tests {
         let backwards = mission_events_path(id, 40, "all", Some(99), Some(17));
         assert!(backwards.ends_with("&before_seq=99"));
         assert!(!backwards.contains("since_seq"));
+    }
+
+    #[test]
+    fn mission_start_tags_record_hermes_merge_authority() {
+        let tags = mission_start_tags(
+            Some(vec![
+                "verity".to_string(),
+                " origin:hermes-assistant ".to_string(),
+            ]),
+            true,
+            Some("owner-standing-grant-2026-07-29"),
+            Some("lfglabs-dev/verity#2209"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            tags,
+            vec![
+                "verity",
+                "origin:hermes-assistant",
+                "merge-authority:granted",
+                "merge-authority-source:owner-standing-grant-2026-07-29"
+            ]
+        );
+    }
+
+    #[test]
+    fn mission_start_tags_reject_ambiguous_merge_authority() {
+        assert!(mission_start_tags(None, true, None, Some("owner/repo#1")).is_err());
+        assert!(mission_start_tags(None, true, Some("owner grant"), Some("owner/repo#1")).is_err());
+        assert!(mission_start_tags(None, true, Some("owner-grant"), None).is_err());
+        assert!(
+            mission_start_tags(None, false, Some("owner-grant"), Some("owner/repo#1")).is_err()
+        );
     }
 
     #[test]
