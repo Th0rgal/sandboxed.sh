@@ -155,18 +155,10 @@ struct StartMissionParams {
     github_pr: Option<String>,
     #[serde(default)]
     writer: Option<bool>,
-    /// Model-visible request for merge capability. It is not authority: a
-    /// trusted Hermes client must independently inject `may_merge` and the
-    /// configured grant source.
+    /// Model-visible request for merge capability. It is not authority: this
+    /// server derives grants only from its operator-owned environment.
     #[serde(default)]
     request_merge_authority: Option<bool>,
-    /// Whether this mission may perform the final guarded PR merge. Branch
-    /// write ownership and merge authority are deliberately separate.
-    #[serde(default)]
-    may_merge: Option<bool>,
-    /// Durable owner/campaign grant that authorizes `may_merge=true`.
-    #[serde(default)]
-    merge_authority_source: Option<String>,
     /// Injected by the Hermes MCP client. Deliberately absent from the public
     /// tool schema so the model cannot choose its own provenance.
     #[serde(default)]
@@ -197,11 +189,10 @@ fn native_backend_from_agent(agent: Option<&str>) -> Option<String> {
 fn mission_start_tags(
     tags: Option<Vec<String>>,
     request_merge_authority: bool,
-    may_merge: bool,
-    merge_authority_source: Option<&str>,
     github_pr: Option<&str>,
     origin_session_id: Option<&str>,
     origin_platform: Option<&str>,
+    merge_grant: Option<&MergeGrantConfig>,
 ) -> Result<Vec<String>, String> {
     let mut tags: Vec<String> = tags
         .unwrap_or_default()
@@ -234,42 +225,77 @@ fn mission_start_tags(
         }
     }
 
-    let authority_source = merge_authority_source
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if request_merge_authority && !may_merge {
-        return Err(
-            "merge authority was requested but not granted by the trusted Hermes client"
-                .to_string(),
-        );
-    }
-    if !may_merge {
-        if authority_source.is_some() {
-            return Err("merge_authority_source requires may_merge=true".to_string());
-        }
+    if !request_merge_authority {
         return Ok(tags);
     }
-
     let github_pr = github_pr
         .map(str::trim)
         .filter(|value| canonical_github_pr_ref(value))
         .ok_or_else(|| {
-            "may_merge=true requires github_pr in owner/repository#123 form".to_string()
+            "merge authority requires github_pr in owner/repository#123 form".to_string()
         })?;
-    let authority_source = authority_source
-        .ok_or_else(|| "may_merge=true requires merge_authority_source".to_string())?;
-    if authority_source.len() > 128
-        || !authority_source.chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(character, '-' | '_' | ':' | '/' | '#' | '.')
-        })
-    {
-        return Err("merge_authority_source must be a <=128 character audit slug".to_string());
+    let merge_grant = merge_grant.ok_or_else(|| {
+        "merge authority was requested but no operator grant is configured".to_string()
+    })?;
+    let repository = github_pr.split_once('#').expect("validated PR ref").0;
+    if !merge_grant.allows(repository) {
+        return Err(format!(
+            "merge authority was requested outside the configured repository scope: {repository}"
+        ));
     }
     tags.push("merge-authority:granted".to_string());
-    tags.push(format!("merge-authority-source:{authority_source}"));
+    tags.push(format!(
+        "merge-authority-source:{}",
+        merge_grant.authority_source
+    ));
     tags.push(format!("merge-authority-target:{github_pr}"));
     Ok(tags)
+}
+
+#[derive(Debug)]
+struct MergeGrantConfig {
+    authority_source: String,
+    repositories: Vec<String>,
+}
+
+impl MergeGrantConfig {
+    fn from_environment() -> Option<Self> {
+        let authority_source = std::env::var("HERMES_MERGE_AUTHORITY_SOURCE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 128
+                    && value.chars().all(|character| {
+                        character.is_ascii_alphanumeric()
+                            || matches!(character, '-' | '_' | ':' | '/' | '#' | '.')
+                    })
+            })?;
+        let repositories: Vec<String> = std::env::var("HERMES_MERGE_AUTHORITY_REPOSITORIES")
+            .ok()?
+            .split(',')
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect();
+        if repositories.is_empty() {
+            return None;
+        }
+        Some(Self {
+            authority_source,
+            repositories,
+        })
+    }
+
+    fn allows(&self, repository: &str) -> bool {
+        let repository = repository.to_ascii_lowercase();
+        let owner = repository.split_once('/').map(|(owner, _)| owner);
+        self.repositories.iter().any(|allowed| {
+            allowed == &repository
+                || allowed
+                    .strip_suffix("/*")
+                    .is_some_and(|allowed_owner| owner == Some(allowed_owner))
+        })
+    }
 }
 
 fn canonical_github_pr_ref(value: &str) -> bool {
@@ -1585,11 +1611,10 @@ impl AssistantMcp {
         let tags = mission_start_tags(
             params.tags,
             params.request_merge_authority.unwrap_or(false),
-            params.may_merge.unwrap_or(false),
-            params.merge_authority_source.as_deref(),
             params.github_pr.as_deref(),
             params.origin_session_id.as_deref(),
             params.origin_platform.as_deref(),
+            MergeGrantConfig::from_environment().as_ref(),
         )?;
         let body = json!({
             "title": params.title,
@@ -3552,17 +3577,20 @@ mod tests {
 
     #[test]
     fn mission_start_tags_record_hermes_merge_authority() {
+        let grant = MergeGrantConfig {
+            authority_source: "owner-standing-grant-2026-07-29".to_string(),
+            repositories: vec!["lfglabs-dev/*".to_string()],
+        };
         let tags = mission_start_tags(
             Some(vec![
                 "verity".to_string(),
                 " origin:hermes-assistant ".to_string(),
             ]),
             true,
-            true,
-            Some("owner-standing-grant-2026-07-29"),
             Some("lfglabs-dev/verity#2209"),
             Some("20260729_080825_2df2a0"),
             Some("desktop"),
+            Some(&grant),
         )
         .unwrap();
 
@@ -3582,45 +3610,30 @@ mod tests {
 
     #[test]
     fn mission_start_tags_reject_ambiguous_merge_authority() {
+        let grant = MergeGrantConfig {
+            authority_source: "owner-grant".to_string(),
+            repositories: vec!["owner/repo".to_string()],
+        };
+        assert!(mission_start_tags(None, true, Some("owner/repo#1"), None, None, None).is_err());
         assert!(
-            mission_start_tags(None, true, true, None, Some("owner/repo#1"), None, None).is_err()
+            mission_start_tags(None, true, Some("owner/repo"), None, None, Some(&grant)).is_err()
         );
-        assert!(mission_start_tags(
-            None,
-            true,
-            true,
-            Some("owner grant"),
+        assert!(
+            mission_start_tags(None, true, Some("other/repo#1"), None, None, Some(&grant)).is_err()
+        );
+        let tags = mission_start_tags(
+            Some(vec![
+                "merge-authority:granted".to_string(),
+                "merge-authority-source:spoofed".to_string(),
+            ]),
+            false,
             Some("owner/repo#1"),
             None,
-            None
+            None,
+            Some(&grant),
         )
-        .is_err());
-        assert!(
-            mission_start_tags(None, true, true, Some("owner-grant"), None, None, None).is_err()
-        );
-        assert!(mission_start_tags(
-            None,
-            false,
-            false,
-            Some("owner-grant"),
-            Some("owner/repo#1"),
-            None,
-            None
-        )
-        .is_err());
-        assert!(mission_start_tags(
-            None,
-            true,
-            true,
-            Some("owner-grant"),
-            Some("owner/repo"),
-            None,
-            None
-        )
-        .is_err());
-        assert!(
-            mission_start_tags(None, true, false, None, Some("owner/repo#1"), None, None).is_err()
-        );
+        .unwrap();
+        assert!(!tags.iter().any(|tag| tag.starts_with("merge-authority:")));
     }
 
     #[test]
