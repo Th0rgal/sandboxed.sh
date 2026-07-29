@@ -12,6 +12,10 @@ use std::sync::Arc;
 /// and a `server_shutdown` terminal reason instead of `cancelled`.
 static SHUTDOWN_INITIATED: AtomicBool = AtomicBool::new(false);
 
+/// Once mission state has been durably drained, do not let a stale HTTP/SSE
+/// handler hold a deployment in systemd's much longer stop timeout.
+const SHUTDOWN_HTTP_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Returns `true` if `handle_shutdown_signal` has begun draining missions
 /// for a graceful shutdown.
 pub fn is_shutdown_initiated() -> bool {
@@ -1241,11 +1245,26 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Setup graceful shutdown on SIGTERM/SIGINT
     let shutdown_state = Arc::clone(&state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
+    let (drain_complete_tx, drain_complete_rx) = tokio::sync::oneshot::channel();
+    let server = std::future::IntoFuture::into_future(
+        axum::serve(listener, app).with_graceful_shutdown(async move {
             shutdown_signal(shutdown_state).await;
-        })
-        .await?;
+            let _ = drain_complete_tx.send(());
+        }),
+    );
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        _ = async {
+            let _ = drain_complete_rx.await;
+            tokio::time::sleep(SHUTDOWN_HTTP_DRAIN_TIMEOUT).await;
+        } => {
+            tracing::warn!(
+                timeout_secs = SHUTDOWN_HTTP_DRAIN_TIMEOUT.as_secs(),
+                "HTTP graceful drain timed out after mission state was preserved; forcing server future closed"
+            );
+        }
+    }
 
     Ok(())
 }
