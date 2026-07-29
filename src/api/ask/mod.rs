@@ -1177,6 +1177,7 @@ async fn cancel_working_agent(turn: &AskTurn) -> Result<(), String> {
     turn.control_cmd_tx
         .send(crate::api::control::ControlCommand::CancelMission {
             mission_id: turn.mission_id,
+            actor: "system:ask-cancel-working-agent".to_string(),
             min_idle: None,
             respond: tx,
         })

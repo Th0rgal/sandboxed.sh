@@ -465,6 +465,8 @@ pub enum ControlCommand {
     /// Cancel a specific mission
     CancelMission {
         mission_id: Uuid,
+        /// Stable attribution recorded in logs and cancellation events.
+        actor: String,
         /// If `Some(d)`, only cancel when the runner has been idle for at
         /// least `d`. Race-protects watchdog/cleanup from killing a
         /// mission that has already resumed activity in the time between

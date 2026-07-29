@@ -236,6 +236,7 @@ pub(crate) async fn cleanup_stale_active_missions_once(
                 if cmd_tx
                     .send(ControlCommand::CancelMission {
                         mission_id: mission.id,
+                        actor: "system:stale-run-recovery".to_string(),
                         min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
                         respond: tx,
                     })
@@ -519,6 +520,7 @@ pub(crate) async fn stuck_mission_watchdog_loop(
             let cancelled = if cmd_tx
                 .send(ControlCommand::CancelMission {
                     mission_id: info.mission_id,
+                    actor: "system:stuck-mission-watchdog".to_string(),
                     min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
                     respond: cancel_tx,
                 })

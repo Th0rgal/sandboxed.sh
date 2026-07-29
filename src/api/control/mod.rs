@@ -10156,6 +10156,7 @@ pub async fn cancel_mission(
         .cmd_tx
         .send(ControlCommand::CancelMission {
             mission_id,
+            actor: resolve_actor(None, &user),
             min_idle: None,
             respond: tx,
         })
@@ -16223,7 +16224,9 @@ async fn control_actor_loop(
                             )));
                         }
                     }
-                    ControlCommand::CancelMission { mission_id, min_idle, respond } => {
+                    ControlCommand::CancelMission { mission_id, actor, min_idle, respond } => {
+                        tracing::info!(mission_id = %mission_id, actor = %actor,
+                            "Mission cancellation requested");
                         // Race-protect background cancels (watchdog, stale-cleanup):
                         // if the caller asked us to only cancel when truly idle and the
                         // mission has touched activity in the meantime, skip the cancel.
@@ -16320,7 +16323,10 @@ async fn control_actor_loop(
                                     .await;
                             }
                             let _ = events_tx.send(AgentEvent::Error {
-                                message: format!("Parallel mission {} cancellation requested", mission_id),
+                                message: format!(
+                                    "Parallel mission {} cancellation requested by {}",
+                                    mission_id, actor
+                                ),
                                 mission_id: Some(mission_id),
                                 resumable: true, // Cancelled missions can be resumed
                             });

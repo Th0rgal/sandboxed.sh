@@ -1140,6 +1140,7 @@ fn self_cancel_mission(cmd_tx: &mpsc::Sender<ControlCommand>, mission_id: Uuid) 
     let (respond, _rx) = oneshot::channel();
     match cmd_tx.try_send(ControlCommand::CancelMission {
         mission_id,
+        actor: "system:board-dead-boss".to_string(),
         min_idle: None,
         respond,
     }) {
