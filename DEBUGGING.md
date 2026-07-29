@@ -124,9 +124,17 @@ Hermes gotchas:
   deploy.
 - When testing the WS handshake with curl, force `--http1.1` — ALPN negotiates
   h2, which has no `Upgrade` header, and the resulting 401 is a red herring.
-- When rotating the `hsk_` key, update `API_SERVER_KEY`,
-  `HERMES_DASHBOARD_SESSION_TOKEN`, and the desktop's `connection.json` together.
-  Read the dotenv through a shell when syncing the desktop; `env_line` quotes
+- When rotating the `hsk_` key, update `API_SERVER_KEY` and
+  `HERMES_DASHBOARD_SESSION_TOKEN` in **both**
+  `/etc/sandboxed-sh/hermes-assistant.env` and
+  `/var/lib/hermes-assistant/.env`, update the matching Bitwarden secrets, and
+  update the desktop's `connection.json` together. Hermes loads the home
+  `.env` with override semantics, then external secret sources, so changing
+  only the systemd `EnvironmentFile` leaves the dashboard on a different key.
+  Remove any hardcoded `Environment=HERMES_DASHBOARD_SESSION_TOKEN=...` from
+  the unit rather than maintaining a fifth source. Restart the gateway and
+  dashboard only after all durable sources agree.
+- Read the dotenv through a shell when syncing the desktop; `env_line` quotes
   values, so copying the raw text after `=` also copies the quote characters
   and produces a credential that looks right but always returns HTTP 401.
 
@@ -135,9 +143,11 @@ desktop_token="$(ssh -i ~/.ssh/paloma root@65.109.98.246 \
   "bash -lc 'set -a; source /etc/sandboxed-sh/hermes-assistant.env; printf %s \"\$HERMES_DASHBOARD_SESSION_TOKEN\"'")"
 ```
 
-  After syncing, require an authenticated `/api/config` response and a 101
-  WebSocket handshake on `/api/ws?token=...`; `/api/status` is public and is
-  not sufficient proof that Desktop authentication works.
+  After syncing, require an authenticated `/api/config` response with
+  `X-Hermes-Session-Token` and a 101 WebSocket handshake on
+  `/api/ws?token=...` using `--http1.1`; a header-only WS probe is expected to
+  return 403. `/api/status` is public and is not sufficient proof that Desktop
+  authentication works.
 
 ```bash
 # Production inspection. Deploy/restart through the guarded endpoint below.
