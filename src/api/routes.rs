@@ -1261,8 +1261,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         } => {
             tracing::warn!(
                 timeout_secs = SHUTDOWN_HTTP_DRAIN_TIMEOUT.as_secs(),
-                "HTTP graceful drain timed out after mission state was preserved; forcing server future closed"
+                "HTTP graceful drain timed out after mission state was preserved; exiting without waiting for leaked runtime tasks"
             );
+            // Dropping the server future is insufficient when a leaked
+            // spawn_blocking task keeps Tokio's runtime destructor alive.
+            // Mission and detached-job state has already been persisted by
+            // shutdown_signal, so terminate the old deploy generation now.
+            std::process::exit(0);
         }
     }
 
