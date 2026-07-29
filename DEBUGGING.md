@@ -124,19 +124,8 @@ Hermes gotchas:
   deploy.
 - When testing the WS handshake with curl, force `--http1.1` — ALPN negotiates
   h2, which has no `Upgrade` header, and the resulting 401 is a red herring.
-- When rotating the `hsk_` key, update `API_SERVER_KEY` and
-  `HERMES_DASHBOARD_SESSION_TOKEN` in **both**
-  `/etc/sandboxed-sh/hermes-assistant.env` and
-  `/var/lib/hermes-assistant/.env`, update the matching Bitwarden secrets, and
-  update the desktop's `connection.json` together. Hermes loads the home
-  `.env` with override semantics, then external secret sources, so changing
-  only the systemd `EnvironmentFile` leaves the dashboard on a different key.
-  Remove any hardcoded `Environment=HERMES_DASHBOARD_SESSION_TOKEN=...` from
-  the unit rather than maintaining a fifth source. Restart the gateway and
-  dashboard only after all durable sources agree.
-- Validate dashboard REST auth with `X-Hermes-Session-Token`. Validate the
-  loopback-mode WebSocket with `?token=...`, `--http1.1`, and an Upgrade
-  request; a header-only WS probe is expected to return 403.
+- When rotating the `hsk_` key, update `API_SERVER_KEY`,
+  `HERMES_DASHBOARD_SESSION_TOKEN`, and the desktop's `connection.json` together.
 
 ```bash
 # Production inspection. Deploy/restart through the guarded endpoint below.
