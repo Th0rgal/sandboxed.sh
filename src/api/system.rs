@@ -1826,6 +1826,9 @@ pub struct RotateHermesRemoteKeyResponse {
     /// Public path prefix to combine with the dashboard's API base URL.
     pub path: &'static str,
     pub service_restarted: bool,
+    /// Whether the production dashboard backend was restarted with the same
+    /// credential. Development currently has no companion dashboard unit.
+    pub dashboard_restarted: bool,
 }
 
 /// POST /api/system/hermes-assistant/remote/key — rotate the bearer token
@@ -1849,18 +1852,24 @@ async fn rotate_hermes_remote_key(
         ));
     }
 
-    let service_restarted = run_host_command("systemctl", &["restart", &service_name])
-        .await
-        .map(|_| true)
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to restart {service_name} after key rotation: {e}");
-            false
-        });
+    let dashboard_service =
+        (runtime_name == "hermes-assistant").then_some("hermes-dashboard.service");
+    let restart_result = if let Some(dashboard_service) = dashboard_service {
+        run_host_command("systemctl", &["restart", &service_name, dashboard_service]).await
+    } else {
+        run_host_command("systemctl", &["restart", &service_name]).await
+    };
+    let service_restarted = restart_result.map(|_| true).unwrap_or_else(|e| {
+        tracing::warn!("Failed to restart Hermes services after key rotation: {e}");
+        false
+    });
+    let dashboard_restarted = dashboard_service.is_some() && service_restarted;
 
     Ok(Json(RotateHermesRemoteKeyResponse {
         key,
         path: HERMES_REMOTE_PATH,
         service_restarted,
+        dashboard_restarted,
     }))
 }
 
