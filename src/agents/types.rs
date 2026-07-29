@@ -320,6 +320,10 @@ pub enum TerminalReason {
     InfiniteLoop,
     /// Hit maximum iterations limit
     MaxIterations,
+    /// A durable goal declared a genuine external blocker. Controllers with
+    /// live task-board work are parked until the board changes instead of
+    /// being watchdog-cancelled.
+    Blocked,
     /// Provider rate-limited all retry attempts
     RateLimited,
     /// Provider rejected turn due to concurrent mission capacity exhaustion

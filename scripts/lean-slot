@@ -15,6 +15,18 @@
 # every offload-enabled mission (full fleet).
 set -u
 
+_usage() {
+  cat <<'EOF'
+Usage: lean-slot COMMAND [ARGS...]
+
+Run a heavy Lean command under the host-wide concurrency gate, optionally via
+the configured Spark offload. Examples:
+  lean-slot lake build Compiler
+  lean-slot lake env lean Probe.lean
+  lean-slot status
+EOF
+}
+
 # --- rollout gate ---
 # Defaults to a single mission for a controlled rollout. To arm a mission, set
 # this to its id (or set SPARK_OFFLOAD_ALLOW="" in the env to arm the whole
@@ -58,6 +70,40 @@ _spark_eligible() {
     *) return 1 ;;
   esac
 }
+
+case "${1:-}" in
+  -h|--help)
+    _usage
+    exit 0
+    ;;
+  status)
+    if command -v flock >/dev/null 2>&1; then
+      printf 'lean-slot: local slots'
+      for i in 0 1; do
+        exec 9>"/tmp/lean-slot-$i.lock"
+        if flock -n 9; then
+          printf ' %s=available' "$i"
+        else
+          printf ' %s=busy' "$i"
+        fi
+        exec 9>&-
+      done
+      printf '\n'
+    else
+      printf 'lean-slot: local slots=unknown (flock unavailable)\n'
+    fi
+    if _spark_eligible 2>/dev/null; then
+      printf 'lean-slot: spark=eligible\n'
+    else
+      printf 'lean-slot: spark=disabled-or-ineligible\n'
+    fi
+    exit 0
+    ;;
+  '')
+    _usage >&2
+    exit 64
+    ;;
+esac
 
 if _spark_eligible; then
   spark-build "$@"

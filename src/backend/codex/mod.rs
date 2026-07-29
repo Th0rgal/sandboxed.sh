@@ -190,7 +190,8 @@ fn fold_delta_into(buffer: &mut String, delta: &str) {
 ///   `thread/goal/set` instead of `turn/start`. Codex auto-starts a turn and
 ///   keeps looping until the model invokes `update_goal { status: "complete" }`
 ///   (or the optional token budget is hit). We finish the mission when we see
-///   a `thread/goal/updated` notification with terminal status.
+///   a `thread/goal/updated` notification with terminal status (`complete`,
+///   `budgetLimited`, or `blocked`).
 /// - Otherwise → `turn/start` with a single text input item. We finish the
 ///   mission on the first `turn/completed` notification.
 async fn send_message_streaming_app_server(
@@ -762,8 +763,8 @@ struct AppServerEventTranslator {
     /// `complete` before the current turn emits its final assistant message;
     /// ending immediately on the goal update drops that closing response.
     goal_turn_active: bool,
-    /// Set after a terminal goal update (`complete` / `budgetLimited`). The
-    /// stream becomes terminal once the active turn completes.
+    /// Set after a terminal goal update (`complete` / `budgetLimited` /
+    /// `blocked`). The stream becomes terminal once the active turn completes.
     goal_terminal_seen: bool,
     /// Tool calls emitted to consumers but not yet paired with a terminal
     /// result. Persisted across an app-server reconnect within this driver so
@@ -1195,7 +1196,7 @@ impl AppServerEventTranslator {
                             objective: self.goal_objective.clone(),
                         });
                     }
-                    if status == "complete" || status == "budgetLimited" {
+                    if matches!(status.as_str(), "complete" | "budgetLimited" | "blocked") {
                         self.goal_terminal_seen = true;
                         if !self.goal_turn_active {
                             terminal = true;
@@ -1550,6 +1551,41 @@ mod tests {
         assert!(text.events.iter().any(|event| matches!(
             event,
             ExecutionEvent::TextDelta { content } if content == "FINAL_RESPONSE_DEBUG_OK"
+        )));
+
+        let turn_completed = translator.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "turn-1", "status": "completed" } }),
+            true,
+        );
+        assert!(turn_completed.terminal);
+    }
+
+    #[test]
+    fn goal_blocked_waits_for_active_turn_completion() {
+        let mut translator = AppServerEventTranslator::default();
+
+        let started = translator.handle_notification(
+            "turn/started",
+            &json!({ "turn": { "id": "turn-1" } }),
+            true,
+        );
+        assert!(!started.terminal);
+
+        let blocked = translator.handle_notification(
+            "thread/goal/updated",
+            &json!({
+                "goal": {
+                    "status": "blocked",
+                    "objective": "wait for exact-head receipts"
+                }
+            }),
+            true,
+        );
+        assert!(!blocked.terminal);
+        assert!(blocked.events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::GoalStatus { status, .. } if status == "blocked"
         )));
 
         let turn_completed = translator.handle_notification(

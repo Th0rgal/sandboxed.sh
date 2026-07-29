@@ -13132,6 +13132,10 @@ fn mission_status_for_terminal_reason(
         TerminalReason::Cancelled => Some((MissionStatus::Interrupted, "cancelled")),
         TerminalReason::ServerShutdown => Some((MissionStatus::Interrupted, "server_shutdown")),
         TerminalReason::MaxIterations => Some((MissionStatus::Blocked, "max_iterations")),
+        // A blocked goal with live board work is a normal durable wait, not an
+        // impasse. `maybe_finalize_terminal_mission` refines this to
+        // WaitingBackground after consulting the board.
+        TerminalReason::Blocked => Some((MissionStatus::Blocked, "goal_blocked")),
         TerminalReason::LlmError => Some((MissionStatus::Failed, "llm_error")),
         TerminalReason::Stalled => Some((MissionStatus::Failed, "stalled")),
         TerminalReason::InfiniteLoop => Some((MissionStatus::Failed, "infinite_loop")),
@@ -13205,6 +13209,7 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
     match reason {
         TerminalReason::TurnComplete | TerminalReason::Completed => None,
         TerminalReason::MaxIterations => Some("Reached iteration limit".to_string()),
+        TerminalReason::Blocked => Some("Goal is blocked".to_string()),
         TerminalReason::Cancelled => Some("Cancelled by user".to_string()),
         TerminalReason::ServerShutdown => {
             Some("Paused for server restart — click Resume to continue".to_string())
@@ -13509,7 +13514,7 @@ async fn maybe_finalize_terminal_mission(
     let Some(reason) = terminal_reason else {
         return;
     };
-    let Some((new_status, terminal_reason_str)) =
+    let Some((mut new_status, mut terminal_reason_str)) =
         mission_status_for_terminal_reason(reason, complete_turn_without_follow_up)
     else {
         tracing::debug!(
@@ -13520,6 +13525,22 @@ async fn maybe_finalize_terminal_mission(
         );
         return;
     };
+
+    if reason == TerminalReason::Blocked {
+        match mission_store.list_board_tasks(mission_id).await {
+            Ok(tasks) if tasks.iter().any(|task| !task.status.is_terminal()) => {
+                new_status = MissionStatus::WaitingBackground;
+                terminal_reason_str = "goal_waiting_on_board";
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    "Could not inspect task board for blocked goal; preserving blocked status: {error}"
+                );
+            }
+        }
+    }
 
     match mission_store.get_mission(mission_id).await {
         Ok(Some(mission)) => {
@@ -28138,6 +28159,97 @@ Investigate <service/> failures.
         assert_eq!(updated.terminal_reason, None);
         assert!(updated.resumable);
         assert!(events_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn blocked_goal_with_live_board_work_parks_without_cancelling_workers() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("Board controller"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("mission should be active");
+        store
+            .upsert_board_tasks(
+                mission.id,
+                vec![NewBoardTask {
+                    task_key: "proof-worker".to_string(),
+                    title: "Proof worker".to_string(),
+                    prompt: "Wait for the exact-head proof receipt".to_string(),
+                    backend: "codex".to_string(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("board task should be created");
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel(8);
+
+        maybe_finalize_terminal_mission(
+            &store,
+            &events_tx,
+            mission.id,
+            Some(TerminalReason::Blocked),
+            Some(crate::agents::CompletionConfidence::High),
+            true,
+            Some("Waiting for the proof worker."),
+            "blocked board goal test",
+        )
+        .await;
+
+        let updated = store
+            .get_mission(mission.id)
+            .await
+            .expect("mission lookup should succeed")
+            .expect("mission should exist");
+        assert_eq!(updated.status, MissionStatus::WaitingBackground);
+        assert_eq!(
+            updated.terminal_reason.as_deref(),
+            Some("goal_waiting_on_board")
+        );
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(AgentEvent::MissionStatusChanged {
+                status: MissionStatus::WaitingBackground,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn blocked_goal_without_live_board_work_is_terminally_blocked() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("Blocked goal"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("mission should be active");
+        let (events_tx, _events_rx) = tokio::sync::broadcast::channel(8);
+
+        maybe_finalize_terminal_mission(
+            &store,
+            &events_tx,
+            mission.id,
+            Some(TerminalReason::Blocked),
+            Some(crate::agents::CompletionConfidence::High),
+            true,
+            Some("The required external authority is unavailable."),
+            "blocked goal test",
+        )
+        .await;
+
+        let updated = store
+            .get_mission(mission.id)
+            .await
+            .expect("mission lookup should succeed")
+            .expect("mission should exist");
+        assert_eq!(updated.status, MissionStatus::Blocked);
+        assert_eq!(updated.terminal_reason.as_deref(), Some("goal_blocked"));
     }
 
     #[tokio::test]

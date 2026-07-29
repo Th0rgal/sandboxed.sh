@@ -15,7 +15,7 @@
 //! - After `thread/goal/set`, codex auto-starts a turn — clients only need to
 //!   send `turn/start` for non-goal sessions or follow-up user input.
 //! - Goal terminal status arrives as `thread/goal/updated` with
-//!   `goal.status ∈ {"complete", "budgetLimited"}`. The model's
+//!   `goal.status ∈ {"complete", "budgetLimited", "blocked"}`. The model's
 //!   `update_goal` tool call also surfaces as a normal `item/started` +
 //!   `item/completed`, but the notification is the canonical signal.
 //!

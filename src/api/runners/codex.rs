@@ -1121,6 +1121,7 @@ pub async fn run_codex_turn(
     let mut codex_goal_cancel_deferred = false;
     let is_goal_request = codex_is_goal_request(user_message);
 
+    let mut goal_terminal_status: Option<String> = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled(), if !codex_goal_cancel_deferred => {
@@ -1260,6 +1261,9 @@ pub async fn run_codex_turn(
                         });
                     }
                     ExecutionEvent::GoalStatus { status, objective } => {
+                        if matches!(status.as_str(), "complete" | "budgetLimited" | "blocked") {
+                            goal_terminal_status = Some(status.clone());
+                        }
                         let _ = events_tx.send(AgentEvent::GoalStatus {
                             status,
                             objective,
@@ -1482,8 +1486,16 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
         let cancel_reason = marker.terminal_reason.unwrap_or(TerminalReason::Cancelled);
         AgentResult::failure(final_message, cost_cents).with_terminal_reason(cancel_reason)
     } else if success {
-        AgentResult::success(final_message, cost_cents)
-            .with_terminal_reason(TerminalReason::TurnComplete)
+        match goal_terminal_status.as_deref() {
+            Some("complete") => AgentResult::success(final_message, cost_cents)
+                .with_terminal_reason(TerminalReason::Completed),
+            Some("budgetLimited") => AgentResult::failure(final_message, cost_cents)
+                .with_terminal_reason(TerminalReason::MaxIterations),
+            Some("blocked") => AgentResult::success(final_message, cost_cents)
+                .with_terminal_reason(TerminalReason::Blocked),
+            _ => AgentResult::success(final_message, cost_cents)
+                .with_terminal_reason(TerminalReason::TurnComplete),
+        }
     } else {
         // Distinguish provider concurrency exhaustion from classic rate limits.
         // Refresh-token reuse (ChatGPT OAuth races between sibling missions)

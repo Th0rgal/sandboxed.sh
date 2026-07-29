@@ -131,6 +131,7 @@ fn persisted_terminal_reason(reason: Option<&str>) -> Option<TerminalReason> {
         Some("stalled") => Some(TerminalReason::Stalled),
         Some("infinite_loop") => Some(TerminalReason::InfiniteLoop),
         Some("max_iterations") => Some(TerminalReason::MaxIterations),
+        Some("blocked" | "goal_blocked" | "goal_waiting_on_board") => Some(TerminalReason::Blocked),
         Some("rate_limited") => Some(TerminalReason::RateLimited),
         Some("capacity_limited") => Some(TerminalReason::CapacityLimited),
         Some("auth_error") => Some(TerminalReason::AuthError),
@@ -405,6 +406,9 @@ pub fn classify_outcome(
     if failed {
         return BoardTaskOutcome::Failed;
     }
+    if terminal_reason == Some(TerminalReason::Blocked) {
+        return BoardTaskOutcome::Blocked;
+    }
     // Harness-level failures can surface as a "successful" turn whose entire
     // output is an error banner (e.g. opencode session errors arrive via
     // stderr text, not terminal_reason — observed in the dev smoke test).
@@ -444,16 +448,20 @@ pub fn classify_outcome(
 /// remain valid unless the message is shaped like future intent. Thus terse
 /// reports such as "Fixed the parser." still pass.
 fn has_delivery_evidence(output: &str) -> bool {
-    let explicit_delivery = output
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .is_some_and(|line| {
-            line.trim_start()
-                .trim_start_matches("**")
-                .to_ascii_uppercase()
-                .starts_with("DELIVERED:")
-        });
+    let is_delivery_line = |line: &str| {
+        line.trim_start()
+            .trim_start_matches("**")
+            .to_ascii_uppercase()
+            .starts_with("DELIVERED:")
+    };
+    // The worker contract says to finish *with a line* beginning DELIVERED.
+    // Models commonly put that summary on the first line and follow it with
+    // evidence. Accept the first or last non-empty line, but not an example
+    // marker quoted in the middle of an unfinished progress report.
+    let first_non_empty = output.lines().find(|line| !line.trim().is_empty());
+    let last_non_empty = output.lines().rev().find(|line| !line.trim().is_empty());
+    let explicit_delivery = first_non_empty.is_some_and(is_delivery_line)
+        || last_non_empty.is_some_and(is_delivery_line);
 
     // Normalize common typography produced by rich-text clients before
     // matching progress-only replies. Without this, `I’ll` and an em dash
@@ -2346,6 +2354,14 @@ mod tests {
             classify_outcome(
                 Some(TerminalReason::TurnComplete),
                 true,
+                "DELIVERED: Completed the audit.\n\nEvidence:\n- nine lemmas checked\n- suggested patch follows"
+            ),
+            BoardTaskOutcome::Success
+        );
+        assert_eq!(
+            classify_outcome(
+                Some(TerminalReason::TurnComplete),
+                true,
                 "**DELIVERED:** Fixed the settle path; verified with cargo test."
             ),
             BoardTaskOutcome::Success
@@ -2500,6 +2516,14 @@ mod tests {
                 Some(TerminalReason::TurnComplete),
                 true,
                 "BLOCKED: cannot find the artifact.\nTried X and Y."
+            ),
+            BoardTaskOutcome::Blocked
+        );
+        assert_eq!(
+            classify_outcome(
+                Some(TerminalReason::Blocked),
+                true,
+                "Waiting on a durable receipt."
             ),
             BoardTaskOutcome::Blocked
         );

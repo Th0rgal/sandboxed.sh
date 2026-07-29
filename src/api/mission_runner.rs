@@ -123,7 +123,9 @@ fn failure_class_for_terminal_reason(reason: TerminalReason) -> FailureClass {
         }
         TerminalReason::Cancelled | TerminalReason::ServerShutdown => FailureClass::AgentError,
         TerminalReason::LlmError => FailureClass::ProviderError,
-        TerminalReason::TurnComplete | TerminalReason::Completed => FailureClass::Unknown,
+        TerminalReason::TurnComplete | TerminalReason::Completed | TerminalReason::Blocked => {
+            FailureClass::Unknown
+        }
     }
 }
 
