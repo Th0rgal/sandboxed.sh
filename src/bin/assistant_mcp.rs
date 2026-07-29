@@ -155,6 +155,11 @@ struct StartMissionParams {
     github_pr: Option<String>,
     #[serde(default)]
     writer: Option<bool>,
+    /// Model-visible request for merge capability. It is not authority: a
+    /// trusted Hermes client must independently inject `may_merge` and the
+    /// configured grant source.
+    #[serde(default)]
+    request_merge_authority: Option<bool>,
     /// Whether this mission may perform the final guarded PR merge. Branch
     /// write ownership and merge authority are deliberately separate.
     #[serde(default)]
@@ -191,6 +196,7 @@ fn native_backend_from_agent(agent: Option<&str>) -> Option<String> {
 
 fn mission_start_tags(
     tags: Option<Vec<String>>,
+    request_merge_authority: bool,
     may_merge: bool,
     merge_authority_source: Option<&str>,
     github_pr: Option<&str>,
@@ -207,6 +213,7 @@ fn mission_start_tags(
         tag != "origin:hermes-assistant"
             && tag != "merge-authority:granted"
             && !tag.starts_with("merge-authority-source:")
+            && !tag.starts_with("merge-authority-target:")
             && !tag.starts_with("origin-session:")
             && !tag.starts_with("origin-platform:")
     });
@@ -230,6 +237,12 @@ fn mission_start_tags(
     let authority_source = merge_authority_source
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    if request_merge_authority && !may_merge {
+        return Err(
+            "merge authority was requested but not granted by the trusted Hermes client"
+                .to_string(),
+        );
+    }
     if !may_merge {
         if authority_source.is_some() {
             return Err("merge_authority_source requires may_merge=true".to_string());
@@ -237,9 +250,12 @@ fn mission_start_tags(
         return Ok(tags);
     }
 
-    if github_pr.is_none_or(|value| value.trim().is_empty()) {
-        return Err("may_merge=true requires github_pr".to_string());
-    }
+    let github_pr = github_pr
+        .map(str::trim)
+        .filter(|value| canonical_github_pr_ref(value))
+        .ok_or_else(|| {
+            "may_merge=true requires github_pr in owner/repository#123 form".to_string()
+        })?;
     let authority_source = authority_source
         .ok_or_else(|| "may_merge=true requires merge_authority_source".to_string())?;
     if authority_source.len() > 128
@@ -252,7 +268,29 @@ fn mission_start_tags(
     }
     tags.push("merge-authority:granted".to_string());
     tags.push(format!("merge-authority-source:{authority_source}"));
+    tags.push(format!("merge-authority-target:{github_pr}"));
     Ok(tags)
+}
+
+fn canonical_github_pr_ref(value: &str) -> bool {
+    let Some((repository, number)) = value.split_once('#') else {
+        return false;
+    };
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let mut parts = repository.split('/');
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let valid_component = |component: &str| {
+        !component.is_empty()
+            && component.len() <= 100
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    valid_component(owner) && valid_component(repo)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1045,8 +1083,7 @@ impl AssistantMcp {
                         "intent": {"type": "string", "description": "Intent (e.g. \"review_merge_pr\")."},
                         "github_pr": {"type": "string", "description": "Associated PR ref (e.g. \"owner/repo#123\")."},
                         "writer": {"type": "boolean", "description": "Whether this mission may modify the associated PR branch. Concurrent writers for one PR are rejected."},
-                        "may_merge": {"type": "boolean", "description": "Whether this mission may perform the final guarded PR merge. Set only for a dedicated integrator covered by a durable owner/campaign grant."},
-                        "merge_authority_source": {"type": "string", "description": "Required with may_merge=true. Stable grant slug, for example owner-standing-grant-2026-07-29. Recorded in mission tags for audit provenance."},
+                        "request_merge_authority": {"type": "boolean", "description": "Request final guarded merge capability for a dedicated integrator. This is not self-authorization: the trusted Hermes client grants it only when github_pr matches the operator-configured repository allowlist."},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "desired_state": {"type": "string", "description": "Track state, e.g. waiting_ci / waiting_review / blocked_external."},
                         "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."},
@@ -1547,6 +1584,7 @@ impl AssistantMcp {
             .or_else(|| native_backend_from_agent(params.agent.as_deref()));
         let tags = mission_start_tags(
             params.tags,
+            params.request_merge_authority.unwrap_or(false),
             params.may_merge.unwrap_or(false),
             params.merge_authority_source.as_deref(),
             params.github_pr.as_deref(),
@@ -3520,6 +3558,7 @@ mod tests {
                 " origin:hermes-assistant ".to_string(),
             ]),
             true,
+            true,
             Some("owner-standing-grant-2026-07-29"),
             Some("lfglabs-dev/verity#2209"),
             Some("20260729_080825_2df2a0"),
@@ -3535,16 +3574,20 @@ mod tests {
                 "origin-session:20260729_080825_2df2a0",
                 "origin-platform:desktop",
                 "merge-authority:granted",
-                "merge-authority-source:owner-standing-grant-2026-07-29"
+                "merge-authority-source:owner-standing-grant-2026-07-29",
+                "merge-authority-target:lfglabs-dev/verity#2209"
             ]
         );
     }
 
     #[test]
     fn mission_start_tags_reject_ambiguous_merge_authority() {
-        assert!(mission_start_tags(None, true, None, Some("owner/repo#1"), None, None).is_err());
+        assert!(
+            mission_start_tags(None, true, true, None, Some("owner/repo#1"), None, None).is_err()
+        );
         assert!(mission_start_tags(
             None,
+            true,
             true,
             Some("owner grant"),
             Some("owner/repo#1"),
@@ -3552,9 +3595,12 @@ mod tests {
             None
         )
         .is_err());
-        assert!(mission_start_tags(None, true, Some("owner-grant"), None, None, None).is_err());
+        assert!(
+            mission_start_tags(None, true, true, Some("owner-grant"), None, None, None).is_err()
+        );
         assert!(mission_start_tags(
             None,
+            false,
             false,
             Some("owner-grant"),
             Some("owner/repo#1"),
@@ -3562,6 +3608,19 @@ mod tests {
             None
         )
         .is_err());
+        assert!(mission_start_tags(
+            None,
+            true,
+            true,
+            Some("owner-grant"),
+            Some("owner/repo"),
+            None,
+            None
+        )
+        .is_err());
+        assert!(
+            mission_start_tags(None, true, false, None, Some("owner/repo#1"), None, None).is_err()
+        );
     }
 
     #[test]
