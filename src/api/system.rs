@@ -1675,16 +1675,24 @@ fn generate_hermes_remote_key() -> String {
     format!("hsk_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+fn hermes_remote_env_updates<'a>(port: &'a str, key: &'a str) -> [(&'static str, &'a str); 5] {
+    [
+        ("API_SERVER_ENABLED", "true"),
+        ("API_SERVER_KEY", key),
+        // The native remote-dashboard transport authenticates with the same
+        // bearer. Keep both consumers atomic so a rotation cannot leave the
+        // dashboard on the previous credential.
+        ("HERMES_DASHBOARD_SESSION_TOKEN", key),
+        ("API_SERVER_HOST", "127.0.0.1"),
+        ("API_SERVER_PORT", port),
+    ]
+}
+
 /// Upsert the API server lines (key + enable + bind) into every existing
 /// Hermes env file. Returns `false` when no env file exists (not adopted).
 async fn write_hermes_remote_env(runtime_name: &str, port: u16, key: &str) -> Result<bool, String> {
     let port_str = port.to_string();
-    let updates: [(&str, &str); 4] = [
-        ("API_SERVER_ENABLED", "true"),
-        ("API_SERVER_KEY", key),
-        ("API_SERVER_HOST", "127.0.0.1"),
-        ("API_SERVER_PORT", &port_str),
-    ];
+    let updates = hermes_remote_env_updates(&port_str, key);
     let mut touched = false;
     for env_path in hermes_env_paths(runtime_name) {
         let Ok(contents) = tokio::fs::read_to_string(&env_path).await else {
@@ -5370,14 +5378,32 @@ mod tests {
     use super::{
         chatgpt_ui_driver_install_path, evaluate_debounce, evaluate_deploy_request,
         expand_hermes_env_refs, extract_version_token, hermes_chat_proxy_status,
-        hermes_config_base_url, hermes_config_model_label, hermes_config_yaml, hermes_service_unit,
-        hermes_uses_native_codex, install_versioned_binary_as, is_safe_repo_path,
-        normalize_repo_path, prepare_deploy_backup, prune_deploy_backups, rollback_deployed_binary,
-        sandboxed_service_name_from_path, sanitize_hermes_chat_proxy_headers, select_repo_path,
-        systemd_service_component_from_states, upsert_hermes_mcp_command, ComponentStatus,
-        DebounceDecision, DeployRefusal, DeployRollback, DEPLOY_DEBOUNCE_SECS,
+        hermes_config_base_url, hermes_config_model_label, hermes_config_yaml,
+        hermes_remote_env_updates, hermes_service_unit, hermes_uses_native_codex,
+        install_versioned_binary_as, is_safe_repo_path, normalize_repo_path, prepare_deploy_backup,
+        prune_deploy_backups, rollback_deployed_binary, sandboxed_service_name_from_path,
+        sanitize_hermes_chat_proxy_headers, select_repo_path,
+        systemd_service_component_from_states, upsert_env_lines, upsert_hermes_mcp_command,
+        ComponentStatus, DebounceDecision, DeployRefusal, DeployRollback, DEPLOY_DEBOUNCE_SECS,
         HERMES_SERVICE_DRAIN_DROP_IN,
     };
+
+    #[test]
+    fn hermes_remote_rotation_keeps_dashboard_token_in_sync() {
+        let updates = hermes_remote_env_updates("8642", "fresh-key");
+        let rendered = upsert_env_lines(
+            "API_SERVER_KEY='old'\nHERMES_DASHBOARD_SESSION_TOKEN='old'\n",
+            &updates,
+        );
+        assert_eq!(
+            super::parse_env_value(&rendered, "API_SERVER_KEY").as_deref(),
+            Some("fresh-key")
+        );
+        assert_eq!(
+            super::parse_env_value(&rendered, "HERMES_DASHBOARD_SESSION_TOKEN").as_deref(),
+            Some("fresh-key")
+        );
+    }
 
     #[test]
     fn hermes_chat_proxy_removes_browser_origin_but_keeps_application_headers() {
