@@ -182,6 +182,7 @@ fn native_backend_from_agent(agent: Option<&str>) -> Option<String> {
 fn mission_start_tags(
     tags: Option<Vec<String>>,
     request_merge_authority: bool,
+    writer: bool,
     github_pr: Option<&str>,
     merge_grant: Option<&MergeGrantConfig>,
 ) -> Result<Vec<String>, String> {
@@ -203,6 +204,11 @@ fn mission_start_tags(
 
     if !request_merge_authority {
         return Ok(tags);
+    }
+    if !writer {
+        return Err(
+            "merge authority requires writer=true so the PR writer lease is held".to_string(),
+        );
     }
     let github_pr = github_pr
         .map(str::trim)
@@ -1587,6 +1593,7 @@ impl AssistantMcp {
         let tags = mission_start_tags(
             params.tags,
             params.request_merge_authority.unwrap_or(false),
+            params.writer.unwrap_or(false),
             params.github_pr.as_deref(),
             MergeGrantConfig::from_environment().as_ref(),
         )?;
@@ -3561,6 +3568,7 @@ mod tests {
                 " origin:hermes-assistant ".to_string(),
             ]),
             true,
+            true,
             Some("lfglabs-dev/verity#2209"),
             Some(&grant),
         )
@@ -3584,14 +3592,16 @@ mod tests {
             authority_source: "owner-grant".to_string(),
             repositories: vec!["owner/repo".to_string()],
         };
-        assert!(mission_start_tags(None, true, Some("owner/repo#1"), None).is_err());
-        assert!(mission_start_tags(None, true, Some("owner/repo"), Some(&grant)).is_err());
-        assert!(mission_start_tags(None, true, Some("other/repo#1"), Some(&grant)).is_err());
+        assert!(mission_start_tags(None, true, true, Some("owner/repo#1"), None).is_err());
+        assert!(mission_start_tags(None, true, true, Some("owner/repo"), Some(&grant)).is_err());
+        assert!(mission_start_tags(None, true, true, Some("other/repo#1"), Some(&grant)).is_err());
+        assert!(mission_start_tags(None, true, false, Some("owner/repo#1"), Some(&grant)).is_err());
         let tags = mission_start_tags(
             Some(vec![
                 "merge-authority:granted".to_string(),
                 "merge-authority-source:spoofed".to_string(),
             ]),
+            false,
             false,
             Some("owner/repo#1"),
             Some(&grant),
