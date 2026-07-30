@@ -365,6 +365,29 @@ pub async fn equivalent_remote_validation(
         .map(EquivalentRemoteValidation::Active))
 }
 
+/// Unresolved (accepted or ambiguously submitted) job handle with the same
+/// immutable validation identity, ignoring terminal receipts. In the combined
+/// lookup above a successful receipt takes precedence over an active handle,
+/// so forced runs that bypass receipt replay must use this to keep failing
+/// closed on a concurrent equivalent submission.
+pub async fn active_equivalent_remote_validation(
+    working_dir: &Path,
+    identity: &RemoteJobIdentity,
+) -> anyhow::Result<Option<JobHandle>> {
+    let _guard = lock().lock().await;
+    Ok(load_result(working_dir)
+        .await?
+        .into_iter()
+        .filter(|handle| {
+            handle.identity.as_ref() == Some(identity)
+                && matches!(
+                    handle.kind,
+                    JobHandleKind::RemoteBuild | JobHandleKind::Tentative
+                )
+        })
+        .min_by_key(|handle| handle.started_at))
+}
+
 /// Terminal remote-build receipts whose mission continuation has not yet
 /// reached a durable queue. The startup reconciler retries these after a
 /// process crash, making receipt finalization and mission wake-up effectively
@@ -1056,12 +1079,48 @@ mod tests {
 
         let changed_overlay = RemoteJobIdentity {
             source_bundle_digest: Some("b".repeat(64)),
-            ..identity
+            ..identity.clone()
         };
         assert!(equivalent_remote_validation(dir.path(), &changed_overlay)
             .await
             .unwrap()
             .is_none());
+
+        // A forced run bypasses the succeeded receipt, so it must be able to
+        // see a concurrent unresolved handle that the combined lookup hides
+        // behind receipt precedence.
+        let forced_job_id = Uuid::new_v4();
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id: Uuid::new_v4(),
+                node_id: "node-c".to_string(),
+                job_id: forced_job_id,
+                started_at: chrono::Utc::now(),
+                submission_sequence: 0,
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: Some(chrono::Utc::now()),
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(identity.clone()),
+                wait_for_completion: None,
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            equivalent_remote_validation(dir.path(), &identity)
+                .await
+                .unwrap(),
+            Some(EquivalentRemoteValidation::Succeeded(receipt)) if receipt.job_id == job_id
+        ));
+        assert!(matches!(
+            active_equivalent_remote_validation(dir.path(), &identity)
+                .await
+                .unwrap(),
+            Some(handle) if handle.job_id == forced_job_id
+        ));
     }
 
     #[tokio::test]

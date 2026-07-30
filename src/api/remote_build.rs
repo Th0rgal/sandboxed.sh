@@ -331,7 +331,8 @@ fn minimum_node_protocol_version(source_bundle: Option<&SourceBundle>) -> u32 {
         Some(bundle)
             if bundle.complete
                 || !bundle.deleted_paths.is_empty()
-                || bundle.operations_sha256.is_some() =>
+                || bundle.operations_sha256.is_some()
+                || bundle.files.iter().any(|file| file.executable.is_some()) =>
         {
             crate::remote_node::protocol::NODE_PROTOCOL_VERSION
         }
@@ -912,6 +913,21 @@ async fn equivalent_remote_validation_response(
     identity: &crate::remote_node::job_ledger::RemoteJobIdentity,
     reuse_succeeded_receipt: bool,
 ) -> Option<axum::response::Response> {
+    let active_conflict = |handle: &crate::remote_node::job_ledger::JobHandle| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "code": "REMOTE_VALIDATION_ALREADY_ACTIVE",
+                "message": "an equivalent immutable remote validation is already unresolved; reconcile or attach to its canonical job before retrying",
+                "job_id": handle.job_id,
+                "node_id": handle.node_id,
+                "mission_id": handle.mission_id,
+                "accepted": handle.accepted_at.is_some(),
+                "validation": identity,
+            })),
+        )
+            .into_response()
+    };
     match crate::remote_node::job_ledger::equivalent_remote_validation(
         &state.config.working_dir,
         identity,
@@ -921,11 +937,29 @@ async fn equivalent_remote_validation_response(
         Ok(Some(crate::remote_node::job_ledger::EquivalentRemoteValidation::Succeeded(
             receipt,
         ))) => {
-            // Forced certification runs must still fail closed on an
-            // unresolved equivalent job (handled below), but may bypass
-            // successful-receipt replay to produce an independent receipt.
+            // Forced certification runs may bypass successful-receipt replay
+            // to produce an independent receipt, but must still fail closed on
+            // an unresolved equivalent job: the combined lookup gives receipts
+            // precedence, so probe active handles explicitly here.
             if !reuse_succeeded_receipt {
-                return None;
+                return match crate::remote_node::job_ledger::active_equivalent_remote_validation(
+                    &state.config.working_dir,
+                    identity,
+                )
+                .await
+                {
+                    Ok(Some(handle)) => Some(active_conflict(&handle)),
+                    Ok(None) => None,
+                    Err(error) => Some(
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "remote validation ledger could not be reconciled before submission: {error}"
+                            ),
+                        )
+                            .into_response(),
+                    ),
+                };
             }
             tracing::info!(
                 mission_id = %req.mission_id,
@@ -973,21 +1007,7 @@ async fn equivalent_remote_validation_response(
             }
         }
         Ok(Some(crate::remote_node::job_ledger::EquivalentRemoteValidation::Active(handle))) => {
-            Some(
-                (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "code": "REMOTE_VALIDATION_ALREADY_ACTIVE",
-                        "message": "an equivalent immutable remote validation is already unresolved; reconcile or attach to its canonical job before retrying",
-                        "job_id": handle.job_id,
-                        "node_id": handle.node_id,
-                        "mission_id": handle.mission_id,
-                        "accepted": handle.accepted_at.is_some(),
-                        "validation": identity,
-                    })),
-                )
-                    .into_response(),
-            )
+            Some(active_conflict(&handle))
         }
         Ok(None) => None,
         Err(error) => Some(
@@ -1692,10 +1712,20 @@ mod tests {
         };
         let extended_overlay = SourceBundle {
             manifest_sha256: "d".repeat(64),
-            files: vec![file],
+            files: vec![file.clone()],
             complete: false,
             deleted_paths: vec!["Removed.lean".to_string()],
             operations_sha256: Some("e".repeat(64)),
+        };
+        let executable_overlay = SourceBundle {
+            manifest_sha256: "f".repeat(64),
+            files: vec![crate::remote_node::SourceBundleFile {
+                executable: Some(true),
+                ..file
+            }],
+            complete: false,
+            deleted_paths: Vec::new(),
+            operations_sha256: None,
         };
         assert_eq!(minimum_node_protocol_version(None), 1);
         assert_eq!(minimum_node_protocol_version(Some(&overlay)), 3);
@@ -1707,6 +1737,12 @@ mod tests {
         // v3 node, so extended overlays must also require the current version.
         assert_eq!(
             minimum_node_protocol_version(Some(&extended_overlay)),
+            crate::remote_node::protocol::NODE_PROTOCOL_VERSION
+        );
+        // Executable metadata alone must not fall back to v3 either: a v3
+        // node would build with the wrong file mode and still report success.
+        assert_eq!(
+            minimum_node_protocol_version(Some(&executable_overlay)),
             crate::remote_node::protocol::NODE_PROTOCOL_VERSION
         );
     }

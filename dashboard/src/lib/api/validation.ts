@@ -58,6 +58,9 @@ export interface ValidationReceiptInput {
   exit_code?: number;
   blocked_reason?: string;
   observed_head?: string;
+  /** Required for exact-head classification of dirty-overlay candidates:
+   * must match the campaign candidate's source_bundle_digest. */
+  source_bundle_digest?: string;
   toolchain?: string;
   environment_digest?: string;
   cache?: {
