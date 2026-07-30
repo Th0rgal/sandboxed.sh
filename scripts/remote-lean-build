@@ -321,6 +321,11 @@ request.pop("resume_mission_on_terminal", None)
 # identity. A retry after the branch advances must resume the accepted job for
 # the pinned commit and report it as stale, never submit a duplicate.
 request.pop("expected_head", None)
+# `force_new` is a submission control knob, not build identity: the server
+# also excludes it from the immutable job identity. A forced result must
+# replace the receipt for the same immutable request so ordinary retries
+# resume it instead of replaying a stale local terminal state.
+request.pop("force_new", None)
 fingerprint = {"endpoint": sys.argv[2], "request": request}
 canonical = json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
 print(hashlib.sha256(canonical).hexdigest())

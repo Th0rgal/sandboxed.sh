@@ -901,6 +901,7 @@ async fn equivalent_remote_validation_response(
     state: &AppState,
     req: &RemoteBuildRequest,
     identity: &crate::remote_node::job_ledger::RemoteJobIdentity,
+    reuse_succeeded_receipt: bool,
 ) -> Option<axum::response::Response> {
     match crate::remote_node::job_ledger::equivalent_remote_validation(
         &state.config.working_dir,
@@ -911,6 +912,12 @@ async fn equivalent_remote_validation_response(
         Ok(Some(crate::remote_node::job_ledger::EquivalentRemoteValidation::Succeeded(
             receipt,
         ))) => {
+            // Forced certification runs must still fail closed on an
+            // unresolved equivalent job (handled below), but may bypass
+            // successful-receipt replay to produce an independent receipt.
+            if !reuse_succeeded_receipt {
+                return None;
+            }
             tracing::info!(
                 mission_id = %req.mission_id,
                 canonical_mission_id = %receipt.mission_id,
@@ -1049,8 +1056,9 @@ async fn submit_remote_build(
     // Reuse completed evidence even when every runner is currently offline.
     // This optimistic read is repeated under the placement lock after any
     // explicit network probe, which closes the concurrent-submit race.
-    if req.source_archive.is_none() && !req.force_new {
-        if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await
+    if req.source_archive.is_none() {
+        if let Some(response) =
+            equivalent_remote_validation_response(&state, &req, &identity, !req.force_new).await
         {
             return response;
         }
@@ -1064,8 +1072,9 @@ async fn submit_remote_build(
     // tentative-handle persistence. No network probe runs while this mutex is
     // held, so a slow explicit runner cannot block unrelated auto placement.
     let placement_guard = placement_lock().lock().await;
-    if req.source_archive.is_none() && !req.force_new {
-        if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await
+    if req.source_archive.is_none() {
+        if let Some(response) =
+            equivalent_remote_validation_response(&state, &req, &identity, !req.force_new).await
         {
             return response;
         }
