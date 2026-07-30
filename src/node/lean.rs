@@ -2244,6 +2244,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let log = temp.path().join("job.log");
         let mut bundled_source = source(&"a".repeat(40));
+        bundled_source.repo = "https://github.com/private/lido-proof.git".to_string();
         let mut bundle = source_bundle("lean-toolchain", b"leanprover/lean4:v4.31.0\n");
         bundle.complete = true;
         bundle.manifest_sha256 = bundle_manifest_sha256_for_mode(
@@ -2270,6 +2271,7 @@ mod tests {
                 .unwrap(),
             "leanprover/lean4:v4.31.0\n"
         );
+        assert!(!checkout.join(".git").exists());
         tokio::fs::create_dir_all(checkout.join(".lake/build"))
             .await
             .unwrap();
