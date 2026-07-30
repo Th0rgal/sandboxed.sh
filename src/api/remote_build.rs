@@ -365,11 +365,10 @@ fn repository_url_has_credentials(repo: &str) -> bool {
     let Ok(parsed) = url::Url::parse(repo) else {
         return false;
     };
-    matches!(parsed.scheme(), "http" | "https")
-        && (!parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some())
+    parsed.password().is_some()
+        || (matches!(parsed.scheme(), "http" | "https") && !parsed.username().is_empty())
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
 }
 
 fn remote_job_identity(
@@ -910,7 +909,7 @@ async fn submit_remote_build(
     if repository_url_has_credentials(&req.repo) {
         return (
             StatusCode::BAD_REQUEST,
-            "HTTP repository URL must not contain userinfo, query parameters, or a fragment",
+            "repository URL must not contain credentials, query parameters, or a fragment",
         )
             .into_response();
     }
@@ -946,8 +945,11 @@ async fn submit_remote_build(
     // Reuse completed evidence even when every runner is currently offline.
     // This optimistic read is repeated under the placement lock after any
     // explicit network probe, which closes the concurrent-submit race.
-    if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await {
-        return response;
+    if req.source_archive.is_none() {
+        if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await
+        {
+            return response;
+        }
     }
     if let Err((status, message)) =
         probe_explicit_lean_node(&state, &req.node_id, &requirements).await
@@ -958,8 +960,11 @@ async fn submit_remote_build(
     // tentative-handle persistence. No network probe runs while this mutex is
     // held, so a slow explicit runner cannot block unrelated auto placement.
     let placement_guard = placement_lock().lock().await;
-    if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await {
-        return response;
+    if req.source_archive.is_none() {
+        if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await
+        {
+            return response;
+        }
     }
     let node = match resolve_node(
         &state,
@@ -2317,6 +2322,18 @@ esac
         assert!(receipt.get("token").is_none());
         assert!(receipt.get("repo").is_none());
         assert!(receipt.get("wait").is_none());
+        assert!(
+            receipt.get("source_archive").is_none(),
+            "private source bytes must never be retained in a receipt"
+        );
+        assert!(receipt
+            .get("source_archive_sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|digest| digest.len() == 64));
+        assert!(receipt
+            .get("source_archive_size_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|size| size > 0));
         assert_eq!(
             receipt.get("job_id").and_then(serde_json::Value::as_str),
             Some("11111111-1111-1111-1111-111111111111")

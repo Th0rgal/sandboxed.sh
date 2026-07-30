@@ -85,41 +85,63 @@ root_tree = subprocess.check_output(
     ["git", "-C", str(repo_root), "rev-parse", f"{commit}^{{tree}}"], text=True
 ).strip()
 object_ids = [commit, root_tree]
+has_gitlinks = False
 for record in tree_records:
     if not record:
         continue
     try:
         metadata, _path = record.split(b"\t", 1)
-        _mode, _kind, object_id = metadata.split(b" ", 2)
+        mode, _kind, object_id = metadata.split(b" ", 2)
     except ValueError:
         raise SystemExit("git returned a malformed tree entry while creating source archive")
+    if mode == b"160000":
+        # A gitlink names an object in another repository. Preserve the legacy
+        # public fetch/submodule path instead of creating a knowingly incomplete
+        # archive or asking pack-objects for an object that cannot exist here.
+        has_gitlinks = True
+        continue
     object_ids.append(object_id.decode("ascii"))
-pack = subprocess.run(
-    ["git", "-C", str(repo_root), "pack-objects", "--stdout", "--no-reuse-delta"],
-    input=("\n".join(object_ids) + "\n").encode("ascii"),
-    stdout=subprocess.PIPE,
-    check=True,
-).stdout
 max_archive_bytes = int(
     os.environ.get("REMOTE_BUILD_MAX_SOURCE_ARCHIVE_BYTES", str(32 << 20))
 )
 if max_archive_bytes <= 0:
     raise SystemExit("REMOTE_BUILD_MAX_SOURCE_ARCHIVE_BYTES must be positive")
-if not pack or len(pack) > max_archive_bytes:
-    raise SystemExit(
-        f"source archive is {len(pack)} bytes; maximum is {max_archive_bytes}"
+if has_gitlinks:
+    print(
+        "remote-lean-build: pinned tree contains submodules; using legacy runner fetch",
+        file=sys.stderr,
     )
-archive_hash = hashlib.sha256(
-    b"sandboxed-source-archive-v1\0"
-    + commit.encode("ascii")
-    + b"\0"
-    + pack
-).hexdigest()
-req["source_archive"] = {
-    "sha256": archive_hash,
-    "size_bytes": len(pack),
-    "data_base64": base64.b64encode(pack).decode("ascii"),
-}
+else:
+    pack_process = subprocess.Popen(
+        ["git", "-C", str(repo_root), "pack-objects", "--stdout", "--no-reuse-delta"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    assert pack_process.stdin is not None and pack_process.stdout is not None
+    pack_process.stdin.write(("\n".join(object_ids) + "\n").encode("ascii"))
+    pack_process.stdin.close()
+    pack = pack_process.stdout.read(max_archive_bytes + 1)
+    if len(pack) > max_archive_bytes:
+        pack_process.kill()
+        pack_process.wait()
+        raise SystemExit(
+            f"source archive exceeds maximum of {max_archive_bytes} bytes"
+        )
+    if pack_process.wait() != 0:
+        raise SystemExit("git pack-objects failed while creating source archive")
+    if not pack:
+        raise SystemExit("git pack-objects returned an empty source archive")
+    archive_hash = hashlib.sha256(
+        b"sandboxed-source-archive-v1\0"
+        + commit.encode("ascii")
+        + b"\0"
+        + pack
+    ).hexdigest()
+    req["source_archive"] = {
+        "sha256": archive_hash,
+        "size_bytes": len(pack),
+        "data_base64": base64.b64encode(pack).decode("ascii"),
+    }
 
 def git_paths(*args):
     raw = subprocess.check_output(["git", "-C", str(repo_root), *args])
@@ -414,6 +436,10 @@ request.pop("resume_mission_on_terminal", None)
 bundle = request.pop("source_bundle", None)
 if bundle:
     request["source_bundle_sha256"] = bundle.get("manifest_sha256")
+archive = request.pop("source_archive", None)
+if archive:
+    request["source_archive_sha256"] = archive.get("sha256")
+    request["source_archive_size_bytes"] = archive.get("size_bytes")
 request.update({"state": "ambiguous", "submit_outcome": reason})
 fd, tmp = tempfile.mkstemp(prefix=".remote-build-", dir=os.path.dirname(path))
 try:
@@ -501,6 +527,10 @@ request.pop("resume_mission_on_terminal", None)
 bundle = request.pop("source_bundle", None)
 if bundle:
     request["source_bundle_sha256"] = bundle.get("manifest_sha256")
+archive = request.pop("source_archive", None)
+if archive:
+    request["source_archive_sha256"] = archive.get("sha256")
+    request["source_archive_size_bytes"] = archive.get("size_bytes")
 request.update(response)
 fd, tmp = tempfile.mkstemp(prefix=".remote-build-", dir=os.path.dirname(path))
 try:
@@ -569,6 +599,10 @@ request.pop("resume_mission_on_terminal", None)
 bundle = request.pop("source_bundle", None)
 if bundle:
     request["source_bundle_sha256"] = bundle.get("manifest_sha256")
+archive = request.pop("source_archive", None)
+if archive:
+    request["source_archive_sha256"] = archive.get("sha256")
+    request["source_archive_size_bytes"] = archive.get("size_bytes")
 request.update({"job_id": job_id, "node_id": node_id, "state": "submitted"})
 fd, tmp = tempfile.mkstemp(prefix=".remote-build-", dir=os.path.dirname(path))
 try:

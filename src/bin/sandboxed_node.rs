@@ -136,7 +136,12 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/heartbeat", get(heartbeat))
         .route("/execute", post(execute))
-        .route("/jobs", post(submit_job).get(list_jobs))
+        .route(
+            "/jobs",
+            post(submit_job)
+                .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
+                .get(list_jobs),
+        )
         .route("/jobs/:id", get(get_job))
         .route("/jobs/:id/cancel", post(cancel_job))
         .with_state(state);

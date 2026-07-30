@@ -44,6 +44,8 @@ const DEFAULT_MIN_FREE_GB: u64 = 10;
 const DEFAULT_MAX_SOURCE_BUNDLE_BYTES: u64 = 1 << 20;
 const MAX_SOURCE_BUNDLE_FILES: usize = 256;
 const DEFAULT_MAX_SOURCE_ARCHIVE_BYTES: u64 = 32 << 20;
+const DEFAULT_MAX_SOURCE_ARCHIVE_EXPANDED_BYTES: u64 = 2 << 30;
+const MAX_SOURCE_ARCHIVE_OBJECTS: usize = 100_000;
 
 /// Interval between node-side cache GC passes.
 const GC_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -123,6 +125,14 @@ fn source_archive_max_bytes() -> u64 {
         .unwrap_or(DEFAULT_MAX_SOURCE_ARCHIVE_BYTES)
 }
 
+fn source_archive_expanded_max_bytes() -> u64 {
+    std::env::var("SANDBOXED_NODE_MAX_SOURCE_ARCHIVE_EXPANDED_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_MAX_SOURCE_ARCHIVE_EXPANDED_BYTES)
+}
+
 pub(crate) fn source_archive_sha256(commit: &str, bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"sandboxed-source-archive-v1\0");
@@ -153,8 +163,21 @@ fn decode_source_archive(source: &JobSource, archive: &SourceArchive) -> Result<
     if bytes.len() as u64 != archive.size_bytes {
         return Err("source archive decoded size mismatch".to_string());
     }
-    if source_archive_sha256(&source.commit, &bytes) != archive.sha256 {
+    let computed = source_archive_sha256(&source.commit, &bytes);
+    if !crate::remote_node::protocol::constant_time_eq(
+        computed.as_bytes(),
+        archive.sha256.as_bytes(),
+    ) {
         return Err("source archive commit-bound hash mismatch".to_string());
+    }
+    if bytes.len() < 12 || &bytes[..4] != b"PACK" {
+        return Err("source archive is not a Git pack".to_string());
+    }
+    let object_count = u32::from_be_bytes(bytes[8..12].try_into().expect("fixed pack header"));
+    if object_count as usize > MAX_SOURCE_ARCHIVE_OBJECTS {
+        return Err(format!(
+            "source archive contains more than {MAX_SOURCE_ARCHIVE_OBJECTS} objects"
+        ));
     }
     Ok(bytes)
 }
@@ -257,11 +280,10 @@ fn repo_url_has_credentials(repo: &str) -> bool {
     let Ok(parsed) = url::Url::parse(repo) else {
         return false;
     };
-    matches!(parsed.scheme(), "http" | "https")
-        && (!parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some())
+    parsed.password().is_some()
+        || (matches!(parsed.scheme(), "http" | "https") && !parsed.username().is_empty())
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
 }
 
 /// Validate a lean-build payload before touching the filesystem or network.
@@ -277,7 +299,7 @@ pub fn validate_lean_build(
     }
     if repo_url_has_credentials(&source.repo) {
         return Err(
-            "source.repo HTTP URL must not contain userinfo, query parameters, or a fragment"
+            "source.repo URL must not contain credentials, query parameters, or a fragment"
                 .to_string(),
         );
     }
@@ -848,6 +870,17 @@ fn validate_archive_tree_output(output: &[u8]) -> Result<(), String> {
                 String::from_utf8_lossy(mode)
             ));
         }
+        let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
+        if fields.len() != 3
+            || !matches!(
+                (fields[0], fields[1]),
+                (b"040000", b"tree") | (b"100644" | b"100755", b"blob")
+            )
+            || fields[2].len() != 40
+            || !fields[2].iter().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("malformed source archive tree metadata".to_string());
+        }
         let path = std::str::from_utf8(path)
             .map_err(|_| "source archive paths must be UTF-8".to_string())?;
         if path.starts_with('/')
@@ -906,6 +939,54 @@ async fn import_source_archive(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    let pack_hash_output = std::str::from_utf8(&output.stdout)
+        .map_err(|_| anyhow::anyhow!("git index-pack returned a non-UTF-8 pack id"))?
+        .trim();
+    let pack_hash = pack_hash_output
+        .strip_prefix("pack\t")
+        .unwrap_or(pack_hash_output);
+    if pack_hash.len() != 40 || !pack_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("git index-pack returned an invalid pack id");
+    }
+    let index_path = tmp.join(format!(".git/objects/pack/pack-{pack_hash}.idx"));
+    let verified = tokio::process::Command::new("git")
+        .args(["verify-pack", "-v"])
+        .arg(&index_path)
+        .current_dir(tmp)
+        .output()
+        .await?;
+    if !verified.status.success() {
+        anyhow::bail!("source archive pack verification failed");
+    }
+    let expanded_limit = source_archive_expanded_max_bytes();
+    let mut expanded_bytes = 0_u64;
+    let mut object_count = 0_usize;
+    for line in verified.stdout.split(|byte| *byte == b'\n') {
+        let mut fields = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        let Some(object_id) = fields.next() else {
+            continue;
+        };
+        if object_id.len() != 40 || !object_id.iter().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let _kind = fields.next();
+        let size = fields
+            .next()
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .ok_or_else(|| anyhow::anyhow!("malformed source archive object size"))?;
+        object_count = object_count.saturating_add(1);
+        if object_count > MAX_SOURCE_ARCHIVE_OBJECTS {
+            anyhow::bail!("source archive contains more than {MAX_SOURCE_ARCHIVE_OBJECTS} objects");
+        }
+        expanded_bytes = expanded_bytes.saturating_add(size);
+        if expanded_bytes > expanded_limit {
+            anyhow::bail!("source archive expands to more than {expanded_limit} bytes");
+        }
+    }
+    tokio::fs::write(tmp.join(".git/shallow"), format!("{}\n", source.commit)).await?;
 
     let commit_object = format!("{}^{{commit}}", source.commit);
     run_git_step(
@@ -1046,15 +1127,39 @@ async fn ensure_checkout(
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         return Err(err);
     }
+    let stale = if dest.is_dir() {
+        let stale = parent.join(format!(".stale-{}", uuid::Uuid::new_v4()));
+        tokio::fs::rename(&dest, &stale).await?;
+        Some(stale)
+    } else {
+        None
+    };
     match tokio::fs::rename(&tmp, &dest).await {
-        Ok(()) => Ok(dest),
+        Ok(()) => {
+            if let Some(stale) = stale {
+                let _ = tokio::fs::remove_dir_all(stale).await;
+            }
+            Ok(dest)
+        }
         // A concurrent build (other lock domain) won the rename; reuse theirs.
-        Err(_) if dest.is_dir() => {
+        Err(_)
+            if dest.is_dir()
+                && source.archive.as_ref().is_none_or(|archive| {
+                    std::fs::read_to_string(dest.join(".git/sandboxed-source-archive"))
+                        .is_ok_and(|digest| digest.trim() == archive.sha256)
+                }) =>
+        {
             let _ = tokio::fs::remove_dir_all(&tmp).await;
+            if let Some(stale) = stale {
+                let _ = tokio::fs::remove_dir_all(stale).await;
+            }
             Ok(dest)
         }
         Err(err) => {
             let _ = tokio::fs::remove_dir_all(&tmp).await;
+            if let Some(stale) = stale {
+                let _ = tokio::fs::rename(stale, &dest).await;
+            }
             Err(err.into())
         }
     }
@@ -1650,6 +1755,16 @@ mod tests {
         git(&["config", "user.name", "Archive Test"]);
         git(&["config", "user.email", "archive@example.invalid"]);
         std::fs::create_dir(repo.path().join("Proof")).unwrap();
+        std::fs::write(repo.path().join("Proof/Main.lean"), "baseline\n").unwrap();
+        git(&["add", "Proof/Main.lean"]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "parent",
+        ]);
         std::fs::write(
             repo.path().join("Proof/Main.lean"),
             "theorem ok : True := by trivial\n",
@@ -1750,6 +1865,36 @@ mod tests {
         assert!(std::fs::read_to_string(log)
             .unwrap()
             .contains("source archive verified"));
+        let log_history = Command::new("git")
+            .args(["log", "--format=%H", "-1"])
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
+        assert!(
+            log_history.status.success(),
+            "the archived commit must be a valid shallow history boundary"
+        );
+
+        // A legacy or differently attested cached checkout must be replaced by
+        // the verified archive, never returned after the temporary validation.
+        std::fs::write(checkout.join("Proof/Main.lean"), "stale checkout\n").unwrap();
+        std::fs::write(
+            checkout.join(".git/sandboxed-source-archive"),
+            format!("{}\n", "0".repeat(64)),
+        )
+        .unwrap();
+        let replaced = ensure_checkout(
+            work_root.path(),
+            &source,
+            &work_root.path().join("replace.log"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(replaced.join("Proof/Main.lean")).unwrap(),
+            "theorem ok : True := by trivial\n"
+        );
 
         let invalid_pack = b"not a git pack";
         source.archive = Some(Box::new(SourceArchive {
@@ -1767,7 +1912,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string()
-            .contains("not a valid Git object pack"),
+            .contains("not a Git pack"),
             "a cached checkout must not bypass validation of a different archive"
         );
     }
