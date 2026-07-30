@@ -507,11 +507,7 @@ fn terminal_verdict_from_content(content: &str) -> Option<&'static str> {
     // conclusion wins over status prose or quoted historical verdicts above.
     for raw_line in content.lines().rev().take(80) {
         let line = strip_markdown_prefixes(raw_line.trim());
-        let normalized = line
-            .replace('`', "")
-            .replace('*', "")
-            .trim()
-            .to_ascii_uppercase();
+        let normalized = line.replace(['`', '*'], "").trim().to_ascii_uppercase();
         let explicit = normalized
             .strip_prefix("VERDICT:")
             .or_else(|| normalized.strip_prefix("FINAL DECISION:"))
