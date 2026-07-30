@@ -705,7 +705,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/spark", super::spark::routes())
         // Remote lean-build dispatch: same per-mission HMAC capability-token
         // model as spark (domain-separated), verified inside the handlers,
-        // so it also bypasses require_auth.
+        // so it also bypasses require_auth. Source payloads are bounded before
+        // base64 encoding; allow enough wire overhead for the archive/bundle
+        // and manifest instead of Axum's 2 MiB default.
         .nest(
             "/api/remote-build",
             super::remote_build::routes().layer(DefaultBodyLimit::max(50 * 1024 * 1024)),

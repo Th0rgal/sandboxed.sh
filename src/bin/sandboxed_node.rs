@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path as AxumPath, Query, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -136,10 +136,13 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/heartbeat", get(heartbeat))
         .route("/execute", post(execute))
+        // Private-source jobs carry bounded payloads before base64 encoding,
+        // so this route needs the same bounded wire allowance as the core
+        // `/api/remote-build` endpoint.
         .route(
             "/jobs",
             post(submit_job)
-                .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
+                .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
                 .get(list_jobs),
         )
         .route("/jobs/:id", get(get_job))
