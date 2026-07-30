@@ -531,6 +531,7 @@ async fn create_workspace(
             mcps_replace_defaults,
             config_profile: config_profile.clone(),
             resolved_git_credentials: None,
+            read_only_command_guard_dir: None,
             harness_versions: None,
         },
         WorkspaceType::Container => {

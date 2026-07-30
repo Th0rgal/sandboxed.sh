@@ -6,10 +6,10 @@ description: >
   to exhaust its budget instead of giving up, and send targeted hints. Trigger
   terms: mission, sandboxed.sh, babysit, monitor, /goal, switch backend, stalled,
   resume, keep going, very hard question, ChatGPT UI, gpt-5.6-pro.
-version: 1.3.0
 metadata:
+  version: 1.4.0
   policy: chatgpt-ui-pool
-  policy_version: 1.3.0
+  policy_version: 1.4.0
 ---
 
 # Hermes Mission Control
@@ -229,6 +229,48 @@ this section must stay in sync with it.
    nothing from you. Check back later.
 6. **Escalate genuine blockers.** Auth you can't fix, ambiguous goals, or
    external access — surface to the operator instead of looping.
+
+## PR repair and certification campaigns
+
+Use one frozen-head campaign instead of alternating a new reviewer and writer
+for every finding.
+
+1. **Freeze discovery.** Pin one SHA. Start 1–3 bounded reviewers with
+   `writer: false`, different reasoning routes when useful, and no repair
+   authority. Collect every reproduced finding into one ledger. Do not push
+   between reviewers.
+2. **Repair once.** Start exactly one `writer: true` mission after discovery
+   settles. Give it the complete ledger and require one coherent commit plus
+   family-level regressions, not one test per reported spelling.
+3. **Certify once.** Start a fresh `writer: false` mission on the successor
+   SHA. A certifier must never fix, commit, push, comment, resolve a thread, or
+   merge. Sandboxed.sh enforces git/gh mutation guards for this capability.
+4. **Integrate separately.** Only after `VERDICT: CLEAN`, give the sole writer
+   or a merge-owner mission the authority to resolve threads and merge. Never
+   let the certifier certify a SHA it authored.
+
+Every certifier must end with exactly one terminal line:
+
+```text
+VERDICT: CLEAN
+VERDICT: BLOCKED
+VERDICT: INFRA_BLOCKED
+```
+
+Treat the digest's structured `terminal_verdict` as authoritative over its
+short description. `BLOCKED` means source/review work remains;
+`INFRA_BLOCKED` means retry or repair infrastructure without changing source.
+
+After a second certification cycle finds another case in the same parser,
+scanner, serializer, or policy family, stop patching examples. Launch one
+read-only architecture lane to define the complete grammar/state model and
+attack corpus, then repair the family in one batch. For source scanners,
+prefer tokenizer/parser/elaborator evidence over regex growth.
+
+Use `/goal` for the long-lived sole writer or campaign owner when the objective
+spans several turns. Keep reviewers as bounded task missions. Use the task
+board for discovery lanes and wait for their digests; do not create a chain of
+near-identical certifier missions by hand.
 
 ## Check-in cadence for multi-day missions
 

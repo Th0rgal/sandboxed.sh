@@ -254,6 +254,11 @@ pub struct Workspace {
     /// so env injection does not re-read the connection file.
     #[serde(skip, default)]
     pub resolved_git_credentials: Option<git_credentials::GitCredentialConfig>,
+    /// Host-side directory containing the per-mission read-only git/gh guards.
+    /// WorkspaceExec translates it into the container namespace before adding
+    /// it to PATH/GH_CONFIG_DIR.
+    #[serde(skip, default)]
+    pub read_only_command_guard_dir: Option<PathBuf>,
     /// Harness CLI versions last probed inside this container workspace
     /// (after harness bootstrap on build/rebuild). None = never probed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -512,6 +517,7 @@ impl Workspace {
             mcps_replace_defaults: true,
             config_profile: None,
             resolved_git_credentials: None,
+            read_only_command_guard_dir: None,
             harness_versions: None,
         }
     }
@@ -540,6 +546,7 @@ impl Workspace {
             mcps: Vec::new(),
             mcps_replace_defaults: true,
             resolved_git_credentials: None,
+            read_only_command_guard_dir: None,
             harness_versions: None,
         }
     }
@@ -734,6 +741,7 @@ impl WorkspaceStore {
                     mcps_replace_defaults: true,
                     config_profile: None,
                     resolved_git_credentials: None,
+                    read_only_command_guard_dir: None,
                     harness_versions: None,
                 };
 
@@ -2345,9 +2353,99 @@ pub async fn prepare_mission_workspace_with_skills(
     mission_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
     prepare_mission_workspace_with_skills_backend(
-        workspace, mcp, library, mission_id, "opencode", None, None, None, None,
+        workspace, mcp, library, mission_id, "opencode", None, None, None, None, true,
     )
     .await
+}
+
+#[cfg(unix)]
+async fn install_read_only_command_guards(dir: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let guard_dir = dir.join(".sandboxed-sh").join("read-only-bin");
+    tokio::fs::create_dir_all(&guard_dir).await?;
+    let git_guard = guard_dir.join("git");
+    let gh_guard = guard_dir.join("gh");
+    let git_script = r#"#!/bin/sh
+set -eu
+subcommand=""
+skip_next=0
+for arg in "$@"; do
+  if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
+  case "$arg" in
+    -C|-c|--git-dir|--work-tree|--namespace) skip_next=1 ;;
+    -*) ;;
+    *) subcommand="$arg"; break ;;
+  esac
+done
+case "$subcommand" in
+  push|commit|merge|rebase|tag|am|cherry-pick|revert)
+    echo "sandboxed.sh: git $subcommand is disabled for this pr-readonly mission" >&2
+    exit 73
+    ;;
+esac
+PATH="${PATH#*:}" exec git "$@"
+"#;
+    let gh_script = r#"#!/bin/sh
+set -eu
+first="${1:-}"
+second="${2:-}"
+deny=""
+case "$first:$second" in
+  pr:create|pr:merge|pr:close|pr:edit|pr:ready|pr:reopen|pr:comment|pr:review|\
+  issue:create|issue:close|issue:edit|issue:reopen|issue:comment|\
+  workflow:run|workflow:enable|workflow:disable|\
+  run:cancel|run:rerun|run:delete|\
+  release:create|release:delete|release:edit|release:upload|\
+  repo:create|repo:delete|repo:edit|repo:rename|\
+  label:create|label:delete|label:edit)
+    deny="$first $second"
+    ;;
+  secret:*|variable:*) deny="$first" ;;
+esac
+if [ "$first" = api ]; then
+  graphql=0
+  mutation=0
+  explicit_write=0
+  fields=0
+  expect_method=0
+  for arg in "$@"; do
+    if [ "$expect_method" = 1 ]; then
+      case "$arg" in POST|PATCH|PUT|DELETE) explicit_write=1 ;; esac
+      expect_method=0
+      continue
+    fi
+    [ "$arg" = graphql ] && graphql=1
+    case "$arg" in
+      *mutation*) mutation=1 ;;
+      -X|--method) expect_method=1 ;;
+      -XPOST|-XPATCH|-XPUT|-XDELETE|--method=POST|--method=PATCH|--method=PUT|--method=DELETE)
+        explicit_write=1 ;;
+      -f|--field|-F|--raw-field|--input|--input=*) fields=1 ;;
+    esac
+  done
+  if [ "$mutation" = 1 ] || [ "$explicit_write" = 1 ] || { [ "$fields" = 1 ] && [ "$graphql" = 0 ]; }; then
+    deny="api mutation"
+  fi
+fi
+if [ -n "$deny" ]; then
+  echo "sandboxed.sh: gh $deny is disabled for this pr-readonly mission" >&2
+  exit 73
+fi
+PATH="${PATH#*:}" exec gh "$@"
+"#;
+    tokio::fs::write(&git_guard, git_script).await?;
+    tokio::fs::write(&gh_guard, gh_script).await?;
+    tokio::fs::set_permissions(&git_guard, std::fs::Permissions::from_mode(0o755)).await?;
+    tokio::fs::set_permissions(&gh_guard, std::fs::Permissions::from_mode(0o755)).await?;
+    Ok(guard_dir)
+}
+
+#[cfg(not(unix))]
+async fn install_read_only_command_guards(dir: &Path) -> anyhow::Result<PathBuf> {
+    let guard_dir = dir.join(".sandboxed-sh").join("read-only-bin");
+    tokio::fs::create_dir_all(&guard_dir).await?;
+    Ok(guard_dir)
 }
 
 /// Read custom providers from the ai_providers.json file.
@@ -2412,12 +2510,21 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     config_profile: Option<&str>,
     boss_user_id: Option<&str>,
     app_working_dir: Option<&Path>,
+    allow_git_mutations: bool,
 ) -> anyhow::Result<PathBuf> {
     // Mission workspace directory lives under the selected workspace root.
     // This keeps filesystem and config effects scoped to the mission.
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
     install_remote_build_wrapper(workspace, mission_id).await?;
+    // Reviewers still need authenticated read access to private repositories.
+    // The capability boundary is therefore enforced by command guards and
+    // push-url overrides rather than by removing the connected account.
+    workspace.read_only_command_guard_dir = if allow_git_mutations {
+        None
+    } else {
+        Some(install_read_only_command_guards(&dir).await?)
+    };
 
     // Get custom providers: use provided list or read from file
     let providers_from_file;
@@ -2666,6 +2773,13 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         mission_id,
         app_working_dir,
     );
+    if !allow_git_mutations {
+        tracing::info!(
+            mission = %mission_id,
+            workspace = %workspace.name,
+            "PR read-only capability active; installed git/gh mutation guards"
+        );
+    }
 
     // Sync native opencode agents from profile into the workspace path read by
     // vanilla `opencode`.
@@ -4024,6 +4138,44 @@ pub async fn read_sandboxed_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_command_guards_block_mutations_and_allow_git_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let guard_dir = install_read_only_command_guards(root.path()).await.unwrap();
+        let original_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+        let guarded_path = format!("{}:{original_path}", guard_dir.display());
+
+        let read = std::process::Command::new(guard_dir.join("git"))
+            .arg("--version")
+            .env("PATH", &guarded_path)
+            .output()
+            .unwrap();
+        assert!(read.status.success(), "git read failed: {:?}", read);
+
+        let push = std::process::Command::new(guard_dir.join("git"))
+            .arg("push")
+            .env("PATH", &guarded_path)
+            .output()
+            .unwrap();
+        assert_eq!(push.status.code(), Some(73));
+        assert!(String::from_utf8_lossy(&push.stderr).contains("pr-readonly"));
+
+        let comment = std::process::Command::new(guard_dir.join("gh"))
+            .args(["pr", "comment", "1", "--body", "must not publish"])
+            .env("PATH", &guarded_path)
+            .output()
+            .unwrap();
+        assert_eq!(comment.status.code(), Some(73));
+
+        let api_write = std::process::Command::new(guard_dir.join("gh"))
+            .args(["api", "repos/o/r/issues/1", "--method", "PATCH"])
+            .env("PATH", &guarded_path)
+            .output()
+            .unwrap();
+        assert_eq!(api_write.status.code(), Some(73));
+    }
 
     fn all_bootstrap_flags() -> HarnessBootstrapFlags {
         HarnessBootstrapFlags {

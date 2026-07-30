@@ -26,10 +26,19 @@ Workers inherit your workspace by default — same container, same mounts, same 
 9. On `failed` or `interrupted`, inspect once, then either `resume_worker` to recover or replace the worker immediately.
 10. If you choose not to delegate something, state the blocker explicitly.
 11. Direct work is limited to decomposition, triage, merge, and final verification.
+12. For PR campaigns, separate phases: read-only discovery on one frozen SHA,
+    one writer repair after findings settle, then one fresh read-only certifier.
+    Never interleave pushes with discovery reviews.
+13. A task with `writer: false` is a capability boundary. It may inspect and
+    build, but may not edit, commit, push, comment, resolve, approve, or merge.
+14. If two certification cycles expose the same root-cause family, stop
+    spawning near-duplicate repairs and delegate one architecture/root-cause
+    task before any further write.
 
 ## Backend Guide
 
-- `codex` + `gpt-5.5`: default for code changes
+- `codex` + `gpt-5.6-terra`: default for bounded code changes
+- `codex` + `gpt-5.6-sol`: hard blockers, formal proofs, and adversarial certification
 - `gemini` + `gemini-3.1-pro-preview` or `gemini-2.5-pro`: good for proofs and parallel analysis
 - `claudecode` + Claude models: careful broad edits
 - `opencode`: cheap redundancy
@@ -51,7 +60,9 @@ Always match `backend` to `model_override`.
 1. Call `get_workspace_layout` once. Use its paths in worker prompts and worktree setup.
 2. If backend choice matters, call `get_backend_auth_status` once before spawning. Do not infer auth from shell env vars, CLI login status, or missing `*_API_KEY` in Bash.
 3. Build a task graph with `ready`, `blocked`, and `depends_on`.
-4. Spawn every ready task now.
+4. For a PR campaign, register every read-only discovery task first. Make the
+   single repair task depend on all discovery tasks, and certification depend
+   on repair. Otherwise spawn every ready task now.
 5. Wait with `wait_for_any_worker`.
 6. React immediately:
    - `completed`: verify the actual result, then integrate or reject and spawn newly-ready work

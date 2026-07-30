@@ -41,6 +41,10 @@ new question specifically requires.
 5. **Stay available.** Finish each answer cleanly — your turn ending is what
    delivers the answer to the executor. Do not start open-ended background
    work.
+6. **Aggregate before repair.** During a frozen-head review campaign, keep
+   looking for sibling cases in the same root-cause family. Return one bounded
+   ledger after the family is explored; do not ask the executor to push after
+   every example.
 
 ## Answer shape
 

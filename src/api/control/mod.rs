@@ -502,6 +502,69 @@ fn extract_short_description_from_recent_history(
         .or_else(|| extract_short_description_from_recent_role(history, "user", max_len))
 }
 
+fn terminal_verdict_from_content(content: &str) -> Option<&'static str> {
+    // The contract asks for a terminal line. Scan backward so a long review's
+    // conclusion wins over status prose or quoted historical verdicts above.
+    for raw_line in content.lines().rev().take(80) {
+        let line = strip_markdown_prefixes(raw_line.trim());
+        let normalized = line
+            .replace('`', "")
+            .replace('*', "")
+            .trim()
+            .to_ascii_uppercase();
+        let explicit = normalized
+            .strip_prefix("VERDICT:")
+            .or_else(|| normalized.strip_prefix("FINAL DECISION:"))
+            .map(str::trim);
+        let value = explicit.unwrap_or(normalized.as_str());
+        if value == "INFRA_BLOCKED"
+            || value == "INFRA BLOCKED"
+            || value.starts_with("INFRA_BLOCKED ")
+            || value.starts_with("INFRA BLOCKED ")
+        {
+            return Some("infra_blocked");
+        }
+        if value == "BLOCKED"
+            || value == "NOT CERTIFIED"
+            || value.starts_with("BLOCKED ")
+            || value.starts_with("NOT CERTIFIED ")
+        {
+            return Some("blocked");
+        }
+        if value == "CLEAN"
+            || value == "CERTIFIED"
+            || value == "MERGE READY"
+            || value == "MERGE-READY"
+            || value.starts_with("CLEAN ")
+            || value.starts_with("CERTIFIED ")
+            || value.starts_with("MERGE READY ")
+            || value.starts_with("MERGE-READY ")
+        {
+            return Some("clean");
+        }
+    }
+    None
+}
+
+fn terminal_verdict_from_history(history: &[(String, String)]) -> Option<&'static str> {
+    history
+        .iter()
+        .rev()
+        .find(|(role, content)| role == "assistant" && !content.trim().is_empty())
+        .and_then(|(_, content)| terminal_verdict_from_content(content))
+}
+
+fn terminal_verdict_description(verdict: &str) -> &'static str {
+    match verdict {
+        "clean" => "VERDICT: CLEAN — exact-head review reported no blocking finding.",
+        "blocked" => "VERDICT: BLOCKED — exact-head review reported unresolved blockers.",
+        "infra_blocked" => {
+            "VERDICT: INFRA_BLOCKED — verification could not complete because of infrastructure."
+        }
+        _ => "VERDICT: UNKNOWN",
+    }
+}
+
 fn extract_short_description_from_first_successful_assistant(
     history: &[(String, String)],
     max_len: usize,
@@ -1904,6 +1967,7 @@ async fn generate_mission_metadata_updates(
     let has_successful_assistant_reply = history
         .iter()
         .any(|(role, content)| role == "assistant" && assistant_reply_is_successful(content));
+    let deterministic_terminal_verdict = terminal_verdict_from_history(history);
     let should_bootstrap_title_from_first_assistant =
         title_missing && has_successful_assistant_reply;
     let should_bootstrap_short_description_from_first_assistant = has_successful_assistant_reply
@@ -1953,7 +2017,11 @@ async fn generate_mission_metadata_updates(
             }
 
             if needs_description {
-                if let Some(candidate) = llm_status {
+                if let Some(candidate) = deterministic_terminal_verdict
+                    .map(terminal_verdict_description)
+                    .map(str::to_string)
+                    .or(llm_status)
+                {
                     if should_accept_metadata_candidate(
                         mission.short_description.as_deref(),
                         &candidate,
@@ -2017,7 +2085,9 @@ async fn generate_mission_metadata_updates(
     };
 
     let short_description_candidate = if needs_description {
-        if should_bootstrap_short_description_from_first_assistant {
+        if let Some(verdict) = deterministic_terminal_verdict {
+            Some(terminal_verdict_description(verdict).to_string())
+        } else if should_bootstrap_short_description_from_first_assistant {
             extract_short_description_from_first_successful_assistant(history, 160)
                 .or_else(|| extract_short_description_from_history(history, 160))
         } else if should_refresh {
@@ -5544,6 +5614,12 @@ pub async fn get_mission_digest(
         .rev()
         .find(|e| e.role == "assistant" && !e.content.trim().is_empty())
         .map(|e| truncate_chars(&e.content, 2000));
+    let terminal_verdict = mission
+        .history
+        .iter()
+        .rev()
+        .find(|entry| entry.role == "assistant" && !entry.content.trim().is_empty())
+        .and_then(|entry| terminal_verdict_from_content(&entry.content));
     let last_user = mission
         .history
         .iter()
@@ -5582,6 +5658,7 @@ pub async fn get_mission_digest(
         "awaiting_kind": mission.awaiting_kind.map(|k| k.as_str()),
         "terminal_reason": mission.terminal_reason,
         "short_description": mission.short_description,
+        "terminal_verdict": terminal_verdict,
         "backend": mission.backend,
         "model_override": mission.model_override,
         "model_effort": mission.model_effort,
@@ -15199,6 +15276,7 @@ async fn control_actor_loop(
                                                 mission.model_effort.clone(),
                                                 mission.fast_mode,
                                             );
+                                            runner.pr_readonly = mission.project.tags.iter().any(|tag| tag == "pr-readonly");
                                             runner.working_directory = mission.working_directory.clone();
                                             runner.user_id = Some(session_user_id.clone());
                                             // Load existing history
@@ -15654,7 +15732,7 @@ async fn control_actor_loop(
                                 // Use the mission ID that was captured when message was queued
                                 // This prevents race conditions where current_mission changes between queueing and execution
                                 let mission_id = msg_target_mid;
-                                let (workspace_id, model_override, model_effort, fast_mode, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
+                                let (workspace_id, model_override, model_effort, fast_mode, mission_agent, backend_id, session_id, mission_config_profile, pr_readonly) = if let Some(mid) = mission_id {
                                     match mission_store.get_mission(mid).await {
                                         Ok(Some(mission)) => {
                                             if let Err(error) = activate_mission_for_message(
@@ -15686,6 +15764,7 @@ async fn control_actor_loop(
                                                 Some(mission.backend.clone()),
                                                 mission.session_id.clone(),
                                                 mission.config_profile.clone(),
+                                                mission.project.tags.iter().any(|tag| tag == "pr-readonly"),
                                             )
                                         }
                                         Ok(None) => {
@@ -15693,7 +15772,7 @@ async fn control_actor_loop(
                                                 "Mission {} not found while resolving workspace",
                                                 mid
                                             );
-                                            (None, None, None, false, None, None, None, None)
+                                            (None, None, None, false, None, None, None, None, false)
                                         }
                                         Err(e) => {
                                             tracing::warn!(
@@ -15701,11 +15780,11 @@ async fn control_actor_loop(
                                                 mid,
                                                 e
                                             );
-                                            (None, None, None, false, None, None, None, None)
+                                            (None, None, None, false, None, None, None, None, false)
                                         }
                                     }
                                 } else {
-                                    (None, None, None, false, None, None, None, None)
+                                    (None, None, None, false, None, None, None, None, false)
                                 };
                                 // Per-message agent overrides mission agent
                                 let agent_override = per_msg_agent.or(mission_agent);
@@ -15792,6 +15871,7 @@ async fn control_actor_loop(
                                         false, // force_session_resume: regular message, not a resume
                                         mission_config_profile,
                                         Some(user_id_for_turn),
+                                        pr_readonly,
                                     )
                                     .await;
                                     (mid, msg, result)
@@ -16174,6 +16254,7 @@ async fn control_actor_loop(
                                 mission.model_effort.clone(),
                                 mission.fast_mode,
                             );
+                            runner.pr_readonly = mission.project.tags.iter().any(|tag| tag == "pr-readonly");
                             runner.working_directory = mission.working_directory.clone();
                             runner.user_id = Some(session_user_id.clone());
 
@@ -16803,6 +16884,7 @@ async fn control_actor_loop(
                                         mission.model_effort.clone(),
                                         mission.fast_mode,
                                     );
+                                    runner.pr_readonly = mission.project.tags.iter().any(|tag| tag == "pr-readonly");
                                     runner.working_directory = mission.working_directory.clone();
                                     runner.user_id = Some(session_user_id.clone());
                                     for entry in &mission.history {
@@ -17000,6 +17082,7 @@ async fn control_actor_loop(
                                         let agent_override = mission.agent.clone();
                                         let session_id = mission.session_id.clone();
                                         let mission_config_profile = mission.config_profile.clone();
+                                        let pr_readonly = mission.project.tags.iter().any(|tag| tag == "pr-readonly");
                                         running_cancel = Some(cancel.clone());
                                         // Capture which mission this task is working on (the resumed mission)
                                         running_mission_id = Some(mission_id);
@@ -17056,6 +17139,7 @@ async fn control_actor_loop(
                                                 true, // force_session_resume: this is a resume operation
                                                 mission_config_profile,
                                                 Some(user_id_for_turn),
+                                                pr_readonly,
                                             )
                                             .await;
                                             (mid, msg, result)
@@ -18052,7 +18136,7 @@ async fn control_actor_loop(
                     // Use the mission ID that was captured when message was queued.
                     // This prevents races where current_mission changes between
                     // queueing and execution.
-                    let (workspace_id, model_override, model_effort, fast_mode, mission_agent, backend_id, session_id, mission_config_profile) = if let Some(mid) = mission_id {
+                    let (workspace_id, model_override, model_effort, fast_mode, mission_agent, backend_id, session_id, mission_config_profile, pr_readonly) = if let Some(mid) = mission_id {
                         match mission_store.get_mission(mid).await {
                             Ok(Some(mission)) => (
                                 Some(mission.workspace_id),
@@ -18063,13 +18147,14 @@ async fn control_actor_loop(
                                 Some(mission.backend.clone()),
                                 mission.session_id.clone(),
                                 mission.config_profile.clone(),
+                                mission.project.tags.iter().any(|tag| tag == "pr-readonly"),
                             ),
                             Ok(None) => {
                                 tracing::warn!(
                                     "Mission {} not found while resolving workspace",
                                     mid
                                 );
-                                (None, None, None, false, None, None, None, None)
+                                (None, None, None, false, None, None, None, None, false)
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -18077,11 +18162,11 @@ async fn control_actor_loop(
                                     mid,
                                     e
                                 );
-                                (None, None, None, false, None, None, None, None)
+                                (None, None, None, false, None, None, None, None, false)
                             }
                         }
                     } else {
-                        (None, None, None, false, None, None, None, None)
+                        (None, None, None, false, None, None, None, None, false)
                     };
                     // Per-message agent overrides mission agent
                     let agent_override = per_msg_agent.or(mission_agent);
@@ -18121,6 +18206,7 @@ async fn control_actor_loop(
                             false, // force_session_resume: continuation turn, not a resume
                             mission_config_profile,
                             Some(user_id_for_turn),
+                            pr_readonly,
                         )
                         .await;
                         (mid, msg, result)
@@ -19476,6 +19562,7 @@ async fn run_single_control_turn(
     force_session_resume: bool,
     mission_config_profile: Option<String>,
     boss_user_id: Option<String>,
+    pr_readonly: bool,
 ) -> crate::agents::AgentResult {
     let is_claudecode = backend_id.as_deref() == Some("claudecode");
     let is_codex = backend_id.as_deref() == Some("codex");
@@ -19547,6 +19634,7 @@ async fn run_single_control_turn(
             effective_config_profile.as_deref(),
             boss_user_id.as_deref(),
             Some(&config.working_dir),
+            !pr_readonly,
         ))
         .await
         {
@@ -19621,6 +19709,9 @@ async fn run_single_control_turn(
         &user_message,
     ));
     convo.push_str("\n\nInstructions:\n- Respond to the CURRENT user request. The conversation history is context only: do not resume or continue earlier tasks from it unless the current request asks you to.\n- Use available tools as needed.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n");
+    if pr_readonly {
+        convo.push_str("\nPR READ-ONLY CAPABILITY (server-enforced): inspect and run verification only. Do not edit tracked files, commit, push, comment, resolve threads, approve, close, or merge. End with exactly one explicit terminal line: `VERDICT: CLEAN`, `VERDICT: BLOCKED`, or `VERDICT: INFRA_BLOCKED`. Git/gh mutation commands are disabled.\n");
+    }
     let _task = match crate::task::Task::new(convo.clone(), Some(1000)) {
         Ok(t) => t,
         Err(e) => {
@@ -26593,6 +26684,31 @@ And the report:
         let history = vec![("user".to_string(), "Hi".to_string())];
         let extracted = extract_short_description_from_history(&history, 160);
         assert_eq!(extracted.as_deref(), Some("Hi"));
+    }
+
+    #[test]
+    fn terminal_verdict_prefers_explicit_blocked_over_optimistic_body() {
+        let content = "Final decision: **BLOCKED** on exact head abc.\n\nAll existing builds pass.";
+        assert_eq!(terminal_verdict_from_content(content), Some("blocked"));
+        assert_eq!(
+            terminal_verdict_description("blocked"),
+            "VERDICT: BLOCKED — exact-head review reported unresolved blockers."
+        );
+    }
+
+    #[test]
+    fn terminal_verdict_does_not_treat_historical_mentions_as_current() {
+        let content =
+            "Review complete. The prior certifier was BLOCKED, but this head still needs analysis.";
+        assert_eq!(terminal_verdict_from_content(content), None);
+    }
+
+    #[test]
+    fn terminal_verdict_recognizes_clean_contract() {
+        assert_eq!(
+            terminal_verdict_from_content("VERDICT: CLEAN\nExact head verified."),
+            Some("clean")
+        );
     }
 
     #[test]

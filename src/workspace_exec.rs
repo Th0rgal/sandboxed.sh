@@ -1372,6 +1372,37 @@ impl WorkspaceExec {
             );
         }
 
+        if let Some(guard_dir) = self.workspace.read_only_command_guard_dir.as_ref() {
+            let guard_dir = self.translate_path_for_container(guard_dir);
+            let existing_path = merged
+                .get("PATH")
+                .cloned()
+                .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
+            merged.insert("PATH".to_string(), format!("{guard_dir}:{existing_path}"));
+            merged.insert("SANDBOXED_SH_PR_READONLY".to_string(), "1".to_string());
+            merged.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
+            merged.insert("GCM_INTERACTIVE".to_string(), "never".to_string());
+            // Standard pushes are blocked twice: the PATH guard rejects the
+            // subcommand and the per-process config gives common remotes an
+            // unusable push URL. Authenticated GETs remain available for
+            // private-repository review through gh.
+            for remote in ["origin", "upstream"] {
+                let index = merged
+                    .get("GIT_CONFIG_COUNT")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                merged.insert("GIT_CONFIG_COUNT".to_string(), (index + 1).to_string());
+                merged.insert(
+                    format!("GIT_CONFIG_KEY_{index}"),
+                    format!("remote.{remote}.pushurl"),
+                );
+                merged.insert(
+                    format!("GIT_CONFIG_VALUE_{index}"),
+                    "disabled://pr-readonly".to_string(),
+                );
+            }
+        }
+
         merged
     }
 

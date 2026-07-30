@@ -2613,6 +2613,11 @@ pub struct MissionRunner {
     /// Request Codex fast service tier for supported GPT models.
     pub fast_mode: bool,
 
+    /// Durable PR capability copied from the mission's `pr-readonly` tag.
+    /// This controls process-level git/gh mutation guards; prompt wording is
+    /// never treated as authority.
+    pub pr_readonly: bool,
+
     /// Message queue for this mission
     pub queue: VecDeque<QueuedMessage>,
 
@@ -2717,6 +2722,7 @@ impl MissionRunner {
             model_override,
             model_effort,
             fast_mode,
+            pr_readonly: false,
             queue: VecDeque::new(),
             inflight_message: None,
             history: Vec::new(),
@@ -3018,6 +3024,7 @@ impl MissionRunner {
         let model_override = self.model_override.clone();
         let model_effort = self.model_effort.clone();
         let fast_mode = self.fast_mode;
+        let pr_readonly = self.pr_readonly;
         let backend_id = self.backend_id.clone();
         let session_id = self.session_id.clone();
         let config_profile = self.config_profile.clone();
@@ -3079,6 +3086,7 @@ impl MissionRunner {
                 config_profile,
                 working_directory,
                 user_id,
+                pr_readonly,
             )
             .await;
             (msg_id, user_message, result)
@@ -3456,6 +3464,7 @@ async fn run_mission_turn(
     mission_config_profile: Option<String>,
     mission_working_directory: Option<String>,
     boss_user_id: Option<String>,
+    pr_readonly: bool,
 ) -> AgentResult {
     let mut config = config;
     // Operator-note bridge: flush any pending Ask-assistant writes into this
@@ -3599,6 +3608,9 @@ async fn run_mission_turn(
     ));
     convo.push_str(&deliverable_reminder);
     convo.push_str("\n\nInstructions:\n- Respond to the CURRENT user request. The conversation history is context only: do not resume or continue earlier tasks from it unless the current request asks you to.\n- Use available tools to gather information or make changes.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n- USE information already provided in the message - do not ask for URLs, paths, or details that were already given.\n- When you have fully completed the user's goal or determined it cannot be completed, state that clearly in your final response.");
+    if pr_readonly {
+        convo.push_str("\n\nPR READ-ONLY CAPABILITY (server-enforced): inspect and run verification only. Do not edit tracked files, commit, push, comment, resolve threads, approve, close, or merge. Report findings with an explicit terminal line `VERDICT: CLEAN`, `VERDICT: BLOCKED`, or `VERDICT: INFRA_BLOCKED`. Git/gh mutation commands are disabled for this mission.");
+    }
     convo.push_str(multi_step_instructions);
     convo.push('\n');
 
@@ -3627,6 +3639,7 @@ async fn run_mission_turn(
             effective_config_profile.as_deref(),
             boss_user_id.as_deref(),
             Some(&config.working_dir),
+            !pr_readonly,
         )
         .await
     };
