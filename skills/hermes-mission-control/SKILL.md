@@ -9,7 +9,7 @@ description: >
 metadata:
   policy: chatgpt-ui-pool
   policy_version: 1.3.0
-version: 1.5.0
+version: 1.6.0
 ---
 
 # Hermes Mission Control
@@ -262,6 +262,20 @@ Do **not** notify merely because:
 If nothing meaningful changed, record the observation internally and remain
 silent. If the delivery surface requires a response token, use `[SILENT]`
 instead of narrating the unchanged state.
+
+For every recurring monitor or fallback reconciliation cron, end a deliverable
+response with one machine-only line:
+
+```text
+[STATE_SIGNATURE: <project>|<item>|<exact-head>|<gate-state>|<blocker-class>|<next-event>]
+```
+
+Keep the fields canonical and stable; use `none` for an absent head or blocker.
+Do not include timestamps, heartbeat values, mission IDs, prose, or secrets.
+Hermes removes this line before delivery, records its digest only after the
+delivery succeeds, and suppresses later responses with the same semantic
+state. A meaningful delta must change the signature. `[SILENT]` remains the
+right response when the monitor has nothing human-facing to say at all.
 
 ### Lead with project state, not agent telemetry
 
