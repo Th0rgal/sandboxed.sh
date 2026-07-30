@@ -421,6 +421,16 @@ fn repository_identity(repo: &str) -> String {
     parsed.to_string()
 }
 
+fn repository_url_has_credentials(repo: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(repo) else {
+        return false;
+    };
+    parsed.password().is_some()
+        || (matches!(parsed.scheme(), "http" | "https") && !parsed.username().is_empty())
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+}
+
 fn remote_job_identity(
     req: &RemoteBuildRequest,
 ) -> crate::remote_node::job_ledger::RemoteJobIdentity {
@@ -960,6 +970,13 @@ async fn submit_remote_build(
     }
     if req.command.is_empty() {
         return (StatusCode::BAD_REQUEST, "command argv required").into_response();
+    }
+    if repository_url_has_credentials(&req.repo) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "repository URL must not contain credentials, query parameters, or a fragment",
+        )
+            .into_response();
     }
     if let Err(message) = validate_expected_head(&req.commit, req.expected_head.as_deref()) {
         return (StatusCode::CONFLICT, message).into_response();
@@ -1686,7 +1703,7 @@ mod tests {
             "remote",
             "add",
             "origin",
-            "https://example.invalid/repo.git",
+            "https://build-user:secret-token@example.invalid/repo.git?token=secret#fragment",
         ]);
 
         let fake_curl = bin.join("curl");
@@ -1911,6 +1928,8 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             identity.toolchain.as_deref(),
             Some("leanprover/lean4:v4.19.0")
         );
+        assert!(repository_url_has_credentials(&req.repo));
+        assert!(!repository_url_has_credentials(&identity.repository));
     }
 
     #[test]
@@ -2242,6 +2261,10 @@ printf '503'
             std::fs::File::open(&capture).unwrap(),
         ))
         .unwrap();
+        assert_eq!(
+            request.get("repo").and_then(serde_json::Value::as_str),
+            Some("https://example.invalid/repo.git")
+        );
         assert_eq!(
             request
                 .get("estimated_disk_bytes")

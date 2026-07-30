@@ -41,8 +41,17 @@ if [ "$#" -eq 0 ]; then set -- lake build; fi
 request_file="$(mktemp)" || die "cannot create temporary request file" 75
 python3 - "$REMOTE_BUILD_MISSION_ID" "$REMOTE_BUILD_TOKEN" "$repo" "$commit" "$cwd_rel" "$@" > "$request_file" <<'PY'
 import base64, hashlib, json, os, pathlib, subprocess, sys
+from urllib.parse import urlsplit, urlunsplit
 mission_id, token, repo, commit, cwd_rel = sys.argv[1:6]
 command = sys.argv[6:]
+parsed_repo = urlsplit(repo)
+if parsed_repo.scheme in {"http", "https"}:
+    host = parsed_repo.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    if parsed_repo.port is not None:
+        host = f"{host}:{parsed_repo.port}"
+    repo = urlunsplit((parsed_repo.scheme, host, parsed_repo.path, "", ""))
 req = {
     "mission_id": mission_id,
     "token": token,
