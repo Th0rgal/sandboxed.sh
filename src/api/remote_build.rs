@@ -325,7 +325,16 @@ fn default_wait() -> bool {
 
 fn minimum_node_protocol_version(source_bundle: Option<&SourceBundle>) -> u32 {
     match source_bundle {
-        Some(bundle) if bundle.complete => crate::remote_node::protocol::NODE_PROTOCOL_VERSION,
+        // Complete snapshots and extended operations (deletions, executable
+        // bits) are both v4 features. An older node would silently ignore the
+        // unknown fields and build the wrong tree, so fail placement instead.
+        Some(bundle)
+            if bundle.complete
+                || !bundle.deleted_paths.is_empty()
+                || bundle.operations_sha256.is_some() =>
+        {
+            crate::remote_node::protocol::NODE_PROTOCOL_VERSION
+        }
         Some(_) => 3,
         None => 1,
     }
@@ -1676,15 +1685,28 @@ mod tests {
         };
         let complete = SourceBundle {
             manifest_sha256: "c".repeat(64),
-            files: vec![file],
+            files: vec![file.clone()],
             complete: true,
             deleted_paths: Vec::new(),
             operations_sha256: None,
+        };
+        let extended_overlay = SourceBundle {
+            manifest_sha256: "d".repeat(64),
+            files: vec![file],
+            complete: false,
+            deleted_paths: vec!["Removed.lean".to_string()],
+            operations_sha256: Some("e".repeat(64)),
         };
         assert_eq!(minimum_node_protocol_version(None), 1);
         assert_eq!(minimum_node_protocol_version(Some(&overlay)), 3);
         assert_eq!(
             minimum_node_protocol_version(Some(&complete)),
+            crate::remote_node::protocol::NODE_PROTOCOL_VERSION
+        );
+        // Deletions and executable-bit digests would be silently dropped by a
+        // v3 node, so extended overlays must also require the current version.
+        assert_eq!(
+            minimum_node_protocol_version(Some(&extended_overlay)),
             crate::remote_node::protocol::NODE_PROTOCOL_VERSION
         );
     }
