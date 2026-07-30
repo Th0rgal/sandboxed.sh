@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path as AxumPath, Query, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -136,7 +136,15 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/heartbeat", get(heartbeat))
         .route("/execute", post(execute))
-        .route("/jobs", post(submit_job).get(list_jobs))
+        // Complete private-source jobs carry up to 16 MiB before base64
+        // encoding, so the submit route needs the same bounded wire allowance
+        // as the core `/api/remote-build` endpoint.
+        .route(
+            "/jobs",
+            post(submit_job)
+                .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+                .get(list_jobs),
+        )
         .route("/jobs/:id", get(get_job))
         .route("/jobs/:id/cancel", post(cancel_job))
         .with_state(state);

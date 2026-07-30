@@ -2233,6 +2233,24 @@ pub(crate) async fn install_remote_build_wrapper(
         }
         tokio::fs::rename(&tmp, &destination).await?;
     }
+
+    // Older container images shipped a second, unmanaged copy at
+    // `/usr/local/bin/remote-lean-build`.  Keep that historical entry point as
+    // an alias to the mission-managed wrapper so agents cannot inspect or run
+    // a stale protocol implementation by using the absolute legacy path.
+    #[cfg(unix)]
+    if workspace.workspace_type == WorkspaceType::Container && !is_container_fallback(workspace) {
+        use std::os::unix::fs::symlink;
+
+        let legacy = workspace.path.join("usr/local/bin/remote-lean-build");
+        if let Some(parent) = legacy.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let tmp = legacy.with_extension(format!("tmp-{}-{mission_id}", std::process::id()));
+        let _ = tokio::fs::remove_file(&tmp).await;
+        symlink("/usr/local/lib/sandboxed-sh/bin/remote-lean-build", &tmp)?;
+        tokio::fs::rename(&tmp, &legacy).await?;
+    }
     Ok(())
 }
 
@@ -4396,6 +4414,12 @@ sandboxed-harness-version:grok=\n";
         assert_eq!(
             tokio::fs::read(shim).await.unwrap(),
             include_bytes!("../../scripts/lake")
+        );
+        assert_eq!(
+            tokio::fs::read_link(root.path().join("usr/local/bin/remote-lean-build"))
+                .await
+                .unwrap(),
+            PathBuf::from("/usr/local/lib/sandboxed-sh/bin/remote-lean-build")
         );
     }
 
