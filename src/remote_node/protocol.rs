@@ -15,7 +15,7 @@ use super::RemoteNodeError;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Current node protocol version reported by heartbeats.
-pub const NODE_PROTOCOL_VERSION: u32 = 3;
+pub const NODE_PROTOCOL_VERSION: u32 = 4;
 /// First protocol that reports `active_jobs` and `queued_jobs` in heartbeats.
 pub const NODE_JOB_COUNTER_PROTOCOL_VERSION: u32 = 2;
 
@@ -118,20 +118,32 @@ pub struct ExecuteResponse {
     pub stderr: String,
 }
 
-/// Git source of a declarative build job: the node fetches exactly this
-/// commit itself, so no workspace sync between core and node is needed.
+/// Git source of a declarative build job. New clients attach a complete,
+/// commit-bound archive; legacy public builds may still let the node fetch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobSource {
-    /// Clone/fetch URL (https or ssh).
+    /// Credential-free repository identity and legacy clone/fetch URL.
     pub repo: String,
     /// Full 40-char lowercase hex commit SHA. Branch names are rejected so a
     /// job always builds a pinned, reproducible tree.
     pub commit: String,
+    /// Optional complete Git object pack for `commit`. When present, the node
+    /// materializes the checkout without contacting `repo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<Box<SourceArchive>>,
     /// Optional bounded overlay applied after resetting the pinned checkout.
     /// This lets a local-only proof source run remotely without creating or
     /// pushing a Git commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<SourceBundle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceArchive {
+    /// SHA-256 over `sandboxed-source-archive-v1\0<commit>\0<pack bytes>`.
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub data_base64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -488,6 +500,7 @@ mod tests {
             source: JobSource {
                 repo: "https://github.com/example/verity.git".to_string(),
                 commit: "a".repeat(40),
+                archive: None,
                 bundle: None,
             },
             cwd_rel: Some("morpho-verity".to_string()),

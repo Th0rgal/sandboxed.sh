@@ -1,8 +1,10 @@
 //! Declarative `lean_build` job execution for the `sandboxed-node` runner.
 //!
-//! A lean-build job carries only a git source (repo + pinned commit), a
+//! A lean-build job carries a git source (credential-free repo identity,
+//! pinned commit, and normally a complete commit-bound object pack), a
 //! constrained argv (`lake build`/`lean`), and artifact patterns. The node
-//! materializes a content-addressed checkout, restores trusted shared runtime
+//! materializes a content-addressed checkout without network access when the
+//! archive is present, restores trusted shared runtime
 //! caches, runs the build, and records artifact digests. Lake dependency-cache
 //! plumbing fails closed until the evaluated package layout can be attested.
 //! No workspace sync with core, no shell interpretation of the payload.
@@ -27,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::job_store::JobState;
 use super::runner::{clamp_timeout, run_logged_command, CommandEnvironment};
-use crate::remote_node::{ArtifactEntry, JobPayload, JobSource, SourceBundle};
+use crate::remote_node::{ArtifactEntry, JobPayload, JobSource, SourceArchive, SourceBundle};
 
 /// Default allowlist for lean-build env keys
 /// (`SANDBOXED_NODE_ENV_ALLOWLIST` overrides, comma-separated).
@@ -41,6 +43,7 @@ pub const ALLOWED_COMMANDS: [&str; 2] = ["lake", "lean"];
 const DEFAULT_MIN_FREE_GB: u64 = 10;
 const DEFAULT_MAX_SOURCE_BUNDLE_BYTES: u64 = 1 << 20;
 const MAX_SOURCE_BUNDLE_FILES: usize = 256;
+const DEFAULT_MAX_SOURCE_ARCHIVE_BYTES: u64 = 32 << 20;
 
 /// Interval between node-side cache GC passes.
 const GC_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -110,6 +113,50 @@ fn source_bundle_max_bytes() -> u64 {
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|bytes| *bytes > 0)
         .unwrap_or(DEFAULT_MAX_SOURCE_BUNDLE_BYTES)
+}
+
+fn source_archive_max_bytes() -> u64 {
+    std::env::var("SANDBOXED_NODE_MAX_SOURCE_ARCHIVE_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_MAX_SOURCE_ARCHIVE_BYTES)
+}
+
+pub(crate) fn source_archive_sha256(commit: &str, bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sandboxed-source-archive-v1\0");
+    hasher.update(commit.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn decode_source_archive(source: &JobSource, archive: &SourceArchive) -> Result<Vec<u8>, String> {
+    if archive.sha256.len() != 64
+        || !archive
+            .sha256
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+    {
+        return Err("invalid source archive sha256".to_string());
+    }
+    if archive.size_bytes == 0 || archive.size_bytes > source_archive_max_bytes() {
+        return Err(format!(
+            "source archive size must be between 1 and {} bytes",
+            source_archive_max_bytes()
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&archive.data_base64)
+        .map_err(|_| "invalid source archive base64".to_string())?;
+    if bytes.len() as u64 != archive.size_bytes {
+        return Err("source archive decoded size mismatch".to_string());
+    }
+    if source_archive_sha256(&source.commit, &bytes) != archive.sha256 {
+        return Err("source archive commit-bound hash mismatch".to_string());
+    }
+    Ok(bytes)
 }
 
 fn bundle_path_is_safe(path: &str) -> bool {
@@ -206,6 +253,17 @@ fn repo_url_is_remote(repo: &str) -> bool {
     false
 }
 
+fn repo_url_has_credentials(repo: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(repo) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && (!parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some())
+}
+
 /// Validate a lean-build payload before touching the filesystem or network.
 pub fn validate_lean_build(
     source: &JobSource,
@@ -216,6 +274,12 @@ pub fn validate_lean_build(
 ) -> Result<(), String> {
     if source.repo.trim().is_empty() {
         return Err("source.repo is required".to_string());
+    }
+    if repo_url_has_credentials(&source.repo) {
+        return Err(
+            "source.repo HTTP URL must not contain userinfo, query parameters, or a fragment"
+                .to_string(),
+        );
     }
     if !repo_url_is_remote(&source.repo) {
         return Err(format!(
@@ -229,6 +293,9 @@ pub fn validate_lean_build(
             "source.commit must be a full 40-char lowercase hex SHA (got '{}')",
             source.commit
         ));
+    }
+    if let Some(archive) = &source.archive {
+        decode_source_archive(source, archive)?;
     }
     if let Some(bundle) = &source.bundle {
         validate_source_bundle(bundle)?;
@@ -760,6 +827,148 @@ async fn run_git_step(
     Ok(())
 }
 
+fn validate_archive_tree_output(output: &[u8]) -> Result<(), String> {
+    for record in output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let separator = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| "malformed source archive tree entry".to_string())?;
+        let (metadata, path_with_separator) = record.split_at(separator);
+        let path = &path_with_separator[1..];
+        let mode = metadata
+            .split(|byte| *byte == b' ')
+            .next()
+            .ok_or_else(|| "malformed source archive tree mode".to_string())?;
+        if !matches!(mode, b"040000" | b"100644" | b"100755") {
+            return Err(format!(
+                "source archive contains unsupported tree mode {}",
+                String::from_utf8_lossy(mode)
+            ));
+        }
+        let path = std::str::from_utf8(path)
+            .map_err(|_| "source archive paths must be UTF-8".to_string())?;
+        if path.starts_with('/')
+            || path.contains('\\')
+            || path.chars().any(char::is_control)
+            || path
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".." | ".git"))
+        {
+            return Err(format!("unsafe source archive path '{path}'"));
+        }
+    }
+    Ok(())
+}
+
+async fn import_source_archive(
+    tmp: &Path,
+    source: &JobSource,
+    archive: &SourceArchive,
+    log_path: &Path,
+    token: &CancellationToken,
+) -> anyhow::Result<()> {
+    let bytes = decode_source_archive(source, archive).map_err(|error| anyhow::anyhow!(error))?;
+    run_git_step(&["init", "--quiet"], tmp, log_path, token).await?;
+
+    let mut child = tokio::process::Command::new("git")
+        // The transport deliberately contains the requested commit and its
+        // complete snapshot, not historical parent commits. `index-pack`
+        // still verifies pack/object integrity; `--strict` cannot be used
+        // because it requires every referenced parent object.
+        .args(["index-pack", "--stdin"])
+        .current_dir(tmp)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git index-pack stdin unavailable"))?
+        .write_all(&bytes)
+        .await?;
+    if token.is_cancelled() {
+        anyhow::bail!("source archive import cancelled");
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(GIT_STEP_TIMEOUT_SECS),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("source archive import timed out"))??;
+    if !output.status.success() {
+        anyhow::bail!(
+            "source archive is not a valid Git object pack: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let commit_object = format!("{}^{{commit}}", source.commit);
+    run_git_step(
+        &["cat-file", "-e", commit_object.as_str()],
+        tmp,
+        log_path,
+        token,
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "source archive does not contain requested commit {}",
+            source.commit
+        )
+    })?;
+    let tree = tokio::process::Command::new("git")
+        .args([
+            "ls-tree",
+            "-r",
+            "-t",
+            "-z",
+            "--full-tree",
+            source.commit.as_str(),
+        ])
+        .current_dir(tmp)
+        .output()
+        .await?;
+    if !tree.status.success() {
+        anyhow::bail!(
+            "source archive does not contain the complete tree for commit {}",
+            source.commit
+        );
+    }
+    validate_archive_tree_output(&tree.stdout).map_err(|error| anyhow::anyhow!(error))?;
+    run_git_step(
+        &["checkout", "--quiet", "--detach", source.commit.as_str()],
+        tmp,
+        log_path,
+        token,
+    )
+    .await?;
+    tokio::fs::write(
+        tmp.join(".git/sandboxed-source-archive"),
+        format!("{}\n", archive.sha256),
+    )
+    .await?;
+
+    let mut log = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .await?;
+    log.write_all(
+        format!(
+            "source archive verified sha256={} commit={} bytes={}\n",
+            archive.sha256, source.commit, archive.size_bytes
+        )
+        .as_bytes(),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Ensure `<workdir>/checkouts/<repo-hash>/<commit>/` exists, fetching it if
 /// needed. Builds into a temp sibling and atomically renames so a partially
 /// fetched tree is never observed at the final path. Callers must hold the
@@ -772,7 +981,20 @@ async fn ensure_checkout(
 ) -> anyhow::Result<PathBuf> {
     let dest = checkout_dir(work_root, &source.repo, &source.commit);
     if dest.is_dir() {
-        return Ok(dest);
+        match &source.archive {
+            None => return Ok(dest),
+            Some(archive)
+                if tokio::fs::read_to_string(dest.join(".git/sandboxed-source-archive"))
+                    .await
+                    .is_ok_and(|digest| digest.trim() == archive.sha256) =>
+            {
+                return Ok(dest);
+            }
+            // A legacy/network checkout or a different archive digest cannot
+            // attest this request. Validate the supplied pack in a temporary
+            // repository before reusing the already materialized commit.
+            Some(_) => {}
+        }
     }
     let parent = dest
         .parent()
@@ -781,41 +1003,44 @@ async fn ensure_checkout(
     let tmp = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&tmp).await?;
 
-    let fetch = async {
-        run_git_step(&["init", "--quiet"], &tmp, log_path, token).await?;
-        run_git_step(
-            &[
-                "fetch",
-                "--depth",
-                "1",
-                "--quiet",
-                source.repo.as_str(),
-                source.commit.as_str(),
-            ],
-            &tmp,
-            log_path,
-            token,
-        )
-        .await?;
-        run_git_step(
-            &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
-            &tmp,
-            log_path,
-            token,
-        )
-        .await?;
-        // Best-effort: many Lean repos have no submodules and lakefile deps
-        // are fetched by lake itself.
-        let _ = run_git_step(
-            &["submodule", "update", "--init", "--depth", "1"],
-            &tmp,
-            log_path,
-            token,
-        )
-        .await;
-        anyhow::Ok(())
-    }
-    .await;
+    let fetch = if let Some(archive) = &source.archive {
+        import_source_archive(&tmp, source, archive, log_path, token).await
+    } else {
+        async {
+            run_git_step(&["init", "--quiet"], &tmp, log_path, token).await?;
+            run_git_step(
+                &[
+                    "fetch",
+                    "--depth",
+                    "1",
+                    "--quiet",
+                    source.repo.as_str(),
+                    source.commit.as_str(),
+                ],
+                &tmp,
+                log_path,
+                token,
+            )
+            .await?;
+            run_git_step(
+                &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+                &tmp,
+                log_path,
+                token,
+            )
+            .await?;
+            // Legacy public-source path: preserve best-effort submodule fetch.
+            let _ = run_git_step(
+                &["submodule", "update", "--init", "--depth", "1"],
+                &tmp,
+                log_path,
+                token,
+            )
+            .await;
+            anyhow::Ok(())
+        }
+        .await
+    };
 
     if let Err(err) = fetch {
         let _ = tokio::fs::remove_dir_all(&tmp).await;
@@ -1379,11 +1604,13 @@ fn gc_once(work_root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn source(commit: &str) -> JobSource {
         JobSource {
             repo: "https://github.com/example/verity.git".to_string(),
             commit: commit.to_string(),
+            archive: None,
             bundle: None,
         }
     }
@@ -1402,6 +1629,213 @@ mod tests {
                 data_base64: base64::engine::general_purpose::STANDARD.encode(contents),
             }],
         }
+    }
+
+    fn committed_archive() -> (tempfile::TempDir, String, SourceArchive) {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "Archive Test"]);
+        git(&["config", "user.email", "archive@example.invalid"]);
+        std::fs::create_dir(repo.path().join("Proof")).unwrap();
+        std::fs::write(
+            repo.path().join("Proof/Main.lean"),
+            "theorem ok : True := by trivial\n",
+        )
+        .unwrap();
+        git(&["add", "Proof/Main.lean"]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "source",
+        ]);
+        let commit = String::from_utf8(git(&["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_string();
+        let tree = git(&["ls-tree", "-r", "-t", "-z", "--full-tree", &commit]);
+        let root_tree = String::from_utf8(git(&["rev-parse", &format!("{commit}^{{tree}}")]))
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut objects = vec![commit.clone(), root_tree];
+        for record in tree
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            let metadata = record.split(|byte| *byte == b'\t').next().unwrap();
+            objects.push(
+                String::from_utf8(
+                    metadata
+                        .split(|byte| *byte == b' ')
+                        .nth(2)
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap(),
+            );
+        }
+        let mut child = Command::new("git")
+            .args(["pack-objects", "--stdout", "--no-reuse-delta"])
+            .current_dir(repo.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{}\n", objects.join("\n")).as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let archive = SourceArchive {
+            sha256: source_archive_sha256(&commit, &output.stdout),
+            size_bytes: output.stdout.len() as u64,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(output.stdout),
+        };
+        (repo, commit, archive)
+    }
+
+    #[tokio::test]
+    async fn private_equivalent_archive_materializes_without_runner_git_credentials() {
+        let (_source_repo, commit, archive) = committed_archive();
+        let work_root = tempfile::tempdir().unwrap();
+        let log = work_root.path().join("job.log");
+        let mut source = JobSource {
+            repo: "https://127.0.0.1:9/private/repository.git".to_string(),
+            commit: commit.clone(),
+            archive: Some(Box::new(archive)),
+            bundle: None,
+        };
+
+        let checkout = ensure_checkout(work_root.path(), &source, &log, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("Proof/Main.lean")).unwrap(),
+            "theorem ok : True := by trivial\n"
+        );
+        assert_eq!(
+            String::from_utf8(
+                Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(&checkout)
+                    .output()
+                    .unwrap()
+                    .stdout
+            )
+            .unwrap()
+            .trim(),
+            commit
+        );
+        assert!(std::fs::read_to_string(log)
+            .unwrap()
+            .contains("source archive verified"));
+
+        let invalid_pack = b"not a git pack";
+        source.archive = Some(Box::new(SourceArchive {
+            sha256: source_archive_sha256(&commit, invalid_pack),
+            size_bytes: invalid_pack.len() as u64,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(invalid_pack),
+        }));
+        assert!(
+            ensure_checkout(
+                work_root.path(),
+                &source,
+                &work_root.path().join("retry.log"),
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not a valid Git object pack"),
+            "a cached checkout must not bypass validation of a different archive"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_archive_is_commit_bound_and_missing_commit_fails_closed() {
+        let (_source_repo, commit, archive) = committed_archive();
+        let other_commit = "b".repeat(40);
+        let mut source = JobSource {
+            repo: "https://127.0.0.1:9/private/repository.git".to_string(),
+            commit: other_commit.clone(),
+            archive: Some(Box::new(archive.clone())),
+            bundle: None,
+        };
+        assert!(validate_lean_build(
+            &source,
+            None,
+            &["lake".to_string(), "build".to_string()],
+            &HashMap::new(),
+            &allowlist(),
+        )
+        .unwrap_err()
+        .contains("commit-bound hash mismatch"));
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&archive.data_base64)
+            .unwrap();
+        source.archive.as_mut().unwrap().sha256 = source_archive_sha256(&other_commit, &bytes);
+        let work_root = tempfile::tempdir().unwrap();
+        let error = ensure_checkout(
+            work_root.path(),
+            &source,
+            &work_root.path().join("job.log"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("does not contain requested commit"),
+            "{error}; original commit was {commit}"
+        );
+    }
+
+    #[test]
+    fn source_archive_tree_validation_rejects_unsafe_paths_and_special_entries() {
+        assert!(validate_archive_tree_output(
+            b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t../escape\0"
+        )
+        .unwrap_err()
+        .contains("unsafe"));
+        assert!(validate_archive_tree_output(
+            b"120000 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tlink\0"
+        )
+        .unwrap_err()
+        .contains("unsupported tree mode"));
+    }
+
+    #[test]
+    fn legacy_public_source_without_archive_remains_valid() {
+        assert!(validate_lean_build(
+            &source(&"a".repeat(40)),
+            None,
+            &["lake".to_string(), "build".to_string()],
+            &HashMap::new(),
+            &allowlist(),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1614,12 +2048,15 @@ mod tests {
             "../repo",
             "repo",
             "C:/repos/x",
+            "https://user:placeholder@example.invalid/private.git",
+            "https://example.invalid/private.git?token=placeholder",
         ] {
             assert!(
                 validate_lean_build(
                     &JobSource {
                         repo: bad.to_string(),
                         commit: "a".repeat(40),
+                        archive: None,
                         bundle: None,
                     },
                     None,
@@ -1641,6 +2078,7 @@ mod tests {
                     &JobSource {
                         repo: good.to_string(),
                         commit: "a".repeat(40),
+                        archive: None,
                         bundle: None,
                     },
                     None,
@@ -1834,16 +2272,19 @@ mod tests {
         let source_a = JobSource {
             repo: "https://example.com/a.git".to_string(),
             commit: "a".repeat(40),
+            archive: None,
             bundle: None,
         };
         let source_a_next_commit = JobSource {
             repo: source_a.repo.clone(),
             commit: "b".repeat(40),
+            archive: None,
             bundle: None,
         };
         let source_b = JobSource {
             repo: "https://example.com/b.git".to_string(),
             commit: "a".repeat(40),
+            archive: None,
             bundle: None,
         };
         let build = vec!["lake".to_string(), "build".to_string(), "A".to_string()];

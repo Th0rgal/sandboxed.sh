@@ -41,8 +41,17 @@ if [ "$#" -eq 0 ]; then set -- lake build; fi
 request_file="$(mktemp)" || die "cannot create temporary request file" 75
 python3 - "$REMOTE_BUILD_MISSION_ID" "$REMOTE_BUILD_TOKEN" "$repo" "$commit" "$cwd_rel" "$@" > "$request_file" <<'PY'
 import base64, hashlib, json, os, pathlib, subprocess, sys
+from urllib.parse import urlsplit, urlunsplit
 mission_id, token, repo, commit, cwd_rel = sys.argv[1:6]
 command = sys.argv[6:]
+parsed_repo = urlsplit(repo)
+if parsed_repo.scheme in {"http", "https"}:
+    host = parsed_repo.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    if parsed_repo.port is not None:
+        host = f"{host}:{parsed_repo.port}"
+    repo = urlunsplit((parsed_repo.scheme, host, parsed_repo.path, "", ""))
 req = {
     "mission_id": mission_id,
     "token": token,
@@ -65,6 +74,52 @@ if toolchain_path.is_file():
 expected_head = os.environ.get("REMOTE_BUILD_EXPECTED_HEAD", "").strip()
 if expected_head:
     req["expected_head"] = expected_head
+
+# Send the complete pinned Git snapshot as an object pack. Unlike forwarding a
+# credential or asking the node to fetch `origin`, this contains only immutable
+# repository objects reachable from the requested commit's tree.
+tree_records = subprocess.check_output(
+    ["git", "-C", str(repo_root), "ls-tree", "-r", "-t", "-z", "--full-tree", commit]
+).split(b"\0")
+root_tree = subprocess.check_output(
+    ["git", "-C", str(repo_root), "rev-parse", f"{commit}^{{tree}}"], text=True
+).strip()
+object_ids = [commit, root_tree]
+for record in tree_records:
+    if not record:
+        continue
+    try:
+        metadata, _path = record.split(b"\t", 1)
+        _mode, _kind, object_id = metadata.split(b" ", 2)
+    except ValueError:
+        raise SystemExit("git returned a malformed tree entry while creating source archive")
+    object_ids.append(object_id.decode("ascii"))
+pack = subprocess.run(
+    ["git", "-C", str(repo_root), "pack-objects", "--stdout", "--no-reuse-delta"],
+    input=("\n".join(object_ids) + "\n").encode("ascii"),
+    stdout=subprocess.PIPE,
+    check=True,
+).stdout
+max_archive_bytes = int(
+    os.environ.get("REMOTE_BUILD_MAX_SOURCE_ARCHIVE_BYTES", str(32 << 20))
+)
+if max_archive_bytes <= 0:
+    raise SystemExit("REMOTE_BUILD_MAX_SOURCE_ARCHIVE_BYTES must be positive")
+if not pack or len(pack) > max_archive_bytes:
+    raise SystemExit(
+        f"source archive is {len(pack)} bytes; maximum is {max_archive_bytes}"
+    )
+archive_hash = hashlib.sha256(
+    b"sandboxed-source-archive-v1\0"
+    + commit.encode("ascii")
+    + b"\0"
+    + pack
+).hexdigest()
+req["source_archive"] = {
+    "sha256": archive_hash,
+    "size_bytes": len(pack),
+    "data_base64": base64.b64encode(pack).decode("ascii"),
+}
 
 def git_paths(*args):
     raw = subprocess.check_output(["git", "-C", str(repo_root), *args])

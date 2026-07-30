@@ -770,6 +770,7 @@ mod tests {
                     source: sandboxed_sh::remote_node::JobSource {
                         repo: "/node/local/repo".to_string(),
                         commit: "a".repeat(40),
+                        archive: None,
                         bundle: None,
                     },
                     cwd_rel: None,

@@ -706,7 +706,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // Remote lean-build dispatch: same per-mission HMAC capability-token
         // model as spark (domain-separated), verified inside the handlers,
         // so it also bypasses require_auth.
-        .nest("/api/remote-build", super::remote_build::routes());
+        .nest(
+            "/api/remote-build",
+            super::remote_build::routes().layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+        );
 
     // File upload routes with increased body limit (10GB)
     let upload_route = Router::new()
