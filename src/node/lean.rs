@@ -215,19 +215,46 @@ pub(crate) fn bundle_manifest_sha256_for_mode(
     hex::encode(hasher.finalize())
 }
 
+pub(crate) fn bundle_operations_sha256(bundle: &SourceBundle) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sandboxed-source-bundle-ops-v1\n");
+    for file in &bundle.files {
+        hasher.update(b"file\0");
+        hasher.update(file.path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(if file.executable == Some(true) {
+            b"x"
+        } else {
+            b"-"
+        });
+        hasher.update(b"\n");
+    }
+    for path in &bundle.deleted_paths {
+        hasher.update(b"delete\0");
+        hasher.update(path.as_bytes());
+        hasher.update(b"\n");
+    }
+    hex::encode(hasher.finalize())
+}
+
 fn validate_source_bundle(bundle: &SourceBundle) -> Result<u64, String> {
-    if bundle.files.is_empty() {
-        return Err("source.bundle.files must not be empty".to_string());
+    if bundle.files.is_empty() && bundle.deleted_paths.is_empty() {
+        return Err("source bundle must contain files or deletions".to_string());
     }
     let max_files = if bundle.complete {
         MAX_COMPLETE_SOURCE_BUNDLE_FILES
     } else {
         MAX_SOURCE_BUNDLE_FILES
     };
-    if bundle.files.len() > max_files {
+    if bundle
+        .files
+        .len()
+        .saturating_add(bundle.deleted_paths.len())
+        > max_files
+    {
         return Err(format!(
-            "source bundle has {} files; maximum is {max_files}",
-            bundle.files.len()
+            "source bundle has {} operations; maximum is {max_files}",
+            bundle.files.len() + bundle.deleted_paths.len()
         ));
     }
     let mut manifest_files = Vec::with_capacity(bundle.files.len());
@@ -270,6 +297,35 @@ fn validate_source_bundle(bundle: &SourceBundle) -> Result<u64, String> {
     let expected = bundle_manifest_sha256_for_mode(&manifest_files, bundle.complete);
     if expected != bundle.manifest_sha256 {
         return Err("source bundle manifest hash mismatch".to_string());
+    }
+    let has_extended_operations = !bundle.deleted_paths.is_empty()
+        || bundle.files.iter().any(|file| file.executable.is_some());
+    if has_extended_operations {
+        let Some(digest) = bundle.operations_sha256.as_deref() else {
+            return Err("source bundle operations_sha256 is required".to_string());
+        };
+        if digest != bundle_operations_sha256(bundle) {
+            return Err("source bundle operations hash mismatch".to_string());
+        }
+        let mut prior = None;
+        let file_paths = bundle
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for path in &bundle.deleted_paths {
+            if !bundle_path_is_safe(path) || file_paths.contains(path.as_str()) {
+                return Err(format!(
+                    "unsafe or conflicting source bundle deletion '{path}'"
+                ));
+            }
+            if prior.is_some_and(|value| value >= path.as_str()) {
+                return Err("source bundle deleted paths must be unique and sorted".to_string());
+            }
+            prior = Some(path.as_str());
+        }
+    } else if bundle.operations_sha256.is_some() {
+        return Err("source bundle operations_sha256 has no operations".to_string());
     }
     Ok(total)
 }
@@ -1327,6 +1383,20 @@ async fn apply_source_bundle(
     log_path: &Path,
 ) -> anyhow::Result<()> {
     let total_bytes = validate_source_bundle(bundle).map_err(|error| anyhow::anyhow!("{error}"))?;
+    for relative in &bundle.deleted_paths {
+        let destination = checkout.join(relative);
+        match tokio::fs::symlink_metadata(&destination).await {
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                tokio::fs::remove_file(&destination).await?;
+            }
+            Ok(_) => anyhow::bail!(
+                "source bundle deletion must target a file: {}",
+                destination.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     for file in &bundle.files {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&file.data_base64)
@@ -1363,6 +1433,18 @@ async fn apply_source_bundle(
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(error.into());
         }
+        #[cfg(unix)]
+        if let Some(executable) = file.executable {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = tokio::fs::metadata(&destination).await?.permissions();
+            let mode = permissions.mode();
+            permissions.set_mode(if executable {
+                mode | 0o111
+            } else {
+                mode & !0o111
+            });
+            tokio::fs::set_permissions(&destination, permissions).await?;
+        }
     }
     let mut log = tokio::fs::OpenOptions::new()
         .create(true)
@@ -1371,9 +1453,11 @@ async fn apply_source_bundle(
         .await?;
     log.write_all(
         format!(
-            "source bundle verified sha256={} files={} bytes={}\n",
+            "source bundle verified sha256={} operations_sha256={} files={} deletions={} bytes={}\n",
             bundle.manifest_sha256,
+            bundle.operations_sha256.as_deref().unwrap_or("none"),
             bundle.files.len(),
+            bundle.deleted_paths.len(),
             total_bytes
         )
         .as_bytes(),
@@ -1786,8 +1870,11 @@ mod tests {
                 path: path.to_string(),
                 sha256,
                 data_base64: base64::engine::general_purpose::STANDARD.encode(contents),
+                executable: None,
             }],
             complete: false,
+            deleted_paths: Vec::new(),
+            operations_sha256: None,
         }
     }
 
@@ -2224,7 +2311,13 @@ mod tests {
         tokio::fs::write(checkout.join("Beal/Proof.lean"), b"old")
             .await
             .unwrap();
-        let bundle = source_bundle("Beal/Proof.lean", b"new proof\n");
+        tokio::fs::write(checkout.join("Beal/Obsolete.lean"), b"remove")
+            .await
+            .unwrap();
+        let mut bundle = source_bundle("Beal/Proof.lean", b"new proof\n");
+        bundle.files[0].executable = Some(true);
+        bundle.deleted_paths = vec!["Beal/Obsolete.lean".to_string()];
+        bundle.operations_sha256 = Some(bundle_operations_sha256(&bundle));
 
         apply_source_bundle(&checkout, &bundle, &log).await.unwrap();
 
@@ -2234,9 +2327,22 @@ mod tests {
                 .unwrap(),
             b"new proof\n"
         );
+        assert!(!checkout.join("Beal/Obsolete.lean").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                std::fs::metadata(checkout.join("Beal/Proof.lean"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
         let receipt = tokio::fs::read_to_string(log).await.unwrap();
         assert!(receipt.contains(&bundle.manifest_sha256));
-        assert!(receipt.contains("files=1 bytes=10"));
+        assert!(receipt.contains("files=1 deletions=1 bytes=10"));
     }
 
     #[tokio::test]

@@ -13,6 +13,8 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::ArtifactEntry;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum JobHandleKind {
@@ -127,6 +129,11 @@ pub struct RemoteJobReceipt {
     #[serde(default)]
     pub exit_status: Option<i32>,
     pub identity: RemoteJobIdentity,
+    /// Content digests produced by the exact terminal execution. Older
+    /// receipts deserialize empty and are not reused for artifact-bearing
+    /// validations.
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactEntry>,
     /// The accepted request owned a mission continuation even if its terminal
     /// wake had not yet been armed. This lets startup recover the narrow
     /// crash window after finalization but before a synchronous result reaches
@@ -336,7 +343,7 @@ pub async fn equivalent_remote_validation(
         .into_iter()
         .filter(|receipt| {
             receipt.identity == *identity
-                && identity.artifacts.is_empty()
+                && (identity.artifacts.is_empty() || !receipt.artifacts.is_empty())
                 && receipt.state == "succeeded"
                 && receipt.exit_status == Some(0)
         })
@@ -521,6 +528,17 @@ pub async fn finalize(
     state: &str,
     exit_status: Option<i32>,
 ) -> anyhow::Result<bool> {
+    finalize_with_artifacts(working_dir, job_id, state, exit_status, Vec::new()).await
+}
+
+/// Finalize a remote build while retaining its resolved artifact evidence.
+pub async fn finalize_with_artifacts(
+    working_dir: &Path,
+    job_id: Uuid,
+    state: &str,
+    exit_status: Option<i32>,
+    artifacts: Vec<ArtifactEntry>,
+) -> anyhow::Result<bool> {
     const MAX_RECEIPTS: usize = 2_000;
 
     let _guard = lock().lock().await;
@@ -551,6 +569,7 @@ pub async fn finalize(
             state: state.to_string(),
             exit_status,
             identity,
+            artifacts,
             continuation_expected,
             wake_required: handle.kind == JobHandleKind::RemoteBuild && handle.wake_on_terminal,
             wake_delivered_at: previous_wake_delivered_at,
@@ -1014,16 +1033,26 @@ mod tests {
         )
         .await
         .unwrap();
-        finalize(dir.path(), artifact_job_id, "succeeded", Some(0))
-            .await
-            .unwrap();
-        assert!(
+        finalize_with_artifacts(
+            dir.path(),
+            artifact_job_id,
+            "succeeded",
+            Some(0),
+            vec![ArtifactEntry {
+                path: "build/report.json".to_string(),
+                sha256: "c".repeat(64),
+                size_bytes: 42,
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
             equivalent_remote_validation(dir.path(), &artifact_identity)
                 .await
-                .unwrap()
-                .is_none(),
-            "artifact-producing validation cannot replay until receipts retain artifact digests"
-        );
+                .unwrap(),
+            Some(EquivalentRemoteValidation::Succeeded(receipt))
+                if receipt.job_id == artifact_job_id && receipt.artifacts.len() == 1
+        ));
 
         let changed_overlay = RemoteJobIdentity {
             source_bundle_digest: Some("b".repeat(64)),

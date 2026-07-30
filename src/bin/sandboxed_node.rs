@@ -775,12 +775,12 @@ mod tests {
                 mission_id,
                 lease_token: create_lease_token(&claims, &state.shared_token).expect("lease token"),
                 payload: sandboxed_sh::remote_node::JobPayload::LeanBuild {
-                    source: sandboxed_sh::remote_node::JobSource {
+                    source: Box::new(sandboxed_sh::remote_node::JobSource {
                         repo: "/node/local/repo".to_string(),
                         commit: "a".repeat(40),
                         archive: None,
                         bundle: None,
-                    },
+                    }),
                     cwd_rel: None,
                     command: vec!["lake".to_string(), "build".to_string()],
                     timeout_secs: None,
