@@ -9,7 +9,7 @@ description: >
 metadata:
   policy: chatgpt-ui-pool
   policy_version: 1.3.0
-version: 1.6.0
+version: 1.7.0
 ---
 
 # Hermes Mission Control
@@ -357,6 +357,30 @@ scanner, serializer, or policy family, stop patching examples. Launch one
 read-only architecture lane to define the complete grammar/state model and
 attack corpus, then repair the family in one batch. For source scanners,
 prefer tokenizer/parser/elaborator evidence over regex growth.
+
+### Private Lean certification transport
+
+Remote Lean workers are declarative build targets, not SSH hosts to discover or
+configure from a mission. Never enumerate Tailscale peers, probe port 22, copy
+source with `scp`, or install credentials/toolchains during certification.
+
+For a private repository, use the injected wrapper and complete-source mode:
+
+```bash
+REMOTE_BUILD_SOURCE_MODE=full \
+REMOTE_BUILD_NODE_ID=ashur \
+REMOTE_BUILD_EXPECTED_HEAD="$PINNED_SHA" \
+remote-lean-build lake build
+```
+
+For independent two-node evidence, repeat from the unchanged exact head with a
+different explicit `REMOTE_BUILD_NODE_ID` such as `babylon` or `nippur`. Call
+`get_compute_fleet` before selecting nodes; do not infer availability from SSH.
+Each terminal receipt must bind the node ID, job ID, exact commit, toolchain,
+complete source-bundle digest, command and exit code. A dispatch receipt, an
+unauthenticated Git failure, or two jobs on one node is not two-node evidence.
+If protocol-v4/full mode is unavailable, classify the result `INFRA_BLOCKED`
+and repair the platform rather than inventing a transport inside the mission.
 
 Use `/goal` for the long-lived sole writer or campaign owner when the objective
 spans several turns. Keep reviewers as bounded task missions. Use the task
