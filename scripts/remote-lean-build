@@ -392,11 +392,6 @@ PY
 }
 
 if [ -z "$job_id" ]; then
-    # Pre-create the durable blocker while no remote request has been made.
-    # Cleanup removes it on known pre-acceptance outcomes; ambiguous/accepted
-    # failures retain it so a dead owner PID can never permit a duplicate job.
-    printf '%s\n' "armed" > "$submit_recovery_blocker" \
-        || die "cannot arm the remote-build recovery blocker before submission" 75
     # Full snapshots contain base64 and therefore inflate substantially in
     # JSON. Compress the wire copy so reverse proxies only buffer the compact
     # request; keep the plain request locally for fingerprinting and receipts.
@@ -407,6 +402,11 @@ with open(sys.argv[1], "rb") as source, open(sys.argv[2], "wb") as output:
     with gzip.GzipFile(fileobj=output, mode="wb", compresslevel=6, mtime=0) as destination:
         shutil.copyfileobj(source, destination)
 PY
+    # Arm immediately before curl. Cleanup removes this on known
+    # pre-acceptance outcomes; ambiguous/accepted failures retain it so a dead
+    # owner PID can never permit a duplicate job.
+    printf '%s\n' "armed" > "$submit_recovery_blocker" \
+        || die "cannot arm the remote-build recovery blocker before submission" 75
     echo "remote-lean-build: dispatching $* for ${commit:0:12}${cwd_rel:+ in $cwd_rel} ..." >&2
     http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
         -H 'Content-Type: application/json' \

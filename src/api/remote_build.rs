@@ -58,11 +58,16 @@ fn parse_remote_build_request(
     use flate2::read::GzDecoder;
     use std::io::Read;
 
-    let encoding = headers
-        .get(header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("identity")
-        .trim();
+    let encoding = match headers.get(header::CONTENT_ENCODING) {
+        Some(value) => value.to_str().map_err(|_| {
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "remote build Content-Encoding must be valid ASCII".to_string(),
+            )
+        })?,
+        None => "identity",
+    }
+    .trim();
     let reader: Box<dyn Read> = if encoding.eq_ignore_ascii_case("gzip") {
         Box::new(GzDecoder::new(body))
     } else if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
@@ -1783,6 +1788,27 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         let parsed = parse_remote_build_request(&headers, &compressed).unwrap();
         assert_eq!(parsed.repo, "https://github.com/private/example.git");
         assert_eq!(parsed.commit, "a".repeat(40));
+
+        let parsed_identity = parse_remote_build_request(&HeaderMap::new(), &plain).unwrap();
+        assert_eq!(
+            parsed_identity.repo,
+            "https://github.com/private/example.git"
+        );
+
+        let truncated = &compressed[..compressed.len() - 4];
+        let error = parse_remote_build_request(&headers, truncated).unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+
+        let error = parse_remote_build_request(&headers, b"not a gzip stream").unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+
+        let mut invalid_encoding = HeaderMap::new();
+        invalid_encoding.insert(
+            header::CONTENT_ENCODING,
+            header::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        let error = parse_remote_build_request(&invalid_encoding, &plain).unwrap_err();
+        assert_eq!(error.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
         let oversized = vec![b' '; MAX_REMOTE_BUILD_JSON_BYTES as usize + 1];
         let error = parse_remote_build_request(&HeaderMap::new(), &oversized).unwrap_err();
