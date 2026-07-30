@@ -74,6 +74,8 @@ if toolchain_path.is_file():
 expected_head = os.environ.get("REMOTE_BUILD_EXPECTED_HEAD", "").strip()
 if expected_head:
     req["expected_head"] = expected_head
+if os.environ.get("REMOTE_BUILD_FORCE_NEW", "0") == "1":
+    req["force_new"] = True
 
 source_mode = os.environ.get("REMOTE_BUILD_SOURCE_MODE", "overlay").strip().lower()
 if source_mode not in {"overlay", "full"}:

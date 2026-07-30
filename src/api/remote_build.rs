@@ -328,6 +328,11 @@ pub struct RemoteBuildRequest {
     /// fire-and-forget clients leave it false.
     #[serde(default)]
     pub resume_mission_on_terminal: bool,
+    /// Deliberately request independent evidence instead of reusing an
+    /// equivalent successful receipt. Intended for explicit multi-node
+    /// certification; ordinary builds should leave this false.
+    #[serde(default)]
+    pub force_new: bool,
     /// Artifact patterns (relative to the checkout root) to digest after a
     /// successful build.
     #[serde(default)]
@@ -951,7 +956,7 @@ async fn submit_remote_build(
     // Reuse completed evidence even when every runner is currently offline.
     // This optimistic read is repeated under the placement lock after any
     // explicit network probe, which closes the concurrent-submit race.
-    if req.source_archive.is_none() {
+    if req.source_archive.is_none() && !req.force_new {
         if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await
         {
             return response;
@@ -966,7 +971,7 @@ async fn submit_remote_build(
     // tentative-handle persistence. No network probe runs while this mutex is
     // held, so a slow explicit runner cannot block unrelated auto placement.
     let placement_guard = placement_lock().lock().await;
-    if req.source_archive.is_none() {
+    if req.source_archive.is_none() && !req.force_new {
         if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await
         {
             return response;
@@ -2109,6 +2114,7 @@ printf '503'
             .env("REMOTE_BUILD_TOKEN", "test-token")
             .env("REMOTE_BUILD_MISSION_ID", Uuid::new_v4().to_string())
             .env("REMOTE_BUILD_EXPECTED_HEAD", "a".repeat(40))
+            .env("REMOTE_BUILD_FORCE_NEW", "1")
             .env("REMOTE_BUILD_TEST_CAPTURE", &capture)
             .output()
             .unwrap();
@@ -2135,6 +2141,12 @@ printf '503'
                 .get("expected_head")
                 .and_then(serde_json::Value::as_str),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            request
+                .get("force_new")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
         let archive = request.get("source_archive").unwrap();
         let archive_bytes = base64::engine::general_purpose::STANDARD
