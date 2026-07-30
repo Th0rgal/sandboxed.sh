@@ -76,6 +76,17 @@ impl ValidationCandidate {
         validate_digest("candidate.commit", &self.commit, 40)?;
         if let Some(head) = self.expected_head.as_deref() {
             validate_digest("candidate.expected_head", head, 40)?;
+            // Exact receipts certify the pinned candidate commit; an
+            // expected_head pointing at a different revision would classify
+            // evidence for that other revision as exact_head and certify the
+            // wrong commit.
+            if head != self.commit {
+                return Err(format!(
+                    "candidate.expected_head ({head}) must match candidate.commit ({}): \
+                     exact receipts certify the candidate commit",
+                    self.commit
+                ));
+            }
         }
         if let Some(digest) = self.source_bundle_digest.as_deref() {
             validate_digest("candidate.source_bundle_digest", digest, 64)?;
@@ -154,12 +165,12 @@ impl ValidationMatrix {
         if self.gates.is_empty() {
             return Err("matrix.gates must not be empty".to_string());
         }
-        let mut ids = HashSet::new();
+        let mut by_id = HashMap::new();
         for gate in &self.gates {
             if !valid_gate_id(&gate.id) {
                 return Err(format!("invalid gate id '{}'", gate.id));
             }
-            if !ids.insert(gate.id.as_str()) {
+            if by_id.insert(gate.id.as_str(), gate).is_some() {
                 return Err(format!("duplicate gate id '{}'", gate.id));
             }
             if gate.command.is_empty() || gate.command.iter().any(|arg| arg.contains('\0')) {
@@ -174,9 +185,24 @@ impl ValidationMatrix {
         }
         for gate in &self.gates {
             for dependency in &gate.dependencies {
-                if dependency == &gate.id || !ids.contains(dependency.as_str()) {
+                let Some(dependency_gate) = by_id.get(dependency.as_str()) else {
                     return Err(format!(
                         "gate '{}' has invalid dependency '{}'",
+                        gate.id, dependency
+                    ));
+                };
+                if dependency == &gate.id {
+                    return Err(format!(
+                        "gate '{}' has invalid dependency '{}'",
+                        gate.id, dependency
+                    ));
+                }
+                // An optional gate's failure does not fail the campaign, so a
+                // required gate waiting on it would stay pending forever while
+                // the campaign stays active. Reject the shape outright.
+                if gate.required && !dependency_gate.required {
+                    return Err(format!(
+                        "required gate '{}' depends on optional gate '{}'",
                         gate.id, dependency
                     ));
                 }
@@ -528,6 +554,27 @@ impl ValidationStore {
     ) -> Result<GateView, ApiError> {
         let mut connection = self.lock().map_err(internal)?;
         let transaction = connection.transaction().map_err(internal)?;
+        let campaign_status: String = transaction
+            .query_row(
+                "SELECT status FROM validation_campaigns WHERE id=?1",
+                params![campaign_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "validation campaign not found".to_string(),
+                )
+            })?;
+        // Merged is terminal: nothing left to validate for a landed candidate.
+        if campaign_status == "merged" {
+            return Err((
+                StatusCode::CONFLICT,
+                "campaign is merged, gates are no longer claimable".to_string(),
+            ));
+        }
         let current = load_gate(&transaction, campaign_id, gate_id)
             .map_err(internal)?
             .ok_or_else(|| {
@@ -909,11 +956,14 @@ async fn get_ready_gates(
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<Vec<GateView>>, ApiError> {
     let campaign = state.validation.get(id).map_err(not_found)?;
+    // Stale gates stay claimable (see `ValidationStore::claim`), so workers
+    // dispatching from this listing must see them or exact-head retries of
+    // stale evidence would never be scheduled.
     Ok(Json(
         campaign
             .gates
             .into_iter()
-            .filter(|gate| gate.status == "ready")
+            .filter(|gate| gate.status == "ready" || gate.status == "stale")
             .collect(),
     ))
 }
@@ -1378,6 +1428,19 @@ fn reuse_matching_receipts(
 }
 
 fn recompute_campaign(connection: &Connection, campaign_id: Uuid) -> Result<(), String> {
+    let prior_status: String = connection
+        .query_row(
+            "SELECT status FROM validation_campaigns WHERE id=?1",
+            params![campaign_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    // Merged is terminal: the candidate has already landed, so late receipts
+    // (for example from leftover optional gates) must never downgrade the
+    // campaign back to completed/active.
+    if prior_status == "merged" {
+        return Ok(());
+    }
     let mut statement = connection
         .prepare("SELECT gate_id, spec_json, status FROM validation_gates WHERE campaign_id=?1")
         .map_err(db_error)?;
@@ -1432,13 +1495,6 @@ fn recompute_campaign(connection: &Connection, campaign_id: Uuid) -> Result<(), 
     } else {
         "active"
     };
-    let prior_status: String = connection
-        .query_row(
-            "SELECT status FROM validation_campaigns WHERE id=?1",
-            params![campaign_id.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(db_error)?;
     connection
         .execute(
             "UPDATE validation_campaigns SET status=?2, certifying=?3, updated_at=?4 WHERE id=?1",
@@ -1667,6 +1723,22 @@ mod tests {
             .status
     }
 
+    fn optional_gate(id: &str) -> GateSpec {
+        GateSpec {
+            id: id.to_string(),
+            description: None,
+            command: vec!["lake".to_string(), "test".to_string()],
+            cwd: None,
+            dependencies: vec![],
+            required: false,
+            mode: ValidationMode::Incremental,
+            reuse: true,
+            toolchain: None,
+            timeout_secs: None,
+            artifacts: vec![],
+        }
+    }
+
     #[test]
     fn rejects_cycles_and_invalid_candidates() {
         let mut cyclic = matrix();
@@ -1675,6 +1747,35 @@ mod tests {
         let mut invalid = candidate('a');
         invalid.commit = "short".to_string();
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_expected_head_that_differs_from_commit() {
+        let mut mismatched = candidate('a');
+        mismatched.expected_head = Some("b".repeat(40));
+        let error = mismatched.validate().unwrap_err();
+        assert!(error.contains("must match candidate.commit"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ValidationStore::open(dir.path().join("validation.db")).unwrap();
+        let error = store
+            .create(CreateCampaignRequest {
+                candidate: mismatched,
+                matrix: matrix(),
+                workspace_id: None,
+            })
+            .unwrap_err();
+        assert!(error.contains("expected_head"));
+    }
+
+    #[test]
+    fn required_gate_cannot_depend_on_optional_gate() {
+        let mut invalid = matrix();
+        invalid.gates[0].required = false;
+        assert_eq!(
+            invalid.validate().unwrap_err(),
+            "required gate 'clean-final' depends on optional gate 'targeted'"
+        );
     }
 
     #[test]
@@ -1952,6 +2053,78 @@ mod tests {
             .claim(campaign.id, "targeted", &execution())
             .unwrap_err();
         assert_eq!(error.0, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn merged_campaign_stays_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ValidationStore::open(dir.path().join("validation.db")).unwrap();
+        let mut matrix = matrix();
+        matrix.gates.push(optional_gate("optional-extra"));
+        matrix.gates.push(optional_gate("optional-late"));
+        let campaign = store
+            .create(CreateCampaignRequest {
+                candidate: candidate('a'),
+                matrix,
+                workspace_id: None,
+            })
+            .unwrap();
+        let head = "a".repeat(40);
+
+        // Claim one optional gate while the campaign is still active.
+        let optional_execution = execution();
+        store
+            .claim(campaign.id, "optional-extra", &optional_execution)
+            .unwrap();
+
+        // Complete both required gates so the campaign certifies.
+        claim_and_record(
+            &store,
+            campaign.id,
+            "targeted",
+            Some(&head),
+            Some(PINNED_TOOLCHAIN),
+            None,
+        );
+        {
+            let connection = store.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE validation_gates SET status='passed', outcome='passed',
+                     freshness='exact_head' WHERE campaign_id=?1 AND gate_id='clean-final'",
+                    params![campaign.id.to_string()],
+                )
+                .unwrap();
+            recompute_campaign(&connection, campaign.id).unwrap();
+        }
+        assert_eq!(store.get(campaign.id).unwrap().status, "completed");
+        {
+            let connection = store.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE validation_campaigns SET status='merged' WHERE id=?1",
+                    params![campaign.id.to_string()],
+                )
+                .unwrap();
+        }
+
+        // A leftover optional gate recording its receipt must not downgrade
+        // the merged campaign.
+        store
+            .record(
+                campaign.id,
+                "optional-extra",
+                passing_receipt(optional_execution, Some(&head), None, None),
+            )
+            .unwrap();
+        assert_eq!(store.get(campaign.id).unwrap().status, "merged");
+
+        // Gates on a merged campaign are no longer claimable.
+        let error = store
+            .claim(campaign.id, "optional-late", &execution())
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("merged"));
     }
 
     #[test]
