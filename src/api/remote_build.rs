@@ -18,6 +18,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
@@ -48,6 +49,56 @@ const DEFAULT_ESTIMATED_DISK_GB: u64 = 12;
 const MAX_ESTIMATED_DISK_GB: u64 = 512;
 const DEFAULT_NODE_MIN_DISK_GB: u64 = 20;
 const DEFAULT_NODE_DISK_EMERGENCY_GB: u64 = 10;
+const MAX_REMOTE_BUILD_JSON_BYTES: u64 = 32 * 1024 * 1024;
+
+fn parse_remote_build_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<RemoteBuildRequest, (StatusCode, String)> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("identity")
+        .trim();
+    let reader: Box<dyn Read> = if encoding.eq_ignore_ascii_case("gzip") {
+        Box::new(GzDecoder::new(body))
+    } else if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
+        Box::new(body)
+    } else {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "remote build Content-Encoding must be gzip or identity".to_string(),
+        ));
+    };
+    let mut decoded = Vec::new();
+    reader
+        .take(MAX_REMOTE_BUILD_JSON_BYTES + 1)
+        .read_to_end(&mut decoded)
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid gzip remote build request: {error}"),
+            )
+        })?;
+    if decoded.len() as u64 > MAX_REMOTE_BUILD_JSON_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "remote build JSON exceeds {} bytes after decompression",
+                MAX_REMOTE_BUILD_JSON_BYTES
+            ),
+        ));
+    }
+    serde_json::from_slice(&decoded).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid remote build JSON: {error}"),
+        )
+    })
+}
 
 fn env_gib(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -881,8 +932,13 @@ async fn equivalent_remote_validation_response(
 
 async fn submit_remote_build(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<RemoteBuildRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> axum::response::Response {
+    let req = match parse_remote_build_request(&headers, &body) {
+        Ok(req) => req,
+        Err(error) => return error.into_response(),
+    };
     let expects_mission_continuation = req.wait || req.resume_mission_on_terminal;
     // Auth: per-mission, scope-bound capability token (NOT the dashboard JWT
     // and NOT a node bearer token) — a leak only authorizes remote builds
@@ -1705,6 +1761,82 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
     }
 
     #[test]
+    fn remote_build_request_accepts_gzip_and_caps_decompressed_json() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+
+        let request = serde_json::json!({
+            "mission_id": Uuid::new_v4(),
+            "token": "mission-capability",
+            "repo": "https://github.com/private/example.git",
+            "commit": "a".repeat(40),
+            "command": ["lake", "build"],
+        });
+        let plain = serde_json::to_vec(&request).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&plain).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < plain.len());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let parsed = parse_remote_build_request(&headers, &compressed).unwrap();
+        assert_eq!(parsed.repo, "https://github.com/private/example.git");
+        assert_eq!(parsed.commit, "a".repeat(40));
+
+        let oversized = vec![b' '; MAX_REMOTE_BUILD_JSON_BYTES as usize + 1];
+        let error = parse_remote_build_request(&HeaderMap::new(), &oversized).unwrap_err();
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn full_snapshot_crosses_five_mib_as_json_but_fits_when_gzipped() {
+        use base64::Engine;
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+
+        // Model the reported 4.35 MiB raw snapshot with deterministic,
+        // incompressible-ish bytes. Base64 JSON crosses a 5 MiB gateway
+        // buffer while gzip returns close to the raw source size.
+        let mut state = 0x9e37_79b9_u32;
+        let raw = (0..4_560_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect::<Vec<_>>();
+        let request = serde_json::json!({
+            "mission_id": Uuid::new_v4(),
+            "token": "mission-capability",
+            "repo": "https://github.com/private/example.git",
+            "commit": "a".repeat(40),
+            "command": ["lake", "build"],
+            "source_bundle": {
+                "manifest_sha256": "b".repeat(64),
+                "complete": true,
+                "files": [{
+                    "path": "Lido.lean",
+                    "sha256": "c".repeat(64),
+                    "data_base64": base64::engine::general_purpose::STANDARD.encode(raw),
+                }],
+            },
+        });
+        let plain = serde_json::to_vec(&request).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&plain).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(plain.len() > 5 * 1024 * 1024);
+        assert!(compressed.len() < 5 * 1024 * 1024);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let parsed = parse_remote_build_request(&headers, &compressed).unwrap();
+        assert!(parsed.source_bundle.is_some_and(|bundle| bundle.complete));
+    }
+
+    #[test]
     fn token_expiry_is_enforced() {
         let mission = Uuid::new_v4();
         let now = chrono::Utc::now().timestamp();
@@ -2080,8 +2212,10 @@ printf '503'
             .unwrap();
         assert_eq!(output.status.code(), Some(75));
 
-        let request: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+        let request: serde_json::Value = serde_json::from_reader(flate2::read::GzDecoder::new(
+            std::fs::File::open(&capture).unwrap(),
+        ))
+        .unwrap();
         assert_eq!(
             request
                 .get("estimated_disk_bytes")
@@ -2145,8 +2279,10 @@ printf '503'
             .unwrap();
         assert_eq!(full_output.status.code(), Some(75));
 
-        let full_request: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+        let full_request: serde_json::Value = serde_json::from_reader(
+            flate2::read::GzDecoder::new(std::fs::File::open(capture).unwrap()),
+        )
+        .unwrap();
         let full_bundle = full_request.get("source_bundle").unwrap();
         assert_eq!(
             full_bundle
