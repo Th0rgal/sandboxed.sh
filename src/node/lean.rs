@@ -1341,9 +1341,10 @@ async fn require_real_directory_tree(
     Ok(true)
 }
 
-/// Before creating a cache destination, require every existing ancestor below
-/// the checkout root to be a real directory. Once a component is absent, all
-/// deeper components are necessarily absent too and may be created safely.
+/// Before creating or deleting a bundle destination, require every existing
+/// ancestor below the checkout root to be a real directory. Once a component is
+/// absent, all deeper components are necessarily absent too and may be created
+/// safely (or, for deletions, the target cannot exist).
 async fn require_safe_directory_creation_path(
     root: &Path,
     path: &Path,
@@ -1385,6 +1386,16 @@ async fn apply_source_bundle(
     let total_bytes = validate_source_bundle(bundle).map_err(|error| anyhow::anyhow!("{error}"))?;
     for relative in &bundle.deleted_paths {
         let destination = checkout.join(relative);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("bundle deletion path '{relative}' has no parent"))?;
+        if parent != checkout {
+            // A tracked symlink such as `escape -> /outside` would let
+            // `remove_file` on `escape/victim` delete outside the checkout:
+            // `symlink_metadata` refuses to follow only the final component.
+            require_safe_directory_creation_path(checkout, parent, "source bundle deletion")
+                .await?;
+        }
         match tokio::fs::symlink_metadata(&destination).await {
             Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
                 tokio::fs::remove_file(&destination).await?;
@@ -2343,6 +2354,36 @@ mod tests {
         let receipt = tokio::fs::read_to_string(log).await.unwrap();
         assert!(receipt.contains(&bundle.manifest_sha256));
         assert!(receipt.contains("files=1 deletions=1 bytes=10"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_bundle_deletion_rejects_symlinked_parent_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let log = temp.path().join("job.log");
+        tokio::fs::create_dir_all(&checkout).await.unwrap();
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        let victim = outside.join("victim");
+        tokio::fs::write(&victim, b"keep me").await.unwrap();
+        symlink(&outside, checkout.join("escape")).unwrap();
+
+        let mut bundle = source_bundle("Beal/Proof.lean", b"new proof\n");
+        bundle.deleted_paths = vec!["escape/victim".to_string()];
+        bundle.operations_sha256 = Some(bundle_operations_sha256(&bundle));
+
+        let error = apply_source_bundle(&checkout, &bundle, &log)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must not contain a symlink"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(tokio::fs::read(&victim).await.unwrap(), b"keep me");
     }
 
     #[tokio::test]
