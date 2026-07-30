@@ -30,8 +30,8 @@ use uuid::Uuid;
 use super::routes::AppState;
 use crate::remote_node::{
     ArtifactEntry, DispatchOutcome, JobPayload, JobSource, LeaseClaims, NodeJobStatus,
-    RemoteNodeClient, RemoteNodeConfig, RemoteNodeError, RemoteNodeStatus, SourceBundle,
-    SubmitJobRequest, SCOPE_JOB_SUBMIT,
+    RemoteNodeClient, RemoteNodeConfig, RemoteNodeError, RemoteNodeStatus, SourceArchive,
+    SourceBundle, SubmitJobRequest, SCOPE_JOB_SUBMIT,
 };
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -280,7 +280,7 @@ pub struct RemoteBuildRequest {
     /// minted for exactly this mission.
     pub mission_id: Uuid,
     pub token: String,
-    /// Git clone/fetch URL; the node fetches it itself.
+    /// Credential-free repository identity and legacy public clone/fetch URL.
     pub repo: String,
     /// Full 40-char lowercase hex commit SHA.
     pub commit: String,
@@ -293,6 +293,10 @@ pub struct RemoteBuildRequest {
     /// reads the pinned checkout's toolchain file as the execution authority.
     #[serde(default)]
     pub toolchain: Option<String>,
+    /// Optional complete, commit-bound Git object pack. The bundled client
+    /// sends this so private sources never require credentials on a node.
+    #[serde(default)]
+    pub source_archive: Option<SourceArchive>,
     /// Optional, bounded source overlay whose hashes are verified by the node
     /// before it is applied over the pinned commit.
     #[serde(default)]
@@ -363,6 +367,16 @@ fn repository_identity(repo: &str) -> String {
     parsed.set_query(None);
     parsed.set_fragment(None);
     parsed.to_string()
+}
+
+fn repository_url_has_credentials(repo: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(repo) else {
+        return false;
+    };
+    parsed.password().is_some()
+        || (matches!(parsed.scheme(), "http" | "https") && !parsed.username().is_empty())
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
 }
 
 fn remote_job_identity(
@@ -900,6 +914,13 @@ async fn submit_remote_build(
     if req.command.is_empty() {
         return (StatusCode::BAD_REQUEST, "command argv required").into_response();
     }
+    if repository_url_has_credentials(&req.repo) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "repository URL must not contain credentials, query parameters, or a fragment",
+        )
+            .into_response();
+    }
     if let Err(message) = validate_expected_head(&req.commit, req.expected_head.as_deref()) {
         return (StatusCode::CONFLICT, message).into_response();
     }
@@ -916,7 +937,11 @@ async fn submit_remote_build(
             .into_response();
     }
     let min_disk_bytes = required_node_disk_bytes(req.estimated_disk_bytes);
-    let min_protocol_version = minimum_node_protocol_version(req.source_bundle.as_ref());
+    let min_protocol_version = if req.source_archive.is_some() {
+        crate::remote_node::protocol::NODE_PROTOCOL_VERSION
+    } else {
+        minimum_node_protocol_version(req.source_bundle.as_ref())
+    };
     // Every endpoint payload is a declarative Lean build. Callers may add
     // placement labels, but may not remove the runtime readiness gate by
     // sending an empty or unrelated requirements list.
@@ -926,8 +951,11 @@ async fn submit_remote_build(
     // Reuse completed evidence even when every runner is currently offline.
     // This optimistic read is repeated under the placement lock after any
     // explicit network probe, which closes the concurrent-submit race.
-    if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await {
-        return response;
+    if req.source_archive.is_none() {
+        if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await
+        {
+            return response;
+        }
     }
     if let Err((status, message)) =
         probe_explicit_lean_node(&state, &req.node_id, &requirements).await
@@ -938,8 +966,11 @@ async fn submit_remote_build(
     // tentative-handle persistence. No network probe runs while this mutex is
     // held, so a slow explicit runner cannot block unrelated auto placement.
     let placement_guard = placement_lock().lock().await;
-    if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await {
-        return response;
+    if req.source_archive.is_none() {
+        if let Some(response) = equivalent_remote_validation_response(&state, &req, &identity).await
+        {
+            return response;
+        }
     }
     let node = match resolve_node(
         &state,
@@ -978,6 +1009,7 @@ async fn submit_remote_build(
             source: JobSource {
                 repo: req.repo.clone(),
                 commit: req.commit.clone(),
+                archive: req.source_archive.clone().map(Box::new),
                 bundle: req.source_bundle.clone(),
             },
             cwd_rel: req.cwd_rel.clone(),
@@ -1444,6 +1476,7 @@ async fn get_remote_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[tokio::test]
     async fn terminal_handle_finalization_reports_persistence_failure() {
@@ -1625,7 +1658,7 @@ mod tests {
             "remote",
             "add",
             "origin",
-            "https://example.invalid/repo.git",
+            "https://build-user:placeholder@example.invalid/repo.git?token=placeholder#fragment",
         ]);
 
         let fake_curl = bin.join("curl");
@@ -1840,6 +1873,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         assert_eq!(req.timeout_secs, None);
         assert!(!req.resume_mission_on_terminal);
         assert_eq!(req.estimated_disk_bytes, 12 * GIB);
+        assert!(req.source_archive.is_none());
         assert!(req.source_bundle.is_none());
         assert!(req.artifacts.is_empty());
 
@@ -2028,7 +2062,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             "remote",
             "add",
             "origin",
-            "https://example.invalid/repo.git",
+            "https://build-user:placeholder@example.invalid/repo.git?token=placeholder#fragment",
         ]);
         std::fs::write(repo.join("Theory/Proof.lean"), "new proof\n").unwrap();
         std::fs::write(repo.join("Theory/Witness.lean"), "new witness\n").unwrap();
@@ -2089,6 +2123,10 @@ printf '503'
             Some(12 * GIB)
         );
         assert_eq!(
+            request.get("repo").and_then(serde_json::Value::as_str),
+            Some("https://example.invalid/repo.git")
+        );
+        assert_eq!(
             request.get("toolchain").and_then(serde_json::Value::as_str),
             Some("leanprover/lean4:v4.19.0")
         );
@@ -2097,6 +2135,23 @@ printf '503'
                 .get("expected_head")
                 .and_then(serde_json::Value::as_str),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        let archive = request.get("source_archive").unwrap();
+        let archive_bytes = base64::engine::general_purpose::STANDARD
+            .decode(archive.get("data_base64").unwrap().as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            archive
+                .get("size_bytes")
+                .and_then(serde_json::Value::as_u64),
+            Some(archive_bytes.len() as u64)
+        );
+        assert_eq!(
+            archive.get("sha256").unwrap().as_str().unwrap(),
+            crate::node::lean::source_archive_sha256(
+                request.get("commit").unwrap().as_str().unwrap(),
+                &archive_bytes
+            )
         );
         let bundle = request.get("source_bundle").unwrap();
         let files = bundle.get("files").unwrap().as_array().unwrap();
@@ -2147,6 +2202,10 @@ printf '503'
 
         let full_request: serde_json::Value =
             serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+        assert!(
+            full_request.get("source_archive").is_none(),
+            "complete source mode must not duplicate source bytes in an archive"
+        );
         let full_bundle = full_request.get("source_bundle").unwrap();
         assert_eq!(
             full_bundle
@@ -2365,6 +2424,18 @@ esac
         assert!(receipt.get("token").is_none());
         assert!(receipt.get("repo").is_none());
         assert!(receipt.get("wait").is_none());
+        assert!(
+            receipt.get("source_archive").is_none(),
+            "private source bytes must never be retained in a receipt"
+        );
+        assert!(receipt
+            .get("source_archive_sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|digest| digest.len() == 64));
+        assert!(receipt
+            .get("source_archive_size_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|size| size > 0));
         assert_eq!(
             receipt.get("job_id").and_then(serde_json::Value::as_str),
             Some("11111111-1111-1111-1111-111111111111")

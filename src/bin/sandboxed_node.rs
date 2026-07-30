@@ -136,13 +136,13 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/heartbeat", get(heartbeat))
         .route("/execute", post(execute))
-        // Complete private-source jobs carry up to 16 MiB before base64
-        // encoding, so the submit route needs the same bounded wire allowance
-        // as the core `/api/remote-build` endpoint.
+        // Private-source jobs carry bounded payloads before base64 encoding,
+        // so this route needs the same bounded wire allowance as the core
+        // `/api/remote-build` endpoint.
         .route(
             "/jobs",
             post(submit_job)
-                .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+                .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
                 .get(list_jobs),
         )
         .route("/jobs/:id", get(get_job))
@@ -778,6 +778,7 @@ mod tests {
                     source: sandboxed_sh::remote_node::JobSource {
                         repo: "/node/local/repo".to_string(),
                         commit: "a".repeat(40),
+                        archive: None,
                         bundle: None,
                     },
                     cwd_rel: None,
