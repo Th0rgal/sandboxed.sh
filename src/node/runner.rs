@@ -777,7 +777,7 @@ mod tests {
     #[test]
     fn persisted_lean_payload_redacts_source_archive_bytes() {
         let payload = JobPayload::LeanBuild {
-            source: JobSource {
+            source: Box::new(JobSource {
                 repo: "https://example.invalid/private.git".to_string(),
                 commit: "a".repeat(40),
                 archive: Some(Box::new(SourceArchive {
@@ -786,7 +786,7 @@ mod tests {
                     data_base64: "private-source-data".to_string(),
                 })),
                 bundle: None,
-            },
+            }),
             cwd_rel: None,
             command: vec!["lake".to_string(), "build".to_string()],
             timeout_secs: None,

@@ -1656,16 +1656,21 @@ mod tests {
             path: "lean-toolchain".to_string(),
             sha256: "a".repeat(64),
             data_base64: String::new(),
+            executable: None,
         };
         let overlay = SourceBundle {
             manifest_sha256: "b".repeat(64),
             files: vec![file.clone()],
             complete: false,
+            deleted_paths: Vec::new(),
+            operations_sha256: None,
         };
         let complete = SourceBundle {
             manifest_sha256: "c".repeat(64),
             files: vec![file],
             complete: true,
+            deleted_paths: Vec::new(),
+            operations_sha256: None,
         };
         assert_eq!(minimum_node_protocol_version(None), 1);
         assert_eq!(minimum_node_protocol_version(Some(&overlay)), 3);
