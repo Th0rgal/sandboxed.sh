@@ -15,7 +15,7 @@ use super::RemoteNodeError;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Current node protocol version reported by heartbeats.
-pub const NODE_PROTOCOL_VERSION: u32 = 3;
+pub const NODE_PROTOCOL_VERSION: u32 = 4;
 /// First protocol that reports `active_jobs` and `queued_jobs` in heartbeats.
 pub const NODE_JOB_COUNTER_PROTOCOL_VERSION: u32 = 2;
 
@@ -145,6 +145,10 @@ pub struct SourceBundleFile {
 pub struct SourceBundle {
     pub manifest_sha256: String,
     pub files: Vec<SourceBundleFile>,
+    /// Complete source tree that can be materialized without fetching the
+    /// repository. Private-repository runners therefore need no Git secret.
+    #[serde(default)]
+    pub complete: bool,
 }
 
 /// One artifact produced by a build job, relative to the checkout root.

@@ -130,9 +130,10 @@ To rotate a node token with zero downtime:
 `GET /heartbeat` returns the v1 fields (`node_id`, `online`, `capacity_total`,
 `capacity_available`, `active_leases`, `version`) plus:
 
-- `protocol_version` (currently `3`; core treats a missing field as `1`).
-  Version 3 is required for source-bundle jobs so a rolling deployment can
-  never silently drop a dirty overlay on an older node.
+- `protocol_version` (currently `4`; core treats a missing field as `1`).
+  Version 3 is required for overlay jobs and version 4 for complete-source
+  jobs, so a rolling deployment can never silently fetch a private repository
+  or drop source content on an older node.
 - `labels` (from `SANDBOXED_NODE_LABELS`)
 - `cpu_total` (logical cores)
 - `mem_total_bytes` / `mem_available_bytes`
@@ -226,8 +227,9 @@ Node env vars for lean-build jobs:
   filesystem drops below it, checkout dirs then lake cache slots are
   LRU-deleted (by dir mtime) until the threshold is met.
 - `SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES` — maximum decoded size of a local
-  source overlay (default 1 MiB; at most 256 regular files). Paths, per-file
-  hashes and the manifest hash are verified before any file is applied.
+  source bundle (default 1 MiB/256 files for overlays and 16 MiB/4096 files
+  for complete snapshots). Paths, per-file hashes and the manifest hash are
+  verified before any file is applied.
 - `SANDBOXED_NODE_GIT_SSH_KEY` — path to an SSH key used for git fetches
   (`GIT_SSH_COMMAND="ssh -i <key> -o IdentitiesOnly=yes -o
   StrictHostKeyChecking=accept-new"`); unset = default git auth.
@@ -444,7 +446,12 @@ It derives `repo` (`git remote get-url origin`), `commit`
 (`git rev-parse HEAD`), the Lean toolchain, and `cwd_rel`
 (`git rev-parse --show-prefix`). Dirty Lean sources and build metadata are sent
 as a bounded hashed overlay; unsupported deletions/renames fail before
-submission. It submits asynchronously to
+submission. For a private repository, set
+`REMOTE_BUILD_SOURCE_MODE=full`: the wrapper sends a content-addressed snapshot
+of all tracked files (plus the same narrow untracked Lean/build metadata
+allowlist), and the node materializes it without any Git fetch or repository
+credential. The receipt binds both the declared commit and the snapshot digest.
+It submits asynchronously to
 `$REMOTE_BUILD_URL` with `$REMOTE_BUILD_TOKEN`/`$REMOTE_BUILD_MISSION_ID`,
 persists the returned job/node receipt under
 `${XDG_STATE_HOME:-$HOME/.local/state}/sandboxed-sh/remote-builds/`, then polls
