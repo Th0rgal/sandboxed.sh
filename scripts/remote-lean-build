@@ -75,81 +75,85 @@ expected_head = os.environ.get("REMOTE_BUILD_EXPECTED_HEAD", "").strip()
 if expected_head:
     req["expected_head"] = expected_head
 
+source_mode = os.environ.get("REMOTE_BUILD_SOURCE_MODE", "overlay").strip().lower()
+if source_mode not in {"overlay", "full"}:
+    raise SystemExit("REMOTE_BUILD_SOURCE_MODE must be 'overlay' or 'full'")
+
 # Send the complete pinned Git snapshot as an object pack. Unlike forwarding a
 # credential or asking the node to fetch `origin`, this contains only immutable
-# repository objects reachable from the requested commit's tree.
-tree_records = subprocess.check_output(
-    ["git", "-C", str(repo_root), "ls-tree", "-r", "-t", "-z", "--full-tree", commit]
-).split(b"\0")
-root_tree = subprocess.check_output(
-    ["git", "-C", str(repo_root), "rev-parse", f"{commit}^{{tree}}"], text=True
-).strip()
-object_ids = [commit, root_tree]
-has_gitlinks = False
-for record in tree_records:
-    if not record:
-        continue
-    try:
-        metadata, _path = record.split(b"\t", 1)
-        mode, _kind, object_id = metadata.split(b" ", 2)
-    except ValueError:
-        raise SystemExit("git returned a malformed tree entry while creating source archive")
-    if mode == b"160000":
-        # A gitlink names an object in another repository. Preserve the legacy
-        # public fetch/submodule path instead of creating a knowingly incomplete
-        # archive or asking pack-objects for an object that cannot exist here.
-        has_gitlinks = True
-        continue
-    object_ids.append(object_id.decode("ascii"))
-max_archive_bytes = int(
-    os.environ.get("REMOTE_BUILD_MAX_SOURCE_ARCHIVE_BYTES", str(32 << 20))
-)
-if max_archive_bytes <= 0:
-    raise SystemExit("REMOTE_BUILD_MAX_SOURCE_ARCHIVE_BYTES must be positive")
-if has_gitlinks:
-    print(
-        "remote-lean-build: pinned tree contains submodules; using legacy runner fetch",
-        file=sys.stderr,
+# repository objects reachable from the requested commit's tree. Full source
+# mode already sends a bounded complete snapshot, so attaching both transports
+# would duplicate private source and can exceed the request-body limit.
+if source_mode != "full":
+    tree_records = subprocess.check_output(
+        ["git", "-C", str(repo_root), "ls-tree", "-r", "-t", "-z", "--full-tree", commit]
+    ).split(b"\0")
+    root_tree = subprocess.check_output(
+        ["git", "-C", str(repo_root), "rev-parse", f"{commit}^{{tree}}"], text=True
+    ).strip()
+    object_ids = [commit, root_tree]
+    has_gitlinks = False
+    for record in tree_records:
+        if not record:
+            continue
+        try:
+            metadata, _path = record.split(b"\t", 1)
+            mode, _kind, object_id = metadata.split(b" ", 2)
+        except ValueError:
+            raise SystemExit("git returned a malformed tree entry while creating source archive")
+        if mode == b"160000":
+            # A gitlink names an object in another repository. Preserve the legacy
+            # public fetch/submodule path instead of creating a knowingly incomplete
+            # archive or asking pack-objects for an object that cannot exist here.
+            has_gitlinks = True
+            continue
+        object_ids.append(object_id.decode("ascii"))
+    max_archive_bytes = int(
+        os.environ.get("REMOTE_BUILD_MAX_SOURCE_ARCHIVE_BYTES", str(32 << 20))
     )
-else:
-    pack_process = subprocess.Popen(
-        ["git", "-C", str(repo_root), "pack-objects", "--stdout", "--no-reuse-delta"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-    )
-    assert pack_process.stdin is not None and pack_process.stdout is not None
-    pack_process.stdin.write(("\n".join(object_ids) + "\n").encode("ascii"))
-    pack_process.stdin.close()
-    pack = pack_process.stdout.read(max_archive_bytes + 1)
-    if len(pack) > max_archive_bytes:
-        pack_process.kill()
-        pack_process.wait()
-        raise SystemExit(
-            f"source archive exceeds maximum of {max_archive_bytes} bytes"
+    if max_archive_bytes <= 0:
+        raise SystemExit("REMOTE_BUILD_MAX_SOURCE_ARCHIVE_BYTES must be positive")
+    if has_gitlinks:
+        print(
+            "remote-lean-build: pinned tree contains submodules; using legacy runner fetch",
+            file=sys.stderr,
         )
-    if pack_process.wait() != 0:
-        raise SystemExit("git pack-objects failed while creating source archive")
-    if not pack:
-        raise SystemExit("git pack-objects returned an empty source archive")
-    archive_hash = hashlib.sha256(
-        b"sandboxed-source-archive-v1\0"
-        + commit.encode("ascii")
-        + b"\0"
-        + pack
-    ).hexdigest()
-    req["source_archive"] = {
-        "sha256": archive_hash,
-        "size_bytes": len(pack),
-        "data_base64": base64.b64encode(pack).decode("ascii"),
-    }
+    else:
+        pack_process = subprocess.Popen(
+            ["git", "-C", str(repo_root), "pack-objects", "--stdout", "--no-reuse-delta"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        assert pack_process.stdin is not None and pack_process.stdout is not None
+        pack_process.stdin.write(("\n".join(object_ids) + "\n").encode("ascii"))
+        pack_process.stdin.close()
+        pack = pack_process.stdout.read(max_archive_bytes + 1)
+        if len(pack) > max_archive_bytes:
+            pack_process.kill()
+            pack_process.wait()
+            raise SystemExit(
+                f"source archive exceeds maximum of {max_archive_bytes} bytes"
+            )
+        if pack_process.wait() != 0:
+            raise SystemExit("git pack-objects failed while creating source archive")
+        if not pack:
+            raise SystemExit("git pack-objects returned an empty source archive")
+        archive_hash = hashlib.sha256(
+            b"sandboxed-source-archive-v1\0"
+            + commit.encode("ascii")
+            + b"\0"
+            + pack
+        ).hexdigest()
+        req["source_archive"] = {
+            "sha256": archive_hash,
+            "size_bytes": len(pack),
+            "data_base64": base64.b64encode(pack).decode("ascii"),
+        }
 
 def git_paths(*args):
     raw = subprocess.check_output(["git", "-C", str(repo_root), *args])
     return [item.decode("utf-8") for item in raw.split(b"\0") if item]
 
-source_mode = os.environ.get("REMOTE_BUILD_SOURCE_MODE", "overlay").strip().lower()
-if source_mode not in {"overlay", "full"}:
-    raise SystemExit("REMOTE_BUILD_SOURCE_MODE must be 'overlay' or 'full'")
 deleted = git_paths("diff", "--name-only", "-z", "--diff-filter=DR", "HEAD")
 if deleted and source_mode != "full":
     raise SystemExit(

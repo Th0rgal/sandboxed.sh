@@ -55,6 +55,16 @@ struct QueuedJob {
     payload: JobPayload,
 }
 
+fn persisted_payload_json(payload: &JobPayload) -> anyhow::Result<String> {
+    let mut persisted_payload = payload.clone();
+    if let JobPayload::LeanBuild { source, .. } = &mut persisted_payload {
+        if let Some(archive) = &mut source.archive {
+            archive.data_base64.clear();
+        }
+    }
+    Ok(serde_json::to_string(&persisted_payload)?)
+}
+
 /// Shared job runner; construct with [`JobRunner::spawn`].
 pub struct JobRunner {
     store: JobStore,
@@ -171,7 +181,10 @@ impl JobRunner {
         mission_id: Uuid,
         payload: JobPayload,
     ) -> anyhow::Result<()> {
-        let payload_json = serde_json::to_string(&payload)?;
+        // The executable payload remains only in the in-memory queue. Durable
+        // rows are status receipts (in-flight jobs become `lost` on restart),
+        // so never retain commit-pack source bytes in jobs.db.
+        let payload_json = persisted_payload_json(&payload)?;
         // The dispatcher drains the mpsc channel into semaphore waiters so a
         // cancelled queued job releases its channel slot immediately. Keep an
         // explicit atomic bound across both locations.
@@ -759,6 +772,41 @@ pub async fn read_log_tail(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_node::{JobSource, SourceArchive};
+
+    #[test]
+    fn persisted_lean_payload_redacts_source_archive_bytes() {
+        let payload = JobPayload::LeanBuild {
+            source: JobSource {
+                repo: "https://example.invalid/private.git".to_string(),
+                commit: "a".repeat(40),
+                archive: Some(Box::new(SourceArchive {
+                    sha256: "b".repeat(64),
+                    size_bytes: 18,
+                    data_base64: "private-source-data".to_string(),
+                })),
+                bundle: None,
+            },
+            cwd_rel: None,
+            command: vec!["lake".to_string(), "build".to_string()],
+            timeout_secs: None,
+            estimated_disk_bytes: None,
+            cache_key: None,
+            artifacts: Vec::new(),
+            env: HashMap::new(),
+        };
+
+        let persisted = persisted_payload_json(&payload).unwrap();
+        assert!(!persisted.contains("private-source-data"));
+        let decoded: JobPayload = serde_json::from_str(&persisted).unwrap();
+        let JobPayload::LeanBuild { source, .. } = decoded else {
+            panic!("expected Lean payload");
+        };
+        let archive = source.archive.unwrap();
+        assert!(archive.data_base64.is_empty());
+        assert_eq!(archive.sha256, "b".repeat(64));
+        assert_eq!(archive.size_bytes, 18);
+    }
 
     #[tokio::test]
     async fn runs_a_job_and_captures_its_log() {

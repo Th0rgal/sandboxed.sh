@@ -2202,6 +2202,10 @@ printf '503'
 
         let full_request: serde_json::Value =
             serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+        assert!(
+            full_request.get("source_archive").is_none(),
+            "complete source mode must not duplicate source bytes in an archive"
+        );
         let full_bundle = full_request.get("source_bundle").unwrap();
         assert_eq!(
             full_bundle
