@@ -7,9 +7,9 @@ description: >
   terms: mission, sandboxed.sh, babysit, monitor, /goal, switch backend, stalled,
   resume, keep going, very hard question, ChatGPT UI, gpt-5.6-pro.
 metadata:
-  version: 1.4.0
   policy: chatgpt-ui-pool
-  policy_version: 1.4.0
+  policy_version: 1.3.0
+version: 1.4.0
 ---
 
 # Hermes Mission Control
