@@ -28,8 +28,15 @@ timeout_secs = 7200
 Create a campaign with `POST /api/validation-campaigns/from-workspace`, claim
 ready gates with a typed mission/workspace/remote execution reference, then
 submit their receipts. A receipt records actual toolchain, cache provenance,
-exit code, artifacts, diagnostics and observed head. Passed stale receipts are
-retained as evidence but never unlock dependent gates.
+exit code, artifacts, diagnostics, observed head and, for dirty-overlay
+candidates, the source bundle digest. A passed receipt is classified
+`exact_head` only when it attests the candidate's expected head, the
+candidate's `source_bundle_digest` exactly (a bundle-less candidate rejects a
+bundle-attesting receipt and vice versa), and the gate's pinned `toolchain`
+when one is configured; any other pass is `stale`. Passed stale receipts are
+retained as evidence but never unlock dependent gates and never certify. Stale
+gates remain claimable, so a later exact-head execution can replace the stale
+evidence.
 
 The durable outbox emits only `candidate_changed`, `blocker_changed`,
 `campaign_terminal`, and `merged`. When the Paloma/Hermes webhook is configured,

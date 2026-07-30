@@ -292,6 +292,8 @@ struct RecordReceiptRequest {
     #[serde(default)]
     observed_head: Option<String>,
     #[serde(default)]
+    source_bundle_digest: Option<String>,
+    #[serde(default)]
     toolchain: Option<String>,
     #[serde(default)]
     environment_digest: Option<String>,
@@ -380,6 +382,8 @@ pub struct ValidationReceipt {
     pub exit_code: Option<i32>,
     pub blocked_reason: Option<String>,
     pub observed_head: Option<String>,
+    #[serde(default)]
+    pub source_bundle_digest: Option<String>,
     pub toolchain: Option<String>,
     pub environment_digest: Option<String>,
     pub cache: CacheReceipt,
@@ -514,6 +518,242 @@ impl ValidationStore {
     fn get(&self, id: Uuid) -> Result<CampaignView, String> {
         let connection = self.lock()?;
         load_campaign(&connection, id)?.ok_or_else(|| format!("campaign {id} not found"))
+    }
+
+    fn claim(
+        &self,
+        campaign_id: Uuid,
+        gate_id: &str,
+        execution: &ExecutionRef,
+    ) -> Result<GateView, ApiError> {
+        let mut connection = self.lock().map_err(internal)?;
+        let transaction = connection.transaction().map_err(internal)?;
+        let current = load_gate(&transaction, campaign_id, gate_id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "validation gate not found".to_string(),
+                )
+            })?;
+        if current.status == "running" && current.execution.as_ref() == Some(execution) {
+            return Ok(current);
+        }
+        // Stale gates hold retained evidence that can never unlock dependants
+        // or certify, so they stay claimable: a later exact-head execution can
+        // replace the stale receipt instead of wedging the campaign.
+        if current.status != "ready" && current.status != "stale" {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("gate '{gate_id}' is {}, not claimable", current.status),
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE validation_gates SET status='running', execution_json=?3,
+                 started_at=?4 WHERE campaign_id=?1 AND gate_id=?2",
+                params![
+                    campaign_id.to_string(),
+                    gate_id,
+                    json_string(execution).map_err(internal)?,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        load_gate(&connection, campaign_id, gate_id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "validation gate not found".to_string(),
+                )
+            })
+    }
+
+    fn record(
+        &self,
+        campaign_id: Uuid,
+        gate_id: &str,
+        request: RecordReceiptRequest,
+    ) -> Result<(), ApiError> {
+        let mut connection = self.lock().map_err(internal)?;
+        let transaction = connection.transaction().map_err(internal)?;
+        let campaign = load_campaign_row(&transaction, campaign_id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "validation campaign not found".to_string(),
+                )
+            })?;
+        let gate = load_gate(&transaction, campaign_id, gate_id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "validation gate not found".to_string(),
+                )
+            })?;
+        let execution_key = request.execution.key();
+        if transaction
+            .query_row(
+                "SELECT 1 FROM validation_receipts
+                 WHERE campaign_id=?1 AND gate_id=?2 AND execution_key=?3",
+                params![campaign_id.to_string(), gate_id, execution_key],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(internal)?
+            .is_some()
+        {
+            transaction.commit().map_err(internal)?;
+            return Ok(());
+        }
+        if gate.status != "running" || gate.execution.as_ref() != Some(&request.execution) {
+            return Err((
+                StatusCode::CONFLICT,
+                "receipt execution does not own a running gate".to_string(),
+            ));
+        }
+
+        if let Some(head) = request.observed_head.as_deref() {
+            validate_digest("observed_head", head, 40).map_err(bad_request)?;
+        }
+        if let Some(digest) = request.source_bundle_digest.as_deref() {
+            validate_digest("source_bundle_digest", digest, 64).map_err(bad_request)?;
+        }
+        let outcome = if request
+            .blocked_reason
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            "blocked"
+        } else if request.exit_code == Some(0) {
+            "passed"
+        } else {
+            "failed"
+        };
+        if outcome == "passed"
+            && gate.spec.mode == ValidationMode::Clean
+            && !request.cache.clean_checkout
+        {
+            return Err(bad_request(
+                "a passed clean gate receipt must attest cache.clean_checkout=true".to_string(),
+            ));
+        }
+        let expected_head = campaign
+            .candidate
+            .expected_head
+            .as_deref()
+            .unwrap_or(&campaign.candidate.commit);
+        // Exact evidence must attest the pinned candidate in full: the Git
+        // head, the exact source bundle (a clean-base or foreign-overlay run
+        // sharing the head must not certify a pinned bundle, and a bundle
+        // attestation must not certify a bundle-less candidate), and the
+        // gate's pinned toolchain. Anything else is retained as stale.
+        let head_matches = request.observed_head.as_deref() == Some(expected_head);
+        let bundle_matches = request.source_bundle_digest.as_deref()
+            == campaign.candidate.source_bundle_digest.as_deref();
+        let toolchain_matches = match gate.spec.toolchain.as_deref() {
+            Some(pinned) => request.toolchain.as_deref() == Some(pinned),
+            None => true,
+        };
+        let freshness = if head_matches && bundle_matches && toolchain_matches {
+            "exact_head"
+        } else {
+            "stale"
+        };
+        let now = Utc::now();
+        let receipt = ValidationReceipt {
+            id: Uuid::new_v4(),
+            campaign_id,
+            gate_id: gate_id.to_string(),
+            candidate_id: campaign.candidate_id,
+            execution: request.execution,
+            outcome: outcome.to_string(),
+            freshness: freshness.to_string(),
+            exit_code: request.exit_code,
+            blocked_reason: request.blocked_reason.clone(),
+            observed_head: request.observed_head,
+            source_bundle_digest: request.source_bundle_digest,
+            toolchain: request.toolchain,
+            environment_digest: request.environment_digest,
+            cache: request.cache,
+            artifacts: request.artifacts,
+            diagnostic_clusters: request
+                .diagnostics
+                .as_deref()
+                .map(cluster_diagnostics)
+                .unwrap_or_default(),
+            started_at: request.started_at.or(gate.started_at).unwrap_or(now),
+            finished_at: request.finished_at.unwrap_or(now),
+            reused_from: None,
+        };
+        transaction
+            .execute(
+                "INSERT INTO validation_receipts
+                 (id, campaign_id, gate_id, execution_key, validation_key, receipt_json,
+                  outcome, freshness, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    receipt.id.to_string(),
+                    campaign_id.to_string(),
+                    gate_id,
+                    execution_key,
+                    gate.validation_key,
+                    json_string(&receipt).map_err(internal)?,
+                    outcome,
+                    freshness,
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(internal)?;
+        let gate_status = match (outcome, freshness) {
+            ("passed", "exact_head") => "passed",
+            ("passed", _) => "stale",
+            ("blocked", _) => "blocked",
+            _ => "failed",
+        };
+        let blocker_fingerprint = request.blocked_reason.as_deref().map(hash_text);
+        transaction
+            .execute(
+                "UPDATE validation_gates SET status=?3, outcome=?4, freshness=?5,
+                 execution_json=?6, blocker_fingerprint=?7, finished_at=?8
+                 WHERE campaign_id=?1 AND gate_id=?2",
+                params![
+                    campaign_id.to_string(),
+                    gate_id,
+                    gate_status,
+                    outcome,
+                    freshness,
+                    json_string(&receipt.execution).map_err(internal)?,
+                    blocker_fingerprint,
+                    receipt.finished_at.to_rfc3339(),
+                ],
+            )
+            .map_err(internal)?;
+        if let (Some(reason), Some(fingerprint)) = (
+            request.blocked_reason.as_deref(),
+            blocker_fingerprint.as_deref(),
+        ) {
+            insert_outbox(
+                &transaction,
+                campaign_id,
+                "blocker_changed",
+                fingerprint,
+                serde_json::json!({
+                    "campaign_id": campaign_id,
+                    "gate_id": gate_id,
+                    "reason": reason,
+                    "fingerprint": fingerprint,
+                }),
+            )
+            .map_err(internal)?;
+        }
+        recompute_campaign(&transaction, campaign_id).map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        Ok(())
     }
 }
 
@@ -683,47 +923,10 @@ async fn claim_gate(
     AxumPath((campaign_id, gate_id)): AxumPath<(Uuid, String)>,
     Json(request): Json<ClaimGateRequest>,
 ) -> Result<Json<GateView>, ApiError> {
-    let mut connection = state.validation.lock().map_err(internal)?;
-    let transaction = connection.transaction().map_err(internal)?;
-    let current = load_gate(&transaction, campaign_id, &gate_id)
-        .map_err(internal)?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                "validation gate not found".to_string(),
-            )
-        })?;
-    if current.status == "running" && current.execution.as_ref() == Some(&request.execution) {
-        return Ok(Json(current));
-    }
-    if current.status != "ready" {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("gate '{gate_id}' is {}, not ready", current.status),
-        ));
-    }
-    transaction
-        .execute(
-            "UPDATE validation_gates SET status='running', execution_json=?3,
-             started_at=?4 WHERE campaign_id=?1 AND gate_id=?2",
-            params![
-                campaign_id.to_string(),
-                gate_id,
-                json_string(&request.execution).map_err(internal)?,
-                Utc::now().to_rfc3339(),
-            ],
-        )
-        .map_err(internal)?;
-    transaction.commit().map_err(internal)?;
-    load_gate(&connection, campaign_id, &gate_id)
-        .map_err(internal)?
+    state
+        .validation
+        .claim(campaign_id, &gate_id, &request.execution)
         .map(Json)
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                "validation gate not found".to_string(),
-            )
-        })
 }
 
 async fn record_receipt(
@@ -731,172 +934,7 @@ async fn record_receipt(
     AxumPath((campaign_id, gate_id)): AxumPath<(Uuid, String)>,
     Json(request): Json<RecordReceiptRequest>,
 ) -> Result<Json<CampaignView>, ApiError> {
-    let mut connection = state.validation.lock().map_err(internal)?;
-    let transaction = connection.transaction().map_err(internal)?;
-    let campaign = load_campaign_row(&transaction, campaign_id)
-        .map_err(internal)?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                "validation campaign not found".to_string(),
-            )
-        })?;
-    let gate = load_gate(&transaction, campaign_id, &gate_id)
-        .map_err(internal)?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                "validation gate not found".to_string(),
-            )
-        })?;
-    let execution_key = request.execution.key();
-    if transaction
-        .query_row(
-            "SELECT 1 FROM validation_receipts
-             WHERE campaign_id=?1 AND gate_id=?2 AND execution_key=?3",
-            params![campaign_id.to_string(), gate_id, execution_key],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(internal)?
-        .is_some()
-    {
-        transaction.commit().map_err(internal)?;
-        drop(connection);
-        return state
-            .validation
-            .get(campaign_id)
-            .map(Json)
-            .map_err(internal);
-    }
-    if gate.status != "running" || gate.execution.as_ref() != Some(&request.execution) {
-        return Err((
-            StatusCode::CONFLICT,
-            "receipt execution does not own a running gate".to_string(),
-        ));
-    }
-
-    if let Some(head) = request.observed_head.as_deref() {
-        validate_digest("observed_head", head, 40).map_err(bad_request)?;
-    }
-    let outcome = if request
-        .blocked_reason
-        .as_ref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        "blocked"
-    } else if request.exit_code == Some(0) {
-        "passed"
-    } else {
-        "failed"
-    };
-    if outcome == "passed"
-        && gate.spec.mode == ValidationMode::Clean
-        && !request.cache.clean_checkout
-    {
-        return Err(bad_request(
-            "a passed clean gate receipt must attest cache.clean_checkout=true".to_string(),
-        ));
-    }
-    let expected_head = campaign
-        .candidate
-        .expected_head
-        .as_deref()
-        .unwrap_or(&campaign.candidate.commit);
-    let freshness = if request.observed_head.as_deref() == Some(expected_head) {
-        "exact_head"
-    } else {
-        "stale"
-    };
-    let now = Utc::now();
-    let receipt = ValidationReceipt {
-        id: Uuid::new_v4(),
-        campaign_id,
-        gate_id: gate_id.clone(),
-        candidate_id: campaign.candidate_id,
-        execution: request.execution,
-        outcome: outcome.to_string(),
-        freshness: freshness.to_string(),
-        exit_code: request.exit_code,
-        blocked_reason: request.blocked_reason.clone(),
-        observed_head: request.observed_head,
-        toolchain: request.toolchain,
-        environment_digest: request.environment_digest,
-        cache: request.cache,
-        artifacts: request.artifacts,
-        diagnostic_clusters: request
-            .diagnostics
-            .as_deref()
-            .map(cluster_diagnostics)
-            .unwrap_or_default(),
-        started_at: request.started_at.or(gate.started_at).unwrap_or(now),
-        finished_at: request.finished_at.unwrap_or(now),
-        reused_from: None,
-    };
-    transaction
-        .execute(
-            "INSERT INTO validation_receipts
-             (id, campaign_id, gate_id, execution_key, validation_key, receipt_json,
-              outcome, freshness, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                receipt.id.to_string(),
-                campaign_id.to_string(),
-                gate_id,
-                execution_key,
-                gate.validation_key,
-                json_string(&receipt).map_err(internal)?,
-                outcome,
-                freshness,
-                now.to_rfc3339(),
-            ],
-        )
-        .map_err(internal)?;
-    let gate_status = match (outcome, freshness) {
-        ("passed", "exact_head") => "passed",
-        ("passed", _) => "stale",
-        ("blocked", _) => "blocked",
-        _ => "failed",
-    };
-    let blocker_fingerprint = request.blocked_reason.as_deref().map(hash_text);
-    transaction
-        .execute(
-            "UPDATE validation_gates SET status=?3, outcome=?4, freshness=?5,
-             execution_json=?6, blocker_fingerprint=?7, finished_at=?8
-             WHERE campaign_id=?1 AND gate_id=?2",
-            params![
-                campaign_id.to_string(),
-                gate_id,
-                gate_status,
-                outcome,
-                freshness,
-                json_string(&receipt.execution).map_err(internal)?,
-                blocker_fingerprint,
-                receipt.finished_at.to_rfc3339(),
-            ],
-        )
-        .map_err(internal)?;
-    if let (Some(reason), Some(fingerprint)) = (
-        request.blocked_reason.as_deref(),
-        blocker_fingerprint.as_deref(),
-    ) {
-        insert_outbox(
-            &transaction,
-            campaign_id,
-            "blocker_changed",
-            fingerprint,
-            serde_json::json!({
-                "campaign_id": campaign_id,
-                "gate_id": gate_id,
-                "reason": reason,
-                "fingerprint": fingerprint,
-            }),
-        )
-        .map_err(internal)?;
-    }
-    recompute_campaign(&transaction, campaign_id).map_err(internal)?;
-    transaction.commit().map_err(internal)?;
-    drop(connection);
+    state.validation.record(campaign_id, &gate_id, request)?;
     state
         .validation
         .get(campaign_id)
@@ -1522,6 +1560,8 @@ fn internal(error: impl std::fmt::Display) -> ApiError {
 mod tests {
     use super::*;
 
+    const PINNED_TOOLCHAIN: &str = "leanprover/lean4:v4.31.0";
+
     fn candidate(commit: char) -> ValidationCandidate {
         ValidationCandidate {
             repo: "https://github.com/example/verity.git".to_string(),
@@ -1569,6 +1609,62 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn execution() -> ExecutionRef {
+        ExecutionRef::WorkspaceJob {
+            job_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+        }
+    }
+
+    fn passing_receipt(
+        execution: ExecutionRef,
+        observed_head: Option<&str>,
+        toolchain: Option<&str>,
+        source_bundle_digest: Option<&str>,
+    ) -> RecordReceiptRequest {
+        RecordReceiptRequest {
+            execution,
+            exit_code: Some(0),
+            blocked_reason: None,
+            observed_head: observed_head.map(str::to_string),
+            source_bundle_digest: source_bundle_digest.map(str::to_string),
+            toolchain: toolchain.map(str::to_string),
+            environment_digest: None,
+            cache: CacheReceipt::default(),
+            artifacts: vec![],
+            diagnostics: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    fn claim_and_record(
+        store: &ValidationStore,
+        campaign_id: Uuid,
+        gate_id: &str,
+        observed_head: Option<&str>,
+        toolchain: Option<&str>,
+        source_bundle_digest: Option<&str>,
+    ) {
+        let execution = execution();
+        store.claim(campaign_id, gate_id, &execution).unwrap();
+        store
+            .record(
+                campaign_id,
+                gate_id,
+                passing_receipt(execution, observed_head, toolchain, source_bundle_digest),
+            )
+            .unwrap();
+    }
+
+    fn gate_status(store: &ValidationStore, campaign_id: Uuid, gate_id: &str) -> String {
+        let connection = store.lock().unwrap();
+        load_gate(&connection, campaign_id, gate_id)
+            .unwrap()
+            .unwrap()
+            .status
     }
 
     #[test]
@@ -1692,6 +1788,170 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn exact_head_requires_matching_bundle_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ValidationStore::open(dir.path().join("validation.db")).unwrap();
+        let mut pinned = candidate('a');
+        pinned.source_bundle_digest = Some("b".repeat(64));
+        let campaign = store
+            .create(CreateCampaignRequest {
+                candidate: pinned,
+                matrix: matrix(),
+                workspace_id: None,
+            })
+            .unwrap();
+        let head = "a".repeat(40);
+
+        // Same head from the clean base checkout (no bundle attested) is not
+        // exact evidence for a pinned dirty overlay.
+        claim_and_record(
+            &store,
+            campaign.id,
+            "targeted",
+            Some(&head),
+            Some(PINNED_TOOLCHAIN),
+            None,
+        );
+        assert_eq!(gate_status(&store, campaign.id, "targeted"), "stale");
+        assert_eq!(gate_status(&store, campaign.id, "clean-final"), "pending");
+
+        // Same head from a different dirty overlay is not exact evidence.
+        claim_and_record(
+            &store,
+            campaign.id,
+            "targeted",
+            Some(&head),
+            Some(PINNED_TOOLCHAIN),
+            Some(&"c".repeat(64)),
+        );
+        assert_eq!(gate_status(&store, campaign.id, "targeted"), "stale");
+
+        // Matching bundle digest is exact and unlocks the dependant.
+        claim_and_record(
+            &store,
+            campaign.id,
+            "targeted",
+            Some(&head),
+            Some(PINNED_TOOLCHAIN),
+            Some(&"b".repeat(64)),
+        );
+        assert_eq!(gate_status(&store, campaign.id, "targeted"), "passed");
+        assert_eq!(gate_status(&store, campaign.id, "clean-final"), "ready");
+    }
+
+    #[test]
+    fn bundle_less_candidate_rejects_bundle_attesting_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ValidationStore::open(dir.path().join("validation.db")).unwrap();
+        let campaign = store
+            .create(CreateCampaignRequest {
+                candidate: candidate('a'),
+                matrix: matrix(),
+                workspace_id: None,
+            })
+            .unwrap();
+        claim_and_record(
+            &store,
+            campaign.id,
+            "targeted",
+            Some(&"a".repeat(40)),
+            Some(PINNED_TOOLCHAIN),
+            Some(&"b".repeat(64)),
+        );
+        assert_eq!(gate_status(&store, campaign.id, "targeted"), "stale");
+    }
+
+    #[test]
+    fn pinned_toolchain_mismatch_does_not_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ValidationStore::open(dir.path().join("validation.db")).unwrap();
+        let campaign = store
+            .create(CreateCampaignRequest {
+                candidate: candidate('a'),
+                matrix: matrix(),
+                workspace_id: None,
+            })
+            .unwrap();
+        let head = "a".repeat(40);
+
+        // Omitted toolchain on a pinned gate must not pass.
+        claim_and_record(&store, campaign.id, "targeted", Some(&head), None, None);
+        assert_eq!(gate_status(&store, campaign.id, "targeted"), "stale");
+
+        // A different toolchain must not pass either.
+        claim_and_record(
+            &store,
+            campaign.id,
+            "targeted",
+            Some(&head),
+            Some("leanprover/lean4:v4.30.0"),
+            None,
+        );
+        assert_eq!(gate_status(&store, campaign.id, "targeted"), "stale");
+
+        // The pinned toolchain passes.
+        claim_and_record(
+            &store,
+            campaign.id,
+            "targeted",
+            Some(&head),
+            Some(PINNED_TOOLCHAIN),
+            None,
+        );
+        assert_eq!(gate_status(&store, campaign.id, "targeted"), "passed");
+    }
+
+    #[test]
+    fn stale_gate_is_reclaimable_until_exact_head_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ValidationStore::open(dir.path().join("validation.db")).unwrap();
+        let campaign = store
+            .create(CreateCampaignRequest {
+                candidate: candidate('a'),
+                matrix: matrix(),
+                workspace_id: None,
+            })
+            .unwrap();
+
+        // A pass observed at the wrong head is retained as stale evidence and
+        // neither unlocks dependants nor certifies.
+        claim_and_record(
+            &store,
+            campaign.id,
+            "targeted",
+            Some(&"b".repeat(40)),
+            Some(PINNED_TOOLCHAIN),
+            None,
+        );
+        assert_eq!(gate_status(&store, campaign.id, "targeted"), "stale");
+        let view = store.get(campaign.id).unwrap();
+        assert_eq!(view.status, "active");
+        assert!(!view.certifying);
+        assert_eq!(gate_status(&store, campaign.id, "clean-final"), "pending");
+
+        // The stale gate stays claimable and a later exact-head execution
+        // replaces the stale evidence and unlocks the dependant.
+        let retry = execution();
+        let claimed = store.claim(campaign.id, "targeted", &retry).unwrap();
+        assert_eq!(claimed.status, "running");
+        store
+            .record(
+                campaign.id,
+                "targeted",
+                passing_receipt(retry, Some(&"a".repeat(40)), Some(PINNED_TOOLCHAIN), None),
+            )
+            .unwrap();
+        assert_eq!(gate_status(&store, campaign.id, "targeted"), "passed");
+        assert_eq!(gate_status(&store, campaign.id, "clean-final"), "ready");
+
+        // A passed gate is not claimable.
+        let error = store
+            .claim(campaign.id, "targeted", &execution())
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
     }
 
     #[test]
