@@ -266,6 +266,14 @@ fn default_wait() -> bool {
     true
 }
 
+fn minimum_node_protocol_version(source_bundle: Option<&SourceBundle>) -> u32 {
+    match source_bundle {
+        Some(bundle) if bundle.complete => crate::remote_node::protocol::NODE_PROTOCOL_VERSION,
+        Some(_) => 3,
+        None => 1,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RemoteBuildRequest {
     /// Mission this build belongs to; `token` must be the capability token
@@ -931,10 +939,8 @@ async fn submit_remote_build(
     let min_disk_bytes = required_node_disk_bytes(req.estimated_disk_bytes);
     let min_protocol_version = if req.source_archive.is_some() {
         crate::remote_node::protocol::NODE_PROTOCOL_VERSION
-    } else if req.source_bundle.is_some() {
-        3
     } else {
-        1
+        minimum_node_protocol_version(req.source_bundle.as_ref())
     };
     // Every endpoint payload is a declarative Lean build. Callers may add
     // placement labels, but may not remove the runtime readiness gate by
@@ -1540,6 +1546,32 @@ mod tests {
         assert!(!heartbeat_protocol_has_job_counters(1));
         assert!(heartbeat_protocol_has_job_counters(2));
         assert!(heartbeat_protocol_has_job_counters(3));
+        assert!(heartbeat_protocol_has_job_counters(4));
+    }
+
+    #[test]
+    fn complete_source_requires_v4_but_overlay_remains_v3_compatible() {
+        let file = crate::remote_node::SourceBundleFile {
+            path: "lean-toolchain".to_string(),
+            sha256: "a".repeat(64),
+            data_base64: String::new(),
+        };
+        let overlay = SourceBundle {
+            manifest_sha256: "b".repeat(64),
+            files: vec![file.clone()],
+            complete: false,
+        };
+        let complete = SourceBundle {
+            manifest_sha256: "c".repeat(64),
+            files: vec![file],
+            complete: true,
+        };
+        assert_eq!(minimum_node_protocol_version(None), 1);
+        assert_eq!(minimum_node_protocol_version(Some(&overlay)), 3);
+        assert_eq!(
+            minimum_node_protocol_version(Some(&complete)),
+            crate::remote_node::protocol::NODE_PROTOCOL_VERSION
+        );
     }
 
     #[test]
@@ -2069,7 +2101,7 @@ printf '503'
                 "/scripts/remote-lean-build"
             ))
             .current_dir(repo.join("Theory"))
-            .env("PATH", path)
+            .env("PATH", &path)
             .env(
                 "REMOTE_BUILD_URL",
                 "http://example.invalid/api/remote-build",
@@ -2083,7 +2115,7 @@ printf '503'
         assert_eq!(output.status.code(), Some(75));
 
         let request: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
         assert_eq!(
             request
                 .get("estimated_disk_bytes")
@@ -2141,7 +2173,73 @@ printf '503'
             .collect::<Vec<_>>();
         assert_eq!(
             bundle.get("manifest_sha256").unwrap().as_str().unwrap(),
-            crate::node::lean::bundle_manifest_sha256(&manifest)
+            crate::node::lean::bundle_manifest_sha256_for_mode(&manifest, false)
+        );
+        assert_eq!(
+            bundle.get("complete").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+
+        let full_output = std::process::Command::new("bash")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/remote-lean-build"
+            ))
+            .current_dir(repo.join("Theory"))
+            .env("PATH", &path)
+            .env(
+                "REMOTE_BUILD_URL",
+                "http://example.invalid/api/remote-build",
+            )
+            .env("REMOTE_BUILD_TOKEN", "test-token")
+            .env("REMOTE_BUILD_MISSION_ID", Uuid::new_v4().to_string())
+            .env("REMOTE_BUILD_EXPECTED_HEAD", "a".repeat(40))
+            .env("REMOTE_BUILD_TEST_CAPTURE", &capture)
+            .env("REMOTE_BUILD_SOURCE_MODE", "full")
+            .output()
+            .unwrap();
+        assert_eq!(full_output.status.code(), Some(75));
+
+        let full_request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+        let full_bundle = full_request.get("source_bundle").unwrap();
+        assert_eq!(
+            full_bundle
+                .get("complete")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            full_bundle
+                .get("files")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| file.get("path").unwrap().as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Theory/Proof.lean", "Theory/Witness.lean", "lean-toolchain"]
+        );
+        let full_manifest = full_bundle
+            .get("files")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| {
+                (
+                    file.get("path").unwrap().as_str().unwrap().to_string(),
+                    file.get("sha256").unwrap().as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            full_bundle
+                .get("manifest_sha256")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            crate::node::lean::bundle_manifest_sha256_for_mode(&full_manifest, true)
         );
     }
 

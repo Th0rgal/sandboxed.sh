@@ -147,13 +147,20 @@ def git_paths(*args):
     raw = subprocess.check_output(["git", "-C", str(repo_root), *args])
     return [item.decode("utf-8") for item in raw.split(b"\0") if item]
 
+source_mode = os.environ.get("REMOTE_BUILD_SOURCE_MODE", "overlay").strip().lower()
+if source_mode not in {"overlay", "full"}:
+    raise SystemExit("REMOTE_BUILD_SOURCE_MODE must be 'overlay' or 'full'")
 deleted = git_paths("diff", "--name-only", "-z", "--diff-filter=DR", "HEAD")
-if deleted:
+if deleted and source_mode != "full":
     raise SystemExit(
         "remote source bundles do not encode deletions or renames; commit/stash these paths first: "
         + ", ".join(deleted[:8])
     )
-tracked = git_paths("diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "HEAD")
+tracked = (
+    git_paths("ls-files", "--full-name", "-z")
+    if source_mode == "full"
+    else git_paths("diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "HEAD")
+)
 untracked = git_paths("ls-files", "--full-name", "--others", "--exclude-standard", "-z")
 untracked_source = [
     path for path in untracked
@@ -170,15 +177,22 @@ if ignored_untracked:
         file=sys.stderr,
     )
 paths = sorted(set(tracked + untracked_source))
-max_files = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_FILES", "256"))
-max_bytes = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES", str(1 << 20)))
+default_max_files = "4096" if source_mode == "full" else "256"
+default_max_bytes = str(16 << 20) if source_mode == "full" else str(1 << 20)
+max_files = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_FILES", default_max_files))
+max_bytes = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES", default_max_bytes))
 if max_files <= 0 or max_bytes <= 0:
     raise SystemExit("remote source bundle limits must be positive integers")
 if len(paths) > max_files:
     raise SystemExit(f"source bundle has {len(paths)} files; maximum is {max_files}")
 files = []
 total = 0
-manifest = hashlib.sha256(b"sandboxed-source-bundle-v1\n")
+manifest_domain = (
+    b"sandboxed-source-bundle-v2-complete\n"
+    if source_mode == "full"
+    else b"sandboxed-source-bundle-v1\n"
+)
+manifest = hashlib.sha256(manifest_domain)
 for rel in paths:
     components = rel.split("/")
     if (
@@ -194,6 +208,9 @@ for rel in paths:
     ):
         raise SystemExit(f"unsafe source bundle path: {rel!r}")
     path = repo_root / rel
+    if source_mode == "full" and not path.exists():
+        # A complete snapshot represents tracked deletions by omission.
+        continue
     if path.is_symlink() or not path.is_file():
         raise SystemExit(f"source bundle path must be a regular file, not a symlink: {rel}")
     data = path.read_bytes()
@@ -214,6 +231,7 @@ if files:
     req["source_bundle"] = {
         "manifest_sha256": manifest.hexdigest(),
         "files": files,
+        "complete": source_mode == "full",
     }
 if cwd_rel:
     req["cwd_rel"] = cwd_rel
