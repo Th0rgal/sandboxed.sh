@@ -157,6 +157,8 @@ pub struct AppState {
     /// Cached remote-runner-node statuses + recent dispatch outcomes, kept
     /// fresh by the background fleet monitor (see `remote_node::monitor`).
     pub fleet: Arc<crate::remote_node::FleetMonitor>,
+    /// Persistent project validation campaigns, gates, receipts, and delivery outbox.
+    pub validation: super::validation::SharedValidationStore,
 }
 
 /// Start the HTTP server.
@@ -493,6 +495,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     );
     control_state.set_telegram_bridge(Arc::clone(&telegram_bridge));
 
+    let validation = Arc::new(super::validation::ValidationStore::open(
+        config
+            .working_dir
+            .join(".sandboxed-sh/validation-campaigns.db"),
+    )?);
+
     let state = Arc::new(AppState {
         config: config.clone(),
         tasks: RwLock::new(HashMap::new()),
@@ -541,7 +549,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         provider_usage_cache: super::provider_usage_cache::ProviderUsageCache::new(),
         codex_usage: super::codex_usage::CodexUsageStore::new(),
         fleet: Arc::new(crate::remote_node::FleetMonitor::new()),
+        validation,
     });
+
+    super::validation::spawn_outbox_forwarder(Arc::clone(&state));
 
     // Remote-node fleet monitor: periodic heartbeat polling so
     // `/api/remote-nodes` and dispatch decisions read cached statuses
@@ -1200,6 +1211,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/desktop", desktop::routes())
         // Durable background jobs launched outside ephemeral agent-turn shells
         .nest("/api/durable-jobs", durable_jobs::routes())
+        // Project-native validation campaigns and structured receipts.
+        .nest("/api/validation-campaigns", super::validation::routes())
         // System component management endpoints
         .nest("/api/system", system_api::routes())
         // Auth management endpoints

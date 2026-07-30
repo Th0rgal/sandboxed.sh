@@ -65,6 +65,25 @@ export {
   resumeMission,
 } from "./missions";
 
+export {
+  type ValidationMode,
+  type GateStatus,
+  type ValidationCandidate,
+  type ValidationGateSpec,
+  type ValidationMatrix,
+  type ValidationGate,
+  type ValidationExecutionRef,
+  type ValidationReceiptInput,
+  type ValidationCampaign,
+  listValidationCampaigns,
+  getValidationCampaign,
+  createValidationCampaign,
+  getReadyValidationGates,
+  claimValidationGate,
+  recordValidationReceipt,
+  markValidationCampaignMerged,
+} from "./validation";
+
 // Workspaces
 export {
   type WorkspaceType,

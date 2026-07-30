@@ -16,7 +16,7 @@
 #
 # Exit codes:
 #   remote build's exit code on success/failure of the build itself
-#   2   unsupported local deletion/symlink or oversized source overlay
+#   2   unsafe symlink or oversized source overlay
 #   75  remote build unavailable (EX_TEMPFAIL: placement failed / nodes down /
 #       not configured) — fall back to a local build
 set -u
@@ -74,6 +74,8 @@ if toolchain_path.is_file():
 expected_head = os.environ.get("REMOTE_BUILD_EXPECTED_HEAD", "").strip()
 if expected_head:
     req["expected_head"] = expected_head
+if os.environ.get("REMOTE_BUILD_FORCE_NEW", "0") == "1":
+    req["force_new"] = True
 
 source_mode = os.environ.get("REMOTE_BUILD_SOURCE_MODE", "overlay").strip().lower()
 if source_mode not in {"overlay", "full"}:
@@ -154,17 +156,35 @@ def git_paths(*args):
     raw = subprocess.check_output(["git", "-C", str(repo_root), *args])
     return [item.decode("utf-8") for item in raw.split(b"\0") if item]
 
-deleted = git_paths("diff", "--name-only", "-z", "--diff-filter=DR", "HEAD")
-if deleted and source_mode != "full":
-    raise SystemExit(
-        "remote source bundles do not encode deletions or renames; commit/stash these paths first: "
-        + ", ".join(deleted[:8])
-    )
-tracked = (
-    git_paths("ls-files", "--full-name", "-z")
-    if source_mode == "full"
-    else git_paths("diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "HEAD")
-)
+if source_mode == "full":
+    # A complete snapshot carries the whole tracked tree; deletions are
+    # represented by omission, so no explicit delete operations are needed.
+    tracked, deleted = git_paths("ls-files", "--full-name", "-z"), []
+else:
+    status_items = git_paths("diff", "--name-status", "-z", "--find-renames", "HEAD")
+    tracked, deleted = [], []
+    index = 0
+    while index < len(status_items):
+        status = status_items[index]
+        index += 1
+        kind = status[:1]
+        if kind in {"R", "C"}:
+            if index + 1 >= len(status_items):
+                raise SystemExit("malformed git rename/copy status")
+            old_path, new_path = status_items[index:index + 2]
+            index += 2
+            if kind == "R":
+                deleted.append(old_path)
+            tracked.append(new_path)
+        else:
+            if index >= len(status_items):
+                raise SystemExit("malformed git status")
+            path = status_items[index]
+            index += 1
+            if kind == "D":
+                deleted.append(path)
+            else:
+                tracked.append(path)
 untracked = git_paths("ls-files", "--full-name", "--others", "--exclude-standard", "-z")
 untracked_source = [
     path for path in untracked
@@ -181,14 +201,17 @@ if ignored_untracked:
         file=sys.stderr,
     )
 paths = sorted(set(tracked + untracked_source))
+deleted = sorted(set(deleted) - set(paths))
 default_max_files = "4096" if source_mode == "full" else "256"
 default_max_bytes = str(16 << 20) if source_mode == "full" else str(1 << 20)
 max_files = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_FILES", default_max_files))
 max_bytes = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES", default_max_bytes))
 if max_files <= 0 or max_bytes <= 0:
     raise SystemExit("remote source bundle limits must be positive integers")
-if len(paths) > max_files:
-    raise SystemExit(f"source bundle has {len(paths)} files; maximum is {max_files}")
+if len(paths) + len(deleted) > max_files:
+    raise SystemExit(
+        f"source bundle has {len(paths) + len(deleted)} operations; maximum is {max_files}"
+    )
 files = []
 total = 0
 manifest_domain = (
@@ -197,7 +220,8 @@ manifest_domain = (
     else b"sandboxed-source-bundle-v1\n"
 )
 manifest = hashlib.sha256(manifest_domain)
-for rel in paths:
+operations = hashlib.sha256(b"sandboxed-source-bundle-ops-v1\n")
+def validate_path(rel):
     components = rel.split("/")
     if (
         not rel
@@ -211,6 +235,8 @@ for rel in paths:
         )
     ):
         raise SystemExit(f"unsafe source bundle path: {rel!r}")
+for rel in paths:
+    validate_path(rel)
     path = repo_root / rel
     if source_mode == "full" and not path.exists():
         # A complete snapshot represents tracked deletions by omission.
@@ -226,16 +252,30 @@ for rel in paths:
     manifest.update(b"\0")
     manifest.update(digest.encode())
     manifest.update(b"\n")
+    executable = bool(path.stat().st_mode & 0o111)
+    operations.update(b"file\0")
+    operations.update(rel.encode())
+    operations.update(b"\0")
+    operations.update(b"x" if executable else b"-")
+    operations.update(b"\n")
     files.append({
         "path": rel,
         "sha256": digest,
         "data_base64": base64.b64encode(data).decode("ascii"),
+        "executable": executable,
     })
-if files:
+for rel in deleted:
+    validate_path(rel)
+    operations.update(b"delete\0")
+    operations.update(rel.encode())
+    operations.update(b"\n")
+if files or deleted:
     req["source_bundle"] = {
         "manifest_sha256": manifest.hexdigest(),
         "files": files,
         "complete": source_mode == "full",
+        "deleted_paths": deleted,
+        "operations_sha256": operations.hexdigest(),
     }
 if cwd_rel:
     req["cwd_rel"] = cwd_rel
@@ -281,6 +321,11 @@ request.pop("resume_mission_on_terminal", None)
 # identity. A retry after the branch advances must resume the accepted job for
 # the pinned commit and report it as stale, never submit a duplicate.
 request.pop("expected_head", None)
+# `force_new` is a submission control knob, not build identity: the server
+# also excludes it from the immutable job identity. A forced result must
+# replace the receipt for the same immutable request so ordinary retries
+# resume it instead of replaying a stale local terminal state.
+request.pop("force_new", None)
 fingerprint = {"endpoint": sys.argv[2], "request": request}
 canonical = json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
 print(hashlib.sha256(canonical).hexdigest())
@@ -304,6 +349,7 @@ esac
 [ "$lock_timeout_secs" -gt 0 ] || die "REMOTE_BUILD_LOCK_TIMEOUT_SECS must be greater than zero"
 
 response_file="$(mktemp)"
+wire_request_file="$(mktemp)"
 submit_lock_held=0
 submit_lock_persistent=0
 submit_lock_dir="$state_file.lock"
@@ -318,7 +364,7 @@ release_submit_lock() {
 }
 cleanup() {
     release_submit_lock
-    rm -f "$response_file" "$request_file"
+    rm -f "$response_file" "$request_file" "$wire_request_file"
 }
 trap cleanup EXIT
 
@@ -476,16 +522,27 @@ PY
 }
 
 if [ -z "$job_id" ]; then
-    # Pre-create the durable blocker while no remote request has been made.
-    # Cleanup removes it on known pre-acceptance outcomes; ambiguous/accepted
-    # failures retain it so a dead owner PID can never permit a duplicate job.
+    # Full snapshots contain base64 and therefore inflate substantially in
+    # JSON. Compress the wire copy so reverse proxies only buffer the compact
+    # request; keep the plain request locally for fingerprinting and receipts.
+    python3 - "$request_file" "$wire_request_file" <<'PY' \
+        || die "cannot compress remote-build request" 75
+import gzip, shutil, sys
+with open(sys.argv[1], "rb") as source, open(sys.argv[2], "wb") as output:
+    with gzip.GzipFile(fileobj=output, mode="wb", compresslevel=6, mtime=0) as destination:
+        shutil.copyfileobj(source, destination)
+PY
+    # Arm immediately before curl. Cleanup removes this on known
+    # pre-acceptance outcomes; ambiguous/accepted failures retain it so a dead
+    # owner PID can never permit a duplicate job.
     printf '%s\n' "armed" > "$submit_recovery_blocker" \
         || die "cannot arm the remote-build recovery blocker before submission" 75
     echo "remote-lean-build: dispatching $* for ${commit:0:12}${cwd_rel:+ in $cwd_rel} ..." >&2
     http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
         -H 'Content-Type: application/json' \
+        -H 'Content-Encoding: gzip' \
         --max-time "$submit_timeout_secs" \
-        --data-binary "@$request_file" "$REMOTE_BUILD_URL")"
+        --data-binary "@$wire_request_file" "$REMOTE_BUILD_URL")"
     curl_status=$?
     if [ "$curl_status" -ne 0 ]; then
         case "$curl_status" in

@@ -65,6 +65,7 @@ pub mod system;
 pub mod telegram;
 pub mod types;
 pub mod usage_optimize;
+pub mod validation;
 pub mod workspaces;
 
 pub use routes::serve;
