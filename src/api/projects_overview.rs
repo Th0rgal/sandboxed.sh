@@ -592,13 +592,10 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
     // "Bloqué par:" / "Blocked by:" field, when it names a real blocker.
     let blocker = content.lines().find_map(|line| {
         let lower = line.to_lowercase();
-        let rest = if let Some(idx) = lower.find("bloqué par") {
-            &line[idx + "bloqué par".len()..]
-        } else if let Some(idx) = lower.find("blocked by") {
-            &line[idx + "blocked by".len()..]
-        } else {
-            return None;
-        };
+        let (idx, marker_len) = ["bloqué par", "blocked by"]
+            .iter()
+            .find_map(|marker| lower.find(marker).map(|idx| (idx, marker.len())))?;
+        let rest = &line[idx + marker_len..];
         let value = rest
             .trim_start_matches(['*', ':', ' ', '\u{a0}'])
             .trim_end_matches("**")
