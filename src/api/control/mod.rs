@@ -5564,8 +5564,136 @@ pub async fn get_mission(
             }
             Ok(Json(value))
         }
-        None => Err((StatusCode::NOT_FOUND, format!("Mission {} not found", id))),
+        None => {
+            // Cross-tenant read-only fallback. The PR-writer lease check is
+            // deliberately GLOBAL across mission stores, so a lease refusal can
+            // name a holder that lives in another tenant's store. Without this
+            // fallback that holder reads as 404 — indistinguishable from a
+            // ghost — and controllers deadlock instead of resuming/acking it
+            // (observed 2026-08-01 on the Verity two-phase controller). Serve a
+            // bounded projection: enough to see status/ownership, no transcript.
+            if let Some(value) = find_mission_projection_in_any_store(&state.control, id)
+                .await
+                .map_err(internal_error)?
+            {
+                return Ok(Json(value));
+            }
+            Err((StatusCode::NOT_FOUND, format!("Mission {} not found", id)))
+        }
     }
+}
+
+/// Locate a mission by id across every mission store (read-only) and return
+/// the bounded cross-tenant projection. The PR-writer lease check is global
+/// across stores, so lease holders must be inspectable across stores too —
+/// but only as a projection: no transcript, no control surface.
+async fn find_mission_projection_in_any_store(
+    control_hub: &ControlHub,
+    id: Uuid,
+) -> Result<Option<serde_json::Value>, String> {
+    let inventory = control_hub.mission_store_inventory().await?;
+    for store in inventory.live {
+        if let Some(mission) = store.get_mission(id).await? {
+            return Ok(Some(cross_tenant_mission_projection(
+                &mission.id.to_string(),
+                &mission.status,
+                mission.title.as_deref(),
+                Some(&mission.workspace_id.to_string()),
+                Some(&mission.backend),
+                &mission.created_at,
+                &mission.updated_at,
+            )));
+        }
+    }
+    for user in inventory.offline_file_users {
+        let store: Arc<dyn MissionStore> = Arc::new(
+            mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await?,
+        );
+        if let Some(mission) = store.get_mission(id).await? {
+            return Ok(Some(cross_tenant_mission_projection(
+                &mission.id.to_string(),
+                &mission.status,
+                mission.title.as_deref(),
+                Some(&mission.workspace_id.to_string()),
+                Some(&mission.backend),
+                &mission.created_at,
+                &mission.updated_at,
+            )));
+        }
+    }
+    for path in inventory.offline_sqlite {
+        let found =
+            tokio::task::spawn_blocking(move || load_mission_projection_from_sqlite(&path, id))
+                .await
+                .map_err(|error| error.to_string())??;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(None)
+}
+
+fn cross_tenant_mission_projection(
+    id: &str,
+    status: &MissionStatus,
+    title: Option<&str>,
+    workspace_id: Option<&str>,
+    backend: Option<&str>,
+    created_at: &str,
+    updated_at: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "status": status,
+        "title": title,
+        "workspace_id": workspace_id,
+        "backend": backend,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "cross_tenant": true,
+        "read_only": true,
+        "note": "mission belongs to another mission store; transcript and control operations are not exposed here",
+    })
+}
+
+/// Minimal read-only projection load from an offline sqlite store. Missing
+/// columns degrade to null instead of failing the lookup.
+fn load_mission_projection_from_sqlite(
+    path: &std::path::Path,
+    id: Uuid,
+) -> Result<Option<serde_json::Value>, String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT status, title, workspace_id, backend, created_at, updated_at \
+             FROM missions WHERE id = ?1 LIMIT 1",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement
+        .query([id.to_string()])
+        .map_err(|error| error.to_string())?;
+    let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let status: String = row.get(0).map_err(|error| error.to_string())?;
+    let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
+        .unwrap_or(MissionStatus::Active);
+    let title: Option<String> = row.get(1).ok();
+    let workspace_id: Option<String> = row.get(2).ok();
+    let backend: Option<String> = row.get(3).ok();
+    let created_at: String = row.get(4).unwrap_or_default();
+    let updated_at: String = row.get(5).unwrap_or_default();
+    Ok(Some(cross_tenant_mission_projection(
+        &id.to_string(),
+        &status,
+        title.as_deref(),
+        workspace_id.as_deref(),
+        backend.as_deref(),
+        &created_at,
+        &updated_at,
+    )))
 }
 
 /// Compact, orchestrator-friendly view of a mission: status, last exchange,
@@ -6250,6 +6378,68 @@ fn status_holds_pr_writer_lease(status: MissionStatus) -> bool {
     )
 }
 
+/// Grace window during which an `AwaitingUser` PR writer keeps its lease.
+///
+/// `AwaitingUser` is non-terminal on purpose — a writer waiting for a human
+/// reply must not lose its branch. But agent-created writers are often never
+/// opened in the dashboard, so the view-gated ack-promotion tick never
+/// archives them, and a finished writer can hold its PR lease indefinitely
+/// (phantom lease: observed 2026-08-01, a writer 13h idle in a tenant store
+/// blocked every replacement while reading 404 from another tenant). After
+/// this many seconds without any update, the lease check itself releases the
+/// holder by acknowledging it.
+pub(crate) fn pr_writer_awaiting_grace_secs() -> i64 {
+    std::env::var("PR_WRITER_AWAITING_GRACE_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3600)
+}
+
+/// Whether an `AwaitingUser` writer's lease has lapsed. Unparseable
+/// timestamps keep the lease (fail closed on exclusivity, never on release).
+fn awaiting_pr_writer_lease_expired(updated_at: &str) -> bool {
+    let Ok(updated) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+        return false;
+    };
+    let idle = chrono::Utc::now().signed_duration_since(updated.with_timezone(&chrono::Utc));
+    idle.num_seconds() > pr_writer_awaiting_grace_secs()
+}
+
+/// Gate a matched writer through the awaiting-grace policy. Fresh holders are
+/// returned as the lease; lapsed `AwaitingUser` holders are acknowledged in
+/// place (best effort) so the durable state converges with the release.
+async fn resolve_writer_lease_or_release(
+    store: &Arc<dyn MissionStore>,
+    mission: &Mission,
+) -> Result<Option<PrWriterLease>, String> {
+    if mission.status == MissionStatus::AwaitingUser
+        && awaiting_pr_writer_lease_expired(&mission.updated_at)
+    {
+        tracing::info!(
+            mission_id = %mission.id,
+            updated_at = %mission.updated_at,
+            "releasing lapsed AwaitingUser PR-writer lease (auto-acknowledge)"
+        );
+        if let Err(error) = store
+            .update_mission_status(mission.id, MissionStatus::Acknowledged)
+            .await
+        {
+            // The holder could not be archived (read-only store, race). Keep
+            // treating the lease as released for this decision: the mission is
+            // provably idle past grace, and exclusivity failing open here only
+            // after a long idle window is the lesser risk than a permanent
+            // phantom lease.
+            tracing::warn!(
+                mission_id = %mission.id,
+                "failed to acknowledge lapsed PR-writer holder: {error}"
+            );
+        }
+        return Ok(None);
+    }
+    Ok(Some(pr_writer_lease(mission)))
+}
+
 fn mission_is_pr_writer(mission: &Mission) -> bool {
     mission_is_pr_writer_with_prompt(
         mission,
@@ -6330,14 +6520,20 @@ async fn find_existing_pr_writer(
                 continue;
             }
             if mission_is_pr_writer(&mission) {
-                return Ok(Some(pr_writer_lease(&mission)));
+                if let Some(lease) = resolve_writer_lease_or_release(store, &mission).await? {
+                    return Ok(Some(lease));
+                }
+                continue;
             }
             // SQLite list queries intentionally omit history. Load the full
             // mission before treating a legacy prompt-only writer as read-only.
             if let Some(full) = store.get_mission(mission.id).await? {
                 let initial_prompt = store.get_initial_user_message(mission.id).await?;
                 if mission_is_pr_writer_with_prompt(&full, initial_prompt.as_deref()) {
-                    return Ok(Some(pr_writer_lease(&full)));
+                    if let Some(lease) = resolve_writer_lease_or_release(store, &full).await? {
+                        return Ok(Some(lease));
+                    }
+                    continue;
                 }
                 // Scheduled missions can carry their only prompt in the
                 // durable deferred goal until dispatch. Treat that prompt as
@@ -6347,7 +6543,10 @@ async fn find_existing_pr_writer(
                     // steering message. Explicit `pr-readonly` must therefore
                     // continue to win over inferred write verbs in the goal.
                     if mission_is_pr_writer_with_prompt(&full, Some(&goal)) {
-                        return Ok(Some(pr_writer_lease(&full)));
+                        if let Some(lease) = resolve_writer_lease_or_release(store, &full).await? {
+                            return Ok(Some(lease));
+                        }
+                        continue;
                     }
                 }
             }
@@ -6419,13 +6618,14 @@ fn find_existing_pr_writer_in_sqlite(
         "NULL".to_string()
     };
     let query = format!(
-        "SELECT m.id, m.status, m.github_pr, {}, {}, {}, {}, {} \
+        "SELECT m.id, m.status, m.github_pr, {}, {}, {}, {}, {}, {} \
          FROM missions m WHERE m.github_pr IS NOT NULL",
         optional_mission_column("intent"),
         optional_mission_column("tags"),
         optional_mission_column("deferred_goal"),
         first_prompt,
         first_prompt_file,
+        optional_mission_column("updated_at"),
     );
     let mut statement = connection
         .prepare(&query)
@@ -6441,13 +6641,23 @@ fn find_existing_pr_writer_in_sqlite(
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         })
         .map_err(|error| error.to_string())?;
     let target = canonical_github_pr(github_pr);
     for row in rows {
-        let (id, status, candidate_pr, intent, tags, deferred_goal, first_prompt, prompt_file) =
-            row.map_err(|error| error.to_string())?;
+        let (
+            id,
+            status,
+            candidate_pr,
+            intent,
+            tags,
+            deferred_goal,
+            first_prompt,
+            prompt_file,
+            updated_at,
+        ) = row.map_err(|error| error.to_string())?;
         let Ok(id) = Uuid::parse_str(&id) else {
             continue;
         };
@@ -6457,6 +6667,21 @@ fn find_existing_pr_writer_in_sqlite(
         let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
             .unwrap_or(MissionStatus::Active);
         if !status_holds_pr_writer_lease(status) {
+            continue;
+        }
+        // Offline stores are opened read-only, so a lapsed AwaitingUser writer
+        // cannot be acknowledged here — but it must not hold the lease either
+        // (same phantom-lease policy as the live path).
+        if status == MissionStatus::AwaitingUser
+            && updated_at
+                .as_deref()
+                .is_some_and(awaiting_pr_writer_lease_expired)
+        {
+            tracing::info!(
+                mission_id = %id,
+                store = %path.display(),
+                "ignoring lapsed AwaitingUser PR-writer lease in offline store"
+            );
             continue;
         }
         let tags: Vec<String> = tags
@@ -22846,6 +23071,20 @@ pub async fn telegram_webhook_receiver(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn awaiting_writer_lease_grace_policy() {
+        use super::awaiting_pr_writer_lease_expired;
+        // Fresh AwaitingUser writers keep their lease.
+        let fresh = chrono::Utc::now().to_rfc3339();
+        assert!(!awaiting_pr_writer_lease_expired(&fresh));
+        // A writer idle far past the grace window releases it.
+        let stale = (chrono::Utc::now() - chrono::Duration::hours(13)).to_rfc3339();
+        assert!(awaiting_pr_writer_lease_expired(&stale));
+        // Unparseable timestamps fail closed on exclusivity (lease held).
+        assert!(!awaiting_pr_writer_lease_expired("not-a-timestamp"));
+        assert!(!awaiting_pr_writer_lease_expired(""));
+    }
+
     use super::*;
     use crate::api::mission_store::{MissionMode, MissionProjectPatch};
     use std::sync::Arc;
