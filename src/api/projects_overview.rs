@@ -308,16 +308,30 @@ impl ProjectRowBuilder {
                 attention.push("same state on 3 consecutive updates".to_string());
             }
         }
-        for chip in &self.missions {
-            if matches!(
-                chip.status,
-                MissionStatus::Failed | MissionStatus::Interrupted
-            ) {
+        // One aggregated line instead of one per mission: the detail pane
+        // already lists every mission chip.
+        let problem_missions: Vec<&MissionChip> = self
+            .missions
+            .iter()
+            .filter(|chip| {
+                matches!(
+                    chip.status,
+                    MissionStatus::Failed | MissionStatus::Interrupted
+                )
+            })
+            .collect();
+        match problem_missions.len() {
+            0 => {}
+            1 => {
+                let chip = problem_missions[0];
                 attention.push(format!(
                     "mission {} is {:?}",
                     &chip.id[..8.min(chip.id.len())],
                     chip.status
                 ));
+            }
+            count => {
+                attention.push(format!("{count} missions failed or interrupted"));
             }
         }
         let tracker_active = self
@@ -793,6 +807,28 @@ mod tests {
     fn headline_falls_back_to_cron_tag_title() {
         let parsed = parse_delivery("s", 0.0, "[Cron delivery: Lido campaign controller]\n\n");
         assert_eq!(parsed.headline, "Lido campaign controller");
+    }
+
+    #[test]
+    fn multiple_problem_missions_aggregate_into_one_reason() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        for i in 0..3 {
+            builder.missions.push(MissionChip {
+                id: format!("0000000{i}-aaaa-bbbb-cccc-dddddddddddd"),
+                status: MissionStatus::Failed,
+                title: None,
+                updated_at: "2026-08-01T00:00:00Z".to_string(),
+                github_pr: None,
+            });
+        }
+        let row = builder.finish(&[], None);
+        let failed_lines: Vec<&String> = row
+            .attention_reasons
+            .iter()
+            .filter(|r| r.contains("ailed"))
+            .collect();
+        assert_eq!(failed_lines.len(), 1);
+        assert!(failed_lines[0].contains("3 missions failed or interrupted"));
     }
 
     #[test]
