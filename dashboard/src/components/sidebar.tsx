@@ -15,6 +15,7 @@ import {
   Archive,
   ChatCircleText,
   ChatsCircle,
+  Kanban,
   CheckCircle,
   CirclesFour,
   CircleNotch,
@@ -47,12 +48,17 @@ type NavItem = {
 };
 
 const navigation: NavItem[] = [
-  { name: 'Hermes', href: '/', icon: ChatsCircle },
+  { name: 'Projets', href: '/', icon: Kanban },
   { name: 'Overview', href: '/overview', icon: Layout },
   { name: 'Mission', href: '/control', icon: ChatCircleText },
   { name: 'Workspaces', href: '/workspaces', icon: SidebarSimple },
   { name: 'Console', href: '/console', icon: TerminalWindow },
-  { name: 'Assistant', href: '/assistant', icon: Robot },
+  {
+    name: 'Assistant',
+    href: '/assistant',
+    icon: Robot,
+    children: [{ name: 'Chat Hermes', href: '/assistant/chat', icon: ChatsCircle }],
+  },
   { name: 'Routing', href: '/model-routing', icon: GitBranch },
   {
     name: 'Library',

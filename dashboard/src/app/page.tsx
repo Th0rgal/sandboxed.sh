@@ -1,3 +1,3 @@
-import HermesPage from '@/components/hermes/hermes-page';
+import ProjectsBoard from '@/components/projects/projects-board';
 
-export default HermesPage;
+export default ProjectsBoard;

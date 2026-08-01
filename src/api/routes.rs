@@ -1211,6 +1211,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/desktop", desktop::routes())
         // Durable background jobs launched outside ephemeral agent-turn shells
         .nest("/api/durable-jobs", durable_jobs::routes())
+        // Projects board: read-only join of Hermes trackers, project-tagged
+        // missions, and cron deliveries.
+        .nest("/api/projects", super::projects_overview::routes())
         // Project-native validation campaigns and structured receipts.
         .nest("/api/validation-campaigns", super::validation::routes())
         // System component management endpoints

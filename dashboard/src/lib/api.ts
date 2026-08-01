@@ -20,6 +20,7 @@ export * from "./api/automations";
 export * from "./api/telegram";
 export * from "./api/assistant";
 export * from "./api/hermes";
+export * from "./api/projects";
 
 // Import core utilities for use in this file (remaining APIs not yet split)
 import {
