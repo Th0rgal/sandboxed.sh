@@ -3721,9 +3721,6 @@ impl ControlHub {
         self.sessions.read().await.values().cloned().collect()
     }
 
-    /// Inventory every live and persisted mission store without opening
-    /// offline SQLite stores in read-write migration mode.
-
     /// Collect every mission that carries a `project` tag across all mission
     /// stores (live, offline file, offline sqlite). Read-only; used by the
     /// projects-overview board. Terminal missions older than `terminal_horizon`
