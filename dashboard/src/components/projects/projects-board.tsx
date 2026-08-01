@@ -48,9 +48,9 @@ const SECTIONS: {
   title: string;
   icon: LucideIcon;
 }[] = [
-  { bucket: "attention", title: "Attention requise", icon: AlertTriangle },
-  { bucket: "active", title: "Actif", icon: Activity },
-  { bucket: "paused", title: "Pausé", icon: Pause },
+  { bucket: "attention", title: "Needs attention", icon: AlertTriangle },
+  { bucket: "active", title: "Active", icon: Activity },
+  { bucket: "paused", title: "Paused", icon: Pause },
   { bucket: "archived", title: "Archive", icon: Archive },
 ];
 
@@ -182,50 +182,42 @@ export default function ProjectsBoard() {
       <header className="flex flex-wrap items-center gap-x-4 gap-y-2 pb-3">
         <div className="min-w-0">
           <h1 className="text-lg font-semibold tracking-tight text-white/90">
-            Projets
+            Projects
           </h1>
           <p className="text-[11px] text-white/35">
             <Link
               href="/assistant/chat"
               className="transition-colors hover:text-white/60"
             >
-              Le chat vit sous /assistant/chat →
+              Chat lives at /assistant/chat →
             </Link>
           </p>
         </div>
 
         <div className="ml-auto flex items-center gap-2.5">
           {data && (
-            <>
+            <span className="flex items-center gap-3 text-[11px]">
               {attentionCount > 0 && (
-                <span className="flex items-center gap-1.5 rounded-full border border-amber-400/25 bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-300">
+                <span className="flex items-center gap-1 text-amber-300">
                   <AlertTriangle className="h-3 w-3" />
-                  <span className="font-semibold tabular-nums">
-                    {attentionCount}
-                  </span>
+                  {attentionCount} need attention
                 </span>
               )}
-              <span className="flex items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.03] px-2.5 py-1 text-[11px] text-white/50">
-                <Activity className="h-3 w-3" />
-                <span className="font-semibold tabular-nums text-white/70">
-                  {liveTotal}
-                </span>
-                live
-              </span>
+              <span className="text-white/40">{liveTotal} live</span>
               {degradedSources.length > 0 && (
-                <span className="hidden items-center gap-1.5 text-[11px] text-amber-300 sm:flex">
+                <span className="hidden items-center gap-1 text-amber-300 sm:flex">
                   <AlertTriangle className="h-3 w-3" />
-                  source {degradedSources.join(" + ")} indisponible
+                  {degradedSources.join(" + ")} source unavailable
                 </span>
               )}
-            </>
+            </span>
           )}
           <div className="relative">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-white/30" />
             <input
               value={filter}
               onChange={(event) => setFilter(event.target.value)}
-              placeholder="Filtrer…"
+              placeholder="Filter…"
               className="w-36 rounded-lg border border-white/[0.08] bg-white/[0.03] py-1.5 pl-8 pr-3 text-xs text-white/80 placeholder:text-white/25 focus:border-indigo-400/40 focus:outline-none sm:w-48"
             />
           </div>
@@ -235,12 +227,12 @@ export default function ProjectsBoard() {
       {error && (
         <div className="mb-3 flex items-center gap-2 rounded-lg border border-amber-400/20 bg-amber-500/[0.06] px-3 py-2 text-sm text-amber-200/90">
           <AlertTriangle className="h-4 w-4 shrink-0" />
-          Impossible de charger l’aperçu des projets : {String(error)}
+          Failed to load the projects overview: {String(error)}
         </div>
       )}
       {isLoading && !data && (
         <div className="flex items-center gap-2 py-10 text-sm text-white/40">
-          <Loader className="h-4 w-4 animate-spin" /> Chargement des projets…
+          <Loader className="h-4 w-4 animate-spin" /> Loading projects…
         </div>
       )}
 
@@ -284,13 +276,13 @@ export default function ProjectsBoard() {
             ))}
             {flatList.length === 0 && (
               <p className="px-4 py-8 text-center text-sm text-white/30">
-                Aucun projet ne correspond.
+                No matching project.
               </p>
             )}
             {unrouted.length > 0 && (
               <div className="border-t border-white/[0.05] px-3 py-2.5">
                 <p className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-white/35">
-                  <Inbox className="h-3 w-3" /> Non routées ({unrouted.length})
+                  <Inbox className="h-3 w-3" /> Unrouted ({unrouted.length})
                 </p>
                 {unrouted.slice(0, 4).map((update, index) => (
                   <div
@@ -298,7 +290,7 @@ export default function ProjectsBoard() {
                     className="flex min-w-0 items-center gap-2 py-0.5 text-[11px] text-white/40"
                   >
                     <span className="min-w-0 flex-1 truncate">
-                      {update.headline || "(sans titre)"}
+                      {update.headline || "(untitled)"}
                     </span>
                     <UpdateAge at={update.at} />
                   </div>
@@ -321,7 +313,7 @@ export default function ProjectsBoard() {
               />
             ) : (
               <p className="px-4 py-10 text-center text-sm text-white/30">
-                Sélectionne un projet pour voir sa timeline.
+                Select a project to see its timeline.
               </p>
             )}
           </div>
@@ -349,20 +341,10 @@ function ProjectListRow({
       data-slug={project.slug}
       onClick={onSelect}
       className={cn(
-        "group relative flex w-full items-stretch gap-2.5 px-3 py-2 text-left transition-colors",
+        "group relative flex w-full items-stretch gap-2.5 rounded-md px-3 py-2 text-left transition-colors",
         selected ? "bg-indigo-500/[0.09]" : "hover:bg-white/[0.03]",
       )}
     >
-      <span
-        className={cn(
-          "w-[3px] shrink-0 self-stretch rounded-full",
-          selected
-            ? "bg-indigo-400"
-            : attention
-              ? "bg-amber-400/70"
-              : "bg-transparent",
-        )}
-      />
       <span className="min-w-0 flex-1">
         <span className="flex items-baseline justify-between gap-2">
           <span
@@ -466,14 +448,14 @@ function ProjectActions({ project }: { project: ProjectRow }) {
       {project.bucket === "paused" ? (
         <ActionButton
           icon={Play}
-          label="Reprendre"
+          label="Resume"
           busy={busy === "resume"}
           onClick={() => run("resume")}
         />
       ) : (
         <ActionButton
           icon={Pause}
-          label="Pauser"
+          label="Pause"
           busy={busy === "pause"}
           onClick={() => run("pause")}
         />
@@ -481,21 +463,21 @@ function ProjectActions({ project }: { project: ProjectRow }) {
       {project.bucket === "archived" ? (
         <ActionButton
           icon={ArchiveRestore}
-          label="Désarchiver"
+          label="Unarchive"
           busy={busy === "unarchive"}
           onClick={() => run("unarchive")}
         />
       ) : (
         <ActionButton
           icon={Archive}
-          label="Archiver"
+          label="Archive"
           busy={busy === "archive"}
           onClick={() => run("archive")}
         />
       )}
       <ActionButton
         icon={Trash2}
-        label={confirmDelete ? "Confirmer ?" : "Supprimer"}
+        label={confirmDelete ? "Confirm?" : "Delete"}
         danger={confirmDelete}
         busy={busy === "delete"}
         onClick={() => {
@@ -563,7 +545,7 @@ function ReplyComposer({ sessionId }: { sessionId: string }) {
               void send();
             }
           }}
-          placeholder={`Répondre dans la session ${sessionId.slice(0, 14)}…`}
+          placeholder={`Reply in session ${sessionId.slice(0, 14)}…`}
           rows={message.includes("\n") ? 3 : 1}
           className="min-h-[32px] flex-1 resize-none rounded-lg border border-white/[0.08] bg-white/[0.03] px-2.5 py-1.5 text-xs text-white/80 placeholder:text-white/25 focus:border-indigo-400/40 focus:outline-none"
         />
@@ -571,7 +553,7 @@ function ReplyComposer({ sessionId }: { sessionId: string }) {
           type="button"
           onClick={() => void send()}
           disabled={sending || message.trim().length === 0}
-          title="Envoyer (⌘↵)"
+          title="Send (⌘↵)"
           className="flex h-[32px] w-[32px] shrink-0 items-center justify-center rounded-lg border border-white/[0.08] bg-white/[0.03] text-white/50 transition-colors hover:border-indigo-400/40 hover:text-white/85 disabled:opacity-40"
         >
           {sending ? (
@@ -590,14 +572,14 @@ function ReplyComposer({ sessionId }: { sessionId: string }) {
         <div className="mt-2 rounded-lg border border-indigo-400/15 bg-indigo-500/[0.04] px-3 py-2 text-sm">
           {reply === "" ? (
             <p className="flex items-center gap-2 text-xs text-white/40">
-              <Loader className="h-3 w-3 animate-spin" /> Hermes répond…
+              <Loader className="h-3 w-3 animate-spin" /> Hermes is replying…
             </p>
           ) : (
             <MarkdownContent content={reply} />
           )}
           {replyDone && reply !== "" && (
             <p className="mt-1.5 text-[10px] text-white/30">
-              Réponse de la session {sessionId.slice(0, 14)}
+              Reply from session {sessionId.slice(0, 14)}
             </p>
           )}
         </div>
@@ -629,7 +611,7 @@ function ProjectDetail({
             type="button"
             onClick={onBack}
             className="rounded-md p-1 text-white/40 transition-colors hover:bg-white/[0.06] hover:text-white/80 lg:hidden"
-            aria-label="Retour à la liste"
+            aria-label="Back to list"
           >
             <ArrowLeft className="h-4 w-4" />
           </button>
@@ -682,25 +664,25 @@ function ProjectDetail({
 
       <div className="flex-1 px-4 py-3 sm:px-5">
         <p className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-white/35">
-          Timeline des updates
+          Updates
         </p>
         {isLoading && (
           <div className="flex items-center gap-2 py-6 text-sm text-white/40">
-            <Loader className="h-4 w-4 animate-spin" /> Chargement…
+            <Loader className="h-4 w-4 animate-spin" /> Loading…
           </div>
         )}
         {error && (
           <p className="flex items-center gap-2 py-4 text-sm text-amber-200/90">
             <AlertTriangle className="h-4 w-4 shrink-0" />
-            Impossible de charger les updates.
+            Failed to load updates.
           </p>
         )}
         {!isLoading && !error && updates.length === 0 && (
           <p className="py-4 text-sm text-white/35">
-            Aucune update routée vers ce projet.
+            No updates routed to this project.
           </p>
         )}
-        <div className="relative space-y-2.5 before:absolute before:bottom-2 before:left-[5px] before:top-2 before:w-px before:bg-white/[0.07]">
+        <div className="space-y-2.5">
           {updates.map((update, index) => (
             <UpdateEntry
               key={`${update.session_id}-${update.at}-${index}`}
@@ -795,13 +777,7 @@ function UpdateEntry({
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   return (
-    <div className="relative pl-6">
-      <span
-        className={cn(
-          "absolute left-0 top-[13px] h-[11px] w-[11px] rounded-full border-2 border-[rgb(var(--background))]",
-          update.blocker ? "bg-amber-400" : "bg-white/25",
-        )}
-      />
+    <div>
       <div
         className={cn(
           "rounded-lg border px-3 py-2 transition-colors",
@@ -816,14 +792,14 @@ function UpdateEntry({
           className="flex w-full items-center justify-between gap-2 text-left"
         >
           <span className="min-w-0 flex-1 truncate text-[13px] text-white/80">
-            {update.headline || "(update sans titre)"}
+            {update.headline || "(untitled update)"}
           </span>
           <UpdateAge at={update.at} />
         </button>
         {update.blocker && (
           <p className="mt-1 flex items-start gap-1.5 text-xs text-amber-300/90">
             <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
-            Bloqué par : {update.blocker}
+            Blocked by: {update.blocker}
           </p>
         )}
         {expanded && update.body && (
@@ -832,7 +808,7 @@ function UpdateEntry({
               content={bodyWithoutHeadline(update.body, update.headline)}
             />
             <p className="mt-2 text-[11px] text-white/30">
-              Session d’origine : {update.session_id}
+              Origin session: {update.session_id}
             </p>
           </div>
         )}

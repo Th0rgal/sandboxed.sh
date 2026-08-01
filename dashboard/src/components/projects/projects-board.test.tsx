@@ -96,7 +96,7 @@ describe("ProjectsBoard", () => {
     expect(
       await screen.findAllByText(/blocker signalé: lease writer fantôme/),
     ).not.toHaveLength(0);
-    const sections = screen.getAllByText(/Attention requise|Actif|Pausé/);
+    const sections = screen.getAllByText(/Needs attention|Active|Paused/);
     expect(sections.length).toBeGreaterThanOrEqual(3);
   });
 
@@ -159,7 +159,7 @@ describe("ProjectsBoard", () => {
     await waitFor(() => expect(mockedUpdates).toHaveBeenCalledWith("beal", 50));
     // First update is expanded by default: body + origin session visible.
     expect(
-      await screen.findByText(/Session d’origine : sess-42/),
+      await screen.findByText(/Origin session: sess-42/),
     ).toBeInTheDocument();
   });
 
@@ -171,7 +171,7 @@ describe("ProjectsBoard", () => {
     renderBoard();
     await screen.findByRole("button", { name: /beal/ });
 
-    fireEvent.change(screen.getByPlaceholderText("Filtrer…"), {
+    fireEvent.change(screen.getByPlaceholderText("Filter…"), {
       target: { value: "ver" },
     });
 
@@ -187,7 +187,7 @@ describe("ProjectsBoard", () => {
 
     renderBoard();
 
-    fireEvent.click(await screen.findByRole("button", { name: /Pauser/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Pause$/ }));
     await waitFor(() =>
       expect(mockedAction).toHaveBeenCalledWith("verity", "pause"),
     );
@@ -199,9 +199,9 @@ describe("ProjectsBoard", () => {
 
     renderBoard();
 
-    fireEvent.click(await screen.findByRole("button", { name: /Supprimer/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Delete/ }));
     expect(mockedAction).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: /Confirmer/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Confirm/ }));
     await waitFor(() =>
       expect(mockedAction).toHaveBeenCalledWith("verity", "delete"),
     );
@@ -231,7 +231,7 @@ describe("ProjectsBoard", () => {
 
     const composer = await screen.findByPlaceholderText(/sess-cron-7/);
     fireEvent.change(composer, { target: { value: "continue le plan" } });
-    fireEvent.click(screen.getByTitle("Envoyer (⌘↵)"));
+    fireEvent.click(screen.getByTitle("Send (⌘↵)"));
 
     await waitFor(() =>
       expect(mockedChat).toHaveBeenCalledWith(

@@ -48,7 +48,7 @@ type NavItem = {
 };
 
 const navigation: NavItem[] = [
-  { name: 'Projets', href: '/', icon: Kanban },
+  { name: 'Projects', href: '/', icon: Kanban },
   { name: 'Overview', href: '/overview', icon: Layout },
   { name: 'Mission', href: '/control', icon: ChatCircleText },
   { name: 'Workspaces', href: '/workspaces', icon: SidebarSimple },
@@ -57,7 +57,7 @@ const navigation: NavItem[] = [
     name: 'Assistant',
     href: '/assistant',
     icon: Robot,
-    children: [{ name: 'Chat Hermes', href: '/assistant/chat', icon: ChatsCircle }],
+    children: [{ name: 'Hermes Chat', href: '/assistant/chat', icon: ChatsCircle }],
   },
   { name: 'Routing', href: '/model-routing', icon: GitBranch },
   {
