@@ -3723,6 +3723,69 @@ impl ControlHub {
 
     /// Inventory every live and persisted mission store without opening
     /// offline SQLite stores in read-write migration mode.
+
+    /// Collect every mission that carries a `project` tag across all mission
+    /// stores (live, offline file, offline sqlite). Read-only; used by the
+    /// projects-overview board. Terminal missions older than `terminal_horizon`
+    /// are skipped so the scan stays bounded on long-lived stores.
+    pub(crate) async fn collect_project_missions(
+        &self,
+        terminal_horizon: chrono::Duration,
+    ) -> Result<Vec<Mission>, String> {
+        const PAGE_SIZE: usize = 200;
+        let cutoff = chrono::Utc::now() - terminal_horizon;
+        let keep = |mission: &Mission| -> bool {
+            if mission.project.project.is_none() {
+                return false;
+            }
+            if mission.status.is_terminal() || mission.status == MissionStatus::Acknowledged {
+                return chrono::DateTime::parse_from_rfc3339(&mission.updated_at)
+                    .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
+                    .unwrap_or(false);
+            }
+            true
+        };
+        let mut collected: Vec<Mission> = Vec::new();
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let inventory = self.mission_store_inventory().await?;
+        let mut stores: Vec<Arc<dyn MissionStore>> = inventory.live;
+        for user in inventory.offline_file_users {
+            stores.push(Arc::new(
+                mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await?,
+            ));
+        }
+        for store in stores {
+            let mut offset = 0;
+            loop {
+                let page = store.list_missions(PAGE_SIZE, offset).await?;
+                let page_len = page.len();
+                for mission in page {
+                    if keep(&mission) && seen.insert(mission.id) {
+                        collected.push(mission);
+                    }
+                }
+                if page_len < PAGE_SIZE {
+                    break;
+                }
+                offset += page_len;
+            }
+        }
+        for path in inventory.offline_sqlite {
+            let cutoff_str = cutoff.to_rfc3339();
+            let rows = tokio::task::spawn_blocking(move || {
+                collect_project_missions_from_sqlite(&path, &cutoff_str)
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            for mission in rows {
+                if seen.insert(mission.id) {
+                    collected.push(mission);
+                }
+            }
+        }
+        Ok(collected)
+    }
+
     async fn mission_store_inventory(&self) -> Result<MissionStoreInventory, String> {
         let sessions = self.sessions.read().await;
         let live: Vec<Arc<dyn MissionStore>> = sessions
@@ -5654,6 +5717,98 @@ fn cross_tenant_mission_projection(
         "read_only": true,
         "note": "mission belongs to another mission store; transcript and control operations are not exposed here",
     })
+}
+
+/// Read-only scan of an offline sqlite store for project-tagged missions.
+/// Returns lightweight Mission values (no history) — enough for board rows.
+fn collect_project_missions_from_sqlite(
+    path: &std::path::Path,
+    terminal_cutoff_rfc3339: &str,
+) -> Result<Vec<Mission>, String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
+    let columns: std::collections::HashSet<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('missions')")
+        .and_then(|mut st| {
+            st.query_map([], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .map_err(|error| error.to_string())?;
+    if !columns.contains("project") {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT id, status, title, workspace_id, backend, created_at, updated_at, \
+             project, track, intent, github_pr \
+             FROM missions WHERE project IS NOT NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut collected = Vec::new();
+    for row in rows {
+        let (
+            id,
+            status,
+            title,
+            workspace_id,
+            backend,
+            created_at,
+            updated_at,
+            project,
+            track,
+            intent,
+            github_pr,
+        ) = row.map_err(|error| error.to_string())?;
+        let Ok(id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
+            .unwrap_or(MissionStatus::Active);
+        let updated_at = updated_at.unwrap_or_default();
+        if (status.is_terminal() || status == MissionStatus::Acknowledged)
+            && updated_at.as_str() < terminal_cutoff_rfc3339
+        {
+            continue;
+        }
+        let mut mission: Mission = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "status": status,
+            "workspace_id": workspace_id
+                .as_deref()
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+                .unwrap_or_else(Uuid::nil),
+            "backend": backend.unwrap_or_default(),
+            "history": [],
+            "created_at": created_at.unwrap_or_default(),
+            "updated_at": updated_at,
+        }))
+        .map_err(|error| error.to_string())?;
+        mission.title = title;
+        mission.project.project = project;
+        mission.project.track = track;
+        mission.project.intent = intent;
+        mission.project.github_pr = github_pr;
+        collected.push(mission);
+    }
+    Ok(collected)
 }
 
 /// Minimal read-only projection load from an offline sqlite store. Missing

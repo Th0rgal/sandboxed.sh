@@ -48,6 +48,7 @@ mod native_loop_observer;
 pub mod oauth_reconcile;
 pub mod opencode;
 pub mod paloma;
+pub mod projects_overview;
 mod provider_usage_cache;
 pub(crate) mod providers;
 pub(crate) mod proxy;
