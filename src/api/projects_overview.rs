@@ -294,7 +294,7 @@ impl ProjectRowBuilder {
 
         if let Some(latest) = &self.latest_update {
             if let Some(blocker) = latest.blocker.as_deref() {
-                attention.push(format!("blocker signalé: {blocker}"));
+                attention.push(format!("blocker reported: {blocker}"));
             }
             // Same non-silent state three ticks in a row: the controller
             // keeps reporting an unchanged world — the phantom-lease shape.
@@ -305,7 +305,7 @@ impl ProjectRowBuilder {
                     .iter()
                     .all(|signature| signature == &latest.signature)
             {
-                attention.push("état identique sur 3 updates consécutives".to_string());
+                attention.push("same state on 3 consecutive updates".to_string());
             }
         }
         for chip in &self.missions {
@@ -314,7 +314,7 @@ impl ProjectRowBuilder {
                 MissionStatus::Failed | MissionStatus::Interrupted
             ) {
                 attention.push(format!(
-                    "mission {} en état {:?}",
+                    "mission {} is {:?}",
                     &chip.id[..8.min(chip.id.len())],
                     chip.status
                 ));
@@ -353,7 +353,7 @@ impl ProjectRowBuilder {
                 })
                 .unwrap_or(false);
             if stale {
-                attention.push("tracker actif sans mission live ni update récente".to_string());
+                attention.push("active tracker with no live mission or recent update".to_string());
             }
         }
 
@@ -772,7 +772,7 @@ mod tests {
         assert!(row
             .attention_reasons
             .iter()
-            .any(|r| r.contains("état identique")));
+            .any(|r| r.contains("same state")));
     }
 
     #[test]
