@@ -52,13 +52,14 @@ describe("ProjectsBoard", () => {
   beforeEach(() => {
     mockedOverview.mockReset();
     mockedUpdates.mockReset();
+    mockedUpdates.mockResolvedValue({ slug: "verity", updates: [] });
   });
 
   afterEach(() => {
     cleanup();
   });
 
-  test("places projects in their bucket columns with attention reasons", async () => {
+  test("groups projects into sections, attention first with its reasons", async () => {
     mockedOverview.mockResolvedValue(
       overview([
         project({ slug: "verity" }),
@@ -74,14 +75,18 @@ describe("ProjectsBoard", () => {
     renderBoard();
 
     expect(await screen.findByText("verity")).toBeInTheDocument();
-    expect(screen.getByText("lido-audit")).toBeInTheDocument();
-    expect(
-      screen.getByText(/blocker signalé: lease writer fantôme/),
-    ).toBeInTheDocument();
+    expect(screen.getAllByText("lido-audit").length).toBeGreaterThan(0);
     expect(screen.getByText("erc")).toBeInTheDocument();
+    // Attention project is auto-selected (first in triage order) and its
+    // reasons render in the detail pane banner.
+    expect(
+      await screen.findAllByText(/blocker signalé: lease writer fantôme/),
+    ).not.toHaveLength(0);
+    const sections = screen.getAllByText(/Attention requise|Actif|Pausé/);
+    expect(sections.length).toBeGreaterThanOrEqual(3);
   });
 
-  test("mission chips link to /control", async () => {
+  test("mission chips in the detail pane link to /control", async () => {
     mockedOverview.mockResolvedValue(
       overview([
         project({
@@ -108,32 +113,57 @@ describe("ProjectsBoard", () => {
     );
   });
 
-  test("opening a card loads the updates timeline drawer", async () => {
-    mockedOverview.mockResolvedValue(overview([project({ slug: "verity" })]));
-    mockedUpdates.mockResolvedValue({
-      slug: "verity",
-      updates: [
-        {
-          headline: "Phase 1C merged",
-          body: "**Changé :** slice mergée.",
-          session_id: "sess-42",
-          at: "2026-08-01T07:11:00Z",
-          signature: "verity",
-          blocker: null,
-        },
-      ],
-    });
+  test("selecting a project loads its updates timeline in the detail pane", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({ slug: "verity" }),
+        project({ slug: "beal" }),
+      ]),
+    );
+    mockedUpdates.mockImplementation(async (slug: string) => ({
+      slug,
+      updates:
+        slug === "beal"
+          ? [
+              {
+                headline: "P_Cl promoted to proved",
+                body: "**Changé :** promotion vérifiée.",
+                session_id: "sess-42",
+                at: "2026-08-01T07:11:00Z",
+                signature: "beal",
+                blocker: null,
+              },
+            ]
+          : [],
+    }));
 
     renderBoard();
 
-    fireEvent.click(await screen.findByText("verity"));
+    fireEvent.click(await screen.findByRole("button", { name: /beal/ }));
 
-    expect(await screen.findByText("Phase 1C merged")).toBeInTheDocument();
-    await waitFor(() =>
-      expect(mockedUpdates).toHaveBeenCalledWith("verity", 50),
+    expect(await screen.findByText("P_Cl promoted to proved")).toBeInTheDocument();
+    await waitFor(() => expect(mockedUpdates).toHaveBeenCalledWith("beal", 50));
+    // First update is expanded by default: body + origin session visible.
+    expect(
+      await screen.findByText(/Session d’origine : sess-42/),
+    ).toBeInTheDocument();
+  });
+
+  test("search filter narrows the triage list", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([project({ slug: "verity" }), project({ slug: "beal" })]),
     );
 
-    fireEvent.click(screen.getByText("Phase 1C merged"));
-    expect(await screen.findByText(/Session d’origine : sess-42/)).toBeInTheDocument();
+    renderBoard();
+    await screen.findByRole("button", { name: /beal/ });
+
+    fireEvent.change(screen.getByPlaceholderText("Filtrer…"), {
+      target: { value: "ver" },
+    });
+
+    expect(
+      screen.queryByRole("button", { name: /beal/ }),
+    ).not.toBeInTheDocument();
+    expect(screen.getAllByText("verity").length).toBeGreaterThan(0);
   });
 });
