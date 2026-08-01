@@ -41,6 +41,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/overview", get(projects_overview))
         .route("/:slug/updates", get(project_updates))
+        .route("/:slug/action", axum::routing::post(project_action))
 }
 
 fn hermes_projects_dir() -> Option<PathBuf> {
@@ -114,6 +115,10 @@ pub async fn projects_overview(
         .as_deref()
         .map(read_alias_map)
         .unwrap_or_default();
+    let overrides = trackers_dir
+        .as_deref()
+        .map(read_overrides)
+        .unwrap_or_default();
 
     let missions = state
         .control
@@ -140,7 +145,11 @@ pub async fn projects_overview(
     //    can only enrich, never hide, another.
     let mut rows: HashMap<String, ProjectRowBuilder> = HashMap::new();
 
+    let deleted = |slug: &str| overrides.get(slug).map(String::as_str) == Some("deleted");
     for tracker in trackers {
+        if deleted(&tracker.slug) {
+            continue;
+        }
         let slug = tracker.slug.clone();
         rows.entry(slug.clone())
             .or_insert_with(|| ProjectRowBuilder::new(slug))
@@ -150,7 +159,15 @@ pub async fn projects_overview(
         let Some(project) = mission.project.project.as_deref() else {
             continue;
         };
+        // Some missions carry malformed project tags (raw JSON blobs); only
+        // plain slugs may create or join a row.
+        if !is_plain_key(project) {
+            continue;
+        }
         let key = resolve_alias(&aliases, project);
+        if deleted(&key) {
+            continue;
+        }
         rows.entry(key.clone())
             .or_insert_with(|| ProjectRowBuilder::new(key))
             .missions
@@ -163,6 +180,9 @@ pub async fn projects_overview(
             continue;
         };
         let key = resolve_alias(&aliases, &signature_key);
+        if deleted(&key) {
+            continue;
+        }
         rows.entry(key.clone())
             .or_insert_with(|| ProjectRowBuilder::new(key))
             .push_delivery(delivery);
@@ -170,7 +190,10 @@ pub async fn projects_overview(
 
     let mut projects: Vec<ProjectRow> = rows
         .into_values()
-        .map(|builder| builder.finish(&archived))
+        .map(|builder| {
+            let forced = overrides.get(&builder.slug).cloned();
+            builder.finish(&archived, forced.as_deref())
+        })
         .collect();
     projects.sort_by(|a, b| {
         bucket_rank(a.bucket)
@@ -262,7 +285,7 @@ impl ProjectRowBuilder {
         }
     }
 
-    fn finish(mut self, archived: &[String]) -> ProjectRow {
+    fn finish(mut self, archived: &[String], forced: Option<&str>) -> ProjectRow {
         self.missions
             .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         self.missions.truncate(8);
@@ -334,14 +357,22 @@ impl ProjectRowBuilder {
             }
         }
 
-        let bucket: &'static str = if archived.contains(&self.slug) {
-            "archived"
-        } else if !attention.is_empty() {
-            "attention"
-        } else if tracker_paused {
-            "paused"
-        } else {
-            "active"
+        // A board override silences the automatic rules: pausing a project is
+        // an explicit "stop flagging this" from the operator.
+        let bucket: &'static str = match forced {
+            Some("paused") => "paused",
+            Some("archived") => "archived",
+            _ => {
+                if archived.contains(&self.slug) {
+                    "archived"
+                } else if !attention.is_empty() {
+                    "attention"
+                } else if tracker_paused {
+                    "paused"
+                } else {
+                    "active"
+                }
+            }
         };
 
         ProjectRow {
@@ -454,6 +485,87 @@ fn read_alias_map(dir: &Path) -> HashMap<String, String> {
 
 fn resolve_alias(aliases: &HashMap<String, String>, key: &str) -> String {
     aliases.get(key).cloned().unwrap_or_else(|| key.to_string())
+}
+
+/// A routing key / project tag must be a plain slug.
+fn is_plain_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 100
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Board-level state overrides (`board-overrides.json` in the trackers dir):
+/// `{ "slug": "paused" | "archived" | "deleted" }`. An overlay owned by the
+/// dashboard — tracker files stay untouched because Hermes controllers own
+/// them. `deleted` hides the row (and drops its deliveries); the two others
+/// force the bucket.
+fn overrides_path(dir: &Path) -> PathBuf {
+    dir.join("board-overrides.json")
+}
+
+fn read_overrides(dir: &Path) -> HashMap<String, String> {
+    std::fs::read_to_string(overrides_path(dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectActionRequest {
+    action: String,
+}
+
+/// Apply a board action to a project: `pause` / `archive` / `delete` set the
+/// override, `resume` / `unarchive` / `restore` clear it.
+pub async fn project_action(
+    AxumPath(slug): AxumPath<String>,
+    Json(request): Json<ProjectActionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(dir) = hermes_projects_dir() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HERMES_PROJECTS_DIR is not configured".to_string(),
+        ));
+    };
+    if slug.is_empty() || slug.len() > 200 {
+        return Err((StatusCode::BAD_REQUEST, "invalid slug".to_string()));
+    }
+    let mut overrides = read_overrides(&dir);
+    match request.action.as_str() {
+        "pause" => {
+            overrides.insert(slug.clone(), "paused".to_string());
+        }
+        "archive" => {
+            overrides.insert(slug.clone(), "archived".to_string());
+        }
+        "delete" => {
+            overrides.insert(slug.clone(), "deleted".to_string());
+        }
+        "resume" | "unarchive" | "restore" => {
+            overrides.remove(&slug);
+        }
+        other => {
+            return Err((StatusCode::BAD_REQUEST, format!("unknown action '{other}'")));
+        }
+    }
+    let serialized = serde_json::to_string_pretty(&overrides)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let path = overrides_path(&dir);
+    let tmp = dir.join(".board-overrides.json.tmp");
+    std::fs::write(&tmp, serialized)
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write {}: {error}", path.display()),
+            )
+        })?;
+    Ok(Json(serde_json::json!({
+        "slug": slug,
+        "override": overrides.get(&slug),
+    })))
 }
 
 /// Read `[Cron delivery: …]` updates from the Hermes SessionDB, newest first.
@@ -582,12 +694,7 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
         .map(|key| key.trim().to_string())
         // Reject template placeholders like `<project>` and anything that
         // isn't a plain routing key.
-        .filter(|key| {
-            !key.is_empty()
-                && key
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        });
+        .filter(|key| is_plain_key(key));
 
     // "Bloqué par:" / "Blocked by:" field, when it names a real blocker.
     let blocker = content.lines().find_map(|line| {
@@ -659,7 +766,7 @@ mod tests {
         builder.push_delivery(parse_delivery("s", 3.0, SAMPLE));
         builder.push_delivery(parse_delivery("s", 2.0, SAMPLE));
         builder.push_delivery(parse_delivery("s", 1.0, SAMPLE));
-        let row = builder.finish(&[]);
+        let row = builder.finish(&[], None);
         assert_eq!(row.bucket, "attention");
         assert!(row.attention_reasons.iter().any(|r| r.contains("blocker")));
         assert!(row
@@ -689,6 +796,18 @@ mod tests {
     }
 
     #[test]
+    fn forced_override_silences_attention() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder.push_delivery(parse_delivery("s", 3.0, SAMPLE));
+        builder.push_delivery(parse_delivery("s", 2.0, SAMPLE));
+        builder.push_delivery(parse_delivery("s", 1.0, SAMPLE));
+        let row = builder.finish(&[], Some("paused"));
+        assert_eq!(row.bucket, "paused");
+        // Reasons stay visible in the detail pane even when silenced.
+        assert!(!row.attention_reasons.is_empty());
+    }
+
+    #[test]
     fn paused_tracker_without_signals_lands_in_paused_bucket() {
         let mut builder = ProjectRowBuilder::new("erc".to_string());
         builder.tracker = Some(TrackerInfo {
@@ -696,7 +815,7 @@ mod tests {
             status_line: Some("paused (drained)".to_string()),
             updated_at: None,
         });
-        let row = builder.finish(&[]);
+        let row = builder.finish(&[], None);
         assert_eq!(row.bucket, "paused");
     }
 }

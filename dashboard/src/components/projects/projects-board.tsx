@@ -8,35 +8,50 @@ import {
   useRef,
   useState,
 } from "react";
-import useSWR from "swr";
+import useSWR, { useSWRConfig } from "swr";
+import type { LucideIcon } from "lucide-react";
 import {
+  Activity,
   AlertTriangle,
   Archive,
+  ArchiveRestore,
   ArrowLeft,
   GitPullRequest,
   Inbox,
   Loader,
-  PauseCircle,
+  Pause,
+  Play,
   Search,
+  Send,
+  Trash2,
 } from "lucide-react";
 
 import {
   getProjectsOverview,
   getProjectUpdates,
+  postProjectAction,
+  type ProjectAction,
   type ProjectBucket,
   type ProjectDeliveryUpdate,
   type ProjectMissionChip,
   type ProjectRow,
 } from "@/lib/api/projects";
+import { hermesChatStream } from "@/lib/api/hermes";
 import { MarkdownContent } from "@/components/markdown-content";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { cn } from "@/lib/utils";
 
-const SECTIONS: { bucket: ProjectBucket; title: string; emoji: string }[] = [
-  { bucket: "attention", title: "Attention requise", emoji: "🟠" },
-  { bucket: "active", title: "Actif", emoji: "🟢" },
-  { bucket: "paused", title: "Pausé", emoji: "⏸" },
-  { bucket: "archived", title: "Archive", emoji: "📦" },
+// Palette discipline: neutrals for structure, indigo for the current
+// selection, amber for problems. Nothing else carries color.
+const SECTIONS: {
+  bucket: ProjectBucket;
+  title: string;
+  icon: LucideIcon;
+}[] = [
+  { bucket: "attention", title: "Attention requise", icon: AlertTriangle },
+  { bucket: "active", title: "Actif", icon: Activity },
+  { bucket: "paused", title: "Pausé", icon: Pause },
+  { bucket: "archived", title: "Archive", icon: Archive },
 ];
 
 const LIVE_STATUSES = new Set([
@@ -47,6 +62,13 @@ const LIVE_STATUSES = new Set([
   "waiting_background",
   "awaiting_user",
   "paused",
+]);
+
+const PROBLEM_STATUSES = new Set([
+  "failed",
+  "interrupted",
+  "blocked",
+  "not_feasible",
 ]);
 
 function liveMissionCount(project: ProjectRow): number {
@@ -148,6 +170,12 @@ export default function ProjectsBoard() {
   const liveTotal =
     data?.projects.reduce((sum, p) => sum + liveMissionCount(p), 0) ?? 0;
   const unrouted = data?.unrouted_updates ?? [];
+  const degradedSources = data
+    ? [
+        !data.sources.trackers && "trackers",
+        !data.sources.hermes_db && "hermes",
+      ].filter(Boolean)
+    : [];
 
   return (
     <div className="mx-auto flex h-[calc(100vh-1px)] max-w-[1500px] flex-col px-3 pt-3 sm:px-5">
@@ -169,16 +197,27 @@ export default function ProjectsBoard() {
         <div className="ml-auto flex items-center gap-2.5">
           {data && (
             <>
-              <StatPill
-                tone={attentionCount > 0 ? "amber" : "neutral"}
-                label="attention"
-                value={attentionCount}
-              />
-              <StatPill tone="sky" label="missions live" value={liveTotal} />
-              <span className="hidden items-center gap-2.5 text-[11px] text-white/35 sm:flex">
-                <SourceDot ok={data.sources.trackers} label="trackers" />
-                <SourceDot ok={data.sources.hermes_db} label="hermes" />
+              {attentionCount > 0 && (
+                <span className="flex items-center gap-1.5 rounded-full border border-amber-400/25 bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-300">
+                  <AlertTriangle className="h-3 w-3" />
+                  <span className="font-semibold tabular-nums">
+                    {attentionCount}
+                  </span>
+                </span>
+              )}
+              <span className="flex items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.03] px-2.5 py-1 text-[11px] text-white/50">
+                <Activity className="h-3 w-3" />
+                <span className="font-semibold tabular-nums text-white/70">
+                  {liveTotal}
+                </span>
+                live
               </span>
+              {degradedSources.length > 0 && (
+                <span className="hidden items-center gap-1.5 text-[11px] text-amber-300 sm:flex">
+                  <AlertTriangle className="h-3 w-3" />
+                  source {degradedSources.join(" + ")} indisponible
+                </span>
+              )}
             </>
           )}
           <div className="relative">
@@ -194,7 +233,8 @@ export default function ProjectsBoard() {
       </header>
 
       {error && (
-        <div className="mb-3 rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-sm text-red-300/90">
+        <div className="mb-3 flex items-center gap-2 rounded-lg border border-amber-400/20 bg-amber-500/[0.06] px-3 py-2 text-sm text-amber-200/90">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
           Impossible de charger l’aperçu des projets : {String(error)}
         </div>
       )}
@@ -217,8 +257,16 @@ export default function ProjectsBoard() {
             {sections.map((section) => (
               <div key={section.bucket}>
                 <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-white/[0.05] bg-[rgb(var(--background))]/95 px-3 py-1.5 backdrop-blur">
+                  <section.icon
+                    className={cn(
+                      "h-3 w-3",
+                      section.bucket === "attention"
+                        ? "text-amber-300/90"
+                        : "text-white/30",
+                    )}
+                  />
                   <span className="text-[11px] font-semibold uppercase tracking-wider text-white/45">
-                    {section.emoji} {section.title}
+                    {section.title}
                   </span>
                   <span className="text-[11px] text-white/25">
                     {section.projects.length}
@@ -283,51 +331,6 @@ export default function ProjectsBoard() {
   );
 }
 
-function StatPill({
-  tone,
-  label,
-  value,
-}: {
-  tone: "amber" | "sky" | "neutral";
-  label: string;
-  value: number;
-}) {
-  return (
-    <span
-      className={cn(
-        "flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px]",
-        tone === "amber" && "border-amber-400/25 bg-amber-500/10 text-amber-200/90",
-        tone === "sky" && "border-sky-400/25 bg-sky-500/[0.07] text-sky-300",
-        tone === "neutral" && "border-white/[0.08] bg-white/[0.03] text-white/50",
-      )}
-    >
-      <span className="font-semibold tabular-nums">{value}</span> {label}
-    </span>
-  );
-}
-
-function SourceDot({ ok, label }: { ok: boolean; label: string }) {
-  return (
-    <span className="flex items-center gap-1.5">
-      <span
-        className={cn(
-          "h-1.5 w-1.5 rounded-full",
-          ok ? "bg-emerald-400" : "bg-amber-300",
-        )}
-      />
-      {label}
-    </span>
-  );
-}
-
-function railColor(project: ProjectRow): string {
-  if (project.bucket === "attention") return "bg-amber-400/80";
-  if (project.bucket === "paused") return "bg-white/20";
-  if (project.bucket === "archived") return "bg-white/10";
-  if (liveMissionCount(project) > 0) return "bg-emerald-400/80";
-  return "bg-emerald-400/30";
-}
-
 function ProjectListRow({
   project,
   selected,
@@ -339,6 +342,7 @@ function ProjectListRow({
 }) {
   const live = liveMissionCount(project);
   const quiet = isQuiet(project);
+  const attention = project.bucket === "attention";
   return (
     <button
       type="button"
@@ -346,15 +350,17 @@ function ProjectListRow({
       onClick={onSelect}
       className={cn(
         "group relative flex w-full items-stretch gap-2.5 px-3 py-2 text-left transition-colors",
-        selected
-          ? "bg-indigo-500/[0.09]"
-          : "hover:bg-white/[0.03]",
+        selected ? "bg-indigo-500/[0.09]" : "hover:bg-white/[0.03]",
       )}
     >
       <span
         className={cn(
           "w-[3px] shrink-0 self-stretch rounded-full",
-          selected ? "bg-indigo-400" : railColor(project),
+          selected
+            ? "bg-indigo-400"
+            : attention
+              ? "bg-amber-400/70"
+              : "bg-transparent",
         )}
       />
       <span className="min-w-0 flex-1">
@@ -367,16 +373,19 @@ function ProjectListRow({
           >
             {project.slug}
           </span>
-          {project.latest_update && (
-            <UpdateAge at={project.latest_update.at} />
-          )}
+          {project.latest_update && <UpdateAge at={project.latest_update.at} />}
         </span>
         {!quiet && (
-          <span className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-white/40">
+          <span
+            className={cn(
+              "mt-0.5 flex min-w-0 items-center gap-2 text-[11px]",
+              attention ? "text-amber-300/80" : "text-white/40",
+            )}
+          >
             {live > 0 && (
-              <span className="flex shrink-0 items-center gap-1 text-sky-300">
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
-                {live} live
+              <span className="flex shrink-0 items-center gap-1 text-white/55">
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white/60" />
+                {live}
               </span>
             )}
             <span className="min-w-0 truncate">
@@ -388,46 +397,213 @@ function ProjectListRow({
           </span>
         )}
       </span>
-      {project.bucket === "attention" && (
-        <AlertTriangle className="mt-1 h-3.5 w-3.5 shrink-0 text-amber-300/80" />
-      )}
-      {project.bucket === "paused" && (
-        <PauseCircle className="mt-1 h-3.5 w-3.5 shrink-0 text-white/25" />
-      )}
-      {project.bucket === "archived" && (
-        <Archive className="mt-1 h-3.5 w-3.5 shrink-0 text-white/20" />
-      )}
     </button>
   );
 }
 
-function bucketPill(bucket: ProjectBucket) {
-  switch (bucket) {
-    case "attention":
-      return (
-        <span className="rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-200/90">
-          🟠 attention requise
-        </span>
-      );
-    case "paused":
-      return (
-        <span className="rounded-full border border-white/[0.1] bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium text-white/50">
-          ⏸ pausé
-        </span>
-      );
-    case "archived":
-      return (
-        <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-0.5 text-[10px] font-medium text-white/40">
-          📦 archivé
-        </span>
-      );
-    default:
-      return (
-        <span className="rounded-full border border-emerald-400/25 bg-emerald-500/[0.08] px-2 py-0.5 text-[10px] font-medium text-emerald-200/80">
-          🟢 actif
-        </span>
-      );
-  }
+/** Icon button for the detail-pane action bar. */
+function ActionButton({
+  icon: Icon,
+  label,
+  onClick,
+  busy,
+  danger,
+}: {
+  icon: LucideIcon;
+  label: string;
+  onClick: () => void;
+  busy?: boolean;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={busy}
+      title={label}
+      className={cn(
+        "flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[11px] transition-colors disabled:opacity-50",
+        danger
+          ? "border-amber-400/25 bg-amber-500/10 text-amber-300 hover:border-amber-400/50"
+          : "border-white/[0.08] bg-white/[0.03] text-white/50 hover:border-white/20 hover:text-white/80",
+      )}
+    >
+      {busy ? (
+        <Loader className="h-3 w-3 animate-spin" />
+      ) : (
+        <Icon className="h-3 w-3" />
+      )}
+      {label}
+    </button>
+  );
+}
+
+function ProjectActions({ project }: { project: ProjectRow }) {
+  const { mutate } = useSWRConfig();
+  const [busy, setBusy] = useState<ProjectAction | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const run = useCallback(
+    async (action: ProjectAction) => {
+      setBusy(action);
+      setActionError(null);
+      try {
+        await postProjectAction(project.slug, action);
+        await mutate("projects-overview");
+      } catch (err) {
+        setActionError(String(err instanceof Error ? err.message : err));
+      } finally {
+        setBusy(null);
+        setConfirmDelete(false);
+      }
+    },
+    [project.slug, mutate],
+  );
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {project.bucket === "paused" ? (
+        <ActionButton
+          icon={Play}
+          label="Reprendre"
+          busy={busy === "resume"}
+          onClick={() => run("resume")}
+        />
+      ) : (
+        <ActionButton
+          icon={Pause}
+          label="Pauser"
+          busy={busy === "pause"}
+          onClick={() => run("pause")}
+        />
+      )}
+      {project.bucket === "archived" ? (
+        <ActionButton
+          icon={ArchiveRestore}
+          label="Désarchiver"
+          busy={busy === "unarchive"}
+          onClick={() => run("unarchive")}
+        />
+      ) : (
+        <ActionButton
+          icon={Archive}
+          label="Archiver"
+          busy={busy === "archive"}
+          onClick={() => run("archive")}
+        />
+      )}
+      <ActionButton
+        icon={Trash2}
+        label={confirmDelete ? "Confirmer ?" : "Supprimer"}
+        danger={confirmDelete}
+        busy={busy === "delete"}
+        onClick={() => {
+          if (confirmDelete) {
+            void run("delete");
+          } else {
+            setConfirmDelete(true);
+            window.setTimeout(() => setConfirmDelete(false), 4000);
+          }
+        }}
+      />
+      {actionError && (
+        <span className="text-[11px] text-amber-300">{actionError}</span>
+      )}
+    </div>
+  );
+}
+
+/** Inline reply into the Hermes session an update came from. */
+function ReplyComposer({ sessionId }: { sessionId: string }) {
+  const [message, setMessage] = useState("");
+  const [sending, setSending] = useState(false);
+  const [reply, setReply] = useState<string | null>(null);
+  const [replyDone, setReplyDone] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+
+  const send = useCallback(async () => {
+    const text = message.trim();
+    if (!text || sending) return;
+    setSending(true);
+    setSendError(null);
+    setReply("");
+    setReplyDone(false);
+    try {
+      let streamed = "";
+      await hermesChatStream(sessionId, text, {
+        onDelta: (delta) => {
+          streamed += delta;
+          setReply(streamed);
+        },
+        onCompleted: (content) => {
+          setReply(content);
+          setReplyDone(true);
+        },
+        onError: (errorMessage) => setSendError(errorMessage),
+      });
+      setMessage("");
+    } catch (err) {
+      setSendError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setSending(false);
+      setReplyDone(true);
+    }
+  }, [message, sending, sessionId]);
+
+  return (
+    <div className="mt-2 border-t border-white/[0.05] pt-2">
+      <div className="flex items-end gap-2">
+        <textarea
+          value={message}
+          onChange={(event) => setMessage(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+              event.preventDefault();
+              void send();
+            }
+          }}
+          placeholder={`Répondre dans la session ${sessionId.slice(0, 14)}…`}
+          rows={message.includes("\n") ? 3 : 1}
+          className="min-h-[32px] flex-1 resize-none rounded-lg border border-white/[0.08] bg-white/[0.03] px-2.5 py-1.5 text-xs text-white/80 placeholder:text-white/25 focus:border-indigo-400/40 focus:outline-none"
+        />
+        <button
+          type="button"
+          onClick={() => void send()}
+          disabled={sending || message.trim().length === 0}
+          title="Envoyer (⌘↵)"
+          className="flex h-[32px] w-[32px] shrink-0 items-center justify-center rounded-lg border border-white/[0.08] bg-white/[0.03] text-white/50 transition-colors hover:border-indigo-400/40 hover:text-white/85 disabled:opacity-40"
+        >
+          {sending ? (
+            <Loader className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <Send className="h-3.5 w-3.5" />
+          )}
+        </button>
+      </div>
+      {sendError && (
+        <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-amber-300">
+          <AlertTriangle className="h-3 w-3 shrink-0" /> {sendError}
+        </p>
+      )}
+      {reply !== null && !sendError && (
+        <div className="mt-2 rounded-lg border border-indigo-400/15 bg-indigo-500/[0.04] px-3 py-2 text-sm">
+          {reply === "" ? (
+            <p className="flex items-center gap-2 text-xs text-white/40">
+              <Loader className="h-3 w-3 animate-spin" /> Hermes répond…
+            </p>
+          ) : (
+            <MarkdownContent content={reply} />
+          )}
+          {replyDone && reply !== "" && (
+            <p className="mt-1.5 text-[10px] text-white/30">
+              Réponse de la session {sessionId.slice(0, 14)}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function ProjectDetail({
@@ -443,6 +619,7 @@ function ProjectDetail({
     { revalidateOnFocus: false },
   );
   const updates = data?.updates ?? [];
+  const section = SECTIONS.find((s) => s.bucket === project.bucket);
 
   return (
     <div className="flex min-h-full flex-col">
@@ -459,12 +636,22 @@ function ProjectDetail({
           <h2 className="min-w-0 truncate text-base font-semibold text-white/90">
             {project.slug}
           </h2>
-          {bucketPill(project.bucket)}
-          {project.tracker?.updated_at && (
-            <span className="ml-auto hidden shrink-0 text-[11px] text-white/30 sm:block">
-              tracker <UpdateAge at={project.tracker.updated_at} />
+          {section && (
+            <span
+              className={cn(
+                "flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-medium",
+                project.bucket === "attention"
+                  ? "border-amber-400/25 bg-amber-500/10 text-amber-300"
+                  : "border-white/[0.08] bg-white/[0.03] text-white/45",
+              )}
+            >
+              <section.icon className="h-3 w-3" />
+              {section.title.toLowerCase()}
             </span>
           )}
+          <span className="ml-auto">
+            <ProjectActions project={project} />
+          </span>
         </div>
         {project.tracker?.status_line && (
           <p className="mt-1.5 text-xs leading-relaxed text-white/55">
@@ -503,7 +690,8 @@ function ProjectDetail({
           </div>
         )}
         {error && (
-          <p className="py-4 text-sm text-red-300/80">
+          <p className="flex items-center gap-2 py-4 text-sm text-amber-200/90">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
             Impossible de charger les updates.
           </p>
         )}
@@ -526,24 +714,9 @@ function ProjectDetail({
   );
 }
 
-const LIVE_DOT: Record<string, string> = {
-  active: "bg-sky-400",
-  queued: "bg-sky-400",
-  created: "bg-sky-400",
-  pending: "bg-amber-300",
-  awaiting_user: "bg-amber-300",
-  waiting_background: "bg-amber-300",
-  paused: "bg-amber-300",
-  completed: "bg-emerald-400",
-  acknowledged: "bg-emerald-400",
-  failed: "bg-red-400",
-  interrupted: "bg-red-400",
-  blocked: "bg-red-400",
-  not_feasible: "bg-red-400",
-};
-
 function MissionMiniChip({ mission }: { mission: ProjectMissionChip }) {
   const live = LIVE_STATUSES.has(mission.status);
+  const problem = PROBLEM_STATUSES.has(mission.status);
   return (
     <Link
       href={`/control?mission=${mission.id}`}
@@ -551,22 +724,27 @@ function MissionMiniChip({ mission }: { mission: ProjectMissionChip }) {
       title={`${mission.title ?? mission.id} — ${mission.status}`}
       className={cn(
         "inline-flex max-w-[200px] items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] !no-underline transition-colors",
-        live
-          ? "border-sky-400/25 bg-sky-500/10 text-sky-300 hover:border-sky-400/50"
-          : "border-white/[0.1] bg-white/[0.04] text-white/50 hover:border-white/25",
+        problem
+          ? "border-amber-400/20 bg-amber-500/[0.05] text-amber-200/80 hover:border-amber-400/40"
+          : "border-white/[0.09] bg-white/[0.03] hover:border-white/25",
+        !problem && (live ? "text-white/75" : "text-white/45"),
       )}
     >
-      <span
-        className={cn(
-          "h-1.5 w-1.5 shrink-0 rounded-full",
-          LIVE_DOT[mission.status] ?? "bg-white/30",
-        )}
-      />
+      {problem ? (
+        <AlertTriangle className="h-3 w-3 shrink-0" />
+      ) : (
+        <span
+          className={cn(
+            "h-1.5 w-1.5 shrink-0 rounded-full",
+            live ? "animate-pulse bg-white/70" : "bg-white/25",
+          )}
+        />
+      )}
       <span className="truncate">
         {mission.title || mission.id.slice(0, 8)}
       </span>
       {mission.github_pr && (
-        <GitPullRequest className="h-3 w-3 shrink-0 opacity-70" />
+        <GitPullRequest className="h-3 w-3 shrink-0 opacity-60" />
       )}
     </Link>
   );
@@ -601,7 +779,10 @@ function bodyWithoutHeadline(body: string, headline: string): string {
   }
   return lines
     .slice(index)
-    .filter((line) => line.trim() !== "[SILENT]")
+    .filter((line) => {
+      const trimmed = line.trim();
+      return trimmed !== "[SILENT]" && !trimmed.startsWith("[STATE_SIGNATURE:");
+    })
     .join("\n");
 }
 
@@ -655,6 +836,7 @@ function UpdateEntry({
             </p>
           </div>
         )}
+        {expanded && <ReplyComposer sessionId={update.session_id} />}
       </div>
     </div>
   );

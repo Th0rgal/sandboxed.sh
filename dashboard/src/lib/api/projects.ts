@@ -3,7 +3,7 @@
  * project-tagged missions, and cron delivery updates.
  */
 
-import { apiGet } from "./core";
+import { apiGet, apiPost } from "./core";
 
 export interface ProjectTracker {
   slug: string;
@@ -63,5 +63,24 @@ export function getProjectUpdates(
   return apiGet(
     `/api/projects/${encodeURIComponent(slug)}/updates?limit=${limit}`,
     "Failed to load project updates",
+  );
+}
+
+export type ProjectAction =
+  | "pause"
+  | "resume"
+  | "archive"
+  | "unarchive"
+  | "delete"
+  | "restore";
+
+export async function postProjectAction(
+  slug: string,
+  action: ProjectAction,
+): Promise<void> {
+  await apiPost(
+    `/api/projects/${encodeURIComponent(slug)}/action`,
+    { action },
+    "Failed to apply project action",
   );
 }
