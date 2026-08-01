@@ -2,13 +2,23 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { SWRConfig } from "swr";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { getProjectsOverview, getProjectUpdates } from "@/lib/api/projects";
+import {
+  getProjectsOverview,
+  getProjectUpdates,
+  postProjectAction,
+} from "@/lib/api/projects";
 import type { ProjectRow, ProjectsOverview } from "@/lib/api/projects";
+import { hermesChatStream } from "@/lib/api/hermes";
 import ProjectsBoard from "./projects-board";
 
 vi.mock("@/lib/api/projects", () => ({
   getProjectsOverview: vi.fn(),
   getProjectUpdates: vi.fn(),
+  postProjectAction: vi.fn(),
+}));
+
+vi.mock("@/lib/api/hermes", () => ({
+  hermesChatStream: vi.fn(),
 }));
 
 vi.mock("@/components/markdown-content", () => ({
@@ -17,6 +27,8 @@ vi.mock("@/components/markdown-content", () => ({
 
 const mockedOverview = vi.mocked(getProjectsOverview);
 const mockedUpdates = vi.mocked(getProjectUpdates);
+const mockedAction = vi.mocked(postProjectAction);
+const mockedChat = vi.mocked(hermesChatStream);
 
 function project(overrides: Partial<ProjectRow>): ProjectRow {
   return {
@@ -52,6 +64,8 @@ describe("ProjectsBoard", () => {
   beforeEach(() => {
     mockedOverview.mockReset();
     mockedUpdates.mockReset();
+    mockedAction.mockReset();
+    mockedChat.mockReset();
     mockedUpdates.mockResolvedValue({ slug: "verity", updates: [] });
   });
 
@@ -165,5 +179,67 @@ describe("ProjectsBoard", () => {
       screen.queryByRole("button", { name: /beal/ }),
     ).not.toBeInTheDocument();
     expect(screen.getAllByText("verity").length).toBeGreaterThan(0);
+  });
+
+  test("pause action posts and refreshes the overview", async () => {
+    mockedOverview.mockResolvedValue(overview([project({ slug: "verity" })]));
+    mockedAction.mockResolvedValue(undefined);
+
+    renderBoard();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Pauser/ }));
+    await waitFor(() =>
+      expect(mockedAction).toHaveBeenCalledWith("verity", "pause"),
+    );
+  });
+
+  test("delete requires a second confirming click", async () => {
+    mockedOverview.mockResolvedValue(overview([project({ slug: "verity" })]));
+    mockedAction.mockResolvedValue(undefined);
+
+    renderBoard();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Supprimer/ }));
+    expect(mockedAction).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /Confirmer/ }));
+    await waitFor(() =>
+      expect(mockedAction).toHaveBeenCalledWith("verity", "delete"),
+    );
+  });
+
+  test("reply composer streams into the update's origin session", async () => {
+    mockedOverview.mockResolvedValue(overview([project({ slug: "verity" })]));
+    mockedUpdates.mockResolvedValue({
+      slug: "verity",
+      updates: [
+        {
+          headline: "Tick",
+          body: "corps",
+          session_id: "sess-cron-7",
+          at: "2026-08-01T07:11:00Z",
+          signature: "verity",
+          blocker: null,
+        },
+      ],
+    });
+    mockedChat.mockImplementation(async (_id, _msg, handlers) => {
+      handlers.onDelta("Bien re");
+      handlers.onCompleted?.("Bien reçu.");
+    });
+
+    renderBoard();
+
+    const composer = await screen.findByPlaceholderText(/sess-cron-7/);
+    fireEvent.change(composer, { target: { value: "continue le plan" } });
+    fireEvent.click(screen.getByTitle("Envoyer (⌘↵)"));
+
+    await waitFor(() =>
+      expect(mockedChat).toHaveBeenCalledWith(
+        "sess-cron-7",
+        "continue le plan",
+        expect.anything(),
+      ),
+    );
+    expect(await screen.findByText("Bien reçu.")).toBeInTheDocument();
   });
 });
