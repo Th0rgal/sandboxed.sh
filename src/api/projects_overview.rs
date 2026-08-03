@@ -722,10 +722,21 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
             .trim_end_matches("**")
             .trim();
         let normalized = value.to_lowercase();
+        // Controllers routinely write "Blocked by: nothing currently; …" —
+        // any negation opener means "not blocked", however long the tail.
+        const EMPTY_OPENERS: [&str; 7] = [
+            "aucun",
+            "rien",
+            "none",
+            "nothing",
+            "n/a",
+            "no blocker",
+            "not blocked",
+        ];
         if value.is_empty()
-            || normalized.starts_with("aucun")
-            || normalized.starts_with("rien")
-            || normalized.starts_with("none")
+            || EMPTY_OPENERS
+                .iter()
+                .any(|opener| normalized.starts_with(opener))
             || normalized.starts_with('—')
             || normalized.starts_with('-')
         {
@@ -769,9 +780,17 @@ mod tests {
 
     #[test]
     fn empty_blockers_are_not_blockers() {
-        let content = "[Cron delivery: x]\nTitre\n**Bloqué par :** aucun pour l'instant.\n";
-        let parsed = parse_delivery("s", 0.0, content);
-        assert!(parsed.blocker.is_none());
+        for line in [
+            "**Bloqué par :** aucun pour l'instant.",
+            "**Blocked by:** nothing currently; the four v33 lanes are healthy.",
+            "**Blocked by:** none — waiting on CI.",
+            "**Blocked by:** n/a",
+            "**Blocked by:** not blocked, just slow.",
+        ] {
+            let content = format!("[Cron delivery: x]\nTitre\n{line}\n");
+            let parsed = parse_delivery("s", 0.0, &content);
+            assert!(parsed.blocker.is_none(), "should be empty: {line}");
+        }
     }
 
     #[test]

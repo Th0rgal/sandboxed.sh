@@ -230,11 +230,7 @@ export default function ProjectsBoard() {
           Failed to load the projects overview: {String(error)}
         </div>
       )}
-      {isLoading && !data && (
-        <div className="flex items-center gap-2 py-10 text-sm text-white/40">
-          <Loader className="h-4 w-4 animate-spin" /> Loading projects…
-        </div>
-      )}
+      {isLoading && !data && <BoardSkeleton />}
 
       {data && (
         <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 pb-4 lg:grid-cols-[340px_minmax(0,1fr)] xl:grid-cols-[380px_minmax(0,1fr)]">
@@ -334,7 +330,6 @@ function ProjectListRow({
 }) {
   const live = liveMissionCount(project);
   const quiet = isQuiet(project);
-  const attention = project.bucket === "attention";
   return (
     <button
       type="button"
@@ -358,12 +353,7 @@ function ProjectListRow({
           {project.latest_update && <UpdateAge at={project.latest_update.at} />}
         </span>
         {!quiet && (
-          <span
-            className={cn(
-              "mt-0.5 flex min-w-0 items-center gap-2 text-[11px]",
-              attention ? "text-amber-300/80" : "text-white/40",
-            )}
-          >
+          <span className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-white/40">
             {live > 0 && (
               <span className="flex shrink-0 items-center gap-1 text-white/55">
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white/60" />
@@ -619,15 +609,13 @@ function ProjectDetail({
             {project.slug}
           </h2>
           {section && (
-            <span
-              className={cn(
-                "flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-medium",
-                project.bucket === "attention"
-                  ? "border-amber-400/25 bg-amber-500/10 text-amber-300"
-                  : "border-white/[0.08] bg-white/[0.03] text-white/45",
-              )}
-            >
-              <section.icon className="h-3 w-3" />
+            <span className="flex shrink-0 items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-0.5 text-[10px] font-medium text-white/45">
+              <section.icon
+                className={cn(
+                  "h-3 w-3",
+                  project.bucket === "attention" && "text-amber-300/90",
+                )}
+              />
               {section.title.toLowerCase()}
             </span>
           )}
@@ -641,13 +629,13 @@ function ProjectDetail({
           </p>
         )}
         {project.attention_reasons.length > 0 && (
-          <div className="mt-2 space-y-1 rounded-lg border border-amber-400/20 bg-amber-500/[0.06] px-3 py-2">
+          <div className="mt-2 space-y-1 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2">
             {project.attention_reasons.map((reason) => (
               <p
                 key={reason}
-                className="flex items-start gap-1.5 text-xs text-amber-200/90"
+                className="flex items-start gap-1.5 text-xs text-white/60"
               >
-                <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-amber-300/80" />
                 {reason}
               </p>
             ))}
@@ -705,15 +693,12 @@ function MissionMiniChip({ mission }: { mission: ProjectMissionChip }) {
       onClick={(event) => event.stopPropagation()}
       title={`${mission.title ?? mission.id} — ${mission.status}`}
       className={cn(
-        "inline-flex max-w-[200px] items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] !no-underline transition-colors",
-        problem
-          ? "border-amber-400/20 bg-amber-500/[0.05] text-amber-200/80 hover:border-amber-400/40"
-          : "border-white/[0.09] bg-white/[0.03] hover:border-white/25",
-        !problem && (live ? "text-white/75" : "text-white/45"),
+        "inline-flex max-w-[200px] items-center gap-1.5 rounded-full border border-white/[0.09] bg-white/[0.03] px-2 py-0.5 text-[11px] !no-underline transition-colors hover:border-white/25",
+        live ? "text-white/75" : "text-white/45",
       )}
     >
       {problem ? (
-        <AlertTriangle className="h-3 w-3 shrink-0" />
+        <AlertTriangle className="h-3 w-3 shrink-0 text-amber-300/80" />
       ) : (
         <span
           className={cn(
@@ -778,14 +763,7 @@ function UpdateEntry({
   const [expanded, setExpanded] = useState(defaultExpanded);
   return (
     <div>
-      <div
-        className={cn(
-          "rounded-lg border px-3 py-2 transition-colors",
-          update.blocker
-            ? "border-amber-400/20 bg-amber-500/[0.04]"
-            : "border-white/[0.06] bg-white/[0.02]",
-        )}
-      >
+      <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 transition-colors">
         <button
           type="button"
           onClick={() => setExpanded((value) => !value)}
@@ -797,8 +775,8 @@ function UpdateEntry({
           <UpdateAge at={update.at} />
         </button>
         {update.blocker && (
-          <p className="mt-1 flex items-start gap-1.5 text-xs text-amber-300/90">
-            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+          <p className="mt-1 flex items-start gap-1.5 text-xs text-white/60">
+            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-amber-300/80" />
             Blocked by: {update.blocker}
           </p>
         )}
@@ -813,6 +791,48 @@ function UpdateEntry({
           </div>
         )}
         {expanded && <ReplyComposer sessionId={update.session_id} />}
+      </div>
+    </div>
+  );
+}
+
+/** Pulse skeleton mirroring the two-pane layout while the overview loads. */
+function BoardSkeleton() {
+  return (
+    <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 pb-4 lg:grid-cols-[340px_minmax(0,1fr)] xl:grid-cols-[380px_minmax(0,1fr)]">
+      <div className="animate-pulse overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.015]">
+        <div className="border-b border-white/[0.05] px-3 py-2">
+          <div className="h-3 w-28 rounded bg-white/[0.06]" />
+        </div>
+        {Array.from({ length: 7 }).map((_, i) => (
+          <div key={i} className="space-y-1.5 px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="h-3.5 w-32 rounded bg-white/[0.06]" />
+              <div className="h-2.5 w-10 rounded bg-white/[0.04]" />
+            </div>
+            <div className="h-2.5 w-48 rounded bg-white/[0.04]" />
+          </div>
+        ))}
+      </div>
+      <div className="hidden animate-pulse overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.015] lg:block">
+        <div className="space-y-3 border-b border-white/[0.06] px-5 py-4">
+          <div className="flex items-center gap-3">
+            <div className="h-5 w-40 rounded bg-white/[0.06]" />
+            <div className="h-4 w-20 rounded-full bg-white/[0.04]" />
+          </div>
+          <div className="h-3 w-3/4 rounded bg-white/[0.04]" />
+          <div className="flex gap-2">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} className="h-5 w-28 rounded-full bg-white/[0.04]" />
+            ))}
+          </div>
+        </div>
+        <div className="space-y-3 px-5 py-4">
+          <div className="h-3 w-16 rounded bg-white/[0.05]" />
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div key={i} className="h-16 rounded-lg border border-white/[0.05] bg-white/[0.02]" />
+          ))}
+        </div>
       </div>
     </div>
   );

@@ -9036,15 +9036,19 @@ async fn upsert_kimi_oauth_provider(
 pub fn spawn_kimi_oauth_refresh_loop(state: Arc<super::routes::AppState>) {
     tokio::spawn(async move {
         loop {
-            // Run immediately at startup, then every five minutes. Reuse the
-            // same serialized store refresh path as catalog discovery so
-            // rotating refresh tokens cannot race.
+            // Run immediately at startup, then every four minutes. Kimi
+            // access tokens only live 300s, so a 300s sleep left a ~1s hole
+            // between expiry and the next refresh each cycle — requests
+            // landing in it got upstream 403s (about one per hour under
+            // steady builtin/smart traffic). A 240s cadence keeps a 60s
+            // validity margin. Reuse the same serialized store refresh path
+            // as catalog discovery so rotating refresh tokens cannot race.
             let (_, refreshed) =
                 refresh_due_store_oauth(&state.ai_providers, ProviderType::Kimi, 600_000).await;
             if refreshed > 0 {
                 tracing::info!(refreshed, "Refreshed Kimi OAuth credentials");
             }
-            tokio::time::sleep(Duration::from_secs(300)).await;
+            tokio::time::sleep(Duration::from_secs(240)).await;
         }
     });
 }
