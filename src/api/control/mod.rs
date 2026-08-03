@@ -7622,6 +7622,20 @@ pub async fn create_mission(
             .set_deferred_goal(mission.id, Some(prompt.clone()))
             .await
             .map_err(internal_error)?;
+        // A `/goal …` prompt is a goal-mode mandate from the very first turn.
+        // Persist it here, synchronously on the same store that created the
+        // mission — the event-loop hook that also does this only sees events
+        // while a control session is pumping, so MCP/API creations could
+        // otherwise stay goal_mode=false forever.
+        if let Some(objective) = parse_goal_objective(&prompt) {
+            control
+                .mission_store
+                .update_mission_goal(mission.id, true, Some(&objective))
+                .await
+                .map_err(internal_error)?;
+            mission.goal_mode = true;
+            mission.goal_objective = Some(objective);
+        }
         // Surface the queued goal so UIs show it as pending until dispatch.
         let _ = control.events_tx.send(AgentEvent::UserMessage {
             id: Uuid::new_v4(),
@@ -13709,12 +13723,14 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
 }
 
 fn parse_goal_objective(message: &str) -> Option<String> {
-    message
-        .trim_start()
-        .strip_prefix("/goal ")
-        .map(str::trim)
-        .filter(|objective| !objective.is_empty())
-        .map(ToString::to_string)
+    // Accept any whitespace after the command ("/goal x", "/goal\nx"), but
+    // not other slash commands sharing the prefix ("/goals").
+    let rest = message.trim_start().strip_prefix("/goal")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let objective = rest.trim();
+    (!objective.is_empty()).then(|| objective.to_string())
 }
 
 /// If the turn ended with `LlmError` or `AuthError` but the agent produced
@@ -23226,6 +23242,26 @@ pub async fn telegram_webhook_receiver(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_goal_objective_tolerates_whitespace_variants() {
+        assert_eq!(
+            parse_goal_objective("/goal write the docs").as_deref(),
+            Some("write the docs")
+        );
+        assert_eq!(
+            parse_goal_objective("/goal\nMulti-line objective\nwith details").as_deref(),
+            Some("Multi-line objective\nwith details")
+        );
+        assert_eq!(
+            parse_goal_objective("  /goal   spaced   ").as_deref(),
+            Some("spaced")
+        );
+        assert!(parse_goal_objective("/goal").is_none());
+        assert!(parse_goal_objective("/goal   ").is_none());
+        assert!(parse_goal_objective("/goals are nice").is_none());
+        assert!(parse_goal_objective("plain message").is_none());
+    }
+
     #[test]
     fn awaiting_writer_lease_grace_policy() {
         use super::awaiting_pr_writer_lease_expired;
