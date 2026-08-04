@@ -168,9 +168,15 @@ const RETRY_PROMPT_BINDING_GUIDANCE: &str = "[Retry guidance] The prior attempt 
     addressing the prior failure.";
 
 /// Whether the task declares an objective success condition beyond its
-/// prompt: non-empty acceptance criteria or a non-blank verification command.
+/// prompt: at least one non-blank acceptance criterion or a non-blank
+/// verification command. Registration normalizes blanks away
+/// (`validate_and_normalize_board_tasks`), but tasks persisted before that —
+/// or written through another path — must not have `[" "]` count as a
+/// contract and get the prompt declared advisory.
 fn has_outcome_contract(task: &BoardTask) -> bool {
-    !task.acceptance_criteria.is_empty()
+    task.acceptance_criteria
+        .iter()
+        .any(|criterion| !criterion.trim().is_empty())
         || task
             .verification_command
             .as_deref()
@@ -742,10 +748,16 @@ fn worker_contract(task: &BoardTask) -> String {
         .as_deref()
         .map(str::trim)
         .filter(|c| !c.is_empty());
-    if !task.acceptance_criteria.is_empty() {
+    let criteria: Vec<&str> = task
+        .acceptance_criteria
+        .iter()
+        .map(|criterion| criterion.trim())
+        .filter(|criterion| !criterion.is_empty())
+        .collect();
+    if !criteria.is_empty() {
         contract
             .push_str("\n- Acceptance criteria (ALL must hold; this is the success condition):");
-        for criterion in &task.acceptance_criteria {
+        for criterion in criteria {
             contract.push_str("\n  * ");
             contract.push_str(criterion);
         }
@@ -2388,6 +2400,16 @@ mod tests {
         assert!(prompt.contains("remain\n    binding") || prompt.contains("remain binding"));
         assert!(!prompt.contains("advisory"));
         assert!(prompt.ends_with(&task.prompt));
+
+        // Blank-only criteria (possible for tasks persisted before
+        // registration normalization) must not count as a contract either:
+        // no advisory retry guidance, no advisory line in the contract.
+        task.acceptance_criteria = vec!["  ".to_string()];
+        assert!(!has_outcome_contract(&task));
+        assert!(!retry_prompt(&task, &RetryPreflight::NothingFound).contains("advisory"));
+        let contract = worker_contract(&task);
+        assert!(!contract.contains("Acceptance criteria"));
+        assert!(!contract.contains("advisory"));
     }
 
     #[test]

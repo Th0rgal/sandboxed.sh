@@ -1889,7 +1889,11 @@ impl OrchestratorMcp {
                 let key = task["task_key"].as_str().unwrap_or_default();
                 let no_criteria = task["acceptance_criteria"]
                     .as_array()
-                    .map(|criteria| criteria.is_empty())
+                    .map(|criteria| {
+                        criteria.iter().all(|criterion| {
+                            criterion.as_str().map(str::trim).is_none_or(str::is_empty)
+                        })
+                    })
                     .unwrap_or(true);
                 let no_verification = task["verification_command"]
                     .as_str()

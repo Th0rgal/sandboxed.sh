@@ -4136,6 +4136,21 @@ fn validate_and_normalize_board_tasks(
             .model_override
             .as_deref()
             .and_then(|model| normalize_model_override_for_backend(Some(&t.backend), model));
+        // Blank acceptance criteria must not count as an outcome contract:
+        // `[" "]` would otherwise suppress spec_warnings, emit a blank bullet
+        // in the worker contract, and declare the prompt advisory on retry.
+        t.acceptance_criteria = t
+            .acceptance_criteria
+            .iter()
+            .map(|criterion| criterion.trim().to_string())
+            .filter(|criterion| !criterion.is_empty())
+            .collect();
+        t.verification_command = t
+            .verification_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(String::from);
         // `risk_class` now gates scheduler behavior (high = no silent retry),
         // so an unrecognized value must fail loudly instead of silently acting
         // like "normal".
@@ -15233,6 +15248,17 @@ async fn control_actor_loop(
                         // through unchanged. See `api/grok_goal.rs`.
                         let goal_target_mission = effective_target.or(main_mission_id);
                         let mut content = content;
+                        // Canonicalise `/goal\n…` to the space form at the single
+                        // entry point, so every downstream space-only parser (the
+                        // grok kickoff below, the mission_runner dispatch paths,
+                        // the codex/opencode goal drivers) sees the same goal
+                        // command. Strict (control-plane) messages are never goal
+                        // commands and stay byte-exact.
+                        if !strict {
+                            if let Some(canonical) = canonical_goal_message(&content) {
+                                content = canonical;
+                            }
+                        }
                         // Strict (control-plane) messages are system-generated and must
                         // never be reinterpreted as a `/goal` kickoff — skip the rewrite.
                         if !strict {
