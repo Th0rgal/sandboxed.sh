@@ -159,6 +159,8 @@ pub struct AppState {
     pub fleet: Arc<crate::remote_node::FleetMonitor>,
     /// Persistent project validation campaigns, gates, receipts, and delivery outbox.
     pub validation: super::validation::SharedValidationStore,
+    /// Explicitly-declared project facts (control conversation binding).
+    pub projects: super::projects_store::SharedProjectsStore,
 }
 
 /// Start the HTTP server.
@@ -500,6 +502,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             .working_dir
             .join(".sandboxed-sh/validation-campaigns.db"),
     )?);
+    let projects = Arc::new(super::projects_store::ProjectsStore::open(
+        config.working_dir.join(".sandboxed-sh/projects.db"),
+    )?);
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -550,6 +555,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         codex_usage: super::codex_usage::CodexUsageStore::new(),
         fleet: Arc::new(crate::remote_node::FleetMonitor::new()),
         validation,
+        projects,
     });
 
     super::validation::spawn_outbox_forwarder(Arc::clone(&state));

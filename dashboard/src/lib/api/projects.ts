@@ -3,7 +3,7 @@
  * project-tagged missions, and cron delivery updates.
  */
 
-import { apiGet, apiPost } from "./core";
+import { apiDel, apiGet, apiPost, apiPut } from "./core";
 
 export interface ProjectTracker {
   slug: string;
@@ -30,6 +30,15 @@ export interface ProjectDeliveryUpdate {
 
 export type ProjectBucket = "attention" | "active" | "paused" | "archived";
 
+export interface ProjectConversation {
+  session_id: string;
+  /** `binding` = declared by an operator; `latest_update` = guessed from the
+   *  newest delivery, which for a cron-driven project is a throwaway session
+   *  that has already ended. Render the two differently. */
+  source: "binding" | "latest_update";
+  bound_at?: string;
+}
+
 export interface ProjectRow {
   slug: string;
   bucket: ProjectBucket;
@@ -38,6 +47,7 @@ export interface ProjectRow {
   latest_update: ProjectDeliveryUpdate | null;
   updates_count: number;
   attention_reasons: string[];
+  conversation?: ProjectConversation | null;
 }
 
 export interface ProjectsOverview {
@@ -82,5 +92,23 @@ export async function postProjectAction(
     `/api/projects/${encodeURIComponent(slug)}/action`,
     { action },
     "Failed to apply project action",
+  );
+}
+
+export async function bindProjectConversation(
+  slug: string,
+  sessionId: string,
+): Promise<void> {
+  await apiPut(
+    `/api/projects/${encodeURIComponent(slug)}/conversation`,
+    { session_id: sessionId },
+    "Failed to bind the project conversation",
+  );
+}
+
+export async function unbindProjectConversation(slug: string): Promise<void> {
+  await apiDel(
+    `/api/projects/${encodeURIComponent(slug)}/conversation`,
+    "Failed to unbind the project conversation",
   );
 }
