@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use super::control::events::MissionStatus;
 use super::mission_store::Mission;
+use super::projects_store::ProjectConversation;
 use super::routes::AppState;
 
 /// Terminal missions younger than this stay on the board (recent history).
@@ -42,6 +43,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/overview", get(projects_overview))
         .route("/:slug/updates", get(project_updates))
         .route("/:slug/action", axum::routing::post(project_action))
+        .route(
+            "/:slug/conversation",
+            axum::routing::put(bind_project_conversation).delete(unbind_project_conversation),
+        )
 }
 
 fn hermes_projects_dir() -> Option<PathBuf> {
@@ -93,6 +98,12 @@ struct ProjectRow {
     latest_update: Option<DeliveryUpdate>,
     updates_count: usize,
     attention_reasons: Vec<String>,
+    /// The conversation to open for this project. An explicit binding wins;
+    /// otherwise the newest delivery's session is offered as a GUESS, tagged
+    /// as such — cron controllers open a throwaway session per tick, so an
+    /// inferred conversation is very often already ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversation: Option<ProjectConversation>,
 }
 
 pub async fn projects_overview(
@@ -105,6 +116,10 @@ pub async fn projects_overview(
         .as_deref()
         .map(read_trackers)
         .unwrap_or_default();
+    let bindings = state
+        .projects
+        .bindings()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let archived = trackers_dir
         .as_deref()
         .and_then(|dir| dir.parent().map(|p| p.join("archive")))
@@ -192,7 +207,8 @@ pub async fn projects_overview(
         .into_values()
         .map(|builder| {
             let forced = overrides.get(&builder.slug).cloned();
-            builder.finish(&archived, forced.as_deref())
+            let binding = bindings.get(&builder.slug).cloned();
+            builder.finish(&archived, forced.as_deref(), binding)
         })
         .collect();
     projects.sort_by(|a, b| {
@@ -285,7 +301,12 @@ impl ProjectRowBuilder {
         }
     }
 
-    fn finish(mut self, archived: &[String], forced: Option<&str>) -> ProjectRow {
+    fn finish(
+        mut self,
+        archived: &[String],
+        forced: Option<&str>,
+        binding: Option<ProjectConversation>,
+    ) -> ProjectRow {
         self.missions
             .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         self.missions.truncate(8);
@@ -389,6 +410,18 @@ impl ProjectRowBuilder {
             }
         };
 
+        let conversation = binding.or_else(|| {
+            self.latest_update
+                .as_ref()
+                .map(|update| update.session_id.clone())
+                .filter(|session_id| !session_id.is_empty())
+                .map(|session_id| ProjectConversation {
+                    session_id,
+                    source: "latest_update",
+                    bound_at: None,
+                })
+        });
+
         ProjectRow {
             slug: self.slug,
             bucket,
@@ -397,6 +430,7 @@ impl ProjectRowBuilder {
             latest_update: self.latest_update,
             updates_count: self.updates_count,
             attention_reasons: attention,
+            conversation,
         }
     }
 }
@@ -533,6 +567,64 @@ pub struct ProjectActionRequest {
 
 /// Apply a board action to a project: `pause` / `archive` / `delete` set the
 /// override, `resume` / `unarchive` / `restore` clear it.
+#[derive(Debug, serde::Deserialize)]
+pub struct BindConversationRequest {
+    pub session_id: String,
+}
+
+/// Declare which conversation a project reports into.
+///
+/// Deliberately explicit: the inferred value (newest delivery's session) is
+/// almost always a cron tick's throwaway session, which is already ended and
+/// cannot be replied to.
+pub async fn bind_project_conversation(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(request): Json<BindConversationRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // `is_plain_key` also rejects path traversal, which the slug-length check
+    // in `project_action` does not.
+    if !is_plain_key(&slug) {
+        return Err((StatusCode::BAD_REQUEST, "invalid project slug".to_string()));
+    }
+    let session_id = request.session_id.trim();
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "session_id must be 1-128 chars of [A-Za-z0-9._:-]".to_string(),
+        ));
+    }
+    let conversation = state
+        .projects
+        .set_binding(&slug, session_id, None)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(serde_json::json!({
+        "slug": slug,
+        "conversation": conversation,
+    })))
+}
+
+pub async fn unbind_project_conversation(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err((StatusCode::BAD_REQUEST, "invalid project slug".to_string()));
+    }
+    let removed = state
+        .projects
+        .clear_binding(&slug)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(
+        serde_json::json!({ "slug": slug, "unbound": removed }),
+    ))
+}
+
 pub async fn project_action(
     AxumPath(slug): AxumPath<String>,
     Json(request): Json<ProjectActionRequest>,
@@ -799,7 +891,7 @@ mod tests {
         builder.push_delivery(parse_delivery("s", 3.0, SAMPLE));
         builder.push_delivery(parse_delivery("s", 2.0, SAMPLE));
         builder.push_delivery(parse_delivery("s", 1.0, SAMPLE));
-        let row = builder.finish(&[], None);
+        let row = builder.finish(&[], None, None);
         assert_eq!(row.bucket, "attention");
         assert!(row.attention_reasons.iter().any(|r| r.contains("blocker")));
         assert!(row
@@ -840,7 +932,7 @@ mod tests {
                 github_pr: None,
             });
         }
-        let row = builder.finish(&[], None);
+        let row = builder.finish(&[], None, None);
         let failed_lines: Vec<&String> = row
             .attention_reasons
             .iter()
@@ -856,7 +948,7 @@ mod tests {
         builder.push_delivery(parse_delivery("s", 3.0, SAMPLE));
         builder.push_delivery(parse_delivery("s", 2.0, SAMPLE));
         builder.push_delivery(parse_delivery("s", 1.0, SAMPLE));
-        let row = builder.finish(&[], Some("paused"));
+        let row = builder.finish(&[], Some("paused"), None);
         assert_eq!(row.bucket, "paused");
         // Reasons stay visible in the detail pane even when silenced.
         assert!(!row.attention_reasons.is_empty());
@@ -870,7 +962,51 @@ mod tests {
             status_line: Some("paused (drained)".to_string()),
             updated_at: None,
         });
-        let row = builder.finish(&[], None);
+        let row = builder.finish(&[], None, None);
         assert_eq!(row.bucket, "paused");
+    }
+
+    /// An explicit binding must win over the inferred session, and the
+    /// inferred one must be labelled as a guess so the UI can offer to bind it.
+    #[test]
+    fn explicit_binding_wins_over_the_inferred_session() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder.push_delivery(DeliveryUpdate {
+            headline: "tick".into(),
+            body: None,
+            at: "2026-08-04T12:00:00Z".into(),
+            session_id: "cron_e594d751447d_20260804_120931".into(),
+            signature: None,
+            blocker: None,
+        });
+        let row = builder.finish(
+            &[],
+            None,
+            Some(ProjectConversation {
+                session_id: "20260804_103847_86ca5c".into(),
+                source: "binding",
+                bound_at: Some("2026-08-04T13:00:00Z".into()),
+            }),
+        );
+        let conversation = row.conversation.expect("conversation");
+        assert_eq!(conversation.session_id, "20260804_103847_86ca5c");
+        assert_eq!(conversation.source, "binding");
+    }
+
+    #[test]
+    fn without_a_binding_the_latest_update_is_offered_as_a_guess() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder.push_delivery(DeliveryUpdate {
+            headline: "tick".into(),
+            body: None,
+            at: "2026-08-04T12:00:00Z".into(),
+            session_id: "cron_e594d751447d_20260804_120931".into(),
+            signature: None,
+            blocker: None,
+        });
+        let row = builder.finish(&[], None, None);
+        let conversation = row.conversation.expect("conversation");
+        assert_eq!(conversation.source, "latest_update");
+        assert_eq!(conversation.bound_at, None);
     }
 }

@@ -49,6 +49,7 @@ pub mod oauth_reconcile;
 pub mod opencode;
 pub mod paloma;
 pub mod projects_overview;
+pub mod projects_store;
 mod provider_usage_cache;
 pub(crate) mod providers;
 pub(crate) mod proxy;
