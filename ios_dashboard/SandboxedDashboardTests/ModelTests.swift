@@ -131,9 +131,12 @@ final class ModelTests: XCTestCase {
 
         XCTAssertTrue(source.contains("control-inline-thinking"))
         XCTAssertTrue(source.contains("guard viewingMissionIsRunning else { return nil }"))
-        XCTAssertTrue(source.contains("thoughts-timeline"))
-        XCTAssertTrue(source.contains("thought-latest"))
-        XCTAssertTrue(source.contains("thoughts-bottom"))
+        // The thoughts timeline moved to MessageBubbles.swift when ControlView
+        // was split; assert its anchors where they now live.
+        let bubbles = try messageBubblesSource()
+        XCTAssertTrue(bubbles.contains("thoughts-timeline"))
+        XCTAssertTrue(bubbles.contains("thought-latest"))
+        XCTAssertTrue(bubbles.contains("thoughts-bottom"))
         XCTAssertTrue(source.contains(".defaultScrollAnchor(.bottom)"))
         XCTAssertTrue(source.contains("ScrollAnchorState"))
         XCTAssertTrue(source.contains("case pinned"))
@@ -241,12 +244,20 @@ final class ModelTests: XCTestCase {
     }
 
     private func controlViewSource() throws -> String {
+        try controlSource(named: "ControlView.swift")
+    }
+
+    private func messageBubblesSource() throws -> String {
+        try controlSource(named: "MessageBubbles.swift")
+    }
+
+    private func controlSource(named filename: String) throws -> String {
         let testFile = URL(fileURLWithPath: #filePath)
-        let controlView = testFile
+        let source = testFile
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appendingPathComponent("SandboxedDashboard/Views/Control/ControlView.swift")
-        return try String(contentsOf: controlView, encoding: .utf8)
+            .appendingPathComponent("SandboxedDashboard/Views/Control/\(filename)")
+        return try String(contentsOf: source, encoding: .utf8)
     }
 
     private func sharedControlReducerFixtures() throws -> SharedControlReducerFixtures {

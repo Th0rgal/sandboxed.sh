@@ -670,6 +670,140 @@ final class APIService {
         )
     }
 
+    // MARK: - Hermes sessions
+    //
+    // Hermes conversations, reached through the backend proxy which swaps this
+    // app's JWT for Hermes' own API key server-side. The app never sees that
+    // key, and only the `/api/sessions*` surface is exposed.
+
+    private static let hermesProxy = "/api/assistant/hermes"
+
+    func listHermesSessions(limit: Int = 30) async throws -> [HermesSession] {
+        let list: HermesSessionList = try await get(
+            "\(Self.hermesProxy)/api/sessions?source=api_server&limit=\(limit)"
+        )
+        return list.data
+    }
+
+    func createHermesSession(title: String? = nil) async throws -> HermesSession {
+        struct Body: Encodable { let title: String? }
+        let envelope: HermesSessionEnvelope = try await post(
+            "\(Self.hermesProxy)/api/sessions",
+            body: Body(title: title)
+        )
+        return envelope.session
+    }
+
+    func getHermesSessionMessages(sessionId: String) async throws -> [HermesMessage] {
+        let list: HermesMessageList = try await get(
+            "\(Self.hermesProxy)/api/sessions/\(sessionId)/messages"
+        )
+        return list.data
+    }
+
+    func deleteHermesSession(sessionId: String) async throws {
+        let _: EmptyResponse = try await delete("\(Self.hermesProxy)/api/sessions/\(sessionId)")
+    }
+
+    /// Send a message to a Hermes session and stream the turn back.
+    ///
+    /// Hermes emits *named* SSE events (`event: assistant.delta`, `tool.started`,
+    /// …) rather than a `type` field in the payload, so the frame parser here is
+    /// hand-rolled instead of reusing the Ask stream's line decoder. Cancelling
+    /// the task aborts the run server-side.
+    func hermesChatStream(
+        sessionId: String,
+        message: String
+    ) -> AsyncThrowingStream<HermesStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard
+                        let url = makeURL(
+                            "\(Self.hermesProxy)/api/sessions/\(sessionId)/chat/stream")
+                    else {
+                        throw APIError.invalidURL
+                    }
+                    var request = URLRequest(url: url)
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    if let token = jwtToken {
+                        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                    }
+                    struct Body: Encodable { let message: String }
+                    request.httpBody = try JSONEncoder().encode(Body(message: message))
+
+                    let (bytes, response) = try await Self.askSession.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw APIError.invalidResponse
+                    }
+                    if http.statusCode == 401 {
+                        markSessionExpired()
+                        throw APIError.unauthorized
+                    }
+                    guard (200..<300).contains(http.statusCode) else {
+                        throw APIError.httpError(http.statusCode, nil)
+                    }
+
+                    let decoder = JSONDecoder()
+                    var eventName = ""
+                    var payloadRaw = ""
+                    var sawTerminal = false
+
+                    // Emit the frame accumulated so far. SSE frames end at a
+                    // blank line; `bytes.lines` already strips the newlines.
+                    func flushFrame() throws {
+                        defer {
+                            eventName = ""
+                            payloadRaw = ""
+                        }
+                        guard !eventName.isEmpty, !payloadRaw.isEmpty,
+                            let data = payloadRaw.data(using: .utf8),
+                            let payload = try? decoder.decode(
+                                HermesStreamEvent.Payload.self, from: data)
+                        else { return }
+                        let event = HermesStreamEvent(name: eventName, payload: payload)
+                        if event.name == "error" {
+                            throw HermesStreamError(
+                                message: event.message ?? "Hermes run failed")
+                        }
+                        if event.name == "done" || event.name == "run.completed" {
+                            sawTerminal = true
+                        }
+                        continuation.yield(event)
+                    }
+
+                    for try await rawLine in bytes.lines {
+                        // nginx can preserve upstream CRLF line endings.
+                        let line = rawLine.hasSuffix("\r") ? String(rawLine.dropLast()) : rawLine
+                        if line.isEmpty {
+                            try flushFrame()
+                        } else if line.hasPrefix("event:") {
+                            eventName = String(line.dropFirst(6))
+                                .trimmingCharacters(in: .whitespaces)
+                        } else if line.hasPrefix("data:") {
+                            payloadRaw += String(line.dropFirst(5))
+                                .trimmingCharacters(in: .whitespaces)
+                        }
+                        // Comment lines (`: keepalive`) are ignored.
+                    }
+                    try flushFrame()
+
+                    // A truncated stream that never delivered a terminal event
+                    // is a failure, not a silent success.
+                    if !sawTerminal {
+                        throw HermesStreamError(message: "Stream ended before completion")
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     // MARK: - Queue Management
 
     func getQueue() async throws -> [QueuedMessage] {

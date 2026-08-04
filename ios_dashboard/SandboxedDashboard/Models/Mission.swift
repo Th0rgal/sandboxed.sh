@@ -113,6 +113,11 @@ struct Mission: Codable, Identifiable, Hashable {
     let firstViewedAt: String?
     let resumable: Bool
     let parentMissionId: String?
+    /// Which system created this mission ("hermes" for the assistant MCP).
+    let origin: String?
+    /// Hermes session that spawned this mission, when `origin == "hermes"`.
+    /// Lets clients group the mission as a worker of that conversation.
+    let originSessionId: String?
 
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
@@ -139,6 +144,8 @@ struct Mission: Codable, Identifiable, Hashable {
         case interruptedAt = "interrupted_at"
         case firstViewedAt = "first_viewed_at"
         case parentMissionId = "parent_mission_id"
+        case origin
+        case originSessionId = "origin_session_id"
     }
 
     init(from decoder: Decoder) throws {
@@ -165,6 +172,8 @@ struct Mission: Codable, Identifiable, Hashable {
         firstViewedAt = try container.decodeIfPresent(String.self, forKey: .firstViewedAt)
         resumable = try container.decodeIfPresent(Bool.self, forKey: .resumable) ?? false
         parentMissionId = try container.decodeIfPresent(String.self, forKey: .parentMissionId)
+        origin = try container.decodeIfPresent(String.self, forKey: .origin)
+        originSessionId = try container.decodeIfPresent(String.self, forKey: .originSessionId)
     }
 
     var displayTitle: String {
