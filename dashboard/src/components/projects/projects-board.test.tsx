@@ -8,17 +8,20 @@ import {
   postProjectAction,
 } from "@/lib/api/projects";
 import type { ProjectRow, ProjectsOverview } from "@/lib/api/projects";
-import { hermesChatStream } from "@/lib/api/hermes";
+import { hermesChatStream, listHermesSessions } from "@/lib/api/hermes";
 import ProjectsBoard from "./projects-board";
 
 vi.mock("@/lib/api/projects", () => ({
   getProjectsOverview: vi.fn(),
   getProjectUpdates: vi.fn(),
   postProjectAction: vi.fn(),
+  bindProjectConversation: vi.fn(),
+  unbindProjectConversation: vi.fn(),
 }));
 
 vi.mock("@/lib/api/hermes", () => ({
   hermesChatStream: vi.fn(),
+  listHermesSessions: vi.fn(),
 }));
 
 vi.mock("@/components/markdown-content", () => ({
@@ -26,6 +29,7 @@ vi.mock("@/components/markdown-content", () => ({
 }));
 
 const mockedOverview = vi.mocked(getProjectsOverview);
+const mockedListHermesSessions = vi.mocked(listHermesSessions);
 const mockedUpdates = vi.mocked(getProjectUpdates);
 const mockedAction = vi.mocked(postProjectAction);
 const mockedChat = vi.mocked(hermesChatStream);
@@ -299,8 +303,9 @@ describe("ProjectsBoard", () => {
       "href",
       "/control?session=20260804_103847_86ca5c",
     );
-    // Nothing to bind: it is already declared.
-    expect(screen.queryByTitle(/control conversation/i)).not.toBeInTheDocument();
+    // Already declared: the "choose one" affordance is gone (Rebind/Unbind
+    // remain, which is the point — the operator can still change their mind).
+    expect(screen.queryByTitle(/Choose the conversation/i)).not.toBeInTheDocument();
   });
 
   test("an inferred conversation offers to be bound", async () => {
@@ -326,7 +331,49 @@ describe("ProjectsBoard", () => {
 
     renderBoard();
 
-    expect(await screen.findByTitle(/control conversation/i)).toBeInTheDocument();
+    expect(
+      await screen.findByTitle(/Choose the conversation/i),
+    ).toBeInTheDocument();
+  });
+
+  test("binding never persists the inferred per-tick session", async () => {
+    const cronSession = "cron_e594d751447d_20260804_120931";
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity",
+          latest_update: {
+            headline: "tick",
+            body: null,
+            session_id: cronSession,
+            at: "2026-08-04T12:09:00Z",
+            signature: "verity",
+            blocker: null,
+          },
+          conversation: { session_id: cronSession, source: "latest_update" },
+        }),
+      ]),
+    );
+    mockedListHermesSessions.mockResolvedValue([
+      { id: cronSession, title: "tick" },
+      { id: "20260804_103847_86ca5c", title: "Verity dev #28" },
+    ]);
+
+    renderBoard();
+    fireEvent.click(await screen.findByTitle(/Choose the conversation/i));
+
+    // The per-tick session is filtered out: binding it would cement the very
+    // corpse this feature exists to replace.
+    await waitFor(() => {
+      const values = screen
+        .getAllByRole("option")
+        .map((o) => (o as HTMLOptionElement).value);
+      expect(values).toContain("20260804_103847_86ca5c");
+    });
+    const values = screen
+      .getAllByRole("option")
+      .map((o) => (o as HTMLOptionElement).value);
+    expect(values).not.toContain(cronSession);
   });
 
   test("offers no conversation link before a project has an update", async () => {

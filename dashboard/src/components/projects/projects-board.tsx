@@ -28,10 +28,12 @@ import {
   Send,
   Sparkles,
   Trash2,
+  Unlink,
 } from "lucide-react";
 
 import {
   bindProjectConversation,
+  unbindProjectConversation,
   type ProjectConversation,
   getProjectsOverview,
   getProjectUpdates,
@@ -42,6 +44,10 @@ import {
   type ProjectMissionChip,
   type ProjectRow,
 } from "@/lib/api/projects";
+import {
+  listHermesSessions,
+  type HermesSession,
+} from "@/lib/api/hermes";
 import { hermesChatStream } from "@/lib/api/hermes";
 import { MarkdownContent } from "@/components/markdown-content";
 import { RelativeTime } from "@/components/ui/relative-time";
@@ -495,16 +501,53 @@ function ProjectActions({ project }: { project: ProjectRow }) {
   const conversationSessionId = conversation?.session_id ?? null;
   const conversationIsGuess = conversation?.source === "latest_update";
 
-  const bindConversation = useCallback(async () => {
-    if (!conversationSessionId) return;
-    setBusy("bind");
+  const [picking, setPicking] = useState(false);
+  const [sessions, setSessions] = useState<HermesSession[] | null>(null);
+
+  // Offer the conversations an operator could plausibly mean: a control
+  // conversation is one they talk in, so per-tick cron sessions are excluded —
+  // binding one would cement exactly the corpse this feature exists to avoid.
+  const openPicker = useCallback(async () => {
+    setPicking(true);
+    setActionError(null);
+    if (sessions) return;
     try {
-      await bindProjectConversation(project.slug, conversationSessionId);
+      const all = await listHermesSessions(50);
+      setSessions(all.filter((s) => !s.id.startsWith("cron_")));
+    } catch (err) {
+      setActionError(String(err instanceof Error ? err.message : err));
+    }
+  }, [sessions]);
+
+  const bindConversation = useCallback(
+    async (sessionId: string) => {
+      setBusy("bind");
+      setActionError(null);
+      try {
+        await bindProjectConversation(project.slug, sessionId);
+        await mutate("projects-overview");
+        setPicking(false);
+      } catch (err) {
+        setActionError(String(err instanceof Error ? err.message : err));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [project.slug, mutate],
+  );
+
+  const unbindConversation = useCallback(async () => {
+    setBusy("bind");
+    setActionError(null);
+    try {
+      await unbindProjectConversation(project.slug);
       await mutate("projects-overview");
+    } catch (err) {
+      setActionError(String(err instanceof Error ? err.message : err));
     } finally {
       setBusy(null);
     }
-  }, [project.slug, conversationSessionId, mutate]);
+  }, [project.slug, mutate]);
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">
@@ -515,14 +558,24 @@ function ProjectActions({ project }: { project: ProjectRow }) {
           href={`/control?session=${encodeURIComponent(conversationSessionId)}`}
         />
       )}
-      {conversationIsGuess && (
+      {conversationIsGuess ? (
         <ActionButton
           icon={Link2}
-          label="Bind"
-          title="Make this the project's control conversation. Until it is bound, the link above follows whichever session sent the last update — for a cron-driven project that is a per-tick session which has already ended."
+          label="Bind…"
+          title="Choose the conversation this project reports into. Until one is declared, the link above follows whichever session sent the last update — for a cron-driven project that is a per-tick session which has already ended."
           busy={busy === "bind"}
-          onClick={bindConversation}
+          onClick={openPicker}
         />
+      ) : (
+        conversation && (
+          <ActionButton
+            icon={Link2}
+            label="Rebind…"
+            title="Point this project at a different control conversation."
+            busy={busy === "bind"}
+            onClick={openPicker}
+          />
+        )
       )}
       {project.bucket === "paused" ? (
         <ActionButton
@@ -568,6 +621,44 @@ function ProjectActions({ project }: { project: ProjectRow }) {
           }
         }}
       />
+      {conversation?.source === "binding" && (
+        <ActionButton
+          icon={Unlink}
+          label="Unbind"
+          title="Stop declaring a control conversation for this project. The link falls back to whichever session sent the last update."
+          busy={busy === "bind"}
+          onClick={unbindConversation}
+        />
+      )}
+      {picking && (
+        <div className="mt-1 flex w-full flex-wrap items-center gap-1.5">
+          <select
+            className="min-w-0 flex-1 rounded-md border border-white/[0.06] bg-white/[0.03] px-2 py-1 text-[11px] text-[rgb(var(--text))]"
+            defaultValue=""
+            onChange={(event) => {
+              if (event.target.value) void bindConversation(event.target.value);
+            }}
+          >
+            <option value="" disabled>
+              {sessions === null
+                ? "Loading conversations…"
+                : sessions.length === 0
+                  ? "No conversation available"
+                  : "Choose the control conversation…"}
+            </option>
+            {(sessions ?? []).map((session) => (
+              <option key={session.id} value={session.id}>
+                {session.title || session.preview || session.id}
+              </option>
+            ))}
+          </select>
+          <ActionButton
+            icon={ArrowLeft}
+            label="Cancel"
+            onClick={() => setPicking(false)}
+          />
+        </div>
+      )}
       {actionError && (
         <span className="text-[11px] text-amber-300">{actionError}</span>
       )}
