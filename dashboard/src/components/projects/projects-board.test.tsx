@@ -356,6 +356,13 @@ describe("ProjectsBoard", () => {
     );
     mockedListHermesSessions.mockResolvedValue([
       { id: cronSession, title: "tick" },
+      // An ordinary session that has ENDED is just as unreachable as a cron
+      // tick: binding it would point every reply at a closed thread.
+      {
+        id: "20260801_120000_closed",
+        title: "Old thread",
+        ended_at: "2026-08-02T09:00:00Z",
+      },
       { id: "20260804_103847_86ca5c", title: "Verity dev #28" },
     ]);
 
@@ -374,6 +381,7 @@ describe("ProjectsBoard", () => {
       .getAllByRole("option")
       .map((o) => (o as HTMLOptionElement).value);
     expect(values).not.toContain(cronSession);
+    expect(values).not.toContain("20260801_120000_closed");
   });
 
   test("offers no conversation link before a project has an update", async () => {

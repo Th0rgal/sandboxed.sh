@@ -504,16 +504,21 @@ function ProjectActions({ project }: { project: ProjectRow }) {
   const [picking, setPicking] = useState(false);
   const [sessions, setSessions] = useState<HermesSession[] | null>(null);
 
-  // Offer the conversations an operator could plausibly mean: a control
-  // conversation is one they talk in, so per-tick cron sessions are excluded —
-  // binding one would cement exactly the corpse this feature exists to avoid.
+  // Offer only conversations that can actually receive something. An ended
+  // session is unreachable whatever produced it, and a per-tick cron session
+  // is unreachable by construction — binding either would cement exactly the
+  // corpse this feature exists to avoid. `ended_at` is the general rule; the
+  // `cron_` check also catches a tick still in flight, which has no
+  // `ended_at` yet but will never be a conversation.
   const openPicker = useCallback(async () => {
     setPicking(true);
     setActionError(null);
     if (sessions) return;
     try {
       const all = await listHermesSessions(50);
-      setSessions(all.filter((s) => !s.id.startsWith("cron_")));
+      setSessions(
+        all.filter((s) => !s.ended_at && !s.id.startsWith("cron_")),
+      );
     } catch (err) {
       setActionError(String(err instanceof Error ? err.message : err));
     }
