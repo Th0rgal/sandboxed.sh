@@ -1217,31 +1217,7 @@ mcp_servers:
     connect_timeout: 15
     tools:
       include:
-        - list_active_missions
-        - list_missions
-        - get_mission
-        - get_mission_digest
-        - get_mission_events
-        - get_mission_health
-        - get_mission_diagnostics
-        - get_compute_fleet
-        - start_mission
-        - send_message_to_mission
-        - ask_mission
-        - update_mission_settings
-        - resume_mission
-        - cancel_mission
-        - list_workspaces
-        - get_workspace
-        - create_workspace
-        - update_workspace
-        - delete_workspace
-        - list_workspace_templates
-        - get_workspace_template
-        - save_workspace_template
-        - delete_workspace_template
-        - rebuild_workspace_from_template
-        - workspace_bash
+{tools_include}
       prompts: false
       resources: false
 
@@ -1259,6 +1235,7 @@ display:
         jwt_secret = yaml_squote(jwt_secret),
         user_id = yaml_squote(user_id),
         default_workspace_id = yaml_squote(default_workspace_id),
+        tools_include = crate::hermes_tools::yaml_include_items("        "),
     )
 }
 
@@ -5428,19 +5405,10 @@ mod tests {
 
         assert!(yaml.contains("    timeout: 600\n"));
         assert!(!yaml.contains("    timeout: 120\n"));
-        assert!(yaml.contains("        - ask_mission\n"));
-        for tool in [
-            "get_workspace",
-            "create_workspace",
-            "update_workspace",
-            "delete_workspace",
-            "list_workspace_templates",
-            "get_workspace_template",
-            "save_workspace_template",
-            "delete_workspace_template",
-            "rebuild_workspace_from_template",
-            "workspace_bash",
-        ] {
+        // The generated allowlist is the canonical one — every assistant-mcp
+        // tool, including the ones that had drifted out of it
+        // (get_chatgpt_ui_pool_status, acknowledge_mission, workspace jobs).
+        for tool in crate::hermes_tools::HERMES_ASSISTANT_TOOL_ALLOWLIST {
             assert!(
                 yaml.contains(&format!("        - {tool}\n")),
                 "generated Hermes config missing {tool}"

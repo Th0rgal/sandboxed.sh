@@ -835,6 +835,15 @@ impl MissionStore for InMemoryMissionStore {
                         bt.cost_budget_cents = t.cost_budget_cents;
                         bt.depends_on = t.depends_on;
                         bt.updated_at = now.clone();
+                    } else if bt.status == BoardTaskStatus::Running {
+                        // Mirror the sqlite store: a running task's prompt is
+                        // frozen but its outcome contract may still be
+                        // corrected (spec_warnings arrive after registration,
+                        // and the scheduler can spawn within one pass).
+                        bt.acceptance_criteria = t.acceptance_criteria;
+                        bt.verification_command = t.verification_command;
+                        bt.risk_class = t.risk_class;
+                        bt.updated_at = now.clone();
                     }
                     out.push(bt.clone());
                 }

@@ -9,7 +9,7 @@ description: >
 metadata:
   policy: chatgpt-ui-pool
   policy_version: 1.3.0
-version: 1.7.0
+version: 1.8.0
 ---
 
 # Hermes Mission Control
@@ -95,6 +95,26 @@ Match the signal to the fix. The health `recommendation` usually tells you which
   Keep going until <concrete success condition>. Do not stop to ask — make
   reasonable decisions and continue.")` Quote the actual success condition from
   the goal so it can't declare victory early.
+
+## Writing goals and hints: no more specific than necessary
+
+A mission spec is a hypothesis about what will get the outcome you need, and
+over-specific hypotheses fail on the cases you didn't foresee. Apply one rule
+everywhere you write instructions for an agent:
+
+- **`/goal` objectives are verifiable end-states, never step lists.** Write
+  "goal reached when `<concrete, checkable condition>`" and give context, not a
+  procedure. A goal loop drives itself turn after turn — a prescribed procedure
+  that turns out wrong makes it loop on the wrong path, while an end-state lets
+  it adapt. (This is also what `resume_mission` pushes should quote.)
+- **Hints are the minimal added constraint.** When nudging a struggling
+  mission, state the one fact or counterexample it is missing ("X is already
+  handled in Y; only Z remains"), not a revised plan for the whole task. Let it
+  re-plan around the new constraint.
+- **Boss missions inherit the same rule.** When you start an orchestration
+  boss, tell it to specify board tasks by `acceptance_criteria` +
+  `verification_command` (the outcome contract) and treat prompt procedure as
+  advisory — the scheduler and the board tooling already assume this.
 
 ## Switching backends safely (between turns)
 
@@ -222,6 +242,12 @@ this section must stay in sync with it.
    continue with a concrete success condition, not a vague "keep going."
 3. **One change at a time.** Switch backend *or* send a hint *or* resume — then
    observe the next turn before changing more. Don't stack interventions.
+   Corollary — **prefer the weakest diagnosis the evidence supports**: when
+   signals are ambiguous between explanations (transport vs model vs prompt),
+   pick the intervention that is correct under *all* remaining candidates
+   (usually: gather diagnostics, or resume with no other change) rather than a
+   specific fix that damages the mission if your guess is wrong. Commit to a
+   specific intervention only once diagnostics have excluded the alternatives.
 4. **Verify, don't trust the summary.** A mission claiming "done" may not be.
    Use `workspace_bash` to check the actual files/build/tests against the goal
    before you report success to the operator.

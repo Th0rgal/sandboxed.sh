@@ -610,6 +610,22 @@ pub struct RemoteNodesResponse {
     pub nodes: Vec<RemoteNodeView>,
     /// Last dispatch outcomes across the fleet, newest first (max 10).
     pub recent_jobs: Vec<DispatchOutcome>,
+    /// DGX Spark build-offload lane. A separate capacity lane from the
+    /// remote-node fleet (per-workspace opt-in + HMAC env, see
+    /// `src/api/spark.rs`); surfaced here so placement decisions can see the
+    /// whole picture instead of only `nodes`.
+    pub spark_offload: SparkOffloadStatus,
+}
+
+/// Status of the Spark offload lane for fleet/placement consumers.
+#[derive(Debug, Clone, Serialize)]
+pub struct SparkOffloadStatus {
+    /// Arbiter URL, token, SSH target, AND the capability-token signing
+    /// secret are all configured on the host — i.e. the lane is actually
+    /// reachable by opted-in workspaces, not merely credentialed.
+    pub configured: bool,
+    /// Names of workspaces with `spark_offload.enabled == true`.
+    pub enabled_workspaces: Vec<String>,
 }
 
 /// Probe one node and record the result into the monitor cache.
