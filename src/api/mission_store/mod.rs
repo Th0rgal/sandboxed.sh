@@ -1896,40 +1896,33 @@ pub trait MissionStore: Send + Sync {
     /// a prefix is unambiguous. The default implementation pages
     /// `list_missions`; sqlite overrides it with an indexed prefix scan.
     ///
-    /// This deliberately has NO scan ceiling, unlike the filtered listing.
-    /// "Unique" is a claim about the whole store: stopping early could report
-    /// a single visible candidate as unambiguous while a second match sits
-    /// just beyond the horizon, and the caller would then cancel or message
-    /// the wrong mission. An incomplete list is a nuisance; an incomplete
-    /// uniqueness proof is a correctness bug. Callers pass a small `limit`
-    /// (enough to prove ambiguity), so the loop still exits early in the
-    /// ambiguous case.
+    /// Reads the store ONCE, unpaged, on purpose. Two independent hazards make
+    /// paging wrong here, and both end the same way — the caller cancels or
+    /// messages the wrong mission:
+    ///
+    /// - a scan ceiling could report a single visible candidate as unambiguous
+    ///   while a second match sat beyond the horizon;
+    /// - `list_missions` orders by `updated_at`, so a mission touched between
+    ///   two pages can move into an already-consumed page and be skipped
+    ///   entirely, again leaving a false "unique".
+    ///
+    /// A single call is as atomic as the backing store's own listing (the
+    /// file and memory stores materialize under one read lock), which is
+    /// exactly the snapshot this needs. An incomplete list is a nuisance; an
+    /// incomplete uniqueness proof is a correctness bug. sqlite overrides this
+    /// with an indexed range read, which is atomic for the same reason.
     async fn find_missions_by_id_prefix(
         &self,
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<Mission>, String> {
-        const PAGE: usize = 200;
         let prefix = prefix.to_ascii_lowercase();
-        let mut found = Vec::new();
-        let mut offset = 0usize;
-        loop {
-            let page = self.list_missions(PAGE, offset).await?;
-            let page_len = page.len();
-            for mission in page {
-                if mission.id.to_string().starts_with(&prefix) {
-                    found.push(mission);
-                    if found.len() >= limit {
-                        return Ok(found);
-                    }
-                }
-            }
-            if page_len < PAGE {
-                break;
-            }
-            offset += PAGE;
-        }
-        Ok(found)
+        let snapshot = self.list_missions(usize::MAX, 0).await?;
+        Ok(snapshot
+            .into_iter()
+            .filter(|mission| mission.id.to_string().starts_with(&prefix))
+            .take(limit)
+            .collect())
     }
 
     /// Acquire the sole non-terminal execution lease for a mission. Every
