@@ -1207,7 +1207,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "send_message_to_mission".to_string(),
-                description: "Send a follow-up message to an existing mission.".to_string(),
+                description: "Send a follow-up message to an existing mission, waking it if it is idle. This is the general way to restart a parked mission and KEEP THE SAME mission id: it activates pending, awaiting_user, acknowledged, waiting_background, interrupted, blocked, completed and failed missions alike. If the mission is already running the message is delivered to the live turn. There is no idle status that requires starting a new mission just to get the agent's attention.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id", "content"],
@@ -1484,7 +1484,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "resume_mission".to_string(),
-                description: "Restart an interrupted, blocked, or failed mission. Reconstructs context from history and the work directory, then runs the next turn. Pass `content` to steer the resume with a concrete hint (e.g. 'you still have budget — keep going until the build passes; do not stop to ask'). Without `content` it sends the default continue-where-you-left-off prompt.".to_string(),
+                description: "Restart a mission that ended without finishing — interrupted, blocked or failed — by reconstructing context from history and the work directory, then running the next turn. This is the recovery path, not the only way to wake a mission: for a mission parked in awaiting_user or acknowledged, send_message_to_mission wakes it on the same id and is the normal choice. Pass `content` to steer the resume with a concrete hint (e.g. 'you still have budget — keep going until the build passes; do not stop to ask'). Without `content` it sends the default continue-where-you-left-off prompt.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -3230,6 +3230,56 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A tool description is the only thing an autonomous agent knows about
+    /// what a tool can do. When it understates the tool, the agent reasons
+    /// correctly from wrong premises and gives up.
+    ///
+    /// That is not hypothetical. `resume_mission` said "interrupted, blocked,
+    /// or failed" and `send_message_to_mission` said only "Send a follow-up
+    /// message", so a controller holding an `acknowledged` mission concluded
+    /// it could not be woken at all and reported the benchmark campaign
+    /// blocked — while the server would have activated it on the same id.
+    #[test]
+    fn the_wake_tool_advertises_every_status_it_actually_wakes() {
+        let tools = AssistantMcp::tools();
+        let send = tools
+            .iter()
+            .find(|t| t.name == "send_message_to_mission")
+            .expect("send_message_to_mission is registered");
+
+        // These are exactly the statuses `message_activates_mission` accepts.
+        // If that list grows, this description has to grow with it.
+        for status in [
+            "pending",
+            "awaiting_user",
+            "acknowledged",
+            "waiting_background",
+            "interrupted",
+            "blocked",
+            "completed",
+            "failed",
+        ] {
+            assert!(
+                send.description.contains(status),
+                "send_message_to_mission wakes `{status}` but does not say so; \
+                 an agent reading this will believe it cannot: {}",
+                send.description
+            );
+        }
+
+        // And the recovery tool must not read as the only way to wake a
+        // mission, which is the inference that cost the benchmark track.
+        let resume = tools
+            .iter()
+            .find(|t| t.name == "resume_mission")
+            .expect("resume_mission is registered");
+        assert!(
+            resume.description.contains("send_message_to_mission"),
+            "resume_mission should point at the normal wake path: {}",
+            resume.description
+        );
+    }
 
     /// The binary's tool table IS the curated Hermes surface; the generated
     /// config allowlists are pinned to `HERMES_ASSISTANT_TOOL_ALLOWLIST`.
