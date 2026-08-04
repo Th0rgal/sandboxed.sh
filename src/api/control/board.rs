@@ -1974,6 +1974,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_task_outcome_contract_can_still_be_corrected() {
+        // spec_warnings arrive after registration and the scheduler can spawn
+        // within one pass — so re-registering the same task_key must land the
+        // corrected contract on a RUNNING task (contract fields only; the
+        // in-flight prompt stays frozen).
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let boss = store
+            .create_mission_with_parent(
+                Some("boss"),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create boss");
+        store
+            .upsert_board_tasks(
+                boss.id,
+                vec![NewBoardTask {
+                    task_key: "t".into(),
+                    title: "t".into(),
+                    prompt: "original prompt".into(),
+                    backend: "codex".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("register");
+        let mut task = store
+            .list_board_tasks(boss.id)
+            .await
+            .expect("list")
+            .remove(0);
+        task.status = BoardTaskStatus::Running;
+        store.save_board_task(&task).await.expect("mark running");
+
+        store
+            .upsert_board_tasks(
+                boss.id,
+                vec![NewBoardTask {
+                    task_key: "t".into(),
+                    title: "ignored".into(),
+                    prompt: "ignored".into(),
+                    backend: "codex".into(),
+                    acceptance_criteria: vec!["tests pass".into()],
+                    verification_command: Some("cargo test".into()),
+                    risk_class: "high".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("correct contract");
+
+        let corrected = store
+            .list_board_tasks(boss.id)
+            .await
+            .expect("list")
+            .remove(0);
+        assert_eq!(corrected.status, BoardTaskStatus::Running);
+        assert_eq!(corrected.prompt, "original prompt");
+        assert_eq!(
+            corrected.acceptance_criteria,
+            vec!["tests pass".to_string()]
+        );
+        assert_eq!(
+            corrected.verification_command.as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(corrected.risk_class, "high");
+    }
+
+    #[tokio::test]
     async fn dropped_delivery_is_released_for_pending_replay() {
         let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
         let (cmd_tx, mut cmd_rx) = mpsc::channel(1);

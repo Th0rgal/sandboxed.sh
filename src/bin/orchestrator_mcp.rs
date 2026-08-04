@@ -1904,7 +1904,9 @@ impl OrchestratorMcp {
                     format!(
                         "task `{key}`: no acceptance_criteria or verification_command — \
                          declare the weakest testable success condition so any approach \
-                         that satisfies it counts as delivered"
+                         that satisfies it counts as delivered. Re-calling plan_tasks \
+                         with the same task_key applies the contract even if the task \
+                         already started (verdicts and retries read it live)."
                     )
                 })
             })

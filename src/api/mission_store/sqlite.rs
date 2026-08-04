@@ -10570,7 +10570,34 @@ impl MissionStore for SqliteMissionStore {
                         .map_err(|e| format!("Failed to update board task: {e}"))?;
                         id
                     }
-                    Some((id, _)) => id, // non-pending: leave untouched
+                    Some((id, status)) if status == "running" => {
+                        // A worker is already executing this task, so its
+                        // prompt/backend/deps are frozen — but the OUTCOME
+                        // CONTRACT may still be corrected. `plan_tasks` warns
+                        // about missing acceptance criteria only after
+                        // registration, and the scheduler can spawn the task
+                        // within one pass (~3s), before the boss reads the
+                        // warning. Letting the contract fields through means
+                        // that correction still lands: verdict guidance and
+                        // the retry prompt read them live, and a retry's
+                        // worker contract delivers them.
+                        conn.execute(
+                            "UPDATE board_tasks SET acceptance_criteria = ?1, \
+                             verification_command = ?2, risk_class = ?3, updated_at = ?4 \
+                             WHERE id = ?5",
+                            params![
+                                serde_json::to_string(&t.acceptance_criteria)
+                                    .unwrap_or_else(|_| "[]".into()),
+                                t.verification_command,
+                                t.risk_class,
+                                now,
+                                id,
+                            ],
+                        )
+                        .map_err(|e| format!("Failed to update running task contract: {e}"))?;
+                        id
+                    }
+                    Some((id, _)) => id, // settled/terminal: leave untouched
                     None => {
                         let id = Uuid::new_v4().to_string();
                         conn.execute(
