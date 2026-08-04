@@ -173,6 +173,18 @@ struct StartMissionParams {
     origin_session_id: Option<String>,
 }
 
+/// Accept only conservative session identifiers for `origin_session_id`
+/// (Hermes session ids look like `20260803_150605_59ab72`; channel-keyed
+/// sessions contain `:`). Keeping the shape tight means the value stays
+/// machine-routable by the delivery handler.
+fn valid_origin_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
 fn native_backend_from_agent(agent: Option<&str>) -> Option<String> {
     match agent?.trim().to_ascii_lowercase().as_str() {
         "codex" => Some("codex".to_string()),
@@ -1117,7 +1129,7 @@ impl AssistantMcp {
                         "desired_state": {"type": "string", "description": "Track state, e.g. waiting_ci / waiting_review / blocked_external."},
                         "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."},
                         "estimated_disk_gib": {"type": "integer", "minimum": 1, "maximum": 512, "description": "Expected peak local scratch use. Set this for Lean/build-heavy missions; omit for small/no-build work."},
-                        "origin_session_id": {"type": "string", "description": "Hermes session id of the conversation spawning this mission. Dashboards group the mission as a worker of that session. Injected automatically by the Hermes-side plugin; pass through unchanged."}
+                        "origin_session_id": {"type": "string", "description": "Hermes session id of the conversation spawning this mission. Dashboards group the mission as a worker of that session, AND the mission-status webhook carries it back so the completion is delivered into that conversation instead of an isolated webhook session — always pass it when starting a mission from a conversation. Injected automatically by the Hermes-side plugin; pass through unchanged, never another session's id."}
                     }
                 }),
             },
@@ -1619,6 +1631,20 @@ impl AssistantMcp {
             params.github_pr.as_deref(),
             MergeGrantConfig::from_environment().as_ref(),
         )?;
+        // An explicitly supplied origin session must be usable for routing:
+        // silently dropping a blank/malformed id would create exactly the
+        // unreachable mission this field exists to prevent. Only omitting the
+        // field opts out.
+        let origin_session_id = match params.origin_session_id.as_deref().map(str::trim) {
+            Some(session) if valid_origin_session_id(session) => Some(session),
+            Some(session) => {
+                return Err(format!(
+                    "origin_session_id `{session}` is invalid: use 1-128 chars of \
+                     [A-Za-z0-9._:-]"
+                ))
+            }
+            None => None,
+        };
         let body = json!({
             "title": params.title,
             "workspace_id": workspace_id,
@@ -1646,12 +1672,10 @@ impl AssistantMcp {
             "estimated_disk_gib": params.estimated_disk_gib,
             // Mission-level provenance. `origin` is fixed by this server (not
             // model-controlled); the session id ties the mission to the Hermes
-            // conversation that spawned it.
+            // conversation that spawned it, and the mission-status webhook
+            // carries it back so the result reaches that conversation.
             "origin": "hermes",
-            "origin_session_id": params.origin_session_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
+            "origin_session_id": origin_session_id,
         });
         let response = self.api_post("/api/control/missions", body).await?;
         if !response.status().is_success() {
@@ -3665,6 +3689,18 @@ mod tests {
         )
         .unwrap();
         assert!(!tags.iter().any(|tag| tag.starts_with("merge-authority:")));
+    }
+
+    #[test]
+    fn origin_session_ids_are_validated_not_silently_dropped() {
+        assert!(valid_origin_session_id("20260803_150605_59ab72"));
+        assert!(valid_origin_session_id("agent:main:telegram:dm:1139694048"));
+        // A blank or malformed id must not pass as "no origin": the mission
+        // would complete with nowhere to report back to.
+        assert!(!valid_origin_session_id(""));
+        assert!(!valid_origin_session_id("   ".trim()));
+        assert!(!valid_origin_session_id("bad session id"));
+        assert!(!valid_origin_session_id(&"x".repeat(129)));
     }
 
     #[test]
