@@ -25,6 +25,7 @@ import {
   Play,
   Search,
   Send,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 
@@ -392,38 +393,57 @@ function ProjectListRow({
 }
 
 /** Icon button for the detail-pane action bar. */
+/** One control in the project action row. Renders a link when `href` is given
+ * (navigation, so middle-click and open-in-new-tab work), a button otherwise. */
 function ActionButton({
   icon: Icon,
   label,
   onClick,
+  href,
   busy,
   danger,
 }: {
   icon: LucideIcon;
   label: string;
-  onClick: () => void;
+  onClick?: () => void;
+  href?: string;
   busy?: boolean;
   danger?: boolean;
 }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={busy}
-      title={label}
-      className={cn(
-        "flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[11px] transition-colors disabled:opacity-50",
-        danger
-          ? "border-amber-400/25 bg-amber-500/10 text-amber-300 hover:border-amber-400/50"
-          : "border-white/[0.08] bg-white/[0.03] text-white/50 hover:border-white/20 hover:text-white/80",
-      )}
-    >
+  const className = cn(
+    "flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[11px] transition-colors disabled:opacity-50",
+    danger
+      ? "border-amber-400/25 bg-amber-500/10 text-amber-300 hover:border-amber-400/50"
+      : "border-white/[0.08] bg-white/[0.03] text-white/50 hover:border-white/20 hover:text-white/80",
+  );
+  const content = (
+    <>
       {busy ? (
         <Loader className="h-3 w-3 animate-spin" />
       ) : (
         <Icon className="h-3 w-3" />
       )}
       {label}
+    </>
+  );
+
+  if (href) {
+    return (
+      <Link href={href} title={label} className={cn(className, "no-underline")}>
+        {content}
+      </Link>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={busy}
+      title={label}
+      className={className}
+    >
+      {content}
     </button>
   );
 }
@@ -451,8 +471,19 @@ function ProjectActions({ project }: { project: ProjectRow }) {
     [project.slug, mutate],
   );
 
+  // The conversation this project reports into: whichever Hermes session sent
+  // its most recent update. Absent until a project has had one.
+  const conversationSessionId = project.latest_update?.session_id ?? null;
+
   return (
     <div className="flex flex-wrap items-center gap-1.5">
+      {conversationSessionId && (
+        <ActionButton
+          icon={Sparkles}
+          label="Conversation"
+          href={`/control?session=${encodeURIComponent(conversationSessionId)}`}
+        />
+      )}
       {project.bucket === "paused" ? (
         <ActionButton
           icon={Play}
