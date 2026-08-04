@@ -4915,9 +4915,12 @@ pub async fn list_missions(
         tag: query.tag.clone(),
         origin_session_id: query.origin_session_id.clone(),
     };
-    // Workspace is the one filter the store cannot answer: matching by name
-    // needs `populate_workspace_names`, and the persisted `workspace_name`
-    // column is not authoritative. So it keeps the in-memory scan.
+    // Workspace is the one predicate the store cannot answer: matching by
+    // name needs `populate_workspace_names`, and the persisted
+    // `workspace_name` column is not authoritative. It is applied in memory —
+    // but over STORE-FILTERED candidates, so combining it with
+    // origin_session_id/project/track keeps the pushdown and its unlimited
+    // depth instead of falling back to scanning raw rows.
     let needs_workspace_scan = query.workspace.is_some();
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0);
@@ -4933,13 +4936,11 @@ pub async fn list_missions(
         populate_workspace_names(&state, &mut page).await;
         page
     } else {
-        // Filtered path: predicate-match runs in memory, so a single 200-row
-        // page would silently drop matches on a larger fleet. Scan from the
-        // start, collecting matches, until we have `offset + limit` of them or
-        // hit a bounded ceiling. `offset` here means "skip this many MATCHING
-        // missions" (consistent with filtered pagination), not raw rows.
         const PAGE: usize = 200;
-        const MAX_SCAN: usize = 5_000;
+        // Bounds how many STORE-FILTERED candidates we resolve workspace names
+        // for, not how deep we read into the fleet: with a selective filter
+        // the store already skipped everything irrelevant.
+        const MAX_CANDIDATES: usize = 5_000;
         let workspace_lower = query.workspace.as_deref().map(|w| w.to_lowercase());
         let workspace_raw = query.workspace.as_deref();
         let want = offset.saturating_add(limit);
@@ -4950,22 +4951,21 @@ pub async fn list_missions(
         loop {
             let mut page = control
                 .mission_store
-                .list_missions(PAGE, scan_offset)
+                .list_missions_filtered(&filter, PAGE, scan_offset)
                 .await
                 .map_err(internal_error)?;
             let page_len = page.len();
             populate_workspace_names(&state, &mut page).await;
             for m in page {
-                let keep = filter.matches(&m)
-                    && match (workspace_raw, workspace_lower.as_deref()) {
-                        (Some(raw), Some(lower)) => {
-                            m.workspace_id.to_string() == raw
-                                || m.workspace_name
-                                    .as_deref()
-                                    .is_some_and(|name| name.to_lowercase() == lower)
-                        }
-                        _ => true,
-                    };
+                let keep = match (workspace_raw, workspace_lower.as_deref()) {
+                    (Some(raw), Some(lower)) => {
+                        m.workspace_id.to_string() == raw
+                            || m.workspace_name
+                                .as_deref()
+                                .is_some_and(|name| name.to_lowercase() == lower)
+                    }
+                    _ => true,
+                };
                 if keep {
                     matched.push(m);
                     if matched.len() >= want {
@@ -4974,11 +4974,11 @@ pub async fn list_missions(
                 }
             }
             scanned += page_len;
-            if matched.len() >= want || page_len < PAGE || scanned >= MAX_SCAN {
-                if scanned >= MAX_SCAN && matched.len() < want {
+            if matched.len() >= want || page_len < PAGE || scanned >= MAX_CANDIDATES {
+                if scanned >= MAX_CANDIDATES && matched.len() < want {
                     tracing::warn!(
-                        "list_missions filter scan hit cap ({}); results may be incomplete",
-                        MAX_SCAN
+                        "list_missions workspace scan hit candidate cap ({}); results may be incomplete",
+                        MAX_CANDIDATES
                     );
                 }
                 break;
