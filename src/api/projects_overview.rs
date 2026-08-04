@@ -680,6 +680,26 @@ fn resolve_alias(aliases: &HashMap<String, String>, key: &str) -> String {
     aliases.get(key).cloned().unwrap_or_else(|| key.to_string())
 }
 
+/// True when every field of a state descriptor is an unfilled `<placeholder>`.
+///
+/// Deliberately narrow: a descriptor is rejected only when it carries no real
+/// content at all. A partially-filled trailer is still a state — the operator
+/// learns more from `phase1|<heads>|blocked` than from silence.
+fn is_placeholder_descriptor(descriptor: &str) -> bool {
+    let mut saw_field = false;
+    for field in descriptor.split('|') {
+        let field = field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        saw_field = true;
+        if !(field.starts_with('<') && field.ends_with('>')) {
+            return false;
+        }
+    }
+    saw_field
+}
+
 /// A routing key / project tag must be a plain slug.
 fn is_plain_key(key: &str) -> bool {
     !key.is_empty()
@@ -952,7 +972,13 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
     let state = trailer
         .and_then(|inner| inner.split_once('|'))
         .map(|(_, rest)| rest.trim().to_string())
-        .filter(|rest| !rest.is_empty());
+        .filter(|rest| !rest.is_empty())
+        // A controller that quotes the trailer's own template back into its
+        // report emits `lido|<phase>|<heads>|<blocker>`. The routing key is a
+        // real slug so `is_plain_key` above accepts it, and the last trailer
+        // in the message wins — so an echoed template landing last would be
+        // recorded as a genuine state and sit in the durable timeline forever.
+        .filter(|rest| !is_placeholder_descriptor(rest));
 
     // "Bloqué par:" / "Blocked by:" field, when it names a real blocker.
     let blocker = content.lines().find_map(|line| {
@@ -1035,6 +1061,43 @@ mod tests {
             parsed.state.as_deref(),
             Some("phase1-stack|7dba916|clean-ready|none")
         );
+    }
+
+    /// Observed on 2026-08-05: the Lido controller quoted the trailer template
+    /// from its own instructions back into the report, so the message carried
+    /// both the template and the real signature. The last trailer wins, so an
+    /// echo landing last would be ingested as a genuine state and kept in the
+    /// durable timeline. The routing key is a real slug, so `is_plain_key`
+    /// does not catch it.
+    #[test]
+    fn an_echoed_template_is_not_a_state() {
+        let content = "[Cron delivery: x]\nTitre\n\
+                       [STATE_SIGNATURE: lido|<phase>|<heads>|<blocker>|<next-action>]\n";
+        let parsed = parse_delivery("s", 1_754_000_000.0, content);
+        assert_eq!(parsed.signature.as_deref(), Some("lido"), "the key is real");
+        assert_eq!(parsed.state, None, "but the descriptor carries no state");
+    }
+
+    #[test]
+    fn a_partly_filled_descriptor_is_still_a_state() {
+        // Rejecting these would lose real information: knowing the phase and
+        // that it is blocked beats knowing nothing.
+        let content = "[Cron delivery: x]\nTitre\n\
+                       [STATE_SIGNATURE: lido|phase3|<heads>|blocked-on-2231]\n";
+        let parsed = parse_delivery("s", 1_754_000_000.0, content);
+        assert_eq!(
+            parsed.state.as_deref(),
+            Some("phase3|<heads>|blocked-on-2231")
+        );
+    }
+
+    #[test]
+    fn the_real_signature_wins_when_a_template_precedes_it() {
+        let content = "[Cron delivery: x]\nTitre\n\
+                       [STATE_SIGNATURE: lido|<phase>|<heads>]\n\
+                       [STATE_SIGNATURE: lido|phase3|a3d80673|none]\n";
+        let parsed = parse_delivery("s", 1_754_000_000.0, content);
+        assert_eq!(parsed.state.as_deref(), Some("phase3|a3d80673|none"));
     }
 
     #[test]
