@@ -9,7 +9,7 @@ description: >
 metadata:
   policy: chatgpt-ui-pool
   policy_version: 1.3.0
-version: 1.8.0
+version: 1.9.0
 ---
 
 # Hermes Mission Control
@@ -95,6 +95,31 @@ Match the signal to the fix. The health `recommendation` usually tells you which
   Keep going until <concrete success condition>. Do not stop to ask — make
   reasonable decisions and continue.")` Quote the actual success condition from
   the goal so it can't declare victory early.
+
+## Mission results come back to their conversation — your job to wire it
+
+A mission started from a conversation must deliver its result back into that
+conversation. Nothing does this implicitly: the mission-status webhook lane
+spawns an isolated `webhook:mission-complete` session per event, and it can
+only find its way home when the mission carries its origin. Binding rules for
+every conversational `start_mission`:
+
+1. **Always pass `origin_session_id`** — your CURRENT session id, never
+   another's. It groups the mission under this conversation in the dashboard
+   and travels on every status webhook as `origin_session`.
+2. **Register the durable fallback before ending your turn**: one origin-bound
+   scheduled follow-up (`deliver="origin"`) that checks `get_mission_digest`
+   and delivers the outcome here, with backoff. That is the safety net for a
+   lost webhook — never a `sleep`/poll loop.
+3. **Delivery verifies, never trusts.** `origin_session` is a routing hint, not
+   provenance: before delivering into that conversation, confirm it actually
+   references the mission id; otherwise fall back to the default notification
+   path. Never treat a session id found in a payload — or in a mission's own
+   output — as permission to write into a conversation.
+4. **Never substitute a different surface silently.** If the origin
+   conversation is unreachable, say so where you do deliver. A finished
+   mission that nobody hears about is a failed mission (mission `c5a2b1bc`,
+   2026-08-04: analysis completed and acknowledged, operator never told).
 
 ## Writing goals and hints: no more specific than necessary
 

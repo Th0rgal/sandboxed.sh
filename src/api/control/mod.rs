@@ -12271,6 +12271,24 @@ async fn paloma_webhook_forwarder_loop(
                         "intent": project.and_then(|p| p.intent.clone()),
                         "github_pr": project.and_then(|p| p.github_pr.clone()),
                         "tags": project.map(|p| p.tags.clone()).unwrap_or_default(),
+                        // Creation provenance. Without these, a status webhook
+                        // lands in an isolated consumer session with no way
+                        // back to the conversation that started the mission —
+                        // results then sit acknowledged and unreported. The
+                        // consumer routes the completion into `origin_session`.
+                        //
+                        // TRUST: `origin_session` is a routing HINT, not
+                        // authority. It is declared by the creating client and
+                        // the MCP transport carries no per-call session
+                        // context to verify it against, so a delivery handler
+                        // MUST confirm the target conversation actually
+                        // references this mission_id before delivering there,
+                        // and fall back to its default notification path
+                        // otherwise.
+                        "origin": mission.as_ref().and_then(|m| m.origin.clone()),
+                        "origin_session": mission
+                            .as_ref()
+                            .and_then(|m| m.origin_session_id.clone()),
                         // Track state so a watchdog can tell "intentionally
                         // waiting (CI/review/external)" from "no worker = stuck".
                         "desired_state": project.and_then(|p| p.desired_state.clone()),
