@@ -44,6 +44,14 @@ fn spark_offload_secret() -> Option<String> {
         })
 }
 
+/// Whether a signing secret for spark-offload capability tokens is available.
+/// Without it, `build_spark_offload_token` returns `None` and no workspace can
+/// actually reach the offload endpoint — so availability reporting must treat
+/// the lane as unconfigured.
+pub fn spark_offload_signing_available() -> bool {
+    spark_offload_secret().is_some()
+}
+
 /// Mint a per-mission, scope-bound capability token for spark offload. Unlike
 /// the master `SANDBOXED_PROXY_SECRET`, a leaked token only authorizes spark
 /// builds for THIS mission — it can't be replayed against the LLM proxy or any

@@ -620,7 +620,9 @@ pub struct RemoteNodesResponse {
 /// Status of the Spark offload lane for fleet/placement consumers.
 #[derive(Debug, Clone, Serialize)]
 pub struct SparkOffloadStatus {
-    /// Arbiter URL, token, and SSH target are all configured on the host.
+    /// Arbiter URL, token, SSH target, AND the capability-token signing
+    /// secret are all configured on the host — i.e. the lane is actually
+    /// reachable by opted-in workspaces, not merely credentialed.
     pub configured: bool,
     /// Names of workspaces with `spark_offload.enabled == true`.
     pub enabled_workspaces: Vec<String>,

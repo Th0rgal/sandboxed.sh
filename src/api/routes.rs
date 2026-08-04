@@ -1491,10 +1491,14 @@ async fn list_remote_nodes(
     }
     // The Spark offload lane is separate from the remote-node fleet; expose
     // it alongside so `get_compute_fleet` consumers (Hermes, controllers) see
-    // all capacity lanes, not just `nodes`.
+    // all capacity lanes, not just `nodes`. `configured` requires the
+    // capability-token signing secret too: without it no workspace can mint a
+    // token for the endpoint, so advertising the lane would direct work at
+    // unusable capacity.
     let spark_configured = state.config.spark_arbiter_url.is_some()
         && state.config.spark_arbiter_token.is_some()
-        && state.config.spark_ssh_target.is_some();
+        && state.config.spark_ssh_target.is_some()
+        && crate::api::spark::spark_offload_signing_available();
     let spark_workspaces: Vec<String> = state
         .workspaces
         .list()

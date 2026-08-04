@@ -61,7 +61,10 @@ def configure(config: dict, assistant_mcp: str) -> None:
     )
     server = config.setdefault("mcp_servers", {}).setdefault("sandboxed_assistant", {})
     server["command"] = assistant_mcp
-    server["timeout"] = 120
+    # Ask turns (ask_mission) can make multiple sequential LLM/tool calls;
+    # match the 600s timeout contract of the generated config
+    # (hermes_config_yaml in src/api/system.rs) so they aren't cut off.
+    server["timeout"] = 600
     tools = server.setdefault("tools", {})
     tools["include"] = list(ASSISTANT_TOOLS)
     tools["prompts"] = False
@@ -107,7 +110,7 @@ def main() -> None:
 
     print(
         f"Configured {path}: native Kanban disabled, "
-        f"assistant-MCP timeout=120s, tools={len(ASSISTANT_TOOLS)}, "
+        f"assistant-MCP timeout=600s, tools={len(ASSISTANT_TOOLS)}, "
         "Proton disabled"
     )
 
