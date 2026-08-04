@@ -30,6 +30,22 @@ CREATE TABLE IF NOT EXISTS project_bindings (
     bound_at           TEXT NOT NULL,
     bound_by           TEXT
 );
+
+-- One row per *distinct consecutive* state a project reported. A controller
+-- that reports the same signature for six hours produces one row with
+-- observations=24, not 24 rows: the question worth answering is "how long has
+-- it been saying this", and a flat event log makes that a scan.
+CREATE TABLE IF NOT EXISTS project_state_events (
+    slug          TEXT NOT NULL,
+    signature     TEXT NOT NULL,
+    headline      TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    observations  INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (slug, first_seen_at)
+);
+CREATE INDEX IF NOT EXISTS idx_state_events_slug_seen
+    ON project_state_events(slug, last_seen_at DESC);
 "#;
 
 /// A project's control conversation and how we know about it.
@@ -163,6 +179,134 @@ impl ProjectsStore {
             .map_err(|e| e.to_string())?;
         Ok(removed > 0)
     }
+
+    /// Record that `slug` reported `signature` at `at`.
+    ///
+    /// Collapses repeats: re-reporting the state a project is already in
+    /// extends the open row rather than opening a new one. The count that
+    /// results is the durable form of the overview's in-memory "same signature
+    /// three ticks running" heuristic, which could only ever see the deliveries
+    /// still inside the scan window.
+    ///
+    /// Idempotent on `at`: the ingestor re-reads an overlapping window every
+    /// cycle, so replaying a delivery it has already seen must not inflate the
+    /// count. Returns the resulting observation count for this state.
+    pub fn record_state(
+        &self,
+        slug: &str,
+        signature: &str,
+        headline: Option<&str>,
+        at: &str,
+    ) -> Result<u32, String> {
+        let connection = self.lock()?;
+        let current: Option<(String, String, String, u32)> = connection
+            .query_row(
+                "SELECT signature, first_seen_at, last_seen_at, observations \
+                 FROM project_state_events WHERE slug = ?1 \
+                 ORDER BY last_seen_at DESC LIMIT 1",
+                params![slug],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+
+        if let Some((open_signature, first_seen_at, last_seen_at, observations)) = current {
+            if open_signature == signature {
+                // Already counted, or older than what we have: nothing to do.
+                if at <= last_seen_at.as_str() {
+                    return Ok(observations);
+                }
+                connection
+                    .execute(
+                        "UPDATE project_state_events \
+                         SET last_seen_at = ?1, observations = observations + 1, \
+                             headline = COALESCE(?2, headline) \
+                         WHERE slug = ?3 AND first_seen_at = ?4",
+                        params![at, headline, slug, first_seen_at],
+                    )
+                    .map_err(|e| e.to_string())?;
+                return Ok(observations + 1);
+            }
+            // A delivery older than the newest state we hold is a replay from
+            // the ingestor's overlap, not a transition. Recording it would
+            // fabricate a flap between two states the project never made.
+            if at <= last_seen_at.as_str() {
+                return Ok(0);
+            }
+        }
+
+        connection
+            .execute(
+                "INSERT INTO project_state_events \
+                   (slug, signature, headline, first_seen_at, last_seen_at, observations) \
+                 VALUES (?1, ?2, ?3, ?4, ?4, 1) \
+                 ON CONFLICT(slug, first_seen_at) DO NOTHING",
+                params![slug, signature, headline, at],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(1)
+    }
+
+    /// A project's state history, newest first.
+    pub fn state_timeline(&self, slug: &str, limit: usize) -> Result<Vec<ProjectState>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT signature, headline, first_seen_at, last_seen_at, observations \
+                 FROM project_state_events WHERE slug = ?1 \
+                 ORDER BY last_seen_at DESC LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![slug, limit as i64], |row| {
+                Ok(ProjectState {
+                    signature: row.get(0)?,
+                    headline: row.get(1)?,
+                    first_seen_at: row.get(2)?,
+                    last_seen_at: row.get(3)?,
+                    observations: row.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Observation counts for the state each project is *currently* in.
+    ///
+    /// One query for the whole overview: per-row lookups would put a query per
+    /// project inside a page render.
+    pub fn current_state_observations(&self) -> Result<HashMap<String, u32>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT slug, observations FROM project_state_events e \
+                 WHERE last_seen_at = ( \
+                   SELECT MAX(last_seen_at) FROM project_state_events \
+                   WHERE slug = e.slug \
+                 )",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// One distinct state a project reported, with how long it stayed there.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectState {
+    pub signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headline: Option<String>,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    /// How many deliveries reported this same state in a row.
+    pub observations: u32,
 }
 
 #[cfg(test)]
@@ -221,5 +365,142 @@ mod tests {
         let all = store.bindings().expect("all");
         assert_eq!(all["verity"].session_id, "shared");
         assert_eq!(all["verity-docs"].session_id, "shared");
+    }
+
+    // ---- state timeline ----
+
+    #[test]
+    fn repeating_a_state_extends_it_instead_of_opening_a_new_one() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        for (i, at) in [
+            "2026-08-04T10:00:00Z",
+            "2026-08-04T10:15:00Z",
+            "2026-08-04T10:30:00Z",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let count = store
+                .record_state("verity", "phase1-blocked", Some("still blocked"), at)
+                .expect("record");
+            assert_eq!(count as usize, i + 1);
+        }
+        let timeline = store.state_timeline("verity", 10).expect("timeline");
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].observations, 3);
+        assert_eq!(timeline[0].first_seen_at, "2026-08-04T10:00:00Z");
+        assert_eq!(timeline[0].last_seen_at, "2026-08-04T10:30:00Z");
+    }
+
+    #[test]
+    fn a_new_state_opens_a_new_row_and_leaves_the_old_one_closed() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .record_state("verity", "blocked", None, "2026-08-04T10:00:00Z")
+            .expect("record");
+        store
+            .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z")
+            .expect("record");
+        store
+            .record_state("verity", "merged", None, "2026-08-04T10:30:00Z")
+            .expect("record");
+
+        let timeline = store.state_timeline("verity", 10).expect("timeline");
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].signature, "merged");
+        assert_eq!(timeline[0].observations, 1);
+        assert_eq!(timeline[1].signature, "blocked");
+        assert_eq!(timeline[1].observations, 2);
+        assert_eq!(timeline[1].last_seen_at, "2026-08-04T10:15:00Z");
+    }
+
+    /// The ingestor re-reads an overlapping window each cycle. Replaying a
+    /// delivery it has already counted must not inflate the observation count,
+    /// or "how long has it been stuck" grows purely from polling frequency.
+    #[test]
+    fn replaying_a_delivery_does_not_inflate_the_count() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .record_state("verity", "blocked", None, "2026-08-04T10:00:00Z")
+            .expect("record");
+        store
+            .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z")
+            .expect("record");
+        for _ in 0..5 {
+            store
+                .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z")
+                .expect("replay");
+        }
+        let timeline = store.state_timeline("verity", 10).expect("timeline");
+        assert_eq!(timeline[0].observations, 2);
+    }
+
+    /// An out-of-order delivery from the overlap window must not be recorded
+    /// as a transition — that would fabricate a flap between two states the
+    /// project never actually made.
+    #[test]
+    fn an_older_delivery_never_fabricates_a_transition() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .record_state("verity", "blocked", None, "2026-08-04T10:00:00Z")
+            .expect("record");
+        store
+            .record_state("verity", "merged", None, "2026-08-04T11:00:00Z")
+            .expect("record");
+        // Arrives late, older than the current state.
+        store
+            .record_state("verity", "blocked", None, "2026-08-04T10:30:00Z")
+            .expect("late");
+
+        let timeline = store.state_timeline("verity", 10).expect("timeline");
+        assert_eq!(timeline.len(), 2, "no third row for the replayed state");
+        assert_eq!(timeline[0].signature, "merged");
+    }
+
+    #[test]
+    fn projects_keep_separate_timelines() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .record_state("verity", "a", None, "2026-08-04T10:00:00Z")
+            .expect("record");
+        store
+            .record_state("lido", "b", None, "2026-08-04T10:01:00Z")
+            .expect("record");
+        store
+            .record_state("lido", "b", None, "2026-08-04T10:02:00Z")
+            .expect("record");
+
+        let observations = store.current_state_observations().expect("observations");
+        assert_eq!(observations.get("verity"), Some(&1));
+        assert_eq!(observations.get("lido"), Some(&2));
+    }
+
+    #[test]
+    fn an_unknown_project_has_an_empty_timeline() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        assert!(store
+            .state_timeline("nope", 10)
+            .expect("timeline")
+            .is_empty());
+        assert!(store
+            .current_state_observations()
+            .expect("observations")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_headline_backfills_but_never_erases() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .record_state("verity", "s", None, "2026-08-04T10:00:00Z")
+            .expect("record");
+        store
+            .record_state("verity", "s", Some("now we know"), "2026-08-04T10:15:00Z")
+            .expect("record");
+        store
+            .record_state("verity", "s", None, "2026-08-04T10:30:00Z")
+            .expect("record");
+        let timeline = store.state_timeline("verity", 10).expect("timeline");
+        assert_eq!(timeline[0].headline.as_deref(), Some("now we know"));
     }
 }

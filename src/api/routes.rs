@@ -559,6 +559,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     });
 
     super::validation::spawn_outbox_forwarder(Arc::clone(&state));
+    super::projects_overview::spawn_state_ingestor(Arc::clone(&state));
 
     // Remote-node fleet monitor: periodic heartbeat polling so
     // `/api/remote-nodes` and dispatch decisions read cached statuses
