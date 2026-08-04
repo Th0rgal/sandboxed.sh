@@ -73,11 +73,21 @@ final class HermesConversationUITests: XCTestCase {
         }
         attach(app.windows.firstMatch.screenshot(), named: "switcher-with-sessions")
 
-        // First row under the section header.
-        let sessionRow = app.staticTexts.matching(
-            NSPredicate(format: "label BEGINSWITH %@", "Hermes session")
+        // First row under the section header. Target the row's Button, not the
+        // subtitle StaticText inside it: tapping the label does not reliably
+        // activate a plain-styled SwiftUI button in a List. The sheet also pins
+        // a search field over the bottom of the list, so scroll until the row
+        // is actually hittable rather than tapping through the search bar.
+        let sessionRow = app.buttons.matching(
+            NSPredicate(format: "label CONTAINS[c] %@", "Hermes session ·")
         ).firstMatch
         XCTAssertTrue(sessionRow.waitForExistence(timeout: 10), "no session row rendered")
+        var nudges = 0
+        while !sessionRow.isHittable && nudges < 6 {
+            app.swipeUp()
+            nudges += 1
+        }
+        XCTAssertTrue(sessionRow.isHittable, "session row stayed covered by the search field")
         sessionRow.tap()
 
         // The conversation view: its own header subtitle and composer.

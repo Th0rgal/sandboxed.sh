@@ -34,11 +34,43 @@ final class HermesConversationTests: XCTestCase {
             }]}
             """
         )
-        let session = try XCTUnwrap(list.data.first)
+        let session = try XCTUnwrap(list.sessions.first)
         XCTAssertEqual(session.id, "api-94765bde00d93d7f")
         XCTAssertEqual(session.messageCount, 21)
         // Hermes leaves `title` null until its titler runs; the preview stands in.
         XCTAssertEqual(session.displayTitle, "Reconcile Lido SRv3 closure")
+    }
+
+    func testSessionListAcceptsBothEnvelopeKeys() throws {
+        // Hermes has shipped this list under both keys; decoding only one would
+        // empty the list on a gateway upgrade, which reads as "not available".
+        let legacy = try decode(
+            HermesSessionList.self, #"{"object": "list", "data": [{"id": "api-1"}]}"#
+        )
+        XCTAssertEqual(legacy.sessions.map(\.id), ["api-1"])
+
+        let current = try decode(
+            HermesSessionList.self, #"{"object": "list", "sessions": [{"id": "api-2"}]}"#
+        )
+        XCTAssertEqual(current.sessions.map(\.id), ["api-2"])
+
+        let empty = try decode(HermesSessionList.self, #"{"object": "list"}"#)
+        XCTAssertTrue(empty.sessions.isEmpty)
+    }
+
+    func testMessageListAcceptsBothEnvelopeKeys() throws {
+        let legacy = try decode(
+            HermesMessageList.self,
+            #"{"session_id": "api-1", "data": [{"role": "user", "content": "hi"}]}"#
+        )
+        XCTAssertEqual(legacy.messages.count, 1)
+        XCTAssertEqual(legacy.sessionId, "api-1")
+
+        let current = try decode(
+            HermesMessageList.self,
+            #"{"session_id": "api-1", "messages": [{"role": "user", "content": "hi"}]}"#
+        )
+        XCTAssertEqual(current.messages.count, 1)
     }
 
     func testDisplayTitleFallsBackToShortIdWhenBlank() throws {

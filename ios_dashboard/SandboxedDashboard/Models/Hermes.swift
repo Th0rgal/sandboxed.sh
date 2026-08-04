@@ -53,8 +53,30 @@ struct HermesSession: Codable, Identifiable, Hashable {
 }
 
 /// Envelope of `GET /api/assistant/hermes/api/sessions`.
+///
+/// Hermes has shipped this list under both `sessions` and `data` depending on
+/// the version; the web client accepts either, so decode both here too rather
+/// than let a gateway upgrade silently empty the session list (which reads as
+/// "Hermes not available" and hides the whole feature).
 struct HermesSessionList: Codable {
-    let data: [HermesSession]
+    let sessions: [HermesSession]
+
+    enum CodingKeys: String, CodingKey {
+        case sessions, data
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessions =
+            try container.decodeIfPresent([HermesSession].self, forKey: .sessions)
+            ?? container.decodeIfPresent([HermesSession].self, forKey: .data)
+            ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(sessions, forKey: .sessions)
+    }
 }
 
 /// Envelope of `POST /api/assistant/hermes/api/sessions`.
@@ -114,13 +136,31 @@ struct HermesToolCall: Codable {
 }
 
 /// Envelope of `GET /api/assistant/hermes/api/sessions/:id/messages`.
+///
+/// Same dual-key tolerance as `HermesSessionList` — a transcript that decodes
+/// to nothing would render as an empty conversation with no error.
 struct HermesMessageList: Codable {
     let sessionId: String?
-    let data: [HermesMessage]
+    let messages: [HermesMessage]
 
     enum CodingKeys: String, CodingKey {
-        case data
+        case messages, data
         case sessionId = "session_id"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decodeIfPresent(String.self, forKey: .sessionId)
+        messages =
+            try container.decodeIfPresent([HermesMessage].self, forKey: .messages)
+            ?? container.decodeIfPresent([HermesMessage].self, forKey: .data)
+            ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(sessionId, forKey: .sessionId)
+        try container.encode(messages, forKey: .messages)
     }
 }
 

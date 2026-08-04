@@ -124,6 +124,26 @@ struct MissionSwitcherSheet: View {
         recentMissions.filter { $0.originSessionId == sessionId }
     }
 
+    /// Missions already rendered under a visible Hermes session. They are
+    /// filtered out of Running / Just Completed / Recent so a session-spawned
+    /// mission appears once, under its session — mirroring the web switcher's
+    /// `addedIds` bookkeeping. Keyed on the *visible* sessions only: when a
+    /// search hides the session, its workers stay findable in the normal
+    /// sections.
+    private var nestedHermesWorkerIds: Set<String> {
+        guard !hermesSessions.isEmpty else { return [] }
+        let visibleSessionIds = Set(filteredHermesSessions.map(\.id))
+        guard !visibleSessionIds.isEmpty else { return [] }
+        return Set(
+            recentMissions.compactMap { mission in
+                guard let origin = mission.originSessionId,
+                    visibleSessionIds.contains(origin)
+                else { return nil }
+                return mission.id
+            }
+        )
+    }
+
     private func bossWorkerIds(from missions: [Mission]) -> [String: [String]] {
         var map: [String: [String]] = [:]
         for mission in missions {
@@ -340,7 +360,11 @@ struct MissionSwitcherSheet: View {
                 // Running missions — boss + nested workers, then standalone.
                 if !derivedOrderedRunning.isEmpty {
                     Section("Running") {
-                        ForEach(derivedOrderedRunning) { row in
+                        ForEach(
+                            derivedOrderedRunning.filter {
+                                !nestedHermesWorkerIds.contains($0.info.missionId)
+                            }
+                        ) { row in
                             let info = row.info
                             let mission = derivedMissionById[info.missionId]
                             MissionRow(
@@ -404,8 +428,18 @@ struct MissionSwitcherSheet: View {
                     }
                 }
 
-                missionSection("Just Completed", missions: derivedJustCompletedMissions)
-                missionSection("Recent", missions: derivedRecentMissionsForList)
+                missionSection(
+                    "Just Completed",
+                    missions: derivedJustCompletedMissions.filter {
+                        !nestedHermesWorkerIds.contains($0.id)
+                    }
+                )
+                missionSection(
+                    "Recent",
+                    missions: derivedRecentMissionsForList.filter {
+                        !nestedHermesWorkerIds.contains($0.id)
+                    }
+                )
 
                 if isBackendSearchLoading && !normalizedSearchQuery.isEmpty {
                     Section {

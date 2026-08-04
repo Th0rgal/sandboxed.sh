@@ -203,12 +203,16 @@ struct HermesConversationView: View {
 
     private var composer: some View {
         HStack(spacing: 8) {
-            TextField("Message Hermes…", text: $input, axis: .vertical)
-                .lineLimit(1...5)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Theme.card)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            TextField(
+                historyLoaded ? "Message Hermes…" : "Loading session…",
+                text: $input,
+                axis: .vertical
+            )
+            .lineLimit(1...5)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Theme.card)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             if isRunning {
                 Button(action: stop) {
@@ -231,8 +235,14 @@ struct HermesConversationView: View {
         .background(.ultraThinMaterial)
     }
 
+    /// Sending is held until the transcript has loaded: `loadHistory` replaces
+    /// the whole message list when it lands, so a send racing it would have its
+    /// optimistic bubble (and any stream events already folded in) wiped by the
+    /// older snapshot.
     private var canSend: Bool {
-        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isRunning
+        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isRunning
+            && historyLoaded
     }
 
     // MARK: - Loading
@@ -285,7 +295,7 @@ struct HermesConversationView: View {
 
     private func send() {
         let content = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !content.isEmpty, !isRunning else { return }
+        guard !content.isEmpty, !isRunning, historyLoaded else { return }
         input = ""
         errorText = nil
         HapticService.selectionChanged()

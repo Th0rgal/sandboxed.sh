@@ -682,7 +682,7 @@ final class APIService {
         let list: HermesSessionList = try await get(
             "\(Self.hermesProxy)/api/sessions?source=api_server&limit=\(limit)"
         )
-        return list.data
+        return list.sessions
     }
 
     func createHermesSession(title: String? = nil) async throws -> HermesSession {
@@ -698,7 +698,7 @@ final class APIService {
         let list: HermesMessageList = try await get(
             "\(Self.hermesProxy)/api/sessions/\(sessionId)/messages"
         )
-        return list.data
+        return list.messages
     }
 
     func deleteHermesSession(sessionId: String) async throws {
