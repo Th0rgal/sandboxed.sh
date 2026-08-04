@@ -12,24 +12,42 @@ from pathlib import Path
 from ruamel.yaml import YAML
 
 
+# Canonical assistant-mcp allowlist. Mirrors
+# src/hermes_tools.rs::HERMES_ASSISTANT_TOOL_ALLOWLIST — a Rust test pins the
+# two lists together, so update both in the same change.
 ASSISTANT_TOOLS = [
     "list_active_missions",
     "list_missions",
     "get_mission",
+    "get_mission_digest",
     "get_mission_events",
+    "get_chatgpt_ui_pool_status",
+    "list_mission_shared_files",
+    "download_shared_file",
     "start_mission",
     "send_message_to_mission",
+    "ask_mission",
     "cancel_mission",
-    "list_workspaces",
+    "acknowledge_mission",
     "get_compute_fleet",
+    "list_workspaces",
+    "get_workspace",
+    "create_workspace",
+    "update_workspace",
+    "delete_workspace",
+    "list_workspace_templates",
+    "get_workspace_template",
+    "save_workspace_template",
+    "delete_workspace_template",
+    "rebuild_workspace_from_template",
+    "workspace_bash",
+    "start_workspace_job",
+    "get_workspace_job",
+    "cancel_workspace_job",
     "get_mission_health",
     "get_mission_diagnostics",
     "update_mission_settings",
     "resume_mission",
-    "acknowledge_mission",
-    "start_workspace_job",
-    "get_workspace_job",
-    "cancel_workspace_job",
 ]
 
 

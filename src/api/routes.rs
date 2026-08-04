@@ -1489,10 +1489,28 @@ async fn list_remote_nodes(
             cached.as_ref(),
         ));
     }
+    // The Spark offload lane is separate from the remote-node fleet; expose
+    // it alongside so `get_compute_fleet` consumers (Hermes, controllers) see
+    // all capacity lanes, not just `nodes`.
+    let spark_configured = state.config.spark_arbiter_url.is_some()
+        && state.config.spark_arbiter_token.is_some()
+        && state.config.spark_ssh_target.is_some();
+    let spark_workspaces: Vec<String> = state
+        .workspaces
+        .list()
+        .await
+        .into_iter()
+        .filter(|w| w.spark_offload_enabled())
+        .map(|w| w.name)
+        .collect();
     Json(crate::remote_node::RemoteNodesResponse {
         enabled: settings.enabled,
         nodes,
         recent_jobs: state.fleet.recent_outcomes(10),
+        spark_offload: crate::remote_node::SparkOffloadStatus {
+            configured: spark_configured,
+            enabled_workspaces: spark_workspaces,
+        },
     })
 }
 

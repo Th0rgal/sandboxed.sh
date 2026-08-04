@@ -283,6 +283,19 @@ struct PlanTaskSpec {
     /// worktree spec is given.
     #[serde(default)]
     working_directory: Option<String>,
+    /// Objective, testable conditions that define success. Delivered to the
+    /// worker as the authoritative success condition; any approach satisfying
+    /// them is an acceptable delivery.
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
+    /// Command whose success verifies the task (run by the worker before
+    /// `DELIVERED:`).
+    #[serde(default)]
+    verification_command: Option<String>,
+    /// low | normal (default) | high. High-risk tasks are never retried
+    /// silently — a failed attempt settles for boss review instead.
+    #[serde(default)]
+    risk_class: Option<String>,
     /// Task keys (this board) that must settle successfully or be accepted first
     #[serde(default)]
     depends_on: Vec<String>,
@@ -605,7 +618,7 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "plan_tasks".to_string(),
-                description: "PREFERRED orchestration tool. Register tasks on this mission's task board. The server-side scheduler then owns everything mechanical: it spawns a worker mission for every dependency-satisfied task while capacity allows, retries failures once, and MESSAGES YOU A DIGEST as each task settles. You never create workers, wait, or poll. Each task needs: task_key (stable, unique), title, full prompt (scope, absolute paths, success condition, verification command — the done/BLOCKED turn contract is appended automatically), backend (codex/opencode/grok — never claudecode), and optionally model_override/model_effort, depends_on (keys of tasks that must settle successfully first), and worktree {path, branch, base} for an isolated checkout (created here, before registration). Re-calling with an existing key updates the task while it is still pending. After planning: END YOUR TURN — digests will wake you.".to_string(),
+                description: "PREFERRED orchestration tool. Register tasks on this mission's task board. The server-side scheduler then owns everything mechanical: it spawns a worker mission for every dependency-satisfied task while capacity allows, retries failures once, and MESSAGES YOU A DIGEST as each task settles. You never create workers, wait, or poll. Specify each task by its OUTCOME, not its procedure: acceptance_criteria + verification_command are the contract (the weakest testable conditions that define success — any approach satisfying them is an acceptable delivery); the prompt supplies scope, absolute paths, and context, and its suggested approach is advisory. Each task needs: task_key (stable, unique), title, prompt, backend (codex/opencode/grok — never claudecode), acceptance_criteria + verification_command (strongly recommended; tasks without either get a spec_warnings entry), and optionally risk_class (high = never retried silently), model_override/model_effort, depends_on (keys of tasks that must settle successfully first — unknown keys park the task and raise unresolvable_deps), and worktree {path, branch, base} for an isolated checkout (created here, before registration). Re-calling with an existing key updates the task while it is still pending. After planning: END YOUR TURN — digests will wake you.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["tasks"],
@@ -618,8 +631,11 @@ impl OrchestratorMcp {
                                 "properties": {
                                     "task_key": { "type": "string", "description": "Stable unique key on this board (e.g. 'p3-nonce')" },
                                     "title": { "type": "string" },
-                                    "prompt": { "type": "string", "description": "Full worker prompt: exact scope, absolute paths, success condition, verification command" },
+                                    "prompt": { "type": "string", "description": "Worker prompt: exact scope, absolute paths, context. Suggested approach is advisory — the acceptance criteria define success" },
                                     "backend": { "type": "string", "description": "codex | opencode | grok (never claudecode)" },
+                                    "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "description": "Objective, testable conditions that define success — the weakest set that still guarantees the outcome. Delivered to the worker as the authoritative contract" },
+                                    "verification_command": { "type": "string", "description": "Command whose success verifies the task; the worker must run it before DELIVERED" },
+                                    "risk_class": { "type": "string", "description": "low | normal (default) | high. high = a failed attempt is never retried silently; it settles for your review" },
                                     "model_override": { "type": "string", "description": "Exact account-supported model ID. For Codex Terra use gpt-5.6-terra with medium effort. Never invent variants such as gpt-5.5-sol." },
                                     "model_effort": { "type": "string", "description": "low | medium | high | xhigh | max (codex)" },
                                     "working_directory": { "type": "string", "description": "Worker cwd; superseded by worktree.path if a worktree is given" },
@@ -642,7 +658,7 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "board_status".to_string(),
-                description: "Current task board: every task with status (pending/running/settled/accepted/failed/cancelled), outcome, worker mission id, digest, plus utilization counters. Cheap snapshot — use instead of list_worker_missions/get_worker_status for board work.".to_string(),
+                description: "Current task board: every task with status (pending/running/settled/accepted/failed/cancelled), outcome, worker mission id, digest, plus utilization counters and unresolvable_deps (tasks parked forever on a depends_on key that doesn't exist — fix by re-registering via plan_tasks). Cheap snapshot — use instead of list_worker_missions/get_worker_status for board work.".to_string(),
                 input_schema: json!({ "type": "object", "properties": {} }),
             },
             ToolDefinition {
@@ -670,7 +686,7 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "reject_task".to_string(),
-                description: "Reject a settled (or failed) task with feedback. The worker mission is resumed with your feedback so it keeps its context; if the worker is gone the task is re-queued with the feedback appended to its prompt. You'll get a fresh digest when it settles again.".to_string(),
+                description: "Reject a settled (or failed) task with feedback. The worker mission is resumed with your feedback so it keeps its context; if the worker is gone the task is re-queued with the feedback appended to its prompt. Feedback should be the MINIMAL added constraint: a concrete counterexample or a new acceptance criterion that excludes the observed failure — not a prescription of how to redo the work. Judge results on whether they satisfy the acceptance criteria/verification, never on whether the worker followed the approach you imagined. You'll get a fresh digest when it settles again.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["feedback"],
@@ -1835,7 +1851,7 @@ impl OrchestratorMcp {
                 validate_working_directory_visible_to_worker(wd)?;
             }
 
-            registered.push(json!({
+            let mut registered_task = json!({
                 "task_key": spec.task_key,
                 "title": spec.title,
                 "prompt": spec.prompt,
@@ -1845,9 +1861,50 @@ impl OrchestratorMcp {
                 "working_directory": working_directory,
                 "repository": repository,
                 "branch": branch,
+                "acceptance_criteria": spec.acceptance_criteria,
+                "verification_command": spec.verification_command,
                 "depends_on": spec.depends_on,
-            }));
+            });
+            // `risk_class` is a non-optional String server-side (defaulted to
+            // "normal"); only send the key when the boss set one.
+            if let Some(risk) = spec
+                .risk_class
+                .as_deref()
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+            {
+                registered_task["risk_class"] = json!(risk);
+            }
+            registered.push(registered_task);
         }
+
+        // Spec-weakness lint (advisory, never blocking): a task with neither
+        // acceptance criteria nor a verification command has no objective
+        // success condition — the worker, the settle classifier, and the boss
+        // verdict all fall back to judging prompt prose, which over-anchors
+        // on the prompt's suggested approach instead of the outcome.
+        let spec_warnings: Vec<String> = registered
+            .iter()
+            .filter_map(|task| {
+                let key = task["task_key"].as_str().unwrap_or_default();
+                let no_criteria = task["acceptance_criteria"]
+                    .as_array()
+                    .map(|criteria| criteria.is_empty())
+                    .unwrap_or(true);
+                let no_verification = task["verification_command"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|command| !command.is_empty())
+                    .is_none();
+                (no_criteria && no_verification).then(|| {
+                    format!(
+                        "task `{key}`: no acceptance_criteria or verification_command — \
+                         declare the weakest testable success condition so any approach \
+                         that satisfies it counts as delivered"
+                    )
+                })
+            })
+            .collect();
 
         let response = self
             .api_post(
@@ -1865,6 +1922,9 @@ impl OrchestratorMcp {
             .map_err(|e| format!("Failed to parse board response: {}", e))?;
         if let Some(obj) = board.as_object_mut() {
             obj.insert("worktrees_created".to_string(), json!(worktrees_created));
+            if !spec_warnings.is_empty() {
+                obj.insert("spec_warnings".to_string(), json!(spec_warnings));
+            }
             obj.insert(
                 "hint".to_string(),
                 json!(
@@ -2094,6 +2154,15 @@ impl OrchestratorMcp {
                     ),
                     model_effort: Some("high".to_string()),
                     working_directory: Some(repo_dir.clone()),
+                    acceptance_criteria: vec![
+                        format!("a merge commit of `{source}` exists on `{target}`"),
+                        "no conflict markers remain in the tree".to_string(),
+                        "both branches' intent is preserved in the resolution".to_string(),
+                    ],
+                    verification_command: Some(format!(
+                        "git -C {repo_dir} merge-base --is-ancestor {source} {target}"
+                    )),
+                    risk_class: None,
                     depends_on: vec![],
                     worktree: None,
                 }],

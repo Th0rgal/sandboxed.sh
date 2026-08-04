@@ -41,6 +41,7 @@ pub mod backend_config;
 pub mod config;
 pub mod cost;
 pub mod github_connection;
+pub mod hermes_tools;
 pub mod library;
 pub mod mcp;
 pub mod node;

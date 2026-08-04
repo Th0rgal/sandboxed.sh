@@ -4063,9 +4063,30 @@ pub struct BoardUtilization {
 }
 
 #[derive(Debug, serde::Serialize)]
+pub struct UnresolvableDep {
+    pub task_key: String,
+    pub missing_dep: String,
+}
+
+#[derive(Debug, serde::Serialize)]
 pub struct BoardResponse {
     pub tasks: Vec<BoardTask>,
     pub utilization: BoardUtilization,
+    /// Pending tasks parked forever on a `depends_on` key that doesn't exist
+    /// on this board (typo'd or never-registered dependency). The scheduler
+    /// wakes the boss when this is non-empty; fix by re-registering the task
+    /// with corrected depends_on via plan_tasks.
+    pub unresolvable_deps: Vec<UnresolvableDep>,
+}
+
+fn board_unresolvable_deps(tasks: &[BoardTask]) -> Vec<UnresolvableDep> {
+    board::unresolvable_dependencies(tasks)
+        .into_iter()
+        .map(|(task_key, missing_dep)| UnresolvableDep {
+            task_key,
+            missing_dep,
+        })
+        .collect()
 }
 
 fn validate_and_normalize_board_tasks(
@@ -4115,6 +4136,19 @@ fn validate_and_normalize_board_tasks(
             .model_override
             .as_deref()
             .and_then(|model| normalize_model_override_for_backend(Some(&t.backend), model));
+        // `risk_class` now gates scheduler behavior (high = no silent retry),
+        // so an unrecognized value must fail loudly instead of silently acting
+        // like "normal".
+        t.risk_class = t.risk_class.trim().to_ascii_lowercase();
+        if !matches!(t.risk_class.as_str(), "low" | "normal" | "high") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "task `{}`: unknown risk_class `{}` (use low|normal|high)",
+                    t.task_key, t.risk_class
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -4148,6 +4182,7 @@ pub async fn get_mission_board(
     let max_parallel = crate::settings::max_parallel_missions_cached_or(control.max_parallel);
     Ok(Json(BoardResponse {
         utilization: board_utilization(&tasks, max_parallel),
+        unresolvable_deps: board_unresolvable_deps(&tasks),
         tasks,
     }))
 }
@@ -4189,6 +4224,7 @@ pub async fn upsert_mission_board_tasks(
     let max_parallel = crate::settings::max_parallel_missions_cached_or(control.max_parallel);
     Ok(Json(BoardResponse {
         utilization: board_utilization(&tasks, max_parallel),
+        unresolvable_deps: board_unresolvable_deps(&tasks),
         tasks,
     }))
 }
@@ -7617,6 +7653,10 @@ pub async fn create_mission(
     // when set. Unlike the old create-then-message pattern, this cannot be
     // dropped at capacity.
     if let Some(prompt) = nonblank(&req.prompt) {
+        // Canonicalise `/goal\n…` to the space form before storing: the
+        // deferred goal is later re-injected verbatim, and the backend goal
+        // drivers only recognise `/goal <objective>` with a space.
+        let prompt = canonical_goal_message(&prompt).unwrap_or(prompt);
         control
             .mission_store
             .set_deferred_goal(mission.id, Some(prompt.clone()))
@@ -13731,6 +13771,16 @@ fn parse_goal_objective(message: &str) -> Option<String> {
     }
     let objective = rest.trim();
     (!objective.is_empty()).then(|| objective.to_string())
+}
+
+/// Canonical `/goal <objective>` form for a goal message, or `None` when the
+/// message is not a goal command. The backend goal drivers (codex
+/// `parse_goal_prefix`, grok, opencode) only recognise the space-separated
+/// form, while `parse_goal_objective` accepts any whitespace after the
+/// command — normalising at the choke points keeps every downstream parser in
+/// agreement without teaching each one about `/goal\n`.
+fn canonical_goal_message(message: &str) -> Option<String> {
+    parse_goal_objective(message).map(|objective| format!("/goal {objective}"))
 }
 
 /// If the turn ended with `LlmError` or `AuthError` but the agent produced
@@ -20179,10 +20229,9 @@ async fn run_single_control_turn(
             };
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
-            let grok_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
-                user_message.clone()
-            } else {
-                convo.clone()
+            let grok_message_owned: String = match canonical_goal_message(&user_message) {
+                Some(goal) => goal,
+                None => convo.clone(),
             };
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
@@ -20219,10 +20268,9 @@ async fn run_single_control_turn(
             // reach the codex backend; the wrapped `convo` buries the prefix
             // and breaks `parse_goal_prefix`. Mirror the same routing the
             // mission_runner dispatch uses.
-            let codex_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
-                user_message.clone()
-            } else {
-                convo.clone()
+            let codex_message_owned: String = match canonical_goal_message(&user_message) {
+                Some(goal) => goal,
+                None => convo.clone(),
             };
             let codex_message: &str = codex_message_owned.as_str();
             // Shared rotation wrapper: identical account rotation + usage-cap
@@ -20353,13 +20401,14 @@ async fn run_single_control_turn(
             // mission that only has the Claude-Code UUID placeholder),
             // keep using `convo` so the model still gets a history-aware
             // prompt.
-            let is_goal_mode = user_message.trim_start().starts_with("/goal ");
-            let opencode_message_owned: String =
-                if is_goal_mode || (opencode_is_continuation && has_opencode_session) {
-                    user_message.clone()
-                } else {
-                    convo.clone()
-                };
+            let canonical_goal = canonical_goal_message(&user_message);
+            let opencode_message_owned: String = if let Some(goal) = canonical_goal {
+                goal
+            } else if opencode_is_continuation && has_opencode_session {
+                user_message.clone()
+            } else {
+                convo.clone()
+            };
             use crate::api::runners::HarnessRunner as _;
             Box::pin(crate::api::runners::OpenCodeRunner.run_turn(
                 crate::api::runners::TurnContext {
@@ -23260,6 +23309,22 @@ mod tests {
         assert!(parse_goal_objective("/goal   ").is_none());
         assert!(parse_goal_objective("/goals are nice").is_none());
         assert!(parse_goal_objective("plain message").is_none());
+    }
+
+    #[test]
+    fn canonical_goal_message_normalises_to_space_form() {
+        // Backend goal drivers only recognise "/goal <objective>"; every
+        // whitespace variant must canonicalise to that form.
+        assert_eq!(
+            canonical_goal_message("/goal ship it").as_deref(),
+            Some("/goal ship it")
+        );
+        assert_eq!(
+            canonical_goal_message("/goal\nMulti-line objective\nwith details").as_deref(),
+            Some("/goal Multi-line objective\nwith details")
+        );
+        assert!(canonical_goal_message("/goals are nice").is_none());
+        assert!(canonical_goal_message("plain message").is_none());
     }
 
     #[test]

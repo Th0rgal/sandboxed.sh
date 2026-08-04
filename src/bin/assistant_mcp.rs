@@ -2610,9 +2610,11 @@ fn compact_compute_fleet(fleet: &Value) -> Value {
             "ordinary_cpu_work": "prefer online non-GPU nodes with immediate capacity, then lowest normalized utilization",
             "gpu_work": "request the gpu label explicitly",
             "parallel_clean_builds": "use distinct missions and verify distinct node/job/head receipts",
+            "lean_builds": "workspaces listed under spark_offload.enabled_workspaces can also offload Lean builds to the DGX Spark lane (separate from these nodes)",
         },
         "nodes": compact_nodes,
         "recent_jobs": fleet.get("recent_jobs").cloned().unwrap_or_else(|| json!([])),
+        "spark_offload": fleet.get("spark_offload").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -3070,6 +3072,24 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The binary's tool table IS the curated Hermes surface; the generated
+    /// config allowlists are pinned to `HERMES_ASSISTANT_TOOL_ALLOWLIST`.
+    /// Adding/removing a tool here must go through the canonical list.
+    #[test]
+    fn tool_table_matches_canonical_allowlist() {
+        let names: Vec<String> = AssistantMcp::tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            sandboxed_sh::hermes_tools::HERMES_ASSISTANT_TOOL_ALLOWLIST,
+            "assistant-mcp tool table diverged from \
+             src/hermes_tools.rs::HERMES_ASSISTANT_TOOL_ALLOWLIST — update both together"
+        );
+    }
 
     const ENV_KEYS: &[&str] = &[
         "HERMES_SANDBOXED_API_URL",

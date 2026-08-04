@@ -146,12 +146,25 @@ fn retry_disposition(task: &BoardTask, preflight: &RetryPreflight) -> RetryDispo
     }
 }
 
+/// Guidance prepended to automatic-retry prompts. A failed attempt often
+/// means the prompt over-specified the approach, not just that the worker
+/// slipped: the retry is told explicitly that only the task's acceptance
+/// criteria / verification are binding, so it can pick a simpler approach
+/// instead of mechanically re-running the one that just failed.
+const RETRY_RELAXATION_GUIDANCE: &str = "[Retry guidance] The prior attempt failed. Do not \
+    mechanically repeat it. The task's success condition — its acceptance criteria and \
+    verification command (see the task-board contract below) — is the only hard requirement; \
+    any suggested approach in the prompt is advisory. Choose the simplest approach that \
+    satisfies the success condition and addresses the prior failure.";
+
 fn retry_prompt(task: &BoardTask, preflight: &RetryPreflight) -> String {
-    let (branch_state, pr_number) = match preflight {
+    let mut sections: Vec<String> = Vec::new();
+
+    let branch_guard = match preflight {
         RetryPreflight::Surviving {
             branch_state,
             pr_number,
-        } => (branch_state.as_str(), *pr_number),
+        } => Some((branch_state.as_str(), *pr_number)),
         // A spawn message can be dropped after the live preflight result was
         // computed. The zombie re-kick only has persisted task metadata, so
         // retain the same conservative branch guard for every declared retry
@@ -161,26 +174,46 @@ fn retry_prompt(task: &BoardTask, preflight: &RetryPreflight) -> String {
                 && task.prior_worker_mission_id.is_some()
                 && task.branch.is_some() =>
         {
-            ("declared retry branch; re-check before editing", None)
+            Some(("declared retry branch; re-check before editing", None))
         }
-        _ => return task.prompt.clone(),
+        _ => None,
     };
-    let pr = pr_number
-        .map(|number| format!("#{number}"))
-        .unwrap_or_else(|| "none".to_string());
-    format!(
-        "[Prior-attempt digest]\nPrior worker: {}\nPrior outcome: {}\nPrior result: {}\nBranch: {} ({branch_state})\nPR: {pr}\n\
-         Continue the prior attempt: checkout the existing branch, never recreate from master, never force-push.\n\n{}",
-        task.prior_worker_mission_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "unknown".into()),
-        task.prior_outcome
-            .map(|outcome| outcome.to_string())
-            .unwrap_or_else(|| "unknown".into()),
-        task.prior_result_digest.as_deref().unwrap_or("unavailable"),
-        task.branch.as_deref().unwrap_or("unknown"),
-        task.prompt,
-    )
+    if let Some((branch_state, pr_number)) = branch_guard {
+        let pr = pr_number
+            .map(|number| format!("#{number}"))
+            .unwrap_or_else(|| "none".to_string());
+        sections.push(format!(
+            "[Prior-attempt digest]\nPrior worker: {}\nPrior outcome: {}\nPrior result: {}\nBranch: {} ({branch_state})\nPR: {pr}\n\
+             Continue the prior attempt: checkout the existing branch, never recreate from master, never force-push.",
+            task.prior_worker_mission_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            task.prior_outcome
+                .map(|outcome| outcome.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            task.prior_result_digest.as_deref().unwrap_or("unavailable"),
+            task.branch.as_deref().unwrap_or("unknown"),
+        ));
+    } else if task.attempts > 1 {
+        // No branch to guard, but this is still an automatic retry: surface
+        // what the prior attempt produced so the retry reacts to the failure
+        // instead of rediscovering it.
+        if let Some(digest) = task.prior_result_digest.as_deref() {
+            sections.push(format!(
+                "[Prior-attempt digest]\nPrior outcome: {}\nPrior result: {digest}",
+                task.prior_outcome
+                    .map(|outcome| outcome.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+            ));
+        }
+    }
+
+    if task.attempts > 1 {
+        sections.push(RETRY_RELAXATION_GUIDANCE.to_string());
+    }
+
+    sections.push(task.prompt.clone());
+    sections.join("\n\n")
 }
 
 fn repository_identity(repository: &str) -> Option<String> {
@@ -656,9 +689,14 @@ pub fn digest_excerpt(output: &str) -> String {
     format!("{head}\n[… truncated …]\n{tail}")
 }
 
-/// The standing contract appended to every worker prompt.
+/// The standing contract appended to every worker prompt. When the task
+/// declares acceptance criteria / a verification command, they are delivered
+/// here as the authoritative success condition: acceptance is judged on
+/// whether the result satisfies them, not on whether the worker followed the
+/// prompt's suggested approach — so the weakest spec that passes verification
+/// is always an acceptable delivery.
 fn worker_contract(task: &BoardTask) -> String {
-    format!(
+    let mut contract = format!(
         "\n\n---\n[task-board contract] You are the worker for task `{key}` (\"{title}\") \
          of boss mission {boss}.\n\
          - Work autonomously until the success condition in the task is met and verified.\n\
@@ -672,16 +710,63 @@ fn worker_contract(task: &BoardTask) -> String {
         key = task.task_key,
         title = task.title,
         boss = task.boss_mission_id,
-    )
+    );
+    let verification = task
+        .verification_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    if !task.acceptance_criteria.is_empty() {
+        contract
+            .push_str("\n- Acceptance criteria (ALL must hold; this is the success condition):");
+        for criterion in &task.acceptance_criteria {
+            contract.push_str("\n  * ");
+            contract.push_str(criterion);
+        }
+    }
+    if let Some(command) = verification {
+        contract.push_str("\n- Verification command (must pass before DELIVERED): `");
+        contract.push_str(command);
+        contract.push('`');
+    }
+    if !task.acceptance_criteria.is_empty() || verification.is_some() {
+        contract.push_str(
+            "\n- The criteria/verification above define success. Any approach that satisfies \
+             them is acceptable — the prompt's suggested approach is advisory; prefer the \
+             simplest solution that passes.",
+        );
+    }
+    contract
+}
+
+/// Dependency keys referenced by pending tasks that do not exist on the
+/// board. `ready_tasks` blocks such tasks forever by design (a typo'd key
+/// must never silently pass), but that parking must be *visible*: these feed
+/// `board_needs_attention` so the boss is woken to fix its plan instead of
+/// the board sitting idle until someone notices in the UI.
+pub fn unresolvable_dependencies(tasks: &[BoardTask]) -> Vec<(String, String)> {
+    let known: HashSet<&str> = tasks.iter().map(|t| t.task_key.as_str()).collect();
+    tasks
+        .iter()
+        .filter(|t| t.status == BoardTaskStatus::Pending)
+        .flat_map(|t| {
+            t.depends_on
+                .iter()
+                .filter(|dep| !known.contains(dep.as_str()))
+                .map(|dep| (t.task_key.clone(), dep.clone()))
+        })
+        .collect()
 }
 
 /// True when a board has at least one task needing a boss decision — a
-/// settled task awaiting a verdict, or a task that exhausted its retries and
-/// failed. This is the wake trigger.
+/// settled task awaiting a verdict, a task that exhausted its retries and
+/// failed, or a pending task parked forever on a dependency key that doesn't
+/// exist on the board. This is the wake trigger.
 fn board_needs_attention(tasks: &[BoardTask]) -> bool {
     tasks
         .iter()
         .any(|t| matches!(t.status, BoardTaskStatus::Settled | BoardTaskStatus::Failed))
+        || !unresolvable_dependencies(tasks).is_empty()
 }
 
 /// Stable revision for a controller wake. Board state alone is insufficient:
@@ -718,11 +803,13 @@ fn board_wake_revision(tasks: &[BoardTask], history: &[MissionHistoryEntry]) -> 
 /// finds nothing to act on and simply ends its turn, so a misroute can't leak
 /// one board's work into another mission.
 const BOARD_WAKE_PROMPT: &str = "[task-board] Your task board changed — one or more tasks \
-    settled, failed, or need a decision. Call board_status now and act on YOUR board only: \
-    judge each settled task with accept_task / reject_task (review_task for detail), \
-    merge_branch finished worktree branches, and plan_tasks for newly-unblocked or follow-up \
-    work. Scheduling, retries, and worker dispatch are automatic — never wait or poll. If \
-    board_status shows nothing needing action, just end your turn.";
+    settled, failed, need a decision, or are parked on an unresolvable depends_on key. Call \
+    board_status now and act on YOUR board only: judge each settled task with accept_task / \
+    reject_task (review_task for detail), merge_branch finished worktree branches, fix any \
+    task listed under unresolvable_deps by re-registering it via plan_tasks with corrected \
+    depends_on, and plan_tasks for newly-unblocked or follow-up work. Scheduling, retries, \
+    and worker dispatch are automatic — never wait or poll. If board_status shows nothing \
+    needing action, just end your turn.";
 
 pub type BoardOutboxInflight = Arc<std::sync::Mutex<HashSet<Uuid>>>;
 
@@ -1583,6 +1670,20 @@ async fn spawn_task_worker(
     Ok(mission.id)
 }
 
+/// Whether a failed settle re-queues silently for its one automatic retry.
+/// High-risk tasks never retry silently: a failed high-risk attempt is a boss
+/// decision, not a scheduler decision — the board wake surfaces it instead.
+fn eligible_for_automatic_retry(
+    task: &BoardTask,
+    outcome: BoardTaskOutcome,
+    retry: AutomaticRetry,
+) -> bool {
+    outcome == BoardTaskOutcome::Failed
+        && task.attempts < MAX_ATTEMPTS
+        && retry != AutomaticRetry::Suppressed
+        && !task.risk_class.eq_ignore_ascii_case("high")
+}
+
 /// Settle a task: persist outcome + result digest, and retry failures once.
 /// Does NOT notify the boss — the scheduler pass wakes the boss from board
 /// state (pull model), so a settle never pushes per-task content into any
@@ -1623,10 +1724,8 @@ async fn settle_task(
     {
         tracing::warn!(task = %task.task_key, "board: failed to close task attempt: {error}");
     }
-    if outcome == BoardTaskOutcome::Failed
-        && task.attempts < MAX_ATTEMPTS
-        && retry != AutomaticRetry::Suppressed
-    {
+    let high_risk = task.risk_class.eq_ignore_ascii_case("high");
+    if eligible_for_automatic_retry(&task, outcome, retry) {
         // Silent automatic retry: back to pending, next pass respawns fresh.
         task.status = BoardTaskStatus::Pending;
         task.notes = append_note(
@@ -1660,6 +1759,11 @@ async fn settle_task(
             _ => "policy suppressed automatic retry",
         };
         task.notes = append_note(&task.notes, reason);
+    } else if outcome == BoardTaskOutcome::Failed && high_risk && task.attempts < MAX_ATTEMPTS {
+        task.notes = append_note(
+            &task.notes,
+            "risk_class=high: automatic retry suppressed; boss review required",
+        );
     }
     task.status = if outcome == BoardTaskOutcome::Failed {
         BoardTaskStatus::Failed
@@ -1765,6 +1869,70 @@ mod tests {
         .await
         .expect("outbox acknowledgement persisted");
         assert!(inflight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unresolvable_dependencies_are_visible_and_trigger_attention() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let boss = store
+            .create_mission_with_parent(
+                Some("boss"),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create boss");
+        store
+            .upsert_board_tasks(
+                boss.id,
+                vec![
+                    NewBoardTask {
+                        task_key: "a".into(),
+                        title: "a".into(),
+                        prompt: "p".into(),
+                        backend: "codex".into(),
+                        ..Default::default()
+                    },
+                    NewBoardTask {
+                        task_key: "b".into(),
+                        title: "b".into(),
+                        prompt: "p".into(),
+                        backend: "codex".into(),
+                        depends_on: vec!["a".into(), "typo-key".into()],
+                        ..Default::default()
+                    },
+                ],
+            )
+            .await
+            .expect("create tasks");
+        let tasks = store.list_board_tasks(boss.id).await.expect("list tasks");
+
+        // `b` is parked forever (ready_tasks never returns it) …
+        assert!(ready_tasks(&tasks).iter().all(|t| t.task_key != "b"));
+        // … so the parking must be visible and wake the boss.
+        assert_eq!(
+            unresolvable_dependencies(&tasks),
+            vec![("b".to_string(), "typo-key".to_string())]
+        );
+        assert!(board_needs_attention(&tasks));
+
+        // A board whose deps all resolve raises no attention.
+        let resolved: Vec<BoardTask> = tasks
+            .into_iter()
+            .map(|mut t| {
+                t.depends_on.retain(|d| d != "typo-key");
+                t
+            })
+            .collect();
+        assert!(unresolvable_dependencies(&resolved).is_empty());
+        assert!(!board_needs_attention(&resolved));
     }
 
     #[tokio::test]
@@ -2161,6 +2329,83 @@ mod tests {
             retry_prompt(&task, &RetryPreflight::NothingFound),
             task.prompt
         );
+    }
+
+    #[test]
+    fn automatic_retry_relaxes_the_spec_instead_of_repeating_it() {
+        let mut task = mk("relaxed-retry", &[], BoardTaskStatus::Pending, None);
+        task.attempts = 2; // spawn_task_worker increments before building the prompt
+        task.prior_outcome = Some(BoardTaskOutcome::Failed);
+        task.prior_result_digest = Some("build failed: missing import".into());
+
+        let prompt = retry_prompt(&task, &RetryPreflight::NothingFound);
+
+        assert!(prompt.contains("[Retry guidance]"));
+        assert!(prompt.contains("build failed: missing import"));
+        assert!(prompt.ends_with(&task.prompt));
+    }
+
+    #[test]
+    fn first_spawn_prompt_carries_no_retry_guidance() {
+        let mut task = mk("first", &[], BoardTaskStatus::Pending, None);
+        task.attempts = 1;
+        assert_eq!(
+            retry_prompt(&task, &RetryPreflight::NothingFound),
+            task.prompt
+        );
+    }
+
+    #[test]
+    fn worker_contract_delivers_acceptance_criteria_as_the_success_condition() {
+        let mut task = mk("criteria", &[], BoardTaskStatus::Pending, None);
+        task.acceptance_criteria = vec![
+            "cargo test passes".to_string(),
+            "no new clippy warnings".to_string(),
+        ];
+        task.verification_command = Some("cargo test -p sandboxed_sh".to_string());
+
+        let contract = worker_contract(&task);
+        assert!(contract.contains("Acceptance criteria"));
+        assert!(contract.contains("* cargo test passes"));
+        assert!(contract.contains("* no new clippy warnings"));
+        assert!(contract.contains("`cargo test -p sandboxed_sh`"));
+        assert!(contract.contains("suggested approach is advisory"));
+
+        // A task without declared criteria makes no claim that the prompt is
+        // advisory — the prompt is then the only spec.
+        let bare = worker_contract(&mk("bare", &[], BoardTaskStatus::Pending, None));
+        assert!(!bare.contains("Acceptance criteria"));
+        assert!(!bare.contains("advisory"));
+    }
+
+    #[test]
+    fn high_risk_tasks_never_retry_silently() {
+        let mut task = mk("risky", &[], BoardTaskStatus::Running, None);
+        task.attempts = 1;
+        task.risk_class = "high".into();
+        assert!(!eligible_for_automatic_retry(
+            &task,
+            BoardTaskOutcome::Failed,
+            AutomaticRetry::Allowed
+        ));
+
+        task.risk_class = "normal".into();
+        assert!(eligible_for_automatic_retry(
+            &task,
+            BoardTaskOutcome::Failed,
+            AutomaticRetry::Allowed
+        ));
+        assert!(!eligible_for_automatic_retry(
+            &task,
+            BoardTaskOutcome::Failed,
+            AutomaticRetry::Suppressed
+        ));
+        task.attempts = MAX_ATTEMPTS;
+        assert!(!eligible_for_automatic_retry(
+            &task,
+            BoardTaskOutcome::Failed,
+            AutomaticRetry::Allowed
+        ));
     }
 
     #[test]
