@@ -5461,6 +5461,80 @@ async fn mission_search_recency_fingerprint(
 }
 
 /// Search missions with semantic-aware ranking.
+#[derive(Debug, serde::Deserialize)]
+pub struct ResolveMissionQuery {
+    /// A full mission UUID or an unambiguous leading fragment of one.
+    pub id: String,
+}
+
+/// Resolve the id humans actually have — the 8-character prefix dashboards,
+/// logs and transcripts display — into a full mission UUID.
+///
+/// Ambiguity is reported as a conflict listing the candidates rather than
+/// silently picking the newest: a controller acting on the wrong mission is
+/// far worse than one that has to ask again with more characters.
+pub async fn resolve_mission_id(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<ResolveMissionQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let raw = query.id.trim().to_ascii_lowercase();
+    if let Ok(id) = Uuid::parse_str(&raw) {
+        return Ok(Json(serde_json::json!({
+            "mission_id": id.to_string(),
+            "match": "exact",
+        })));
+    }
+    // Anything shorter is not worth resolving: at 4 hex characters a
+    // collision is already likely enough to be a nuisance, and a 1-character
+    // "prefix" would scan half the fleet.
+    if raw.len() < 4 || !raw.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "id must be a mission UUID or at least 4 hex characters of one".to_string(),
+        ));
+    }
+
+    let control = control_for_user(&state, &user).await;
+    // One more than we report, so "exactly one" is provably unambiguous.
+    let candidates = control
+        .mission_store
+        .find_missions_by_id_prefix(&raw, 11)
+        .await
+        .map_err(internal_error)?;
+
+    match candidates.len() {
+        0 => Err((StatusCode::NOT_FOUND, format!("no mission matches '{raw}'"))),
+        1 => Ok(Json(serde_json::json!({
+            "mission_id": candidates[0].id.to_string(),
+            "match": "prefix",
+        }))),
+        _ => {
+            let listed: Vec<serde_json::Value> = candidates
+                .iter()
+                .take(10)
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id.to_string(),
+                        "title": m.title,
+                        "status": m.status.to_string(),
+                        "updated_at": m.updated_at,
+                    })
+                })
+                .collect();
+            Err((
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "ambiguous",
+                    "prefix": raw,
+                    "candidates": listed,
+                })
+                .to_string(),
+            ))
+        }
+    }
+}
+
 pub async fn search_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -9304,6 +9378,67 @@ pub struct UpdateMissionProjectRequest {
 }
 
 /// Set or update project tagging metadata for a mission.
+#[derive(Debug, Deserialize)]
+pub struct UpdateMissionOriginRequest {
+    /// Creating system, e.g. "hermes".
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Conversation the mission belongs to.
+    #[serde(default)]
+    pub origin_session_id: Option<String>,
+}
+
+/// Attach an existing mission to a conversation.
+///
+/// Origin was write-once at creation, so every mission created before the
+/// column existed — or by a caller that did not declare one — was
+/// permanently unattributable. This is what makes that history recoverable.
+pub async fn update_mission_origin(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateMissionOriginRequest>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let origin = req
+        .origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("hermes");
+    let session = req
+        .origin_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(session) = session {
+        // Same shape the assistant MCP validates, so a value that would be
+        // rejected at creation cannot be smuggled in through the patch.
+        if session.len() > 128
+            || !session
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "origin_session_id must be 1-128 chars of [A-Za-z0-9._:-]".to_string(),
+            ));
+        }
+    }
+    control
+        .mission_store
+        .set_mission_origin(id, origin, session)
+        .await
+        .map_err(internal_error)?;
+    let mission = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, format!("mission {id} not found")))?;
+    Ok(Json(mission))
+}
+
 pub async fn update_mission_project(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -10995,8 +11130,11 @@ pub async fn clone_mission(
         remote_command: None,
         remote_async: None,
         estimated_disk_gib: None,
-        origin: None,
-        origin_session_id: None,
+        // A clone is the same work retried, so it belongs to the same
+        // conversation. Dropping the origin here orphaned the retry: it
+        // vanished from the worker strip of the session that asked for it.
+        origin: source.origin.clone(),
+        origin_session_id: source.origin_session_id.clone(),
         extra: Default::default(),
     };
 

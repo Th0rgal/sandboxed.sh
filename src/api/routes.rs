@@ -793,6 +793,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/current",
             get(control::get_current_mission),
         )
+        // Declared BEFORE `/:id` so the literal segment is not captured as a
+        // mission id.
+        .route(
+            "/api/control/missions/resolve",
+            get(control::resolve_mission_id),
+        )
         .route("/api/control/missions/:id", get(control::get_mission))
         .route(
             "/api/control/missions/:id/board",
@@ -854,6 +860,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/:id/project",
             post(control::update_mission_project),
+        )
+        .route(
+            "/api/control/missions/:id/origin",
+            post(control::update_mission_origin),
         )
         .route(
             "/api/control/missions/:id/mode",

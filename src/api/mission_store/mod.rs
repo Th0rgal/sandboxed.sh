@@ -1888,6 +1888,44 @@ pub trait MissionStore: Send + Sync {
     /// Get a single mission by ID.
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String>;
 
+    /// Missions whose canonical id starts with `prefix`, newest first.
+    ///
+    /// Dashboards, logs and humans all refer to a mission by its first 8
+    /// characters, so tooling has to accept that form. Resolution is
+    /// deliberately a lookup rather than a parse: only the store knows whether
+    /// a prefix is unambiguous. The default implementation pages
+    /// `list_missions`; sqlite overrides it with an indexed prefix scan.
+    async fn find_missions_by_id_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Mission>, String> {
+        const PAGE: usize = 200;
+        const MAX_SCAN: usize = 5_000;
+        let prefix = prefix.to_ascii_lowercase();
+        let mut found = Vec::new();
+        let mut offset = 0usize;
+        let mut scanned = 0usize;
+        loop {
+            let page = self.list_missions(PAGE, offset).await?;
+            let page_len = page.len();
+            for mission in page {
+                if mission.id.to_string().starts_with(&prefix) {
+                    found.push(mission);
+                    if found.len() >= limit {
+                        return Ok(found);
+                    }
+                }
+            }
+            scanned += page_len;
+            if page_len < PAGE || scanned >= MAX_SCAN {
+                break;
+            }
+            offset += PAGE;
+        }
+        Ok(found)
+    }
+
     /// Acquire the sole non-terminal execution lease for a mission. Every
     /// successful acquisition increments the mission generation.
     async fn begin_mission_run(
