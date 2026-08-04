@@ -41,6 +41,9 @@ struct MissionSwitcherSheet: View {
     /// Hermes conversations. Empty when Hermes isn't adopted on this backend,
     /// which simply hides the section.
     var hermesSessions: [HermesSession] = []
+    /// Projects board rows. Empty when the backend has no projects surface,
+    /// which simply hides the section.
+    var projects: [ProjectSummary] = []
     let currentMissionId: String?
     let viewingMissionId: String?
     var viewingHermesSessionId: String? = nil
@@ -116,6 +119,22 @@ struct MissionSwitcherSheet: View {
         guard !normalizedSearchQuery.isEmpty else { return hermesSessions }
         return hermesSessions.filter {
             normalizeMetadataText($0.displayTitle).contains(normalizedSearchQuery)
+        }
+    }
+
+    /// Projects worth listing: only those with a declared conversation, since
+    /// the row's whole purpose is to open one. A project whose conversation is
+    /// merely inferred would hand the user a dead cron session.
+    private var filteredProjects: [ProjectSummary] {
+        let bound = projects.filter { $0.boundSessionId != nil }
+        let matching = normalizedSearchQuery.isEmpty
+            ? bound
+            : bound.filter { normalizeMetadataText($0.slug).contains(normalizedSearchQuery) }
+        // Projects needing attention first; the rest alphabetical so the order
+        // does not shuffle between refreshes.
+        return matching.sorted {
+            if $0.needsAttention != $1.needsAttention { return $0.needsAttention }
+            return $0.slug < $1.slug
         }
     }
 
@@ -388,6 +407,25 @@ struct MissionSwitcherSheet: View {
                                     )
                                 },
                                 onCancel: { onCancelMission(info.missionId) }
+                            )
+                        }
+                    }
+                }
+
+                // Projects that have a declared control conversation. Tapping
+                // one opens that conversation — the same path as picking the
+                // session directly, so there is no second way to be viewing a
+                // conversation.
+                if !filteredProjects.isEmpty {
+                    Section("Projects") {
+                        ForEach(filteredProjects) { project in
+                            ProjectRow(
+                                project: project,
+                                isViewing: viewingHermesSessionId == project.boundSessionId,
+                                onSelect: {
+                                    guard let sessionId = project.boundSessionId else { return }
+                                    onSelectHermesSession?(sessionId)
+                                }
                             )
                         }
                     }
@@ -1157,6 +1195,69 @@ private struct HermesSessionRow: View {
         if workerCount > 0 {
             parts.append("\(workerCount) worker\(workerCount == 1 ? "" : "s")")
         }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// A project, opening its declared control conversation.
+private struct ProjectRow: View {
+    let project: ProjectSummary
+    let isViewing: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: 10) {
+                Image(systemName: "square.stack.3d.up")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(project.needsAttention ? Theme.warning : Theme.accent)
+                    .frame(width: 16)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(project.slug)
+                        .font(.system(size: 14))
+                        .foregroundStyle(Theme.textPrimary)
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.system(size: 11))
+                        .foregroundStyle(
+                            project.needsAttention ? Theme.warning : Theme.textTertiary
+                        )
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+
+                if isViewing {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.accent)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Leads with what is wrong, because that is the reason to tap.
+    private var subtitle: String {
+        var parts: [String] = []
+        if let health = project.health {
+            if health.tracksNeedingAttention > 0 {
+                let n = health.tracksNeedingAttention
+                parts.append("\(n) track\(n == 1 ? "" : "s") need attention")
+            }
+            if let worst = health.tracks.first, worst.verdict.needsAttention {
+                parts.append("\(worst.displayTrack) \(worst.verdict.rawValue)")
+            }
+            if parts.isEmpty, health.active > 0 {
+                parts.append("\(health.active) running")
+            }
+            if parts.isEmpty, health.missions > 0 {
+                parts.append("\(health.missions) mission\(health.missions == 1 ? "" : "s")")
+            }
+        }
+        if parts.isEmpty { parts.append("Project") }
         return parts.joined(separator: " · ")
     }
 }

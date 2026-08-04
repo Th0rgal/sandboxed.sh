@@ -35,9 +35,11 @@
 		58D2BEEDF2B4B34B3B98487C /* ToolUIOptionListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCD083A671640B2F286D7C06 /* ToolUIOptionListView.swift */; };
 		5D1FB1BE4D58CC95A500B684 /* ControlView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2E4AC8C92D9F496B8152B8F /* ControlView.swift */; };
 		66E208F9D4759B79ED653374 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B74AB5DF6829813AE79229D /* ContentView.swift */; };
+		66F676EDC1A217D788AF9656 /* ProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16444DBBDC6D78A5324C783D /* ProjectTests.swift */; };
 		6846AB79778CDF4CC216B7D1 /* SandboxedDashboardApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8080D5ADF84794AFE484FE17 /* SandboxedDashboardApp.swift */; };
 		692C694570F45D74CCBAC75B /* TerminalState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6922E2F0E17EDB3A8400D473 /* TerminalState.swift */; };
 		6A15DF1CBD6B0A3716B9FE94 /* WorkerSheetView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 081ACA60E04DBCB6E7313072 /* WorkerSheetView.swift */; };
+		6EC32F7CE8BFDB84428DFF4A /* Project.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08C648C1D5FC7491563EE824 /* Project.swift */; };
 		708B491B7A83A6648C03CA8A /* WorkerPeekView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FF9A2A12846A5FFB3FC7497 /* WorkerPeekView.swift */; };
 		71559C7052796FED7EBACF3F /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 018CEF52A93FCF430A128017 /* Theme.swift */; };
 		7E46D4311CFAF1F7A90E9AAD /* APIService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 55F4658A2D65748FC7AC5DE3 /* APIService.swift */; };
@@ -95,9 +97,11 @@
 /* Begin PBXFileReference section */
 		018CEF52A93FCF430A128017 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
 		081ACA60E04DBCB6E7313072 /* WorkerSheetView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerSheetView.swift; sourceTree = "<group>"; };
+		08C648C1D5FC7491563EE824 /* Project.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Project.swift; sourceTree = "<group>"; };
 		0C2AB7D53F29AB97345FA4DA /* ThemeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeTests.swift; sourceTree = "<group>"; };
 		0C6DBBABC4AE0FD4368A185C /* Mission.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Mission.swift; sourceTree = "<group>"; };
 		13A79A00CA8E2F1246E970A8 /* HermesConversationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesConversationTests.swift; sourceTree = "<group>"; };
+		16444DBBDC6D78A5324C783D /* ProjectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectTests.swift; sourceTree = "<group>"; };
 		1828D2FC9160FC8677E10502 /* NetworkResilienceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkResilienceTests.swift; sourceTree = "<group>"; };
 		1834CB7B575220FDE7679F7B /* NewMissionSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewMissionSheet.swift; sourceTree = "<group>"; };
 		1C19E1741AE5E4A19BDAAB98 /* SandboxedDashboard.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = SandboxedDashboard.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -328,6 +332,7 @@
 				13A79A00CA8E2F1246E970A8 /* HermesConversationTests.swift */,
 				7559F3F4553AD74130B1BC34 /* ModelTests.swift */,
 				1828D2FC9160FC8677E10502 /* NetworkResilienceTests.swift */,
+				16444DBBDC6D78A5324C783D /* ProjectTests.swift */,
 				0C2AB7D53F29AB97345FA4DA /* ThemeTests.swift */,
 			);
 			path = SandboxedDashboardTests;
@@ -355,6 +360,7 @@
 				492E8CF2E0A3AEF64A472C85 /* FileEntry.swift */,
 				7868B572B7E5DBED9E52D160 /* Hermes.swift */,
 				0C6DBBABC4AE0FD4368A185C /* Mission.swift */,
+				08C648C1D5FC7491563EE824 /* Project.swift */,
 				E387E6A01D00EAD668074CCC /* WorkerBuckets.swift */,
 				97D6534BE4C1B5E0BEA90A5A /* Workspace.swift */,
 			);
@@ -542,6 +548,7 @@
 				110C67FF7A62B86FB7AD4CD0 /* NetworkMonitor.swift in Sources */,
 				D0646F9EE2D2E984F0446C57 /* NewMissionSheet.swift in Sources */,
 				B2C28CDD378203A229D62B9B /* PhosphorIcon.swift in Sources */,
+				6EC32F7CE8BFDB84428DFF4A /* Project.swift in Sources */,
 				51E9D9F51934DFC8EAD58CDC /* QueueSheet.swift in Sources */,
 				95B7AB5DBEB42E107EBE06FB /* RunningMissionsBar.swift in Sources */,
 				6846AB79778CDF4CC216B7D1 /* SandboxedDashboardApp.swift in Sources */,
@@ -573,6 +580,7 @@
 				078E5F28B7022DCD1BC721FD /* HermesConversationTests.swift in Sources */,
 				46420BF679A3BD9FD381FB0A /* ModelTests.swift in Sources */,
 				2BBA61051DFCB7A780604B87 /* NetworkResilienceTests.swift in Sources */,
+				66F676EDC1A217D788AF9656 /* ProjectTests.swift in Sources */,
 				7EF75A17733EE6E54126C7A7 /* ThemeTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

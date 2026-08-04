@@ -256,6 +256,9 @@ struct ControlView: View {
     // conversation. Selecting a mission anywhere clears it.
     @State private var hermesSessions: [HermesSession] = []
     @State private var viewingHermesSessionId: String?
+    /// Projects board rows, loaded alongside the Hermes sessions. Empty when
+    /// the backend has no projects surface.
+    @State private var projects: [ProjectSummary] = []
 
     // Desktop stream state
     @State private var showDesktopStream = false
@@ -519,6 +522,7 @@ struct ControlView: View {
             runningMissions: runningMissions,
             recentMissions: recentMissions,
             hermesSessions: hermesSessions,
+            projects: projects,
             currentMissionId: currentMission?.id,
             viewingMissionId: viewingMissionId,
             viewingHermesSessionId: viewingHermesSessionId,
@@ -950,6 +954,9 @@ struct ControlView: View {
     /// section simply stays empty.
     private func loadHermesSessions() async {
         hermesSessions = (try? await api.listHermesSessions(limit: 30)) ?? []
+        // Same shape as above: the request doubles as the availability probe,
+        // so an older backend just leaves the section empty.
+        projects = (try? await api.listProjects()) ?? []
     }
 
     /// Start a fresh Hermes conversation and show it.
