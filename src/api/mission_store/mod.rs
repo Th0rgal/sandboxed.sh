@@ -1895,17 +1895,24 @@ pub trait MissionStore: Send + Sync {
     /// deliberately a lookup rather than a parse: only the store knows whether
     /// a prefix is unambiguous. The default implementation pages
     /// `list_missions`; sqlite overrides it with an indexed prefix scan.
+    ///
+    /// This deliberately has NO scan ceiling, unlike the filtered listing.
+    /// "Unique" is a claim about the whole store: stopping early could report
+    /// a single visible candidate as unambiguous while a second match sits
+    /// just beyond the horizon, and the caller would then cancel or message
+    /// the wrong mission. An incomplete list is a nuisance; an incomplete
+    /// uniqueness proof is a correctness bug. Callers pass a small `limit`
+    /// (enough to prove ambiguity), so the loop still exits early in the
+    /// ambiguous case.
     async fn find_missions_by_id_prefix(
         &self,
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<Mission>, String> {
         const PAGE: usize = 200;
-        const MAX_SCAN: usize = 5_000;
         let prefix = prefix.to_ascii_lowercase();
         let mut found = Vec::new();
         let mut offset = 0usize;
-        let mut scanned = 0usize;
         loop {
             let page = self.list_missions(PAGE, offset).await?;
             let page_len = page.len();
@@ -1917,8 +1924,7 @@ pub trait MissionStore: Send + Sync {
                     }
                 }
             }
-            scanned += page_len;
-            if page_len < PAGE || scanned >= MAX_SCAN {
+            if page_len < PAGE {
                 break;
             }
             offset += PAGE;
@@ -3709,6 +3715,63 @@ pub async fn create_mission_store(
             let store = SqliteMissionStore::new(base_dir, user_id).await?;
             Ok(Box::new(store))
         }
+    }
+}
+
+#[cfg(test)]
+mod id_prefix_default_impl_tests {
+    use super::{InMemoryMissionStore, MissionStore};
+
+    /// The default (non-sqlite) implementation must have no scan ceiling.
+    /// A cap could report a single visible candidate as unambiguous while a
+    /// second match sat beyond the horizon — and the caller would then cancel
+    /// or message the wrong mission. An incomplete list is a nuisance; an
+    /// incomplete uniqueness proof is a correctness bug.
+    #[tokio::test]
+    async fn ambiguity_is_detected_past_any_paging_horizon() {
+        let store = InMemoryMissionStore::new();
+        let mut shared_prefix: Option<String> = None;
+        let mut expected = 0usize;
+
+        // Create enough missions that a naive cap would truncate, and seed two
+        // that genuinely share a prefix at opposite ends of the ordering.
+        for i in 0..40 {
+            let mission = store
+                .create_mission_with_parent(
+                    Some(&format!("m{i}")),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("create mission");
+            let id = mission.id.to_string();
+            match shared_prefix.as_deref() {
+                None => {
+                    shared_prefix = Some(id[..1].to_string());
+                    expected = 1;
+                }
+                Some(prefix) if id.starts_with(prefix) => expected += 1,
+                _ => {}
+            }
+        }
+
+        let prefix = shared_prefix.expect("at least one mission");
+        let found = store
+            .find_missions_by_id_prefix(&prefix, 50)
+            .await
+            .expect("prefix lookup");
+        assert_eq!(
+            found.len(),
+            expected,
+            "every match must be seen, whatever its position"
+        );
     }
 }
 

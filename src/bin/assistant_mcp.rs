@@ -1087,8 +1087,11 @@ impl AssistantMcp {
                     "type": "object",
                     "properties": {
                         "limit": {"type": "integer", "description": "Maximum missions to return, default 50."},
-                        "project": {"type": "string", "description": "Optional filter: only missions with this project."},
-                        "tag": {"type": "string", "description": "Optional filter: only missions carrying this tag."}
+                        "project": {"type": "string", "description": "Optional filter: exact project id."},
+                        "project_prefix": {"type": "string", "description": "Optional filter: project FAMILY — matches the id and its `-` suffixed variants (e.g. verity covers verity-core, verity-phase1d). Use this when a project's work is still split across per-phase ids."},
+                        "track": {"type": "string", "description": "Optional filter: exact track within a project."},
+                        "tag": {"type": "string", "description": "Optional filter: only missions carrying this tag."},
+                        "origin_session_id": {"type": "string", "description": "Optional filter: only missions launched from this Hermes conversation."}
                     }
                 }),
             },
