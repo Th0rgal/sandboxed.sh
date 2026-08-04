@@ -3009,6 +3009,45 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    /// Indexed prefix seek on the primary key: `id` is TEXT PRIMARY KEY, so
+    /// the range bounds below use its implicit index instead of scanning.
+    async fn find_missions_by_id_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Mission>, String> {
+        let prefix = prefix.to_ascii_lowercase();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            // Half-open range over the PK. Incrementing the last byte gives the
+            // exclusive upper bound for "everything starting with prefix";
+            // mission ids are lowercase hex + hyphens, so the successor is
+            // always representable.
+            let mut upper = prefix.clone().into_bytes();
+            match upper.last_mut() {
+                Some(byte) if *byte < 0xFF => *byte += 1,
+                _ => upper.push(0),
+            }
+            let upper = String::from_utf8_lossy(&upper).to_string();
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {MISSION_LIST_COLUMNS} FROM missions \
+                     WHERE id >= ?1 AND id < ?2 \
+                     ORDER BY updated_at DESC LIMIT ?3"
+                ))
+                .map_err(|e| e.to_string())?;
+            let missions = stmt
+                .query_map(params![prefix, upper, limit as i64], row_to_mission)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(missions)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn count_missions_by_status(&self) -> Result<MissionStatusCounts, String> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -16705,5 +16744,89 @@ mod filter_tests {
             .expect("filtered list");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, tagged);
+    }
+}
+
+#[cfg(test)]
+mod id_prefix_tests {
+    use super::SqliteMissionStore;
+    use crate::api::mission_store::MissionStore;
+
+    async fn store(dir: &tempfile::TempDir) -> SqliteMissionStore {
+        SqliteMissionStore::new(dir.path().to_path_buf(), "prefix-user")
+            .await
+            .expect("sqlite store")
+    }
+
+    async fn make(store: &SqliteMissionStore, title: &str) -> uuid::Uuid {
+        store
+            .create_mission_with_parent(
+                Some(title),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create mission")
+            .id
+    }
+
+    #[tokio::test]
+    async fn resolves_the_prefix_dashboards_display() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+        let id = make(&store, "target").await;
+        for i in 0..5 {
+            make(&store, &format!("noise {i}")).await;
+        }
+
+        let short = &id.to_string()[..8];
+        let found = store
+            .find_missions_by_id_prefix(short, 10)
+            .await
+            .expect("prefix lookup");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn reports_every_candidate_so_the_caller_can_disambiguate() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+        let a = make(&store, "a").await;
+        let b = make(&store, "b").await;
+        // Their common prefix is at minimum the empty string; use the first
+        // character both share to force a multi-match without depending on
+        // generated values.
+        let shared = &a.to_string()[..1];
+        if b.to_string().starts_with(shared) {
+            let found = store
+                .find_missions_by_id_prefix(shared, 10)
+                .await
+                .expect("prefix lookup");
+            assert!(
+                found.len() >= 2,
+                "an ambiguous prefix must surface every candidate, got {}",
+                found.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_prefix_finds_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+        make(&store, "only").await;
+        let found = store
+            .find_missions_by_id_prefix("ffffffff", 10)
+            .await
+            .expect("prefix lookup");
+        assert!(found.is_empty());
     }
 }
