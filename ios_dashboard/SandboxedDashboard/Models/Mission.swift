@@ -118,6 +118,10 @@ struct Mission: Codable, Identifiable, Hashable {
     /// Hermes session that spawned this mission, when `origin == "hermes"`.
     /// Lets clients group the mission as a worker of that conversation.
     let originSessionId: String?
+    /// Project this mission belongs to, e.g. "verity".
+    let project: String?
+    /// Workstream within the project, e.g. "phase1d/core-c3".
+    let track: String?
 
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
@@ -146,6 +150,7 @@ struct Mission: Codable, Identifiable, Hashable {
         case parentMissionId = "parent_mission_id"
         case origin
         case originSessionId = "origin_session_id"
+        case project, track
     }
 
     init(from decoder: Decoder) throws {
@@ -174,6 +179,17 @@ struct Mission: Codable, Identifiable, Hashable {
         parentMissionId = try container.decodeIfPresent(String.self, forKey: .parentMissionId)
         origin = try container.decodeIfPresent(String.self, forKey: .origin)
         originSessionId = try container.decodeIfPresent(String.self, forKey: .originSessionId)
+        project = try container.decodeIfPresent(String.self, forKey: .project)
+        track = try container.decodeIfPresent(String.self, forKey: .track)
+    }
+
+    /// "verity · phase1d/core-c3", or just the project, or nothing.
+    var projectLabel: String? {
+        switch (project?.isEmpty == false ? project : nil, track?.isEmpty == false ? track : nil) {
+        case let (.some(project), .some(track)): return "\(project) · \(track)"
+        case let (.some(project), .none): return project
+        default: return nil
+        }
     }
 
     var displayTitle: String {

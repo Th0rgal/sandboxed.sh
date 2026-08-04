@@ -252,6 +252,34 @@ final class APIService {
         try await get("/api/control/missions/\(id)")
     }
 
+    // MARK: - Projects
+
+    private struct ProjectsOverview: Decodable {
+        let projects: [ProjectSummary]
+    }
+
+    /// The projects board: trackers, missions and Hermes deliveries already
+    /// joined server-side, including the per-track health rollup and each
+    /// project's declared control conversation.
+    func listProjects() async throws -> [ProjectSummary] {
+        let overview: ProjectsOverview = try await get("/api/projects/overview")
+        return overview.projects
+    }
+
+    private struct ProjectStates: Decodable {
+        let states: [ProjectState]
+    }
+
+    /// A project's state history, newest first — what it has been reporting
+    /// over days, rather than only the newest delivery.
+    func projectStates(slug: String, limit: Int = 20) async throws -> [ProjectState] {
+        let encoded = slug.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? slug
+        let response: ProjectStates = try await get(
+            "/api/projects/\(encoded)/state?limit=\(limit)"
+        )
+        return response.states
+    }
+
     // MARK: - Mission task board
 
     /// Server-owned task board for a boss mission. Returns an empty board
