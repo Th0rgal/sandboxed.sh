@@ -840,6 +840,50 @@ mod stall_guard_tests {
         reset_stall_guard(boss);
     }
 
+    #[test]
+    fn project_patches_only_arbitrate_the_writer_lease_when_they_could_change_it() {
+        let parse = |json: &str| -> UpdateMissionProjectRequest {
+            serde_json::from_str(json).expect("valid patch")
+        };
+
+        // Retagging metadata cannot make a mission a writer, so it must not be
+        // gated on someone else's lease.
+        assert!(!patch_can_change_writer_status(&parse(
+            r#"{"project":"verity","track":"phase1d/core-c3"}"#
+        )));
+        assert!(!patch_can_change_writer_status(&parse(r#"{}"#)));
+        assert!(!patch_can_change_writer_status(&parse(
+            r#"{"desired_state":"green","next_check_at":"2026-08-05T00:00:00Z"}"#
+        )));
+
+        // Anything `becomes_writer` is derived from still arbitrates.
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"github_pr":"https://github.com/o/r/pull/1"}"#
+        )));
+        assert!(patch_can_change_writer_status(&parse(r#"{"writer":true}"#)));
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"writer":false}"#
+        )));
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"intent":"implementation"}"#
+        )));
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"tags":["pr-writer"]}"#
+        )));
+
+        // An explicit null is a clear, not an absence: dropping the PR or the
+        // intent changes writer status just as much as setting one.
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"github_pr":null}"#
+        )));
+        assert!(patch_can_change_writer_status(&parse(r#"{"intent":null}"#)));
+
+        // A patch that mixes both still arbitrates.
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"project":"verity","writer":true}"#
+        )));
+    }
+
     #[tokio::test]
     async fn delete_rejects_paused_mission_until_resumed_or_cancelled() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
@@ -9377,6 +9421,20 @@ pub struct UpdateMissionProjectRequest {
     pub next_check_at: Option<Option<String>>,
 }
 
+/// Whether this patch could change the mission's PR-writer status.
+///
+/// `becomes_writer` is derived entirely from `github_pr`, `writer`, `intent`
+/// and `tags`. A patch carrying none of them leaves writer status exactly as it
+/// was, so there is no transition to arbitrate — and re-running the lease check
+/// anyway can only reject an edit over a state the mission was already in.
+///
+/// That is not hypothetical: retagging a mission's project returned 409 forever
+/// whenever some *other* mission held the writer lease for the PR this one
+/// happens to reference, which made 32 missions permanently unmaintainable.
+fn patch_can_change_writer_status(req: &UpdateMissionProjectRequest) -> bool {
+    req.github_pr.is_some() || req.writer.is_some() || req.intent.is_some() || req.tags.is_some()
+}
+
 /// Set or update project tagging metadata for a mission.
 #[derive(Debug, Deserialize)]
 pub struct UpdateMissionOriginRequest {
@@ -9466,6 +9524,9 @@ pub async fn update_mission_project(
         .map_err(internal_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
 
+    // Read before the normalize step below consumes `req`'s fields.
+    let could_change_writer_status = patch_can_change_writer_status(&req);
+
     // Normalize: blank string patches clear the field; tags are trimmed.
     let normalize = |patch: Option<Option<String>>| -> Option<Option<String>> {
         patch.map(|inner| {
@@ -9534,7 +9595,7 @@ pub async fn update_mission_project(
         tags = Some(effective_tags.clone());
     }
 
-    let writer_guard = if becomes_writer {
+    let writer_guard = if becomes_writer && could_change_writer_status {
         Some(
             acquire_durable_pr_writer_lock(&state.control)
                 .await
