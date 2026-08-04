@@ -339,6 +339,9 @@ export function NewMissionDialog({
   const preservedSelectedAgent = useMemo(() => {
     const parsed = parseSelectedValue(selectedAgentValue);
     if (!parsed) return null;
+    // Hermes renders its own optgroup (it's not a backend, so it never
+    // appears in allAgents) — don't duplicate it as a "(current)" entry.
+    if (parsed.backend === HERMES_BACKEND_ID) return null;
     if (allAgents.some(a => a.value === selectedAgentValue)) return null;
 
     const backendHasDefaultOption =
