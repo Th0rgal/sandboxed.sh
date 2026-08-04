@@ -48,6 +48,7 @@ mod native_loop_observer;
 pub mod oauth_reconcile;
 pub mod opencode;
 pub mod paloma;
+pub mod project_health;
 pub mod projects_overview;
 pub mod projects_store;
 mod provider_usage_cache;
