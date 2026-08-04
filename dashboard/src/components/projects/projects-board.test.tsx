@@ -100,7 +100,7 @@ describe("ProjectsBoard", () => {
     expect(sections.length).toBeGreaterThanOrEqual(3);
   });
 
-  test("mission chips in the detail pane link to /control", async () => {
+  test("mission rows in the detail pane link to /control", async () => {
     mockedOverview.mockResolvedValue(
       overview([
         project({
@@ -120,8 +120,10 @@ describe("ProjectsBoard", () => {
 
     renderBoard();
 
-    const chip = await screen.findByRole("link", { name: /Phase 1C slice/ });
-    expect(chip).toHaveAttribute(
+    // Missions are behind a collapsible summary now — expand it first.
+    fireEvent.click(await screen.findByRole("button", { name: /Missions \(1\)/ }));
+    const row = await screen.findByRole("link", { name: /Phase 1C slice/ });
+    expect(row).toHaveAttribute(
       "href",
       "/control?mission=f98e1ee2-0000-0000-0000-000000000000",
     );

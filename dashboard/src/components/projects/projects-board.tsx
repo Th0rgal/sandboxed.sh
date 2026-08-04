@@ -16,6 +16,8 @@ import {
   Archive,
   ArchiveRestore,
   ArrowLeft,
+  ChevronDown,
+  ChevronRight,
   GitPullRequest,
   Inbox,
   Loader,
@@ -87,6 +89,17 @@ function lastSignalMs(project: ProjectRow): number {
     const ms = new Date(at).getTime();
     return Number.isNaN(ms) ? max : Math.max(max, ms);
   }, 0);
+}
+
+/** Flatten markdown syntax for one-line headlines (bold, code, links, headings). */
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(\*|_)(.*?)\1/g, "$2")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/^#+\s*/, "")
+    .trim();
 }
 
 /** A project with no missions and no updates is a quiet tracker file. */
@@ -198,7 +211,7 @@ export default function ProjectsBoard() {
           {data && (
             <span className="flex items-center gap-3 text-[11px]">
               {attentionCount > 0 && (
-                <span className="flex items-center gap-1 text-amber-300">
+                <span className="flex items-center gap-1 text-white/40">
                   <AlertTriangle className="h-3 w-3" />
                   {attentionCount} need attention
                 </span>
@@ -236,15 +249,15 @@ export default function ProjectsBoard() {
         <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 pb-4 lg:grid-cols-[340px_minmax(0,1fr)] xl:grid-cols-[380px_minmax(0,1fr)]">
           {/* ── Triage list ── */}
           <div
-            ref={listRef}
             className={cn(
-              "min-h-0 overflow-y-auto rounded-xl border border-white/[0.06] bg-white/[0.015]",
+              "min-h-0 overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.015]",
               mobileDetail && "hidden lg:block",
             )}
           >
+            <div ref={listRef} className="h-full overflow-y-auto py-1">
             {sections.map((section) => (
               <div key={section.bucket}>
-                <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-white/[0.05] bg-[rgb(var(--background))]/95 px-3 py-1.5 backdrop-blur">
+                <div className="sticky -top-1 z-10 flex items-center gap-2 border-b border-white/[0.05] bg-[rgb(var(--background))]/95 px-4 py-1.5 backdrop-blur">
                   <section.icon
                     className={cn(
                       "h-3 w-3",
@@ -276,7 +289,7 @@ export default function ProjectsBoard() {
               </p>
             )}
             {unrouted.length > 0 && (
-              <div className="border-t border-white/[0.05] px-3 py-2.5">
+              <div className="border-t border-white/[0.05] px-4 py-2.5">
                 <p className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-white/35">
                   <Inbox className="h-3 w-3" /> Unrouted ({unrouted.length})
                 </p>
@@ -286,32 +299,35 @@ export default function ProjectsBoard() {
                     className="flex min-w-0 items-center gap-2 py-0.5 text-[11px] text-white/40"
                   >
                     <span className="min-w-0 flex-1 truncate">
-                      {update.headline || "(untitled)"}
+                      {stripMarkdown(update.headline) || "(untitled)"}
                     </span>
                     <UpdateAge at={update.at} />
                   </div>
                 ))}
               </div>
             )}
+            </div>
           </div>
 
           {/* ── Detail pane ── */}
           <div
             className={cn(
-              "min-h-0 overflow-y-auto rounded-xl border border-white/[0.06] bg-white/[0.015]",
+              "min-h-0 overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.015]",
               !mobileDetail && "hidden lg:block",
             )}
           >
-            {selected ? (
-              <ProjectDetail
-                project={selected}
-                onBack={() => setMobileDetail(false)}
-              />
-            ) : (
-              <p className="px-4 py-10 text-center text-sm text-white/30">
-                Select a project to see its timeline.
-              </p>
-            )}
+            <div className="h-full overflow-y-auto">
+              {selected ? (
+                <ProjectDetail
+                  project={selected}
+                  onBack={() => setMobileDetail(false)}
+                />
+              ) : (
+                <p className="px-4 py-10 text-center text-sm text-white/30">
+                  Select a project to see its timeline.
+                </p>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -336,7 +352,7 @@ function ProjectListRow({
       data-slug={project.slug}
       onClick={onSelect}
       className={cn(
-        "group relative flex w-full items-stretch gap-2.5 rounded-md px-3 py-2 text-left transition-colors",
+        "group relative mx-1.5 flex w-[calc(100%-0.75rem)] items-stretch gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors",
         selected ? "bg-indigo-500/[0.09]" : "hover:bg-white/[0.03]",
       )}
     >
@@ -361,10 +377,12 @@ function ProjectListRow({
               </span>
             )}
             <span className="min-w-0 truncate">
-              {project.attention_reasons[0] ??
-                project.latest_update?.headline ??
-                project.tracker?.status_line ??
-                ""}
+              {stripMarkdown(
+                project.attention_reasons[0] ??
+                  project.latest_update?.headline ??
+                  project.tracker?.status_line ??
+                  "",
+              )}
             </span>
           </span>
         )}
@@ -641,13 +659,7 @@ function ProjectDetail({
             ))}
           </div>
         )}
-        {project.missions.length > 0 && (
-          <div className="mt-2.5 flex flex-wrap gap-1.5">
-            {project.missions.map((mission) => (
-              <MissionMiniChip key={mission.id} mission={mission} />
-            ))}
-          </div>
-        )}
+        {project.missions.length > 0 && <MissionList missions={project.missions} />}
       </div>
 
       <div className="flex-1 px-4 py-3 sm:px-5">
@@ -684,18 +696,47 @@ function ProjectDetail({
   );
 }
 
-function MissionMiniChip({ mission }: { mission: ProjectMissionChip }) {
+/** Collapsible mission list for the detail header: summary row, expand for detail. */
+function MissionList({ missions }: { missions: ProjectMissionChip[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const live = missions.filter((m) => LIVE_STATUSES.has(m.status)).length;
+  const problems = missions.filter((m) => PROBLEM_STATUSES.has(m.status)).length;
+  return (
+    <div className="mt-2.5">
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        className="flex w-full items-center gap-1.5 rounded-md py-1 text-left text-[11px] font-semibold uppercase tracking-wider text-white/35 transition-colors hover:text-white/60"
+      >
+        {expanded ? (
+          <ChevronDown className="h-3 w-3" />
+        ) : (
+          <ChevronRight className="h-3 w-3" />
+        )}
+        Missions ({missions.length})
+        <span className="font-normal normal-case tracking-normal text-white/30">
+          {live > 0 && ` · ${live} live`}
+          {problems > 0 && ` · ${problems} failed`}
+        </span>
+      </button>
+      {expanded && (
+        <div className="mt-1 divide-y divide-white/[0.04] rounded-lg border border-white/[0.06] bg-white/[0.02]">
+          {missions.map((mission) => (
+            <MissionRow key={mission.id} mission={mission} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MissionRow({ mission }: { mission: ProjectMissionChip }) {
   const live = LIVE_STATUSES.has(mission.status);
   const problem = PROBLEM_STATUSES.has(mission.status);
   return (
     <Link
       href={`/control?mission=${mission.id}`}
-      onClick={(event) => event.stopPropagation()}
-      title={`${mission.title ?? mission.id} — ${mission.status}`}
-      className={cn(
-        "inline-flex max-w-[200px] items-center gap-1.5 rounded-full border border-white/[0.09] bg-white/[0.03] px-2 py-0.5 text-[11px] !no-underline transition-colors hover:border-white/25",
-        live ? "text-white/75" : "text-white/45",
-      )}
+      className="flex items-center gap-2.5 px-3 py-1.5 !no-underline transition-colors hover:bg-white/[0.03]"
     >
       {problem ? (
         <AlertTriangle className="h-3 w-3 shrink-0 text-amber-300/80" />
@@ -707,12 +748,19 @@ function MissionMiniChip({ mission }: { mission: ProjectMissionChip }) {
           )}
         />
       )}
-      <span className="truncate">
+      <span
+        className={cn(
+          "min-w-0 flex-1 truncate text-xs",
+          live ? "text-white/80" : "text-white/50",
+        )}
+      >
         {mission.title || mission.id.slice(0, 8)}
       </span>
       {mission.github_pr && (
-        <GitPullRequest className="h-3 w-3 shrink-0 opacity-60" />
+        <GitPullRequest className="h-3 w-3 shrink-0 text-white/30" />
       )}
+      <span className="shrink-0 text-[10px] text-white/35">{mission.status}</span>
+      <UpdateAge at={mission.updated_at} />
     </Link>
   );
 }
@@ -770,7 +818,7 @@ function UpdateEntry({
           className="flex w-full items-center justify-between gap-2 text-left"
         >
           <span className="min-w-0 flex-1 truncate text-[13px] text-white/80">
-            {update.headline || "(untitled update)"}
+            {stripMarkdown(update.headline) || "(untitled update)"}
           </span>
           <UpdateAge at={update.at} />
         </button>
