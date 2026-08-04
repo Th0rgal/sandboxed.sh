@@ -4,10 +4,10 @@ use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, AwaitingKind, BoardOutboxItem,
     BoardProject, BoardTask, BoardTaskOutcome, BoardTaskRole, BoardTaskStatus, CommandSource,
     DailyUsageStats, ExecutionStatus, FreshSession, HourlyUsageStats, Mission, MissionActivity,
-    MissionExecutionState, MissionHistoryEntry, MissionMode, MissionProject, MissionProjectPatch,
-    MissionRun, MissionScheduling, MissionStatus, MissionStatusCounts, MissionStore,
-    MissionSummary, MissionToolExecution, MissionToolExecutionState, ModelUsageStats, NewBoardTask,
-    PalomaCooldownState, PalomaDecision, PalomaMissionCard, PalomaSchedulerJob,
+    MissionExecutionState, MissionFilter, MissionHistoryEntry, MissionMode, MissionProject,
+    MissionProjectPatch, MissionRun, MissionScheduling, MissionStatus, MissionStatusCounts,
+    MissionStore, MissionSummary, MissionToolExecution, MissionToolExecutionState, ModelUsageStats,
+    NewBoardTask, PalomaCooldownState, PalomaDecision, PalomaMissionCard, PalomaSchedulerJob,
     PalomaUserPreferences, RetryConfig, StopPolicy, StoredEvent, TaskAttempt,
     TelegramActionExecution, TelegramActionExecutionKind, TelegramActionExecutionStatus,
     TelegramAlert, TelegramAlertPreference, TelegramChannel, TelegramChatMission,
@@ -2369,6 +2369,28 @@ impl SqliteMissionStore {
             tracing::warn!("origin backfill from tags skipped: {}", e);
         }
 
+        // Indexes for the filtered listing. These MUST live here and not in
+        // SCHEMA: `execute_batch(SCHEMA)` runs BEFORE this function, and on an
+        // existing database `CREATE TABLE IF NOT EXISTS missions` is a no-op,
+        // so an index over a column the ALTERs above have not added yet would
+        // fail with "no such column" — failing store init and silently
+        // dropping the service to an in-memory store (same trap the ALTER
+        // comment above describes). Non-fatal for the same reason.
+        for (name, ddl) in [
+            (
+                "idx_missions_origin_session",
+                "CREATE INDEX IF NOT EXISTS idx_missions_origin_session ON missions(origin_session_id)",
+            ),
+            (
+                "idx_missions_project_track",
+                "CREATE INDEX IF NOT EXISTS idx_missions_project_track ON missions(project, track)",
+            ),
+        ] {
+            if let Err(e) = conn.execute(ddl, []) {
+                tracing::warn!("creating {} skipped: {}", name, e);
+            }
+        }
+
         Ok(())
     }
 
@@ -2620,6 +2642,90 @@ impl SqliteMissionStore {
     }
 }
 
+/// Map one row of [`MISSION_LIST_COLUMNS`] onto a `Mission`.
+/// Positional getters — only valid for that exact column list.
+fn row_to_mission(row: &rusqlite::Row<'_>) -> rusqlite::Result<Mission> {
+    let id_str: String = row.get(0)?;
+    let status_str: String = row.get(1)?;
+    let workspace_id_str: String = row.get(8)?;
+    let desktop_sessions_json: Option<String> = row.get(17)?;
+    let backend: String = row.get(18)?;
+    let session_id: Option<String> = row.get(19)?;
+    let terminal_reason: Option<String> = row.get(20)?;
+    let config_profile: Option<String> = row.get(21)?;
+    let (project, awaiting_kind, last_status_change_at) = read_project_columns(row, 32)?;
+
+    Ok(Mission {
+        id: parse_uuid_or_nil(&id_str),
+        status: parse_status(&status_str),
+        title: row.get(2)?,
+        short_description: row.get(3)?,
+        metadata_updated_at: row.get(4)?,
+        metadata_source: row.get(5)?,
+        metadata_model: row.get(6)?,
+        metadata_version: row.get(7)?,
+        workspace_id: Uuid::parse_str(&workspace_id_str)
+            .unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID),
+        workspace_name: row.get(9)?,
+        agent: row.get(10)?,
+        model_override: row.get(11)?,
+        model_effort: row.get(12)?,
+        fast_mode: row.get::<_, i32>(41)? != 0,
+        backend,
+        config_profile,
+        history: vec![], // Loaded separately if needed
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+        interrupted_at: row.get(15)?,
+        paused_at: row.get(31).ok().flatten(),
+        resumable: row.get::<_, i32>(16)? != 0,
+        desktop_sessions: desktop_sessions_json
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        session_id,
+        terminal_reason,
+        parent_mission_id: row
+            .get::<_, Option<String>>(22)?
+            .and_then(|s| Uuid::parse_str(&s).ok()),
+        working_directory: row.get(23)?,
+        mission_mode: row
+            .get::<_, Option<String>>(24)?
+            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+            .unwrap_or_default(),
+        goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
+        goal_objective: row.get(26).ok().flatten(),
+        first_viewed_at: row.get(27).ok().flatten(),
+        scheduling: MissionScheduling {
+            priority: row.get::<_, i32>(28).unwrap_or(0),
+            not_before: row.get(29).ok().flatten(),
+            deadline: row.get(30).ok().flatten(),
+        },
+        project,
+        activity: MissionActivity {
+            last_status_change_at,
+            ..Default::default()
+        },
+        awaiting_kind,
+        origin: row.get(42).ok().flatten(),
+        origin_session_id: row.get(43).ok().flatten(),
+    })
+}
+
+/// Column list shared by every query that maps rows through the same
+/// `Mission` projection. The row getters below are positional, so the two
+/// listings MUST select the same columns in the same order — keeping one
+/// const is what stops them drifting.
+const MISSION_LIST_COLUMNS: &str = "id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, workspace_name, agent, model_override, \
+     model_effort, \
+     created_at, updated_at, interrupted_at, resumable, desktop_sessions, \
+     COALESCE(backend, 'opencode') as backend, session_id, terminal_reason, \
+     config_profile, parent_mission_id, working_directory, \
+     COALESCE(mission_mode, 'task') as mission_mode, \
+     COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at, \
+     COALESCE(priority, 0) as priority, not_before, deadline, paused_at, \
+     project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at, \
+     COALESCE(fast_mode, 0) as fast_mode, origin, origin_session_id";
+
 fn parse_status(s: &str) -> MissionStatus {
     match s {
         "pending" => MissionStatus::Pending,
@@ -2749,93 +2855,129 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn
-                .prepare(
-                    "SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, workspace_name, agent, model_override,
-                            model_effort,
-                            created_at, updated_at, interrupted_at, resumable, desktop_sessions,
-                            COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
-                            config_profile, parent_mission_id, working_directory,
-                            COALESCE(mission_mode, 'task') as mission_mode,
-                            COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
-                            COALESCE(priority, 0) as priority, not_before, deadline, paused_at,
-                            project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at,
-                            COALESCE(fast_mode, 0) as fast_mode, origin, origin_session_id
+                .prepare(&format!(
+                    "SELECT {MISSION_LIST_COLUMNS}
                      FROM missions
                      ORDER BY updated_at DESC
-                     LIMIT ?1 OFFSET ?2",
-                )
+                     LIMIT ?1 OFFSET ?2"
+                ))
                 .map_err(|e| e.to_string())?;
 
             let missions = stmt
-                .query_map(params![limit as i64, offset as i64], |row| {
-                    let id_str: String = row.get(0)?;
-                    let status_str: String = row.get(1)?;
-                    let workspace_id_str: String = row.get(8)?;
-                    let desktop_sessions_json: Option<String> = row.get(17)?;
-                    let backend: String = row.get(18)?;
-                    let session_id: Option<String> = row.get(19)?;
-                    let terminal_reason: Option<String> = row.get(20)?;
-                    let config_profile: Option<String> = row.get(21)?;
-                    let (project, awaiting_kind, last_status_change_at) =
-                        read_project_columns(row, 32)?;
-
-                    Ok(Mission {
-                        id: parse_uuid_or_nil(&id_str),
-                        status: parse_status(&status_str),
-                        title: row.get(2)?,
-                        short_description: row.get(3)?,
-                        metadata_updated_at: row.get(4)?,
-                        metadata_source: row.get(5)?,
-                        metadata_model: row.get(6)?,
-                        metadata_version: row.get(7)?,
-                        workspace_id: Uuid::parse_str(&workspace_id_str)
-                            .unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID),
-                        workspace_name: row.get(9)?,
-                        agent: row.get(10)?,
-                        model_override: row.get(11)?,
-                        model_effort: row.get(12)?,
-                        fast_mode: row.get::<_, i32>(41)? != 0,
-                        backend,
-                        config_profile,
-                        history: vec![], // Loaded separately if needed
-                        created_at: row.get(13)?,
-                        updated_at: row.get(14)?,
-                        interrupted_at: row.get(15)?,
-                        paused_at: row.get(31).ok().flatten(),
-                        resumable: row.get::<_, i32>(16)? != 0,
-                        desktop_sessions: desktop_sessions_json
-                            .and_then(|s| serde_json::from_str(&s).ok())
-                            .unwrap_or_default(),
-                        session_id,
-                        terminal_reason,
-                        parent_mission_id: row.get::<_, Option<String>>(22)?.and_then(|s| Uuid::parse_str(&s).ok()),
-                        working_directory: row.get(23)?,
-                        mission_mode: row.get::<_, Option<String>>(24)?
-                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
-                            .unwrap_or_default(),
-                            goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
-                            goal_objective: row.get(26).ok().flatten(),
-                            first_viewed_at: row.get(27).ok().flatten(),
-                            scheduling: MissionScheduling {
-                                priority: row.get::<_, i32>(28).unwrap_or(0),
-                                not_before: row.get(29).ok().flatten(),
-                                deadline: row.get(30).ok().flatten(),
-                            },
-                            project,
-                            activity: MissionActivity {
-                                last_status_change_at,
-                                ..Default::default()
-                            },
-                            awaiting_kind,
-                            origin: row.get(42).ok().flatten(),
-                            origin_session_id: row.get(43).ok().flatten(),
-                    })
-                })
+                .query_map(params![limit as i64, offset as i64], row_to_mission)
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
 
             Ok(missions)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    /// Exact filtered listing: the predicate runs in SQL, so a match is found
+    /// however deep it sits in the fleet (the generic scan gives up after
+    /// 5 000 rows, which is why old conversations showed zero workers).
+    ///
+    /// `tag` is the one field SQL only narrows: `tags` is a JSON TEXT column
+    /// and some rows hold malformed blobs, so `json_each` would fail the whole
+    /// query. A `LIKE` prefilter selects candidates and
+    /// [`MissionFilter::matches`] makes the final call — which means the
+    /// prefilter can over-select, hence the accumulate-until-satisfied loop.
+    async fn list_missions_filtered(
+        &self,
+        filter: &MissionFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Mission>, String> {
+        if filter.is_empty() {
+            return self.list_missions(limit, offset).await;
+        }
+        let conn = self.conn.clone();
+        let filter = filter.clone();
+        tokio::task::spawn_blocking(move || {
+            const PAGE: i64 = 200;
+            let conn = conn.blocking_lock();
+
+            let mut clauses: Vec<String> = Vec::new();
+            let mut binds: Vec<String> = Vec::new();
+            let mut bind =
+                |clause: &str, value: &str, clauses: &mut Vec<String>, binds: &mut Vec<String>| {
+                    binds.push(value.to_string());
+                    clauses.push(clause.replace("?n", &format!("?{}", binds.len())));
+                };
+            if let Some(v) = filter.status.as_deref() {
+                bind("status = ?n", v, &mut clauses, &mut binds);
+            }
+            if let Some(v) = filter.project.as_deref() {
+                bind("project = ?n", v, &mut clauses, &mut binds);
+            }
+            if let Some(v) = filter.project_prefix.as_deref() {
+                bind(
+                    "(project = ?n OR project LIKE ?n || '-%')",
+                    v,
+                    &mut clauses,
+                    &mut binds,
+                );
+            }
+            if let Some(v) = filter.track.as_deref() {
+                bind("track = ?n", v, &mut clauses, &mut binds);
+            }
+            if let Some(v) = filter.origin_session_id.as_deref() {
+                bind("origin_session_id = ?n", v, &mut clauses, &mut binds);
+            }
+            if let Some(v) = filter.tag.as_deref() {
+                bind(
+                    r#"tags LIKE '%"' || ?n || '"%'"#,
+                    v,
+                    &mut clauses,
+                    &mut binds,
+                );
+            }
+            let where_sql = if clauses.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", clauses.join(" AND "))
+            };
+
+            let sql = format!(
+                "SELECT {MISSION_LIST_COLUMNS} FROM missions {where_sql} \
+                 ORDER BY updated_at DESC LIMIT ?{} OFFSET ?{}",
+                binds.len() + 1,
+                binds.len() + 2
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+
+            let want = offset.saturating_add(limit);
+            let mut matched: Vec<Mission> = Vec::new();
+            let mut sql_offset: i64 = 0;
+            loop {
+                let mut args: Vec<&dyn rusqlite::ToSql> =
+                    binds.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+                args.push(&PAGE);
+                args.push(&sql_offset);
+
+                let page = stmt
+                    .query_map(args.as_slice(), row_to_mission)
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                let page_len = page.len();
+                for mission in page {
+                    // The tag prefilter can over-select; this is the authority.
+                    if filter.matches(&mission) {
+                        matched.push(mission);
+                        if matched.len() >= want {
+                            break;
+                        }
+                    }
+                }
+                if matched.len() >= want || (page_len as i64) < PAGE {
+                    break;
+                }
+                sql_offset += PAGE;
+            }
+            Ok(matched.into_iter().skip(offset).take(limit).collect())
         })
         .await
         .map_err(|e| e.to_string())?
@@ -16177,5 +16319,229 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::SqliteMissionStore;
+    use crate::api::mission_store::{MissionFilter, MissionProjectPatch, MissionStore};
+
+    async fn store(dir: &tempfile::TempDir) -> SqliteMissionStore {
+        SqliteMissionStore::new(dir.path().to_path_buf(), "filter-user")
+            .await
+            .expect("sqlite store")
+    }
+
+    async fn seed(
+        store: &SqliteMissionStore,
+        title: &str,
+        project: Option<&str>,
+        track: Option<&str>,
+        origin_session: Option<&str>,
+    ) -> uuid::Uuid {
+        let mission = store
+            .create_mission_with_parent(
+                Some(title),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create mission");
+        if project.is_some() || track.is_some() {
+            store
+                .update_mission_project(
+                    mission.id,
+                    MissionProjectPatch {
+                        project: Some(project.map(str::to_string)),
+                        track: Some(track.map(str::to_string)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("tag mission");
+        }
+        if let Some(session) = origin_session {
+            store
+                .set_mission_origin(mission.id, "hermes", Some(session))
+                .await
+                .expect("set origin");
+        }
+        mission.id
+    }
+
+    /// The regression that motivated the pushdown: the in-memory scan gave up
+    /// after 5 000 rows, so a conversation whose missions had scrolled past it
+    /// silently showed zero workers. SQL has no such horizon.
+    #[tokio::test]
+    async fn finds_a_match_buried_under_a_large_fleet() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+
+        let needle = seed(&store, "needle", Some("verity"), None, Some("sess-old")).await;
+        for i in 0..250 {
+            seed(&store, &format!("noise {i}"), Some("other"), None, None).await;
+        }
+
+        let found = store
+            .list_missions_filtered(
+                &MissionFilter {
+                    origin_session_id: Some("sess-old".into()),
+                    ..Default::default()
+                },
+                50,
+                0,
+            )
+            .await
+            .expect("filtered list");
+        assert_eq!(found.len(), 1, "the buried match must still be returned");
+        assert_eq!(found[0].id, needle);
+    }
+
+    #[tokio::test]
+    async fn project_prefix_matches_the_family_and_nothing_adjacent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+
+        seed(&store, "family root", Some("verity"), None, None).await;
+        seed(&store, "phase", Some("verity-phase1d"), None, None).await;
+        seed(&store, "lookalike", Some("verityx"), None, None).await;
+        seed(&store, "reversed", Some("x-verity"), None, None).await;
+
+        let found = store
+            .list_missions_filtered(
+                &MissionFilter {
+                    project_prefix: Some("verity".into()),
+                    ..Default::default()
+                },
+                50,
+                0,
+            )
+            .await
+            .expect("filtered list");
+        let projects: Vec<String> = found
+            .iter()
+            .filter_map(|m| m.project.project.clone())
+            .collect();
+        assert_eq!(projects.len(), 2, "got {projects:?}");
+        assert!(projects.contains(&"verity".to_string()));
+        assert!(projects.contains(&"verity-phase1d".to_string()));
+    }
+
+    /// `project` must stay EXACT — widening it would silently change what
+    /// every existing caller (dashboard, iOS, Paloma) gets back.
+    #[tokio::test]
+    async fn project_filter_stays_exact() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+        seed(&store, "root", Some("verity"), None, None).await;
+        seed(&store, "phase", Some("verity-phase1d"), None, None).await;
+
+        let found = store
+            .list_missions_filtered(
+                &MissionFilter {
+                    project: Some("verity".into()),
+                    ..Default::default()
+                },
+                50,
+                0,
+            )
+            .await
+            .expect("filtered list");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].project.project.as_deref(), Some("verity"));
+    }
+
+    #[tokio::test]
+    async fn track_filter_and_offset_count_matches_not_rows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+        for i in 0..3 {
+            seed(
+                &store,
+                &format!("t{i}"),
+                Some("verity"),
+                Some("core-c3"),
+                None,
+            )
+            .await;
+            seed(
+                &store,
+                &format!("n{i}"),
+                Some("verity"),
+                Some("other"),
+                None,
+            )
+            .await;
+        }
+
+        let filter = MissionFilter {
+            track: Some("core-c3".into()),
+            ..Default::default()
+        };
+        let first = store
+            .list_missions_filtered(&filter, 2, 0)
+            .await
+            .expect("page 1");
+        let second = store
+            .list_missions_filtered(&filter, 2, 2)
+            .await
+            .expect("page 2");
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 1, "offset skips MATCHES, not raw rows");
+        assert!(first
+            .iter()
+            .chain(second.iter())
+            .all(|m| m.project.track.as_deref() == Some("core-c3")));
+    }
+
+    /// `tags` is JSON TEXT and some rows hold malformed blobs, which is why
+    /// the tag filter is a SQL prefilter plus a Rust re-check rather than
+    /// `json_each` (that would fail the whole query on the bad row).
+    #[tokio::test]
+    async fn tag_filter_survives_a_malformed_tags_blob() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+        let tagged = seed(&store, "tagged", Some("verity"), None, None).await;
+        store
+            .update_mission_project(
+                tagged,
+                MissionProjectPatch {
+                    tags: Some(vec!["origin:hermes-assistant".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag");
+        let broken = seed(&store, "broken", Some("verity"), None, None).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE missions SET tags = '{not json' WHERE id = ?1",
+                rusqlite::params![broken.to_string()],
+            )
+            .expect("corrupt tags");
+        }
+
+        let found = store
+            .list_missions_filtered(
+                &MissionFilter {
+                    tag: Some("origin:hermes-assistant".into()),
+                    ..Default::default()
+                },
+                50,
+                0,
+            )
+            .await
+            .expect("filtered list");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, tagged);
     }
 }
