@@ -1886,6 +1886,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
+ "tokio-tungstenite",
  "tokio-util",
  "toml",
  "tower-http 0.5.2",

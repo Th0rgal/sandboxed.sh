@@ -12,6 +12,8 @@ tokio = { version = "1", features = ["full"] }
 
 # Web framework
 axum = { version = "0.7", features = ["ws", "multipart"] }
+# WebSocket client for the Hermes gateway bridge (same version axum uses)
+tokio-tungstenite = "0.24"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # Serialization

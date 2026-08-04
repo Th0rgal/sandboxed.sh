@@ -1,7 +1,7 @@
 'use client';
 
-import { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
-import { useRouter, usePathname } from 'next/navigation';
+import { createContext, useContext, useState, useEffect, useCallback, useMemo, Suspense } from 'react';
+import { useRouter, usePathname, useSearchParams } from 'next/navigation';
 import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import { MissionSwitcher } from '@/components/mission-switcher';
@@ -27,6 +27,20 @@ interface MissionSwitcherContextValue {
 
 const MissionSwitcherContext = createContext<MissionSwitcherContextValue | null>(null);
 
+/**
+ * Reports whether the URL carries a `?session=` (Hermes conversation) param.
+ * Isolated in a Suspense-wrapped child because `useSearchParams` in the
+ * provider itself would opt every statically-rendered page out of prerender.
+ */
+function HermesSessionParamProbe({ onChange }: { onChange: (has: boolean) => void }) {
+  const searchParams = useSearchParams();
+  const hasSession = searchParams.get('session') != null;
+  useEffect(() => {
+    onChange(hasSession);
+  }, [hasSession, onChange]);
+  return null;
+}
+
 export function useMissionSwitcher() {
   const ctx = useContext(MissionSwitcherContext);
   if (!ctx) {
@@ -39,9 +53,13 @@ export function MissionSwitcherProvider({ children }: { children: React.ReactNod
   const router = useRouter();
   const pathname = usePathname();
   const [isOpen, setIsOpen] = useState(false);
+  const [hasHermesSession, setHasHermesSession] = useState(false);
 
-  // Control page has its own mission switcher with more context (currentMissionId, viewingMissionId)
-  const isControlPage = pathname === '/control';
+  // Control page has its own mission switcher with more context
+  // (currentMissionId, viewingMissionId) — but only for missions. The Hermes
+  // session view (`/control?session=`) does not mount ControlClient, so the
+  // global palette stays active there.
+  const isControlPage = pathname === '/control' && !hasHermesSession;
 
   // The data here only feeds the Cmd+K MissionSwitcher dialog (rendered below
   // when `!isControlPage`) and the follow-up handler. Polling it constantly
@@ -183,6 +201,9 @@ export function MissionSwitcherProvider({ children }: { children: React.ReactNod
   return (
     <MissionSwitcherContext.Provider value={contextValue}>
       {children}
+      <Suspense fallback={null}>
+        <HermesSessionParamProbe onChange={setHasHermesSession} />
+      </Suspense>
       {/* Don't render on control page - it has its own mission switcher with more context */}
       {!isControlPage && (
         <MissionSwitcher

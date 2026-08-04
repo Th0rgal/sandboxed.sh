@@ -299,6 +299,8 @@ mod tests {
             project: Default::default(),
             activity: Default::default(),
             awaiting_kind: None,
+            origin: None,
+            origin_session_id: None,
         }
     }
 

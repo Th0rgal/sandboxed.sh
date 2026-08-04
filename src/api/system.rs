@@ -2032,6 +2032,187 @@ pub async fn hermes_chat_proxy(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Hermes gateway WebSocket bridge
+//
+// The rich Hermes client protocol (session.create / prompt.submit / streamed
+// message.delta / tool.* / subagent.* events) is the JSON-RPC WebSocket served
+// by the Hermes *dashboard* process at `/api/ws`, loopback-only. This bridge
+// re-exposes it to sandboxed.sh clients behind the dashboard JWT: the browser
+// connects here, the server dials the loopback gateway with the Hermes session
+// token, and frames are pumped verbatim in both directions.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dashboard-JWT path under which the Hermes gateway WS is bridged.
+pub const HERMES_GATEWAY_WS_PATH: &str = "/api/assistant/hermes/ws";
+
+/// Extract the dashboard JWT from the WebSocket subprotocol list. Browsers
+/// cannot set an Authorization header on a WebSocket connect, so clients send
+/// `Sec-WebSocket-Protocol: sandboxed, jwt.<token>` instead (same convention
+/// as `/api/monitoring/ws`) — keeping the token out of URLs and access logs.
+fn extract_jwt_from_ws_protocols(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())?;
+    for part in raw.split(',').map(str::trim) {
+        if let Some(rest) = part.strip_prefix("jwt.") {
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the loopback Hermes gateway WS URL, session token included.
+///
+/// The token is Hermes' `HERMES_DASHBOARD_SESSION_TOKEN` (which pins the
+/// otherwise per-restart `_SESSION_TOKEN` of the hermes-dashboard process).
+/// Deployers set it on the hermes-dashboard unit and mirror it into the
+/// sandboxed.sh service env or the Hermes runtime env file, whichever is
+/// found first here.
+async fn resolve_hermes_gateway_ws_target(
+    config: &crate::config::Config,
+) -> Result<String, &'static str> {
+    let mut token = std::env::var("HERMES_DASHBOARD_SESSION_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if token.is_none() {
+        for path in hermes_env_paths(assistant_runtime_name(config)) {
+            if let Ok(contents) = tokio::fs::read_to_string(&path).await {
+                if let Some(value) = parse_env_value(&contents, "HERMES_DASHBOARD_SESSION_TOKEN")
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                {
+                    token = Some(value);
+                    break;
+                }
+            }
+        }
+    }
+    let Some(token) = token else {
+        return Err(
+            "HERMES_DASHBOARD_SESSION_TOKEN not provisioned: pin it on the hermes-dashboard \
+             unit and mirror it into the sandboxed.sh or Hermes runtime env",
+        );
+    };
+    let base = std::env::var("HERMES_DASHBOARD_WS_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            let port = std::env::var("HERMES_DASHBOARD_PORT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u16>().ok())
+                .unwrap_or(9119);
+            format!("ws://127.0.0.1:{port}/api/ws")
+        });
+    let separator = if base.contains('?') { '&' } else { '?' };
+    Ok(format!("{base}{separator}token={token}"))
+}
+
+/// `GET /api/assistant/hermes/ws` — full pass-through bridge to the Hermes
+/// gateway JSON-RPC WebSocket. Registered on public_routes because browser
+/// WebSockets cannot carry an Authorization header; the JWT arrives via the
+/// `jwt.<token>` subprotocol (or a Bearer header for native clients) and is
+/// verified here, before upgrade.
+pub async fn hermes_gateway_ws(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    ws: axum::extract::WebSocketUpgrade,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let header_token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| {
+            h.strip_prefix("Bearer ")
+                .or_else(|| h.strip_prefix("bearer "))
+        })
+        .map(str::to_string);
+    let token = header_token
+        .or_else(|| extract_jwt_from_ws_protocols(&headers))
+        .unwrap_or_default();
+    if let Err((status, message)) = crate::api::auth::authenticate_token(&state.config, &token) {
+        return (status, message).into_response();
+    }
+
+    let target = match resolve_hermes_gateway_ws_target(&state.config).await {
+        Ok(target) => target,
+        Err(message) => return (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+    };
+
+    // Echo back the stable subprotocol; the jwt.* entry never appears in the
+    // response (a browser rejects the handshake if the selected protocol was
+    // not offered, so "sandboxed" is always offered alongside the token).
+    ws.protocols(["sandboxed"])
+        .on_upgrade(move |socket| async move {
+            if let Err(error) = bridge_hermes_gateway_ws(socket, target).await {
+                tracing::debug!("hermes gateway ws bridge closed: {error}");
+            }
+        })
+}
+
+/// Pump frames between the browser socket and the loopback Hermes gateway
+/// until either side closes. Frames are forwarded verbatim (newline-delimited
+/// JSON-RPC text); either side closing tears down both.
+async fn bridge_hermes_gateway_ws(
+    client: axum::extract::ws::WebSocket,
+    target: String,
+) -> Result<(), String> {
+    use axum::extract::ws::Message as ClientMessage;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
+
+    let (upstream, _response) = tokio_tungstenite::connect_async(&target)
+        .await
+        .map_err(|e| format!("hermes gateway unreachable: {e}"))?;
+    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+    let (mut client_tx, mut client_rx) = client.split();
+
+    let client_to_upstream = async {
+        while let Some(message) = client_rx.next().await {
+            let forwarded = match message {
+                Ok(ClientMessage::Text(text)) => UpstreamMessage::Text(text),
+                Ok(ClientMessage::Binary(bytes)) => UpstreamMessage::Binary(bytes),
+                Ok(ClientMessage::Ping(payload)) => UpstreamMessage::Ping(payload),
+                Ok(ClientMessage::Pong(payload)) => UpstreamMessage::Pong(payload),
+                Ok(ClientMessage::Close(_)) | Err(_) => break,
+            };
+            if upstream_tx.send(forwarded).await.is_err() {
+                break;
+            }
+        }
+        let _ = upstream_tx.send(UpstreamMessage::Close(None)).await;
+    };
+
+    let upstream_to_client = async {
+        while let Some(message) = upstream_rx.next().await {
+            let forwarded = match message {
+                Ok(UpstreamMessage::Text(text)) => ClientMessage::Text(text),
+                Ok(UpstreamMessage::Binary(bytes)) => ClientMessage::Binary(bytes),
+                Ok(UpstreamMessage::Ping(payload)) => ClientMessage::Ping(payload),
+                Ok(UpstreamMessage::Pong(payload)) => ClientMessage::Pong(payload),
+                Ok(UpstreamMessage::Close(_)) | Err(_) => break,
+                // Raw frames never surface from a read; skip defensively.
+                Ok(UpstreamMessage::Frame(_)) => continue,
+            };
+            if client_tx.send(forwarded).await.is_err() {
+                break;
+            }
+        }
+        let _ = client_tx.send(ClientMessage::Close(None)).await;
+    };
+
+    tokio::select! {
+        _ = client_to_upstream => {}
+        _ = upstream_to_client => {}
+    }
+    Ok(())
+}
+
 /// Get the proxy API key for the Hermes gateway, reusing the key already
 /// wired into the gateway env when it is still registered; otherwise mint a
 /// fresh one. Either way, revoke any other "Hermes Assistant" keys so

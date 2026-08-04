@@ -167,6 +167,10 @@ struct StartMissionParams {
     next_check_at: Option<String>,
     #[serde(default)]
     estimated_disk_gib: Option<u64>,
+    /// Hermes session that spawned this mission. Forwarded as the mission's
+    /// `origin_session_id` so clients group it as a worker of that session.
+    #[serde(default)]
+    origin_session_id: Option<String>,
 }
 
 fn native_backend_from_agent(agent: Option<&str>) -> Option<String> {
@@ -1112,7 +1116,8 @@ impl AssistantMcp {
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "desired_state": {"type": "string", "description": "Track state, e.g. waiting_ci / waiting_review / blocked_external."},
                         "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."},
-                        "estimated_disk_gib": {"type": "integer", "minimum": 1, "maximum": 512, "description": "Expected peak local scratch use. Set this for Lean/build-heavy missions; omit for small/no-build work."}
+                        "estimated_disk_gib": {"type": "integer", "minimum": 1, "maximum": 512, "description": "Expected peak local scratch use. Set this for Lean/build-heavy missions; omit for small/no-build work."},
+                        "origin_session_id": {"type": "string", "description": "Hermes session id of the conversation spawning this mission. Dashboards group the mission as a worker of that session. Injected automatically by the Hermes-side plugin; pass through unchanged."}
                     }
                 }),
             },
@@ -1639,6 +1644,14 @@ impl AssistantMcp {
             "desired_state": params.desired_state,
             "next_check_at": params.next_check_at,
             "estimated_disk_gib": params.estimated_disk_gib,
+            // Mission-level provenance. `origin` is fixed by this server (not
+            // model-controlled); the session id ties the mission to the Hermes
+            // conversation that spawned it.
+            "origin": "hermes",
+            "origin_session_id": params.origin_session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
         });
         let response = self.api_post("/api/control/missions", body).await?;
         if !response.status().is_success() {

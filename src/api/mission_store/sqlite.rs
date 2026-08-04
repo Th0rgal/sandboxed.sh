@@ -508,7 +508,9 @@ CREATE TABLE IF NOT EXISTS missions (
     desired_state TEXT,
     next_check_at TEXT,
     awaiting_kind TEXT,
-    last_status_change_at TEXT
+    last_status_change_at TEXT,
+    origin TEXT,
+    origin_session_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
@@ -2295,6 +2297,8 @@ impl SqliteMissionStore {
             ("next_check_at", "TEXT"),
             ("awaiting_kind", "TEXT"),
             ("last_status_change_at", "TEXT"),
+            ("origin", "TEXT"),
+            ("origin_session_id", "TEXT"),
         ] {
             // `github_pr` shipped briefly as INTEGER; it now holds a free-form
             // PR reference string (e.g. "owner/repo#123"). The column is freshly
@@ -2352,6 +2356,17 @@ impl SqliteMissionStore {
                     );
                 }
             }
+        }
+
+        // Backfill `origin` for missions created by the Hermes assistant MCP
+        // before the dedicated column existed (the marker was only a tag).
+        // Non-fatal for the same concurrent-init reason as the ALTERs above.
+        if let Err(e) = conn.execute(
+            "UPDATE missions SET origin = 'hermes' \
+             WHERE origin IS NULL AND tags LIKE '%\"origin:hermes-assistant\"%'",
+            [],
+        ) {
+            tracing::warn!("origin backfill from tags skipped: {}", e);
         }
 
         Ok(())
@@ -2744,7 +2759,7 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
                             COALESCE(priority, 0) as priority, not_before, deadline, paused_at,
                             project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at,
-                            COALESCE(fast_mode, 0) as fast_mode
+                            COALESCE(fast_mode, 0) as fast_mode, origin, origin_session_id
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2812,6 +2827,8 @@ impl MissionStore for SqliteMissionStore {
                                 ..Default::default()
                             },
                             awaiting_kind,
+                            origin: row.get(42).ok().flatten(),
+                            origin_session_id: row.get(43).ok().flatten(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2874,7 +2891,7 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
                             COALESCE(priority, 0) as priority, not_before, deadline, paused_at,
                             project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at,
-                            COALESCE(fast_mode, 0) as fast_mode FROM missions WHERE id = ?1",
+                            COALESCE(fast_mode, 0) as fast_mode, origin, origin_session_id FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -2939,6 +2956,8 @@ impl MissionStore for SqliteMissionStore {
                                 ..Default::default()
                             },
                             awaiting_kind,
+                            origin: row.get(42).ok().flatten(),
+                            origin_session_id: row.get(43).ok().flatten(),
                     })
                 })
                 .optional()
@@ -3373,6 +3392,8 @@ impl MissionStore for SqliteMissionStore {
             project: MissionProject::default(),
             activity: MissionActivity::default(),
             awaiting_kind: None,
+            origin: None,
+            origin_session_id: None,
         };
 
         let m = mission.clone();
@@ -3470,6 +3491,8 @@ impl MissionStore for SqliteMissionStore {
                             project: MissionProject::default(),
                             activity: MissionActivity::default(),
                             awaiting_kind: None,
+                            origin: None,
+                            origin_session_id: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -4033,6 +4056,28 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn set_mission_origin(
+        &self,
+        id: Uuid,
+        origin: &str,
+        origin_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let origin = origin.to_string();
+        let origin_session_id = origin_session_id.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET origin = ?1, origin_session_id = ?2 WHERE id = ?3",
+                params![origin, origin_session_id, id.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn get_mission_activity(
         &self,
         ids: &[Uuid],
@@ -4383,6 +4428,8 @@ impl MissionStore for SqliteMissionStore {
                         project: MissionProject::default(),
                         activity: MissionActivity::default(),
                         awaiting_kind: None,
+                        origin: None,
+                        origin_session_id: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -4463,6 +4510,8 @@ impl MissionStore for SqliteMissionStore {
                         project: MissionProject::default(),
                         activity: MissionActivity::default(),
                         awaiting_kind: None,
+                        origin: None,
+                        origin_session_id: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -4604,6 +4653,8 @@ impl MissionStore for SqliteMissionStore {
                         project: MissionProject::default(),
                         activity: MissionActivity::default(),
                         awaiting_kind: None,
+                        origin: None,
+                        origin_session_id: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -7113,6 +7164,8 @@ impl MissionStore for SqliteMissionStore {
                         project: MissionProject::default(),
                         activity: MissionActivity::default(),
                         awaiting_kind: None,
+                        origin: None,
+                        origin_session_id: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -12976,6 +13029,69 @@ mod tests {
         assert_eq!(
             fetched.awaiting_kind, None,
             "awaiting_kind must clear when leaving AwaitingUser"
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_origin_roundtrip_and_tag_backfill() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Spawned"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        assert_eq!(mission.origin, None);
+        assert_eq!(mission.origin_session_id, None);
+
+        store
+            .set_mission_origin(mission.id, "hermes", Some("20260804_101500_ab12cd34"))
+            .await
+            .expect("set origin");
+        let fetched = store
+            .get_mission(mission.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(fetched.origin.as_deref(), Some("hermes"));
+        assert_eq!(
+            fetched.origin_session_id.as_deref(),
+            Some("20260804_101500_ab12cd34")
+        );
+        let listed = store.list_missions(10, 0).await.expect("list");
+        let listed = listed.iter().find(|m| m.id == mission.id).expect("listed");
+        assert_eq!(listed.origin.as_deref(), Some("hermes"));
+
+        // Legacy hermes missions (tag only, no origin column) get backfilled by
+        // the migration pass.
+        let legacy = store
+            .create_mission(Some("Legacy"), None, None, None, None, None, None)
+            .await
+            .expect("legacy mission");
+        store
+            .update_mission_project(
+                legacy.id,
+                MissionProjectPatch {
+                    tags: Some(vec!["origin:hermes-assistant".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag legacy");
+        {
+            let conn = store.conn.lock().await;
+            SqliteMissionStore::run_migrations(&conn).expect("re-run migration");
+        }
+        let fetched = store
+            .get_mission(legacy.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            fetched.origin.as_deref(),
+            Some("hermes"),
+            "tag-only hermes mission must be backfilled to origin='hermes'"
         );
     }
 

@@ -396,6 +396,15 @@ pub struct Mission {
     /// decision or just an acknowledgement. `None` for every other status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awaiting_kind: Option<AwaitingKind>,
+    /// Which system created this mission (e.g. "hermes" for the assistant
+    /// MCP). `None` for missions created directly from the dashboard/API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// External conversation that spawned this mission — the Hermes session id
+    /// when `origin == "hermes"`. Lets clients group missions as workers under
+    /// their owning session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_session_id: Option<String>,
 }
 
 /// Aggregate mission counts by status.
@@ -1990,6 +1999,19 @@ pub trait MissionStore: Send + Sync {
     ) -> Result<std::collections::HashMap<Uuid, MissionSummary>, String> {
         let _ = ids;
         Ok(std::collections::HashMap::new())
+    }
+
+    /// Record which system created a mission (`origin`, e.g. "hermes") and,
+    /// when known, the external session that spawned it. Written once right
+    /// after creation. Default no-op for stores that do not persist it.
+    async fn set_mission_origin(
+        &self,
+        id: Uuid,
+        origin: &str,
+        origin_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let _ = (id, origin, origin_session_id);
+        Ok(())
     }
 
     /// Set (or clear) the `awaiting_kind` classification for a mission. Only
@@ -3845,6 +3867,8 @@ mod tests {
             project: MissionProject::default(),
             activity: MissionActivity::default(),
             awaiting_kind: None,
+            origin: None,
+            origin_session_id: None,
         }
     }
 

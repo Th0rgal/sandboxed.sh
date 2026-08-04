@@ -6170,6 +6170,13 @@ pub struct CreateMissionRequest {
     /// can continue without admitting work that would cross the emergency
     /// reserve.
     pub estimated_disk_gib: Option<u64>,
+    /// Which system created this mission (e.g. "hermes" for the assistant
+    /// MCP). Clients group foreign-origin missions as workers of their owning
+    /// conversation instead of standalone rows.
+    pub origin: Option<String>,
+    /// External conversation that spawned this mission — the Hermes session id
+    /// when `origin` is "hermes". Only stored when `origin` is set.
+    pub origin_session_id: Option<String>,
     /// Catch-all for unrecognized request fields. Serde ignores unknown fields
     /// by default, which has repeatedly hidden client bugs (a `prompt` sent
     /// before the field existed, a mistyped `target_mission_id`). Captured
@@ -7170,6 +7177,8 @@ pub async fn create_mission(
         remote_command: None,
         remote_async: None,
         estimated_disk_gib: None,
+        origin: None,
+        origin_session_id: None,
         extra: Default::default(),
     });
 
@@ -7661,6 +7670,28 @@ pub async fn create_mission(
         }
     }
     drop(pr_writer_guard);
+
+    // Creation origin ("hermes" + owning session id). Written once here so
+    // clients can group foreign-origin missions under their conversation.
+    if let Some(origin) = req
+        .origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let origin_session_id = req
+            .origin_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        control
+            .mission_store
+            .set_mission_origin(mission.id, origin, origin_session_id)
+            .await
+            .map_err(internal_error)?;
+        mission.origin = Some(origin.to_string());
+        mission.origin_session_id = origin_session_id.map(str::to_string);
+    }
 
     // Atomic create+start: stash the initial prompt as the deferred goal. The
     // FLEET-001 scheduler pass (every ~5s) dispatches pending missions with a
@@ -10948,6 +10979,8 @@ pub async fn clone_mission(
         remote_command: None,
         remote_async: None,
         estimated_disk_gib: None,
+        origin: None,
+        origin_session_id: None,
         extra: Default::default(),
     };
 
@@ -27583,6 +27616,8 @@ And the report:
             project: Default::default(),
             activity: Default::default(),
             awaiting_kind: None,
+            origin: None,
+            origin_session_id: None,
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -27620,6 +27655,8 @@ And the report:
             project: Default::default(),
             activity: Default::default(),
             awaiting_kind: None,
+            origin: None,
+            origin_session_id: None,
         };
 
         let strong_score = mission_search_relevance_score(
@@ -27672,6 +27709,8 @@ And the report:
             project: Default::default(),
             activity: Default::default(),
             awaiting_kind: None,
+            origin: None,
+            origin_session_id: None,
         };
 
         let score = mission_search_relevance_score(
@@ -27721,6 +27760,8 @@ And the report:
             project: Default::default(),
             activity: Default::default(),
             awaiting_kind: None,
+            origin: None,
+            origin_session_id: None,
         };
 
         let score = mission_search_relevance_score(
@@ -27770,6 +27811,8 @@ And the report:
             project: Default::default(),
             activity: Default::default(),
             awaiting_kind: None,
+            origin: None,
+            origin_session_id: None,
         };
 
         let score = mission_search_relevance_score(
@@ -27819,6 +27862,8 @@ And the report:
             project: Default::default(),
             activity: Default::default(),
             awaiting_kind: None,
+            origin: None,
+            origin_session_id: None,
         };
 
         let score = mission_search_relevance_score(
@@ -27952,6 +27997,8 @@ And the report:
             project: Default::default(),
             activity: Default::default(),
             awaiting_kind: None,
+            origin: None,
+            origin_session_id: None,
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {

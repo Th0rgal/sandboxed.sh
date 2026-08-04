@@ -50,7 +50,7 @@ type NavItem = {
 const navigation: NavItem[] = [
   { name: 'Projects', href: '/', icon: Kanban },
   { name: 'Overview', href: '/overview', icon: Layout },
-  { name: 'Mission', href: '/control', icon: ChatCircleText },
+  { name: 'Conversations', href: '/control', icon: ChatCircleText },
   { name: 'Workspaces', href: '/workspaces', icon: SidebarSimple },
   { name: 'Console', href: '/console', icon: TerminalWindow },
   {

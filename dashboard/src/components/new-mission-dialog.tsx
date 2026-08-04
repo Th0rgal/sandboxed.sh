@@ -6,13 +6,15 @@ import { createPortal } from 'react-dom';
 import { useRouter } from 'next/navigation';
 import { Plus, X, ExternalLink, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import useSWR from 'swr';
-import { getVisibleAgents, getSandboxedConfig, listBackends, listBackendAgents, getClaudeCodeConfig, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
+import { getVisibleAgents, getSandboxedConfig, listBackends, listBackendAgents, getClaudeCodeConfig, listBackendModelOptions, listProviders, createHermesSession, getHermesAssistantStatus, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
 import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
 import { toast } from '@/components/toast';
 
 const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok', 'chatgpt_ui'] as const;
 const CHATGPT_UI_BACKEND_ID = 'chatgpt_ui';
+/** Pseudo-backend: selecting it starts a Hermes session, not a mission. */
+const HERMES_BACKEND_ID = 'hermes';
 const CHATGPT_UI_CANONICAL_MODEL = 'gpt-5.6-pro';
 const CLAUDE_CODE_DEFAULT_MODEL = 'claude-opus-5';
 
@@ -181,6 +183,15 @@ export function NewMissionDialog({
     return backends?.filter((b) => isBackendAvailable(backendConfigs[b.id])) || [];
   }, [backends, backendConfigs]);
 
+  // Hermes availability: selecting "Hermes" starts a session instead of a
+  // mission, so it only appears in create mode and when the runtime is live.
+  const { data: hermesStatus } = useSWR(
+    open && !isEditMode ? 'hermes-assistant-status' : null,
+    getHermesAssistantStatus,
+    { revalidateOnFocus: false, dedupingInterval: 30000 }
+  );
+  const hermesAvailable = !isEditMode && hermesStatus?.service_active === true;
+
   const workspaceProfile = useMemo(() => {
     const targetWorkspace = newMissionWorkspace
       ? workspaces.find((workspace) => workspace.id === newMissionWorkspace)
@@ -348,6 +359,7 @@ export function NewMissionDialog({
     return parseSelectedValue(selectedAgentValue)?.backend || 'claudecode';
   }, [selectedAgentValue]);
   const isChatGptUi = selectedBackend === CHATGPT_UI_BACKEND_ID;
+  const isHermes = selectedBackend === HERMES_BACKEND_ID;
   const chatGptUiModel = useMemo(() => {
     const configuredModel = backendConfigs[CHATGPT_UI_BACKEND_ID]?.settings?.model;
     return typeof configuredModel === 'string' && configuredModel.trim()
@@ -656,6 +668,42 @@ export function NewMissionDialog({
 
   const handleCreate = async (openInNewTab: boolean) => {
     if (disabled || submitting) return;
+    // Hermes is a conversation, not a mission: create the session through the
+    // chat proxy and navigate to the session view of the control page.
+    if (isHermes && !isEditMode) {
+      const pendingTab = openInNewTab ? window.open('about:blank', '_blank') : null;
+      if (pendingTab) pendingTab.opener = null;
+      setSubmitting(true);
+      try {
+        const session = await createHermesSession();
+        const url = `${controlPath}?session=${encodeURIComponent(session.id)}`;
+        setOpen(false);
+        resetForm();
+        if (openInNewTab) {
+          let opened = false;
+          if (pendingTab && !pendingTab.closed) {
+            try {
+              pendingTab.location.href = url;
+              opened = true;
+            } catch {
+              opened = false;
+            }
+          }
+          if (!opened && !window.open(url, '_blank')) {
+            router.push(url);
+          }
+          onClose?.();
+        } else {
+          router.push(url);
+        }
+      } catch (err) {
+        if (pendingTab && !pendingTab.closed) pendingTab.close();
+        toast.error(err instanceof Error ? err.message : 'Could not start a Hermes session');
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
     if (!isChatGptUi && newMissionWorkspace) {
       const ws = workspaces.find(w => w.id === newMissionWorkspace);
       if (ws && ws.status !== 'ready') {
@@ -761,6 +809,7 @@ export function NewMissionDialog({
 
           <div className="space-y-3">
             {/* Workspace selection */}
+            {!isHermes && (
             <div>
               <label className="block text-xs text-white/50 mb-1.5">Workspace</label>
               <select
@@ -809,6 +858,7 @@ export function NewMissionDialog({
                 <p className="text-xs text-white/30 mt-1.5">Where the mission will run</p>
               )}
             </div>
+            )}
 
             {/* Agent selection (includes backend) */}
             <div>
@@ -842,6 +892,13 @@ export function NewMissionDialog({
                     </option>
                   </optgroup>
                 )}
+                {hermesAvailable && (
+                  <optgroup key={HERMES_BACKEND_ID} label="Hermes" className="bg-[#1a1a1a]">
+                    <option value={`${HERMES_BACKEND_ID}:`} className="bg-[#1a1a1a]">
+                      Hermes assistant session
+                    </option>
+                  </optgroup>
+                )}
                 {enabledBackends.map((backend) => {
                   const backendAgentsList = agentsByBackend[backend.id] || [];
                   if (backendAgentsList.length === 0) return null;
@@ -870,14 +927,16 @@ export function NewMissionDialog({
                 })}
               </select>
               <p className="text-xs text-white/30 mt-1.5">
-                {isChatGptUi
-                  ? 'Uses the authenticated ChatGPT web harness on the control plane.'
-                  : 'Select an agent and backend to power this mission'}
+                {isHermes
+                  ? 'Starts a Hermes conversation. Hermes plans, chats across platforms, and can spawn missions as workers.'
+                  : isChatGptUi
+                    ? 'Uses the authenticated ChatGPT web harness on the control plane.'
+                    : 'Select an agent and backend to power this mission'}
               </p>
             </div>
 
             {/* Model selection */}
-            {isChatGptUi ? (
+            {isHermes ? null : isChatGptUi ? (
               <div>
                 <label className="block text-xs text-white/50 mb-1.5">Model</label>
                 <div className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm">

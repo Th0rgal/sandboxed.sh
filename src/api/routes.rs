@@ -701,6 +701,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             axum::routing::any(system_api::hermes_remote_proxy)
                 .layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
         )
+        // Hermes gateway JSON-RPC WebSocket bridge. On public_routes because
+        // browser WebSockets cannot carry an Authorization header; the handler
+        // verifies the dashboard JWT (Bearer header or `jwt.<token>`
+        // subprotocol, as on /api/monitoring/ws) before upgrading.
+        .route(
+            system_api::HERMES_GATEWAY_WS_PATH,
+            get(system_api::hermes_gateway_ws),
+        )
         // OpenAI-compatible proxy endpoint (bearer token auth via SANDBOXED_PROXY_SECRET).
         // LLM payloads with tool outputs and long contexts can exceed the default 2MB
         // body limit, so set a generous 50MB limit for proxy routes.
