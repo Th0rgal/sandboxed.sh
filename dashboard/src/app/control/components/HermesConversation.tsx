@@ -1,12 +1,6 @@
 "use client";
 
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { Loader, Plus, Sparkles, Square } from "lucide-react";
 
@@ -24,10 +18,22 @@ import {
   HermesGatewayClient,
   type HermesGatewayEvent,
 } from "@/lib/hermes-gateway";
+import {
+  createHermesDeliveryId,
+  getHermesOutbox,
+  hermesDeliveryObserved,
+  putHermesOutbox,
+  removeHermesOutbox,
+  type HermesOutboxEntry,
+} from "@/lib/hermes-outbox";
 import { EnhancedInput } from "@/components/enhanced-input";
 import { cn } from "@/lib/utils";
 
-import { ChatItemRow, deriveItemViews, getGroupedItemKey } from "../control-client";
+import {
+  ChatItemRow,
+  deriveItemViews,
+  getGroupedItemKey,
+} from "../control-client";
 import type { ChatItem } from "../events-reducer";
 import {
   HermesLiveTranscript,
@@ -44,6 +50,7 @@ interface ResumeResult {
   session_id?: string;
   messages?: HermesMessage[];
   running?: boolean;
+  inflight?: { user?: string | null } | null;
   info?: { model?: string };
 }
 
@@ -80,11 +87,49 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
   const restToolIdsByName = useRef(new Map<string, string[]>());
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const generationRef = useRef(0);
+  const reconnectingRef = useRef(false);
+  const deliverRef = useRef<
+    ((entry: HermesOutboxEntry) => Promise<void>) | null
+  >(null);
 
   const syncFromTranscript = useCallback(() => {
     setItems([...transcriptRef.current.items]);
     setRunning(transcriptRef.current.running);
   }, []);
+
+  const markDelivery = useCallback(
+    (
+      entry: HermesOutboxEntry,
+      status: "sending" | "sent" | "failed",
+      reason?: "network" | "rejected",
+    ) => {
+      const transcript = transcriptRef.current;
+      const index = transcript.items.findIndex(
+        (item) => item.kind === "user" && item.id === entry.id,
+      );
+      if (index >= 0) {
+        transcript.items = transcript.items.map((item, itemIndex) =>
+          itemIndex === index && item.kind === "user"
+            ? { ...item, sendStatus: status, failedReason: reason }
+            : item,
+        );
+      } else {
+        transcript.items = [
+          ...transcript.items,
+          {
+            kind: "user",
+            id: entry.id,
+            content: entry.content,
+            timestamp: entry.createdAt,
+            sendStatus: status,
+            failedReason: reason,
+          },
+        ];
+      }
+      syncFromTranscript();
+    },
+    [syncFromTranscript],
+  );
 
   // ── Connection lifecycle ──────────────────────────────────────────────────
   useEffect(() => {
@@ -95,6 +140,7 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
     const client = new HermesGatewayClient();
     clientRef.current = client;
     let disposed = false;
+    let hasConnected = false;
 
     const applyEvent = (event: HermesGatewayEvent) => {
       if (disposed || generationRef.current !== generation) return;
@@ -110,27 +156,110 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
       setHistoryLoaded(true);
     };
 
+    const deliver = async (
+      entry: HermesOutboxEntry,
+      activeClient: HermesGatewayClient,
+    ) => {
+      markDelivery(entry, "sending");
+      try {
+        await activeClient.request("prompt.submit", {
+          session_id: handleRef.current,
+          text: entry.content,
+          // Current Hermes ignores unknown prompt fields. The bridge/client
+          // retain this stable id for observability and future server dedupe.
+          client_message_id: entry.id,
+        });
+        removeHermesOutbox(entry.id);
+        markDelivery(entry, "sent");
+      } catch (sendError) {
+        const disconnected = activeClient.getState() !== "open";
+        if (!disconnected) removeHermesOutbox(entry.id);
+        transcript.running = false;
+        markDelivery(entry, "failed", disconnected ? "network" : "rejected");
+        throw sendError;
+      }
+    };
+    deliverRef.current = (entry) => deliver(entry, client);
+
+    const resume = async () => {
+      await client.connect();
+      const result = await client.request<ResumeResult>("session.resume", {
+        session_id: sessionId,
+      });
+      if (disposed || generationRef.current !== generation) return;
+      if (result?.session_id) handleRef.current = result.session_id;
+      const messages = Array.isArray(result?.messages)
+        ? result.messages
+        : await getHermesSessionMessages(sessionId);
+      if (disposed || generationRef.current !== generation) return;
+      transcript.reset(hermesHistoryToItems(messages));
+      transcript.running = Boolean(result?.running);
+
+      const pending = getHermesOutbox(sessionId);
+      for (const entry of pending) {
+        if (
+          hermesDeliveryObserved(entry, { messages, inflight: result.inflight })
+        ) {
+          removeHermesOutbox(entry.id);
+          if (!hermesDeliveryObserved(entry, { messages })) {
+            markDelivery(entry, "sent");
+          }
+          continue;
+        }
+        markDelivery(entry, "failed", "network");
+      }
+
+      syncFromTranscript();
+      setHistoryLoaded(true);
+      setTransport("ws");
+      hasConnected = true;
+
+      // Only redeliver after the authoritative resume snapshot proved that
+      // Hermes neither persisted nor started this prompt.
+      if (!result?.running) {
+        for (const entry of getHermesOutbox(sessionId)) {
+          if (disposed || generationRef.current !== generation) return;
+          try {
+            await deliver(entry, client);
+          } catch {
+            break;
+          }
+        }
+      }
+    };
+
+    const reconnect = async () => {
+      if (reconnectingRef.current || disposed) return;
+      reconnectingRef.current = true;
+      setTransport("connecting");
+      let delay = 500;
+      try {
+        while (!disposed && generationRef.current === generation) {
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          try {
+            await resume();
+            return;
+          } catch {
+            delay = Math.min(delay * 2, 5_000);
+          }
+        }
+      } finally {
+        reconnectingRef.current = false;
+      }
+    };
+
+    const unsubscribeState = client.onState((state) => {
+      if (disposed || generationRef.current !== generation) return;
+      if (state === "error" && hasConnected) void reconnect();
+    });
+
+    const unsubscribeEvent = client.onEvent(applyEvent);
+    setHistoryLoaded(false);
+    setTransport("connecting");
+    setError(null);
     void (async () => {
       try {
-        await client.connect();
-        const unsubscribe = client.onEvent(applyEvent);
-        void unsubscribe;
-        const result = await client.request<ResumeResult>("session.resume", {
-          session_id: sessionId,
-        });
-        if (disposed || generationRef.current !== generation) return;
-        if (result?.session_id) handleRef.current = result.session_id;
-        if (Array.isArray(result?.messages)) {
-          transcript.reset(hermesHistoryToItems(result.messages));
-        } else {
-          transcript.reset(
-            hermesHistoryToItems(await getHermesSessionMessages(sessionId)),
-          );
-        }
-        transcript.running = Boolean(result?.running);
-        syncFromTranscript();
-        setHistoryLoaded(true);
-        setTransport("ws");
+        await resume();
       } catch {
         if (disposed || generationRef.current !== generation) return;
         client.close();
@@ -151,11 +280,17 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
 
     return () => {
       disposed = true;
+      unsubscribeState();
+      unsubscribeEvent();
+      if (clientRef.current === client) {
+        clientRef.current = null;
+        deliverRef.current = null;
+      }
       client.close();
       restAbortRef.current?.abort();
       restAbortRef.current = null;
     };
-  }, [sessionId, syncFromTranscript]);
+  }, [markDelivery, sessionId, syncFromTranscript]);
 
   // Session metadata (title) + worker missions spawned by this session.
   useEffect(() => {
@@ -211,16 +346,16 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
   }, [items]);
 
   const pushUserItem = useCallback(
-    (content: string) => {
+    (entry: HermesOutboxEntry) => {
       const transcript = transcriptRef.current;
       transcript.items = [
         ...transcript.items,
         {
           kind: "user",
-          id: localId("hs-user"),
-          content,
-          timestamp: Date.now(),
-          sendStatus: "sent",
+          id: entry.id,
+          content: entry.content,
+          timestamp: entry.createdAt,
+          sendStatus: "sending",
         },
       ];
       transcript.running = true;
@@ -230,7 +365,7 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
   );
 
   const sendViaRest = useCallback(
-    (content: string) => {
+    (entry: HermesOutboxEntry) => {
       const transcript = transcriptRef.current;
       const abort = new AbortController();
       restAbortRef.current = abort;
@@ -257,71 +392,114 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
           });
         }
       };
-      void hermesChatStream(
-        sessionId,
-        content,
-        {
-          onDelta: (text) =>
-            synthesize({ type: "message.delta", payload: { text } }),
-          onThinking: (text) =>
-            synthesize({ type: "thinking.delta", payload: { text } }),
-          onToolStart: (t) => openRestTool(t.tool_name ?? "tool", t.args),
-          onToolComplete: (t) =>
-            closeRestTool(t.tool_name ?? "tool", t.preview),
-          onToolFailed: (t) =>
-            closeRestTool(t.tool_name ?? "tool", t.preview ?? "failed"),
-          onCompleted: (text) =>
-            synthesize({ type: "message.complete", payload: { text } }),
-          onError: (message) =>
-            synthesize({ type: "error", payload: { message } }),
-        },
-        abort.signal,
-      )
-        .catch((err: unknown) => {
+      void (async () => {
+        let streamFailure: string | null = null;
+        try {
+          await hermesChatStream(
+            sessionId,
+            entry.content,
+            {
+              onDelta: (text) =>
+                synthesize({ type: "message.delta", payload: { text } }),
+              onThinking: (text) =>
+                synthesize({ type: "thinking.delta", payload: { text } }),
+              onToolStart: (t) => openRestTool(t.tool_name ?? "tool", t.args),
+              onToolComplete: (t) =>
+                closeRestTool(t.tool_name ?? "tool", t.preview),
+              onToolFailed: (t) =>
+                closeRestTool(t.tool_name ?? "tool", t.preview ?? "failed"),
+              onCompleted: (text) =>
+                synthesize({ type: "message.complete", payload: { text } }),
+              onError: (message) => {
+                streamFailure = message;
+                synthesize({ type: "error", payload: { message } });
+              },
+            },
+            abort.signal,
+          );
+          if (streamFailure) throw new Error(streamFailure);
+          removeHermesOutbox(entry.id);
+          markDelivery(entry, "sent");
+        } catch (err: unknown) {
           if (abort.signal.aborted) return;
+          markDelivery(entry, "failed", "network");
           synthesize({
             type: "error",
             payload: {
               message: err instanceof Error ? err.message : "Send failed",
             },
           });
-        })
-        .finally(() => {
+        } finally {
           if (restAbortRef.current === abort) restAbortRef.current = null;
           synthesize({ type: "turn.end" });
-        });
+        }
+      })();
     },
-    [sessionId, syncFromTranscript],
+    [markDelivery, sessionId, syncFromTranscript],
   );
 
   const handleSubmit = useCallback(
     ({ content }: { content: string }) => {
       const text = content.trim();
       if (!text || running) return;
+      const entry: HermesOutboxEntry = {
+        id: createHermesDeliveryId(),
+        sessionId,
+        content: text,
+        createdAt: Date.now(),
+        userOrdinal: transcriptRef.current.items.filter(
+          (item) => item.kind === "user",
+        ).length,
+      };
+      putHermesOutbox(entry);
       setInput("");
       setError(null);
-      pushUserItem(text);
-      if (transport === "ws" && clientRef.current) {
-        clientRef.current
-          .request("prompt.submit", {
-            session_id: handleRef.current,
-            text,
-          })
-          .catch((err: unknown) => {
-            const transcript = transcriptRef.current;
-            transcript.apply({
-              type: "error",
-              payload: {
-                message: err instanceof Error ? err.message : "Send failed",
-              },
-            });
-            syncFromTranscript();
-          });
+      pushUserItem(entry);
+      if (transport === "ws" && deliverRef.current) {
+        deliverRef.current(entry).catch((err: unknown) => {
+          setError(
+            err instanceof Error ? err.message : "Message not delivered",
+          );
+        });
       } else {
-        sendViaRest(text);
+        sendViaRest(entry);
       }
     },
-    [pushUserItem, running, sendViaRest, syncFromTranscript, transport],
+    [pushUserItem, running, sendViaRest, sessionId, transport],
+  );
+
+  const retryUserMessage = useCallback(
+    (message: { id: string; content: string }) => {
+      if (running) return;
+      const existing = getHermesOutbox(sessionId).find(
+        (entry) => entry.id === message.id,
+      );
+      const entry: HermesOutboxEntry = existing ?? {
+        id: message.id,
+        sessionId,
+        content: message.content,
+        createdAt: Date.now(),
+        userOrdinal: Math.max(
+          0,
+          transcriptRef.current.items.filter((item) => item.kind === "user")
+            .length - 1,
+        ),
+      };
+      putHermesOutbox(entry);
+      transcriptRef.current.running = true;
+      markDelivery(entry, "sending");
+      setError(null);
+      if (transport === "ws" && deliverRef.current) {
+        deliverRef.current(entry).catch((err: unknown) => {
+          setError(
+            err instanceof Error ? err.message : "Message not delivered",
+          );
+        });
+      } else {
+        sendViaRest(entry);
+      }
+    },
+    [markDelivery, running, sendViaRest, sessionId, transport],
   );
 
   const handleStop = useCallback(() => {
@@ -372,9 +550,7 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
       <div className="flex items-center gap-2 border-b border-white/5 px-4 py-2.5">
         <Sparkles className="h-4 w-4 shrink-0 text-indigo-400" />
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-medium text-white">
-            {title}
-          </div>
+          <div className="truncate text-sm font-medium text-white">{title}</div>
           <div className="text-[11px] text-white/40">
             Hermes session
             {transport === "rest" && " · live events unavailable (polling)"}
@@ -450,7 +626,7 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
               onResume={noop}
               onToolResult={noopToolResult}
               onOptimisticToolResult={noop}
-              onRetryUserMessage={noop}
+              onRetryUserMessage={retryUserMessage}
             />
           ))}
         </div>
