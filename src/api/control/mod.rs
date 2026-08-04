@@ -9425,6 +9425,19 @@ pub async fn update_mission_origin(
             ));
         }
     }
+    // Existence first: the memory and file stores answer a missing mission
+    // with a plain Err, which `internal_error` would surface as a 500 — a
+    // caller backfilling origins in bulk needs "this one is gone" to read as
+    // 404, not as a server fault it should retry.
+    if control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, format!("mission {id} not found")));
+    }
     control
         .mission_store
         .set_mission_origin(id, origin, session)
