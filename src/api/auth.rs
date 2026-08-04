@@ -299,30 +299,43 @@ pub async fn login(
     Ok(Json(LoginResponse { token, exp }))
 }
 
+/// Resolve an [`AuthUser`] from a bare JWT, mirroring `require_auth` exactly
+/// (dev-mode bypass included). Exists for handlers that receive the token
+/// outside the `Authorization` header — browser WebSocket clients cannot set
+/// request headers, so they pass the JWT as a query parameter instead.
+pub fn authenticate_token(
+    config: &crate::config::Config,
+    token: &str,
+) -> Result<AuthUser, (StatusCode, &'static str)> {
+    if config.dev_mode {
+        return Ok(implicit_single_tenant_user(config));
+    }
+    let secret = config.auth.jwt_secret.as_deref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "JWT_SECRET not configured",
+    ))?;
+    if token.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "Missing Authorization header"));
+    }
+    let claims = verify_jwt(token, secret)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid or expired token"))?;
+    match config.auth.auth_mode(config.dev_mode) {
+        AuthMode::MultiUser => user_for_claims(&claims, &config.auth.users)
+            .or_else(|| github_user_for_claims(&claims, config))
+            .ok_or((StatusCode::UNAUTHORIZED, "Invalid user")),
+        AuthMode::SingleTenant => Ok(AuthUser {
+            id: claims.sub,
+            username: claims.usr,
+        }),
+        AuthMode::Disabled => Ok(implicit_single_tenant_user(config)),
+    }
+}
+
 pub async fn require_auth(
     State(state): State<std::sync::Arc<AppState>>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // Dev mode => no auth checks.
-    if state.config.dev_mode {
-        req.extensions_mut()
-            .insert(implicit_single_tenant_user(&state.config));
-        return next.run(req).await;
-    }
-
-    // If auth isn't configured, fail closed in non-dev mode.
-    let secret = match state.config.auth.jwt_secret.as_deref() {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "JWT_SECRET not configured",
-            )
-                .into_response();
-        }
-    };
-
     let auth_header = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -334,33 +347,12 @@ pub async fn require_auth(
         .or_else(|| auth_header.strip_prefix("bearer "))
         .unwrap_or("");
 
-    if token.is_empty() {
-        return (StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response();
-    }
-
-    match verify_jwt(token, secret) {
-        Ok(claims) => {
-            let user = match state.config.auth.auth_mode(state.config.dev_mode) {
-                AuthMode::MultiUser => {
-                    match user_for_claims(&claims, &state.config.auth.users)
-                        .or_else(|| github_user_for_claims(&claims, &state.config))
-                    {
-                        Some(u) => u,
-                        None => {
-                            return (StatusCode::UNAUTHORIZED, "Invalid user").into_response();
-                        }
-                    }
-                }
-                AuthMode::SingleTenant => AuthUser {
-                    id: claims.sub,
-                    username: claims.usr,
-                },
-                AuthMode::Disabled => implicit_single_tenant_user(&state.config),
-            };
+    match authenticate_token(&state.config, token) {
+        Ok(user) => {
             req.extensions_mut().insert(user);
             next.run(req).await
         }
-        Err(_) => (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response(),
+        Err((status, message)) => (status, message).into_response(),
     }
 }
 

@@ -71,6 +71,13 @@ export interface Mission {
   resumable?: boolean;
   session_id?: string | null;
   parent_mission_id?: string;
+  /** Which system created this mission (e.g. "hermes" for the assistant MCP). */
+  origin?: string | null;
+  /**
+   * External conversation that spawned this mission — the Hermes session id
+   * when `origin` is "hermes". Groups the mission as a worker of that session.
+   */
+  origin_session_id?: string | null;
   working_directory?: string;
   mission_mode?: "task" | "assistant";
   goal_mode?: boolean;

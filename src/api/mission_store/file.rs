@@ -327,6 +327,8 @@ impl MissionStore for FileMissionStore {
                 ..Default::default()
             },
             awaiting_kind: None,
+            origin: None,
+            origin_session_id: None,
         };
         self.missions
             .write()
@@ -662,6 +664,22 @@ impl MissionStore for FileMissionStore {
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
         mission.awaiting_kind = kind;
+        drop(missions);
+        self.persist().await
+    }
+
+    async fn set_mission_origin(
+        &self,
+        id: Uuid,
+        origin: &str,
+        origin_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+        mission.origin = Some(origin.to_string());
+        mission.origin_session_id = origin_session_id.map(ToString::to_string);
         drop(missions);
         self.persist().await
     }
