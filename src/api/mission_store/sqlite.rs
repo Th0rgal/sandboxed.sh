@@ -2927,9 +2927,16 @@ impl MissionStore for SqliteMissionStore {
                 bind("origin_session_id = ?n", v, &mut clauses, &mut binds);
             }
             if let Some(v) = filter.tag.as_deref() {
+                // Match the tag's JSON *serialization*, quotes included: a tag
+                // holding a quote/backslash/newline is escaped inside the
+                // column, so a raw-text LIKE would exclude it in SQL and the
+                // Rust re-check below would never get to see it. Over-matching
+                // is fine here (LIKE wildcards in the tag only widen the
+                // candidate set); under-matching would be a silent miss.
+                let encoded = serde_json::to_string(v).unwrap_or_else(|_| format!("\"{v}\""));
                 bind(
-                    r#"tags LIKE '%"' || ?n || '"%'"#,
-                    v,
+                    "tags LIKE '%' || ?n || '%'",
+                    &encoded,
                     &mut clauses,
                     &mut binds,
                 );
@@ -16500,6 +16507,42 @@ mod filter_tests {
             .iter()
             .chain(second.iter())
             .all(|m| m.project.track.as_deref() == Some("core-c3")));
+    }
+
+    /// A tag holding a JSON-escaped character is stored escaped in the column,
+    /// so the prefilter has to match its SERIALIZATION, not its raw text —
+    /// otherwise SQL drops it before the Rust re-check can rescue it.
+    #[tokio::test]
+    async fn tag_filter_matches_json_escaped_tags() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+        for tag in [r#"quote"inside"#, r"back\slash", "new\nline"] {
+            let id = seed(&store, tag, Some("verity"), None, None).await;
+            store
+                .update_mission_project(
+                    id,
+                    MissionProjectPatch {
+                        tags: Some(vec![tag.to_string()]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("tag");
+
+            let found = store
+                .list_missions_filtered(
+                    &MissionFilter {
+                        tag: Some(tag.to_string()),
+                        ..Default::default()
+                    },
+                    50,
+                    0,
+                )
+                .await
+                .expect("filtered list");
+            assert_eq!(found.len(), 1, "tag {tag:?} must be findable");
+            assert_eq!(found[0].id, id);
+        }
     }
 
     /// `tags` is JSON TEXT and some rows hold malformed blobs, which is why

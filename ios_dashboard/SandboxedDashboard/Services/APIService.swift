@@ -223,8 +223,29 @@ final class APIService {
     
     // MARK: - Missions
     
-    func listMissions() async throws -> [Mission] {
-        try await get("/api/control/missions")
+    /// Missions, newest first. Filters are applied server-side: filtering a
+    /// bare page client-side silently reported none once a conversation's
+    /// workers had scrolled past the default page.
+    func listMissions(
+        originSessionId: String? = nil,
+        project: String? = nil,
+        projectPrefix: String? = nil,
+        track: String? = nil,
+        limit: Int? = nil
+    ) async throws -> [Mission] {
+        var items: [URLQueryItem] = []
+        if let originSessionId { items.append(URLQueryItem(name: "origin_session_id", value: originSessionId)) }
+        if let project { items.append(URLQueryItem(name: "project", value: project)) }
+        if let projectPrefix { items.append(URLQueryItem(name: "project_prefix", value: projectPrefix)) }
+        if let track { items.append(URLQueryItem(name: "track", value: track)) }
+        if let limit { items.append(URLQueryItem(name: "limit", value: String(limit))) }
+        guard !items.isEmpty else {
+            return try await get("/api/control/missions")
+        }
+        var components = URLComponents()
+        components.queryItems = items
+        let query = components.percentEncodedQuery ?? ""
+        return try await get("/api/control/missions?\(query)")
     }
     
     func getMission(id: String) async throws -> Mission {
