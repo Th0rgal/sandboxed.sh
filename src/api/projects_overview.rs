@@ -38,9 +38,92 @@ const DELIVERY_SCAN_LIMIT: usize = 600;
 /// is flagged stale-active.
 const STALE_ACTIVE_HOURS: i64 = 24;
 
+/// How often the state ingestor folds new deliveries into the timeline.
+///
+/// The window it re-reads overlaps generously; `record_state` is idempotent on
+/// a delivery's timestamp precisely so that overlap is free.
+const STATE_INGEST_INTERVAL_SECS: u64 = 60;
+
+/// Fold controller state signatures into the durable project timeline.
+///
+/// A background task rather than work done on read: ingesting inside the
+/// overview handler would be an unbounded write on a GET, and the history has
+/// to accumulate whether or not anyone has the board open — that is the whole
+/// point of asking "what has this project been doing for three days".
+pub fn spawn_state_ingestor(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(STATE_INGEST_INTERVAL_SECS)).await;
+            let Some(path) = hermes_state_db() else {
+                continue;
+            };
+            let deliveries = match tokio::task::spawn_blocking(move || {
+                read_deliveries(&path, DELIVERY_SCAN_LIMIT, None)
+            })
+            .await
+            {
+                Ok(Ok(deliveries)) => deliveries,
+                Ok(Err(error)) => {
+                    tracing::warn!("state ingest: hermes deliveries unavailable: {error}");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!("state ingest: join failed: {error}");
+                    continue;
+                }
+            };
+            // read_deliveries returns newest-first; replay oldest-first so a
+            // run of the same state lands as one extended row rather than
+            // being rejected as out-of-order.
+            for delivery in deliveries.into_iter().rev() {
+                // Both are required: the routing key says which project the
+                // row belongs to, the descriptor says what to record. A
+                // delivery carrying only a key has reported no state.
+                let (Some(slug), Some(descriptor)) =
+                    (delivery.signature.as_deref(), delivery.state.as_deref())
+                else {
+                    continue;
+                };
+                let headline = Some(delivery.headline.as_str()).filter(|h| !h.is_empty());
+                if let Err(error) =
+                    state
+                        .projects
+                        .record_state(slug, descriptor, headline, &delivery.at)
+                {
+                    tracing::warn!("state ingest: {slug}: {error}");
+                }
+            }
+        }
+    });
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// A project's state history, newest first.
+pub async fn project_state(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Query(query): Query<StateQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err((StatusCode::BAD_REQUEST, "invalid project slug".to_string()));
+    }
+    let limit = query.limit.unwrap_or(50).min(200);
+    let states = state
+        .projects
+        .state_timeline(&slug, limit)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(serde_json::json!({ "slug": slug, "states": states })))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/overview", get(projects_overview))
+        .route("/:slug/state", get(project_state))
         .route("/:slug/updates", get(project_updates))
         .route("/:slug/action", axum::routing::post(project_action))
         .route(
@@ -111,7 +194,14 @@ pub struct DeliveryUpdate {
     body: Option<String>,
     session_id: String,
     at: String,
+    /// Routing key: the FIRST field of the STATE_SIGNATURE trailer. Says which
+    /// project the delivery belongs to, not what state it is in.
     signature: Option<String>,
+    /// The rest of the trailer — the fields that actually describe the state
+    /// (`phase1-stack|7dba916|clean-ready|ci-failures-3-prs|…`). Two deliveries
+    /// with the same value reported the same world.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
     blocker: Option<String>,
 }
 
@@ -314,7 +404,8 @@ struct ProjectRowBuilder {
     /// Health inputs, accumulated alongside the display chips.
     health_inputs: Vec<OwnedHealthInput>,
     latest_update: Option<DeliveryUpdate>,
-    recent_signatures: Vec<Option<String>>,
+    /// The three newest state descriptors, for the stall signal.
+    recent_states: Vec<Option<String>>,
     updates_count: usize,
 }
 
@@ -326,17 +417,17 @@ impl ProjectRowBuilder {
             missions: Vec::new(),
             health_inputs: Vec::new(),
             latest_update: None,
-            recent_signatures: Vec::new(),
+            recent_states: Vec::new(),
             updates_count: 0,
         }
     }
 
     /// Deliveries arrive newest-first; keep the first as latest and remember
-    /// the three most recent signatures for the repeated-state stall signal.
+    /// the three most recent *state descriptors* for the stall signal.
     fn push_delivery(&mut self, delivery: DeliveryUpdate) {
         self.updates_count += 1;
-        if self.recent_signatures.len() < 3 {
-            self.recent_signatures.push(delivery.signature.clone());
+        if self.recent_states.len() < 3 {
+            self.recent_states.push(delivery.state.clone());
         }
         if self.latest_update.is_none() {
             self.latest_update = Some(delivery);
@@ -367,12 +458,17 @@ impl ProjectRowBuilder {
             }
             // Same non-silent state three ticks in a row: the controller
             // keeps reporting an unchanged world — the phantom-lease shape.
-            if latest.signature.is_some()
-                && self.recent_signatures.len() >= 3
+            // Compare the state descriptor, not the routing key. The key is
+            // near-constant within a row by construction, so the old
+            // comparison fired for essentially every project with three
+            // updates — carrying no information at all, and flagging projects
+            // making progress every tick identically to genuinely stuck ones.
+            if latest.state.is_some()
+                && self.recent_states.len() >= 3
                 && self
-                    .recent_signatures
+                    .recent_states
                     .iter()
-                    .all(|signature| signature == &latest.signature)
+                    .all(|state| state == &latest.state)
             {
                 attention.push("same state on 3 consecutive updates".to_string());
             }
@@ -836,20 +932,27 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
         headline = tag_title.unwrap_or_default();
     }
 
-    let signature = content
-        .lines()
-        .rev()
-        .find_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .strip_prefix("[STATE_SIGNATURE:")
-                .and_then(|rest| rest.strip_suffix(']'))
-        })
+    // `[STATE_SIGNATURE: <routing-key>|<state fields…>]`. The first field says
+    // WHICH project; everything after it says WHAT state it is in. Conflating
+    // the two is what made the stall signal meaningless — see `state` below.
+    let trailer = content.lines().rev().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("[STATE_SIGNATURE:")
+            .and_then(|rest| rest.strip_suffix(']'))
+    });
+    let signature = trailer
         .and_then(|inner| inner.split('|').next())
         .map(|key| key.trim().to_string())
         // Reject template placeholders like `<project>` and anything that
         // isn't a plain routing key.
         .filter(|key| is_plain_key(key));
+    // The state descriptor: the trailer minus its routing key. Empty when the
+    // controller emitted a key and nothing else, which is not a state.
+    let state = trailer
+        .and_then(|inner| inner.split_once('|'))
+        .map(|(_, rest)| rest.trim().to_string())
+        .filter(|rest| !rest.is_empty());
 
     // "Bloqué par:" / "Blocked by:" field, when it names a real blocker.
     let blocker = content.lines().find_map(|line| {
@@ -893,6 +996,7 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
         session_id: session_id.to_string(),
         at,
         signature,
+        state,
         blocker,
     }
 }
@@ -917,6 +1021,78 @@ mod tests {
             .as_deref()
             .is_some_and(|b| b.contains("lease writer fantôme")));
         assert!(!parsed.at.is_empty());
+    }
+
+    /// The trailer's first field routes; the rest describes the state. Keeping
+    /// them apart is the whole fix — see the stall-signal test below.
+    #[test]
+    fn the_state_descriptor_is_the_trailer_minus_its_routing_key() {
+        let content = "[Cron delivery: x]\nTitre\n\
+                       [STATE_SIGNATURE: verity|phase1-stack|7dba916|clean-ready|none]\n";
+        let parsed = parse_delivery("sess-1", 1_754_000_000.0, content);
+        assert_eq!(parsed.signature.as_deref(), Some("verity"));
+        assert_eq!(
+            parsed.state.as_deref(),
+            Some("phase1-stack|7dba916|clean-ready|none")
+        );
+    }
+
+    #[test]
+    fn a_routing_key_with_no_state_fields_is_not_a_state() {
+        let content = "[Cron delivery: x]\nTitre\n[STATE_SIGNATURE: verity]\n";
+        let parsed = parse_delivery("sess-1", 1_754_000_000.0, content);
+        assert_eq!(parsed.signature.as_deref(), Some("verity"));
+        assert_eq!(parsed.state, None);
+
+        // A trailing separator with nothing after it is the same absence.
+        let content = "[Cron delivery: x]\nTitre\n[STATE_SIGNATURE: verity|  ]\n";
+        assert_eq!(parse_delivery("s", 1.0, content).state, None);
+    }
+
+    /// The signal used to compare the *routing key*, which is near-constant
+    /// within a project row by construction — so it fired for essentially
+    /// every project with three updates, flagging steady progress and a real
+    /// stall identically. Measured on prod: 6 of 26 rows, i.e. exactly those
+    /// with three or more deliveries.
+    #[test]
+    fn the_stall_signal_tracks_the_state_not_the_routing_key() {
+        let delivery = |state: &str, at: &str| DeliveryUpdate {
+            headline: "h".into(),
+            body: None,
+            session_id: "s".into(),
+            at: at.into(),
+            signature: Some("verity".into()),
+            state: Some(state.into()),
+            blocker: None,
+        };
+
+        // Same project, three genuinely different states: not a stall.
+        let mut moving = ProjectRowBuilder::new("verity".into());
+        for (i, state) in ["a|1", "b|2", "c|3"].iter().enumerate() {
+            moving.push_delivery(delivery(state, &format!("2026-08-04T1{i}:00:00Z")));
+        }
+        let row = moving.finish(&[], None, None, "2026-08-04T20:00:00Z");
+        assert!(
+            !row.attention_reasons
+                .iter()
+                .any(|r| r.contains("3 consecutive")),
+            "a project changing state every tick must not be flagged: {:?}",
+            row.attention_reasons
+        );
+
+        // Same state three times running: that is the stall worth reporting.
+        let mut stuck = ProjectRowBuilder::new("verity".into());
+        for i in 0..3 {
+            stuck.push_delivery(delivery("blocked|same", &format!("2026-08-04T1{i}:00:00Z")));
+        }
+        let row = stuck.finish(&[], None, None, "2026-08-04T20:00:00Z");
+        assert!(
+            row.attention_reasons
+                .iter()
+                .any(|r| r.contains("3 consecutive")),
+            "an unchanged state must still be flagged: {:?}",
+            row.attention_reasons
+        );
     }
 
     #[test]
@@ -1026,6 +1202,7 @@ mod tests {
             at: "2026-08-04T12:00:00Z".into(),
             session_id: "cron_e594d751447d_20260804_120931".into(),
             signature: None,
+            state: None,
             blocker: None,
         });
         let row = builder.finish(
@@ -1052,6 +1229,7 @@ mod tests {
             at: "2026-08-04T12:00:00Z".into(),
             session_id: "cron_e594d751447d_20260804_120931".into(),
             signature: None,
+            state: None,
             blocker: None,
         });
         let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
