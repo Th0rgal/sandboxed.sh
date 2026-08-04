@@ -17,7 +17,8 @@
 import { apiUrl } from "@/lib/api/core";
 import { getValidJwt } from "@/lib/auth";
 
-export type HermesGatewayState = "idle" | "connecting" | "open" | "closed" | "error";
+export type HermesGatewayState =
+  "idle" | "connecting" | "open" | "closed" | "error";
 
 export interface HermesGatewayEvent<P = unknown> {
   type: string;
@@ -75,8 +76,13 @@ export class HermesGatewayClient {
   /** Connect and resolve once the socket is open (the server then emits a
    * `gateway.ready` event through `onEvent`). */
   connect(): Promise<void> {
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
       return Promise.resolve();
+    }
+    if (this.ws?.readyState === WebSocket.CONNECTING) {
+      return Promise.reject(
+        new Error("Hermes gateway connection already in progress"),
+      );
     }
     this.closedByUser = false;
     const jwt = getValidJwt();
@@ -132,6 +138,7 @@ export class HermesGatewayClient {
       };
       ws.onclose = () => {
         clearTimeout(connectTimer);
+        if (this.ws === ws) this.ws = null;
         this.failAllPending(new Error("Hermes gateway connection closed"));
         this.setState(this.closedByUser ? "closed" : "error");
         if (!settled) {
