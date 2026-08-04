@@ -2385,6 +2385,16 @@ impl SqliteMissionStore {
                 "idx_missions_project_track",
                 "CREATE INDEX IF NOT EXISTS idx_missions_project_track ON missions(project, track)",
             ),
+            (
+                // `track` alone cannot use the composite above — SQLite can
+                // only seek an index by a prefix of its columns, and that one
+                // starts with `project`. Both client APIs and the control
+                // endpoint accept `track` without a project, so without this
+                // a rare or missing track scanned the whole fleet while the
+                // connection mutex was held, once per page.
+                "idx_missions_track_updated",
+                "CREATE INDEX IF NOT EXISTS idx_missions_track_updated ON missions(track, updated_at DESC)",
+            ),
         ] {
             if let Err(e) = conn.execute(ddl, []) {
                 tracing::warn!("creating {} skipped: {}", name, e);
@@ -16603,6 +16613,43 @@ mod filter_tests {
         assert!(
             !detail.contains("SCAN missions"),
             "family lookup must not scan the table, got: {detail}"
+        );
+    }
+
+    /// A `track` filter with no project must seek too. The composite index
+    /// starts with `project`, and SQLite can only seek an index by a prefix of
+    /// its columns — so track-alone fell back to `SCAN missions`, once per
+    /// page, with the connection mutex held. Both client APIs and the control
+    /// endpoint permit that combination, so it is a reachable path and not a
+    /// theoretical one.
+    #[tokio::test]
+    async fn track_only_lookup_uses_an_index() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+        seed(&store, "m", Some("verity"), Some("core-c3"), None).await;
+
+        let plan: Vec<String> = {
+            let conn = store.conn.lock().await;
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT id FROM missions \
+                     WHERE track = ?1 ORDER BY updated_at DESC LIMIT 200 OFFSET 0",
+                )
+                .expect("prepare plan");
+            stmt.query_map(rusqlite::params!["core-c3"], |row| row.get::<_, String>(3))
+                .expect("plan rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("plan detail")
+        };
+
+        let detail = plan.join(" | ");
+        assert!(
+            !detail.contains("SCAN missions"),
+            "track-only lookup must not scan the table, got: {detail}"
+        );
+        assert!(
+            detail.contains("idx_missions_track_updated"),
+            "track-only lookup should seek the track index, got: {detail}"
         );
     }
 
