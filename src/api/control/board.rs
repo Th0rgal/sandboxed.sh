@@ -146,16 +146,37 @@ fn retry_disposition(task: &BoardTask, preflight: &RetryPreflight) -> RetryDispo
     }
 }
 
-/// Guidance prepended to automatic-retry prompts. A failed attempt often
-/// means the prompt over-specified the approach, not just that the worker
-/// slipped: the retry is told explicitly that only the task's acceptance
-/// criteria / verification are binding, so it can pick a simpler approach
-/// instead of mechanically re-running the one that just failed.
+/// Guidance prepended to automatic-retry prompts when the task declares an
+/// outcome contract. A failed attempt often means the prompt over-specified
+/// the approach, not just that the worker slipped: the retry is told
+/// explicitly that only the task's acceptance criteria / verification are
+/// binding, so it can pick a simpler approach instead of mechanically
+/// re-running the one that just failed.
 const RETRY_RELAXATION_GUIDANCE: &str = "[Retry guidance] The prior attempt failed. Do not \
     mechanically repeat it. The task's success condition — its acceptance criteria and \
     verification command (see the task-board contract below) — is the only hard requirement; \
     any suggested approach in the prompt is advisory. Choose the simplest approach that \
     satisfies the success condition and addresses the prior failure.";
+
+/// Retry guidance for tasks WITHOUT an outcome contract. The prompt is then
+/// the task's only specification, so it must stay binding — declaring it
+/// advisory here would leave the retry with no success condition at all and
+/// let a worker simplify away required behavior.
+const RETRY_PROMPT_BINDING_GUIDANCE: &str = "[Retry guidance] The prior attempt failed. Do \
+    not mechanically repeat it. The prompt's stated scope and success condition remain \
+    binding; what is open is the approach — try a different or simpler way to satisfy them, \
+    addressing the prior failure.";
+
+/// Whether the task declares an objective success condition beyond its
+/// prompt: non-empty acceptance criteria or a non-blank verification command.
+fn has_outcome_contract(task: &BoardTask) -> bool {
+    !task.acceptance_criteria.is_empty()
+        || task
+            .verification_command
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|command| !command.is_empty())
+}
 
 fn retry_prompt(task: &BoardTask, preflight: &RetryPreflight) -> String {
     let mut sections: Vec<String> = Vec::new();
@@ -209,7 +230,12 @@ fn retry_prompt(task: &BoardTask, preflight: &RetryPreflight) -> String {
     }
 
     if task.attempts > 1 {
-        sections.push(RETRY_RELAXATION_GUIDANCE.to_string());
+        let guidance = if has_outcome_contract(task) {
+            RETRY_RELAXATION_GUIDANCE
+        } else {
+            RETRY_PROMPT_BINDING_GUIDANCE
+        };
+        sections.push(guidance.to_string());
     }
 
     sections.push(task.prompt.clone());
@@ -729,7 +755,7 @@ fn worker_contract(task: &BoardTask) -> String {
         contract.push_str(command);
         contract.push('`');
     }
-    if !task.acceptance_criteria.is_empty() || verification.is_some() {
+    if has_outcome_contract(task) {
         contract.push_str(
             "\n- The criteria/verification above define success. Any approach that satisfies \
              them is acceptable — the prompt's suggested approach is advisory; prefer the \
@@ -2335,13 +2361,32 @@ mod tests {
     fn automatic_retry_relaxes_the_spec_instead_of_repeating_it() {
         let mut task = mk("relaxed-retry", &[], BoardTaskStatus::Pending, None);
         task.attempts = 2; // spawn_task_worker increments before building the prompt
+        task.acceptance_criteria = vec!["tests pass".to_string()];
         task.prior_outcome = Some(BoardTaskOutcome::Failed);
         task.prior_result_digest = Some("build failed: missing import".into());
 
         let prompt = retry_prompt(&task, &RetryPreflight::NothingFound);
 
         assert!(prompt.contains("[Retry guidance]"));
+        assert!(prompt.contains("advisory"));
         assert!(prompt.contains("build failed: missing import"));
+        assert!(prompt.ends_with(&task.prompt));
+    }
+
+    #[test]
+    fn retry_without_outcome_contract_keeps_the_prompt_binding() {
+        // No acceptance criteria / verification command: the prompt is the
+        // task's only spec, so the retry must NOT be told it is advisory.
+        let mut task = mk("prompt-only-retry", &[], BoardTaskStatus::Pending, None);
+        task.attempts = 2;
+        task.prior_outcome = Some(BoardTaskOutcome::Failed);
+        task.prior_result_digest = Some("worker gave up".into());
+
+        let prompt = retry_prompt(&task, &RetryPreflight::NothingFound);
+
+        assert!(prompt.contains("[Retry guidance]"));
+        assert!(prompt.contains("remain\n    binding") || prompt.contains("remain binding"));
+        assert!(!prompt.contains("advisory"));
         assert!(prompt.ends_with(&task.prompt));
     }
 
