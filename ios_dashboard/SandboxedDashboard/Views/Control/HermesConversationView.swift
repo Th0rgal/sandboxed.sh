@@ -286,8 +286,9 @@ struct HermesConversationView: View {
                 resolvedSession = sessions.first { $0.id == sessionId }
             }
         }
-        if let missions = try? await api.listMissions(), gen == generation {
-            workerMissions = missions.filter { $0.originSessionId == sessionId }
+        if let missions = try? await api.listMissions(originSessionId: sessionId, limit: 200),
+           gen == generation {
+            workerMissions = missions
         }
     }
 

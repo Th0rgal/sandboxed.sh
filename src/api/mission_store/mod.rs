@@ -43,6 +43,72 @@ pub struct MissionScheduling {
     pub deadline: Option<String>,
 }
 
+/// Which missions a listing wants. One value, one predicate — so the SQL
+/// pushdown and the in-memory scan can never disagree about what a filter
+/// means.
+///
+/// `project` stays an exact match: widening it would silently change every
+/// existing caller's results. Cross-phase queries ask for `project_prefix`
+/// instead, which matches a project family (`verity` covers `verity-core`,
+/// `verity-phase1d`, …) while a project is being migrated onto the
+/// `project` + `track` convention.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MissionFilter {
+    pub status: Option<String>,
+    pub project: Option<String>,
+    /// Family match: `project == X` OR `project` starts with `X-`.
+    pub project_prefix: Option<String>,
+    pub track: Option<String>,
+    pub tag: Option<String>,
+    /// The conversation a mission was launched from (Hermes session id).
+    pub origin_session_id: Option<String>,
+}
+
+impl MissionFilter {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// True when `project` belongs to the `family` family: the family itself,
+    /// or a `family-<suffix>` member. Deliberately hyphen-anchored so `verity`
+    /// never swallows `verityx`.
+    fn in_family(project: &str, family: &str) -> bool {
+        project == family
+            || (project.len() > family.len()
+                && project.starts_with(family)
+                && project.as_bytes()[family.len()] == b'-')
+    }
+
+    pub fn matches(&self, mission: &Mission) -> bool {
+        self.status
+            .as_deref()
+            .is_none_or(|s| mission.status.to_string() == s)
+            && self
+                .project
+                .as_deref()
+                .is_none_or(|p| mission.project.project.as_deref() == Some(p))
+            && self.project_prefix.as_deref().is_none_or(|family| {
+                mission
+                    .project
+                    .project
+                    .as_deref()
+                    .is_some_and(|p| Self::in_family(p, family))
+            })
+            && self
+                .track
+                .as_deref()
+                .is_none_or(|t| mission.project.track.as_deref() == Some(t))
+            && self
+                .tag
+                .as_deref()
+                .is_none_or(|t| mission.project.tags.iter().any(|x| x == t))
+            && self
+                .origin_session_id
+                .as_deref()
+                .is_none_or(|s| mission.origin_session_id.as_deref() == Some(s))
+    }
+}
+
 /// Project tagging metadata for a mission. Flattened into `Mission` so the
 /// fields appear top-level in serialized output. Lets external consumers (e.g.
 /// Paloma) group/filter/route missions by project, track, intent, PR, or
@@ -1768,6 +1834,53 @@ pub trait MissionStore: Send + Sync {
 
     /// List missions, ordered by updated_at descending.
     async fn list_missions(&self, limit: usize, offset: usize) -> Result<Vec<Mission>, String>;
+
+    /// Filtered listing, newest first. `offset` counts MATCHES, not raw rows.
+    ///
+    /// The default implementation pages `list_missions` and applies
+    /// [`MissionFilter::matches`], so it is bounded by `MAX_FILTER_SCAN` and
+    /// can miss matches that live deeper than that in a large fleet. Stores
+    /// that can push the predicate down (sqlite) override this and are exact.
+    async fn list_missions_filtered(
+        &self,
+        filter: &MissionFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Mission>, String> {
+        const PAGE: usize = 200;
+        const MAX_FILTER_SCAN: usize = 5_000;
+        if filter.is_empty() {
+            return self.list_missions(limit, offset).await;
+        }
+        let want = offset.saturating_add(limit);
+        let mut matched: Vec<Mission> = Vec::new();
+        let mut scan_offset = 0usize;
+        let mut scanned = 0usize;
+        loop {
+            let page = self.list_missions(PAGE, scan_offset).await?;
+            let page_len = page.len();
+            for mission in page {
+                if filter.matches(&mission) {
+                    matched.push(mission);
+                    if matched.len() >= want {
+                        break;
+                    }
+                }
+            }
+            scanned += page_len;
+            if matched.len() >= want || page_len < PAGE || scanned >= MAX_FILTER_SCAN {
+                if scanned >= MAX_FILTER_SCAN && matched.len() < want {
+                    tracing::warn!(
+                        "list_missions_filtered scan hit cap ({}); results may be incomplete",
+                        MAX_FILTER_SCAN
+                    );
+                }
+                break;
+            }
+            scan_offset += PAGE;
+        }
+        Ok(matched.into_iter().skip(offset).take(limit).collect())
+    }
 
     /// Count missions by status without applying list pagination.
     async fn count_missions_by_status(&self) -> Result<MissionStatusCounts, String>;

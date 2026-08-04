@@ -304,11 +304,15 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
         // Title stays generic; not fatal.
       }
       try {
-        const missions = await listMissions();
+        // Server-side filter: fetching the newest 50 and filtering here used
+        // to show zero workers for any conversation whose missions had
+        // scrolled out of that page.
+        const missions = await listMissions({
+          originSessionId: sessionId,
+          limit: 200,
+        });
         if (cancelled) return;
-        setWorkerMissions(
-          missions.filter((m) => m.origin_session_id === sessionId),
-        );
+        setWorkerMissions(missions);
       } catch {
         // Worker strip stays empty; not fatal.
       }
