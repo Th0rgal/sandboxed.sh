@@ -79,6 +79,32 @@ struct MissionChip {
     github_pr: Option<String>,
 }
 
+/// Owned copy of what the health rollup reads.
+///
+/// The chip list is truncated to the 8 newest missions for display; the rollup
+/// must see *all* of them, or a project's oldest broken track becomes invisible
+/// precisely when it has been broken longest.
+#[derive(Debug, Clone)]
+struct OwnedHealthInput {
+    track: Option<String>,
+    status: MissionStatus,
+    desired_state: Option<String>,
+    next_check_at: Option<String>,
+    updated_at: String,
+}
+
+impl OwnedHealthInput {
+    fn as_input(&self) -> super::project_health::MissionHealthInput<'_> {
+        super::project_health::MissionHealthInput {
+            track: self.track.as_deref(),
+            status: self.status,
+            desired_state: self.desired_state.as_deref(),
+            next_check_at: self.next_check_at.as_deref(),
+            updated_at: self.updated_at.as_str(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryUpdate {
     headline: String,
@@ -98,6 +124,9 @@ struct ProjectRow {
     latest_update: Option<DeliveryUpdate>,
     updates_count: usize,
     attention_reasons: Vec<String>,
+    /// Per-track rollup, worst-first. Answers "which track is stuck" without
+    /// making the reader scan a list of 800 mission chips.
+    health: super::project_health::ProjectHealth,
     /// The conversation to open for this project. An explicit binding wins;
     /// otherwise the newest delivery's session is offered as a GUESS, tagged
     /// as such — cron controllers open a throwaway session per tick, so an
@@ -158,6 +187,9 @@ pub async fn projects_overview(
     // ── Assemble rows: union of tracker slugs, mission project tags, and
     //    routed delivery keys. Every source can create a row; every source
     //    can only enrich, never hide, another.
+    // One instant for the whole response: two tracks in the same payload must
+    // not disagree about whether the same deadline has passed.
+    let now = chrono::Utc::now().to_rfc3339();
     let mut rows: HashMap<String, ProjectRowBuilder> = HashMap::new();
 
     let deleted = |slug: &str| overrides.get(slug).map(String::as_str) == Some("deleted");
@@ -183,10 +215,17 @@ pub async fn projects_overview(
         if deleted(&key) {
             continue;
         }
-        rows.entry(key.clone())
-            .or_insert_with(|| ProjectRowBuilder::new(key))
-            .missions
-            .push(mission_chip(mission));
+        let builder = rows
+            .entry(key.clone())
+            .or_insert_with(|| ProjectRowBuilder::new(key));
+        builder.missions.push(mission_chip(mission));
+        builder.health_inputs.push(OwnedHealthInput {
+            track: mission.project.track.clone(),
+            status: mission.status,
+            desired_state: mission.project.desired_state.clone(),
+            next_check_at: mission.project.next_check_at.clone(),
+            updated_at: mission.updated_at.clone(),
+        });
     }
     let mut unrouted: Vec<DeliveryUpdate> = Vec::new();
     for delivery in deliveries {
@@ -208,7 +247,7 @@ pub async fn projects_overview(
         .map(|builder| {
             let forced = overrides.get(&builder.slug).cloned();
             let binding = bindings.get(&builder.slug).cloned();
-            builder.finish(&archived, forced.as_deref(), binding)
+            builder.finish(&archived, forced.as_deref(), binding, &now)
         })
         .collect();
     projects.sort_by(|a, b| {
@@ -272,6 +311,8 @@ struct ProjectRowBuilder {
     slug: String,
     tracker: Option<TrackerInfo>,
     missions: Vec<MissionChip>,
+    /// Health inputs, accumulated alongside the display chips.
+    health_inputs: Vec<OwnedHealthInput>,
     latest_update: Option<DeliveryUpdate>,
     recent_signatures: Vec<Option<String>>,
     updates_count: usize,
@@ -283,6 +324,7 @@ impl ProjectRowBuilder {
             slug,
             tracker: None,
             missions: Vec::new(),
+            health_inputs: Vec::new(),
             latest_update: None,
             recent_signatures: Vec::new(),
             updates_count: 0,
@@ -306,7 +348,13 @@ impl ProjectRowBuilder {
         archived: &[String],
         forced: Option<&str>,
         binding: Option<ProjectConversation>,
+        now: &str,
     ) -> ProjectRow {
+        // Rolled up before the chips are truncated, so the verdict covers
+        // every mission rather than only the 8 shown.
+        let inputs: Vec<_> = self.health_inputs.iter().map(|i| i.as_input()).collect();
+        let health = super::project_health::rollup(&inputs, now);
+
         self.missions
             .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         self.missions.truncate(8);
@@ -430,6 +478,7 @@ impl ProjectRowBuilder {
             latest_update: self.latest_update,
             updates_count: self.updates_count,
             attention_reasons: attention,
+            health,
             conversation,
         }
     }
@@ -891,7 +940,7 @@ mod tests {
         builder.push_delivery(parse_delivery("s", 3.0, SAMPLE));
         builder.push_delivery(parse_delivery("s", 2.0, SAMPLE));
         builder.push_delivery(parse_delivery("s", 1.0, SAMPLE));
-        let row = builder.finish(&[], None, None);
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
         assert_eq!(row.bucket, "attention");
         assert!(row.attention_reasons.iter().any(|r| r.contains("blocker")));
         assert!(row
@@ -932,7 +981,7 @@ mod tests {
                 github_pr: None,
             });
         }
-        let row = builder.finish(&[], None, None);
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
         let failed_lines: Vec<&String> = row
             .attention_reasons
             .iter()
@@ -948,7 +997,7 @@ mod tests {
         builder.push_delivery(parse_delivery("s", 3.0, SAMPLE));
         builder.push_delivery(parse_delivery("s", 2.0, SAMPLE));
         builder.push_delivery(parse_delivery("s", 1.0, SAMPLE));
-        let row = builder.finish(&[], Some("paused"), None);
+        let row = builder.finish(&[], Some("paused"), None, "2026-08-04T12:00:00Z");
         assert_eq!(row.bucket, "paused");
         // Reasons stay visible in the detail pane even when silenced.
         assert!(!row.attention_reasons.is_empty());
@@ -962,7 +1011,7 @@ mod tests {
             status_line: Some("paused (drained)".to_string()),
             updated_at: None,
         });
-        let row = builder.finish(&[], None, None);
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
         assert_eq!(row.bucket, "paused");
     }
 
@@ -987,6 +1036,7 @@ mod tests {
                 source: "binding",
                 bound_at: Some("2026-08-04T13:00:00Z".into()),
             }),
+            "2026-08-04T12:00:00Z",
         );
         let conversation = row.conversation.expect("conversation");
         assert_eq!(conversation.session_id, "20260804_103847_86ca5c");
@@ -1004,7 +1054,7 @@ mod tests {
             signature: None,
             blocker: None,
         });
-        let row = builder.finish(&[], None, None);
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
         let conversation = row.conversation.expect("conversation");
         assert_eq!(conversation.source, "latest_update");
         assert_eq!(conversation.bound_at, None);
