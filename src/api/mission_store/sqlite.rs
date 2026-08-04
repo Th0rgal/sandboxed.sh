@@ -2930,13 +2930,21 @@ impl MissionStore for SqliteMissionStore {
                 // Match the tag's JSON *serialization*, quotes included: a tag
                 // holding a quote/backslash/newline is escaped inside the
                 // column, so a raw-text LIKE would exclude it in SQL and the
-                // Rust re-check below would never get to see it. Over-matching
-                // is fine here (LIKE wildcards in the tag only widen the
-                // candidate set); under-matching would be a silent miss.
+                // Rust re-check below would never get to see it.
+                //
+                // Then neutralise LIKE's own wildcards. Tags are free-form, so
+                // `?tag=%` would otherwise select nearly every row and make the
+                // loop page through them holding the connection lock — a
+                // selective prefilter is what keeps this off the critical path.
+                // Escape the escape character first, or `\` would be doubled.
                 let encoded = serde_json::to_string(v).unwrap_or_else(|_| format!("\"{v}\""));
+                let pattern = encoded
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
                 bind(
-                    "tags LIKE '%' || ?n || '%'",
-                    &encoded,
+                    r"tags LIKE '%' || ?n || '%' ESCAPE '\'",
+                    &pattern,
                     &mut clauses,
                     &mut binds,
                 );
@@ -16507,6 +16515,67 @@ mod filter_tests {
             .iter()
             .chain(second.iter())
             .all(|m| m.project.track.as_deref() == Some("core-c3")));
+    }
+
+    /// LIKE wildcards inside a free-form tag must not widen the prefilter:
+    /// `?tag=%` would otherwise select nearly every row and make the loop page
+    /// through them while holding the connection lock.
+    #[tokio::test]
+    async fn tag_filter_treats_like_wildcards_as_literals() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+
+        let literal = seed(&store, "literal", Some("verity"), None, None).await;
+        store
+            .update_mission_project(
+                literal,
+                MissionProjectPatch {
+                    tags: Some(vec!["100%".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag");
+        let other = seed(&store, "other", Some("verity"), None, None).await;
+        store
+            .update_mission_project(
+                other,
+                MissionProjectPatch {
+                    tags: Some(vec!["unrelated".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag");
+
+        // A bare wildcard matches nothing: it is a literal, not "everything".
+        let wild = store
+            .list_missions_filtered(
+                &MissionFilter {
+                    tag: Some("%".into()),
+                    ..Default::default()
+                },
+                50,
+                0,
+            )
+            .await
+            .expect("filtered list");
+        assert!(wild.is_empty(), "'%' must not behave as a wildcard");
+
+        // And a tag that genuinely contains '%' is still found.
+        let exact = store
+            .list_missions_filtered(
+                &MissionFilter {
+                    tag: Some("100%".into()),
+                    ..Default::default()
+                },
+                50,
+                0,
+            )
+            .await
+            .expect("filtered list");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].id, literal);
     }
 
     /// A tag holding a JSON-escaped character is stored escaped in the column,
