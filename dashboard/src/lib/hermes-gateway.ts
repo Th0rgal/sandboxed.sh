@@ -80,13 +80,16 @@ export class HermesGatewayClient {
     }
     this.closedByUser = false;
     const jwt = getValidJwt();
-    const base = apiUrl("/api/assistant/hermes/ws").replace(/^http/, "ws");
-    const url = jwt ? `${base}?token=${encodeURIComponent(jwt.token)}` : base;
+    const url = apiUrl("/api/assistant/hermes/ws").replace(/^http/, "ws");
+    // The JWT travels in the subprotocol list (never the URL, so it can't
+    // land in access logs); the server echoes back "sandboxed". Same
+    // convention as /api/monitoring/ws.
+    const protocols = jwt ? ["sandboxed", `jwt.${jwt.token}`] : ["sandboxed"];
 
     return new Promise<void>((resolve, reject) => {
       this.setState("connecting");
       let settled = false;
-      const ws = new WebSocket(url);
+      const ws = new WebSocket(url, protocols);
       this.ws = ws;
       const connectTimer = setTimeout(() => {
         if (!settled) {

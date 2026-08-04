@@ -2046,12 +2046,22 @@ pub async fn hermes_chat_proxy(
 /// Dashboard-JWT path under which the Hermes gateway WS is bridged.
 pub const HERMES_GATEWAY_WS_PATH: &str = "/api/assistant/hermes/ws";
 
-#[derive(Debug, serde::Deserialize)]
-pub struct HermesGatewayWsQuery {
-    /// Dashboard JWT. Browsers cannot set an Authorization header on a
-    /// WebSocket connect, so the token arrives as a query parameter instead.
-    #[serde(default)]
-    token: Option<String>,
+/// Extract the dashboard JWT from the WebSocket subprotocol list. Browsers
+/// cannot set an Authorization header on a WebSocket connect, so clients send
+/// `Sec-WebSocket-Protocol: sandboxed, jwt.<token>` instead (same convention
+/// as `/api/monitoring/ws`) — keeping the token out of URLs and access logs.
+fn extract_jwt_from_ws_protocols(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())?;
+    for part in raw.split(',').map(str::trim) {
+        if let Some(rest) = part.strip_prefix("jwt.") {
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Resolve the loopback Hermes gateway WS URL, session token included.
@@ -2103,11 +2113,12 @@ async fn resolve_hermes_gateway_ws_target(
 }
 
 /// `GET /api/assistant/hermes/ws` — full pass-through bridge to the Hermes
-/// gateway JSON-RPC WebSocket. Registered on public_routes because the JWT
-/// arrives via query param; authentication happens here, before upgrade.
+/// gateway JSON-RPC WebSocket. Registered on public_routes because browser
+/// WebSockets cannot carry an Authorization header; the JWT arrives via the
+/// `jwt.<token>` subprotocol (or a Bearer header for native clients) and is
+/// verified here, before upgrade.
 pub async fn hermes_gateway_ws(
     State(state): State<Arc<AppState>>,
-    axum::extract::Query(query): axum::extract::Query<HermesGatewayWsQuery>,
     headers: axum::http::HeaderMap,
     ws: axum::extract::WebSocketUpgrade,
 ) -> axum::response::Response {
@@ -2119,9 +2130,12 @@ pub async fn hermes_gateway_ws(
         .and_then(|h| {
             h.strip_prefix("Bearer ")
                 .or_else(|| h.strip_prefix("bearer "))
-        });
-    let token = header_token.or(query.token.as_deref()).unwrap_or("");
-    if let Err((status, message)) = crate::api::auth::authenticate_token(&state.config, token) {
+        })
+        .map(str::to_string);
+    let token = header_token
+        .or_else(|| extract_jwt_from_ws_protocols(&headers))
+        .unwrap_or_default();
+    if let Err((status, message)) = crate::api::auth::authenticate_token(&state.config, &token) {
         return (status, message).into_response();
     }
 
@@ -2130,11 +2144,15 @@ pub async fn hermes_gateway_ws(
         Err(message) => return (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
     };
 
-    ws.on_upgrade(move |socket| async move {
-        if let Err(error) = bridge_hermes_gateway_ws(socket, target).await {
-            tracing::debug!("hermes gateway ws bridge closed: {error}");
-        }
-    })
+    // Echo back the stable subprotocol; the jwt.* entry never appears in the
+    // response (a browser rejects the handshake if the selected protocol was
+    // not offered, so "sandboxed" is always offered alongside the token).
+    ws.protocols(["sandboxed"])
+        .on_upgrade(move |socket| async move {
+            if let Err(error) = bridge_hermes_gateway_ws(socket, target).await {
+                tracing::debug!("hermes gateway ws bridge closed: {error}");
+            }
+        })
 }
 
 /// Pump frames between the browser socket and the loopback Hermes gateway

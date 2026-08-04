@@ -703,7 +703,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         // Hermes gateway JSON-RPC WebSocket bridge. On public_routes because
         // browser WebSockets cannot carry an Authorization header; the handler
-        // verifies the dashboard JWT (header or ?token=) before upgrading.
+        // verifies the dashboard JWT (Bearer header or `jwt.<token>`
+        // subprotocol, as on /api/monitoring/ws) before upgrading.
         .route(
             system_api::HERMES_GATEWAY_WS_PATH,
             get(system_api::hermes_gateway_ws),
