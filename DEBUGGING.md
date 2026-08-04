@@ -127,6 +127,50 @@ Hermes gotchas:
 - When rotating the `hsk_` key, update `API_SERVER_KEY`,
   `HERMES_DASHBOARD_SESSION_TOKEN`, and the desktop's `connection.json` together.
 
+### CLIProxyAPI inference sidecar
+
+Production subscription-backed OpenAI-compatible inference uses a loopback-only
+CLIProxyAPI sidecar. Sandboxed.sh translates `/v1/chat/completions` requests for
+Codex, xAI, and Anthropic OAuth accounts through this service.
+
+| Item | Production value |
+| --- | --- |
+| Unit | `cli-proxy-api.service` |
+| Listener | `127.0.0.1:8317` |
+| Binary | `/usr/local/bin/cli-proxy-api` |
+| Config | `/etc/cli-proxy-api/config.yaml` |
+| Auth directory | `/var/lib/cli-proxy-api/auth` |
+
+The Sandboxed.sh environment must define `CLI_PROXY_API_BASE_URL`,
+`CLI_PROXY_API_KEY`, and `CLI_PROXY_AUTH_DIR`. The API key must match one of the
+sidecar's configured `api-keys`; never print either value while debugging.
+The systemd unit must set `UMask=0077`, and every OAuth JSON file in the auth
+directory must remain mode `0600` because those files contain refresh tokens.
+
+During a zero-downtime migration, CLIProxyAPI can temporarily run without
+`api-keys` so an already-running Sandboxed.sh process can use the loopback
+default without a restart. This is acceptable only while the listener is bound
+to `127.0.0.1`; restore key enforcement after the next safe backend restart.
+
+Safe health checks:
+
+```bash
+systemctl is-active cli-proxy-api
+ss -ltn | grep -F '127.0.0.1:8317'
+find /var/lib/cli-proxy-api/auth -maxdepth 1 -type f -name '*.json' \
+  -printf '%f\n' | sed -E 's/^([^-]+)-.*/auth_type=\1/' | sort
+```
+
+Expected auth types are `codex`, `xai`, and `claude`. Create them with the
+sidecar's own OAuth login commands under the `cli-proxy-api` system account.
+Do not copy refresh tokens out of Sandboxed.sh's provider store: two independent
+refreshers can rotate the same token and trigger `refresh_token_reused`.
+
+After changing the three `CLI_PROXY_*` environment variables, restart
+`sandboxed-sh-prod` only when no mission harness is active, then validate both
+`/v1/models` and real streaming/non-streaming inference. Direct provider IDs use
+the `openai/<model>` form unless a short model-routing chain is configured.
+
 ```bash
 # Production inspection. Deploy/restart through the guarded endpoint below.
 systemctl status sandboxed-sh-prod

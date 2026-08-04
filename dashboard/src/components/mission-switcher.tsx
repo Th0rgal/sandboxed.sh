@@ -1,7 +1,9 @@
 'use client';
 
 import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import useSWR from 'swr';
 import {
   Search,
   XCircle,
@@ -14,9 +16,10 @@ import {
   ChevronDown,
   Pin,
   Pencil,
+  Sparkles,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { searchMissions, type AwaitingKind, type Mission, type RunningMissionInfo } from '@/lib/api';
+import { searchMissions, listHermesSessions, type AwaitingKind, type HermesSession, type Mission, type RunningMissionInfo } from '@/lib/api';
 import { getMissionShortName } from '@/lib/mission-display';
 import { statusLabel, getMissionDotColor, getMissionTitle } from '@/lib/mission-status';
 import { AsyncButton } from '@/components/ui/async-button';
@@ -40,13 +43,19 @@ interface MissionSwitcherProps {
 }
 
 type MissionSwitcherItem = {
-  type: 'running' | 'current' | 'recent';
+  type: 'running' | 'current' | 'recent' | 'session';
   mission?: Mission;
   runningInfo?: RunningMissionInfo;
+  /** Hermes session backing this row when `type === 'session'`. */
+  session?: HermesSession;
   id: string;
   isWorkerOf?: string;
   isBoss?: boolean;
 };
+
+/** Row id prefix for Hermes sessions, so they can't collide with mission
+ * UUIDs anywhere ids are compared (pins, selection, loading state). */
+const SESSION_ITEM_PREFIX = 'session:';
 
 type MissionSwitcherRow =
   | { kind: 'section'; id: string; label: string }
@@ -722,6 +731,7 @@ export function MissionSwitcher({
   onRenameMission,
   onRefresh,
 }: MissionSwitcherProps) {
+  const router = useRouter();
   const dialogRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -805,7 +815,15 @@ export function MissionSwitcher({
   const handleSelect = useCallback(async (missionId: string) => {
     // Don't allow selecting while already loading
     if (loadingMissionId) return;
-    
+
+    // Hermes sessions are a navigation target, not a mission load.
+    if (missionId.startsWith(SESSION_ITEM_PREFIX)) {
+      const sessionId = missionId.slice(SESSION_ITEM_PREFIX.length);
+      router.push(`/control?session=${encodeURIComponent(sessionId)}`);
+      onClose();
+      return;
+    }
+
     setLoadingMissionId(missionId);
     try {
       await onSelectMission(missionId);
@@ -815,7 +833,7 @@ export function MissionSwitcher({
       // Clear loading state on error so user can try again
       setLoadingMissionId(null);
     }
-  }, [loadingMissionId, onSelectMission, onClose]);
+  }, [loadingMissionId, onSelectMission, onClose, router]);
 
   // Compute filtered missions
   const runningMissionIds = useMemo(
@@ -840,6 +858,28 @@ export function MissionSwitcher({
           map.set(m.parent_mission_id, set);
         }
         set.add(m.id);
+      }
+    }
+    return map;
+  }, [missions]);
+
+  // Hermes sessions (conversations). The request itself doubles as the
+  // availability probe: when Hermes is not adopted/running it fails and the
+  // section simply doesn't render.
+  const { data: hermesSessions } = useSWR<HermesSession[]>(
+    open ? 'switcher-hermes-sessions' : null,
+    () => listHermesSessions(30),
+    { revalidateOnFocus: false, dedupingInterval: 15000, shouldRetryOnError: false }
+  );
+
+  // Missions spawned by a Hermes session, grouped as that session's workers.
+  const missionsBySessionId = useMemo(() => {
+    const map = new Map<string, Mission[]>();
+    for (const m of missions) {
+      if (m.origin_session_id) {
+        const list = map.get(m.origin_session_id) ?? [];
+        list.push(m);
+        map.set(m.origin_session_id, list);
       }
     }
     return map;
@@ -929,6 +969,26 @@ export function MissionSwitcher({
       });
     }
 
+    // Hermes sessions, each with the missions it spawned grouped as workers.
+    for (const session of hermesSessions ?? []) {
+      const sessionItemId = `${SESSION_ITEM_PREFIX}${session.id}`;
+      if (addedIds.has(sessionItemId)) continue;
+      addedIds.add(sessionItemId);
+      items.push({ type: 'session', id: sessionItemId, session });
+      for (const worker of missionsBySessionId.get(session.id) ?? []) {
+        if (addedIds.has(worker.id)) continue;
+        addedIds.add(worker.id);
+        const workerRunningInfo = runningByMissionId.get(worker.id);
+        items.push({
+          type: workerRunningInfo ? 'running' : 'recent',
+          mission: worker,
+          runningInfo: workerRunningInfo,
+          id: worker.id,
+          isWorkerOf: sessionItemId,
+        });
+      }
+    }
+
     // Recent missions
     recentMissions.forEach((m) => {
       if (addedIds.has(m.id)) return;
@@ -937,7 +997,7 @@ export function MissionSwitcher({
     });
 
     return items;
-  }, [currentMissionId, runningMissions, runningMissionIds, recentMissions, bossMissionWorkerIds, missionById]);
+  }, [currentMissionId, runningMissions, runningMissionIds, recentMissions, bossMissionWorkerIds, missionById, hermesSessions, missionsBySessionId]);
 
   // Bosses that have at least one worker row grouped under them in this
   // session's items list. These are the rows that get a chevron toggle.
@@ -1016,6 +1076,14 @@ export function MissionSwitcher({
 
     const cache = searchScoreCacheRef.current;
     const scored = visibleItems.flatMap((item) => {
+      if (item.type === 'session') {
+        const haystack = normalizeMetadataText(
+          `${item.session?.title ?? ''} ${item.session?.preview ?? ''} hermes session`
+        );
+        const terms = normalizedSearchQuery.split(/\s+/).filter(Boolean);
+        const matches = terms.every((term) => haystack.includes(term));
+        return matches ? [{ item, score: 0.5 }] : [];
+      }
       if (!item.mission) {
         if (!item.runningInfo) {
           return [];
@@ -1082,12 +1150,18 @@ export function MissionSwitcher({
         ) {
           rows.push({ kind: 'section', id: 'section-running', label: 'Running' });
         }
+        if (!isPinned && item.type === 'session' && previousType !== 'session') {
+          rows.push({ kind: 'section', id: 'section-sessions', label: 'Hermes sessions' });
+        }
         if (!isPinned && item.type === 'recent' && !isWorkerItem && previousType !== 'recent') {
           rows.push({ kind: 'section', id: 'section-recent', label: 'Recent' });
         }
       }
       rows.push({ kind: 'item', id: item.id, item, itemIndex });
-      previousType = isPinned ? previousType : item.type;
+      // Worker rows inherit their parent's section: letting them advance
+      // `previousType` would re-emit a section header (with a duplicate row
+      // id) as soon as the next top-level row of the same type appears.
+      previousType = isPinned || isWorkerItem ? previousType : item.type;
       previousPinned = isPinned;
     });
 
@@ -1440,6 +1514,72 @@ export function MissionSwitcher({
                 const isBossExpanded = bossesShowingWorkers.has(item.id);
                 const workerCount = workerCountByBossId.get(item.id) ?? 0;
 
+                if (item.type === 'session') {
+                  const sessionTitle =
+                    item.session?.title?.trim() ||
+                    item.session?.preview?.trim() ||
+                    `Session ${item.session?.id.slice(0, 8) ?? ''}`;
+                  const sessionHasWorkers = bossesWithGroupedWorkers.has(item.id);
+                  const sessionExpanded = bossesShowingWorkers.has(item.id);
+                  return (
+                    <div
+                      key={item.id}
+                      data-index={virtualRow.index}
+                      ref={rowVirtualizer.measureElement}
+                      className="absolute left-0 top-0 w-full"
+                      style={{ transform: `translateY(${virtualRow.start}px)` }}
+                    >
+                      <a
+                        href={`/control?session=${encodeURIComponent(item.session?.id ?? '')}`}
+                        data-selected={isSelected}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          handleSelect(item.id);
+                        }}
+                        className={cn(
+                          'mission-switcher-row group flex items-center gap-3 py-2 mx-2 rounded-lg px-3 cursor-pointer transition-colors no-underline',
+                          isSelected
+                            ? 'mission-switcher-row-selected bg-indigo-500/15 text-white'
+                            : 'text-white/70 hover:bg-white/[0.04]'
+                        )}
+                      >
+                        {sessionHasWorkers && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              toggleBossExpansion(item.id);
+                            }}
+                            aria-label={sessionExpanded ? 'Collapse workers' : 'Expand workers'}
+                            aria-expanded={sessionExpanded}
+                            className="-ml-0.5 p-0.5 rounded text-white/40 hover:text-white/80 hover:bg-white/[0.06] transition-colors shrink-0"
+                          >
+                            {sessionExpanded ? (
+                              <ChevronDown className="h-3.5 w-3.5" />
+                            ) : (
+                              <ChevronRight className="h-3.5 w-3.5" />
+                            )}
+                          </button>
+                        )}
+                        <Sparkles className="h-3.5 w-3.5 shrink-0 text-indigo-400" />
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm">{sessionTitle}</div>
+                          <div className="truncate text-xs text-white/40">
+                            Hermes session
+                            {typeof item.session?.message_count === 'number'
+                              ? ` · ${item.session.message_count} messages`
+                              : ''}
+                            {workerCount > 0
+                              ? ` · ${workerCount} worker${workerCount === 1 ? '' : 's'}`
+                              : ''}
+                          </div>
+                        </div>
+                      </a>
+                    </div>
+                  );
+                }
+
                 return (
                   <div
                     key={item.id}
@@ -1631,6 +1771,14 @@ export function MissionSwitcher({
                           {mission?.mission_mode === 'assistant' && (
                             <span className="inline-flex items-center rounded bg-indigo-500/10 border border-indigo-500/20 px-1 py-0.5 text-[8px] font-medium text-indigo-400 shrink-0">
                               Assistant
+                            </span>
+                          )}
+                          {mission?.origin === 'hermes' && (
+                            <span
+                              className="shrink-0 text-indigo-400/70"
+                              title="Spawned by a Hermes session"
+                            >
+                              <Sparkles className="h-3 w-3" />
                             </span>
                           )}
                           {item.isBoss && (

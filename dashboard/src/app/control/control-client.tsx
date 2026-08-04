@@ -736,9 +736,9 @@ type ThinkingGroup = {
   groupId: string;
   thoughts: SidePanelItem[];
 };
-type GroupedItem = ChatItem | ToolGroup | ThinkingGroup;
+export type GroupedItem = ChatItem | ToolGroup | ThinkingGroup;
 
-function getGroupedItemKey(item: GroupedItem): string {
+export function getGroupedItemKey(item: GroupedItem): string {
   if (item.kind === "tool_group" || item.kind === "thinking_group") {
     return item.groupId;
   }
@@ -2633,7 +2633,7 @@ type ChatItemRowProps = {
  * plain boolean per row so toggling one group doesn't invalidate any
  * of the others.
  */
-const ChatItemRow = memo(function ChatItemRow({
+export const ChatItemRow = memo(function ChatItemRow({
   item,
   highlighted,
   workspaceId,
