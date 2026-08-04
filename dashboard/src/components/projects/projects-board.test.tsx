@@ -270,6 +270,65 @@ describe("ProjectsBoard", () => {
     );
   });
 
+  test("a declared binding wins over the session of the newest delivery", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity",
+          latest_update: {
+            headline: "tick",
+            body: null,
+            // A cron tick's throwaway session: already ended, unreachable.
+            session_id: "cron_e594d751447d_20260804_120931",
+            at: "2026-08-04T12:09:00Z",
+            signature: "verity",
+            blocker: null,
+          },
+          conversation: {
+            session_id: "20260804_103847_86ca5c",
+            source: "binding",
+          },
+        }),
+      ]),
+    );
+
+    renderBoard();
+
+    const link = await screen.findByTitle("Conversation");
+    expect(link).toHaveAttribute(
+      "href",
+      "/control?session=20260804_103847_86ca5c",
+    );
+    // Nothing to bind: it is already declared.
+    expect(screen.queryByTitle(/control conversation/i)).not.toBeInTheDocument();
+  });
+
+  test("an inferred conversation offers to be bound", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity",
+          latest_update: {
+            headline: "tick",
+            body: null,
+            session_id: "cron_e594d751447d_20260804_120931",
+            at: "2026-08-04T12:09:00Z",
+            signature: "verity",
+            blocker: null,
+          },
+          conversation: {
+            session_id: "cron_e594d751447d_20260804_120931",
+            source: "latest_update",
+          },
+        }),
+      ]),
+    );
+
+    renderBoard();
+
+    expect(await screen.findByTitle(/control conversation/i)).toBeInTheDocument();
+  });
+
   test("offers no conversation link before a project has an update", async () => {
     mockedOverview.mockResolvedValue(overview([project({ slug: "verity" })]));
 

@@ -20,6 +20,7 @@ import {
   ChevronRight,
   GitPullRequest,
   Inbox,
+  Link2,
   Loader,
   Pause,
   Play,
@@ -30,6 +31,8 @@ import {
 } from "lucide-react";
 
 import {
+  bindProjectConversation,
+  type ProjectConversation,
   getProjectsOverview,
   getProjectUpdates,
   postProjectAction,
@@ -398,6 +401,7 @@ function ProjectListRow({
 function ActionButton({
   icon: Icon,
   label,
+  title,
   onClick,
   href,
   busy,
@@ -405,6 +409,8 @@ function ActionButton({
 }: {
   icon: LucideIcon;
   label: string;
+  /** Hover text when the label alone does not explain the consequence. */
+  title?: string;
   onClick?: () => void;
   href?: string;
   busy?: boolean;
@@ -429,7 +435,7 @@ function ActionButton({
 
   if (href) {
     return (
-      <Link href={href} title={label} className={cn(className, "no-underline")}>
+      <Link href={href} title={title ?? label} className={cn(className, "no-underline")}>
         {content}
       </Link>
     );
@@ -440,7 +446,7 @@ function ActionButton({
       type="button"
       onClick={onClick}
       disabled={busy}
-      title={label}
+      title={title ?? label}
       className={className}
     >
       {content}
@@ -450,7 +456,7 @@ function ActionButton({
 
 function ProjectActions({ project }: { project: ProjectRow }) {
   const { mutate } = useSWRConfig();
-  const [busy, setBusy] = useState<ProjectAction | null>(null);
+  const [busy, setBusy] = useState<ProjectAction | "bind" | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -471,9 +477,34 @@ function ProjectActions({ project }: { project: ProjectRow }) {
     [project.slug, mutate],
   );
 
-  // The conversation this project reports into: whichever Hermes session sent
-  // its most recent update. Absent until a project has had one.
-  const conversationSessionId = project.latest_update?.session_id ?? null;
+  // The conversation this project reports into. A declared binding is
+  // authoritative; otherwise the newest delivery's session is only a GUESS —
+  // and for a cron-driven project that guess is a throwaway per-tick session
+  // that has already ended, which is why binding it is offered right here.
+  // The dashboard ships via Vercel and the backend deploys separately, so a
+  // window exists where this field is not served yet. Fall back to the old
+  // inference rather than dropping the button — tagged as a guess either way.
+  const conversation: ProjectConversation | null =
+    project.conversation ??
+    (project.latest_update?.session_id
+      ? {
+          session_id: project.latest_update.session_id,
+          source: "latest_update" as const,
+        }
+      : null);
+  const conversationSessionId = conversation?.session_id ?? null;
+  const conversationIsGuess = conversation?.source === "latest_update";
+
+  const bindConversation = useCallback(async () => {
+    if (!conversationSessionId) return;
+    setBusy("bind");
+    try {
+      await bindProjectConversation(project.slug, conversationSessionId);
+      await mutate("projects-overview");
+    } finally {
+      setBusy(null);
+    }
+  }, [project.slug, conversationSessionId, mutate]);
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">
@@ -482,6 +513,15 @@ function ProjectActions({ project }: { project: ProjectRow }) {
           icon={Sparkles}
           label="Conversation"
           href={`/control?session=${encodeURIComponent(conversationSessionId)}`}
+        />
+      )}
+      {conversationIsGuess && (
+        <ActionButton
+          icon={Link2}
+          label="Bind"
+          title="Make this the project's control conversation. Until it is bound, the link above follows whichever session sent the last update — for a cron-driven project that is a per-tick session which has already ended."
+          busy={busy === "bind"}
+          onClick={bindConversation}
         />
       )}
       {project.bucket === "paused" ? (
@@ -719,6 +759,11 @@ function ProjectDetail({
               key={`${update.session_id}-${update.at}-${index}`}
               update={update}
               defaultExpanded={index === 0}
+              replyToSessionId={
+                project.conversation?.source === "binding"
+                  ? project.conversation.session_id
+                  : update.session_id
+              }
             />
           ))}
         </div>
@@ -835,9 +880,14 @@ function bodyWithoutHeadline(body: string, headline: string): string {
 function UpdateEntry({
   update,
   defaultExpanded,
+  replyToSessionId,
 }: {
   update: ProjectDeliveryUpdate;
   defaultExpanded: boolean;
+  /** Where a reply should go — the project's bound conversation when one is
+   *  declared. Replying into the delivery's own session would land in a cron
+   *  tick that has already ended. */
+  replyToSessionId: string;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   return (
@@ -869,7 +919,7 @@ function UpdateEntry({
             </p>
           </div>
         )}
-        {expanded && <ReplyComposer sessionId={update.session_id} />}
+        {expanded && <ReplyComposer sessionId={replyToSessionId} />}
       </div>
     </div>
   );
