@@ -372,17 +372,17 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
       <div className="flex items-center gap-2 border-b border-white/5 px-4 py-2.5">
         <Sparkles className="h-4 w-4 shrink-0 text-indigo-400" />
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-medium text-zinc-100">
+          <div className="truncate text-sm font-medium text-white">
             {title}
           </div>
-          <div className="text-[11px] text-zinc-500">
+          <div className="text-[11px] text-white/40">
             Hermes session
             {transport === "rest" && " · live events unavailable (polling)"}
             {transport === "connecting" && " · connecting…"}
           </div>
         </div>
         {running && (
-          <span className="flex items-center gap-1.5 text-[11px] text-zinc-400">
+          <span className="flex items-center gap-1.5 text-[11px] text-white/50">
             <Loader className="h-3 w-3 animate-spin" />
             working
           </span>
@@ -392,17 +392,17 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
       {/* Worker missions spawned by this session */}
       {workerMissions.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5 border-b border-white/5 px-4 py-1.5">
-          <span className="text-[11px] text-zinc-500">Workers</span>
+          <span className="text-[11px] text-white/40">Workers</span>
           {workerMissions.map((mission) => (
             <Link
               key={mission.id}
               href={`/control?mission=${mission.id}`}
-              className="flex items-center gap-1.5 rounded-full border border-white/10 px-2 py-0.5 text-[11px] text-zinc-300 transition-colors hover:border-white/25 hover:text-zinc-100"
+              className="flex items-center gap-1.5 rounded-full border border-white/10 px-2 py-0.5 text-[11px] text-white/70 transition-colors hover:border-white/25 hover:text-white"
             >
               <span
                 className={cn(
                   "h-1.5 w-1.5 rounded-full",
-                  STATUS_DOT_COLORS[mission.status] ?? "bg-zinc-500",
+                  STATUS_DOT_COLORS[mission.status] ?? "bg-gray-400",
                 )}
               />
               <span className="max-w-48 truncate">
@@ -416,19 +416,19 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
       {/* Transcript */}
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         {!historyLoaded && transport === "connecting" && (
-          <div className="flex items-center justify-center gap-2 py-12 text-sm text-zinc-500">
+          <div className="flex items-center justify-center gap-2 py-12 text-sm text-white/40">
             <Loader className="h-4 w-4 animate-spin" />
             Connecting to Hermes…
           </div>
         )}
         {transport === "offline" && (
-          <div className="mx-auto max-w-md py-12 text-center text-sm text-zinc-500">
-            <p className="text-zinc-300">Hermes is unreachable.</p>
+          <div className="mx-auto max-w-md py-12 text-center text-sm text-white/40">
+            <p className="text-white/70">Hermes is unreachable.</p>
             {error && <p className="mt-2 text-xs">{error}</p>}
           </div>
         )}
         {historyLoaded && rows.length === 0 && transport !== "offline" && (
-          <div className="flex flex-col items-center gap-2 py-12 text-sm text-zinc-500">
+          <div className="flex flex-col items-center gap-2 py-12 text-sm text-white/40">
             <Plus className="h-4 w-4" />
             Send the first message to start this session.
           </div>
@@ -464,7 +464,7 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
               <button
                 type="button"
                 onClick={handleStop}
-                className="flex items-center gap-1.5 rounded-md border border-white/10 px-2.5 py-1 text-xs text-zinc-300 transition-colors hover:border-white/25 hover:text-zinc-100"
+                className="flex items-center gap-1.5 rounded-md border border-white/10 px-2.5 py-1 text-xs text-white/70 transition-colors hover:border-white/25 hover:text-white"
               >
                 <Square className="h-3 w-3" />
                 Stop

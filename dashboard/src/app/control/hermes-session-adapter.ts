@@ -155,7 +155,14 @@ export function hermesHistoryToItems(messages: HermesMessage[]): ChatItem[] {
       }
     }
   }
-  return items;
+  // Historical tool calls whose result row was never persisted would render
+  // as "running for N days" (the row treats result === undefined as live).
+  // They are history — close them with an empty result.
+  return items.map((item) =>
+    item.kind === "tool" && item.result === undefined
+      ? { ...item, result: "", hasResult: true }
+      : item,
+  );
 }
 
 function payloadString(payload: unknown, key: string): string | undefined {
