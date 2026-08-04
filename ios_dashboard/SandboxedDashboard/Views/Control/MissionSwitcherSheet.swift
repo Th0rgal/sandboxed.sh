@@ -38,9 +38,14 @@ enum MissionQuickAction: Hashable {
 struct MissionSwitcherSheet: View {
     let runningMissions: [RunningMissionInfo]
     let recentMissions: [Mission]
+    /// Hermes conversations. Empty when Hermes isn't adopted on this backend,
+    /// which simply hides the section.
+    var hermesSessions: [HermesSession] = []
     let currentMissionId: String?
     let viewingMissionId: String?
+    var viewingHermesSessionId: String? = nil
     let onSelectMission: (String) -> Void
+    var onSelectHermesSession: ((String) -> Void)? = nil
     let onResumeMission: (String) -> Void
     let onFollowUpMission: (Mission) -> Void
     let onOpenFailureMission: (String) -> Void
@@ -103,6 +108,40 @@ struct MissionSwitcherSheet: View {
             backendSearchQuery,
             backendPart
         ].joined(separator: "||")
+    }
+
+    /// Sessions matching the current search (title/preview only — Hermes has
+    /// no server-side session search to defer to).
+    private var filteredHermesSessions: [HermesSession] {
+        guard !normalizedSearchQuery.isEmpty else { return hermesSessions }
+        return hermesSessions.filter {
+            normalizeMetadataText($0.displayTitle).contains(normalizedSearchQuery)
+        }
+    }
+
+    /// Missions this Hermes session spawned, rendered as its workers.
+    private func hermesWorkers(for sessionId: String) -> [Mission] {
+        recentMissions.filter { $0.originSessionId == sessionId }
+    }
+
+    /// Missions already rendered under a visible Hermes session. They are
+    /// filtered out of Running / Just Completed / Recent so a session-spawned
+    /// mission appears once, under its session — mirroring the web switcher's
+    /// `addedIds` bookkeeping. Keyed on the *visible* sessions only: when a
+    /// search hides the session, its workers stay findable in the normal
+    /// sections.
+    private var nestedHermesWorkerIds: Set<String> {
+        guard !hermesSessions.isEmpty else { return [] }
+        let visibleSessionIds = Set(filteredHermesSessions.map(\.id))
+        guard !visibleSessionIds.isEmpty else { return [] }
+        return Set(
+            recentMissions.compactMap { mission in
+                guard let origin = mission.originSessionId,
+                    visibleSessionIds.contains(origin)
+                else { return nil }
+                return mission.id
+            }
+        )
     }
 
     private func bossWorkerIds(from missions: [Mission]) -> [String: [String]] {
@@ -321,7 +360,11 @@ struct MissionSwitcherSheet: View {
                 // Running missions — boss + nested workers, then standalone.
                 if !derivedOrderedRunning.isEmpty {
                     Section("Running") {
-                        ForEach(derivedOrderedRunning) { row in
+                        ForEach(
+                            derivedOrderedRunning.filter {
+                                !nestedHermesWorkerIds.contains($0.info.missionId)
+                            }
+                        ) { row in
                             let info = row.info
                             let mission = derivedMissionById[info.missionId]
                             MissionRow(
@@ -350,8 +393,53 @@ struct MissionSwitcherSheet: View {
                     }
                 }
 
-                missionSection("Just Completed", missions: derivedJustCompletedMissions)
-                missionSection("Recent", missions: derivedRecentMissionsForList)
+                // Hermes conversations, with the missions each one spawned
+                // nested under it as workers.
+                if !filteredHermesSessions.isEmpty {
+                    Section("Hermes Sessions") {
+                        ForEach(filteredHermesSessions) { session in
+                            HermesSessionRow(
+                                session: session,
+                                workerCount: hermesWorkers(for: session.id).count,
+                                isViewing: viewingHermesSessionId == session.id,
+                                onSelect: { onSelectHermesSession?(session.id) }
+                            )
+                            ForEach(hermesWorkers(for: session.id)) { worker in
+                                MissionRow(
+                                    missionId: worker.id,
+                                    displayName: missionDisplayName(for: worker),
+                                    title: worker.displayTitle,
+                                    shortDescription: missionCardDescription(for: worker),
+                                    backend: worker.backend,
+                                    status: worker.status,
+                                    isRunning: runningMissions.contains {
+                                        $0.missionId == worker.id
+                                    },
+                                    runningState: nil,
+                                    isViewing: viewingMissionId == worker.id,
+                                    isWorker: true,
+                                    quickActions: [],
+                                    onSelect: { onSelectMission(worker.id) },
+                                    onQuickAction: nil,
+                                    onCancel: nil
+                                )
+                            }
+                        }
+                    }
+                }
+
+                missionSection(
+                    "Just Completed",
+                    missions: derivedJustCompletedMissions.filter {
+                        !nestedHermesWorkerIds.contains($0.id)
+                    }
+                )
+                missionSection(
+                    "Recent",
+                    missions: derivedRecentMissionsForList.filter {
+                        !nestedHermesWorkerIds.contains($0.id)
+                    }
+                )
 
                 if isBackendSearchLoading && !normalizedSearchQuery.isEmpty {
                     Section {
@@ -1015,5 +1103,60 @@ private struct MissionRow: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Hermes Session Row
+
+/// One Hermes conversation in the switcher. Deliberately lighter than
+/// `MissionRow`: a session has no status, workspace, or backend — only a
+/// title, its message count, and how many missions it spawned.
+private struct HermesSessionRow: View {
+    let session: HermesSession
+    let workerCount: Int
+    let isViewing: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                    .frame(width: 16)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(session.displayTitle)
+                        .font(.system(size: 14))
+                        .foregroundStyle(Theme.textPrimary)
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textTertiary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+
+                if isViewing {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.accent)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var subtitle: String {
+        var parts = ["Hermes session"]
+        if let count = session.messageCount, count > 0 {
+            parts.append("\(count) messages")
+        }
+        if workerCount > 0 {
+            parts.append("\(workerCount) worker\(workerCount == 1 ? "" : "s")")
+        }
+        return parts.joined(separator: " · ")
     }
 }

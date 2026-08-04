@@ -251,6 +251,12 @@ struct ControlView: View {
     @State private var showMissionSwitcher = false
     @State private var recentMissions: [Mission] = []
 
+    // Hermes session state. When `viewingHermesSessionId` is set the tab shows
+    // that conversation instead of a mission — same surface, other kind of
+    // conversation. Selecting a mission anywhere clears it.
+    @State private var hermesSessions: [HermesSession] = []
+    @State private var viewingHermesSessionId: String?
+
     // Desktop stream state
     @State private var showDesktopStream = false
     @State private var desktopDisplayId = ":101"
@@ -279,7 +285,7 @@ struct ControlView: View {
     
     var body: some View {
         bodyContent
-            .navigationTitle(viewingMission?.displayTitle ?? "Control")
+            .navigationTitle(navigationTitleText)
             .navigationBarTitleDisplayMode(.inline)
             // Keep the bar opaque: without this the conversation scrolls
             // through the title/buttons because SwiftUI can't always find
@@ -288,14 +294,24 @@ struct ControlView: View {
             .toolbarBackground(Theme.backgroundPrimary, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbar {
-                ToolbarItem(placement: .principal) { AnyView(principalToolbarContent) }
-                ToolbarItem(placement: .topBarLeading) { AnyView(leadingToolbarContent) }
+                // A Hermes conversation draws its own header and has none of
+                // the mission affordances (thoughts, Ask, mission actions), so
+                // only the switcher stays — it's the way back out.
+                if viewingHermesSessionId == nil {
+                    ToolbarItem(placement: .principal) { AnyView(principalToolbarContent) }
+                    ToolbarItem(placement: .topBarLeading) { AnyView(leadingToolbarContent) }
+                }
                 ToolbarItem(placement: .topBarTrailing) { AnyView(missionSwitcherToolbarButton) }
-                ToolbarItem(placement: .topBarTrailing) { AnyView(overflowMenuToolbarItem) }
+                if viewingHermesSessionId == nil {
+                    ToolbarItem(placement: .topBarTrailing) { AnyView(overflowMenuToolbarItem) }
+                }
             }
         .task { await coldStart() }
         .onChange(of: nav.pendingMissionId) { _, newId in
             handlePendingMissionId(newId)
+        }
+        .onChange(of: nav.pendingHermesSessionId) { _, newId in
+            handlePendingHermesSessionId(newId)
         }
         .onChange(of: currentMission?.id) { _, newId in
             syncViewingMissionFromCurrent(newId: newId)
@@ -385,6 +401,10 @@ struct ControlView: View {
                     showNewMissionSheet = false
                     Task { await createNewMission(options: options) }
                 },
+                onCreateHermesSession: {
+                    showNewMissionSheet = false
+                    Task { await createHermesSession() }
+                },
                 onCancel: {
                     showNewMissionSheet = false
                 }
@@ -400,6 +420,7 @@ struct ControlView: View {
         }
         .sheet(isPresented: $showMissionSwitcher) {
             missionSwitcherSheetContent
+                .task { await loadHermesSessions() }
         }
         .sheet(isPresented: $showQueueSheet) {
             QueueSheet(
@@ -497,11 +518,17 @@ struct ControlView: View {
         MissionSwitcherSheet(
             runningMissions: runningMissions,
             recentMissions: recentMissions,
+            hermesSessions: hermesSessions,
             currentMissionId: currentMission?.id,
             viewingMissionId: viewingMissionId,
+            viewingHermesSessionId: viewingHermesSessionId,
             onSelectMission: { missionId in
                 showMissionSwitcher = false
                 Task { await switchToMission(id: missionId) }
+            },
+            onSelectHermesSession: { sessionId in
+                showMissionSwitcher = false
+                openHermesSession(sessionId)
             },
             onResumeMission: { missionId in
                 showMissionSwitcher = false
@@ -602,6 +629,7 @@ struct ControlView: View {
             }
             .foregroundStyle(runningMissions.isEmpty ? Theme.textSecondary : Theme.accent)
         }
+        .accessibilityLabel("Switch mission")
     }
 
     /// Trailing toolbar: overflow `...` menu with all the actions.
@@ -775,12 +803,27 @@ struct ControlView: View {
 
     /// Top-level body ZStack — opaque single-View so the long modifier
     /// chain on `body` doesn't blow the SwiftUI type-checker budget.
+    /// The tab hosts two conversation kinds; the title follows whichever is
+    /// on screen. The Hermes view draws its own header, so keep this generic.
+    private var navigationTitleText: String {
+        if viewingHermesSessionId != nil { return "Conversation" }
+        return viewingMission?.displayTitle ?? "Control"
+    }
+
     private var bodyContent: some View {
         ZStack {
             Theme.backgroundPrimary.ignoresSafeArea()
-            backgroundGlows
-            mainContentStack
-            diagnosticsOverlay
+            if let sessionId = viewingHermesSessionId {
+                HermesConversationView(
+                    sessionId: sessionId,
+                    session: hermesSessions.first { $0.id == sessionId }
+                )
+                .id(sessionId)
+            } else {
+                backgroundGlows
+                mainContentStack
+                diagnosticsOverlay
+            }
         }
     }
 
@@ -880,7 +923,52 @@ struct ControlView: View {
     private func handlePendingMissionId(_ newId: String?) {
         guard let missionId = newId else { return }
         nav.pendingMissionId = nil
+        viewingHermesSessionId = nil
         Task { await loadMission(id: missionId) }
+    }
+
+    /// Handle a `sandboxed://session/<id>` deep link (or an in-app request
+    /// routed through `NavigationState`).
+    private func handlePendingHermesSessionId(_ newId: String?) {
+        guard let sessionId = newId else { return }
+        nav.pendingHermesSessionId = nil
+        openHermesSession(sessionId)
+        if hermesSessions.isEmpty {
+            Task { await loadHermesSessions() }
+        }
+    }
+
+    /// Show a Hermes session in this tab, replacing whatever mission was
+    /// being viewed. The mission stream keeps running underneath.
+    private func openHermesSession(_ sessionId: String) {
+        viewingHermesSessionId = sessionId
+        HapticService.selectionChanged()
+    }
+
+    /// Hermes conversations for the switcher. The request doubles as the
+    /// availability probe: when Hermes isn't adopted, it fails and the
+    /// section simply stays empty.
+    private func loadHermesSessions() async {
+        hermesSessions = (try? await api.listHermesSessions(limit: 30)) ?? []
+    }
+
+    /// Start a fresh Hermes conversation and show it.
+    private func createHermesSession() async {
+        do {
+            let session = try await api.createHermesSession()
+            hermesSessions.insert(session, at: 0)
+            openHermesSession(session.id)
+        } catch {
+            // Surface in the mission transcript, the same way stream errors do
+            // — the sheet is already dismissed at this point.
+            messages.append(
+                ChatMessage(
+                    id: "error-\(Date().timeIntervalSince1970)",
+                    type: .error,
+                    content: "Could not start a Hermes session: \(error.localizedDescription)"
+                )
+            )
+        }
     }
 
     /// On change of `currentMission?.id`: if no mission is being viewed yet,
@@ -1233,7 +1321,10 @@ struct ControlView: View {
     /// Groups consecutive tool calls together for collapsed display (like dashboard).
     /// Thinking messages are always elided here — they live in the thoughts sheet
     /// only. Showing them inline duplicated the same content twice on screen.
-    private static func buildGroupedItems(from messages: [ChatMessage]) -> [GroupedChatItem] {
+    /// Collapse a flat message list into rendered rows (tool runs grouped,
+    /// thinking elided). Shared with the Hermes session view so both
+    /// conversation kinds group identically.
+    static func buildGroupedItems(from messages: [ChatMessage]) -> [GroupedChatItem] {
         var result: [GroupedChatItem] = []
         var currentToolGroup: [ChatMessage] = []
 
@@ -3668,6 +3759,9 @@ struct ControlView: View {
     }
     
     private func switchToMission(id: String) async {
+        // Leaving a Hermes session for a mission: the tab shows one
+        // conversation at a time.
+        viewingHermesSessionId = nil
         guard id != viewingMissionId else { return }
 
         // Set the target mission ID immediately for race condition tracking

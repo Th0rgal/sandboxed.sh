@@ -56,6 +56,17 @@
     </dict>
     <key>CFBundleIconName</key>
     <string>AppIcon</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>md.thomas.openagent.dashboard.conversation</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>sandboxed</string>
+            </array>
+        </dict>
+    </array>
     <key>UIBackgroundModes</key>
     <array>
         <string>audio</string>

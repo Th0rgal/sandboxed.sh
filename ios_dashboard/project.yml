@@ -51,3 +51,20 @@ targets:
         BUNDLE_LOADER: "$(TEST_HOST)"
     dependencies:
       - target: SandboxedDashboard
+
+  SandboxedDashboardUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: SandboxedDashboardUITests
+        excludes:
+          - "**/.DS_Store"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: md.thomas.openagent.dashboard.uitests
+        PRODUCT_NAME: SandboxedDashboardUITests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_TARGET_NAME: SandboxedDashboard
+    dependencies:
+      - target: SandboxedDashboard

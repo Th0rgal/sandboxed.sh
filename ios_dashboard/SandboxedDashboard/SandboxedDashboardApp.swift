@@ -20,6 +20,9 @@ struct SandboxedDashboardApp: App {
         WindowGroup {
             ContentView()
                 .preferredColorScheme(.dark)
+                .onOpenURL { url in
+                    NavigationState.shared.handle(url: url)
+                }
         }
     }
 }

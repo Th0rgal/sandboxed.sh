@@ -7,12 +7,22 @@
 
 import SwiftUI
 
+/// Value of `selectedAgentValue` for the Hermes entry. Hermes isn't a backend
+/// — picking it starts an assistant *session* rather than a mission.
+private let hermesAgentValue = "hermes:"
+
 struct NewMissionSheet: View {
     let workspaces: [Workspace]
     @Binding var selectedWorkspaceId: String?
     let onCreate: (NewMissionOptions) -> Void
+    /// Start a Hermes conversation instead of a mission. Absent callback hides
+    /// the Hermes entry entirely.
+    var onCreateHermesSession: (() -> Void)? = nil
     let onCancel: () -> Void
-    
+
+    /// Hermes reachable on this backend (probed once when the sheet loads).
+    @State private var hermesAvailable = false
+
     // Backend and agent selection
     @State private var backends: [Backend] = Backend.defaults
     @State private var enabledBackendIds: Set<String> = ["opencode", "claudecode", "amp", "codex", "gemini", "grok"]
@@ -51,19 +61,23 @@ struct NewMissionSheet: View {
                 // Form
                 ScrollView {
                     VStack(spacing: 20) {
-                        // Workspace selection
-                        sectionCard(title: "Workspace", icon: "server.rack") {
-                            workspaceSelector
+                        // A Hermes session has no workspace, backend or model
+                        // to pick — Hermes owns all of that.
+                        if !isHermesSelected {
+                            sectionCard(title: "Workspace", icon: "server.rack") {
+                                workspaceSelector
+                            }
                         }
-                        
+
                         // Agent selection (includes backend)
                         sectionCard(title: "Agent", icon: "cpu") {
                             agentSelector
                         }
-                        
-                        // Model override
-                        sectionCard(title: "Model Override", icon: "slider.horizontal.3") {
-                            modelSelector
+
+                        if !isHermesSelected {
+                            sectionCard(title: "Model Override", icon: "slider.horizontal.3") {
+                                modelSelector
+                            }
                         }
                     }
                     .padding(.horizontal, 16)
@@ -74,6 +88,10 @@ struct NewMissionSheet: View {
                 // Action buttons
                 VStack(spacing: 12) {
                     Button {
+                        if isHermesSelected {
+                            onCreateHermesSession?()
+                            return
+                        }
                         let parsed = CombinedAgent.parse(selectedAgentValue)
                         onCreate(NewMissionOptions(
                             workspaceId: selectedWorkspaceId,
@@ -83,8 +101,8 @@ struct NewMissionSheet: View {
                         ))
                     } label: {
                         HStack {
-                            Image(systemName: "play.fill")
-                            Text("Start Mission")
+                            Image(systemName: isHermesSelected ? "sparkles" : "play.fill")
+                            Text(isHermesSelected ? "Start Session" : "Start Mission")
                         }
                         .font(.body.weight(.semibold))
                         .foregroundStyle(.white)
@@ -93,8 +111,8 @@ struct NewMissionSheet: View {
                         .background(Theme.accent)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                     }
-                    .disabled(workspaces.isEmpty || isLoading)
-                    .opacity(workspaces.isEmpty || isLoading ? 0.5 : 1)
+                    .disabled(isStartDisabled)
+                    .opacity(isStartDisabled ? 0.5 : 1)
 
                     Button {
                         onCancel()
@@ -219,6 +237,15 @@ struct NewMissionSheet: View {
     
     // MARK: - Agent Selector
     
+    private var isHermesSelected: Bool { selectedAgentValue == hermesAgentValue }
+
+    private var isStartDisabled: Bool {
+        if isLoading { return true }
+        // A Hermes session needs no workspace, so an empty workspace list
+        // only blocks missions.
+        return isHermesSelected ? false : workspaces.isEmpty
+    }
+
     private var agentSelector: some View {
         VStack(spacing: 8) {
             if isLoading {
@@ -231,6 +258,9 @@ struct NewMissionSheet: View {
                 }
                 .padding(.vertical, 8)
             } else {
+                if hermesAvailable && onCreateHermesSession != nil {
+                    hermesSection
+                }
                 // Group agents by backend
                 ForEach(backends.filter { enabledBackendIds.contains($0.id) }) { backend in
                     let agents = backendAgents[backend.id] ?? []
@@ -239,6 +269,62 @@ struct NewMissionSheet: View {
                     }
                 }
             }
+        }
+    }
+
+    /// Hermes sits above the backends: it starts a conversation with the
+    /// assistant, which can then spawn missions as workers.
+    private var hermesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "sparkles")
+                    .font(.caption)
+                    .foregroundStyle(Theme.accent)
+                Text("Hermes")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.textSecondary)
+            }
+            .padding(.leading, 4)
+
+            Button {
+                selectedAgentValue = hermesAgentValue
+                HapticService.selectionChanged()
+            } label: {
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Theme.accent.opacity(0.15))
+                            .frame(width: 32, height: 32)
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(Theme.accent)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Assistant session")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(Theme.textPrimary)
+                        Text("Hermes plans and can spawn missions as workers")
+                            .font(.caption2)
+                            .foregroundStyle(Theme.textTertiary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    selectionIndicator(isSelected: isHermesSelected)
+                }
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(isHermesSelected ? Theme.accent.opacity(0.08) : Color.clear)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(
+                            isHermesSelected ? Theme.accent.opacity(0.3) : Color.clear,
+                            lineWidth: 1
+                        )
+                )
+            }
+            .buttonStyle(.plain)
         }
     }
     
@@ -444,6 +530,8 @@ struct NewMissionSheet: View {
         // form half-populated. (UX audit item #15.)
         async let backendDataTask = BackendAgentService.loadBackendsAndAgents()
         async let providersTask: ProvidersResponse? = try? api.listProviders()
+        // Probe Hermes: the session list doubles as the availability check.
+        async let hermesTask: [HermesSession]? = try? api.listHermesSessions(limit: 1)
 
         let data = await backendDataTask
         backends = data.backends
@@ -473,6 +561,7 @@ struct NewMissionSheet: View {
         }
 
         providers = (await providersTask)?.providers ?? []
+        hermesAvailable = (await hermesTask) != nil
     }
 }
 
