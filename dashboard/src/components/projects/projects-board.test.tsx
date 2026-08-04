@@ -8,17 +8,20 @@ import {
   postProjectAction,
 } from "@/lib/api/projects";
 import type { ProjectRow, ProjectsOverview } from "@/lib/api/projects";
-import { hermesChatStream } from "@/lib/api/hermes";
+import { hermesChatStream, listHermesSessions } from "@/lib/api/hermes";
 import ProjectsBoard from "./projects-board";
 
 vi.mock("@/lib/api/projects", () => ({
   getProjectsOverview: vi.fn(),
   getProjectUpdates: vi.fn(),
   postProjectAction: vi.fn(),
+  bindProjectConversation: vi.fn(),
+  unbindProjectConversation: vi.fn(),
 }));
 
 vi.mock("@/lib/api/hermes", () => ({
   hermesChatStream: vi.fn(),
+  listHermesSessions: vi.fn(),
 }));
 
 vi.mock("@/components/markdown-content", () => ({
@@ -26,6 +29,7 @@ vi.mock("@/components/markdown-content", () => ({
 }));
 
 const mockedOverview = vi.mocked(getProjectsOverview);
+const mockedListHermesSessions = vi.mocked(listHermesSessions);
 const mockedUpdates = vi.mocked(getProjectUpdates);
 const mockedAction = vi.mocked(postProjectAction);
 const mockedChat = vi.mocked(hermesChatStream);
@@ -243,5 +247,150 @@ describe("ProjectsBoard", () => {
       ),
     );
     expect(await screen.findByText("Bien reçu.")).toBeInTheDocument();
+  });
+  test("links a project to the conversation its updates come from", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity",
+          latest_update: {
+            headline: "Slice fermée",
+            body: null,
+            session_id: "api-94765bde00d93d7f",
+            at: "2026-08-04T07:11:00Z",
+            signature: "verity",
+            blocker: null,
+          },
+        }),
+      ]),
+    );
+
+    renderBoard();
+
+    const link = await screen.findByTitle("Conversation");
+    expect(link).toHaveAttribute(
+      "href",
+      "/control?session=api-94765bde00d93d7f",
+    );
+  });
+
+  test("a declared binding wins over the session of the newest delivery", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity",
+          latest_update: {
+            headline: "tick",
+            body: null,
+            // A cron tick's throwaway session: already ended, unreachable.
+            session_id: "cron_e594d751447d_20260804_120931",
+            at: "2026-08-04T12:09:00Z",
+            signature: "verity",
+            blocker: null,
+          },
+          conversation: {
+            session_id: "20260804_103847_86ca5c",
+            source: "binding",
+          },
+        }),
+      ]),
+    );
+
+    renderBoard();
+
+    const link = await screen.findByTitle("Conversation");
+    expect(link).toHaveAttribute(
+      "href",
+      "/control?session=20260804_103847_86ca5c",
+    );
+    // Already declared: the "choose one" affordance is gone (Rebind/Unbind
+    // remain, which is the point — the operator can still change their mind).
+    expect(screen.queryByTitle(/Choose the conversation/i)).not.toBeInTheDocument();
+  });
+
+  test("an inferred conversation offers to be bound", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity",
+          latest_update: {
+            headline: "tick",
+            body: null,
+            session_id: "cron_e594d751447d_20260804_120931",
+            at: "2026-08-04T12:09:00Z",
+            signature: "verity",
+            blocker: null,
+          },
+          conversation: {
+            session_id: "cron_e594d751447d_20260804_120931",
+            source: "latest_update",
+          },
+        }),
+      ]),
+    );
+
+    renderBoard();
+
+    expect(
+      await screen.findByTitle(/Choose the conversation/i),
+    ).toBeInTheDocument();
+  });
+
+  test("binding never persists the inferred per-tick session", async () => {
+    const cronSession = "cron_e594d751447d_20260804_120931";
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity",
+          latest_update: {
+            headline: "tick",
+            body: null,
+            session_id: cronSession,
+            at: "2026-08-04T12:09:00Z",
+            signature: "verity",
+            blocker: null,
+          },
+          conversation: { session_id: cronSession, source: "latest_update" },
+        }),
+      ]),
+    );
+    mockedListHermesSessions.mockResolvedValue([
+      { id: cronSession, title: "tick" },
+      // An ordinary session that has ENDED is just as unreachable as a cron
+      // tick: binding it would point every reply at a closed thread.
+      {
+        id: "20260801_120000_closed",
+        title: "Old thread",
+        ended_at: "2026-08-02T09:00:00Z",
+      },
+      { id: "20260804_103847_86ca5c", title: "Verity dev #28" },
+    ]);
+
+    renderBoard();
+    fireEvent.click(await screen.findByTitle(/Choose the conversation/i));
+
+    // The per-tick session is filtered out: binding it would cement the very
+    // corpse this feature exists to replace.
+    await waitFor(() => {
+      const values = screen
+        .getAllByRole("option")
+        .map((o) => (o as HTMLOptionElement).value);
+      expect(values).toContain("20260804_103847_86ca5c");
+    });
+    const values = screen
+      .getAllByRole("option")
+      .map((o) => (o as HTMLOptionElement).value);
+    expect(values).not.toContain(cronSession);
+    expect(values).not.toContain("20260801_120000_closed");
+  });
+
+  test("offers no conversation link before a project has an update", async () => {
+    mockedOverview.mockResolvedValue(overview([project({ slug: "verity" })]));
+
+    renderBoard();
+
+    // The slug renders in both the list row and the detail heading.
+    expect(await screen.findAllByText("verity")).not.toHaveLength(0);
+    expect(screen.queryByTitle("Conversation")).not.toBeInTheDocument();
   });
 });

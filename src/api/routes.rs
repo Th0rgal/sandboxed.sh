@@ -159,6 +159,8 @@ pub struct AppState {
     pub fleet: Arc<crate::remote_node::FleetMonitor>,
     /// Persistent project validation campaigns, gates, receipts, and delivery outbox.
     pub validation: super::validation::SharedValidationStore,
+    /// Explicitly-declared project facts (control conversation binding).
+    pub projects: super::projects_store::SharedProjectsStore,
 }
 
 /// Start the HTTP server.
@@ -500,6 +502,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             .working_dir
             .join(".sandboxed-sh/validation-campaigns.db"),
     )?);
+    let projects = Arc::new(super::projects_store::ProjectsStore::open(
+        config.working_dir.join(".sandboxed-sh/projects.db"),
+    )?);
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -550,6 +555,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         codex_usage: super::codex_usage::CodexUsageStore::new(),
         fleet: Arc::new(crate::remote_node::FleetMonitor::new()),
         validation,
+        projects,
     });
 
     super::validation::spawn_outbox_forwarder(Arc::clone(&state));
@@ -793,6 +799,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/current",
             get(control::get_current_mission),
         )
+        // Declared BEFORE `/:id` so the literal segment is not captured as a
+        // mission id.
+        .route(
+            "/api/control/missions/resolve",
+            get(control::resolve_mission_id),
+        )
         .route("/api/control/missions/:id", get(control::get_mission))
         .route(
             "/api/control/missions/:id/board",
@@ -854,6 +866,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/:id/project",
             post(control::update_mission_project),
+        )
+        .route(
+            "/api/control/missions/:id/origin",
+            post(control::update_mission_origin),
         )
         .route(
             "/api/control/missions/:id/mode",

@@ -88,8 +88,16 @@ struct ListMissionsParams {
     limit: usize,
     #[serde(default)]
     project: Option<String>,
+    /// Project family: matches `X` and `X-*`.
+    #[serde(default)]
+    project_prefix: Option<String>,
+    #[serde(default)]
+    track: Option<String>,
     #[serde(default)]
     tag: Option<String>,
+    /// The Hermes conversation a mission was launched from.
+    #[serde(default)]
+    origin_session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -899,6 +907,64 @@ impl AssistantMcp {
             .map(|token| ("Authorization".to_string(), format!("Bearer {token}")))
     }
 
+    /// Turn whatever the caller has into a mission UUID.
+    ///
+    /// Dashboards, logs and transcripts all show the 8-character prefix, so a
+    /// controller keeping notes across days inevitably feeds one back. A full
+    /// UUID resolves locally with no round trip; anything else asks the
+    /// server, which is the only party that can tell whether the fragment is
+    /// unambiguous. Ambiguity surfaces the candidates instead of guessing.
+    async fn resolve_mission_id(&self, raw: &str) -> Result<Uuid, String> {
+        let trimmed = raw.trim();
+        if let Ok(id) = Uuid::parse_str(trimmed) {
+            return Ok(id);
+        }
+        let response = self
+            .api_get(&format!(
+                "/api/control/missions/resolve?id={}",
+                urlencoding::encode(trimmed)
+            ))
+            .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status.is_success() {
+            let value: Value = serde_json::from_str(&body)
+                .map_err(|error| format!("Failed to parse mission resolve response: {error}"))?;
+            return value
+                .get("mission_id")
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .ok_or_else(|| format!("Mission resolve returned no id for '{trimmed}'"));
+        }
+        // Name the candidates so the next call can be exact.
+        if let Ok(value) = serde_json::from_str::<Value>(&body) {
+            if value.get("error").and_then(Value::as_str) == Some("ambiguous") {
+                let listed = value
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|row| {
+                                let id = row.get("id")?.as_str()?;
+                                let title = row.get("title").and_then(Value::as_str).unwrap_or("");
+                                let mission_status =
+                                    row.get("status").and_then(Value::as_str).unwrap_or("");
+                                Some(format!("{id} ({mission_status}, {title:?})"))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .unwrap_or_default();
+                return Err(format!(
+                    "Ambiguous mission id '{trimmed}' — candidates: {listed}. Pass the full id."
+                ));
+            }
+        }
+        Err(format!(
+            "Failed to resolve mission '{trimmed}' ({status}): {body}"
+        ))
+    }
+
     async fn api_get(&self, path: &str) -> Result<reqwest::Response, String> {
         let mut req = self.client.get(format!("{}{}", self.api_url, path));
         if let Some((name, value)) = self.auth_header() {
@@ -1021,8 +1087,11 @@ impl AssistantMcp {
                     "type": "object",
                     "properties": {
                         "limit": {"type": "integer", "description": "Maximum missions to return, default 50."},
-                        "project": {"type": "string", "description": "Optional filter: only missions with this project."},
-                        "tag": {"type": "string", "description": "Optional filter: only missions carrying this tag."}
+                        "project": {"type": "string", "description": "Optional filter: exact project id."},
+                        "project_prefix": {"type": "string", "description": "Optional filter: project FAMILY — matches the id and its `-` suffixed variants (e.g. verity covers verity-core, verity-phase1d). Use this when a project's work is still split across per-phase ids."},
+                        "track": {"type": "string", "description": "Optional filter: exact track within a project."},
+                        "tag": {"type": "string", "description": "Optional filter: only missions carrying this tag."},
+                        "origin_session_id": {"type": "string", "description": "Optional filter: only missions launched from this Hermes conversation."}
                     }
                 }),
             },
@@ -1034,8 +1103,11 @@ impl AssistantMcp {
                     "properties": {
                         "status": {"type": "string", "description": "Optional mission status filter."},
                         "limit": {"type": "integer", "description": "Maximum missions to return, default 50."},
-                        "project": {"type": "string", "description": "Optional filter: only missions with this project."},
-                        "tag": {"type": "string", "description": "Optional filter: only missions carrying this tag."}
+                        "project": {"type": "string", "description": "Optional filter: exact project id."},
+                        "project_prefix": {"type": "string", "description": "Optional filter: project FAMILY — matches the id and its `-` suffixed variants (e.g. verity covers verity-core, verity-phase1d). Use this when a project's work is still split across per-phase ids."},
+                        "track": {"type": "string", "description": "Optional filter: exact track within a project."},
+                        "tag": {"type": "string", "description": "Optional filter: only missions carrying this tag."},
+                        "origin_session_id": {"type": "string", "description": "Optional filter: only missions launched from this Hermes conversation."}
                     }
                 }),
             },
@@ -1045,7 +1117,7 @@ impl AssistantMcp {
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
-                    "properties": {"mission_id": {"type": "string"}}
+                    "properties": {"mission_id": {"type": "string", "description": "Mission UUID, or an unambiguous leading fragment of one (the 8-character form dashboards and logs display)."}}
                 }),
             },
             ToolDefinition {
@@ -1054,7 +1126,7 @@ impl AssistantMcp {
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
-                    "properties": {"mission_id": {"type": "string"}}
+                    "properties": {"mission_id": {"type": "string", "description": "Mission UUID, or an unambiguous leading fragment of one (the 8-character form dashboards and logs display)."}}
                 }),
             },
             ToolDefinition {
@@ -1165,7 +1237,7 @@ impl AssistantMcp {
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
-                    "properties": {"mission_id": {"type": "string"}}
+                    "properties": {"mission_id": {"type": "string", "description": "Mission UUID, or an unambiguous leading fragment of one (the 8-character form dashboards and logs display)."}}
                 }),
             },
             ToolDefinition {
@@ -1174,7 +1246,7 @@ impl AssistantMcp {
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
-                    "properties": {"mission_id": {"type": "string"}}
+                    "properties": {"mission_id": {"type": "string", "description": "Mission UUID, or an unambiguous leading fragment of one (the 8-character form dashboards and logs display)."}}
                 }),
             },
             ToolDefinition {
@@ -1378,7 +1450,7 @@ impl AssistantMcp {
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
-                    "properties": {"mission_id": {"type": "string"}}
+                    "properties": {"mission_id": {"type": "string", "description": "Mission UUID, or an unambiguous leading fragment of one (the 8-character form dashboards and logs display)."}}
                 }),
             },
             ToolDefinition {
@@ -1438,8 +1510,20 @@ impl AssistantMcp {
         if let Some(project) = params.project.as_deref() {
             path.push_str(&format!("&project={}", urlencoding::encode(project)));
         }
+        if let Some(prefix) = params.project_prefix.as_deref() {
+            path.push_str(&format!("&project_prefix={}", urlencoding::encode(prefix)));
+        }
+        if let Some(track) = params.track.as_deref() {
+            path.push_str(&format!("&track={}", urlencoding::encode(track)));
+        }
         if let Some(tag) = params.tag.as_deref() {
             path.push_str(&format!("&tag={}", urlencoding::encode(tag)));
+        }
+        if let Some(session) = params.origin_session_id.as_deref() {
+            path.push_str(&format!(
+                "&origin_session_id={}",
+                urlencoding::encode(session)
+            ));
         }
         let response = self.api_get(&path).await?;
         if !response.status().is_success() {
@@ -1456,12 +1540,18 @@ impl AssistantMcp {
         Ok(json!({ "missions": missions }))
     }
 
-    async fn list_active_missions(
-        &self,
-        limit: usize,
-        project: Option<String>,
-        tag: Option<String>,
-    ) -> Result<Value, String> {
+    /// Takes the whole filter set so an active-mission query can be narrowed
+    /// exactly like a full listing (by conversation, family, track, …).
+    async fn list_active_missions(&self, params: ListMissionsParams) -> Result<Value, String> {
+        let ListMissionsParams {
+            limit,
+            project,
+            project_prefix,
+            track,
+            tag,
+            origin_session_id,
+            ..
+        } = params;
         let requested = limit.clamp(1, 100);
         // The API returns the most recent missions regardless of status, so a
         // narrow fetch limit can be fully consumed by recent completed missions
@@ -1473,7 +1563,10 @@ impl AssistantMcp {
                 status: None,
                 limit: fetch_limit,
                 project,
+                project_prefix,
+                track,
                 tag,
+                origin_session_id,
             })
             .await?;
         if let Some(missions) = result["missions"].as_array_mut() {
@@ -1497,7 +1590,7 @@ impl AssistantMcp {
     }
 
     async fn get_mission_digest(&self, params: MissionIdParams) -> Result<Value, String> {
-        let id = parse_uuid(&params.mission_id)?;
+        let id = self.resolve_mission_id(&params.mission_id).await?;
         let response = self
             .api_get(&format!("/api/control/missions/{id}/digest"))
             .await?;
@@ -1511,7 +1604,7 @@ impl AssistantMcp {
     }
 
     async fn get_mission_events(&self, params: MissionEventsParams) -> Result<Value, String> {
-        let id = parse_uuid(&params.mission_id)?;
+        let id = self.resolve_mission_id(&params.mission_id).await?;
         let limit = params.limit.clamp(1, 200);
         // Validate against the declared enum rather than interpolating a
         // free-form string into the URL, which would let a caller smuggle
@@ -1552,7 +1645,7 @@ impl AssistantMcp {
         &self,
         params: MissionSharedFilesParams,
     ) -> Result<Value, String> {
-        let mission_id = parse_uuid(&params.mission_id)?;
+        let mission_id = self.resolve_mission_id(&params.mission_id).await?;
         // Page backwards from the end of the transcript: shared files are
         // "current attachments", so we must scan the NEWEST `limit` events —
         // the default (no cursor) pagination returns the oldest rows and would
@@ -1596,7 +1689,7 @@ impl AssistantMcp {
         &self,
         params: DownloadSharedFileParams,
     ) -> Result<Value, String> {
-        let mission_id = parse_uuid(&params.mission_id)?;
+        let mission_id = self.resolve_mission_id(&params.mission_id).await?;
         let path = shared_file_download_path(&params.url)?;
         let filename = params
             .filename
@@ -1740,7 +1833,7 @@ impl AssistantMcp {
             "No workspace_id given and no default workspace configured (HERMES_DEFAULT_WORKSPACE_ID / ASSISTANT_DEFAULT_WORKSPACE_ID)".to_string()
         })?;
         let workspace_id = parse_uuid(&workspace_id)?;
-        let mission_id = parse_uuid(&params.mission_id)?;
+        let mission_id = self.resolve_mission_id(&params.mission_id).await?;
         let command = workspace_job_command(params.command, params.argv)?;
         let key = params.idempotency_key.trim();
         if key.is_empty() {
@@ -1788,7 +1881,7 @@ impl AssistantMcp {
     }
 
     async fn send_message(&self, params: SendMessageParams) -> Result<Value, String> {
-        let id = parse_uuid(&params.mission_id)?;
+        let id = self.resolve_mission_id(&params.mission_id).await?;
         let response = self
             .api_post(
                 "/api/control/message",
@@ -1809,7 +1902,7 @@ impl AssistantMcp {
     }
 
     async fn ask_mission(&self, params: AskMissionParams) -> Result<Value, String> {
-        let id = parse_uuid(&params.mission_id)?;
+        let id = self.resolve_mission_id(&params.mission_id).await?;
         let mut body = json!({
             "content": params.content,
             "sandbox": params.sandbox,
@@ -1846,7 +1939,7 @@ impl AssistantMcp {
     }
 
     async fn cancel_mission(&self, params: MissionIdParams) -> Result<Value, String> {
-        let id = parse_uuid(&params.mission_id)?;
+        let id = self.resolve_mission_id(&params.mission_id).await?;
         let response = self
             .api_post(&format!("/api/control/missions/{id}/cancel"), json!({}))
             .await?;
@@ -1858,7 +1951,7 @@ impl AssistantMcp {
     }
 
     async fn acknowledge_mission(&self, params: MissionIdParams) -> Result<Value, String> {
-        let id = parse_uuid(&params.mission_id)?;
+        let id = self.resolve_mission_id(&params.mission_id).await?;
         let response = self
             .api_get(&format!("/api/control/missions/{id}/digest"))
             .await?;
@@ -2074,7 +2167,7 @@ impl AssistantMcp {
     }
 
     async fn update_mission_settings(&self, params: UpdateSettingsParams) -> Result<Value, String> {
-        let id = parse_uuid(&params.mission_id)?;
+        let id = self.resolve_mission_id(&params.mission_id).await?;
         let mut body = serde_json::Map::new();
         if let Some(backend) = params
             .backend
@@ -2136,7 +2229,7 @@ impl AssistantMcp {
     }
 
     async fn resume_mission(&self, params: ResumeMissionParams) -> Result<Value, String> {
-        let id = parse_uuid(&params.mission_id)?;
+        let id = self.resolve_mission_id(&params.mission_id).await?;
         let hint = params
             .content
             .as_deref()
@@ -2252,7 +2345,7 @@ impl AssistantMcp {
     }
 
     async fn get_mission_health(&self, params: MissionHealthParams) -> Result<Value, String> {
-        let id = parse_uuid(&params.mission_id)?;
+        let id = self.resolve_mission_id(&params.mission_id).await?;
         let mission = self
             .get_mission(MissionIdParams {
                 mission_id: id.to_string(),
@@ -2313,7 +2406,7 @@ impl AssistantMcp {
         &self,
         params: MissionDiagnosticsParams,
     ) -> Result<Value, String> {
-        let id = parse_uuid(&params.mission_id)?;
+        let id = self.resolve_mission_id(&params.mission_id).await?;
         let limit = params.limit.clamp(10, 300);
         let events = self
             .get_mission_events(MissionEventsParams {
@@ -2399,8 +2492,7 @@ impl AssistantMcp {
             "list_active_missions" => {
                 let params: ListMissionsParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
-                self.list_active_missions(params.limit, params.project, params.tag)
-                    .await
+                self.list_active_missions(params).await
             }
             "list_missions" => {
                 let params: ListMissionsParams = serde_json::from_value(arguments)
@@ -2703,6 +2795,11 @@ fn compact_mission_summary(mission: Value) -> Value {
         "tags": mission.get("tags").cloned().unwrap_or_else(|| json!([])),
         "desired_state": mission.get("desired_state").cloned().unwrap_or(Value::Null),
         "next_check_at": mission.get("next_check_at").cloned().unwrap_or(Value::Null),
+        // Creation provenance. Hermes is what SETS this, and until now could
+        // not read it back — so it could not tell which of its own
+        // conversations a mission belonged to.
+        "origin": mission.get("origin").cloned().unwrap_or(Value::Null),
+        "origin_session_id": mission.get("origin_session_id").cloned().unwrap_or(Value::Null),
         "awaiting_kind": mission.get("awaiting_kind").cloned().unwrap_or(Value::Null),
         "last_activity_at": mission.get("last_activity_at").cloned().unwrap_or(Value::Null),
         "last_status_change_at": mission.get("last_status_change_at").cloned().unwrap_or(Value::Null),
@@ -3137,6 +3234,46 @@ mod tests {
     /// The binary's tool table IS the curated Hermes surface; the generated
     /// config allowlists are pinned to `HERMES_ASSISTANT_TOOL_ALLOWLIST`.
     /// Adding/removing a tool here must go through the canonical list.
+    /// A full UUID must resolve without a round trip: no HTTP client is
+    /// configured in tests, so any network attempt would fail here.
+    #[tokio::test]
+    async fn full_uuid_resolves_without_calling_the_server() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let mcp = AssistantMcp::new();
+        let id = Uuid::new_v4();
+        assert_eq!(
+            mcp.resolve_mission_id(&id.to_string())
+                .await
+                .expect("resolve"),
+            id
+        );
+        // Mixed case with surrounding whitespace is the shape humans paste.
+        assert_eq!(
+            mcp.resolve_mission_id(&format!("  {}  ", id.to_string().to_uppercase()))
+                .await
+                .expect("resolve"),
+            id
+        );
+    }
+
+    #[test]
+    fn compact_summary_exposes_creation_origin() {
+        let summary = compact_mission_summary(json!({
+            "id": "11111111-2222-3333-4444-555555555555",
+            "status": "active",
+            "origin": "hermes",
+            "origin_session_id": "20260804_103847_86ca5c",
+            "prompt": "secret",
+            "api_token": "secret",
+        }));
+        assert_eq!(summary["origin"], "hermes");
+        assert_eq!(summary["origin_session_id"], "20260804_103847_86ca5c");
+        // The summary stays a projection, not a passthrough.
+        assert!(summary.get("prompt").is_none());
+        assert!(summary.get("api_token").is_none());
+    }
+
     #[test]
     fn tool_table_matches_canonical_allowlist() {
         let names: Vec<String> = AssistantMcp::tools()

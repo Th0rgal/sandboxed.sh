@@ -840,6 +840,50 @@ mod stall_guard_tests {
         reset_stall_guard(boss);
     }
 
+    #[test]
+    fn project_patches_only_arbitrate_the_writer_lease_when_they_could_change_it() {
+        let parse = |json: &str| -> UpdateMissionProjectRequest {
+            serde_json::from_str(json).expect("valid patch")
+        };
+
+        // Retagging metadata cannot make a mission a writer, so it must not be
+        // gated on someone else's lease.
+        assert!(!patch_can_change_writer_status(&parse(
+            r#"{"project":"verity","track":"phase1d/core-c3"}"#
+        )));
+        assert!(!patch_can_change_writer_status(&parse(r#"{}"#)));
+        assert!(!patch_can_change_writer_status(&parse(
+            r#"{"desired_state":"green","next_check_at":"2026-08-05T00:00:00Z"}"#
+        )));
+
+        // Anything `becomes_writer` is derived from still arbitrates.
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"github_pr":"https://github.com/o/r/pull/1"}"#
+        )));
+        assert!(patch_can_change_writer_status(&parse(r#"{"writer":true}"#)));
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"writer":false}"#
+        )));
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"intent":"implementation"}"#
+        )));
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"tags":["pr-writer"]}"#
+        )));
+
+        // An explicit null is a clear, not an absence: dropping the PR or the
+        // intent changes writer status just as much as setting one.
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"github_pr":null}"#
+        )));
+        assert!(patch_can_change_writer_status(&parse(r#"{"intent":null}"#)));
+
+        // A patch that mixes both still arbitrates.
+        assert!(patch_can_change_writer_status(&parse(
+            r#"{"project":"verity","writer":true}"#
+        )));
+    }
+
     #[tokio::test]
     async fn delete_rejects_paused_mission_until_resumed_or_cancelled() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
@@ -4551,9 +4595,21 @@ pub struct ListMissionsQuery {
     /// Optional filter: exact project identifier.
     #[serde(default)]
     pub project: Option<String>,
+    /// Optional filter: project FAMILY — matches `X` and `X-*`. Use this to
+    /// span a project whose missions are still split across per-phase slugs
+    /// (`verity`, `verity-core`, `verity-phase1d`, …). `project` stays exact
+    /// so existing callers keep their current results.
+    #[serde(default)]
+    pub project_prefix: Option<String>,
+    /// Optional filter: exact track within a project.
+    #[serde(default)]
+    pub track: Option<String>,
     /// Optional filter: missions carrying this tag.
     #[serde(default)]
     pub tag: Option<String>,
+    /// Optional filter: the conversation a mission was launched from.
+    #[serde(default)]
+    pub origin_session_id: Option<String>,
     /// Optional filter: workspace by id or (case-insensitive) name.
     #[serde(default)]
     pub workspace: Option<String>,
@@ -4895,33 +4951,40 @@ pub async fn list_missions(
     let control = control_for_user(&state, &user).await;
     // Default to the most recent 50; honor an explicit limit so callers (e.g.
     // the assistant MCP) can request more, capped to keep the response bounded.
-    let has_filters = query.status.is_some()
-        || query.project.is_some()
-        || query.tag.is_some()
-        || query.workspace.is_some();
+    let filter = crate::api::mission_store::MissionFilter {
+        status: query.status.clone(),
+        project: query.project.clone(),
+        project_prefix: query.project_prefix.clone(),
+        track: query.track.clone(),
+        tag: query.tag.clone(),
+        origin_session_id: query.origin_session_id.clone(),
+    };
+    // Workspace is the one predicate the store cannot answer: matching by
+    // name needs `populate_workspace_names`, and the persisted
+    // `workspace_name` column is not authoritative. It is applied in memory —
+    // but over STORE-FILTERED candidates, so combining it with
+    // origin_session_id/project/track keeps the pushdown and its unlimited
+    // depth instead of falling back to scanning raw rows.
+    let needs_workspace_scan = query.workspace.is_some();
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0);
 
-    let mut missions = if !has_filters {
-        // Fast path: no filters, list the page directly.
+    let mut missions = if !needs_workspace_scan {
+        // The store owns the predicate — sqlite pushes it into SQL, so a match
+        // is found however deep it sits in the fleet.
         let mut page = control
             .mission_store
-            .list_missions(limit, offset)
+            .list_missions_filtered(&filter, limit, offset)
             .await
             .map_err(internal_error)?;
         populate_workspace_names(&state, &mut page).await;
         page
     } else {
-        // Filtered path: predicate-match runs in memory, so a single 200-row
-        // page would silently drop matches on a larger fleet. Scan from the
-        // start, collecting matches, until we have `offset + limit` of them or
-        // hit a bounded ceiling. `offset` here means "skip this many MATCHING
-        // missions" (consistent with filtered pagination), not raw rows.
         const PAGE: usize = 200;
-        const MAX_SCAN: usize = 5_000;
-        let status = query.status.as_deref();
-        let project = query.project.as_deref();
-        let tag = query.tag.as_deref();
+        // Bounds how many STORE-FILTERED candidates we resolve workspace names
+        // for, not how deep we read into the fleet: with a selective filter
+        // the store already skipped everything irrelevant.
+        const MAX_CANDIDATES: usize = 5_000;
         let workspace_lower = query.workspace.as_deref().map(|w| w.to_lowercase());
         let workspace_raw = query.workspace.as_deref();
         let want = offset.saturating_add(limit);
@@ -4932,24 +4995,21 @@ pub async fn list_missions(
         loop {
             let mut page = control
                 .mission_store
-                .list_missions(PAGE, scan_offset)
+                .list_missions_filtered(&filter, PAGE, scan_offset)
                 .await
                 .map_err(internal_error)?;
             let page_len = page.len();
             populate_workspace_names(&state, &mut page).await;
             for m in page {
-                let keep = status.is_none_or(|s| m.status.to_string() == s)
-                    && project.is_none_or(|p| m.project.project.as_deref() == Some(p))
-                    && tag.is_none_or(|t| m.project.tags.iter().any(|x| x == t))
-                    && match (workspace_raw, workspace_lower.as_deref()) {
-                        (Some(raw), Some(lower)) => {
-                            m.workspace_id.to_string() == raw
-                                || m.workspace_name
-                                    .as_deref()
-                                    .is_some_and(|name| name.to_lowercase() == lower)
-                        }
-                        _ => true,
-                    };
+                let keep = match (workspace_raw, workspace_lower.as_deref()) {
+                    (Some(raw), Some(lower)) => {
+                        m.workspace_id.to_string() == raw
+                            || m.workspace_name
+                                .as_deref()
+                                .is_some_and(|name| name.to_lowercase() == lower)
+                    }
+                    _ => true,
+                };
                 if keep {
                     matched.push(m);
                     if matched.len() >= want {
@@ -4958,11 +5018,11 @@ pub async fn list_missions(
                 }
             }
             scanned += page_len;
-            if matched.len() >= want || page_len < PAGE || scanned >= MAX_SCAN {
-                if scanned >= MAX_SCAN && matched.len() < want {
+            if matched.len() >= want || page_len < PAGE || scanned >= MAX_CANDIDATES {
+                if scanned >= MAX_CANDIDATES && matched.len() < want {
                     tracing::warn!(
-                        "list_missions filter scan hit cap ({}); results may be incomplete",
-                        MAX_SCAN
+                        "list_missions workspace scan hit candidate cap ({}); results may be incomplete",
+                        MAX_CANDIDATES
                     );
                 }
                 break;
@@ -5445,6 +5505,80 @@ async fn mission_search_recency_fingerprint(
 }
 
 /// Search missions with semantic-aware ranking.
+#[derive(Debug, serde::Deserialize)]
+pub struct ResolveMissionQuery {
+    /// A full mission UUID or an unambiguous leading fragment of one.
+    pub id: String,
+}
+
+/// Resolve the id humans actually have — the 8-character prefix dashboards,
+/// logs and transcripts display — into a full mission UUID.
+///
+/// Ambiguity is reported as a conflict listing the candidates rather than
+/// silently picking the newest: a controller acting on the wrong mission is
+/// far worse than one that has to ask again with more characters.
+pub async fn resolve_mission_id(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<ResolveMissionQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let raw = query.id.trim().to_ascii_lowercase();
+    if let Ok(id) = Uuid::parse_str(&raw) {
+        return Ok(Json(serde_json::json!({
+            "mission_id": id.to_string(),
+            "match": "exact",
+        })));
+    }
+    // Anything shorter is not worth resolving: at 4 hex characters a
+    // collision is already likely enough to be a nuisance, and a 1-character
+    // "prefix" would scan half the fleet.
+    if raw.len() < 4 || !raw.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "id must be a mission UUID or at least 4 hex characters of one".to_string(),
+        ));
+    }
+
+    let control = control_for_user(&state, &user).await;
+    // One more than we report, so "exactly one" is provably unambiguous.
+    let candidates = control
+        .mission_store
+        .find_missions_by_id_prefix(&raw, 11)
+        .await
+        .map_err(internal_error)?;
+
+    match candidates.len() {
+        0 => Err((StatusCode::NOT_FOUND, format!("no mission matches '{raw}'"))),
+        1 => Ok(Json(serde_json::json!({
+            "mission_id": candidates[0].id.to_string(),
+            "match": "prefix",
+        }))),
+        _ => {
+            let listed: Vec<serde_json::Value> = candidates
+                .iter()
+                .take(10)
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id.to_string(),
+                        "title": m.title,
+                        "status": m.status.to_string(),
+                        "updated_at": m.updated_at,
+                    })
+                })
+                .collect();
+            Err((
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "ambiguous",
+                    "prefix": raw,
+                    "candidates": listed,
+                })
+                .to_string(),
+            ))
+        }
+    }
+}
+
 pub async fn search_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -9287,7 +9421,95 @@ pub struct UpdateMissionProjectRequest {
     pub next_check_at: Option<Option<String>>,
 }
 
+/// Whether this patch could change the mission's PR-writer status.
+///
+/// `becomes_writer` is derived entirely from `github_pr`, `writer`, `intent`
+/// and `tags`. A patch carrying none of them leaves writer status exactly as it
+/// was, so there is no transition to arbitrate — and re-running the lease check
+/// anyway can only reject an edit over a state the mission was already in.
+///
+/// That is not hypothetical: retagging a mission's project returned 409 forever
+/// whenever some *other* mission held the writer lease for the PR this one
+/// happens to reference, which made 32 missions permanently unmaintainable.
+fn patch_can_change_writer_status(req: &UpdateMissionProjectRequest) -> bool {
+    req.github_pr.is_some() || req.writer.is_some() || req.intent.is_some() || req.tags.is_some()
+}
+
 /// Set or update project tagging metadata for a mission.
+#[derive(Debug, Deserialize)]
+pub struct UpdateMissionOriginRequest {
+    /// Creating system, e.g. "hermes".
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Conversation the mission belongs to.
+    #[serde(default)]
+    pub origin_session_id: Option<String>,
+}
+
+/// Attach an existing mission to a conversation.
+///
+/// Origin was write-once at creation, so every mission created before the
+/// column existed — or by a caller that did not declare one — was
+/// permanently unattributable. This is what makes that history recoverable.
+pub async fn update_mission_origin(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateMissionOriginRequest>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let origin = req
+        .origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("hermes");
+    let session = req
+        .origin_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(session) = session {
+        // Same shape the assistant MCP validates, so a value that would be
+        // rejected at creation cannot be smuggled in through the patch.
+        if session.len() > 128
+            || !session
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "origin_session_id must be 1-128 chars of [A-Za-z0-9._:-]".to_string(),
+            ));
+        }
+    }
+    // Existence first: the memory and file stores answer a missing mission
+    // with a plain Err, which `internal_error` would surface as a 500 — a
+    // caller backfilling origins in bulk needs "this one is gone" to read as
+    // 404, not as a server fault it should retry.
+    if control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, format!("mission {id} not found")));
+    }
+    control
+        .mission_store
+        .set_mission_origin(id, origin, session)
+        .await
+        .map_err(internal_error)?;
+    let mission = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, format!("mission {id} not found")))?;
+    Ok(Json(mission))
+}
+
 pub async fn update_mission_project(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -9301,6 +9523,9 @@ pub async fn update_mission_project(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
+
+    // Read before the normalize step below consumes `req`'s fields.
+    let could_change_writer_status = patch_can_change_writer_status(&req);
 
     // Normalize: blank string patches clear the field; tags are trimmed.
     let normalize = |patch: Option<Option<String>>| -> Option<Option<String>> {
@@ -9370,7 +9595,7 @@ pub async fn update_mission_project(
         tags = Some(effective_tags.clone());
     }
 
-    let writer_guard = if becomes_writer {
+    let writer_guard = if becomes_writer && could_change_writer_status {
         Some(
             acquire_durable_pr_writer_lock(&state.control)
                 .await
@@ -10979,8 +11204,11 @@ pub async fn clone_mission(
         remote_command: None,
         remote_async: None,
         estimated_disk_gib: None,
-        origin: None,
-        origin_session_id: None,
+        // A clone is the same work retried, so it belongs to the same
+        // conversation. Dropping the origin here orphaned the retry: it
+        // vanished from the worker strip of the session that asked for it.
+        origin: source.origin.clone(),
+        origin_session_id: source.origin_session_id.clone(),
         extra: Default::default(),
     };
 

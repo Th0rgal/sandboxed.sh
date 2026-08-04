@@ -43,6 +43,72 @@ pub struct MissionScheduling {
     pub deadline: Option<String>,
 }
 
+/// Which missions a listing wants. One value, one predicate — so the SQL
+/// pushdown and the in-memory scan can never disagree about what a filter
+/// means.
+///
+/// `project` stays an exact match: widening it would silently change every
+/// existing caller's results. Cross-phase queries ask for `project_prefix`
+/// instead, which matches a project family (`verity` covers `verity-core`,
+/// `verity-phase1d`, …) while a project is being migrated onto the
+/// `project` + `track` convention.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MissionFilter {
+    pub status: Option<String>,
+    pub project: Option<String>,
+    /// Family match: `project == X` OR `project` starts with `X-`.
+    pub project_prefix: Option<String>,
+    pub track: Option<String>,
+    pub tag: Option<String>,
+    /// The conversation a mission was launched from (Hermes session id).
+    pub origin_session_id: Option<String>,
+}
+
+impl MissionFilter {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// True when `project` belongs to the `family` family: the family itself,
+    /// or a `family-<suffix>` member. Deliberately hyphen-anchored so `verity`
+    /// never swallows `verityx`.
+    fn in_family(project: &str, family: &str) -> bool {
+        project == family
+            || (project.len() > family.len()
+                && project.starts_with(family)
+                && project.as_bytes()[family.len()] == b'-')
+    }
+
+    pub fn matches(&self, mission: &Mission) -> bool {
+        self.status
+            .as_deref()
+            .is_none_or(|s| mission.status.to_string() == s)
+            && self
+                .project
+                .as_deref()
+                .is_none_or(|p| mission.project.project.as_deref() == Some(p))
+            && self.project_prefix.as_deref().is_none_or(|family| {
+                mission
+                    .project
+                    .project
+                    .as_deref()
+                    .is_some_and(|p| Self::in_family(p, family))
+            })
+            && self
+                .track
+                .as_deref()
+                .is_none_or(|t| mission.project.track.as_deref() == Some(t))
+            && self
+                .tag
+                .as_deref()
+                .is_none_or(|t| mission.project.tags.iter().any(|x| x == t))
+            && self
+                .origin_session_id
+                .as_deref()
+                .is_none_or(|s| mission.origin_session_id.as_deref() == Some(s))
+    }
+}
+
 /// Project tagging metadata for a mission. Flattened into `Mission` so the
 /// fields appear top-level in serialized output. Lets external consumers (e.g.
 /// Paloma) group/filter/route missions by project, track, intent, PR, or
@@ -1769,11 +1835,95 @@ pub trait MissionStore: Send + Sync {
     /// List missions, ordered by updated_at descending.
     async fn list_missions(&self, limit: usize, offset: usize) -> Result<Vec<Mission>, String>;
 
+    /// Filtered listing, newest first. `offset` counts MATCHES, not raw rows.
+    ///
+    /// The default implementation pages `list_missions` and applies
+    /// [`MissionFilter::matches`], so it is bounded by `MAX_FILTER_SCAN` and
+    /// can miss matches that live deeper than that in a large fleet. Stores
+    /// that can push the predicate down (sqlite) override this and are exact.
+    async fn list_missions_filtered(
+        &self,
+        filter: &MissionFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Mission>, String> {
+        const PAGE: usize = 200;
+        const MAX_FILTER_SCAN: usize = 5_000;
+        if filter.is_empty() {
+            return self.list_missions(limit, offset).await;
+        }
+        let want = offset.saturating_add(limit);
+        let mut matched: Vec<Mission> = Vec::new();
+        let mut scan_offset = 0usize;
+        let mut scanned = 0usize;
+        loop {
+            let page = self.list_missions(PAGE, scan_offset).await?;
+            let page_len = page.len();
+            for mission in page {
+                if filter.matches(&mission) {
+                    matched.push(mission);
+                    if matched.len() >= want {
+                        break;
+                    }
+                }
+            }
+            scanned += page_len;
+            if matched.len() >= want || page_len < PAGE || scanned >= MAX_FILTER_SCAN {
+                if scanned >= MAX_FILTER_SCAN && matched.len() < want {
+                    tracing::warn!(
+                        "list_missions_filtered scan hit cap ({}); results may be incomplete",
+                        MAX_FILTER_SCAN
+                    );
+                }
+                break;
+            }
+            scan_offset += PAGE;
+        }
+        Ok(matched.into_iter().skip(offset).take(limit).collect())
+    }
+
     /// Count missions by status without applying list pagination.
     async fn count_missions_by_status(&self) -> Result<MissionStatusCounts, String>;
 
     /// Get a single mission by ID.
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String>;
+
+    /// Missions whose canonical id starts with `prefix`, newest first.
+    ///
+    /// Dashboards, logs and humans all refer to a mission by its first 8
+    /// characters, so tooling has to accept that form. Resolution is
+    /// deliberately a lookup rather than a parse: only the store knows whether
+    /// a prefix is unambiguous. The default implementation pages
+    /// `list_missions`; sqlite overrides it with an indexed prefix scan.
+    ///
+    /// Reads the store ONCE, unpaged, on purpose. Two independent hazards make
+    /// paging wrong here, and both end the same way — the caller cancels or
+    /// messages the wrong mission:
+    ///
+    /// - a scan ceiling could report a single visible candidate as unambiguous
+    ///   while a second match sat beyond the horizon;
+    /// - `list_missions` orders by `updated_at`, so a mission touched between
+    ///   two pages can move into an already-consumed page and be skipped
+    ///   entirely, again leaving a false "unique".
+    ///
+    /// A single call is as atomic as the backing store's own listing (the
+    /// file and memory stores materialize under one read lock), which is
+    /// exactly the snapshot this needs. An incomplete list is a nuisance; an
+    /// incomplete uniqueness proof is a correctness bug. sqlite overrides this
+    /// with an indexed range read, which is atomic for the same reason.
+    async fn find_missions_by_id_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Mission>, String> {
+        let prefix = prefix.to_ascii_lowercase();
+        let snapshot = self.list_missions(usize::MAX, 0).await?;
+        Ok(snapshot
+            .into_iter()
+            .filter(|mission| mission.id.to_string().starts_with(&prefix))
+            .take(limit)
+            .collect())
+    }
 
     /// Acquire the sole non-terminal execution lease for a mission. Every
     /// successful acquisition increments the mission generation.
@@ -3558,6 +3708,63 @@ pub async fn create_mission_store(
             let store = SqliteMissionStore::new(base_dir, user_id).await?;
             Ok(Box::new(store))
         }
+    }
+}
+
+#[cfg(test)]
+mod id_prefix_default_impl_tests {
+    use super::{InMemoryMissionStore, MissionStore};
+
+    /// The default (non-sqlite) implementation must have no scan ceiling.
+    /// A cap could report a single visible candidate as unambiguous while a
+    /// second match sat beyond the horizon — and the caller would then cancel
+    /// or message the wrong mission. An incomplete list is a nuisance; an
+    /// incomplete uniqueness proof is a correctness bug.
+    #[tokio::test]
+    async fn ambiguity_is_detected_past_any_paging_horizon() {
+        let store = InMemoryMissionStore::new();
+        let mut shared_prefix: Option<String> = None;
+        let mut expected = 0usize;
+
+        // Create enough missions that a naive cap would truncate, and seed two
+        // that genuinely share a prefix at opposite ends of the ordering.
+        for i in 0..40 {
+            let mission = store
+                .create_mission_with_parent(
+                    Some(&format!("m{i}")),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("create mission");
+            let id = mission.id.to_string();
+            match shared_prefix.as_deref() {
+                None => {
+                    shared_prefix = Some(id[..1].to_string());
+                    expected = 1;
+                }
+                Some(prefix) if id.starts_with(prefix) => expected += 1,
+                _ => {}
+            }
+        }
+
+        let prefix = shared_prefix.expect("at least one mission");
+        let found = store
+            .find_missions_by_id_prefix(&prefix, 50)
+            .await
+            .expect("prefix lookup");
+        assert_eq!(
+            found.len(),
+            expected,
+            "every match must be seen, whatever its position"
+        );
     }
 }
 

@@ -215,8 +215,38 @@ export interface MissionMomentSearchResult {
 // API Functions
 // ---------------------------------------------------------------------------
 
-export async function listMissions(): Promise<Mission[]> {
-  return apiGet("/api/control/missions", "Failed to fetch missions");
+export interface ListMissionsOptions {
+  status?: string;
+  /** Exact project id. */
+  project?: string;
+  /** Project family: matches `X` and `X-*`. */
+  projectPrefix?: string;
+  track?: string;
+  tag?: string;
+  /** The Hermes conversation a mission was launched from. */
+  originSessionId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export async function listMissions(
+  options?: ListMissionsOptions,
+): Promise<Mission[]> {
+  const params = new URLSearchParams();
+  if (options?.status) params.set("status", options.status);
+  if (options?.project) params.set("project", options.project);
+  if (options?.projectPrefix) params.set("project_prefix", options.projectPrefix);
+  if (options?.track) params.set("track", options.track);
+  if (options?.tag) params.set("tag", options.tag);
+  if (options?.originSessionId)
+    params.set("origin_session_id", options.originSessionId);
+  if (options?.limit) params.set("limit", String(options.limit));
+  if (options?.offset) params.set("offset", String(options.offset));
+  const query = params.toString();
+  return apiGet(
+    query ? `/api/control/missions?${query}` : "/api/control/missions",
+    "Failed to fetch missions",
+  );
 }
 
 export async function searchMissions(

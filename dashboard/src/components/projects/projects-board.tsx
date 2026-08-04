@@ -20,15 +20,21 @@ import {
   ChevronRight,
   GitPullRequest,
   Inbox,
+  Link2,
   Loader,
   Pause,
   Play,
   Search,
   Send,
+  Sparkles,
   Trash2,
+  Unlink,
 } from "lucide-react";
 
 import {
+  bindProjectConversation,
+  unbindProjectConversation,
+  type ProjectConversation,
   getProjectsOverview,
   getProjectUpdates,
   postProjectAction,
@@ -38,6 +44,10 @@ import {
   type ProjectMissionChip,
   type ProjectRow,
 } from "@/lib/api/projects";
+import {
+  listHermesSessions,
+  type HermesSession,
+} from "@/lib/api/hermes";
 import { hermesChatStream } from "@/lib/api/hermes";
 import { MarkdownContent } from "@/components/markdown-content";
 import { RelativeTime } from "@/components/ui/relative-time";
@@ -392,45 +402,67 @@ function ProjectListRow({
 }
 
 /** Icon button for the detail-pane action bar. */
+/** One control in the project action row. Renders a link when `href` is given
+ * (navigation, so middle-click and open-in-new-tab work), a button otherwise. */
 function ActionButton({
   icon: Icon,
   label,
+  title,
   onClick,
+  href,
   busy,
   danger,
 }: {
   icon: LucideIcon;
   label: string;
-  onClick: () => void;
+  /** Hover text when the label alone does not explain the consequence. */
+  title?: string;
+  onClick?: () => void;
+  href?: string;
   busy?: boolean;
   danger?: boolean;
 }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={busy}
-      title={label}
-      className={cn(
-        "flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[11px] transition-colors disabled:opacity-50",
-        danger
-          ? "border-amber-400/25 bg-amber-500/10 text-amber-300 hover:border-amber-400/50"
-          : "border-white/[0.08] bg-white/[0.03] text-white/50 hover:border-white/20 hover:text-white/80",
-      )}
-    >
+  const className = cn(
+    "flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[11px] transition-colors disabled:opacity-50",
+    danger
+      ? "border-amber-400/25 bg-amber-500/10 text-amber-300 hover:border-amber-400/50"
+      : "border-white/[0.08] bg-white/[0.03] text-white/50 hover:border-white/20 hover:text-white/80",
+  );
+  const content = (
+    <>
       {busy ? (
         <Loader className="h-3 w-3 animate-spin" />
       ) : (
         <Icon className="h-3 w-3" />
       )}
       {label}
+    </>
+  );
+
+  if (href) {
+    return (
+      <Link href={href} title={title ?? label} className={cn(className, "no-underline")}>
+        {content}
+      </Link>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={busy}
+      title={title ?? label}
+      className={className}
+    >
+      {content}
     </button>
   );
 }
 
 function ProjectActions({ project }: { project: ProjectRow }) {
   const { mutate } = useSWRConfig();
-  const [busy, setBusy] = useState<ProjectAction | null>(null);
+  const [busy, setBusy] = useState<ProjectAction | "bind" | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -451,8 +483,105 @@ function ProjectActions({ project }: { project: ProjectRow }) {
     [project.slug, mutate],
   );
 
+  // The conversation this project reports into. A declared binding is
+  // authoritative; otherwise the newest delivery's session is only a GUESS —
+  // and for a cron-driven project that guess is a throwaway per-tick session
+  // that has already ended, which is why binding it is offered right here.
+  // The dashboard ships via Vercel and the backend deploys separately, so a
+  // window exists where this field is not served yet. Fall back to the old
+  // inference rather than dropping the button — tagged as a guess either way.
+  const conversation: ProjectConversation | null =
+    project.conversation ??
+    (project.latest_update?.session_id
+      ? {
+          session_id: project.latest_update.session_id,
+          source: "latest_update" as const,
+        }
+      : null);
+  const conversationSessionId = conversation?.session_id ?? null;
+  const conversationIsGuess = conversation?.source === "latest_update";
+
+  const [picking, setPicking] = useState(false);
+  const [sessions, setSessions] = useState<HermesSession[] | null>(null);
+
+  // Offer only conversations that can actually receive something. An ended
+  // session is unreachable whatever produced it, and a per-tick cron session
+  // is unreachable by construction — binding either would cement exactly the
+  // corpse this feature exists to avoid. `ended_at` is the general rule; the
+  // `cron_` check also catches a tick still in flight, which has no
+  // `ended_at` yet but will never be a conversation.
+  const openPicker = useCallback(async () => {
+    setPicking(true);
+    setActionError(null);
+    if (sessions) return;
+    try {
+      const all = await listHermesSessions(50);
+      setSessions(
+        all.filter((s) => !s.ended_at && !s.id.startsWith("cron_")),
+      );
+    } catch (err) {
+      setActionError(String(err instanceof Error ? err.message : err));
+    }
+  }, [sessions]);
+
+  const bindConversation = useCallback(
+    async (sessionId: string) => {
+      setBusy("bind");
+      setActionError(null);
+      try {
+        await bindProjectConversation(project.slug, sessionId);
+        await mutate("projects-overview");
+        setPicking(false);
+      } catch (err) {
+        setActionError(String(err instanceof Error ? err.message : err));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [project.slug, mutate],
+  );
+
+  const unbindConversation = useCallback(async () => {
+    setBusy("bind");
+    setActionError(null);
+    try {
+      await unbindProjectConversation(project.slug);
+      await mutate("projects-overview");
+    } catch (err) {
+      setActionError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setBusy(null);
+    }
+  }, [project.slug, mutate]);
+
   return (
     <div className="flex flex-wrap items-center gap-1.5">
+      {conversationSessionId && (
+        <ActionButton
+          icon={Sparkles}
+          label="Conversation"
+          href={`/control?session=${encodeURIComponent(conversationSessionId)}`}
+        />
+      )}
+      {conversationIsGuess ? (
+        <ActionButton
+          icon={Link2}
+          label="Bind…"
+          title="Choose the conversation this project reports into. Until one is declared, the link above follows whichever session sent the last update — for a cron-driven project that is a per-tick session which has already ended."
+          busy={busy === "bind"}
+          onClick={openPicker}
+        />
+      ) : (
+        conversation && (
+          <ActionButton
+            icon={Link2}
+            label="Rebind…"
+            title="Point this project at a different control conversation."
+            busy={busy === "bind"}
+            onClick={openPicker}
+          />
+        )
+      )}
       {project.bucket === "paused" ? (
         <ActionButton
           icon={Play}
@@ -497,6 +626,44 @@ function ProjectActions({ project }: { project: ProjectRow }) {
           }
         }}
       />
+      {conversation?.source === "binding" && (
+        <ActionButton
+          icon={Unlink}
+          label="Unbind"
+          title="Stop declaring a control conversation for this project. The link falls back to whichever session sent the last update."
+          busy={busy === "bind"}
+          onClick={unbindConversation}
+        />
+      )}
+      {picking && (
+        <div className="mt-1 flex w-full flex-wrap items-center gap-1.5">
+          <select
+            className="min-w-0 flex-1 rounded-md border border-white/[0.06] bg-white/[0.03] px-2 py-1 text-[11px] text-[rgb(var(--text))]"
+            defaultValue=""
+            onChange={(event) => {
+              if (event.target.value) void bindConversation(event.target.value);
+            }}
+          >
+            <option value="" disabled>
+              {sessions === null
+                ? "Loading conversations…"
+                : sessions.length === 0
+                  ? "No conversation available"
+                  : "Choose the control conversation…"}
+            </option>
+            {(sessions ?? []).map((session) => (
+              <option key={session.id} value={session.id}>
+                {session.title || session.preview || session.id}
+              </option>
+            ))}
+          </select>
+          <ActionButton
+            icon={ArrowLeft}
+            label="Cancel"
+            onClick={() => setPicking(false)}
+          />
+        </div>
+      )}
       {actionError && (
         <span className="text-[11px] text-amber-300">{actionError}</span>
       )}
@@ -688,6 +855,11 @@ function ProjectDetail({
               key={`${update.session_id}-${update.at}-${index}`}
               update={update}
               defaultExpanded={index === 0}
+              replyToSessionId={
+                project.conversation?.source === "binding"
+                  ? project.conversation.session_id
+                  : update.session_id
+              }
             />
           ))}
         </div>
@@ -804,9 +976,14 @@ function bodyWithoutHeadline(body: string, headline: string): string {
 function UpdateEntry({
   update,
   defaultExpanded,
+  replyToSessionId,
 }: {
   update: ProjectDeliveryUpdate;
   defaultExpanded: boolean;
+  /** Where a reply should go — the project's bound conversation when one is
+   *  declared. Replying into the delivery's own session would land in a cron
+   *  tick that has already ended. */
+  replyToSessionId: string;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   return (
@@ -838,7 +1015,7 @@ function UpdateEntry({
             </p>
           </div>
         )}
-        {expanded && <ReplyComposer sessionId={update.session_id} />}
+        {expanded && <ReplyComposer sessionId={replyToSessionId} />}
       </div>
     </div>
   );

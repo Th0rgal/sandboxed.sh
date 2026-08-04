@@ -286,8 +286,12 @@ struct HermesConversationView: View {
                 resolvedSession = sessions.first { $0.id == sessionId }
             }
         }
-        if let missions = try? await api.listMissions(), gen == generation {
-            workerMissions = missions.filter { $0.originSessionId == sessionId }
+        // Filtered by the server: the unfiltered listing is capped, so a
+        // conversation whose workers fell outside that window silently showed
+        // none at all.
+        if let missions = try? await api.listMissions(originSessionId: sessionId, limit: 200),
+           gen == generation {
+            workerMissions = missions
         }
     }
 
