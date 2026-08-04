@@ -250,7 +250,7 @@ export default function ProjectsBoard() {
           {/* ── Triage list ── */}
           <div
             className={cn(
-              "min-h-0 overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.015]",
+              "min-h-0 overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.02]",
               mobileDetail && "hidden lg:block",
             )}
           >
@@ -312,7 +312,7 @@ export default function ProjectsBoard() {
           {/* ── Detail pane ── */}
           <div
             className={cn(
-              "min-h-0 overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.015]",
+              "min-h-0 overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.02]",
               !mobileDetail && "hidden lg:block",
             )}
           >
@@ -372,7 +372,7 @@ function ProjectListRow({
           <span className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-white/40">
             {live > 0 && (
               <span className="flex shrink-0 items-center gap-1 text-white/55">
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white/60" />
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[rgb(var(--text)/0.6)]" />
                 {live}
               </span>
             )}
@@ -744,7 +744,7 @@ function MissionRow({ mission }: { mission: ProjectMissionChip }) {
         <span
           className={cn(
             "h-1.5 w-1.5 shrink-0 rounded-full",
-            live ? "animate-pulse bg-white/70" : "bg-white/25",
+            live ? "animate-pulse bg-[rgb(var(--text)/0.65)]" : "bg-[rgb(var(--text)/0.25)]",
           )}
         />
       )}
@@ -848,7 +848,7 @@ function UpdateEntry({
 function BoardSkeleton() {
   return (
     <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 pb-4 lg:grid-cols-[340px_minmax(0,1fr)] xl:grid-cols-[380px_minmax(0,1fr)]">
-      <div className="animate-pulse overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.015]">
+      <div className="animate-pulse overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.02]">
         <div className="border-b border-white/[0.05] px-3 py-2">
           <div className="h-3 w-28 rounded bg-white/[0.06]" />
         </div>
@@ -862,7 +862,7 @@ function BoardSkeleton() {
           </div>
         ))}
       </div>
-      <div className="hidden animate-pulse overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.015] lg:block">
+      <div className="hidden animate-pulse overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.02] lg:block">
         <div className="space-y-3 border-b border-white/[0.06] px-5 py-4">
           <div className="flex items-center gap-3">
             <div className="h-5 w-40 rounded bg-white/[0.06]" />
