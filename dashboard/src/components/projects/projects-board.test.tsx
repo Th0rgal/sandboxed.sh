@@ -244,4 +244,39 @@ describe("ProjectsBoard", () => {
     );
     expect(await screen.findByText("Bien reçu.")).toBeInTheDocument();
   });
+  test("links a project to the conversation its updates come from", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity",
+          latest_update: {
+            headline: "Slice fermée",
+            body: null,
+            session_id: "api-94765bde00d93d7f",
+            at: "2026-08-04T07:11:00Z",
+            signature: "verity",
+            blocker: null,
+          },
+        }),
+      ]),
+    );
+
+    renderBoard();
+
+    const link = await screen.findByTitle("Conversation");
+    expect(link).toHaveAttribute(
+      "href",
+      "/control?session=api-94765bde00d93d7f",
+    );
+  });
+
+  test("offers no conversation link before a project has an update", async () => {
+    mockedOverview.mockResolvedValue(overview([project({ slug: "verity" })]));
+
+    renderBoard();
+
+    // The slug renders in both the list row and the detail heading.
+    expect(await screen.findAllByText("verity")).not.toHaveLength(0);
+    expect(screen.queryByTitle("Conversation")).not.toBeInTheDocument();
+  });
 });
