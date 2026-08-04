@@ -978,6 +978,8 @@ export default function ProvidersPage() {
                                   'p-1.5 rounded-md hover:bg-white/[0.04] transition-colors cursor-pointer disabled:opacity-50',
                                   effectiveStatus === 'needs_auth' || effectiveStatus === 'needs_reauth'
                                     ? 'text-amber-400'
+                                    : effectiveStatus === 'connected'
+                                    ? 'text-white/30 hover:text-white/70'
                                     : 'text-red-400 hover:text-red-300'
                                 )}
                                 title={
