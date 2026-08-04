@@ -1564,7 +1564,16 @@ export function MissionSwitcher({
                         )}
                         <Sparkles className="h-3.5 w-3.5 shrink-0 text-indigo-400" />
                         <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm">{sessionTitle}</div>
+                          <div className="flex items-center gap-2">
+                            <span className="truncate text-sm">{sessionTitle}</span>
+                            {/* Search hides the section headers (results are
+                                ranked across both kinds), and the sparkles
+                                glyph also marks hermes-spawned missions — so
+                                the row needs a label that says what it is. */}
+                            <span className="inline-flex items-center rounded bg-indigo-500/10 border border-indigo-500/20 px-1 py-0.5 text-[8px] font-medium text-indigo-400 shrink-0">
+                              Session
+                            </span>
+                          </div>
                           <div className="truncate text-xs text-white/40">
                             Hermes session
                             {typeof item.session?.message_count === 'number'
