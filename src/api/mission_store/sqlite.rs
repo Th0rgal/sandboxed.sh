@@ -2913,12 +2913,23 @@ impl MissionStore for SqliteMissionStore {
                 bind("project = ?n", v, &mut clauses, &mut binds);
             }
             if let Some(v) = filter.project_prefix.as_deref() {
-                bind(
-                    "(project = ?n OR project LIKE ?n || '-%')",
-                    v,
-                    &mut clauses,
-                    &mut binds,
-                );
+                // Range bounds, not `LIKE ?n || '-%'`: a LIKE whose pattern is
+                // a concatenation expression is never index-optimised, so the
+                // family lookup degraded into a full `SCAN missions` — on the
+                // fleets this feature exists for, while holding the connection
+                // mutex. `'-'` is 0x2D and `'.'` is 0x2E, so [`family-`,
+                // `family.`) is exactly the set of `family-*` values under
+                // BINARY collation, and both branches can use
+                // idx_missions_project_track.
+                binds.push(v.to_string());
+                let exact = binds.len();
+                binds.push(format!("{v}-"));
+                let lower = binds.len();
+                binds.push(format!("{v}."));
+                let upper = binds.len();
+                clauses.push(format!(
+                    "(project = ?{exact} OR (project >= ?{lower} AND project < ?{upper}))"
+                ));
             }
             if let Some(v) = filter.track.as_deref() {
                 bind("track = ?n", v, &mut clauses, &mut binds);
@@ -16515,6 +16526,45 @@ mod filter_tests {
             .iter()
             .chain(second.iter())
             .all(|m| m.project.track.as_deref() == Some("core-c3")));
+    }
+
+    /// The family predicate must stay indexable. `LIKE ?n || '-%'` looked
+    /// right but is a concatenation expression, which SQLite never optimises
+    /// into an index seek — every family lookup became a full table scan under
+    /// the connection mutex. Assert the plan, not just the rows: a regression
+    /// here is invisible in behaviour and only shows up as latency.
+    #[tokio::test]
+    async fn project_family_lookup_uses_an_index() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+        seed(&store, "m", Some("verity-core"), None, None).await;
+
+        let plan: Vec<String> = {
+            let conn = store.conn.lock().await;
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT id FROM missions \
+                     WHERE (project = ?1 OR (project >= ?2 AND project < ?3)) \
+                     ORDER BY updated_at DESC LIMIT 200 OFFSET 0",
+                )
+                .expect("prepare plan");
+            stmt.query_map(rusqlite::params!["verity", "verity-", "verity."], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("plan rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("plan detail")
+        };
+
+        let detail = plan.join(" | ");
+        assert!(
+            detail.contains("idx_missions_project_track") || detail.contains("SEARCH"),
+            "family lookup should seek an index, got: {detail}"
+        );
+        assert!(
+            !detail.contains("SCAN missions"),
+            "family lookup must not scan the table, got: {detail}"
+        );
     }
 
     /// LIKE wildcards inside a free-form tag must not widen the prefilter:
