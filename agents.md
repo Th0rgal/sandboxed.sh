@@ -172,6 +172,33 @@ Gotchas:
 - Unset env (default) = no scope wrapping at all, so Docker installs without
   systemd PID 1 stay on the direct path.
 
+## Resource isolation (container `/tmp`)
+
+systemd-nspawn mounts a **tmpfs on `/tmp` inside every container**, sized at 10%
+of host RAM (6.3G on a 64G box). Mission scratch — multi-GB audit trees, cert
+runs, Ask sandbox copies — therefore lands in *RAM*, priced against the same
+budget as the caps above. Setting `SANDBOXED_SH_CONTAINER_TMP_ROOT` backs each
+container's `/tmp` with a per-workspace directory on a data disk instead
+(`container_tmp.rs`, bound in `start_persistent_container_leader`). Retention for
+stale scratch is `SANDBOXED_SH_CONTAINER_TMP_RETENTION_HOURS` (default 72); the
+sweep rides the mission-workspace GC cadence.
+
+Gotchas:
+- **A full container `/tmp` is silent.** Writes get ENOSPC, but tooling that
+  doesn't check leaves 0-byte logs and empty directories — no crash, no alert.
+  In the 2026-08-05 incident two containers sat at zero bytes free for ~2 days.
+- **It is invisible from the host.** Host-side `containers/<ws>/tmp` is an empty
+  shadow of the tmpfs, so `df`, the disk watcher, and the workspace GC all
+  report healthy numbers. To inspect it you must enter the namespace via the
+  nspawn **child** pid (the nspawn pid itself still shows the host fs):
+  `p=$(pgrep -f "systemd-nspawn .*--machine=sandboxed-<ws>-"|head -1); c=$(pgrep -P $p|head -1); nsenter -t $c -m -- df -h /tmp`
+- **Raising the tmpfs size is not the fix.** Eleven containers at the default
+  already oversubscribe a 62G box; disk-backing it is what buys real margin.
+- Takes effect only when a container leader next starts (execs `nsenter` into
+  the existing leader), so rollout is per-container as they cycle.
+- Unset (default) = stock nspawn tmpfs, so shipping this changes nothing until
+  the env is set.
+
 ## Operational notes
 
 - **No central OpenCode server needed**: Missions spawn per-workspace CLI

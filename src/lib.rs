@@ -39,6 +39,7 @@ pub mod api;
 pub mod backend;
 pub mod backend_config;
 pub mod config;
+pub mod container_tmp;
 pub mod cost;
 pub mod github_connection;
 pub mod hermes_tools;

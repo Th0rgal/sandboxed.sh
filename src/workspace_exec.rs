@@ -1719,6 +1719,31 @@ impl WorkspaceExec {
             ));
         }
 
+        // Disk-backed `/tmp` (Layer 2, opt-in). nspawn's default is a tmpfs at
+        // 10% of host RAM — small, RAM-priced, silent when it fills, and
+        // invisible to every host-side disk check. See `container_tmp`.
+        //
+        // This is bound before the X11 socket on purpose for readability only:
+        // nspawn sorts custom mounts by destination depth, so `/tmp` is mounted
+        // before `/tmp/.X11-unix` regardless of argument order.
+        if let Some(tmp_dir) = crate::container_tmp::dir_for(&self.workspace.name) {
+            match crate::container_tmp::prepare(&tmp_dir) {
+                Ok(()) => {
+                    cmd.arg(format!("--bind={}:/tmp", tmp_dir.display()));
+                }
+                Err(error) => {
+                    // Falling back to the stock tmpfs keeps the container
+                    // bootable; a workspace with no `/tmp` at all would not be.
+                    tracing::warn!(
+                        workspace = %self.workspace.name,
+                        path = %tmp_dir.display(),
+                        %error,
+                        "Could not prepare a disk-backed /tmp; falling back to the nspawn tmpfs"
+                    );
+                }
+            }
+        }
+
         let x11_socket_path = Path::new("/tmp/.X11-unix");
         if x11_socket_path.exists() {
             cmd.arg("--bind=/tmp/.X11-unix");
