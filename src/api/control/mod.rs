@@ -7326,12 +7326,7 @@ async fn find_recent_identical_mission(
         if !in_flight {
             return false;
         }
-        if mission
-            .title
-            .as_deref()
-            .map(str::trim)
-            .map_or(true, |existing| existing != title)
-        {
+        if mission.title.as_deref().map(str::trim) != Some(title) {
             return false;
         }
         if mission.origin_session_id.as_deref() != origin_session_id {
