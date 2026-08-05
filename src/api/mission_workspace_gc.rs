@@ -70,6 +70,10 @@ async fn run_loop(state: Arc<AppState>) {
     loop {
         interval.tick().await;
         run_configured_sweep(&state, "scheduled").await;
+        // Container `/tmp` scratch shares this cadence but not this GC's
+        // settings: it is disk hygiene for a path no mission record points at,
+        // so it is gated only on the feature being enabled.
+        crate::container_tmp::sweep_if_enabled().await;
     }
 }
 

@@ -1467,10 +1467,18 @@ pub async fn prepare_sandbox(exec: &WorkspaceExec, base_work_dir: &Path) -> Opti
             }
             Ok(out) => {
                 log_sandbox_command_failure("copy", &out);
+                // The copy command creates the destination before filling it,
+                // so a failure part-way through (a full `/tmp` is the usual
+                // one) strands a partial tree that nothing else will ever
+                // collect — the caller only tears down sandboxes it was
+                // handed. That turns one failed Ask into permanently lost
+                // scratch space, which makes the next Ask likelier to fail.
+                cleanup_sandbox(exec, base_work_dir, &sandbox_host).await;
                 None
             }
             Err(error) => {
                 tracing::warn!(stage = "copy", %error, "Ask sandbox command failed to start");
+                cleanup_sandbox(exec, base_work_dir, &sandbox_host).await;
                 None
             }
         };
@@ -1496,10 +1504,12 @@ pub async fn prepare_sandbox(exec: &WorkspaceExec, base_work_dir: &Path) -> Opti
         }
         Ok(out) => {
             log_sandbox_command_failure("git-worktree", &out);
+            cleanup_sandbox(exec, base_work_dir, &sandbox_host).await;
             None
         }
         Err(error) => {
             tracing::warn!(stage = "git-worktree", %error, "Ask sandbox command failed to start");
+            cleanup_sandbox(exec, base_work_dir, &sandbox_host).await;
             None
         }
     }
@@ -1543,8 +1553,13 @@ fn log_sandbox_command_failure(stage: &str, output: &std::process::Output) {
 pub async fn cleanup_sandbox(exec: &WorkspaceExec, base_work_dir: &Path, sandbox: &Path) {
     let base_str = exec.translate_path_for_container(base_work_dir);
     let sandbox_str = exec.translate_path_for_container(sandbox);
+    // `prune` matters for the failure path: a `worktree add` that died partway
+    // leaves an admin entry in `.git/worktrees` that `rm -rf` alone cannot
+    // clear, and which then blocks re-using that path. It only drops entries
+    // whose directory is already gone, so healthy worktrees are untouched.
     let cmd = format!(
-        "git -C {b} worktree remove --force {s} 2>/dev/null || rm -rf {s}",
+        "git -C {b} worktree remove --force {s} 2>/dev/null || rm -rf {s}; \
+         git -C {b} worktree prune 2>/dev/null || true",
         b = single_quote(&base_str),
         s = single_quote(&sandbox_str)
     );

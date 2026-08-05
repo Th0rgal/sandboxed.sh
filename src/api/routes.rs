@@ -1180,6 +1180,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/monitoring/memory-health",
             get(super::monitoring::memory_health_handler),
         )
+        // What the caller can actually do here — so an agent asks instead of
+        // inferring a capability from an auth field. Authenticated: it names
+        // the connected GitHub account.
+        .route(
+            "/api/capabilities",
+            get(super::capabilities::get_capabilities),
+        )
         // Library management endpoints
         .nest("/api/library", library_api::routes())
         // Workspace management endpoints
@@ -1488,6 +1495,7 @@ async fn health(State(state): State<Arc<AppState>>) -> (HeaderMap, Json<HealthRe
             max_iterations: state.config.max_iterations,
             library_remote,
             github_enabled: state.config.auth.github_enabled(),
+            dashboard_github_login_enabled: state.config.auth.github_enabled(),
         }),
     )
 }
