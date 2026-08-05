@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header};
+use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -179,6 +180,34 @@ struct StartMissionParams {
     /// `origin_session_id` so clients group it as a worker of that session.
     #[serde(default)]
     origin_session_id: Option<String>,
+}
+
+/// Deserialize a tool's arguments, naming the offending field when it fails.
+///
+/// `serde_json::from_value` reports the shape mismatch but not its location:
+/// `invalid type: map, expected a string` for a struct with fourteen string
+/// fields. An agent that reads that has no way to know which argument to fix.
+///
+/// Measured 2026-08-05: a controller called `start_mission` seven times in
+/// ninety seconds, each time getting exactly that sentence back, until the
+/// tool-loop guard cut it off. It was never told which field was wrong, so
+/// each retry was a guess.
+///
+/// `serde_path_to_error` wraps the deserializer and tracks the path, turning
+/// the same failure into `desired_state: invalid type: map, expected a
+/// string` — actionable on the first read.
+fn parse_params<T: serde::de::DeserializeOwned>(arguments: Value) -> Result<T, String> {
+    let deserializer = arguments.into_deserializer();
+    serde_path_to_error::deserialize(deserializer).map_err(|error| {
+        let path = error.path().to_string();
+        // The path is "." for a failure on the root value itself (arguments
+        // that are not an object at all). Naming "." there would be noise.
+        if path.is_empty() || path == "." {
+            format!("Invalid params: {}", error.inner())
+        } else {
+            format!("Invalid params: {path}: {}", error.inner())
+        }
+    })
 }
 
 /// Accept only conservative session identifiers for `origin_session_id`
@@ -2490,147 +2519,119 @@ impl AssistantMcp {
     async fn handle_call(&self, name: &str, arguments: Value) -> Result<Value, String> {
         match name {
             "list_active_missions" => {
-                let params: ListMissionsParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: ListMissionsParams = parse_params(arguments)?;
                 self.list_active_missions(params).await
             }
             "list_missions" => {
-                let params: ListMissionsParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: ListMissionsParams = parse_params(arguments)?;
                 self.list_missions(params).await
             }
             "get_mission" => {
-                let params: MissionIdParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: MissionIdParams = parse_params(arguments)?;
                 self.get_mission(params).await
             }
             "get_mission_digest" => {
-                let params: MissionIdParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: MissionIdParams = parse_params(arguments)?;
                 self.get_mission_digest(params).await
             }
             "get_mission_events" => {
-                let params: MissionEventsParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: MissionEventsParams = parse_params(arguments)?;
                 self.get_mission_events(params).await
             }
             "get_chatgpt_ui_pool_status" => self.get_chatgpt_ui_pool_status().await,
             "list_mission_shared_files" => {
-                let params: MissionSharedFilesParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: MissionSharedFilesParams = parse_params(arguments)?;
                 self.list_mission_shared_files(params).await
             }
             "download_shared_file" => {
-                let params: DownloadSharedFileParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: DownloadSharedFileParams = parse_params(arguments)?;
                 self.download_shared_file(params).await
             }
             "start_mission" => {
-                let params: StartMissionParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: StartMissionParams = parse_params(arguments)?;
                 self.start_mission(params).await
             }
             "send_message_to_mission" => {
-                let params: SendMessageParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: SendMessageParams = parse_params(arguments)?;
                 self.send_message(params).await
             }
             "ask_mission" => {
-                let params: AskMissionParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: AskMissionParams = parse_params(arguments)?;
                 self.ask_mission(params).await
             }
             "cancel_mission" => {
-                let params: MissionIdParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: MissionIdParams = parse_params(arguments)?;
                 self.cancel_mission(params).await
             }
             "acknowledge_mission" => {
-                let params: MissionIdParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: MissionIdParams = parse_params(arguments)?;
                 self.acknowledge_mission(params).await
             }
             "get_compute_fleet" => self.get_compute_fleet().await,
             "list_workspaces" => self.list_workspaces().await,
             "get_workspace" => {
-                let params: WorkspaceIdParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: WorkspaceIdParams = parse_params(arguments)?;
                 self.get_workspace(params).await
             }
             "create_workspace" => {
-                let params: CreateWorkspaceParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: CreateWorkspaceParams = parse_params(arguments)?;
                 self.create_workspace(params).await
             }
             "update_workspace" => {
-                let params: UpdateWorkspaceParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: UpdateWorkspaceParams = parse_params(arguments)?;
                 self.update_workspace(params).await
             }
             "delete_workspace" => {
-                let params: DeleteWorkspaceParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: DeleteWorkspaceParams = parse_params(arguments)?;
                 self.delete_workspace(params).await
             }
             "list_workspace_templates" => self.list_workspace_templates().await,
             "get_workspace_template" => {
-                let params: WorkspaceTemplateNameParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: WorkspaceTemplateNameParams = parse_params(arguments)?;
                 self.get_workspace_template(params).await
             }
             "save_workspace_template" => {
-                let params: SaveWorkspaceTemplateParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: SaveWorkspaceTemplateParams = parse_params(arguments)?;
                 self.save_workspace_template(params).await
             }
             "delete_workspace_template" => {
-                let params: DeleteWorkspaceTemplateParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: DeleteWorkspaceTemplateParams = parse_params(arguments)?;
                 self.delete_workspace_template(params).await
             }
             "rebuild_workspace_from_template" => {
-                let params: RebuildWorkspaceFromTemplateParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: RebuildWorkspaceFromTemplateParams = parse_params(arguments)?;
                 self.rebuild_workspace_from_template(params).await
             }
             "workspace_bash" => {
-                let params: WorkspaceBashParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: WorkspaceBashParams = parse_params(arguments)?;
                 self.workspace_bash(params).await
             }
             "start_workspace_job" => {
-                let params: StartWorkspaceJobParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: StartWorkspaceJobParams = parse_params(arguments)?;
                 self.start_workspace_job(params).await
             }
             "get_workspace_job" => {
-                let params: WorkspaceJobParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: WorkspaceJobParams = parse_params(arguments)?;
                 self.get_workspace_job(params).await
             }
             "cancel_workspace_job" => {
-                let params: WorkspaceJobParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: WorkspaceJobParams = parse_params(arguments)?;
                 self.cancel_workspace_job(params).await
             }
             "get_mission_health" => {
-                let params: MissionHealthParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: MissionHealthParams = parse_params(arguments)?;
                 self.get_mission_health(params).await
             }
             "get_mission_diagnostics" => {
-                let params: MissionDiagnosticsParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: MissionDiagnosticsParams = parse_params(arguments)?;
                 self.get_mission_diagnostics(params).await
             }
             "update_mission_settings" => {
-                let params: UpdateSettingsParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: UpdateSettingsParams = parse_params(arguments)?;
                 self.update_mission_settings(params).await
             }
             "resume_mission" => {
-                let params: ResumeMissionParams = serde_json::from_value(arguments)
-                    .map_err(|error| format!("Invalid params: {error}"))?;
+                let params: ResumeMissionParams = parse_params(arguments)?;
                 self.resume_mission(params).await
             }
             other => Err(format!("Unknown tool: {other}")),
@@ -3230,6 +3231,59 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The 2026-08-05 incident: seven identical retries in ninety seconds,
+    /// because the error named no field.
+    #[test]
+    fn a_params_error_names_the_offending_field() {
+        let arguments = json!({
+            "title": "t",
+            "prompt": "p",
+            "desired_state": {"status": "running"},
+        });
+        let error = parse_params::<StartMissionParams>(arguments)
+            .expect_err("a map where a string belongs must not deserialize");
+        assert!(
+            error.contains("desired_state"),
+            "the field must be named, got: {error}"
+        );
+        assert!(error.contains("invalid type: map"), "got: {error}");
+    }
+
+    #[test]
+    fn a_nested_field_reports_its_path() {
+        let arguments = json!({"title": "t", "prompt": "p", "tags": ["ok", {"a": 1}]});
+        let error = parse_params::<StartMissionParams>(arguments).expect_err("a map is not a tag");
+        assert!(error.contains("tags[1]"), "got: {error}");
+    }
+
+    #[test]
+    fn a_missing_required_field_is_named_too() {
+        let error = parse_params::<StartMissionParams>(json!({"title": "t"}))
+            .expect_err("prompt is required");
+        assert!(error.contains("prompt"), "got: {error}");
+    }
+
+    #[test]
+    fn valid_params_still_deserialize() {
+        let params: StartMissionParams =
+            parse_params(json!({"title": "t", "prompt": "p", "tags": ["a"]}))
+                .expect("valid arguments must parse");
+        assert_eq!(params.title, "t");
+        assert_eq!(params.tags.as_deref(), Some(&["a".to_string()][..]));
+    }
+
+    /// Arguments that are not an object at all have no field to name, and a
+    /// bare "." would be noise rather than information.
+    #[test]
+    fn a_root_level_failure_reports_no_path() {
+        let error = parse_params::<StartMissionParams>(json!("not an object"))
+            .expect_err("a string is not a params object");
+        assert!(
+            error.starts_with("Invalid params: invalid type"),
+            "got: {error}"
+        );
+    }
 
     /// A tool description is the only thing an autonomous agent knows about
     /// what a tool can do. When it understates the tool, the agent reasons
