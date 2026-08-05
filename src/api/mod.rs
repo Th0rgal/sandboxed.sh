@@ -20,6 +20,7 @@ pub mod ask;
 mod auth;
 pub mod automation_variables;
 pub mod backends;
+pub mod capabilities;
 pub mod claudecode;
 pub mod codex_usage;
 mod console;

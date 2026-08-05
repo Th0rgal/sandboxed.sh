@@ -247,8 +247,24 @@ pub struct HealthResponse {
     /// Whether "Sign in with GitHub" is configured and offered to clients.
     /// Requires `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`,
     /// `GITHUB_OAUTH_ALLOWLIST`, and `JWT_SECRET` to all be set.
+    ///
+    /// DEPRECATED NAME, kept for the dashboard and iOS clients that already
+    /// read it. Prefer [`Self::dashboard_github_login_enabled`], which says
+    /// what the flag actually gates. An autonomous agent read this one on
+    /// 2026-08-05, concluded "GitHub is disabled in this environment", and
+    /// then concluded it could not dispatch a mission — two wrong inferences,
+    /// the first invited by the name.
     #[serde(default)]
     pub github_enabled: bool,
+
+    /// Same value as [`Self::github_enabled`], under a name that cannot be
+    /// mistaken for "this server can use GitHub". It gates one thing: the
+    /// "Sign in with GitHub" button on the dashboard login screen.
+    ///
+    /// Nothing about mission git access is derivable from it. Ask
+    /// `GET /api/capabilities` instead.
+    #[serde(default)]
+    pub dashboard_github_login_enabled: bool,
 }
 
 /// Login request for dashboard auth.
