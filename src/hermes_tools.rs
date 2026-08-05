@@ -29,6 +29,7 @@ pub const HERMES_ASSISTANT_TOOL_ALLOWLIST: &[&str] = &[
     "ask_mission",
     "cancel_mission",
     "acknowledge_mission",
+    "adopt_mission",
     "get_compute_fleet",
     "list_workspaces",
     "get_workspace",
