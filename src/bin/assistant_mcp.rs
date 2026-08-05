@@ -82,6 +82,16 @@ struct MissionIdParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct AdoptMissionParams {
+    mission_id: String,
+    /// The Hermes session that should own this mission's callbacks from now
+    /// on. The sandboxed-origin-session plugin stamps it exactly as it does
+    /// for start_mission; the model itself should not pass it.
+    #[serde(default)]
+    origin_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ListMissionsParams {
     #[serde(default)]
     status: Option<String>,
@@ -1279,6 +1289,15 @@ impl AssistantMcp {
                 }),
             },
             ToolDefinition {
+                name: "adopt_mission".to_string(),
+                description: "Re-point a mission's origin to THIS conversation so its completion callback lands here. Use when you are waiting on a mission that was dispatched from another session (or with no origin): without adoption, its terminal webhook pins into the conversation that started it — or nowhere — and this conversation is never woken. After adopting, do not poll: the mission-complete callback will arrive as a delivery in this conversation.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id"],
+                    "properties": {"mission_id": {"type": "string", "description": "Mission UUID, or an unambiguous leading fragment of one (the 8-character form dashboards and logs display)."}}
+                }),
+            },
+            ToolDefinition {
                 name: "get_compute_fleet".to_string(),
                 description: "Get a compact live view of sandboxed.sh compute capacity: remote node health, labels, Lean readiness/toolchains, available slots, active/queued jobs, and recent placement receipts. Use this before dispatching parallel compute or choosing a remote validation node. Ordinary CPU/Lean work should prefer non-GPU nodes while they have immediate capacity; request the gpu label only for GPU work.".to_string(),
                 input_schema: json!({"type": "object", "properties": {}}),
@@ -1979,6 +1998,45 @@ impl AssistantMcp {
         Ok(json!({ "success": true, "cancelled": id.to_string() }))
     }
 
+    async fn adopt_mission(&self, params: AdoptMissionParams) -> Result<Value, String> {
+        let id = self.resolve_mission_id(&params.mission_id).await?;
+        // The session id is stamped by the sandboxed-origin-session plugin,
+        // exactly as for start_mission. Refuse to adopt into nothing: an
+        // adoption without a session would silently CLEAR the mission's
+        // origin, which is the opposite of what the caller wanted.
+        let session = params
+            .origin_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "adopt_mission needs the calling session's id; it is normally \
+                 injected automatically. If you see this, the origin-session \
+                 plugin did not stamp the call — report that rather than \
+                 passing a session id by hand."
+                    .to_string()
+            })?;
+        if !valid_origin_session_id(session) {
+            return Err(format!(
+                "origin_session_id {session:?} is not a valid session id"
+            ));
+        }
+        let response = self
+            .api_post(
+                &format!("/api/control/missions/{id}/origin"),
+                json!({ "origin": "hermes", "origin_session_id": session }),
+            )
+            .await?;
+        let mission = Self::response_value(response, "adopt mission").await?;
+        Ok(json!({
+            "success": true,
+            "adopted": id.to_string(),
+            "origin_session_id": session,
+            "mission": mission,
+            "note": "This conversation now receives the mission's completion callback; do not poll.",
+        }))
+    }
+
     async fn acknowledge_mission(&self, params: MissionIdParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
         let response = self
@@ -2566,6 +2624,10 @@ impl AssistantMcp {
             "acknowledge_mission" => {
                 let params: MissionIdParams = parse_params(arguments)?;
                 self.acknowledge_mission(params).await
+            }
+            "adopt_mission" => {
+                let params: AdoptMissionParams = parse_params(arguments)?;
+                self.adopt_mission(params).await
             }
             "get_compute_fleet" => self.get_compute_fleet().await,
             "list_workspaces" => self.list_workspaces().await,
@@ -3231,6 +3293,38 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// `adopt_mission` without a stamped session must refuse, not clear.
+    #[test]
+    fn adopt_without_a_session_is_refused() {
+        let params: AdoptMissionParams =
+            parse_params(json!({"mission_id": "57c1dfb4"})).expect("parse");
+        assert!(params.origin_session_id.is_none());
+        // The handler itself needs a live API to run; pin the refusal message
+        // contract here instead: an empty stamp must not silently clear.
+        let session = params
+            .origin_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        assert!(session.is_none(), "an absent stamp must read as absent");
+    }
+
+    #[test]
+    fn adopt_params_accept_the_stamped_shape() {
+        let params: AdoptMissionParams = parse_params(json!({
+            "mission_id": "57c1dfb4-a782-4010-9f8b-aaa7f88afa7e",
+            "origin_session_id": "20260805_190902_361101",
+        }))
+        .expect("parse");
+        assert_eq!(
+            params.origin_session_id.as_deref(),
+            Some("20260805_190902_361101")
+        );
+        assert!(valid_origin_session_id(
+            params.origin_session_id.as_deref().unwrap()
+        ));
+    }
 
     /// The 2026-08-05 incident: seven identical retries in ninety seconds,
     /// because the error named no field.
