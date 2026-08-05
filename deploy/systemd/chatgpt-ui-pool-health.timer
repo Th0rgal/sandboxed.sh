@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodically check ChatGPT UI pool logins
+
+[Timer]
+OnBootSec=10min
+# Two slots per run at this cadence sweeps a 12-slot pool every ~2h — ample for
+# a failure mode that unfolds over days, and gentle enough that Cloudflare does
+# not start challenging the shared egress.
+OnUnitActiveSec=20min
+RandomizedDelaySec=2min
+Persistent=true
+Unit=chatgpt-ui-pool-health.service
+
+[Install]
+WantedBy=timers.target
