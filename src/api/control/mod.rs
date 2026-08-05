@@ -7276,6 +7276,70 @@ async fn rollback_message_writer_tag(
     }
 }
 
+/// Window inside which an identical create is treated as a retry, not intent.
+///
+/// Measured 2026-08-05 on prod: seven groups of missions with the same title
+/// and the same origin session created 26–90 seconds apart, one of them a
+/// triple (`PR #2231 writer-fix v2`, three copies in 69 seconds). The shape is
+/// always the same — an agent calls `start_mission`, the answer is slow or the
+/// MCP transport errors, the agent retries, and a full duplicate mission runs
+/// to completion. Ten minutes comfortably covers every observed retry gap
+/// while staying far below the cadence at which a controller legitimately
+/// re-dispatches the same lane (hours).
+const CREATE_RETRY_WINDOW_SECS: i64 = 600;
+
+/// A recent, non-terminal mission that an identical create should coalesce to.
+///
+/// Conservative on purpose — all four must hold:
+/// * the incoming request carries an explicit, non-empty title that matches
+///   exactly (trimmed); auto-titled creates never coalesce,
+/// * `origin_session_id` matches exactly (including both absent),
+/// * the existing mission is **not terminal** — retrying a failed or
+///   completed mission with the same title is a legitimate re-dispatch,
+/// * the existing mission was created inside [`CREATE_RETRY_WINDOW_SECS`].
+///
+/// Scan errors return `None`: creating a duplicate is recoverable (that is
+/// today's behaviour), refusing a legitimate create is not.
+async fn find_recent_identical_mission(
+    mission_store: &Arc<dyn MissionStore>,
+    title: &str,
+    origin_session_id: Option<&str>,
+) -> Option<Mission> {
+    const PAGE: usize = 100;
+    let title = title.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let now = chrono::Utc::now();
+    let missions = mission_store.list_missions(PAGE, 0).await.ok()?;
+    missions.into_iter().find(|mission| {
+        // Coalesce only onto work that is genuinely still going to run. NOT
+        // simply `!is_terminal()`: `Acknowledged` and `AwaitingUser` are
+        // non-terminal but parked — answering a create with a parked mission
+        // would silently swallow a deliberate re-dispatch. An unlisted status
+        // falls through to "do not coalesce", which is today's behaviour
+        // (a duplicate runs) and therefore the safe failure direction.
+        let in_flight = matches!(
+            mission.status,
+            MissionStatus::Pending | MissionStatus::Active | MissionStatus::WaitingBackground
+        );
+        if !in_flight {
+            return false;
+        }
+        if mission.title.as_deref().map(str::trim) != Some(title) {
+            return false;
+        }
+        if mission.origin_session_id.as_deref() != origin_session_id {
+            return false;
+        }
+        chrono::DateTime::parse_from_rfc3339(&mission.created_at)
+            .map(|created| {
+                (now - created.with_timezone(&chrono::Utc)).num_seconds() < CREATE_RETRY_WINDOW_SECS
+            })
+            .unwrap_or(false)
+    })
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -7330,6 +7394,33 @@ pub async fn create_mission(
         );
         if let Ok(value) = axum::http::HeaderValue::from_str(&joined) {
             headers.insert("x-ignored-fields", value);
+        }
+    }
+
+    // Retry-shaped duplicate? Same explicit title, same origin session, an
+    // existing NON-terminal mission created moments ago: answer with that
+    // mission instead of running the work twice. The response carries a header
+    // so the caller can tell a coalesced answer from a fresh create; a client
+    // that genuinely wants a parallel duplicate retitles it.
+    if let Some(title) = req.title.as_deref().filter(|t| !t.trim().is_empty()) {
+        let control_state = control_for_user(&state, &user).await;
+        if let Some(existing) = find_recent_identical_mission(
+            &control_state.mission_store,
+            title,
+            req.origin_session_id.as_deref(),
+        )
+        .await
+        {
+            tracing::info!(
+                mission_id = %existing.id,
+                title = %title,
+                "create_mission coalesced onto a recent identical mission \
+                 (retry-shaped duplicate)"
+            );
+            if let Ok(value) = axum::http::HeaderValue::from_str(&existing.id.to_string()) {
+                headers.insert("x-coalesced-with", value);
+            }
+            return Ok((headers, Json(existing)));
         }
     }
 
@@ -23637,6 +23728,141 @@ pub async fn telegram_webhook_receiver(
 
 #[cfg(test)]
 mod tests {
+    mod create_idempotency {
+        use crate::api::control::MissionStatus;
+        use crate::api::mission_store::{InMemoryMissionStore, Mission, MissionStore};
+        use std::sync::Arc;
+
+        async fn store_with(
+            title: &str,
+            origin: Option<&str>,
+            status: MissionStatus,
+        ) -> (Arc<dyn MissionStore>, Mission) {
+            let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+            let mission = store
+                .create_mission(Some(title), None, None, None, None, None, None)
+                .await
+                .expect("create");
+            if let Some(origin) = origin {
+                store
+                    .set_mission_origin(mission.id, "hermes", Some(origin))
+                    .await
+                    .expect("origin");
+            }
+            store
+                .update_mission_status(mission.id, status)
+                .await
+                .expect("status");
+            (store, mission)
+        }
+
+        /// The measured incident: `fix(ci)` created twice 30 seconds apart,
+        /// same (absent) origin, first copy still working.
+        #[tokio::test]
+        async fn a_retry_shaped_duplicate_coalesces() {
+            let (store, first) = store_with(
+                "fix(ci): mechanical Lean warning cleanup",
+                None,
+                MissionStatus::Active,
+            )
+            .await;
+            let found = super::super::find_recent_identical_mission(
+                &store,
+                "fix(ci): mechanical Lean warning cleanup",
+                None,
+            )
+            .await;
+            assert_eq!(found.map(|m| m.id), Some(first.id));
+        }
+
+        #[tokio::test]
+        async fn a_different_title_does_not_coalesce() {
+            let (store, _) = store_with("lane A", None, MissionStatus::Active).await;
+            assert!(
+                super::super::find_recent_identical_mission(&store, "lane B", None)
+                    .await
+                    .is_none()
+            );
+        }
+
+        /// Same title from a DIFFERENT conversation is parallel work, not a
+        /// retry — two controllers may legitimately race the same lane name.
+        #[tokio::test]
+        async fn a_different_origin_does_not_coalesce() {
+            let (store, _) = store_with(
+                "lane A",
+                Some("20260805_093524_88112a"),
+                MissionStatus::Active,
+            )
+            .await;
+            assert!(super::super::find_recent_identical_mission(
+                &store,
+                "lane A",
+                Some("20260805_152329_6058d9"),
+            )
+            .await
+            .is_none());
+        }
+
+        #[tokio::test]
+        async fn a_matching_origin_coalesces() {
+            let (store, first) = store_with(
+                "lane A",
+                Some("20260805_093524_88112a"),
+                MissionStatus::Active,
+            )
+            .await;
+            let found = super::super::find_recent_identical_mission(
+                &store,
+                "lane A",
+                Some("20260805_093524_88112a"),
+            )
+            .await;
+            assert_eq!(found.map(|m| m.id), Some(first.id));
+        }
+
+        /// Re-dispatching a lane whose previous run finished, failed, or is
+        /// merely PARKED is intent, not a retry artifact. `Acknowledged` and
+        /// `AwaitingUser` are non-terminal but will not run again on their
+        /// own — coalescing onto them would swallow the new dispatch.
+        #[tokio::test]
+        async fn a_settled_or_parked_mission_does_not_coalesce() {
+            for status in [
+                MissionStatus::Completed,
+                MissionStatus::Failed,
+                MissionStatus::Interrupted,
+                MissionStatus::Acknowledged,
+                MissionStatus::AwaitingUser,
+            ] {
+                let (store, _) = store_with("lane A", None, status).await;
+                assert!(
+                    super::super::find_recent_identical_mission(&store, "lane A", None)
+                        .await
+                        .is_none(),
+                    "a {status:?} mission must not absorb a new create"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn whitespace_variants_of_the_title_still_match() {
+            let (store, first) = store_with("lane A", None, MissionStatus::Active).await;
+            let found =
+                super::super::find_recent_identical_mission(&store, "  lane A  ", None).await;
+            assert_eq!(found.map(|m| m.id), Some(first.id));
+        }
+
+        #[tokio::test]
+        async fn an_empty_title_never_coalesces() {
+            let (store, _) = store_with("lane A", None, MissionStatus::Active).await;
+            assert!(
+                super::super::find_recent_identical_mission(&store, "   ", None)
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
     #[test]
     fn parse_goal_objective_tolerates_whitespace_variants() {
         assert_eq!(
