@@ -168,6 +168,26 @@ impl ProjectsStore {
         })
     }
 
+    /// The project bound to `session_id`, if any.
+    ///
+    /// The reverse of [`Self::bindings`], used to tag a mission with the
+    /// project of the conversation that spawned it. Bindings are one project
+    /// per slug but several slugs may share a conversation, so this returns
+    /// the lexicographically first match: an arbitrary-but-stable choice is
+    /// better than a tag that changes between two calls.
+    pub fn project_for_session(&self, session_id: &str) -> Result<Option<String>, String> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT slug FROM project_bindings WHERE control_session_id = ?1 \
+                 ORDER BY slug LIMIT 1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
     /// Returns whether a binding existed.
     pub fn clear_binding(&self, slug: &str) -> Result<bool, String> {
         let connection = self.lock()?;
@@ -365,6 +385,68 @@ mod tests {
         let all = store.bindings().expect("all");
         assert_eq!(all["verity"].session_id, "shared");
         assert_eq!(all["verity-docs"].session_id, "shared");
+    }
+
+    // ---- reverse lookup ----
+
+    #[test]
+    fn a_bound_session_resolves_back_to_its_project() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store.set_binding("verity", "sess-a", None).expect("bind");
+        store.set_binding("lido", "sess-b", None).expect("bind");
+        assert_eq!(
+            store
+                .project_for_session("sess-a")
+                .expect("lookup")
+                .as_deref(),
+            Some("verity")
+        );
+        assert_eq!(
+            store
+                .project_for_session("sess-b")
+                .expect("lookup")
+                .as_deref(),
+            Some("lido")
+        );
+    }
+
+    #[test]
+    fn an_unbound_session_resolves_to_nothing() {
+        // Must be None rather than a guess: tagging a mission with the wrong
+        // project is worse than leaving it untagged, because a wrong tag is
+        // believed.
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store.set_binding("verity", "sess-a", None).expect("bind");
+        assert_eq!(
+            store.project_for_session("sess-unknown").expect("lookup"),
+            None
+        );
+        assert_eq!(store.project_for_session("").expect("lookup"), None);
+    }
+
+    #[test]
+    fn a_shared_conversation_resolves_stably() {
+        // Several projects may report into one conversation. Any answer is
+        // arbitrary, but it must not change between two identical calls.
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store.set_binding("zulu", "shared", None).expect("bind");
+        store.set_binding("alpha", "shared", None).expect("bind");
+        let first = store.project_for_session("shared").expect("lookup");
+        let second = store.project_for_session("shared").expect("lookup");
+        assert_eq!(first, second);
+        assert_eq!(first.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn rebinding_moves_the_reverse_lookup_too() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store.set_binding("verity", "old", None).expect("bind");
+        store.set_binding("verity", "new", None).expect("rebind");
+        assert_eq!(store.project_for_session("old").expect("lookup"), None);
+        assert_eq!(
+            store.project_for_session("new").expect("lookup").as_deref(),
+            Some("verity")
+        );
     }
 
     // ---- state timeline ----

@@ -7741,7 +7741,38 @@ pub async fn create_mission(
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let project = nonblank(&req.project);
+    // A mission dispatched from a bound conversation inherits that project
+    // when the caller did not name one. Agents omit it often — 11 of the 39
+    // missions created in one 12h window on prod carried no project at all —
+    // and an untagged mission is invisible to every project-scoped view:
+    // the health rollup, the state timeline, the writer-slot counts, and the
+    // inventory the controllers themselves query. Making the tag structural
+    // beats asking every dispatcher to remember it.
+    //
+    // An explicit value always wins, including a deliberate blank, which is
+    // how a caller says "this belongs to no project".
+    let project = match nonblank(&req.project) {
+        Some(explicit) => Some(explicit),
+        None if req.project.is_some() => None,
+        None => req
+            .origin_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|session| !session.is_empty())
+            .and_then(
+                |session| match state.projects.project_for_session(session) {
+                    Ok(slug) => slug,
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = session,
+                            error = %error,
+                            "could not resolve a project for the origin session"
+                        );
+                        None
+                    }
+                },
+            ),
+    };
     let track = nonblank(&req.track);
     let intent = nonblank(&req.intent);
     let github_pr = nonblank(&req.github_pr);
