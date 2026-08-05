@@ -7759,19 +7759,29 @@ pub async fn create_mission(
             .as_deref()
             .map(str::trim)
             .filter(|session| !session.is_empty())
-            .and_then(
-                |session| match state.projects.project_for_session(session) {
-                    Ok(slug) => slug,
-                    Err(error) => {
-                        tracing::warn!(
-                            session_id = session,
-                            error = %error,
-                            "could not resolve a project for the origin session"
-                        );
-                        None
+            .and_then(|session| {
+                // A conversation rolls over into a continuation, and the
+                // binding names whichever id the operator declared — often
+                // several rollovers above this one. Walk up the ancestry,
+                // nearest first, so the closest binding wins.
+                let chain = match super::projects_overview::hermes_state_db_path() {
+                    Some(path) => super::session_chain::ancestry(&path, session),
+                    None => vec![session.to_string()],
+                };
+                chain.iter().find_map(|candidate| {
+                    match state.projects.project_for_session(candidate) {
+                        Ok(slug) => slug,
+                        Err(error) => {
+                            tracing::warn!(
+                                session_id = candidate,
+                                error = %error,
+                                "could not resolve a project for the origin session"
+                            );
+                            None
+                        }
                     }
-                },
-            ),
+                })
+            }),
     };
     let track = nonblank(&req.track);
     let intent = nonblank(&req.intent);
