@@ -139,6 +139,11 @@ fn hermes_projects_dir() -> Option<PathBuf> {
         .filter(|path| path.is_dir())
 }
 
+/// Path to Hermes' `state.db`, for callers that need the continuation chain.
+pub fn hermes_state_db_path() -> Option<PathBuf> {
+    hermes_state_db()
+}
+
 fn hermes_state_db() -> Option<PathBuf> {
     std::env::var("HERMES_STATE_DB")
         .ok()
@@ -235,10 +240,28 @@ pub async fn projects_overview(
         .as_deref()
         .map(read_trackers)
         .unwrap_or_default();
-    let bindings = state
+    let mut bindings = state
         .projects
         .bindings()
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    // A binding names the conversation the operator declared. That id goes
+    // stale as soon as Hermes compresses the conversation and forks a
+    // continuation — measured on the Lido audit, four times in one night. The
+    // declared value stays the stored fact; the live tip is resolved here, the
+    // same way Hermes resolves its own routes.
+    if let Some(path) = hermes_state_db() {
+        for conversation in bindings.values_mut() {
+            let tip = super::session_chain::live_tip(&path, &conversation.session_id);
+            if tip != conversation.session_id {
+                tracing::debug!(
+                    declared = %conversation.session_id,
+                    live = %tip,
+                    "binding followed a conversation continuation"
+                );
+                conversation.session_id = tip;
+            }
+        }
+    }
     let archived = trackers_dir
         .as_deref()
         .and_then(|dir| dir.parent().map(|p| p.join("archive")))

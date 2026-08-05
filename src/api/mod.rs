@@ -61,6 +61,7 @@ mod routes;
 pub(crate) mod runners;
 pub mod scope_reaper;
 pub mod secrets;
+pub mod session_chain;
 pub mod settings;
 pub(crate) mod spark;
 pub(crate) mod supervision;
