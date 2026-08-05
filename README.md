@@ -178,6 +178,7 @@ deployment:
 - **[Native Installation](docs/install-native.md)** - Bare metal Ubuntu setup
 
 ### Architecture & APIs
+- **[Hermes orchestration](docs/HERMES_ORCHESTRATION.md)** - How Hermes and sandboxed.sh run autonomous projects: sessions, missions, controllers, routes
 - **[Harness System](docs/HARNESS_SYSTEM.md)** - Backend integration architecture
 - **[ChatGPT UI harness](docs/CHATGPT_UI_HARNESS.md)** - Experimental subscription-backed browser harness
 - **[Workspaces](docs/WORKSPACES.md)** - Isolated execution environments
