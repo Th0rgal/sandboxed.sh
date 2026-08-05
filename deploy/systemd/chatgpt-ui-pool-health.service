@@ -1,0 +1,16 @@
+[Unit]
+Description=Probe ChatGPT UI pool profiles for expired logins
+After=chatgpt-ui-dgx-proxy.service
+Wants=chatgpt-ui-dgx-proxy.service
+
+[Service]
+Type=oneshot
+# Its own display: missions paint on :93 and a probe must never share it.
+ExecStart=/usr/bin/xvfb-run --auto-servernum "--server-args=-screen 0 1440x1000x24" \
+    /opt/sandboxed-sh/chatgpt-ui-venv/bin/python \
+    /opt/sandboxed-sh/scripts/chatgpt_ui_pool_health.py
+# Probing copies a ~250MB profile and drives a browser; it must always yield to
+# the missions it exists to protect.
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=15min
