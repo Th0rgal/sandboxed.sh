@@ -1,0 +1,4 @@
+[submodule "third_party/hermes-agent"]
+	path = third_party/hermes-agent
+	url = https://github.com/Th0rgal/hermes-agent.git
+	branch = production

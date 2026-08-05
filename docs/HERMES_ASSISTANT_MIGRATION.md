@@ -4,6 +4,11 @@ This document captures the target architecture for replacing the built-in
 Telegram assistant path with a standalone Hermes assistant connected to
 sandboxed.sh over MCP.
 
+> This is the migration plan. For how the two systems operate together once
+> migrated — sessions, missions, controllers, project routes, and what makes
+> progress visible — see
+> [`HERMES_ORCHESTRATION.md`](HERMES_ORCHESTRATION.md).
+
 ## Current Architecture
 
 The existing Telegram assistant is not just a workspace. It is a backend-owned
