@@ -1,5 +1,6 @@
 import type { HermesMessage } from "@/lib/api";
 import type { HermesGatewayEvent } from "@/lib/hermes-gateway";
+import { stripStateSignature } from "@/lib/hermes-state-signature";
 import type { ChatItem } from "./events-reducer";
 
 /**
@@ -58,7 +59,12 @@ export function hermesHistoryToItems(messages: HermesMessage[]): ChatItem[] {
     const id =
       message.id == null ? localId("hh") : `hermes-msg-${String(message.id)}`;
     const timestamp = parseTimestamp(message.timestamp);
-    const content = (message.content ?? "").trim();
+    const rawContent = (message.content ?? "").trim();
+    // STATE_SIGNATURE trailers are controller routing metadata, not prose:
+    // strip them from conversational rows. Tool results keep the raw text —
+    // a tool output that legitimately ends with a signature (e.g. reading
+    // the tracker page) must not be truncated.
+    const content = stripStateSignature(rawContent).trim();
 
     if (message.role === "user") {
       if (content) {
@@ -134,19 +140,19 @@ export function hermesHistoryToItems(messages: HermesMessage[]): ChatItem[] {
         if (existing.kind === "tool") {
           items[index] = {
             ...existing,
-            result: content,
+            result: rawContent,
             hasResult: true,
             endTime: timestamp,
           };
         }
-      } else if (content) {
+      } else if (rawContent) {
         items.push({
           kind: "tool",
           id,
           toolCallId: callId ?? id,
           name: message.tool_name ?? "tool",
           args: undefined,
-          result: content,
+          result: rawContent,
           isUiTool: false,
           startTime: timestamp,
           endTime: timestamp,
@@ -270,7 +276,7 @@ export class HermesLiveTranscript {
 
   private finalizeAssistant(finalText?: string) {
     this.finalizeThinking();
-    const text = (finalText ?? this.streamText).trim();
+    const text = stripStateSignature(finalText ?? this.streamText).trim();
     const streamId = this.streamItemId;
     this.streamItemId = null;
     this.streamText = "";

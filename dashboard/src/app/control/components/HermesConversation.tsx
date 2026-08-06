@@ -27,6 +27,7 @@ import {
   type HermesOutboxEntry,
 } from "@/lib/hermes-outbox";
 import { EnhancedInput } from "@/components/enhanced-input";
+import { stateSignatureKeyFromMessages } from "@/lib/hermes-state-signature";
 import { cn } from "@/lib/utils";
 
 import {
@@ -71,6 +72,10 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [session, setSession] = useState<HermesSession | null>(null);
+  // Routing key from the transcript's last [STATE_SIGNATURE: …] trailer —
+  // the display name of last resort for sessions that never got a title
+  // (cron controllers), matching what the desktop sidebar shows.
+  const [signatureKey, setSignatureKey] = useState<string | null>(null);
   const [workerMissions, setWorkerMissions] = useState<Mission[]>([]);
   const [input, setInput] = useState("");
   const [expandedToolGroups, setExpandedToolGroups] = useState<Set<string>>(
@@ -152,6 +157,7 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
       const messages = await getHermesSessionMessages(sessionId);
       if (disposed || generationRef.current !== generation) return;
       transcript.reset(hermesHistoryToItems(messages));
+      setSignatureKey(stateSignatureKeyFromMessages(messages));
       syncFromTranscript();
       setHistoryLoaded(true);
     };
@@ -193,6 +199,7 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
         : await getHermesSessionMessages(sessionId);
       if (disposed || generationRef.current !== generation) return;
       transcript.reset(hermesHistoryToItems(messages));
+      setSignatureKey(stateSignatureKeyFromMessages(messages));
       transcript.running = Boolean(result?.running);
 
       const pending = getHermesOutbox(sessionId);
@@ -333,6 +340,7 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
           const transcript = transcriptRef.current;
           if (!transcript.running && fresh.length !== transcript.items.length) {
             transcript.reset(fresh);
+            setSignatureKey(stateSignatureKeyFromMessages(messages));
             syncFromTranscript();
           }
         } catch {
@@ -539,6 +547,7 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
 
   const title =
     session?.title?.trim() ||
+    signatureKey ||
     session?.preview?.trim() ||
     `Session ${sessionId.slice(0, 8)}`;
 

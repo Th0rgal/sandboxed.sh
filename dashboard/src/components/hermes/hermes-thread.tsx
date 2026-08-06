@@ -24,6 +24,7 @@ import {
   type HermesSession,
 } from "@/lib/api";
 import { LazyMarkdownContent } from "@/components/markdown-content";
+import { stripStateSignature } from "@/lib/hermes-state-signature";
 import { cn } from "@/lib/utils";
 
 /** One rendered row in the Hermes transcript. Tool/thinking rows are built
@@ -52,7 +53,8 @@ function persistedRows(messages: HermesMessage[]): ChatItem[] {
         ? localId("hist")
         : `persisted-${String(message.id)}`;
     if (message.role === "user" || message.role === "assistant") {
-      const content = (message.content ?? "").trim();
+      // STATE_SIGNATURE trailers are controller routing metadata, not prose.
+      const content = stripStateSignature(message.content ?? "").trim();
       if (content) rows.push({ id, role: message.role, content });
     } else if (message.role === "tool") {
       rows.push({
@@ -346,8 +348,13 @@ export function HermesThread({ className }: { className?: string }) {
               return next;
             });
           },
-          onCompleted: (finalContent) => {
-            if (stale() || !finalContent.trim()) return;
+          onCompleted: (rawFinalContent) => {
+            if (stale() || !rawFinalContent.trim()) return;
+            // The deltas may have streamed a STATE_SIGNATURE trailer into the
+            // bubble; the authoritative patch below erases it. A signature-only
+            // turn patches the bubble to empty rather than leaving metadata.
+            const finalContent = stripStateSignature(rawFinalContent).trim();
+            if (!streamAssistantIdRef.current && !finalContent) return;
             // Authoritative turn text: replace the streamed bubble (deltas can
             // be lossy) or append if the turn produced no deltas.
             const id = streamAssistantIdRef.current;
