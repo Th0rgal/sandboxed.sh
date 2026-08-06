@@ -433,6 +433,13 @@ pub struct Mission {
     /// Why the mission terminated (for failed/completed missions)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,
+    /// What the guard that terminated the mission OBSERVED — the repeated
+    /// substring, the missing selector, the measured timeout. The guard
+    /// contract (2026-08-06): a terminal_reason without evidence is how a
+    /// downstream agent ends up inventing a cause ("transport bug",
+    /// "GitHub is disabled") instead of reporting a fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_evidence: Option<String>,
     /// Parent mission ID (for orchestrated worker missions)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_mission_id: Option<Uuid>,
@@ -2083,6 +2090,14 @@ pub trait MissionStore: Send + Sync {
         status: MissionStatus,
         terminal_reason: Option<&str>,
     ) -> Result<(), String>;
+
+    /// Attach what the terminating guard observed. Additive and best-effort:
+    /// stores that predate the column simply keep None, and a failure to
+    /// record evidence must never turn into a failure to terminate.
+    async fn set_terminal_evidence(&self, id: Uuid, evidence: &str) -> Result<(), String> {
+        let _ = (id, evidence);
+        Ok(())
+    }
 
     /// Update mission conversation history.
     async fn update_mission_history(
@@ -4074,6 +4089,7 @@ mod tests {
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),

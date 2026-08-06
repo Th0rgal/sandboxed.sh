@@ -238,6 +238,37 @@ believed an `acknowledged` mission could not be woken. It could.
 
 ---
 
+## The guard contract
+
+Every kill-switch in the stack — watchdogs, loop detectors, auth preflights,
+circuit breakers — obeys three rules, each paid for by an incident where a
+guard fired and the agent downstream **invented a cause** ("transport bug",
+"GitHub is disabled here", "the pool needs 12 logins re-provisioned"):
+
+1. **Evidence, not a verdict.** The guard names what it *observed* — the
+   repeated substring, the selectors probed and the page they were probed on,
+   the measured idle time — in its message, its logs, and the mission's
+   `terminal_evidence` field, which rides the completion webhook next to
+   `terminal_reason`.
+2. **A guard that cannot check says so.** Silence reads as "checked, nothing
+   found".
+3. **The work survives the verdict.** Partial output is preserved below the
+   notice, never replaced by it.
+
+Compliance at the time of writing:
+
+| guard | evidence | says-when-blind | preserves work |
+|---|---|---|---|
+| cron idle watchdog (600s) | ✓ `last_activity` | ✓ | n/a |
+| degenerate-stream detector | ✓ repeated substring | n/a | ✓ since the adjacency fix |
+| chatgpt_ui auth preflight | ✓ probed selectors + URL | ✓ fails closed loudly | n/a |
+| MCP circuit breaker | ✓ triggering error class (denylist) | ✓ | n/a |
+| skill-body guard | ✓ | ✓ warns with the skill name | n/a |
+| webhook forwarder | ✓ marker divergence is the evidence | ✓ reconcile log | ✓ durable markers |
+
+For agents, the mirror rule lives in `controllers-policy`: a `terminal_reason`
+without evidence is missing data to report — never an invitation to guess.
+
 ## Known limitations
 
 **Two stores hold the project↔conversation link.** Hermes `projects.db` follows

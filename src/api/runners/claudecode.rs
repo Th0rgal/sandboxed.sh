@@ -1598,6 +1598,7 @@ pub fn run_claudecode_turn<'a>(
                 .unwrap_or(4096);
         let mut first_text_delta_at: Option<Instant> = None;
         let mut degenerate_stage_triggered: bool = false;
+        let mut degenerate_evidence: Option<String> = None;
 
         let mut saw_non_init_event = false;
         let startup_timeout = Duration::from_secs(
@@ -2005,14 +2006,18 @@ pub fn run_claudecode_turn<'a>(
                                                                 .cloned()
                                                                 .collect::<Vec<_>>()
                                                                 .join("");
-                                                            if streaming_for >= degenerate_min_duration
-                                                                && text_buffer_stream_looks_degenerate(
-                                                                    &total_acc,
-                                                                    degenerate_window_chars,
-                                                                    degenerate_min_substring_len,
-                                                                    degenerate_min_repeats,
-                                                                )
-                                                            {
+                                                            let degenerate_needle =
+                                                                if streaming_for >= degenerate_min_duration {
+                                                                    crate::api::mission_runner::degenerate_repeated_substring(
+                                                                        &total_acc,
+                                                                        degenerate_window_chars,
+                                                                        degenerate_min_substring_len,
+                                                                        degenerate_min_repeats,
+                                                                    )
+                                                                } else {
+                                                                    None
+                                                                };
+                                                            if let Some(needle) = degenerate_needle {
                                                                 tracing::warn!(
                                                                     mission_id = %mission_id,
                                                                     streaming_for_secs = streaming_for.as_secs(),
@@ -2023,6 +2028,7 @@ pub fn run_claudecode_turn<'a>(
                                                                     "Claude Code stream looks degenerate (same substring repeated); killing CLI"
                                                                 );
                                                                 degenerate_stage_triggered = true;
+                                                                degenerate_evidence = Some(needle);
                                                                 pty.kill();
                                                                 reader_handle.abort();
                                                                 break;
@@ -2621,9 +2627,18 @@ pub fn run_claudecode_turn<'a>(
                 // Keep the partial output. The previous message claimed it
                 // was "preserved" while overwriting it — mission 7fb8970f
                 // lost five minutes of verified findings to that word.
+                let evidence_line = degenerate_evidence
+                    .as_deref()
+                    .map(|needle| {
+                        format!(
+                            "\nRepeated substring (the guard's evidence): {:?}",
+                            needle.chars().take(120).collect::<String>()
+                        )
+                    })
+                    .unwrap_or_default();
                 let notice = format!(
-                    "Claude Code entered a degenerate output loop (the same short string was repeated many times in the streamed response) and the turn was cut short to avoid a runaway 50-minute bill — see mission ab260b2e for the canonical example.\n\nThe model never produced a terminal result event. Partial output ({} chars) is preserved below; resend your last message to try again.",
-                    partial_chars
+                    "Claude Code entered a degenerate output loop (the same short string was repeated many times in the streamed response) and the turn was cut short to avoid a runaway 50-minute bill — see mission ab260b2e for the canonical example.{}\n\nThe model never produced a terminal result event. Partial output ({} chars) is preserved below; resend your last message to try again.",
+                    evidence_line, partial_chars
                 );
                 final_result = if final_result.trim().is_empty() {
                     notice
@@ -2785,7 +2800,15 @@ pub fn run_claudecode_turn<'a>(
             } else {
                 TerminalReason::LlmError
             };
-            AgentResult::failure(final_result, cost_cents).with_terminal_reason(reason)
+            let mut failure =
+                AgentResult::failure(final_result, cost_cents).with_terminal_reason(reason);
+            if let Some(needle) = degenerate_evidence.as_deref() {
+                failure = failure.with_terminal_evidence(format!(
+                    "repeated substring: {:?}",
+                    needle.chars().take(200).collect::<String>()
+                ));
+            }
+            failure
         } else if is_success_path_rate_limited_error(&final_result) {
             // Claude Code sometimes surfaces subscription quota exhaustion as a
             // normal assistant message (e.g. "You've hit your limit · resets

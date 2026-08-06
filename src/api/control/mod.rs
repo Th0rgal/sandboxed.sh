@@ -6275,6 +6275,7 @@ pub async fn get_mission_digest(
         "status": mission.status,
         "awaiting_kind": mission.awaiting_kind.map(|k| k.as_str()),
         "terminal_reason": mission.terminal_reason,
+        "terminal_evidence": mission.terminal_evidence,
         "short_description": mission.short_description,
         "terminal_verdict": terminal_verdict,
         "backend": mission.backend,
@@ -12856,6 +12857,12 @@ async fn paloma_webhook_forwarder_loop(
                 "workspace_name": workspace_name,
                 "backend": mission.as_ref().map(|m| m.backend.clone()),
                 "terminal_reason": terminal_reason,
+                // What the terminating guard OBSERVED. Without it, consumers
+                // invent causes: "transport bug", "GitHub is disabled",
+                // "pool needs re-provisioning" — all measured this week.
+                "terminal_evidence": mission
+                    .as_ref()
+                    .and_then(|mission| mission.terminal_evidence.as_deref()),
                 "resumable": matches!(status, MissionStatus::Interrupted | MissionStatus::Failed | MissionStatus::Blocked),
                 "recommended_action": recommended_action,
                 "execution": run.as_ref().map(|run| serde_json::json!({
@@ -14799,6 +14806,8 @@ async fn maybe_finalize_terminal_mission(
     events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
     mission_id: Uuid,
     terminal_reason: Option<TerminalReason>,
+    // What the terminating guard observed, from AgentResult::terminal_evidence.
+    terminal_evidence: Option<&str>,
     completion_confidence: Option<crate::agents::CompletionConfidence>,
     complete_turn_without_follow_up: bool,
     // The just-completed turn's assistant output, if available. Used to classify
@@ -14926,6 +14935,16 @@ async fn maybe_finalize_terminal_mission(
                 None
             };
 
+            if let Some(evidence) = terminal_evidence.filter(|e| !e.trim().is_empty()) {
+                // Best-effort by contract: failing to record evidence must
+                // never turn into failing to terminate.
+                if let Err(e) = mission_store
+                    .set_terminal_evidence(mission_id, evidence)
+                    .await
+                {
+                    tracing::warn!(mission_id = %mission_id, "failed to record terminal evidence: {e}");
+                }
+            }
             if let Err(e) = mission_store
                 .update_mission_status_with_reason(
                     mission_id,
@@ -18885,6 +18904,7 @@ async fn control_actor_loop(
                                     &events_tx,
                                     mission_id,
                                     agent_result.terminal_reason,
+                                    agent_result.terminal_evidence.as_deref(),
                                     Some(completion_evidence.completion_confidence),
                                     false,
                                     Some(agent_result.output.as_str()),
@@ -19149,6 +19169,7 @@ async fn control_actor_loop(
                                 &events_tx,
                                 mission_id,
                                 completed_terminal_reason,
+                                None,
                                 completed_completion_confidence,
                                 true,
                                 Some(completed_agent_output.as_str()),
@@ -19793,6 +19814,7 @@ async fn control_actor_loop(
                                         &events_tx,
                                         *mission_id,
                                         result.terminal_reason,
+                                        result.terminal_evidence.as_deref(),
                                         Some(completion_evidence.completion_confidence),
                                         true,
                                         Some(result.output.as_str()),
@@ -28492,6 +28514,7 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
@@ -28531,6 +28554,7 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
@@ -28585,6 +28609,7 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
@@ -28636,6 +28661,7 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
@@ -28687,6 +28713,7 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
@@ -28738,6 +28765,7 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
@@ -28873,6 +28901,7 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
@@ -29733,6 +29762,7 @@ Investigate <service/> failures.
             mission.id,
             Some(TerminalReason::LlmError),
             None,
+            None,
             false,
             None,
             "shutdown race test",
@@ -29768,6 +29798,7 @@ Investigate <service/> failures.
             &events_tx,
             mission.id,
             Some(TerminalReason::Completed),
+            None,
             Some(crate::agents::CompletionConfidence::Low),
             true,
             None,
