@@ -12688,8 +12688,298 @@ async fn paloma_webhook_forwarder_loop(
     // (at-least-once delivery: a single logical event keeps one `event_id`
     // across retries). Resets on restart — `event_id` is the durable key.
     let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // One forwarding path shared by the live broadcast arm and the
+    // reconcile sweep below, so a transition can never be forwardable in
+    // one and skipped by the other.
+    let http_c = http.clone();
+    let url_c = url.clone();
+    let secret_c = secret.clone();
+    let mission_store_c = Arc::clone(&mission_store);
+    let workspaces_c = workspaces.clone();
+    let working_dir_c = working_dir.clone();
+    let sem_c = Arc::clone(&sem);
+    let sequence_c = Arc::clone(&sequence);
+    let forward = move |mission_id: Uuid,
+                        status: MissionStatus,
+                        old_status: Option<MissionStatus>| {
+        let http = http_c.clone();
+        let url = url_c.clone();
+        let secret = secret_c.clone();
+        let mission_store = Arc::clone(&mission_store_c);
+        let workspaces = workspaces_c.clone();
+        let working_dir = working_dir_c.clone();
+        let sem = Arc::clone(&sem_c);
+        let sequence = Arc::clone(&sequence_c);
+        // Stable per-logical-event identity for idempotent consumers.
+        let event_id = Uuid::new_v4();
+        let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // The mission load + POST run in a spawned, concurrency-bounded
+        // task so neither a slow DB read nor a slow webhook can stall the
+        // caller.
+        tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            let mission = mission_store.get_mission(mission_id).await.ok().flatten();
+            let title = mission
+                .as_ref()
+                .and_then(|mission| mission.title.clone())
+                .unwrap_or_else(|| mission_id.to_string());
+            let project = mission.as_ref().map(|m| &m.project);
+            let run = mission_store
+                .get_active_mission_run(mission_id)
+                .await
+                .ok()
+                .flatten();
+            let mut remote_jobs = crate::remote_node::job_ledger::load(&working_dir)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|handle| handle.mission_id == mission_id)
+                .map(|handle| {
+                    serde_json::json!({
+                        "job_id": handle.job_id,
+                        "node_id": handle.node_id,
+                        "kind": handle.kind,
+                        "accepted_at": handle.accepted_at,
+                        "heartbeat_at": handle.heartbeat_at,
+                        "identity": handle.identity,
+                    })
+                })
+                .collect::<Vec<_>>();
+            remote_jobs.extend(
+                crate::remote_node::job_ledger::terminal_receipts_for_mission(
+                    &working_dir,
+                    mission_id,
+                )
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .take(16)
+                .map(|receipt| {
+                    serde_json::json!({
+                        "job_id": receipt.job_id,
+                        "node_id": receipt.node_id,
+                        "kind": "remote_build_receipt",
+                        "state": receipt.state,
+                        "started_at": receipt.started_at,
+                        "finished_at": receipt.finished_at,
+                        "exit_status": receipt.exit_status,
+                        "identity": receipt.identity,
+                        "artifacts": receipt.artifacts,
+                    })
+                }),
+            );
+            let terminal_reason = mission
+                .as_ref()
+                .and_then(|mission| mission.terminal_reason.as_deref());
+            let recommended_action = match terminal_reason {
+                Some("server_shutdown" | "orphan_no_runner") => "resume_once",
+                Some("auth_error") => "disable_provider_and_reroute",
+                Some("rate_limited" | "capacity_limited") => "reroute_or_queue",
+                Some("watchdog_stalled" | "cancelled") => "inspect_artifacts",
+                _ if status == MissionStatus::Interrupted => "reconcile_then_resume",
+                _ if status == MissionStatus::Failed => "classify_failure",
+                _ if status == MissionStatus::AwaitingUser => "inspect_result",
+                _ => "notify",
+            };
+            // Resolve workspace_name from the registry (the store row
+            // usually leaves it null), so the payload is self-contained.
+            let workspace_name = match mission.as_ref() {
+                Some(m) => match m.workspace_name.clone() {
+                    Some(name) => Some(name),
+                    None => workspaces.get(m.workspace_id).await.map(|ws| ws.name),
+                },
+                None => None,
+            };
+            let body = serde_json::json!({
+                // Idempotency / ordering (P#6): consumers dedupe on
+                // `event_id` and may order by `sequence`.
+                "event_id": event_id,
+                "sequence": seq,
+                "mission_id": mission_id,
+                "old_status": old_status,
+                "status": status,
+                // Event-type mirror of `status` so consumers with
+                // route-level event filters (e.g. the Hermes webhook
+                // platform reads `payload.type`) can drop unwanted
+                // transitions like `acknowledged` before spawning an
+                // agent run.
+                "type": status,
+                "title": title,
+                "short_description": mission
+                    .as_ref()
+                    .and_then(|m| m.short_description.clone()),
+                "workspace_id": mission.as_ref().map(|m| m.workspace_id),
+                "workspace_name": workspace_name,
+                "backend": mission.as_ref().map(|m| m.backend.clone()),
+                "terminal_reason": terminal_reason,
+                "resumable": matches!(status, MissionStatus::Interrupted | MissionStatus::Failed | MissionStatus::Blocked),
+                "recommended_action": recommended_action,
+                "execution": run.as_ref().map(|run| serde_json::json!({
+                    "run_id": run.run_id,
+                    "generation": run.generation,
+                    "state": run.execution_state,
+                    "heartbeat_at": run.heartbeat_at,
+                    "scope_unit": run.scope_unit,
+                })),
+                "remote_jobs": remote_jobs,
+                "updated_at": mission.as_ref().map(|m| m.updated_at.clone()),
+                // When the status itself last changed (P#5) — the most
+                // relevant staleness anchor for a status-change webhook.
+                "last_status_change_at": mission
+                    .as_ref()
+                    .and_then(|m| m.activity.last_status_change_at.clone()),
+                // Project tagging so Paloma can route by project/track/
+                // intent/PR instead of parsing titles.
+                "project": project.and_then(|p| p.project.clone()),
+                "track": project.and_then(|p| p.track.clone()),
+                "intent": project.and_then(|p| p.intent.clone()),
+                "github_pr": project.and_then(|p| p.github_pr.clone()),
+                "tags": project.map(|p| p.tags.clone()).unwrap_or_default(),
+                // Creation provenance. Without these, a status webhook
+                // lands in an isolated consumer session with no way
+                // back to the conversation that started the mission —
+                // results then sit acknowledged and unreported. The
+                // consumer routes the completion into `origin_session`.
+                //
+                // TRUST: `origin_session` is a routing HINT, not
+                // authority. It is declared by the creating client and
+                // the MCP transport carries no per-call session
+                // context to verify it against, so a delivery handler
+                // MUST confirm the target conversation actually
+                // references this mission_id before delivering there,
+                // and fall back to its default notification path
+                // otherwise.
+                "origin": mission.as_ref().and_then(|m| m.origin.clone()),
+                "origin_session": mission
+                    .as_ref()
+                    .and_then(|m| m.origin_session_id.clone()),
+                // Track state so a watchdog can tell "intentionally
+                // waiting (CI/review/external)" from "no worker = stuck".
+                "desired_state": project.and_then(|p| p.desired_state.clone()),
+                "next_check_at": project.and_then(|p| p.next_check_at.clone()),
+                // For awaiting_user, whether the agent needs a decision
+                // or is just waiting to be acked/merged.
+                "awaiting_kind": mission
+                    .as_ref()
+                    .and_then(|m| m.awaiting_kind)
+                    .map(|k| k.as_str()),
+            });
+
+            // Serialize once so the signature is computed over the
+            // exact bytes sent (consumers verify HMAC over the raw
+            // body, e.g. the Hermes webhook platform's GitHub-style
+            // `X-Hub-Signature-256` check).
+            let payload = match serde_json::to_vec(&body) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        "Failed to serialize Paloma webhook payload: {}",
+                        err
+                    );
+                    return;
+                }
+            };
+            let signature = secret.as_ref().and_then(|secret| {
+                use hmac::{Hmac, Mac};
+                let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+                mac.update(&payload);
+                Some(format!(
+                    "sha256={}",
+                    hex::encode(mac.finalize().into_bytes())
+                ))
+            });
+
+            // At-least-once: retry transient failures with the SAME
+            // event_id so the consumer can dedupe. Bounded so a dead
+            // endpoint can't pile up tasks.
+            const MAX_ATTEMPTS: u32 = 3;
+            for attempt in 1..=MAX_ATTEMPTS {
+                let mut request = http
+                    .post(&url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(payload.clone());
+                if let Some(signature) = signature.as_deref() {
+                    request = request.header("X-Hub-Signature-256", signature);
+                }
+                match request.send().await {
+                    Ok(resp) if resp.status().is_success() => break,
+                    Ok(resp) => {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            webhook_url = %url,
+                            attempt,
+                            status = %resp.status(),
+                            "Paloma webhook returned non-success status"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            webhook_url = %url,
+                            attempt,
+                            "Failed to forward Paloma mission status webhook: {}",
+                            err
+                        );
+                    }
+                }
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64))
+                        .await;
+                }
+            }
+        });
+    };
+    // The broadcast channel is lossy under bursts, and not every status
+    // writer broadcasts. Measured 2026-08-06: mission 45e54e0b reached
+    // awaiting_user and acknowledged at 09:35:42Z, its origin conversation
+    // was adopted and waiting, and neither transition was ever forwarded --
+    // no lag warning, nothing to retry, the conversation simply never woke.
+    // The sweep reconciles from the store: any mission whose CURRENT status
+    // is forwardable, differs from what we last forwarded, and changed
+    // recently is forwarded now. Older divergences are adopted silently so
+    // a fresh map after restart cannot replay history.
+    let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(60));
+    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        match events_rx.recv().await {
+        let recv = tokio::select! {
+            result = events_rx.recv() => Some(result),
+            _ = reconcile.tick() => None,
+        };
+        let Some(result) = recv else {
+            let missions = match mission_store.list_missions(100, 0).await {
+                Ok(missions) => missions,
+                Err(_) => continue,
+            };
+            let now = chrono::Utc::now();
+            for mission in missions {
+                let status = mission.status;
+                if !webhook_forwardable_status(status) {
+                    continue;
+                }
+                if last_status.get(&mission.id) == Some(&status) {
+                    continue;
+                }
+                let recent = chrono::DateTime::parse_from_rfc3339(&mission.updated_at)
+                    .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() < 900)
+                    .unwrap_or(false);
+                let prior = last_status.insert(mission.id, status);
+                if !recent {
+                    continue;
+                }
+                tracing::info!(
+                    mission_id = %mission.id,
+                    ?status,
+                    "webhook reconcile: forwarding a status transition the \
+                     broadcast never delivered"
+                );
+                forward(mission.id, status, prior);
+            }
+            continue;
+        };
+        match result {
             Ok(AgentEvent::MissionStatusChanged {
                 mission_id, status, ..
             }) => {
@@ -12700,237 +12990,7 @@ async fn paloma_webhook_forwarder_loop(
                     continue;
                 }
 
-                // Stable per-logical-event identity for idempotent consumers.
-                let event_id = Uuid::new_v4();
-                let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-                // Everything else (the mission load + POST) runs in a spawned,
-                // concurrency-bounded task so neither a slow DB read nor a slow
-                // webhook can stall the broadcast receiver and lag-drop events.
-                let http = http.clone();
-                let url = url.clone();
-                let secret = secret.clone();
-                let mission_store = Arc::clone(&mission_store);
-                let workspaces = workspaces.clone();
-                let working_dir = working_dir.clone();
-                let sem = Arc::clone(&sem);
-                tokio::spawn(async move {
-                    let _permit = sem.acquire_owned().await;
-                    let mission = mission_store.get_mission(mission_id).await.ok().flatten();
-                    let title = mission
-                        .as_ref()
-                        .and_then(|mission| mission.title.clone())
-                        .unwrap_or_else(|| mission_id.to_string());
-                    let project = mission.as_ref().map(|m| &m.project);
-                    let run = mission_store
-                        .get_active_mission_run(mission_id)
-                        .await
-                        .ok()
-                        .flatten();
-                    let mut remote_jobs = crate::remote_node::job_ledger::load(&working_dir)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|handle| handle.mission_id == mission_id)
-                        .map(|handle| {
-                            serde_json::json!({
-                                "job_id": handle.job_id,
-                                "node_id": handle.node_id,
-                                "kind": handle.kind,
-                                "accepted_at": handle.accepted_at,
-                                "heartbeat_at": handle.heartbeat_at,
-                                "identity": handle.identity,
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    remote_jobs.extend(
-                        crate::remote_node::job_ledger::terminal_receipts_for_mission(
-                            &working_dir,
-                            mission_id,
-                        )
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .rev()
-                        .take(16)
-                        .map(|receipt| {
-                            serde_json::json!({
-                                "job_id": receipt.job_id,
-                                "node_id": receipt.node_id,
-                                "kind": "remote_build_receipt",
-                                "state": receipt.state,
-                                "started_at": receipt.started_at,
-                                "finished_at": receipt.finished_at,
-                                "exit_status": receipt.exit_status,
-                                "identity": receipt.identity,
-                                "artifacts": receipt.artifacts,
-                            })
-                        }),
-                    );
-                    let terminal_reason = mission
-                        .as_ref()
-                        .and_then(|mission| mission.terminal_reason.as_deref());
-                    let recommended_action = match terminal_reason {
-                        Some("server_shutdown" | "orphan_no_runner") => "resume_once",
-                        Some("auth_error") => "disable_provider_and_reroute",
-                        Some("rate_limited" | "capacity_limited") => "reroute_or_queue",
-                        Some("watchdog_stalled" | "cancelled") => "inspect_artifacts",
-                        _ if status == MissionStatus::Interrupted => "reconcile_then_resume",
-                        _ if status == MissionStatus::Failed => "classify_failure",
-                        _ if status == MissionStatus::AwaitingUser => "inspect_result",
-                        _ => "notify",
-                    };
-                    // Resolve workspace_name from the registry (the store row
-                    // usually leaves it null), so the payload is self-contained.
-                    let workspace_name = match mission.as_ref() {
-                        Some(m) => match m.workspace_name.clone() {
-                            Some(name) => Some(name),
-                            None => workspaces.get(m.workspace_id).await.map(|ws| ws.name),
-                        },
-                        None => None,
-                    };
-                    let body = serde_json::json!({
-                        // Idempotency / ordering (P#6): consumers dedupe on
-                        // `event_id` and may order by `sequence`.
-                        "event_id": event_id,
-                        "sequence": seq,
-                        "mission_id": mission_id,
-                        "old_status": old_status,
-                        "status": status,
-                        // Event-type mirror of `status` so consumers with
-                        // route-level event filters (e.g. the Hermes webhook
-                        // platform reads `payload.type`) can drop unwanted
-                        // transitions like `acknowledged` before spawning an
-                        // agent run.
-                        "type": status,
-                        "title": title,
-                        "short_description": mission
-                            .as_ref()
-                            .and_then(|m| m.short_description.clone()),
-                        "workspace_id": mission.as_ref().map(|m| m.workspace_id),
-                        "workspace_name": workspace_name,
-                        "backend": mission.as_ref().map(|m| m.backend.clone()),
-                        "terminal_reason": terminal_reason,
-                        "resumable": matches!(status, MissionStatus::Interrupted | MissionStatus::Failed | MissionStatus::Blocked),
-                        "recommended_action": recommended_action,
-                        "execution": run.as_ref().map(|run| serde_json::json!({
-                            "run_id": run.run_id,
-                            "generation": run.generation,
-                            "state": run.execution_state,
-                            "heartbeat_at": run.heartbeat_at,
-                            "scope_unit": run.scope_unit,
-                        })),
-                        "remote_jobs": remote_jobs,
-                        "updated_at": mission.as_ref().map(|m| m.updated_at.clone()),
-                        // When the status itself last changed (P#5) — the most
-                        // relevant staleness anchor for a status-change webhook.
-                        "last_status_change_at": mission
-                            .as_ref()
-                            .and_then(|m| m.activity.last_status_change_at.clone()),
-                        // Project tagging so Paloma can route by project/track/
-                        // intent/PR instead of parsing titles.
-                        "project": project.and_then(|p| p.project.clone()),
-                        "track": project.and_then(|p| p.track.clone()),
-                        "intent": project.and_then(|p| p.intent.clone()),
-                        "github_pr": project.and_then(|p| p.github_pr.clone()),
-                        "tags": project.map(|p| p.tags.clone()).unwrap_or_default(),
-                        // Creation provenance. Without these, a status webhook
-                        // lands in an isolated consumer session with no way
-                        // back to the conversation that started the mission —
-                        // results then sit acknowledged and unreported. The
-                        // consumer routes the completion into `origin_session`.
-                        //
-                        // TRUST: `origin_session` is a routing HINT, not
-                        // authority. It is declared by the creating client and
-                        // the MCP transport carries no per-call session
-                        // context to verify it against, so a delivery handler
-                        // MUST confirm the target conversation actually
-                        // references this mission_id before delivering there,
-                        // and fall back to its default notification path
-                        // otherwise.
-                        "origin": mission.as_ref().and_then(|m| m.origin.clone()),
-                        "origin_session": mission
-                            .as_ref()
-                            .and_then(|m| m.origin_session_id.clone()),
-                        // Track state so a watchdog can tell "intentionally
-                        // waiting (CI/review/external)" from "no worker = stuck".
-                        "desired_state": project.and_then(|p| p.desired_state.clone()),
-                        "next_check_at": project.and_then(|p| p.next_check_at.clone()),
-                        // For awaiting_user, whether the agent needs a decision
-                        // or is just waiting to be acked/merged.
-                        "awaiting_kind": mission
-                            .as_ref()
-                            .and_then(|m| m.awaiting_kind)
-                            .map(|k| k.as_str()),
-                    });
-
-                    // Serialize once so the signature is computed over the
-                    // exact bytes sent (consumers verify HMAC over the raw
-                    // body, e.g. the Hermes webhook platform's GitHub-style
-                    // `X-Hub-Signature-256` check).
-                    let payload = match serde_json::to_vec(&body) {
-                        Ok(bytes) => bytes,
-                        Err(err) => {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                "Failed to serialize Paloma webhook payload: {}",
-                                err
-                            );
-                            return;
-                        }
-                    };
-                    let signature = secret.as_ref().and_then(|secret| {
-                        use hmac::{Hmac, Mac};
-                        let mut mac =
-                            Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).ok()?;
-                        mac.update(&payload);
-                        Some(format!(
-                            "sha256={}",
-                            hex::encode(mac.finalize().into_bytes())
-                        ))
-                    });
-
-                    // At-least-once: retry transient failures with the SAME
-                    // event_id so the consumer can dedupe. Bounded so a dead
-                    // endpoint can't pile up tasks.
-                    const MAX_ATTEMPTS: u32 = 3;
-                    for attempt in 1..=MAX_ATTEMPTS {
-                        let mut request = http
-                            .post(&url)
-                            .header(reqwest::header::CONTENT_TYPE, "application/json")
-                            .body(payload.clone());
-                        if let Some(signature) = signature.as_deref() {
-                            request = request.header("X-Hub-Signature-256", signature);
-                        }
-                        match request.send().await {
-                            Ok(resp) if resp.status().is_success() => break,
-                            Ok(resp) => {
-                                tracing::warn!(
-                                    mission_id = %mission_id,
-                                    webhook_url = %url,
-                                    attempt,
-                                    status = %resp.status(),
-                                    "Paloma webhook returned non-success status"
-                                );
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    mission_id = %mission_id,
-                                    webhook_url = %url,
-                                    attempt,
-                                    "Failed to forward Paloma mission status webhook: {}",
-                                    err
-                                );
-                            }
-                        }
-                        if attempt < MAX_ATTEMPTS {
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                250 * attempt as u64,
-                            ))
-                            .await;
-                        }
-                    }
-                });
+                forward(mission_id, status, old_status);
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(dropped)) => {
