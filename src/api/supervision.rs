@@ -29,7 +29,7 @@ use super::control::MissionStatus;
 #[allow(unused_imports)]
 use super::control::*;
 use super::mission_runner::TOOL_CALL_STALL_GRACE_SECS;
-use super::mission_store::{MissionExecutionState, MissionRun, MissionStore};
+use super::mission_store::{MissionExecutionState, MissionFilter, MissionRun, MissionStore};
 
 mod bg_autoresume;
 
@@ -403,6 +403,13 @@ pub(crate) async fn stuck_mission_watchdog_loop(
     // interrupted and the boss handles it, so this can never resume-storm.
     let mut auto_resumed_workers: HashSet<Uuid> = HashSet::new();
 
+    // Idle-child notification state: child id → (last_activity_at at the time
+    // we notified, notifications sent). One notification per stall episode —
+    // re-notify only if the child showed new activity and stalled again.
+    let mut idle_child_notified: std::collections::HashMap<Uuid, (String, u32)> =
+        std::collections::HashMap::new();
+    let idle_child_threshold = idle_worker_notify_threshold_secs();
+
     loop {
         tokio::time::sleep(CHECK_INTERVAL).await;
 
@@ -662,6 +669,195 @@ pub(crate) async fn stuck_mission_watchdog_loop(
                 }
             }
         }
+
+        // Case 3 — a CHILD mission parked in a non-terminal status with no
+        // activity for a long time. The boss learns about terminal workers via
+        // wait_for_worker, but a worker that ends its turn without delivering
+        // (awaiting_user → acknowledged) is silent: nothing tells the boss it
+        // has been sitting there for 16 hours. Ping the parent so detection is
+        // an event, not a discipline the boss must remember.
+        if let Some(threshold) = idle_child_threshold {
+            notify_parents_of_idle_children(
+                mission_store.as_ref(),
+                &cmd_tx,
+                threshold,
+                &mut idle_child_notified,
+            )
+            .await;
+        }
+    }
+}
+
+/// Idle threshold (seconds) before a parked child mission triggers a parent
+/// notification. Env-tunable; `0` disables the sweep entirely.
+fn idle_worker_notify_threshold_secs() -> Option<u64> {
+    const DEFAULT_SECS: u64 = 3600;
+    match std::env::var("SANDBOXED_SH_IDLE_WORKER_NOTIFY_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(secs),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    "SANDBOXED_SH_IDLE_WORKER_NOTIFY_SECS is not a number; using default"
+                );
+                Some(DEFAULT_SECS)
+            }
+        },
+        Err(_) => Some(DEFAULT_SECS),
+    }
+}
+
+/// Whether a child mission's (status, idle) pair warrants pinging its parent.
+/// Only parked, non-terminal statuses count: Active stalls are the stuck-
+/// mission watchdog's job, WaitingBackground has its own auto-resume watcher,
+/// and Paused is an explicit operator decision.
+fn idle_child_needs_parent_ping(status: MissionStatus, idle_seconds: u64, threshold: u64) -> bool {
+    matches!(
+        status,
+        MissionStatus::Pending | MissionStatus::AwaitingUser | MissionStatus::Acknowledged
+    ) && idle_seconds >= threshold
+}
+
+/// Sweep recent missions for parked children idle past `threshold` and inject
+/// a strict control message into their parent mission. One notification per
+/// stall episode (keyed by the child's `last_activity` at notify time), capped
+/// per child so a permanently-ignored worker cannot spam its boss forever.
+async fn notify_parents_of_idle_children(
+    mission_store: &dyn MissionStore,
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    threshold: u64,
+    notified: &mut std::collections::HashMap<Uuid, (String, u32)>,
+) {
+    const MAX_NOTIFICATIONS_PER_CHILD: u32 = 3;
+    const SCAN_LIMIT: usize = 200;
+
+    let missions = match mission_store
+        .list_missions_filtered(&MissionFilter::default(), SCAN_LIMIT, 0)
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Idle-child watchdog: list missions failed: {}", e);
+            return;
+        }
+    };
+
+    let candidates: Vec<_> = missions
+        .iter()
+        .filter(|m| m.parent_mission_id.is_some())
+        .filter(|m| {
+            matches!(
+                m.status,
+                MissionStatus::Pending | MissionStatus::AwaitingUser | MissionStatus::Acknowledged
+            )
+        })
+        .collect();
+
+    // Drop state for children that left the candidate set (went terminal or
+    // active again); if they re-park and stall, that's a fresh episode anyway.
+    let candidate_ids: HashSet<Uuid> = candidates.iter().map(|m| m.id).collect();
+    notified.retain(|id, _| candidate_ids.contains(id));
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    let ids: Vec<Uuid> = candidates.iter().map(|m| m.id).collect();
+    let activity = match mission_store.get_mission_activity(&ids).await {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!("Idle-child watchdog: load activity failed: {}", e);
+            return;
+        }
+    };
+
+    let now = chrono::Utc::now();
+    for child in candidates {
+        // Same staleness basis as `populate_activity`: the most recent of
+        // updated_at and the newest persisted event.
+        let last_event = activity.get(&child.id).and_then(|(e, _)| e.clone());
+        let last_activity = [Some(child.updated_at.clone()), last_event]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or_else(|| child.updated_at.clone());
+        let idle_seconds = match chrono::DateTime::parse_from_rfc3339(&last_activity) {
+            Ok(ts) => (now - ts.with_timezone(&chrono::Utc)).num_seconds().max(0) as u64,
+            Err(_) => continue,
+        };
+        if !idle_child_needs_parent_ping(child.status, idle_seconds, threshold) {
+            continue;
+        }
+
+        match notified.get(&child.id) {
+            // Already notified for this exact stall episode.
+            Some((at, _)) if *at == last_activity => continue,
+            Some((_, count)) if *count >= MAX_NOTIFICATIONS_PER_CHILD => continue,
+            _ => {}
+        }
+
+        let Some(parent_id) = child.parent_mission_id else {
+            continue;
+        };
+        // Never resurrect a finished orchestration over a leftover child; a
+        // terminal boss's stale workers are garbage-collection material, not
+        // an emergency.
+        match mission_store.get_mission(parent_id).await {
+            Ok(Some(parent)) if !parent.status.is_terminal() => {}
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    child = %child.id,
+                    "Idle-child watchdog: parent lookup failed: {}",
+                    e
+                );
+                continue;
+            }
+        }
+
+        let idle_human = crate::api::control::humanize_idle(idle_seconds);
+        let title = child.title.as_deref().unwrap_or("untitled");
+        let content = format!(
+            "[worker-watchdog] Worker mission {id} ('{title}') has been idle for {idle} \
+in status {status}: no new events and no status change. It may be stalled, or parked \
+without having delivered. Inspect it with get_worker_diagnostics(mission_id=\"{id}\"), \
+then either send it corrective instructions (send_message_to_worker / retask_worker), \
+cancel it (cancel_worker), or accept its current output if the work is actually done. \
+This notification fires at most once per stall episode.",
+            id = child.id,
+            title = title,
+            idle = idle_human,
+            status = child.status,
+        );
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if cmd_tx
+            .send(ControlCommand::UserMessage {
+                id: Uuid::new_v4(),
+                content,
+                agent: None,
+                target_mission_id: Some(parent_id),
+                strict: true,
+                source: Some("idle-worker-watchdog".to_string()),
+                respond: ack_tx,
+            })
+            .await
+            .is_err()
+        {
+            return; // actor gone; loop will exit on its own
+        }
+        let delivered = !matches!(ack_rx.await, Ok(UserMessageAck::Dropped));
+        let entry = notified.entry(child.id).or_insert((String::new(), 0));
+        entry.0 = last_activity;
+        entry.1 += 1;
+        tracing::info!(
+            child = %child.id,
+            parent = %parent_id,
+            idle_seconds,
+            delivered,
+            "Idle-child watchdog: notified parent of idle worker"
+        );
     }
 }
 
@@ -872,5 +1068,50 @@ mod tests {
         run.heartbeat_at = now.to_rfc3339();
         run.execution_state = MissionExecutionState::Stopping;
         assert!(!chatgpt_ui_run_proves_liveness(&run, now));
+    }
+
+    #[test]
+    fn idle_child_ping_covers_parked_statuses_past_threshold() {
+        // The A.3 incident shape: acknowledged for 16h.
+        assert!(idle_child_needs_parent_ping(
+            MissionStatus::Acknowledged,
+            16 * 3600,
+            3600
+        ));
+        assert!(idle_child_needs_parent_ping(
+            MissionStatus::AwaitingUser,
+            3600,
+            3600
+        ));
+        assert!(idle_child_needs_parent_ping(
+            MissionStatus::Pending,
+            7200,
+            3600
+        ));
+        // Below threshold: parked is normal end-of-turn, not a stall.
+        assert!(!idle_child_needs_parent_ping(
+            MissionStatus::AwaitingUser,
+            60,
+            3600
+        ));
+    }
+
+    #[test]
+    fn idle_child_ping_never_fires_for_active_terminal_or_paused() {
+        for status in [
+            MissionStatus::Active,            // stuck-mission watchdog's job
+            MissionStatus::WaitingBackground, // bg auto-resume watcher's job
+            MissionStatus::Paused,            // operator decision
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::Interrupted,
+            MissionStatus::Blocked,
+            MissionStatus::NotFeasible,
+        ] {
+            assert!(
+                !idle_child_needs_parent_ping(status, 1_000_000, 3600),
+                "{status} must not trigger a parent ping"
+            );
+        }
     }
 }

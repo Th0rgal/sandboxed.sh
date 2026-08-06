@@ -204,6 +204,20 @@ pub struct MissionActivity {
     /// consumer derive staleness with a single field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_at: Option<String>,
+    /// Seconds since `last_activity_at`, computed at read time. Consumers
+    /// (LLM orchestrators especially) should never have to subtract two
+    /// RFC3339 timestamps to decide whether a worker looks alive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_seconds: Option<u64>,
+    /// Human rendering of `idle_seconds` (e.g. "16h", "2h30m", "45s").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_for: Option<String>,
+    /// Server-computed staleness verdict for non-terminal missions
+    /// (`working`, `quiet`, `stalled`, `parked`, `stalled_parked`, `queued`,
+    /// `stuck_queued`, `waiting_background`, `stalled_background`, `paused`).
+    /// Absent for terminal missions. See `mission_health_verdict`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_verdict: Option<String>,
 }
 
 /// Durable execution truth for one mission runner generation. Mission status

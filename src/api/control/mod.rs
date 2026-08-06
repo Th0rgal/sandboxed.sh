@@ -5315,6 +5315,7 @@ async fn populate_activity(control: &ControlState, missions: &mut [Mission]) {
             return;
         }
     };
+    let now = chrono::Utc::now();
     for mission in missions.iter_mut() {
         if let Some((last_event, last_output)) = activity.get(&mission.id) {
             mission.activity.last_agent_event_at = last_event.clone();
@@ -5329,6 +5330,162 @@ async fn populate_activity(control: &ControlState, missions: &mut [Mission]) {
         .flatten()
         .max();
         mission.activity.last_activity_at = last_activity;
+
+        // Staleness is server-computed so consumers (LLM orchestrators
+        // especially) read a verdict word instead of doing timestamp math —
+        // in practice they don't, and idle workers go unnoticed for hours.
+        let idle_seconds = mission
+            .activity
+            .last_activity_at
+            .as_deref()
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|ts| (now - ts.with_timezone(&chrono::Utc)).num_seconds().max(0) as u64);
+        mission.activity.idle_seconds = idle_seconds;
+        mission.activity.idle_for = idle_seconds.map(humanize_idle);
+        mission.activity.health_verdict = idle_seconds
+            .and_then(|idle| mission_health_verdict(mission.status, idle))
+            .map(str::to_string);
+    }
+}
+
+/// Render a duration in seconds as a compact human string ("45s", "12m",
+/// "2h30m", "16h", "3d"). Meant for LLM/UI consumption, not parsing.
+pub(crate) fn humanize_idle(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{}s", seconds);
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{}m", minutes);
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        let rem_minutes = minutes % 60;
+        if hours < 6 && rem_minutes > 0 {
+            return format!("{}h{:02}m", hours, rem_minutes);
+        }
+        return format!("{}h", hours);
+    }
+    format!("{}d", hours / 24)
+}
+
+/// Server-side staleness verdict for a mission given its status and idle time.
+/// Returns `None` for terminal statuses — a finished mission is not "stalled",
+/// however old it is. Thresholds are deliberately coarse: the point is to make
+/// "this worker has produced nothing for hours" jump out of a listing, not to
+/// diagnose precisely why.
+pub(crate) fn mission_health_verdict(
+    status: MissionStatus,
+    idle_seconds: u64,
+) -> Option<&'static str> {
+    const QUIET_AFTER: u64 = 300; // 5 min without events while active
+    const STALLED_AFTER: u64 = 1800; // 30 min: something is wrong
+    const QUEUE_STUCK_AFTER: u64 = 900; // pending that never dispatched
+    const BACKGROUND_STALLED_AFTER: u64 = 21_600; // 6h of background work
+
+    let verdict = match status {
+        MissionStatus::Active => {
+            if idle_seconds < QUIET_AFTER {
+                "working"
+            } else if idle_seconds < STALLED_AFTER {
+                "quiet"
+            } else {
+                "stalled"
+            }
+        }
+        MissionStatus::Pending => {
+            if idle_seconds < QUEUE_STUCK_AFTER {
+                "queued"
+            } else {
+                "stuck_queued"
+            }
+        }
+        MissionStatus::AwaitingUser | MissionStatus::Acknowledged => {
+            if idle_seconds < STALLED_AFTER {
+                "parked"
+            } else {
+                "stalled_parked"
+            }
+        }
+        MissionStatus::WaitingBackground => {
+            if idle_seconds < BACKGROUND_STALLED_AFTER {
+                "waiting_background"
+            } else {
+                "stalled_background"
+            }
+        }
+        MissionStatus::Paused => "paused",
+        MissionStatus::Completed
+        | MissionStatus::Failed
+        | MissionStatus::Interrupted
+        | MissionStatus::Blocked
+        | MissionStatus::NotFeasible => return None,
+    };
+    Some(verdict)
+}
+
+#[cfg(test)]
+mod health_verdict_tests {
+    use super::*;
+
+    #[test]
+    fn active_missions_go_working_quiet_stalled() {
+        assert_eq!(
+            mission_health_verdict(MissionStatus::Active, 10),
+            Some("working")
+        );
+        assert_eq!(
+            mission_health_verdict(MissionStatus::Active, 600),
+            Some("quiet")
+        );
+        assert_eq!(
+            mission_health_verdict(MissionStatus::Active, 7200),
+            Some("stalled")
+        );
+    }
+
+    #[test]
+    fn parked_missions_stall_after_threshold() {
+        assert_eq!(
+            mission_health_verdict(MissionStatus::AwaitingUser, 60),
+            Some("parked")
+        );
+        // The A.3 incident shape: a worker sitting acknowledged for 16h must
+        // not read as healthy.
+        assert_eq!(
+            mission_health_verdict(MissionStatus::Acknowledged, 16 * 3600),
+            Some("stalled_parked")
+        );
+    }
+
+    #[test]
+    fn terminal_missions_have_no_verdict() {
+        assert_eq!(
+            mission_health_verdict(MissionStatus::Completed, 999_999),
+            None
+        );
+        assert_eq!(mission_health_verdict(MissionStatus::Failed, 0), None);
+    }
+
+    #[test]
+    fn pending_missions_flag_a_stuck_queue() {
+        assert_eq!(
+            mission_health_verdict(MissionStatus::Pending, 60),
+            Some("queued")
+        );
+        assert_eq!(
+            mission_health_verdict(MissionStatus::Pending, 3600),
+            Some("stuck_queued")
+        );
+    }
+
+    #[test]
+    fn idle_durations_render_compactly() {
+        assert_eq!(humanize_idle(45), "45s");
+        assert_eq!(humanize_idle(12 * 60), "12m");
+        assert_eq!(humanize_idle(2 * 3600 + 30 * 60), "2h30m");
+        assert_eq!(humanize_idle(16 * 3600), "16h");
+        assert_eq!(humanize_idle(3 * 86_400), "3d");
     }
 }
 

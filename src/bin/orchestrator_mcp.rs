@@ -158,6 +158,14 @@ struct GetWorkerStatusParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct GetWorkerDiagnosticsParams {
+    mission_id: String,
+    /// How many recent events to include (default 30, max 200).
+    #[serde(default)]
+    event_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CancelWorkerParams {
     mission_id: String,
 }
@@ -800,7 +808,15 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "list_worker_missions".to_string(),
-                description: "List all worker missions spawned by this boss mission.".to_string(),
+                description: "List all worker missions spawned by this boss mission as compact rows: status, server-computed health_verdict (working/quiet/stalled/parked/stalled_parked/stuck_queued/...), idle_for, and the worker's last words. Workers needing attention are repeated in `attention`. Use get_worker_status for the full record.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+            ToolDefinition {
+                name: "check_workers_health".to_string(),
+                description: "Report ONLY the workers that look stuck: idle past server thresholds while non-terminal (verdicts stalled, stalled_parked, stuck_queued, stalled_background). Cheap — call it at the start of a turn to catch a worker that has been silently idle for hours. Empty `anomalies` means nobody is stuck.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {}
@@ -816,6 +832,24 @@ impl OrchestratorMcp {
                         "mission_id": {
                             "type": "string",
                             "description": "UUID of the worker mission"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "get_worker_diagnostics".to_string(),
+                description: "Debug a worker that has been quiet too long: health verdict + idle time, execution state, the tail of its event stream, its last assistant message, its last error, and verification of any push it claims (did the branch actually reach the remote?). Use this BEFORE deciding to message, retask, or cancel a stalled worker.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id"],
+                    "properties": {
+                        "mission_id": {
+                            "type": "string",
+                            "description": "UUID of the worker mission to diagnose"
+                        },
+                        "event_limit": {
+                            "type": "integer",
+                            "description": "How many recent events to include (default 30, max 200)"
                         }
                     }
                 }),
@@ -1198,8 +1232,9 @@ impl OrchestratorMcp {
         Ok(mission)
     }
 
-    async fn list_workers(&self) -> Result<Value, String> {
-        // List all missions and filter for children of this boss mission
+    /// Fetch all child missions of this boss, push-claim enriched. Shared by
+    /// list_worker_missions and check_workers_health.
+    async fn fetch_workers(&self) -> Result<Vec<Value>, String> {
         let response = self
             .api_get("/api/control/missions?limit=100&offset=0")
             .await?;
@@ -1224,11 +1259,67 @@ impl OrchestratorMcp {
         for worker in workers.iter_mut() {
             enrich_with_push_claims(worker);
         }
+        Ok(workers)
+    }
+
+    async fn list_workers(&self) -> Result<Value, String> {
+        let workers = self.fetch_workers().await?;
+
+        // Compact rows instead of full mission dumps: a boss skimming ten
+        // full histories misses the one worker that has been idle for 16h.
+        // The server-computed health_verdict + idle_for are surfaced per row
+        // and anomalies are repeated in `attention` so they cannot be missed.
+        let rows: Vec<Value> = workers.iter().map(compact_worker_row).collect();
+        let attention: Vec<&Value> = rows
+            .iter()
+            .filter(|row| {
+                row.get("health_verdict")
+                    .and_then(Value::as_str)
+                    .is_some_and(verdict_is_anomalous)
+            })
+            .collect();
 
         Ok(json!({
-            "boss_mission_id": boss_id,
-            "worker_count": workers.len(),
-            "workers": workers,
+            "boss_mission_id": self.mission_id.to_string(),
+            "worker_count": rows.len(),
+            "workers": rows,
+            "attention": attention,
+            "hint": "Rows are compact. Use get_worker_status for the full mission record, and get_worker_diagnostics for any worker whose health_verdict is stalled/stalled_parked/stuck_queued.",
+        }))
+    }
+
+    /// Report only the workers that need the boss's attention. Cheap to call
+    /// at the start of every turn: an empty `anomalies` array means no worker
+    /// is silently stuck.
+    async fn check_workers_health(&self) -> Result<Value, String> {
+        let workers = self.fetch_workers().await?;
+        let checked = workers.len();
+        let anomalies: Vec<Value> = workers
+            .iter()
+            .filter(|w| {
+                worker_activity_field(w, "health_verdict")
+                    .and_then(Value::as_str)
+                    .is_some_and(verdict_is_anomalous)
+            })
+            .map(|w| {
+                let mut row = compact_worker_row(w);
+                let hint = stalled_worker_hint(&row);
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("hint".to_string(), json!(hint));
+                }
+                row
+            })
+            .collect();
+
+        Ok(json!({
+            "checked": checked,
+            "anomaly_count": anomalies.len(),
+            "anomalies": anomalies,
+            "note": if anomalies.is_empty() {
+                "All workers are either progressing normally or in a terminal status."
+            } else {
+                "These workers have produced nothing for a long time. Diagnose each with get_worker_diagnostics before deciding to message, retask, or cancel it."
+            },
         }))
     }
 
@@ -1254,6 +1345,87 @@ impl OrchestratorMcp {
         enrich_with_push_claims(&mut mission);
 
         Ok(mission)
+    }
+
+    /// Debug view of one worker: health verdict, execution truth, the tail of
+    /// its event stream, its last words, its last error, and whether any push
+    /// it claims actually reached the remote. This is the tool to reach for
+    /// when a worker has been quiet too long and "status" alone explains
+    /// nothing.
+    async fn get_worker_diagnostics(
+        &self,
+        params: GetWorkerDiagnosticsParams,
+    ) -> Result<Value, String> {
+        let id = Uuid::parse_str(&params.mission_id)
+            .map_err(|_| "Invalid mission ID format".to_string())?;
+
+        let response = self
+            .api_get(&format!("/api/control/missions/{}", id))
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!("Worker mission not found: {}", response.status()));
+        }
+        let mission: Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        // Push claims are verified for ANY status here (get_worker_status only
+        // checks completed workers): a "busy" worker that claims pushes which
+        // never reached the remote is exactly the silent-no-op case.
+        let push_claims = compute_push_claims(&mission);
+
+        // Tail of the persisted event stream, most recent last.
+        let event_limit = params.event_limit.unwrap_or(30).clamp(1, 200);
+        let events_response = self
+            .api_get(&format!(
+                "/api/control/missions/{}/events?before_seq={}&limit={}&include_counts=false",
+                id,
+                i64::MAX,
+                event_limit
+            ))
+            .await?;
+        let events: Vec<Value> = if events_response.status().is_success() {
+            events_response.json().await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let recent_events: Vec<Value> = events.iter().map(compact_event).collect();
+        let last_error = events
+            .iter()
+            .rev()
+            .find(|e| {
+                e.get("event_type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t.contains("error"))
+            })
+            .map(compact_event);
+
+        let compact = compact_worker_row(&mission);
+        let hint = stalled_worker_hint(&compact);
+
+        Ok(json!({
+            "mission_id": id.to_string(),
+            "title": mission.get("title"),
+            "status": mission.get("status"),
+            "health": {
+                "verdict": worker_activity_field(&mission, "health_verdict"),
+                "idle_seconds": worker_activity_field(&mission, "idle_seconds"),
+                "idle_for": worker_activity_field(&mission, "idle_for"),
+                "last_activity_at": worker_activity_field(&mission, "last_activity_at"),
+                "last_output_at": worker_activity_field(&mission, "last_output_at"),
+            },
+            "execution": mission.get("execution"),
+            "awaiting_kind": mission.get("awaiting_kind"),
+            "terminal_reason": mission.get("terminal_reason"),
+            "working_directory": mission.get("working_directory"),
+            "last_assistant_message": last_assistant_message(&mission)
+                .map(|s| truncate_chars(&s, 2000)),
+            "last_error": last_error,
+            "recent_events": recent_events,
+            "push_claims": push_claims,
+            "hint": hint,
+        }))
     }
 
     async fn cancel_worker(&self, params: CancelWorkerParams) -> Result<Value, String> {
@@ -2448,6 +2620,28 @@ impl OrchestratorMcp {
             // Check timeout
             if start.elapsed() > timeout {
                 let was_clamped = params.timeout_seconds > MAX_INTERNAL_TIMEOUT_SECS;
+                // If the worker produced nothing for longer than this entire
+                // wait, "call again" is the wrong advice — escalate to
+                // diagnostics instead of letting the boss poll a corpse.
+                let idle_seconds =
+                    worker_activity_field(&mission, "idle_seconds").and_then(Value::as_u64);
+                let verdict = worker_activity_field(&mission, "health_verdict")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let looks_stalled = verdict.as_deref().is_some_and(verdict_is_anomalous)
+                    || idle_seconds.is_some_and(|idle| idle > start.elapsed().as_secs().max(300));
+                let hint = if looks_stalled {
+                    format!(
+                        "Worker produced NO activity during this entire wait (idle {}, verdict {}). It may be stalled: run get_worker_diagnostics(mission_id=\"{}\") before waiting again, then message/retask/cancel it.",
+                        worker_activity_field(&mission, "idle_for")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown"),
+                        verdict.as_deref().unwrap_or("unknown"),
+                        id
+                    )
+                } else {
+                    "Worker has not reached a target status yet. Call wait_for_worker again to continue waiting.".to_string()
+                };
                 return Ok(json!({
                     "reached_target": false,
                     "internal_timeout": was_clamped,
@@ -2456,8 +2650,10 @@ impl OrchestratorMcp {
                     "elapsed_seconds": start.elapsed().as_secs(),
                     "effective_timeout_seconds": effective_timeout_secs,
                     "requested_timeout_seconds": params.timeout_seconds,
+                    "idle_seconds": idle_seconds,
+                    "health_verdict": verdict,
                     "mission": mission,
-                    "hint": "Worker has not reached a target status yet. Call wait_for_worker again to continue waiting.",
+                    "hint": hint,
                 }));
             }
 
@@ -2596,10 +2792,16 @@ impl OrchestratorMcp {
                 self.batch_create_workers(params).await
             }
             "list_worker_missions" => self.list_workers().await,
+            "check_workers_health" => self.check_workers_health().await,
             "get_worker_status" => {
                 let params: GetWorkerStatusParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.get_worker_status(params).await
+            }
+            "get_worker_diagnostics" => {
+                let params: GetWorkerDiagnosticsParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.get_worker_diagnostics(params).await
             }
             "cancel_worker" => {
                 let params: CancelWorkerParams =
@@ -3096,17 +3298,27 @@ fn enrich_with_push_claims(mission: &mut Value) {
         return;
     }
 
-    let Some(content) = last_assistant_message(mission) else {
+    let Some(claims) = compute_push_claims(mission) else {
         return;
     };
 
+    if let Some(obj) = mission.as_object_mut() {
+        obj.insert("push_claims".to_string(), Value::Array(claims));
+    }
+}
+
+/// Verify any push the worker's last message claims, for a mission in ANY
+/// status. Returns `None` when there is no push claim to verify.
+fn compute_push_claims(mission: &Value) -> Option<Vec<Value>> {
+    let content = last_assistant_message(mission)?;
+
     if !looks_like_push_claim(&content) {
-        return;
+        return None;
     }
 
     let branches = extract_branch_candidates(&content);
     if branches.is_empty() {
-        return;
+        return None;
     }
 
     let working_directory = mission
@@ -3130,10 +3342,92 @@ fn enrich_with_push_claims(mission: &mut Value) {
             "verified": verified,
         }));
     }
+    Some(claims)
+}
 
-    if let Some(obj) = mission.as_object_mut() {
-        obj.insert("push_claims".to_string(), Value::Array(claims));
+/// Server-computed verdicts that mean a worker needs the boss's attention.
+fn verdict_is_anomalous(verdict: &str) -> bool {
+    matches!(
+        verdict,
+        "stalled" | "stalled_parked" | "stuck_queued" | "stalled_background"
+    )
+}
+
+fn worker_activity_field<'a>(worker: &'a Value, key: &str) -> Option<&'a Value> {
+    worker.get("activity").and_then(|a| a.get(key))
+}
+
+/// Truncate to a character budget with an ellipsis, safe on any UTF-8.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
     }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+/// One compact row per worker for listings: enough to triage without paging
+/// through full mission histories. `health_verdict`/`idle_for` come from the
+/// server (`activity` block); `last_assistant_snippet` is the worker's last
+/// words, truncated.
+fn compact_worker_row(worker: &Value) -> Value {
+    json!({
+        "id": worker.get("id"),
+        "title": worker.get("title"),
+        "status": worker.get("status"),
+        "health_verdict": worker_activity_field(worker, "health_verdict"),
+        "idle_for": worker_activity_field(worker, "idle_for"),
+        "last_activity_at": worker_activity_field(worker, "last_activity_at"),
+        "backend": worker.get("backend"),
+        "awaiting_kind": worker.get("awaiting_kind"),
+        "terminal_reason": worker.get("terminal_reason"),
+        "working_directory": worker.get("working_directory"),
+        "last_assistant_snippet": last_assistant_message(worker)
+            .map(|s| truncate_chars(&s, 240)),
+        "push_claims": worker.get("push_claims"),
+    })
+}
+
+/// Actionable next step for a worker row, derived from its health verdict.
+fn stalled_worker_hint(row: &Value) -> Option<String> {
+    let verdict = row.get("health_verdict").and_then(Value::as_str)?;
+    let idle = row
+        .get("idle_for")
+        .and_then(Value::as_str)
+        .unwrap_or("a long time");
+    let id = row.get("id").and_then(Value::as_str).unwrap_or("<id>");
+    let hint = match verdict {
+        "stalled" => format!(
+            "Worker has been active but silent for {idle}. Run get_worker_diagnostics(mission_id=\"{id}\") to see its last events before deciding anything."
+        ),
+        "stalled_parked" => format!(
+            "Worker parked {idle} ago without a follow-up. It may have ended its turn without delivering: run get_worker_diagnostics(mission_id=\"{id}\"), then send_message_to_worker/retask_worker with concrete next steps, or cancel_worker if its work is obsolete."
+        ),
+        "stuck_queued" => format!(
+            "Worker has been pending for {idle} without dispatching. Check queue/scheduling constraints, or resume it with send_message_to_worker."
+        ),
+        "stalled_background" => format!(
+            "Worker has waited on background jobs for {idle}. Run get_worker_diagnostics(mission_id=\"{id}\") to check whether the job is alive."
+        ),
+        _ => return None,
+    };
+    Some(hint)
+}
+
+/// Compact projection of a persisted mission event for diagnostics output.
+fn compact_event(event: &Value) -> Value {
+    let content = event
+        .get("content")
+        .and_then(Value::as_str)
+        .map(|s| truncate_chars(s, 400));
+    json!({
+        "sequence": event.get("sequence"),
+        "type": event.get("event_type"),
+        "timestamp": event.get("timestamp"),
+        "tool_name": event.get("tool_name"),
+        "content": content,
+    })
 }
 
 /// Heuristic: did the worker claim to have pushed?
@@ -3706,8 +4000,10 @@ mod codex_auth_status_tests {
 #[cfg(test)]
 mod push_claim_tests {
     use super::{
-        ask_settled, enrich_with_push_claims, extract_branch_candidates, history_fingerprint,
-        is_plausible_branch, last_assistant_message, looks_like_push_claim, AskWorkerBaseline,
+        ask_settled, compact_event, compact_worker_row, enrich_with_push_claims,
+        extract_branch_candidates, history_fingerprint, is_plausible_branch,
+        last_assistant_message, looks_like_push_claim, stalled_worker_hint, truncate_chars,
+        verdict_is_anomalous, AskWorkerBaseline,
     };
     use serde_json::json;
 
@@ -3837,6 +4133,96 @@ mod push_claim_tests {
             last_assistant_message(&json!({ "history": [{ "role": "user", "content": "hi" }] })),
             None
         );
+    }
+
+    #[test]
+    fn compact_worker_row_surfaces_health_and_last_words() {
+        let worker = json!({
+            "id": "abc-123",
+            "title": "A.3 allocation extraction",
+            "status": "acknowledged",
+            "backend": "codex",
+            "activity": {
+                "health_verdict": "stalled_parked",
+                "idle_for": "16h",
+                "last_activity_at": "2026-08-05T00:00:00Z"
+            },
+            "history": [
+                { "role": "assistant", "content": "Acknowledged, starting on the extraction." }
+            ]
+        });
+        let row = compact_worker_row(&worker);
+        assert_eq!(row["health_verdict"], "stalled_parked");
+        assert_eq!(row["idle_for"], "16h");
+        assert_eq!(
+            row["last_assistant_snippet"],
+            "Acknowledged, starting on the extraction."
+        );
+        // No full history in the row.
+        assert!(row.get("history").is_none());
+    }
+
+    #[test]
+    fn anomalous_verdicts_are_exactly_the_stuck_ones() {
+        for v in [
+            "stalled",
+            "stalled_parked",
+            "stuck_queued",
+            "stalled_background",
+        ] {
+            assert!(verdict_is_anomalous(v), "{v} must be anomalous");
+        }
+        for v in [
+            "working",
+            "quiet",
+            "parked",
+            "queued",
+            "waiting_background",
+            "paused",
+            "",
+        ] {
+            assert!(!verdict_is_anomalous(v), "{v} must not be anomalous");
+        }
+    }
+
+    #[test]
+    fn stalled_worker_hint_names_the_worker_and_the_next_tool() {
+        let row = json!({
+            "id": "abc-123",
+            "health_verdict": "stalled_parked",
+            "idle_for": "16h"
+        });
+        let hint = stalled_worker_hint(&row).expect("hint for stalled_parked");
+        assert!(hint.contains("16h"));
+        assert!(hint.contains("get_worker_diagnostics(mission_id=\"abc-123\")"));
+        assert!(stalled_worker_hint(&json!({ "health_verdict": "working" })).is_none());
+        assert!(stalled_worker_hint(&json!({})).is_none());
+    }
+
+    #[test]
+    fn truncate_chars_is_utf8_safe() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("abcdef", 3), "abc…");
+        // Multi-byte chars must not be split.
+        assert_eq!(truncate_chars("héllo wörld", 5), "héllo…");
+    }
+
+    #[test]
+    fn compact_event_truncates_content() {
+        let event = json!({
+            "sequence": 42,
+            "event_type": "tool_result",
+            "timestamp": "2026-08-05T12:00:00Z",
+            "tool_name": "bash",
+            "content": "x".repeat(1000),
+            "metadata": { "huge": "blob" }
+        });
+        let compact = compact_event(&event);
+        assert_eq!(compact["sequence"], 42);
+        assert_eq!(compact["type"], "tool_result");
+        let content = compact["content"].as_str().unwrap();
+        assert!(content.chars().count() <= 401);
+        assert!(compact.get("metadata").is_none());
     }
 
     #[test]
