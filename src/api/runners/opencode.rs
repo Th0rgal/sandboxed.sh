@@ -996,6 +996,8 @@ pub async fn run_opencode_turn(
     // Used after the event loop to flag the result as incomplete so the caller
     // can surface the truncation to the user.
     let mut killed_by_idle_timeout = false;
+    // Guard contract: what the stall watchdog OBSERVED, for terminal_evidence.
+    let mut stall_evidence: Option<String> = None;
     // Track session idle state — used as a fallback completion signal when
     // response.completed is not emitted (common with GLM models).
     let mut session_idle_seen = false;
@@ -1225,6 +1227,11 @@ pub async fn run_opencode_turn(
                                 mission_id = %mission_id,
                                 "OpenCode output idle timeout reached; terminating CLI process"
                             );
+                            stall_evidence = Some(format!(
+                                "no streamed text for {}s (SANDBOXED_SH_OPENCODE_IDLE_TIMEOUT_SECS), \
+                                 no active tools, no proxy streaming; CLI killed",
+                                opencode_text_idle_timeout_secs
+                            ));
                             killed_by_idle_timeout = true;
                             let _ = child.kill().await;
                             break;
@@ -1288,6 +1295,10 @@ pub async fn run_opencode_turn(
                             proxy_streaming = proxy_streaming,
                             "Global inactivity timeout; terminating stuck CLI process"
                         );
+                        stall_evidence = Some(format!(
+                            "no SSE events, stdout or stderr for {}s; CLI killed",
+                            inactivity_elapsed.as_secs()
+                        ));
                         killed_by_idle_timeout = true;
                         let _ = child.kill().await;
                         break;
@@ -2043,7 +2054,13 @@ pub async fn run_opencode_turn(
         } else {
             TerminalReason::LlmError
         };
-        AgentResult::failure(final_result, 0).with_terminal_reason(reason)
+        let mut failure = AgentResult::failure(final_result, 0).with_terminal_reason(reason);
+        if reason == TerminalReason::Stalled {
+            if let Some(evidence) = stall_evidence.as_deref() {
+                failure = failure.with_terminal_evidence(evidence);
+            }
+        }
+        failure
     } else {
         AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::TurnComplete)
     };

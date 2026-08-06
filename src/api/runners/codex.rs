@@ -1540,7 +1540,18 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
         } else {
             TerminalReason::LlmError
         };
-        AgentResult::failure(final_message, cost_cents).with_terminal_reason(reason)
+        let mut failure =
+            AgentResult::failure(final_message, cost_cents).with_terminal_reason(reason);
+        if reason == TerminalReason::Stalled {
+            // Guard contract: say what was observed, not just the verdict.
+            failure = failure.with_terminal_evidence(if stopped_before_required_tools {
+                "Codex stopped before completing required workspace/tool steps \
+                 (no required tool call was made after the last response)"
+            } else {
+                "Codex stopped on a progress-update message without resuming work"
+            });
+        }
+        failure
     };
 
     let outcome = turn_outcome_for_result(
