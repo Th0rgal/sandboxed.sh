@@ -1959,14 +1959,22 @@ impl AssistantMcp {
             let tid = parse_uuid(tid)?;
             body["thread_id"] = json!(tid.to_string());
         }
-        // Ask turns make multiple sequential LLM/tool calls; give the
-        // synchronous /ask request most of the Hermes-side 600s MCP budget
-        // (the shared client default of 120s would abort long asks).
+        // Ask turns make multiple sequential LLM/tool calls, so the shared
+        // client default of 120s would abort long asks. But TWO budgets sit
+        // above this call, and both are 600s: the Hermes-side MCP request
+        // timeout, and the cron scheduler's idle watchdog — which counts from
+        // the moment the tool STARTS, so id resolution, connect time and this
+        // whole request all spend it. At 570s the margin was 30s; measured
+        // 2026-08-06 05:18, a busy mission ate it and the watchdog killed the
+        // whole tick ("idle for 600s — last activity: executing tool:
+        // ask_mission"), turning one slow answer into a failed controller
+        // run. 450s keeps ample room for real asks and returns a clean
+        // "mission busy" error while both outer budgets still have 150s left.
         let response = self
             .api_post_with_timeout(
                 &format!("/api/control/missions/{id}/ask"),
                 body,
-                Some(std::time::Duration::from_secs(570)),
+                Some(std::time::Duration::from_secs(450)),
             )
             .await?;
         if !response.status().is_success() {
