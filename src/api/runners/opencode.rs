@@ -686,6 +686,17 @@ pub async fn run_opencode_turn(
 
     if let Some(auth) = opencode_auth.as_ref() {
         let providers = apply_opencode_auth_env(auth, &mut env);
+        // Server-env fallback for Muse: the key may live only in
+        // META_MODEL_API_KEY on the service (no provider row), and the
+        // opencode provider block references {env:META_MODEL_API_KEY}.
+        // Without this, a store-less deployment silently loses the key.
+        if !env.contains_key("META_MODEL_API_KEY") {
+            if let Ok(value) = std::env::var("META_MODEL_API_KEY") {
+                if !value.trim().is_empty() {
+                    env.insert("META_MODEL_API_KEY".to_string(), value);
+                }
+            }
+        }
         if !providers.is_empty() {
             tracing::info!(
                 mission_id = %mission_id,

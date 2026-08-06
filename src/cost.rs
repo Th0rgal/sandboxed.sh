@@ -353,6 +353,21 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         aliases: &["minimax-m3"],
         pricing: pricing(600, 2_400, Some(375), Some(60)),
     },
+    // Meta Muse (api.meta.ai). TODO: replace with published per-token prices —
+    // none were available at integration time (2026-08-06); zero entries here
+    // would be SILENT zero-cost accounting, so this placeholder uses
+    // MiniMax-M3-class rates as a conservative stand-in and must be corrected
+    // when Meta publishes pricing.
+    PricingEntry {
+        canonical: "muse-spark-1.2",
+        aliases: &["muse-spark-1.2", "muse-spark"],
+        pricing: pricing(600, 2_400, None, None),
+    },
+    PricingEntry {
+        canonical: "muse-spark-1.1",
+        aliases: &["muse-spark-1.1"],
+        pricing: pricing(600, 2_400, None, None),
+    },
     PricingEntry {
         canonical: "minimax-m2.7-highspeed",
         aliases: &["minimax-m2.7-highspeed", "minimax-m2-7-highspeed"],

@@ -29,6 +29,7 @@ const providerIcons: Record<string, string> = {
   zai: '⚡',
   xai: '𝕏',
   minimax: 'M',
+  muse: '🎭',
   kimi: '🌙',
   custom: '🔧',
 };

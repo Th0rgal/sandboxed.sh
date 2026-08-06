@@ -64,6 +64,7 @@ pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
     "cerebras",
     "zai",
     "minimax",
+    "muse",
     "kimi",
 ];
 
@@ -1190,6 +1191,27 @@ fn default_providers_config() -> ProvidersConfig {
                 description: "Kimi Code via Moonshot OAuth (device login)".to_string(),
                 models: kimi_fallback_models(),
             },
+            Provider {
+                id: "muse".to_string(),
+                name: "Meta Muse".to_string(),
+                billing: "api_key".to_string(),
+                description: "Meta's Muse family via api.meta.ai (OpenAI-compatible)".to_string(),
+                // Verified live against /models on 2026-08-06; the catalog
+                // refresh overwrites this with the fetched list when the key
+                // is present.
+                models: vec![
+                    ProviderModel {
+                        id: "muse-spark-1.2".to_string(),
+                        name: "Muse Spark 1.2".to_string(),
+                        description: Some("Fast reasoning model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "muse-spark-1.1".to_string(),
+                        name: "Muse Spark 1.1".to_string(),
+                        description: None,
+                    },
+                ],
+            },
         ],
     }
 }
@@ -2063,6 +2085,16 @@ async fn fetch_model_catalog(
             provider_id: "minimax",
             base_url: "https://api.minimax.io/v1",
             prefix_filters: vec!["MiniMax-"],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
+            max_models: None,
+        },
+        FetchTarget {
+            provider_type: ProviderType::Muse,
+            provider_id: "muse",
+            base_url: "https://api.meta.ai/v1",
+            prefix_filters: vec!["muse-"],
             models_query: None,
             sort_results_by_id: true,
             allow_unauthenticated: false,
