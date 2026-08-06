@@ -2401,6 +2401,22 @@ impl SqliteMissionStore {
             }
         }
 
+        // Guard-evidence side table (2026-08-06). A separate table, NOT a
+        // missions column: every mission SELECT here maps columns by
+        // position, and widening those projections risks the exact
+        // fall-back-to-memory failure the migration comments above warn
+        // about. Non-fatal like the indexes.
+        if let Err(e) = conn.execute(
+            "CREATE TABLE IF NOT EXISTS mission_terminal_evidence (
+                mission_id TEXT PRIMARY KEY,
+                evidence TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            )",
+            [],
+        ) {
+            tracing::warn!("creating mission_terminal_evidence skipped: {}", e);
+        }
+
         Ok(())
     }
 
@@ -2694,6 +2710,7 @@ fn row_to_mission(row: &rusqlite::Row<'_>) -> rusqlite::Result<Mission> {
             .unwrap_or_default(),
         session_id,
         terminal_reason,
+        terminal_evidence: None,
         parent_mission_id: row
             .get::<_, Option<String>>(22)?
             .and_then(|s| Uuid::parse_str(&s).ok()),
@@ -3090,6 +3107,25 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn set_terminal_evidence(&self, id: Uuid, evidence: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let evidence = evidence.chars().take(2000).collect::<String>();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO mission_terminal_evidence (mission_id, evidence, recorded_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(mission_id) DO UPDATE SET evidence = ?2, recorded_at = ?3",
+                params![id_str, evidence, now_string()],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String> {
         let conn = self.conn.clone();
         let id_str = id.to_string();
@@ -3154,6 +3190,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         session_id,
                         terminal_reason,
+                        terminal_evidence: None,
                         parent_mission_id: row.get::<_, Option<String>>(22)?.and_then(|s| Uuid::parse_str(&s).ok()),
                         working_directory: row.get(23)?,
                         mission_mode: row.get::<_, Option<String>>(24)?
@@ -3216,6 +3253,16 @@ impl MissionStore for SqliteMissionStore {
                     .map_err(|e| e.to_string())?;
 
                 m.history = history;
+                // Guard evidence lives in its own side table (see
+                // run_migrations); the single-mission read is the one path
+                // that carries it — list projections stay lean.
+                m.terminal_evidence = conn
+                    .query_row(
+                        "SELECT evidence FROM mission_terminal_evidence WHERE mission_id = ?1",
+                        params![&id_str],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok();
                 Ok(Some(m))
             } else {
                 Ok(None)
@@ -3599,6 +3646,7 @@ impl MissionStore for SqliteMissionStore {
             desktop_sessions: Vec::new(),
             session_id: Some(session_id.clone()),
             terminal_reason: None,
+            terminal_evidence: None,
             parent_mission_id,
             working_directory: working_directory.map(|s| s.to_string()),
             mission_mode: MissionMode::default(),
@@ -3696,6 +3744,7 @@ impl MissionStore for SqliteMissionStore {
                         desktop_sessions: Vec::new(),
                         session_id: row.get(18)?,
                         terminal_reason: row.get(19)?,
+                        terminal_evidence: None,
                         parent_mission_id: row.get::<_, Option<String>>(20)?.and_then(|s| Uuid::parse_str(&s).ok()),
                         working_directory: row.get(21)?,
                         mission_mode: row.get::<_, Option<String>>(22)?
@@ -4635,6 +4684,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         session_id: None, // Not needed for stale mission checks
                         terminal_reason: None,
+                        terminal_evidence: None,
                         parent_mission_id: None,
                         working_directory: None,
                         mission_mode: MissionMode::default(),
@@ -4714,6 +4764,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         session_id: None,
                         terminal_reason: None,
+                        terminal_evidence: None,
                         parent_mission_id: None,
                         working_directory: None,
                         mission_mode: row
@@ -4853,6 +4904,7 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         session_id: None,
                         terminal_reason: None,
+                        terminal_evidence: None,
                         parent_mission_id: None,
                         working_directory: None,
                         mission_mode: row
@@ -7370,6 +7422,7 @@ impl MissionStore for SqliteMissionStore {
                         desktop_sessions: vec![],
                         session_id: None,
                         terminal_reason: None,
+                        terminal_evidence: None,
                         parent_mission_id: None,
                         working_directory: None,
                         mission_mode: serde_json::from_value(serde_json::Value::String(mode_str))

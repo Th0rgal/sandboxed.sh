@@ -8526,12 +8526,26 @@ pub(crate) fn text_buffer_stream_looks_degenerate(
     min_substring_len: usize,
     min_repeats: usize,
 ) -> bool {
+    degenerate_repeated_substring(accumulated, window_chars, min_substring_len, min_repeats)
+        .is_some()
+}
+
+/// The substring that makes the stream look degenerate, if any — the guard's
+/// EVIDENCE. Returning it (rather than a bare bool) is what lets the runner
+/// record what actually tripped the kill, so a downstream agent reads a fact
+/// instead of inventing a transport bug (mission 7fb8970f, 2026-08-06).
+pub(crate) fn degenerate_repeated_substring(
+    accumulated: &str,
+    window_chars: usize,
+    min_substring_len: usize,
+    min_repeats: usize,
+) -> Option<String> {
     if min_substring_len == 0 || min_repeats < 2 || window_chars == 0 {
-        return false;
+        return None;
     }
     let chars: Vec<char> = accumulated.chars().collect();
     if chars.len() < min_substring_len.saturating_mul(min_repeats) {
-        return false;
+        return None;
     }
     let window_end = chars.len();
     let window_start = window_end.saturating_sub(window_chars);
@@ -8595,7 +8609,7 @@ pub(crate) fn text_buffer_stream_looks_degenerate(
                         "degenerate-stream detector matched; this substring is \
                          what tripped it"
                     );
-                    return true;
+                    return Some(needle);
                 }
                 // Non-overlapping, as the comment above has always claimed:
                 // advancing by one char let a periodic needle count its own
@@ -8605,7 +8619,7 @@ pub(crate) fn text_buffer_stream_looks_degenerate(
             }
         }
     }
-    false
+    None
 }
 
 /// Count distinct "substantive" words in `s`: tokens that are at least 4
@@ -12283,6 +12297,19 @@ mod tests {
     /// mid-way through its final report because a 17-guarantee table repeats
     /// long row scaffolding. Legitimate structure repeats are SEPARATED by
     /// distinct content; a degenerate loop is back to back.
+    /// Guard contract: the detector must surrender its evidence, not a bool.
+    #[test]
+    fn degenerate_detector_names_the_repeated_substring() {
+        let phrase = "Yielding pending your choice between the three options. ";
+        let s = phrase.repeat(50);
+        let needle = super::degenerate_repeated_substring(&s, 4096, 40, 3)
+            .expect("a 50x adjacent repeat must be caught");
+        assert!(
+            phrase.contains(&needle) || needle.contains(phrase.trim_end()),
+            "the evidence must be the actual repeated text, got {needle:?}"
+        );
+    }
+
     #[test]
     fn degenerate_detector_spares_a_structured_report() {
         let mut s = String::from("## Hypothesis report\n### Sources verified\n");

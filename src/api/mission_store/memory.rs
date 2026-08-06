@@ -316,6 +316,7 @@ impl MissionStore for InMemoryMissionStore {
             desktop_sessions: Vec::new(),
             session_id: Some(Uuid::new_v4().to_string()),
             terminal_reason: None,
+            terminal_evidence: None,
             parent_mission_id,
             working_directory: working_directory.map(|s| s.to_string()),
             mission_mode: super::MissionMode::default(),
@@ -351,6 +352,15 @@ impl MissionStore for InMemoryMissionStore {
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String> {
         self.update_mission_status_with_reason(id, status, None)
             .await
+    }
+
+    async fn set_terminal_evidence(&self, id: Uuid, evidence: &str) -> Result<(), String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission not found: {id}"))?;
+        mission.terminal_evidence = Some(evidence.chars().take(2000).collect());
+        Ok(())
     }
 
     async fn update_mission_status_with_reason(

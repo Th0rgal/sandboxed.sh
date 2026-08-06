@@ -189,6 +189,11 @@ pub struct AgentResult {
 
     /// Reason why execution terminated (if not successful completion)
     pub terminal_reason: Option<TerminalReason>,
+
+    /// What the terminating guard OBSERVED (the repeated substring, the
+    /// missing selector, the measured timeout). Guard contract, 2026-08-06:
+    /// a reason without evidence is how downstream agents invent causes.
+    pub terminal_evidence: Option<String>,
 }
 
 impl AgentResult {
@@ -203,6 +208,7 @@ impl AgentResult {
             model_used: None,
             data: None,
             terminal_reason: None,
+            terminal_evidence: None,
         }
     }
 
@@ -217,6 +223,7 @@ impl AgentResult {
             model_used: None,
             data: None,
             terminal_reason: None,
+            terminal_evidence: None,
         }
     }
 
@@ -294,6 +301,12 @@ impl AgentResult {
     /// Add terminal reason to the result.
     pub fn with_terminal_reason(mut self, reason: TerminalReason) -> Self {
         self.terminal_reason = Some(reason);
+        self
+    }
+
+    /// Attach what the terminating guard observed.
+    pub fn with_terminal_evidence(mut self, evidence: impl Into<String>) -> Self {
+        self.terminal_evidence = Some(evidence.into());
         self
     }
 }

@@ -497,7 +497,17 @@ async def verify_authentication(page) -> None:
         if await nav_evidence.nth(index).is_visible():
             emit("diagnostic", message="stage=account_confirmed_via_nav")
             return
-    raise PermissionError("authenticated account control not found")
+    # Guard contract: name what was probed and where. Without this, the
+    # 2026-08-06 false positive read as "login required" and the dispatching
+    # agent asked the operator to re-provision 12 accounts that were fine.
+    raise PermissionError(
+        "authenticated account control not found: no visible match for "
+        "accounts-profile-button / account / profile aria-labels, nor for the "
+        f"Library/Scheduled nav, on {page.url!r} (title {await page.title()!r}). "
+        "If ChatGPT's UI was redesigned again, the selector lists in "
+        "verify_authentication need the new evidence — the session cookie may "
+        "still be perfectly valid."
+    )
 
 
 async def establish_resumed_chat(page, conversation_path: str, message: str) -> int:

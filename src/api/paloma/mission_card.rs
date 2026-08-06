@@ -289,6 +289,7 @@ mod tests {
             desktop_sessions: vec![],
             session_id: None,
             terminal_reason: None,
+            terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::Task,
