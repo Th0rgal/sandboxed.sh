@@ -481,6 +481,22 @@ async def verify_authentication(page) -> None:
         if await account_controls.nth(index).is_visible():
             emit("diagnostic", message="stage=account_confirmed")
             return
+
+    # A UI rollout renamed the profile button and this check began failing
+    # closed on PROVISIONED profiles: measured 2026-08-06, all 12 pool
+    # profiles held session cookies valid for ~90 days while every mission
+    # died in seconds with "login is required". The sidebar's Library and
+    # Scheduled entries are account-only surfaces (anonymous ChatGPT has
+    # neither) and survive the rename — accept them as evidence before
+    # concluding the account is gone.
+    nav_evidence = page.locator(
+        'a[href*="/library"], a[href*="/scheduled"], '
+        '[data-testid="create-scheduled-task-button"]'
+    )
+    for index in range(await nav_evidence.count()):
+        if await nav_evidence.nth(index).is_visible():
+            emit("diagnostic", message="stage=account_confirmed_via_nav")
+            return
     raise PermissionError("authenticated account control not found")
 
 
