@@ -8569,12 +8569,39 @@ pub(crate) fn text_buffer_stream_looks_degenerate(
             }
             let mut count = 0usize;
             let mut idx = 0usize;
+            let mut last_end: Option<usize> = None;
             while let Some(found) = find_subslice(window, &needle, idx) {
-                count += 1;
+                // A degenerate loop is ADJACENT: the model emits the same
+                // string back to back. A structured report legitimately
+                // repeats 40+ char scaffolding — measured 2026-08-06, mission
+                // 7fb8970f was killed mid-way through a 17-guarantee review
+                // table whose rows shared long prefixes — but those repeats
+                // are separated by distinct content. Only count a repeat when
+                // it starts within one needle-length of the previous match's
+                // end; anything farther apart is prose that happens to rhyme.
+                let adjacent = match last_end {
+                    None => true,
+                    Some(end) => found <= end.saturating_add(len),
+                };
+                if adjacent {
+                    count += 1;
+                } else {
+                    count = 1;
+                }
                 if count >= min_repeats {
+                    tracing::warn!(
+                        repeated_substring = %needle.chars().take(120).collect::<String>(),
+                        repeats = count,
+                        "degenerate-stream detector matched; this substring is \
+                         what tripped it"
+                    );
                     return true;
                 }
-                idx = found + 1;
+                // Non-overlapping, as the comment above has always claimed:
+                // advancing by one char let a periodic needle count its own
+                // overlaps and inflate the tally.
+                idx = found + len;
+                last_end = Some(found + len);
             }
         }
     }
@@ -12251,6 +12278,44 @@ mod tests {
     // before the model hit max_tokens. The detector should fire on a loop
     // large enough to matter, and NOT fire on a normal response that
     // happens to contain repeated short strings (e.g. "yes, yes, yes").
+
+    /// The 7fb8970f incident (2026-08-06): a Fable 5 review was killed
+    /// mid-way through its final report because a 17-guarantee table repeats
+    /// long row scaffolding. Legitimate structure repeats are SEPARATED by
+    /// distinct content; a degenerate loop is back to back.
+    #[test]
+    fn degenerate_detector_spares_a_structured_report() {
+        let mut s = String::from("## Hypothesis report\n### Sources verified\n");
+        for i in 0..17 {
+            s.push_str(&format!(
+                "| P-GUARANTEE-{i} | verified against the PR head checkout \
+                 | Source/Correspondence{i}.lean lines {}..{} | detailed note \
+                 about branch conditions and revert paths for case {i} |\n",
+                i * 40,
+                i * 40 + 39
+            ));
+        }
+        assert!(
+            !text_buffer_stream_looks_degenerate(&s, 4096, 40, 3),
+            "a review table with distinct data between repeated scaffolding \
+             is a report, not a loop"
+        );
+    }
+
+    /// Non-overlap regression: a periodic phrase must be counted by whole
+    /// occurrences, not by every one-char offset of itself.
+    #[test]
+    fn degenerate_detector_counts_whole_occurrences_only() {
+        // Two adjacent copies of a 56-char phrase: below min_repeats=3, so it
+        // must NOT fire — the old `found + 1` overlap walk could inflate a
+        // periodic needle past the threshold.
+        let phrase = "Yielding pending your choice between the three options. ";
+        let s = phrase.repeat(2);
+        assert!(
+            !text_buffer_stream_looks_degenerate(&s, 4096, 40, 3),
+            "two copies are two, not three"
+        );
+    }
 
     #[test]
     fn degenerate_detector_flags_long_repeated_phrase() {

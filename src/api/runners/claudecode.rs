@@ -2618,10 +2618,18 @@ pub fn run_claudecode_turn<'a>(
                     "Claude Code stream looked degenerate; killed CLI and treating as degenerate-stream failure"
                 );
                 let partial_chars = final_result.chars().count();
-                final_result = format!(
-                    "Claude Code entered a degenerate output loop (the same short string was repeated many times in the streamed response) and the turn was cut short to avoid a runaway 50-minute bill — see mission ab260b2e for the canonical example.\n\nThe model never produced a terminal result event. Partial output ({} chars) was preserved; resend your last message to try again.",
+                // Keep the partial output. The previous message claimed it
+                // was "preserved" while overwriting it — mission 7fb8970f
+                // lost five minutes of verified findings to that word.
+                let notice = format!(
+                    "Claude Code entered a degenerate output loop (the same short string was repeated many times in the streamed response) and the turn was cut short to avoid a runaway 50-minute bill — see mission ab260b2e for the canonical example.\n\nThe model never produced a terminal result event. Partial output ({} chars) is preserved below; resend your last message to try again.",
                     partial_chars
                 );
+                final_result = if final_result.trim().is_empty() {
+                    notice
+                } else {
+                    format!("{notice}\n\n--- partial output ---\n{final_result}")
+                };
             } else if !saw_non_init_event {
                 transport_failure_stage = Some(ClaudeTransportFailureStage::Startup);
                 tracing::warn!(
