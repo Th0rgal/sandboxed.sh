@@ -12675,13 +12675,51 @@ async fn paloma_webhook_forwarder_loop(
     http: reqwest::Client,
 ) {
     tracing::info!(webhook_url = %url, "Paloma mission-status webhook forwarder started");
-    // Track the last status seen per mission (for ALL transitions, not just
-    // forwardable ones) so we forward a status only when it actually CHANGED.
-    // This drops the re-emit `mark_mission_opened` broadcasts (it re-sends the
-    // current, unchanged status on first view) while still forwarding a genuine
-    // re-entry into a state. Single-task loop → a plain map needs no locking.
-    let mut last_status: std::collections::HashMap<Uuid, MissionStatus> =
-        std::collections::HashMap::new();
+    // The dedupe record is DURABLE and success-gated: a marker means "this
+    // status has been fully processed" — trivially on observation for
+    // non-forwardable statuses, only after a successful POST for forwardable
+    // ones. That closes the two loss windows the in-memory map had: a restart
+    // blanking history, and delivery failure counting as delivery. Divergence
+    // store-vs-marker is exactly the set of undelivered transitions, and the
+    // sweep retries them until they land.
+    let markers = super::webhook_markers::MarkerStore::load(&working_dir);
+    let first_boot = !markers.loaded_from_disk;
+    let markers = Arc::new(tokio::sync::Mutex::new(markers));
+    if first_boot {
+        // Adopt current history without forwarding any of it: pre-feature
+        // missions have long-settled statuses, and replaying them as fresh
+        // events would flood every bound conversation exactly once.
+        let mut adopted = 0usize;
+        let mut offset = 0usize;
+        let mut guard = markers.lock().await;
+        while offset < 5_000 {
+            let page = match mission_store.list_missions(500, offset).await {
+                Ok(page) => page,
+                Err(_) => break,
+            };
+            if page.is_empty() {
+                break;
+            }
+            let len = page.len();
+            for mission in page {
+                guard.set(mission.id, mission.status);
+                adopted += 1;
+            }
+            if len < 500 {
+                break;
+            }
+            offset += 500;
+        }
+        drop(guard);
+        tracing::info!(
+            adopted,
+            "webhook markers: first boot, adopted current mission statuses"
+        );
+    }
+    // Transitions currently being POSTed, so the sweep cannot double-send what
+    // the broadcast arm already has in flight (and vice versa).
+    let in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<(Uuid, MissionStatus)>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
     // Bound concurrent in-flight callbacks (each does a get_mission + HTTP POST).
     let sem = Arc::new(tokio::sync::Semaphore::new(8));
     // Process-monotonic sequence so the consumer can order events and dedupe
@@ -12699,6 +12737,8 @@ async fn paloma_webhook_forwarder_loop(
     let working_dir_c = working_dir.clone();
     let sem_c = Arc::clone(&sem);
     let sequence_c = Arc::clone(&sequence);
+    let markers_c = Arc::clone(&markers);
+    let in_flight_c = Arc::clone(&in_flight);
     let forward = move |mission_id: Uuid,
                         status: MissionStatus,
                         old_status: Option<MissionStatus>| {
@@ -12710,6 +12750,8 @@ async fn paloma_webhook_forwarder_loop(
         let working_dir = working_dir_c.clone();
         let sem = Arc::clone(&sem_c);
         let sequence = Arc::clone(&sequence_c);
+        let markers = Arc::clone(&markers_c);
+        let in_flight = Arc::clone(&in_flight_c);
         // Stable per-logical-event identity for idempotent consumers.
         let event_id = Uuid::new_v4();
         let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -12905,7 +12947,13 @@ async fn paloma_webhook_forwarder_loop(
                     request = request.header("X-Hub-Signature-256", signature);
                 }
                 match request.send().await {
-                    Ok(resp) if resp.status().is_success() => break,
+                    Ok(resp) if resp.status().is_success() => {
+                        // Only a delivered event earns its durable marker. An
+                        // exhausted retry leaves it unset, so the 60s sweep
+                        // re-sends until the consumer is reachable again.
+                        markers.lock().await.set(mission_id, status);
+                        break;
+                    }
                     Ok(resp) => {
                         tracing::warn!(
                             mission_id = %mission_id,
@@ -12930,6 +12978,7 @@ async fn paloma_webhook_forwarder_loop(
                         .await;
                 }
             }
+            in_flight.lock().await.remove(&(mission_id, status));
         });
     };
     // The broadcast channel is lossy under bursts, and not every status
@@ -12949,26 +12998,29 @@ async fn paloma_webhook_forwarder_loop(
             _ = reconcile.tick() => None,
         };
         let Some(result) = recv else {
-            let missions = match mission_store.list_missions(100, 0).await {
+            let missions = match mission_store.list_missions(400, 0).await {
                 Ok(missions) => missions,
                 Err(_) => continue,
             };
-            let now = chrono::Utc::now();
             for mission in missions {
                 let status = mission.status;
+                let prior = markers.lock().await.get(mission.id);
+                if prior == Some(status) {
+                    continue;
+                }
                 if !webhook_forwardable_status(status) {
+                    // Nothing to deliver; recording it keeps re-entry
+                    // detection exact (A -> B -> A must forward A again).
+                    markers.lock().await.set(mission.id, status);
                     continue;
                 }
-                if last_status.get(&mission.id) == Some(&status) {
+                if !in_flight.lock().await.insert((mission.id, status)) {
                     continue;
                 }
-                let recent = chrono::DateTime::parse_from_rfc3339(&mission.updated_at)
-                    .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() < 900)
-                    .unwrap_or(false);
-                let prior = last_status.insert(mission.id, status);
-                if !recent {
-                    continue;
-                }
+                // No recency window: the marker file is the durable authority,
+                // so a divergence IS an undelivered transition, however old --
+                // that is the whole lossless-across-outages property. First
+                // boot cannot replay history because adoption above marked it.
                 tracing::info!(
                     mission_id = %mission.id,
                     ?status,
@@ -12983,13 +13035,17 @@ async fn paloma_webhook_forwarder_loop(
             Ok(AgentEvent::MissionStatusChanged {
                 mission_id, status, ..
             }) => {
-                // `insert` returns the prior value; forward only on a real change.
-                let old_status = last_status.insert(mission_id, status);
-                let changed = old_status != Some(status);
-                if !changed || !webhook_forwardable_status(status) {
+                let old_status = markers.lock().await.get(mission_id);
+                if old_status == Some(status) {
                     continue;
                 }
-
+                if !webhook_forwardable_status(status) {
+                    markers.lock().await.set(mission_id, status);
+                    continue;
+                }
+                if !in_flight.lock().await.insert((mission_id, status)) {
+                    continue;
+                }
                 forward(mission_id, status, old_status);
             }
             Ok(_) => {}
