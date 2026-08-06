@@ -7433,6 +7433,27 @@ async fn rollback_message_writer_tag(
     }
 }
 
+/// Whether `session_id` names a real Hermes session, when that is checkable.
+///
+/// `None` means "could not check" — no `HERMES_STATE_DB` configured, or the
+/// database was unreadable — and the caller must treat the id as plausible.
+/// The distinction between "not found" and "could not ask" is load-bearing:
+/// refusing stamps whenever the check is unavailable would strip attribution
+/// on every deployment that runs without a Hermes state database.
+fn hermes_session_exists(session_id: &str) -> Option<bool> {
+    let path = super::projects_overview::hermes_state_db_path()?;
+    let connection =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .ok()
+}
+
 /// Window inside which an identical create is treated as a retry, not intent.
 ///
 /// Measured 2026-08-05 on prod: seven groups of missions with the same title
@@ -8102,11 +8123,36 @@ pub async fn create_mission(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let origin_session_id = req
+        let mut origin_session_id = req
             .origin_session_id
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        // A fabricated session id is worse than none: it is BELIEVED. Measured
+        // 2026-08-06, a controller hand-passed "20260805_night_supervision" —
+        // valid in shape, existing nowhere — so the mission was invisible to
+        // ?origin_session_id=, its completion callback could pin nowhere, and
+        // the interruption that followed had no conversation to report into.
+        // When the Hermes state database is available, verify the session
+        // exists; an id that provably does not gets dropped with a warning,
+        // leaving the mission honestly unattributed and adoptable later.
+        // "Could not check" keeps the stamp — stripping attribution on every
+        // deployment without HERMES_STATE_DB would be the larger harm.
+        if let Some(session) = origin_session_id {
+            if hermes_session_exists(session) == Some(false) {
+                tracing::warn!(
+                    mission_id = %mission.id,
+                    origin_session_id = %session,
+                    "origin_session_id names no existing Hermes session; \
+                     leaving the mission unattributed instead of stamping a \
+                     fabricated id"
+                );
+                if let Ok(value) = axum::http::HeaderValue::from_str(session) {
+                    headers.insert("x-dropped-origin-session", value);
+                }
+                origin_session_id = None;
+            }
+        }
         control
             .mission_store
             .set_mission_origin(mission.id, origin, origin_session_id)
@@ -23885,6 +23931,60 @@ pub async fn telegram_webhook_receiver(
 
 #[cfg(test)]
 mod tests {
+    mod fabricated_origin {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        /// The measured incident: "20260805_night_supervision" — valid in
+        /// shape, existing nowhere.
+        #[test]
+        fn an_unconfigured_state_db_means_could_not_check() {
+            // Serialised via a scoped env var: no HERMES_STATE_DB → None,
+            // never Some(false) — stripping attribution on deployments
+            // without the database would be the larger harm.
+            let _guard = ENV_LOCK.lock().unwrap();
+            let previous = std::env::var("HERMES_STATE_DB").ok();
+            std::env::remove_var("HERMES_STATE_DB");
+            assert_eq!(super::super::hermes_session_exists("any"), None);
+            if let Some(value) = previous {
+                std::env::set_var("HERMES_STATE_DB", value);
+            }
+        }
+
+        #[test]
+        fn a_real_db_answers_true_and_false() {
+            let _guard = ENV_LOCK.lock().unwrap();
+            let dir = tempfile::tempdir().expect("tmp");
+            let path = dir.path().join("state.db");
+            let connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)", [])
+                .expect("schema");
+            connection
+                .execute(
+                    "INSERT INTO sessions (id) VALUES ('20260805_093524_88112a')",
+                    [],
+                )
+                .expect("insert");
+            drop(connection);
+            let previous = std::env::var("HERMES_STATE_DB").ok();
+            std::env::set_var("HERMES_STATE_DB", &path);
+
+            assert_eq!(
+                super::super::hermes_session_exists("20260805_093524_88112a"),
+                Some(true)
+            );
+            assert_eq!(
+                super::super::hermes_session_exists("20260805_night_supervision"),
+                Some(false)
+            );
+
+            match previous {
+                Some(value) => std::env::set_var("HERMES_STATE_DB", value),
+                None => std::env::remove_var("HERMES_STATE_DB"),
+            }
+        }
+    }
+
     mod create_idempotency {
         use crate::api::control::MissionStatus;
         use crate::api::mission_store::{InMemoryMissionStore, Mission, MissionStore};
