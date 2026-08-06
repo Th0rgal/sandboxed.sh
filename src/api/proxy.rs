@@ -152,6 +152,7 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::Cerebras => Some("https://api.cerebras.ai/v1"),
         ProviderType::Zai => Some("https://api.z.ai/api/coding/paas/v4"),
         ProviderType::Minimax => Some("https://api.minimax.io/v1"),
+        ProviderType::Muse => Some("https://api.meta.ai/v1"),
         ProviderType::DeepInfra => Some("https://api.deepinfra.com/v1/openai"),
         ProviderType::Groq => Some("https://api.groq.com/openai/v1"),
         ProviderType::OpenRouter => Some("https://openrouter.ai/api/v1"),

@@ -887,6 +887,10 @@ impl ModelChainStore {
                         provider_id: "zai".to_string(),
                         model_id: "glm-5.2".to_string(),
                     },
+                    ChainEntry {
+                        provider_id: "muse".to_string(),
+                        model_id: "muse-spark-1.2".to_string(),
+                    },
                 ],
                 is_default: true,
                 strip_thinking: false,
@@ -925,6 +929,22 @@ impl ModelChainStore {
                     chain.entries.swap(0, 1);
                     migrated = true;
                     tracing::info!("Reordered builtin/smart to lead with MiniMax");
+                }
+                // 2026-08-06: append Meta Muse as a tail fallback to already-
+                // persisted chains. Appending (never inserting) preserves the
+                // operator's configured priority — prod runs a kimi-first
+                // custom order that the stock migrations deliberately skip.
+                if !chain
+                    .entries
+                    .iter()
+                    .any(|entry| entry.provider_id == "muse")
+                {
+                    chain.entries.push(ChainEntry {
+                        provider_id: "muse".to_string(),
+                        model_id: "muse-spark-1.2".to_string(),
+                    });
+                    migrated = true;
+                    tracing::info!("Appended muse/muse-spark-1.2 to builtin/smart");
                 }
                 if migrated {
                     chain.updated_at = now;
@@ -1621,6 +1641,9 @@ mod tests {
                 // glm-5.1 is migrated to glm-5.2 by ensure_default_chain.
                 ("zai".to_string(), "glm-5.2".to_string()),
                 ("cerebras".to_string(), "zai-glm-4.7".to_string()),
+                // The 2026-08-06 migration appends Meta Muse as a tail
+                // fallback to persisted chains, never reordering them.
+                ("muse".to_string(), "muse-spark-1.2".to_string()),
             ]
         );
 

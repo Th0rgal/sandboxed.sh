@@ -25,6 +25,7 @@ export type AIProviderType =
   | "perplexity"
   | "zai"
   | "minimax"
+  | "muse"
   | "github-copilot"
   | "kimi"
   | "custom";

@@ -6471,6 +6471,12 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
             env_var: Some("MINIMAX_API_KEY".to_string()),
         },
         ProviderTypeInfo {
+            id: "muse".to_string(),
+            name: "Meta Muse".to_string(),
+            uses_oauth: false,
+            env_var: Some("META_MODEL_API_KEY".to_string()),
+        },
+        ProviderTypeInfo {
             id: "deep-infra".to_string(),
             name: "DeepInfra".to_string(),
             uses_oauth: false,
@@ -6834,6 +6840,20 @@ async fn check_provider_health(
                 "https://api.minimax.io/v1/chat/completions",
                 serde_json::json!({
                     "model": "MiniMax-M3",
+                    "messages": [{"role": "user", "content": "test"}],
+                    "max_tokens": 1
+                }),
+                format!("Bearer {}", key),
+            )
+        }
+        ProviderType::Muse => {
+            let key = api_key_opt
+                .as_ref()
+                .ok_or((StatusCode::BAD_REQUEST, "No API key".to_string()))?;
+            (
+                "https://api.meta.ai/v1/chat/completions",
+                serde_json::json!({
+                    "model": "muse-spark-1.2",
                     "messages": [{"role": "user", "content": "test"}],
                     "max_tokens": 1
                 }),

@@ -1746,6 +1746,8 @@ fn infer_provider_for_model(model: &str) -> Option<String> {
         Some("zai".to_string())
     } else if m.contains("minimax") || m.contains("abab") {
         Some("minimax".to_string())
+    } else if m.contains("muse") {
+        Some("muse".to_string())
     } else if m.contains("mistral") || m.contains("codestral") {
         Some("mistral".to_string())
     } else if m.contains("llama") && m.contains("groq") {

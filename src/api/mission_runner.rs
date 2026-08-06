@@ -4887,6 +4887,12 @@ pub(crate) fn detect_opencode_provider_auth(
             configured_providers.insert("cerebras".to_string());
         }
     }
+    if let Ok(value) = std::env::var("META_MODEL_API_KEY") {
+        if !value.trim().is_empty() {
+            has_other = true;
+            configured_providers.insert("muse".to_string());
+        }
+    }
 
     if let Some(app_dir) = app_working_dir {
         if let Some(auth) = build_opencode_auth_from_ai_providers(app_dir) {
@@ -5329,6 +5335,27 @@ pub(crate) fn ensure_opencode_provider_for_model(
                 },
                 "options": {
                     "baseURL": base_url
+                }
+            }))
+        }
+        "muse" => {
+            // Unlike minimax/xai, "muse" is not in OpenCode's built-in
+            // provider registry, so the key must be referenced explicitly.
+            // `{env:META_MODEL_API_KEY}` is expanded by OpenCode from the
+            // mission process env, which apply_opencode_auth_env populates
+            // from the provider store / server env (enum-driven via
+            // ProviderType::env_var_name).
+            let base_url = std::env::var("MUSE_BASE_URL")
+                .unwrap_or_else(|_| "https://api.meta.ai/v1".to_string());
+            Some(serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Meta Muse",
+                "models": {
+                    model_id: { "name": model_id }
+                },
+                "options": {
+                    "baseURL": base_url,
+                    "apiKey": "{env:META_MODEL_API_KEY}"
                 }
             }))
         }
@@ -5803,6 +5830,7 @@ pub(crate) fn sync_opencode_auth_to_workspace(
         "zai",
         "cerebras",
         "minimax",
+        "muse",
     ];
     if let (Some(src_dir), Some(dest_dir)) =
         (host_opencode_provider_auth_dir(), provider_auth_dir.clone())

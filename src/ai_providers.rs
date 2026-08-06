@@ -105,6 +105,8 @@ pub enum ProviderType {
     Zai,
     Minimax,
     Kimi,
+    /// Meta's Muse model family (api.meta.ai, OpenAI-compatible).
+    Muse,
     Custom,
 }
 
@@ -128,6 +130,7 @@ impl ProviderType {
             Self::GithubCopilot => "GitHub Copilot",
             Self::Zai => "Z.AI",
             Self::Minimax => "Minimax",
+            Self::Muse => "Meta Muse",
             Self::Kimi => "Kimi",
             Self::Custom => "Custom",
         }
@@ -152,6 +155,7 @@ impl ProviderType {
             Self::GithubCopilot => "github-copilot",
             Self::Zai => "zai",
             Self::Minimax => "minimax",
+            Self::Muse => "muse",
             Self::Kimi => "kimi",
             Self::Custom => "custom",
         }
@@ -177,6 +181,7 @@ impl ProviderType {
             "github-copilot" => Some(Self::GithubCopilot),
             "zai" => Some(Self::Zai),
             "minimax" => Some(Self::Minimax),
+            "muse" => Some(Self::Muse),
             "kimi" => Some(Self::Kimi),
             "custom" => Some(Self::Custom),
             _ => None,
@@ -202,6 +207,7 @@ impl ProviderType {
             Self::GithubCopilot => None, // Uses OAuth
             Self::Zai => Some("ZHIPU_API_KEY"),
             Self::Minimax => Some("MINIMAX_API_KEY"),
+            Self::Muse => Some("META_MODEL_API_KEY"),
             Self::Kimi => None, // OAuth-only (Kimi Code subscription)
             Self::Custom => None,
         }
