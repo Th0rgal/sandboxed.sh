@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::agents::TerminalReason;
 use crate::api::mission_store::{
     now_string, BoardOutboxItem, BoardTask, BoardTaskOutcome, BoardTaskRole, BoardTaskStatus,
-    MissionHistoryEntry, MissionStore, TaskAttempt,
+    MissionHistoryEntry, MissionProjectPatch, MissionStore, TaskAttempt,
 };
 
 use super::{ControlCommand, MissionStatus, UserMessageAck};
@@ -1644,6 +1644,40 @@ async fn spawn_task_worker(
             task.working_directory.as_deref(),
         )
         .await?;
+    // Inherit the boss's project tagging. Board tasks bypass the public
+    // create-mission handler, and `create_mission_with_parent` carries no
+    // project metadata — so workers were landing untagged. The parent link
+    // alone does not group them: an untagged worker is invisible in the
+    // per-project inventory the board and every controller reconcile against,
+    // which is exactly where a campaign's own work needs to be visible.
+    // The task's own key becomes the track when the boss has none, so sibling
+    // workers stay distinguishable.
+    if let Ok(Some(boss)) = mission_store.get_mission(task.boss_mission_id).await {
+        if boss.project.project.is_some() {
+            let patch = MissionProjectPatch {
+                project: Some(boss.project.project.clone()),
+                track: Some(
+                    boss.project
+                        .track
+                        .clone()
+                        .or_else(|| Some(task.task_key.clone())),
+                ),
+                intent: Some(boss.project.intent.clone()),
+                ..Default::default()
+            };
+            if let Err(error) = mission_store
+                .update_mission_project(mission.id, patch)
+                .await
+            {
+                tracing::warn!(
+                    mission = %mission.id,
+                    boss = %task.boss_mission_id,
+                    "board: could not inherit project tagging: {error}"
+                );
+            }
+        }
+    }
+
     if let Some(profile_slot) = task
         .prior_result_digest
         .as_deref()
@@ -1907,6 +1941,77 @@ mod tests {
         .await
         .expect("outbox acknowledgement persisted");
         assert!(inflight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_workers_inherit_the_boss_project_tagging() {
+        // An untagged worker is invisible in the per-project inventory the
+        // board and every controller reconcile against — a campaign's own
+        // work must not vanish from its project.
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let boss = store
+            .create_mission_with_parent(
+                Some("boss"),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create boss");
+        store
+            .update_mission_project(
+                boss.id,
+                MissionProjectPatch {
+                    project: Some(Some("verity-benchmark".into())),
+                    intent: Some(Some("evaluate".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag boss");
+        store
+            .upsert_board_tasks(
+                boss.id,
+                vec![NewBoardTask {
+                    task_key: "fast-verdict".into(),
+                    title: "Obtain verdicts".into(),
+                    prompt: "p".into(),
+                    backend: "codex".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .expect("create task");
+        let task = store.list_board_tasks(boss.id).await.expect("list")[0].clone();
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let inflight: BoardOutboxInflight = Default::default();
+        let worker_id = spawn_task_worker(
+            &store,
+            &cmd_tx,
+            &inflight,
+            &task,
+            Uuid::new_v4(),
+            &RetryPreflight::NothingFound,
+        )
+        .await
+        .expect("spawn worker");
+
+        let worker = store
+            .get_mission(worker_id)
+            .await
+            .expect("load")
+            .expect("worker exists");
+        assert_eq!(worker.project.project.as_deref(), Some("verity-benchmark"));
+        assert_eq!(worker.project.intent.as_deref(), Some("evaluate"));
+        // The boss has no track, so the task key keeps siblings apart.
+        assert_eq!(worker.project.track.as_deref(), Some("fast-verdict"));
     }
 
     #[tokio::test]
