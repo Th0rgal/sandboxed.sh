@@ -17,9 +17,11 @@ struct ProjectSummary: Codable, Identifiable, Hashable {
     let health: ProjectHealth?
     let conversation: ProjectConversation?
     let latestUpdate: ProjectUpdate?
+    /// Live missions grouped under this project — the "agents" of the fleet.
+    let missions: [ProjectMissionChip]
 
     enum CodingKeys: String, CodingKey {
-        case slug, bucket, health, conversation
+        case slug, bucket, health, conversation, missions
         case attentionReasons = "attention_reasons"
         case updatesCount = "updates_count"
         case latestUpdate = "latest_update"
@@ -34,6 +36,21 @@ struct ProjectSummary: Codable, Identifiable, Hashable {
         health = try container.decodeIfPresent(ProjectHealth.self, forKey: .health)
         conversation = try container.decodeIfPresent(ProjectConversation.self, forKey: .conversation)
         latestUpdate = try container.decodeIfPresent(ProjectUpdate.self, forKey: .latestUpdate)
+        missions = try container.decodeIfPresent([ProjectMissionChip].self, forKey: .missions) ?? []
+    }
+
+    /// The controller-reported mode from the latest delivery: `active`,
+    /// `blocked`, or `paused`. Nil when the controller hasn't reported one.
+    var mode: ControllerMode? { latestUpdate?.controllerMode }
+
+    /// Live missions worth showing as "working": active or awaiting the user.
+    var liveMissions: [ProjectMissionChip] {
+        missions.filter { $0.status == "active" || $0.status == "awaiting_user" }
+    }
+
+    /// Missions that need the operator — the attention rail.
+    var missionsNeedingAttention: [ProjectMissionChip] {
+        missions.filter { $0.status == "awaiting_user" }
     }
 
     /// The conversation to open, but only when it is a real declared binding.
@@ -68,6 +85,170 @@ struct ProjectUpdate: Codable, Hashable {
     let headline: String
     let at: String
     let blocker: String?
+    /// The `[CTRL: … mode=… ]` mode the controller reported: `active`,
+    /// `blocked[:cause]`, or `paused[:reason]`. Absent for controllers that
+    /// predate the trailer — render nothing rather than a guessed state.
+    let mode: String?
+
+    var controllerMode: ControllerMode? { ControllerMode(raw: mode) }
+}
+
+/// A controller's regime, parsed from the `mode` string (`blocked:transport-cap`
+/// splits into base + cause). Absent input yields nil — never an invented state.
+struct ControllerMode: Hashable {
+    enum Base: String { case active, blocked, paused }
+    let base: Base
+    let cause: String?
+
+    init?(raw: String?) {
+        guard let raw = raw?.trimmingCharacters(in: .whitespaces).lowercased(),
+              !raw.isEmpty else { return nil }
+        let parts = raw.split(separator: ":", maxSplits: 1).map(String.init)
+        guard let base = Base(rawValue: parts[0]) else { return nil }
+        self.base = base
+        self.cause = parts.count > 1 ? parts[1] : nil
+    }
+
+    var label: String { cause.map { "\(base.rawValue): \($0)" } ?? base.rawValue }
+}
+
+/// A live mission under a project, from the overview's `missions` chips.
+struct ProjectMissionChip: Codable, Hashable, Identifiable {
+    let id: String
+    let status: String
+    let title: String?
+    let updatedAt: String?
+    let githubPr: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, status, title
+        case updatedAt = "updated_at"
+        case githubPr = "github_pr"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "unknown"
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
+        githubPr = try c.decodeIfPresent(String.self, forKey: .githubPr)
+    }
+
+    var displayTitle: String { title ?? String(id.prefix(8)) }
+    var needsAttention: Bool { status == "awaiting_user" }
+}
+
+// MARK: - Project detail (`/api/projects/:slug`)
+
+/// The structured project object from `/api/projects/:slug`: record + grant +
+/// tracks + open decisions + bound conversation. Powers the project detail
+/// view, where the controller ↔ project ↔ sessions link is made visible.
+struct ProjectDetail: Codable, Hashable {
+    let project: ProjectRecord
+    let grant: ProjectGrant?
+    let tracks: [ProjectTrack]
+    let openDecisions: [ProjectDecision]
+    let conversation: ProjectConversation?
+
+    enum CodingKeys: String, CodingKey {
+        case project, grant, tracks, conversation
+        case openDecisions = "open_decisions"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        project = try c.decode(ProjectRecord.self, forKey: .project)
+        grant = try c.decodeIfPresent(ProjectGrant.self, forKey: .grant)
+        tracks = try c.decodeIfPresent([ProjectTrack].self, forKey: .tracks) ?? []
+        openDecisions = try c.decodeIfPresent([ProjectDecision].self, forKey: .openDecisions) ?? []
+        conversation = try c.decodeIfPresent(ProjectConversation.self, forKey: .conversation)
+    }
+
+    /// The bound control conversation — only when explicitly declared, not a
+    /// throwaway cron tick guessed from the latest delivery.
+    var boundSessionId: String? {
+        guard let conversation, conversation.source == "binding" else { return nil }
+        return conversation.sessionId
+    }
+}
+
+/// The authoritative project record.
+struct ProjectRecord: Codable, Hashable {
+    let slug: String
+    let title: String?
+    let objective: String?
+    let status: String
+    /// `active` | `blocked` | `paused` — the controller's regime.
+    let mode: String?
+    let waitTicks: Int
+    let nextAction: String?
+    let blocker: String?
+    /// Which cron controller drives this project. The controller ↔ project link.
+    let controllerCronId: String?
+    let repository: String?
+
+    enum CodingKeys: String, CodingKey {
+        case slug, title, objective, status, mode, blocker, repository
+        case waitTicks = "wait_ticks"
+        case nextAction = "next_action"
+        case controllerCronId = "controller_cron_id"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        slug = try c.decode(String.self, forKey: .slug)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        objective = try c.decodeIfPresent(String.self, forKey: .objective)
+        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "active"
+        mode = try c.decodeIfPresent(String.self, forKey: .mode)
+        waitTicks = try c.decodeIfPresent(Int.self, forKey: .waitTicks) ?? 0
+        nextAction = try c.decodeIfPresent(String.self, forKey: .nextAction)
+        blocker = try c.decodeIfPresent(String.self, forKey: .blocker)
+        controllerCronId = try c.decodeIfPresent(String.self, forKey: .controllerCronId)
+        repository = try c.decodeIfPresent(String.self, forKey: .repository)
+    }
+
+    var controllerMode: ControllerMode? { ControllerMode(raw: mode) }
+    var displayTitle: String { title ?? slug }
+}
+
+/// The autonomy grant.
+struct ProjectGrant: Codable, Hashable {
+    let mergeAuthority: String?
+    let budgetPerTick: String?
+    let pauseReason: String?
+    let resumeCondition: String?
+    let materialBar: String?
+
+    enum CodingKeys: String, CodingKey {
+        case mergeAuthority = "merge_authority"
+        case budgetPerTick = "budget_per_tick"
+        case pauseReason = "pause_reason"
+        case resumeCondition = "resume_condition"
+        case materialBar = "material_bar"
+    }
+}
+
+/// One workstream from the detail endpoint.
+struct ProjectTrack: Codable, Hashable, Identifiable {
+    var id: String { track }
+    let track: String
+    let desiredState: String?
+    let status: String?
+
+    enum CodingKeys: String, CodingKey {
+        case track, status
+        case desiredState = "desired_state"
+    }
+}
+
+/// An open question the controller batched for the operator.
+struct ProjectDecision: Codable, Hashable, Identifiable {
+    var id: String { at }
+    let at: String
+    let question: String
+    let rationale: String?
 }
 
 /// Per-track rollup. Mirrors the server's `ProjectHealth`.

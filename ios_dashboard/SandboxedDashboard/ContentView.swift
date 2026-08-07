@@ -468,12 +468,14 @@ struct MainTabView: View {
     
     enum TabItem: String, CaseIterable {
         case control = "Control"
+        case projects = "Projects"
         case terminal = "Terminal"
         case files = "Files"
 
         var icon: String {
             switch self {
             case .control: return "message.fill"
+            case .projects: return "square.stack.3d.up.fill"
             case .terminal: return "terminal.fill"
             case .files: return "folder.fill"
             }
@@ -508,6 +510,8 @@ struct MainTabView: View {
         switch tab {
         case .control:
             ControlView()
+        case .projects:
+            ProjectsView()
         case .terminal:
             TerminalView()
         case .files:
