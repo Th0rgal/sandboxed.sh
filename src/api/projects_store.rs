@@ -515,6 +515,32 @@ impl ProjectsStore {
         Ok(())
     }
 
+    /// Project the mode onto an existing project record from the delivery
+    /// ingestor. Unlike `set_mode`, this is **idempotent** (it does not count
+    /// ticks — `wait` is passed in from the state timeline's observation count)
+    /// so the ingestor replaying the same delivery every cycle is harmless. It
+    /// silently no-ops for an unknown slug: the ingestor must not fabricate a
+    /// project from a routed trailer.
+    pub fn project_mode_from_signal(
+        &self,
+        slug: &str,
+        mode: &str,
+        wait: i64,
+        next_action: Option<&str>,
+        blocker: Option<&str>,
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "UPDATE projects SET mode = ?2, wait_ticks = ?3, next_action = ?4, \
+                 blocker = ?5, updated_at = ?6 WHERE slug = ?1",
+                params![slug, mode, wait, next_action, blocker, now],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Set the operator-facing status (active/paused/archived).
     pub fn set_status(&self, slug: &str, status: &str) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
@@ -1074,6 +1100,32 @@ mod tests {
     fn set_mode_on_unknown_project_errors() {
         let store = ProjectsStore::open_in_memory().expect("store");
         assert!(store.set_mode("ghost", "active", None, None).is_err());
+    }
+
+    #[test]
+    fn mode_projection_is_idempotent_and_never_fabricates() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        // No project row: the ingestor must not create one from a trailer.
+        store
+            .project_mode_from_signal("ghost", "active", 0, None, None)
+            .expect("no-op, not an error");
+        assert!(store.get_project("ghost").expect("read").is_none());
+
+        store
+            .upsert_project("bench", None, None, None, None)
+            .expect("seed");
+        // Replaying the same signal twice does not inflate wait — it is passed
+        // in, not incremented, so overlapping ingest cycles are harmless.
+        store
+            .project_mode_from_signal("bench", "blocked", 2, None, Some("transport-cap"))
+            .expect("m1");
+        store
+            .project_mode_from_signal("bench", "blocked", 2, None, Some("transport-cap"))
+            .expect("m2 replay");
+        let p = store.get_project("bench").expect("read").expect("present");
+        assert_eq!(p.mode.as_deref(), Some("blocked"));
+        assert_eq!(p.wait_ticks, 2);
+        assert_eq!(p.blocker.as_deref(), Some("transport-cap"));
     }
 
     #[test]
