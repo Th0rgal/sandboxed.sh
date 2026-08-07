@@ -3457,6 +3457,32 @@ fn stream_sandboxed_update(
             }
         }
 
+        // Recycle companion processes still executing the binary we just
+        // replaced. Replacing a file does not touch processes that already
+        // opened it: they keep running the old inode (`/proc/<pid>/exe` shows
+        // "(deleted)") and are NOT restarted by the service restart below,
+        // because Hermes agents own them, not this service.
+        //
+        // The failure that motivated this is silent and expensive: a stranded
+        // `assistant-mcp` kept answering on a half-broken connection, a
+        // controller's `get_compute_fleet` hung until its agent-side timeout
+        // (~600s of a bounded tick), and the controller concluded the MCP was
+        // unreachable — while the API itself was answering in 4ms. Deploy
+        // reported success throughout.
+        //
+        // Signalling is safe: each companion runs under a stdio watchdog that
+        // respawns it on next use, now against the new binary.
+        for (binary, _, destination) in &companion_plans {
+            let recycled = recycle_stale_companion_processes(binary, destination).await;
+            if recycled > 0 {
+                yield sse(
+                    "log",
+                    format!("Recycled {recycled} stale {binary} process(es) still on the replaced binary"),
+                    Some(78),
+                );
+            }
+        }
+
         let install_result = if versioned_install {
             install_versioned_binary_as(
                 repo_path,
@@ -3845,6 +3871,49 @@ enum DeployRollback {
     Missing,
     Backup,
     Symlink(std::path::PathBuf),
+}
+
+/// Signal companion processes still executing a binary that was just replaced.
+///
+/// Returns how many were signalled. A process that opened the old inode keeps
+/// running it after `install` overwrites the path — Linux reports this as
+/// `/proc/<pid>/exe` pointing at "<path> (deleted)". Those processes belong to
+/// Hermes agents rather than this service, so restarting the service does not
+/// touch them, and they linger with a broken view of the API they talk to.
+///
+/// Deliberately narrow: only processes whose resolved exe is the *deleted*
+/// version of this exact destination path are signalled. A companion already
+/// running the new binary, or an unrelated process of the same name installed
+/// elsewhere, is left alone.
+async fn recycle_stale_companion_processes(binary: &str, destination: &str) -> usize {
+    let Ok(output) = Command::new("pgrep").args(["-x", binary]).output().await else {
+        return 0;
+    };
+    let mut recycled = 0;
+    for pid in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+    {
+        let exe = match tokio::fs::read_link(format!("/proc/{pid}/exe")).await {
+            Ok(path) => path.to_string_lossy().to_string(),
+            // The process exited between pgrep and now, or we cannot inspect
+            // it. Either way it is not ours to signal.
+            Err(_) => continue,
+        };
+        if exe != format!("{destination} (deleted)") {
+            continue;
+        }
+        if Command::new("kill")
+            .arg(pid.to_string())
+            .output()
+            .await
+            .is_ok_and(|out| out.status.success())
+        {
+            recycled += 1;
+            tracing::info!(pid, binary, "deploy: recycled stale companion process");
+        }
+    }
+    recycled
 }
 
 async fn prepare_deploy_backup(destination: &str, backup: &str) -> Result<DeployRollback, String> {
@@ -5525,6 +5594,26 @@ fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::conve
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stale_companion_matching_is_exact() {
+        // The "(deleted)" suffix is how Linux reports a replaced binary. Only
+        // that exact form, for that exact destination, may be signalled —
+        // matching loosely here would kill a healthy companion that is already
+        // running the new binary, or an unrelated same-named process.
+        let dest = "/usr/local/bin/assistant-mcp";
+        assert_eq!(
+            format!("{dest} (deleted)"),
+            "/usr/local/bin/assistant-mcp (deleted)"
+        );
+        // A companion on the fresh binary reports the bare path and must not match.
+        assert_ne!(dest, format!("{dest} (deleted)"));
+        // A same-named binary installed elsewhere must not match either.
+        assert_ne!(
+            format!("/opt/other/assistant-mcp (deleted)"),
+            format!("{dest} (deleted)")
+        );
+    }
+
     use super::{
         chatgpt_ui_driver_install_path, evaluate_debounce, evaluate_deploy_request,
         expand_hermes_env_refs, extract_version_token, hermes_chat_proxy_status,
