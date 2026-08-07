@@ -128,6 +128,62 @@ final class ProjectTests: XCTestCase {
         XCTAssertEqual(state.observations, 34)
         XCTAssertEqual(state.id, "2026-08-04T10:00:00Z")
     }
+
+    func testDecodesModeAndMissionChipsOnTheSummary() throws {
+        let project = try decode(
+            """
+            {
+              "slug": "verity",
+              "bucket": "active",
+              "latest_update": {"headline": "moving", "at": "2026-08-07T10:00:00Z", "mode": "blocked:transport-cap"},
+              "missions": [
+                {"id": "m1", "status": "awaiting_user", "title": "Fix PR #2240"},
+                {"id": "m2", "status": "active", "title": "Certify head"}
+              ]
+            }
+            """
+        )
+        XCTAssertEqual(project.mode?.base, .blocked)
+        XCTAssertEqual(project.mode?.cause, "transport-cap")
+        XCTAssertEqual(project.mode?.label, "blocked: transport-cap")
+        XCTAssertEqual(project.liveMissions.count, 2)
+        XCTAssertEqual(project.missionsNeedingAttention.count, 1)
+    }
+
+    func testAbsentModeYieldsNilNotAGuess() throws {
+        let project = try decode(
+            #"{"slug": "legacy", "bucket": "active", "latest_update": {"headline": "x", "at": "2026-08-07T10:00:00Z"}}"#
+        )
+        XCTAssertNil(project.mode)
+    }
+
+    func testDecodesTheProjectDetailWithControllerAndGrant() throws {
+        let detail = try JSONDecoder().decode(
+            ProjectDetail.self,
+            from: Data(
+                """
+                {
+                  "project": {
+                    "slug": "verity", "title": "Verity", "objective": "prove it",
+                    "status": "active", "mode": "active", "wait_ticks": 0,
+                    "next_action": "certify #2240", "controller_cron_id": "e594d751447d",
+                    "repository": "lfglabs-dev/verity"
+                  },
+                  "grant": {"merge_authority": "full", "material_bar": "PR merged"},
+                  "tracks": [{"track": "phase-b", "desired_state": "proved", "status": "in-progress"}],
+                  "open_decisions": [{"at": "2026-08-07T10:00:00Z", "question": "merge #48?"}],
+                  "conversation": {"session_id": "20260806_231844_ff644f", "source": "binding"}
+                }
+                """.utf8)
+        )
+        XCTAssertEqual(detail.project.controllerCronId, "e594d751447d")
+        XCTAssertEqual(detail.project.controllerMode?.base, .active)
+        XCTAssertEqual(detail.grant?.mergeAuthority, "full")
+        XCTAssertEqual(detail.tracks.first?.track, "phase-b")
+        XCTAssertEqual(detail.openDecisions.first?.question, "merge #48?")
+        // A declared binding is offered as the session to open.
+        XCTAssertEqual(detail.boundSessionId, "20260806_231844_ff644f")
+    }
 }
 
 final class MissionProjectMetadataTests: XCTestCase {

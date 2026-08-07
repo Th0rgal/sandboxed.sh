@@ -280,6 +280,15 @@ final class APIService {
         return response.states
     }
 
+    /// One project's structured object: record (mode, next action, blocker),
+    /// autonomy grant, tracks, open decisions, and its bound control
+    /// conversation — which is where the controller ↔ project ↔ session link
+    /// is surfaced.
+    func getProject(slug: String) async throws -> ProjectDetail {
+        let encoded = slug.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? slug
+        return try await get("/api/projects/\(encoded)")
+    }
+
     // MARK: - Mission task board
 
     /// Server-owned task board for a boss mission. Returns an empty board
