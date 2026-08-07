@@ -84,26 +84,30 @@ pub fn spawn_state_ingestor(state: Arc<AppState>) {
             // run of the same state lands as one extended row rather than
             // being rejected as out-of-order.
             for delivery in deliveries.into_iter().rev() {
-                // Both are required: the routing key says which project the
-                // row belongs to, the descriptor says what to record. A
-                // delivery carrying only a key has reported no state.
-                let (Some(raw_key), Some(descriptor)) =
-                    (delivery.signature.as_deref(), delivery.state.as_deref())
-                else {
+                // The routing key is what identifies the project. It comes from
+                // the STATE_SIGNATURE trailer, or the CTRL trailer as a fallback
+                // (#763) — so a controller that emits only `[CTRL: …]` (no
+                // STATE_SIGNATURE, as Lido does) still routes. Without a key
+                // there is nothing to attribute.
+                let Some(raw_key) = delivery.signature.as_deref() else {
                     continue;
                 };
                 let canonical = resolve_alias(&aliases, raw_key);
                 let slug = canonical.as_str();
                 // Auto-upsert the roster from routed deliveries: a slug that
-                // reports state is a real project. This is how projects.db
-                // becomes the complete authoritative list without a manual
-                // seed of every project — done in the background ingestor, not
-                // on a GET. Cheap when the row already exists (COALESCE upsert).
+                // reports is a real project. This is how projects.db becomes the
+                // complete authoritative list without a manual seed of every
+                // project — in the background ingestor, not on a GET. Cheap when
+                // the row already exists (COALESCE upsert).
                 if let Err(error) = state.projects.upsert_project(slug, None, None, None, None) {
                     tracing::warn!("state ingest upsert: {slug}: {error}");
                 }
-                let headline = Some(delivery.headline.as_str()).filter(|h| !h.is_empty());
-                let observations =
+                // The descriptor (STATE_SIGNATURE tail) records the state
+                // timeline; it may be absent when a controller emits only a CTRL
+                // trailer. `observations` drives `wait`; default 1 (this is the
+                // first sighting) when there is no timeline entry.
+                let observations = if let Some(descriptor) = delivery.state.as_deref() {
+                    let headline = Some(delivery.headline.as_str()).filter(|h| !h.is_empty());
                     match state
                         .projects
                         .record_state(slug, descriptor, headline, &delivery.at)
@@ -111,17 +115,17 @@ pub fn spawn_state_ingestor(state: Arc<AppState>) {
                         Ok(observations) => observations,
                         Err(error) => {
                             tracing::warn!("state ingest: {slug}: {error}");
-                            continue;
+                            1
                         }
-                    };
+                    }
+                } else {
+                    1
+                };
                 // Project the controller's `[CTRL: … mode=… ]` mode onto the
-                // project record so the board reads a column, not a parsed
-                // trailer, and a live surface can key off it. Idempotent on
-                // replay: `wait` comes from the timeline's observation count
-                // (how many times this exact state repeated), not a per-call
-                // increment, so re-ingesting the same delivery is a no-op.
-                // No-ops for a slug with no project row — the roster is not
-                // fabricated from a routed trailer.
+                // project record — independent of the descriptor, so a
+                // CTRL-only delivery still updates the mode column. Idempotent
+                // on replay: `wait` comes from the observation count, not a
+                // per-call increment.
                 if let Some(mode) = delivery.mode.as_deref() {
                     let base = mode.split_once(':').map_or(mode, |(base, _)| base);
                     let blocker = mode.split_once(':').map(|(_, cause)| cause);
