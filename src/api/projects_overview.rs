@@ -74,6 +74,12 @@ pub fn spawn_state_ingestor(state: Arc<AppState>) {
                     continue;
                 }
             };
+            // The routing key a controller emits (`lido`) and the roster slug
+            // (`lido-audit`) don't always coincide; resolve through the same
+            // alias map the overview uses so state and mode land on one row.
+            let aliases = hermes_projects_dir()
+                .map(|dir| read_alias_map(&dir))
+                .unwrap_or_default();
             // read_deliveries returns newest-first; replay oldest-first so a
             // run of the same state lands as one extended row rather than
             // being rejected as out-of-order.
@@ -81,11 +87,21 @@ pub fn spawn_state_ingestor(state: Arc<AppState>) {
                 // Both are required: the routing key says which project the
                 // row belongs to, the descriptor says what to record. A
                 // delivery carrying only a key has reported no state.
-                let (Some(slug), Some(descriptor)) =
+                let (Some(raw_key), Some(descriptor)) =
                     (delivery.signature.as_deref(), delivery.state.as_deref())
                 else {
                     continue;
                 };
+                let canonical = resolve_alias(&aliases, raw_key);
+                let slug = canonical.as_str();
+                // Auto-upsert the roster from routed deliveries: a slug that
+                // reports state is a real project. This is how projects.db
+                // becomes the complete authoritative list without a manual
+                // seed of every project — done in the background ingestor, not
+                // on a GET. Cheap when the row already exists (COALESCE upsert).
+                if let Err(error) = state.projects.upsert_project(slug, None, None, None, None) {
+                    tracing::warn!("state ingest upsert: {slug}: {error}");
+                }
                 let headline = Some(delivery.headline.as_str()).filter(|h| !h.is_empty());
                 let observations =
                     match state
