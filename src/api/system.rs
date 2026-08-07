@@ -4306,6 +4306,20 @@ fn stream_deploy(
             }
         }
 
+        // The MCP binaries we just replaced are still being executed by the
+        // Hermes agents that spawned them: those processes hold the old inode
+        // and are NOT recycled by this service's restart, because they are not
+        // in its cgroup. See `recycle_stale_companion_processes`.
+        for (binary, destination) in [
+            ("assistant-mcp", &install_dest_assistant_mcp),
+            ("orchestrator-mcp", &install_dest_mcp),
+        ] {
+            let recycled = recycle_stale_companion_processes(binary, destination).await;
+            if recycled > 0 {
+                yield sse("log", format!("Recycled {recycled} stale {binary} process(es) still running the replaced binary"), Some(86));
+            }
+        }
+
         yield sse("log", format!("Installing {} → {}", src_paloma.display(), install_dest_paloma), Some(87));
         let bkp_paloma = format!("{}.pre-deploy-{}", install_dest_paloma, sha);
         let rollback_paloma = match prepare_deploy_backup(&install_dest_paloma, &bkp_paloma).await {
