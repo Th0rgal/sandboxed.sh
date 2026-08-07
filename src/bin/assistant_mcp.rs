@@ -82,6 +82,64 @@ struct MissionIdParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct ProjectSlugParams {
+    slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateProjectStatusParams {
+    slug: String,
+    mode: String,
+    #[serde(default)]
+    next_action: Option<String>,
+    #[serde(default)]
+    blocker: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetProjectTrackParams {
+    slug: String,
+    track: String,
+    #[serde(default)]
+    desired_state: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetProjectGrantParams {
+    slug: String,
+    #[serde(default)]
+    merge_authority: Option<String>,
+    #[serde(default)]
+    budget_per_tick: Option<String>,
+    #[serde(default)]
+    parallel_missions: Option<i64>,
+    #[serde(default)]
+    pause_reason: Option<String>,
+    #[serde(default)]
+    resume_condition: Option<String>,
+    #[serde(default)]
+    material_bar: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecordProjectDecisionParams {
+    slug: String,
+    question: String,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinkMissionToProjectParams {
+    mission_id: String,
+    slug: String,
+    #[serde(default)]
+    track: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct AdoptMissionParams {
     mission_id: String,
     /// The Hermes session that should own this mission's callbacks from now
@@ -1303,6 +1361,100 @@ impl AssistantMcp {
                 input_schema: json!({"type": "object", "properties": {}}),
             },
             ToolDefinition {
+                name: "list_projects".to_string(),
+                description: "List the projects you supervise (the authoritative roster): slug, status, mode (active/blocked/paused), how many consecutive ticks in that mode, and the next action. Read this at the start of a tick instead of scanning tracker files.".to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "get_project".to_string(),
+                description: "Get one project's structured state: record (objective, status, mode, blocker), autonomy grant, tracks, open decisions for the owner, and the bound control conversation. This is the source of truth for your project — prefer it over reading markdown trackers.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug"],
+                    "properties": {"slug": {"type": "string", "description": "Project slug, e.g. 'verity' or 'coldcard-rng-cracker'."}}
+                }),
+            },
+            ToolDefinition {
+                name: "update_project_status".to_string(),
+                description: "Report your project's state for this tick: mode (active | blocked | paused), the next action, and the blocker if any. Replaces the [CTRL:] trailer with a structured write; the store counts how long you have been in this mode, so blocked/paused staleness is visible without parsing your reports.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "mode"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["active", "blocked", "paused"]},
+                        "next_action": {"type": "string", "description": "The next concrete step, or the resume/unblock condition."},
+                        "blocker": {"type": "string", "description": "What you are blocked on. Set only when mode=blocked."}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "set_project_track".to_string(),
+                description: "Declare or update one workstream of your project: its desired_state (what it should reach) and current status. Use instead of editing prose in a tracker file.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "track"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "track": {"type": "string"},
+                        "desired_state": {"type": "string"},
+                        "status": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "get_project_grant".to_string(),
+                description: "Read your project's autonomy grant: merge authority (full | repo:… | review-first), budget per tick, parallel missions, and the structured PAUSED(pause_reason; resume_condition). This is the durable source of what you are authorized to do — it survives prompt rewrites. Read it at your first tick.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug"],
+                    "properties": {"slug": {"type": "string"}}
+                }),
+            },
+            ToolDefinition {
+                name: "set_project_grant".to_string(),
+                description: "Record the owner's autonomy grant for a project after they answer the setup questions: merge authority, budget, parallel missions, pause reason + machine-checkable resume condition, and the material-report bar. The project must already exist.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "merge_authority": {"type": "string", "description": "full | repo:a,b | review-first"},
+                        "budget_per_tick": {"type": "string"},
+                        "parallel_missions": {"type": "integer"},
+                        "pause_reason": {"type": "string"},
+                        "resume_condition": {"type": "string", "description": "A condition you can check yourself, e.g. 'FTDI device enumerates on spark-de79'."},
+                        "material_bar": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "record_project_decision".to_string(),
+                description: "Add a question to the project's pending-decision ledger for the owner. Non-blocking: batch your questions here and keep working under the conservative in-grant default until answered.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "question"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "question": {"type": "string"},
+                        "rationale": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "link_mission_to_project".to_string(),
+                description: "Tag a mission as belonging to your project (and optionally a track), so it appears in the project's inventory. Use this for missions you dispatch that must be grouped under the project — a worker with no project tag is invisible in the roster.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id", "slug"],
+                    "properties": {
+                        "mission_id": {"type": "string", "description": "Mission UUID or an unambiguous leading fragment."},
+                        "slug": {"type": "string"},
+                        "track": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
                 name: "list_workspaces".to_string(),
                 description: "List sandboxed.sh workspaces so new missions can target the right environment.".to_string(),
                 input_schema: json!({"type": "object", "properties": {}}),
@@ -2102,6 +2254,146 @@ impl AssistantMcp {
         Ok(compact_compute_fleet(&fleet))
     }
 
+    // ---- Project roster tools (see projects_store.rs / projects_overview.rs) ----
+
+    async fn list_projects(&self) -> Result<Value, String> {
+        // Reuse the overview endpoint, but return only the light roster fields
+        // a controller needs at the top of a tick — not the full board payload.
+        let response = self.api_get("/api/projects/overview").await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to list projects ({status}): {text}"));
+        }
+        let overview: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("Failed to parse projects: {error}"))?;
+        let rows: Vec<Value> = overview
+            .get("projects")
+            .and_then(Value::as_array)
+            .map(|projects| {
+                projects
+                    .iter()
+                    .map(|p| {
+                        let latest = p.get("latest_update");
+                        json!({
+                            "slug": p.get("slug"),
+                            "bucket": p.get("bucket"),
+                            "mode": latest.and_then(|u| u.get("mode")),
+                            "health": p.get("health").and_then(|h| h.get("tracks_needing_attention")),
+                            "latest_at": latest.and_then(|u| u.get("at")),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(json!({ "projects": rows }))
+    }
+
+    async fn get_project(&self, params: ProjectSlugParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let response = self.api_get(&format!("/api/projects/{slug}")).await?;
+        Self::response_value(response, "get project").await
+    }
+
+    async fn update_project_status(
+        &self,
+        params: UpdateProjectStatusParams,
+    ) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let body = json!({
+            "mode": params.mode,
+            "next_action": params.next_action,
+            "blocker": params.blocker,
+        });
+        let response = self
+            .api_post(&format!("/api/projects/{slug}/status"), body)
+            .await?;
+        Self::response_value(response, "update project status").await
+    }
+
+    async fn set_project_track(&self, params: SetProjectTrackParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let body = json!({
+            "track": params.track,
+            "desired_state": params.desired_state,
+            "status": params.status,
+        });
+        let response = self
+            .api_post(&format!("/api/projects/{slug}/track"), body)
+            .await?;
+        Self::response_value(response, "set project track").await
+    }
+
+    async fn get_project_grant(&self, params: ProjectSlugParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let response = self.api_get(&format!("/api/projects/{slug}/grant")).await?;
+        Self::response_value(response, "get project grant").await
+    }
+
+    async fn set_project_grant(&self, params: SetProjectGrantParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let body = json!({
+            "merge_authority": params.merge_authority,
+            "budget_per_tick": params.budget_per_tick,
+            "parallel_missions": params.parallel_missions,
+            "pause_reason": params.pause_reason,
+            "resume_condition": params.resume_condition,
+            "material_bar": params.material_bar,
+        });
+        let response = self
+            .api_post(&format!("/api/projects/{slug}/grant"), body)
+            .await?;
+        Self::response_value(response, "set project grant").await
+    }
+
+    async fn record_project_decision(
+        &self,
+        params: RecordProjectDecisionParams,
+    ) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let body = json!({
+            "question": params.question,
+            "rationale": params.rationale,
+        });
+        let response = self
+            .api_post(&format!("/api/projects/{slug}/decision"), body)
+            .await?;
+        Self::response_value(response, "record project decision").await
+    }
+
+    async fn link_mission_to_project(
+        &self,
+        params: LinkMissionToProjectParams,
+    ) -> Result<Value, String> {
+        let id = self.resolve_mission_id(&params.mission_id).await?;
+        let mut body = serde_json::Map::new();
+        body.insert("project".to_string(), json!(params.slug.trim()));
+        if let Some(track) = params
+            .track
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            body.insert("track".to_string(), json!(track));
+        }
+        let response = self
+            .api_post(
+                &format!("/api/control/missions/{id}/project"),
+                Value::Object(body),
+            )
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Failed to link mission to project ({status}): {text}"
+            ));
+        }
+        Ok(json!({ "success": true, "mission_id": id.to_string(), "project": params.slug.trim() }))
+    }
+
     async fn list_workspaces(&self) -> Result<Value, String> {
         let response = self.api_get("/api/workspaces").await?;
         if !response.status().is_success() {
@@ -2638,6 +2930,35 @@ impl AssistantMcp {
                 self.adopt_mission(params).await
             }
             "get_compute_fleet" => self.get_compute_fleet().await,
+            "list_projects" => self.list_projects().await,
+            "get_project" => {
+                let params: ProjectSlugParams = parse_params(arguments)?;
+                self.get_project(params).await
+            }
+            "update_project_status" => {
+                let params: UpdateProjectStatusParams = parse_params(arguments)?;
+                self.update_project_status(params).await
+            }
+            "set_project_track" => {
+                let params: SetProjectTrackParams = parse_params(arguments)?;
+                self.set_project_track(params).await
+            }
+            "get_project_grant" => {
+                let params: ProjectSlugParams = parse_params(arguments)?;
+                self.get_project_grant(params).await
+            }
+            "set_project_grant" => {
+                let params: SetProjectGrantParams = parse_params(arguments)?;
+                self.set_project_grant(params).await
+            }
+            "record_project_decision" => {
+                let params: RecordProjectDecisionParams = parse_params(arguments)?;
+                self.record_project_decision(params).await
+            }
+            "link_mission_to_project" => {
+                let params: LinkMissionToProjectParams = parse_params(arguments)?;
+                self.link_mission_to_project(params).await
+            }
             "list_workspaces" => self.list_workspaces().await,
             "get_workspace" => {
                 let params: WorkspaceIdParams = parse_params(arguments)?;
@@ -3869,6 +4190,33 @@ mod tests {
                 .unwrap()
                 .contains(&json!("confirm")));
         }
+    }
+
+    #[test]
+    fn project_roster_tools_are_exposed() {
+        let tools = AssistantMcp::tools();
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        for expected in [
+            "list_projects",
+            "get_project",
+            "update_project_status",
+            "set_project_track",
+            "get_project_grant",
+            "set_project_grant",
+            "record_project_decision",
+            "link_mission_to_project",
+        ] {
+            assert!(names.contains(&expected), "missing project tool {expected}");
+        }
+        // The status tool constrains mode to the three known regimes.
+        let status = tools
+            .iter()
+            .find(|tool| tool.name == "update_project_status")
+            .unwrap();
+        let modes = status.input_schema["properties"]["mode"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(modes.contains(&json!("blocked")));
     }
 
     #[test]
