@@ -87,12 +87,37 @@ pub fn spawn_state_ingestor(state: Arc<AppState>) {
                     continue;
                 };
                 let headline = Some(delivery.headline.as_str()).filter(|h| !h.is_empty());
-                if let Err(error) =
-                    state
+                let observations =
+                    match state
                         .projects
                         .record_state(slug, descriptor, headline, &delivery.at)
-                {
-                    tracing::warn!("state ingest: {slug}: {error}");
+                    {
+                        Ok(observations) => observations,
+                        Err(error) => {
+                            tracing::warn!("state ingest: {slug}: {error}");
+                            continue;
+                        }
+                    };
+                // Project the controller's `[CTRL: … mode=… ]` mode onto the
+                // project record so the board reads a column, not a parsed
+                // trailer, and a live surface can key off it. Idempotent on
+                // replay: `wait` comes from the timeline's observation count
+                // (how many times this exact state repeated), not a per-call
+                // increment, so re-ingesting the same delivery is a no-op.
+                // No-ops for a slug with no project row — the roster is not
+                // fabricated from a routed trailer.
+                if let Some(mode) = delivery.mode.as_deref() {
+                    let base = mode.split_once(':').map_or(mode, |(base, _)| base);
+                    let blocker = mode.split_once(':').map(|(_, cause)| cause);
+                    if let Err(error) = state.projects.project_mode_from_signal(
+                        slug,
+                        base,
+                        observations.saturating_sub(1) as i64,
+                        None,
+                        blocker,
+                    ) {
+                        tracing::warn!("state ingest mode: {slug}: {error}");
+                    }
                 }
             }
         }
