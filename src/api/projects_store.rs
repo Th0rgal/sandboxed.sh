@@ -46,6 +46,65 @@ CREATE TABLE IF NOT EXISTS project_state_events (
 );
 CREATE INDEX IF NOT EXISTS idx_state_events_slug_seen
     ON project_state_events(slug, last_seen_at DESC);
+
+-- The authoritative project roster. Today a project is reconstructed on every
+-- read by unioning three sources (markdown trackers, tagged missions, routed
+-- deliveries), so a slug typo forks a phantom project and nothing owns the
+-- project's own state. This table makes the project an object: it exists
+-- because a row says so, and its mode/blocker are columns, not a parsed trailer.
+CREATE TABLE IF NOT EXISTS projects (
+    slug               TEXT PRIMARY KEY NOT NULL,
+    title              TEXT,
+    objective          TEXT,
+    status             TEXT NOT NULL DEFAULT 'active',   -- active|paused|archived
+    mode               TEXT,                             -- active|blocked|paused
+    wait_ticks         INTEGER NOT NULL DEFAULT 0,
+    next_action        TEXT,
+    blocker            TEXT,
+    controller_cron_id TEXT,                             -- the controller<->project link
+    repository         TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
+-- The autonomy grant, structured so it survives a controller rewriting its own
+-- prompt: merge authority, budget, and the machine-checkable PAUSED() live here,
+-- not in prose the next rollover can drop.
+CREATE TABLE IF NOT EXISTS project_grant (
+    slug              TEXT PRIMARY KEY NOT NULL
+                          REFERENCES projects(slug) ON DELETE CASCADE,
+    merge_authority   TEXT,        -- full | repo:a,b | review-first
+    budget_per_tick   TEXT,
+    parallel_missions INTEGER,
+    pause_reason      TEXT,
+    resume_condition  TEXT,        -- the structured, checkable resume gate
+    material_bar      TEXT,
+    answered_at       TEXT
+);
+
+-- One row per workstream. `desired_state` is what the track should reach;
+-- `status` is where it is. The controller sets these instead of editing prose.
+CREATE TABLE IF NOT EXISTS project_tracks (
+    slug          TEXT NOT NULL,
+    track         TEXT NOT NULL,
+    desired_state TEXT,
+    status        TEXT,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (slug, track)
+);
+
+-- The pending-decision ledger: questions the controller batched for the owner,
+-- requestable rather than buried in a markdown file.
+CREATE TABLE IF NOT EXISTS project_decisions (
+    slug      TEXT NOT NULL,
+    at        TEXT NOT NULL,
+    question  TEXT NOT NULL,
+    rationale TEXT,
+    answered  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (slug, at)
+);
+CREATE INDEX IF NOT EXISTS idx_project_decisions_open
+    ON project_decisions(slug, answered);
 "#;
 
 /// A project's control conversation and how we know about it.
@@ -72,6 +131,9 @@ impl ProjectsStore {
         }
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        // Required for `project_grant`'s ON DELETE CASCADE — SQLite defaults it
+        // off, so without this a deleted project would strand its grant row.
+        connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(SCHEMA)?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -81,6 +143,7 @@ impl ProjectsStore {
     #[cfg(test)]
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let connection = Connection::open_in_memory()?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(SCHEMA)?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -315,6 +378,308 @@ impl ProjectsStore {
         rows.collect::<Result<HashMap<_, _>, _>>()
             .map_err(|e| e.to_string())
     }
+
+    // ---- Authoritative project roster (projects / grant / tracks / decisions) ----
+
+    /// Every project slug in the roster. This is what makes a project *exist*
+    /// once the overview is seeded from the DB rather than the source union.
+    pub fn list_slugs(&self) -> Result<Vec<String>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare("SELECT slug FROM projects ORDER BY slug")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// The full roster as records, newest-updated first.
+    pub fn list_projects(&self) -> Result<Vec<ProjectRecord>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT slug, title, objective, status, mode, wait_ticks, \
+                 next_action, blocker, controller_cron_id, repository, \
+                 created_at, updated_at FROM projects ORDER BY updated_at DESC, slug",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], Self::project_from_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// One project record, or `None` if the slug is not in the roster.
+    pub fn get_project(&self, slug: &str) -> Result<Option<ProjectRecord>, String> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT slug, title, objective, status, mode, wait_ticks, \
+                 next_action, blocker, controller_cron_id, repository, \
+                 created_at, updated_at FROM projects WHERE slug = ?1",
+                params![slug],
+                Self::project_from_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
+        Ok(ProjectRecord {
+            slug: row.get(0)?,
+            title: row.get(1)?,
+            objective: row.get(2)?,
+            status: row.get(3)?,
+            mode: row.get(4)?,
+            wait_ticks: row.get(5)?,
+            next_action: row.get(6)?,
+            blocker: row.get(7)?,
+            controller_cron_id: row.get(8)?,
+            repository: row.get(9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
+        })
+    }
+
+    /// Create or update a project's descriptive fields. Leaves status/mode and
+    /// the runtime fields (wait_ticks/blocker) untouched — those move through
+    /// `set_status`/`set_mode`, which is what a controller tick calls.
+    pub fn upsert_project(
+        &self,
+        slug: &str,
+        title: Option<&str>,
+        objective: Option<&str>,
+        repository: Option<&str>,
+        controller_cron_id: Option<&str>,
+    ) -> Result<ProjectRecord, String> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO projects \
+                   (slug, title, objective, repository, controller_cron_id, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
+                 ON CONFLICT(slug) DO UPDATE SET \
+                   title = COALESCE(excluded.title, projects.title), \
+                   objective = COALESCE(excluded.objective, projects.objective), \
+                   repository = COALESCE(excluded.repository, projects.repository), \
+                   controller_cron_id = COALESCE(excluded.controller_cron_id, projects.controller_cron_id), \
+                   updated_at = excluded.updated_at",
+                params![slug, title, objective, repository, controller_cron_id, now],
+            )
+            .map_err(|e| e.to_string())?;
+        drop(connection);
+        self.get_project(slug)?
+            .ok_or_else(|| "project vanished after upsert".to_string())
+    }
+
+    /// Set the controller-reported mode and next-action. Increments
+    /// `wait_ticks` while the mode/blocker are unchanged, and resets it to 0 on
+    /// any change — so "how long has it been blocked on this" is a column read,
+    /// not a scan of the delivery log.
+    pub fn set_mode(
+        &self,
+        slug: &str,
+        mode: &str,
+        next_action: Option<&str>,
+        blocker: Option<&str>,
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        let previous: Option<(Option<String>, Option<String>)> = connection
+            .query_row(
+                "SELECT mode, blocker FROM projects WHERE slug = ?1",
+                params![slug],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let unchanged = matches!(
+            &previous,
+            Some((m, b)) if m.as_deref() == Some(mode) && b.as_deref() == blocker
+        );
+        let affected = connection
+            .execute(
+                "UPDATE projects SET mode = ?2, next_action = ?3, blocker = ?4, \
+                 wait_ticks = CASE WHEN ?5 THEN wait_ticks + 1 ELSE 0 END, \
+                 updated_at = ?6 WHERE slug = ?1",
+                params![slug, mode, next_action, blocker, unchanged, now],
+            )
+            .map_err(|e| e.to_string())?;
+        if affected == 0 {
+            return Err(format!("unknown project '{slug}'"));
+        }
+        Ok(())
+    }
+
+    /// Set the operator-facing status (active/paused/archived).
+    pub fn set_status(&self, slug: &str, status: &str) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        let affected = connection
+            .execute(
+                "UPDATE projects SET status = ?2, updated_at = ?3 WHERE slug = ?1",
+                params![slug, status, now],
+            )
+            .map_err(|e| e.to_string())?;
+        if affected == 0 {
+            return Err(format!("unknown project '{slug}'"));
+        }
+        Ok(())
+    }
+
+    pub fn tracks(&self, slug: &str) -> Result<Vec<ProjectTrack>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT track, desired_state, status, updated_at \
+                 FROM project_tracks WHERE slug = ?1 ORDER BY track",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![slug], |row| {
+                Ok(ProjectTrack {
+                    track: row.get(0)?,
+                    desired_state: row.get(1)?,
+                    status: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn set_track(
+        &self,
+        slug: &str,
+        track: &str,
+        desired_state: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO project_tracks (slug, track, desired_state, status, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(slug, track) DO UPDATE SET \
+                   desired_state = COALESCE(excluded.desired_state, project_tracks.desired_state), \
+                   status = COALESCE(excluded.status, project_tracks.status), \
+                   updated_at = excluded.updated_at",
+                params![slug, track, desired_state, status, now],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_grant(&self, slug: &str) -> Result<Option<ProjectGrant>, String> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT merge_authority, budget_per_tick, parallel_missions, \
+                 pause_reason, resume_condition, material_bar, answered_at \
+                 FROM project_grant WHERE slug = ?1",
+                params![slug],
+                |row| {
+                    Ok(ProjectGrant {
+                        merge_authority: row.get(0)?,
+                        budget_per_tick: row.get(1)?,
+                        parallel_missions: row.get(2)?,
+                        pause_reason: row.get(3)?,
+                        resume_condition: row.get(4)?,
+                        material_bar: row.get(5)?,
+                        answered_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_grant(
+        &self,
+        slug: &str,
+        merge_authority: Option<&str>,
+        budget_per_tick: Option<&str>,
+        parallel_missions: Option<i64>,
+        pause_reason: Option<&str>,
+        resume_condition: Option<&str>,
+        material_bar: Option<&str>,
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO project_grant \
+                   (slug, merge_authority, budget_per_tick, parallel_missions, \
+                    pause_reason, resume_condition, material_bar, answered_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(slug) DO UPDATE SET \
+                   merge_authority = COALESCE(excluded.merge_authority, project_grant.merge_authority), \
+                   budget_per_tick = COALESCE(excluded.budget_per_tick, project_grant.budget_per_tick), \
+                   parallel_missions = COALESCE(excluded.parallel_missions, project_grant.parallel_missions), \
+                   pause_reason = COALESCE(excluded.pause_reason, project_grant.pause_reason), \
+                   resume_condition = COALESCE(excluded.resume_condition, project_grant.resume_condition), \
+                   material_bar = COALESCE(excluded.material_bar, project_grant.material_bar), \
+                   answered_at = excluded.answered_at",
+                params![
+                    slug,
+                    merge_authority,
+                    budget_per_tick,
+                    parallel_missions,
+                    pause_reason,
+                    resume_condition,
+                    material_bar,
+                    now
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn record_decision(
+        &self,
+        slug: &str,
+        question: &str,
+        rationale: Option<&str>,
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO project_decisions (slug, at, question, rationale, answered) \
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                params![slug, now, question, rationale],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn open_decisions(&self, slug: &str) -> Result<Vec<ProjectDecision>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT at, question, rationale FROM project_decisions \
+                 WHERE slug = ?1 AND answered = 0 ORDER BY at",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![slug], |row| {
+                Ok(ProjectDecision {
+                    at: row.get(0)?,
+                    question: row.get(1)?,
+                    rationale: row.get(2)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// One distinct state a project reported, with how long it stayed there.
@@ -327,6 +692,69 @@ pub struct ProjectState {
     pub last_seen_at: String,
     /// How many deliveries reported this same state in a row.
     pub observations: u32,
+}
+
+/// A project as an object in its own right, not a union reconstructed per read.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectRecord {
+    pub slug: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    pub wait_ticks: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_cron_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The autonomy grant, structured so it outlives a controller's prompt.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectGrant {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_authority: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_per_tick: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_missions: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_condition: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub material_bar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<String>,
+}
+
+/// One workstream within a project.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectTrack {
+    pub track: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    pub updated_at: String,
+}
+
+/// An open question the controller batched for the owner.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectDecision {
+    pub at: String,
+    pub question: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
 }
 
 #[cfg(test)]
@@ -584,5 +1012,109 @@ mod tests {
             .expect("record");
         let timeline = store.state_timeline("verity", 10).expect("timeline");
         assert_eq!(timeline[0].headline.as_deref(), Some("now we know"));
+    }
+
+    #[test]
+    fn a_project_upserts_and_reads_back() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        assert!(store.get_project("verity").expect("read").is_none());
+        assert!(store.list_slugs().expect("slugs").is_empty());
+
+        let p = store
+            .upsert_project(
+                "verity",
+                Some("Verity"),
+                Some("prove the compiler"),
+                Some("lfglabs-dev/verity"),
+                Some("e594d751447d"),
+            )
+            .expect("upsert");
+        assert_eq!(p.slug, "verity");
+        assert_eq!(p.status, "active");
+        assert_eq!(p.controller_cron_id.as_deref(), Some("e594d751447d"));
+
+        // A second upsert enriches without clobbering unspecified fields.
+        let p2 = store
+            .upsert_project("verity", None, None, None, None)
+            .expect("re-upsert");
+        assert_eq!(p2.title.as_deref(), Some("Verity"));
+        assert_eq!(p2.repository.as_deref(), Some("lfglabs-dev/verity"));
+        assert_eq!(store.list_slugs().expect("slugs"), vec!["verity"]);
+    }
+
+    #[test]
+    fn set_mode_counts_consecutive_ticks_and_resets_on_change() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("bench", None, None, None, None)
+            .expect("seed");
+
+        store
+            .set_mode("bench", "active", Some("run"), None)
+            .expect("m1");
+        assert_eq!(store.get_project("bench").unwrap().unwrap().wait_ticks, 0);
+
+        // Same mode+blocker two more ticks: the counter is how long it's been here.
+        store
+            .set_mode("bench", "blocked", Some("x"), Some("transport-cap"))
+            .expect("m2");
+        store
+            .set_mode("bench", "blocked", Some("x"), Some("transport-cap"))
+            .expect("m3");
+        assert_eq!(store.get_project("bench").unwrap().unwrap().wait_ticks, 1);
+
+        // A changed blocker resets the counter — a new thing to be stuck on.
+        store
+            .set_mode("bench", "blocked", Some("x"), Some("other"))
+            .expect("m4");
+        assert_eq!(store.get_project("bench").unwrap().unwrap().wait_ticks, 0);
+    }
+
+    #[test]
+    fn set_mode_on_unknown_project_errors() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        assert!(store.set_mode("ghost", "active", None, None).is_err());
+    }
+
+    #[test]
+    fn grant_and_tracks_round_trip_and_cascade_on_delete() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+        store
+            .set_grant(
+                "lido",
+                Some("review-first"),
+                Some("2/tick"),
+                Some(3),
+                None,
+                None,
+                Some("only merged PRs"),
+            )
+            .expect("grant");
+        let g = store.get_grant("lido").expect("read").expect("present");
+        assert_eq!(g.merge_authority.as_deref(), Some("review-first"));
+        assert_eq!(g.parallel_missions, Some(3));
+
+        store
+            .set_track("lido", "P-ETH-1", Some("proved"), Some("in-progress"))
+            .expect("track");
+        let tracks = store.tracks("lido").expect("tracks");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].track, "P-ETH-1");
+
+        store
+            .record_decision("lido", "merge #48?", Some("blocks A.2"))
+            .expect("dec");
+        assert_eq!(store.open_decisions("lido").expect("open").len(), 1);
+
+        // Deleting the project cascades the grant away (FK ON DELETE CASCADE).
+        store
+            .lock()
+            .expect("lock")
+            .execute("DELETE FROM projects WHERE slug = 'lido'", [])
+            .expect("delete");
+        assert!(store.get_grant("lido").expect("read").is_none());
     }
 }

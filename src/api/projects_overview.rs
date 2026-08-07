@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use super::control::events::MissionStatus;
 use super::mission_store::Mission;
 use super::projects_store::ProjectConversation;
+#[allow(unused_imports)]
+use super::projects_store::{ProjectDecision, ProjectGrant, ProjectRecord, ProjectTrack};
 use super::routes::AppState;
 
 /// Terminal missions younger than this stay on the board (recent history).
@@ -120,12 +122,244 @@ pub async fn project_state(
     Ok(Json(serde_json::json!({ "slug": slug, "states": states })))
 }
 
+fn bad_slug() -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, "invalid project slug".to_string())
+}
+
+fn store_err(error: String) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error)
+}
+
+/// `GET /api/projects/:slug` — the structured project object: record, grant,
+/// tracks, and open decisions. This is what `get_project` (MCP) returns to a
+/// controller instead of it scanning markdown.
+pub async fn get_project(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err(bad_slug());
+    }
+    let project = state
+        .projects
+        .get_project(&slug)
+        .map_err(store_err)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown project '{slug}'")))?;
+    let grant = state.projects.get_grant(&slug).map_err(store_err)?;
+    let tracks = state.projects.tracks(&slug).map_err(store_err)?;
+    let decisions = state.projects.open_decisions(&slug).map_err(store_err)?;
+    let conversation = state.projects.binding(&slug).map_err(store_err)?;
+    Ok(Json(serde_json::json!({
+        "project": project,
+        "grant": grant,
+        "tracks": tracks,
+        "open_decisions": decisions,
+        "conversation": conversation,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpsertProjectRequest {
+    pub slug: String,
+    pub title: Option<String>,
+    pub objective: Option<String>,
+    pub repository: Option<String>,
+    pub controller_cron_id: Option<String>,
+}
+
+/// `PUT /api/projects` — create or enrich a project record. Used by the seed
+/// and whenever a controller declares its project. Never clears a field: pass
+/// only what you mean to set.
+pub async fn upsert_project(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<UpsertProjectRequest>,
+) -> Result<Json<ProjectRecord>, (StatusCode, String)> {
+    if !is_plain_key(&req.slug) {
+        return Err(bad_slug());
+    }
+    let record = state
+        .projects
+        .upsert_project(
+            &req.slug,
+            req.title.as_deref(),
+            req.objective.as_deref(),
+            req.repository.as_deref(),
+            req.controller_cron_id.as_deref(),
+        )
+        .map_err(store_err)?;
+    Ok(Json(record))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetStatusRequest {
+    pub mode: String,
+    pub next_action: Option<String>,
+    pub blocker: Option<String>,
+}
+
+/// `POST /api/projects/:slug/status` — the controller's per-tick state report.
+/// Replaces the parsed `[CTRL:]` trailer with a structured write; `wait_ticks`
+/// is maintained by the store.
+pub async fn set_project_status(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(req): Json<SetStatusRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err(bad_slug());
+    }
+    let mode = req.mode.trim().to_ascii_lowercase();
+    if !matches!(mode.as_str(), "active" | "blocked" | "paused") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "mode must be active, blocked, or paused".to_string(),
+        ));
+    }
+    state
+        .projects
+        .set_mode(
+            &slug,
+            &mode,
+            req.next_action.as_deref(),
+            req.blocker.as_deref(),
+        )
+        .map_err(|error| (StatusCode::NOT_FOUND, error))?;
+    let project = state.projects.get_project(&slug).map_err(store_err)?;
+    Ok(Json(serde_json::json!({ "project": project })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetTrackRequest {
+    pub track: String,
+    pub desired_state: Option<String>,
+    pub status: Option<String>,
+}
+
+/// `POST /api/projects/:slug/track` — declare/update one workstream.
+pub async fn set_project_track(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(req): Json<SetTrackRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err(bad_slug());
+    }
+    if req.track.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "track is required".to_string()));
+    }
+    state
+        .projects
+        .set_track(
+            &slug,
+            req.track.trim(),
+            req.desired_state.as_deref(),
+            req.status.as_deref(),
+        )
+        .map_err(store_err)?;
+    let tracks = state.projects.tracks(&slug).map_err(store_err)?;
+    Ok(Json(serde_json::json!({ "tracks": tracks })))
+}
+
+/// `GET /api/projects/:slug/grant` — the autonomy grant.
+pub async fn get_project_grant(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err(bad_slug());
+    }
+    let grant = state.projects.get_grant(&slug).map_err(store_err)?;
+    Ok(Json(serde_json::json!({ "slug": slug, "grant": grant })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetGrantRequest {
+    pub merge_authority: Option<String>,
+    pub budget_per_tick: Option<String>,
+    pub parallel_missions: Option<i64>,
+    pub pause_reason: Option<String>,
+    pub resume_condition: Option<String>,
+    pub material_bar: Option<String>,
+}
+
+/// `POST /api/projects/:slug/grant` — set the autonomy grant. The project must
+/// exist (the grant FK-references it).
+pub async fn set_project_grant(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(req): Json<SetGrantRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err(bad_slug());
+    }
+    if state
+        .projects
+        .get_project(&slug)
+        .map_err(store_err)?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, format!("unknown project '{slug}'")));
+    }
+    state
+        .projects
+        .set_grant(
+            &slug,
+            req.merge_authority.as_deref(),
+            req.budget_per_tick.as_deref(),
+            req.parallel_missions,
+            req.pause_reason.as_deref(),
+            req.resume_condition.as_deref(),
+            req.material_bar.as_deref(),
+        )
+        .map_err(store_err)?;
+    let grant = state.projects.get_grant(&slug).map_err(store_err)?;
+    Ok(Json(serde_json::json!({ "slug": slug, "grant": grant })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecordDecisionRequest {
+    pub question: String,
+    pub rationale: Option<String>,
+}
+
+/// `POST /api/projects/:slug/decision` — add to the pending-decision ledger.
+pub async fn record_project_decision(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(req): Json<RecordDecisionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err(bad_slug());
+    }
+    if req.question.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "question is required".to_string()));
+    }
+    state
+        .projects
+        .record_decision(&slug, req.question.trim(), req.rationale.as_deref())
+        .map_err(store_err)?;
+    let open = state.projects.open_decisions(&slug).map_err(store_err)?;
+    Ok(Json(serde_json::json!({ "open_decisions": open })))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/overview", get(projects_overview))
+        .route("/", axum::routing::put(upsert_project))
+        .route("/:slug", get(get_project))
         .route("/:slug/state", get(project_state))
         .route("/:slug/updates", get(project_updates))
         .route("/:slug/action", axum::routing::post(project_action))
+        .route("/:slug/status", axum::routing::post(set_project_status))
+        .route("/:slug/track", axum::routing::post(set_project_track))
+        .route(
+            "/:slug/grant",
+            get(get_project_grant).post(set_project_grant),
+        )
+        .route(
+            "/:slug/decision",
+            axum::routing::post(record_project_decision),
+        )
         .route(
             "/:slug/conversation",
             axum::routing::put(bind_project_conversation).delete(unbind_project_conversation),
