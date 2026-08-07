@@ -991,12 +991,28 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
             .strip_prefix("[STATE_SIGNATURE:")
             .and_then(|rest| rest.strip_suffix(']'))
     });
+    let ctrl = content.lines().rev().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("[CTRL:")
+            .and_then(|rest| rest.strip_suffix(']'))
+    });
     let signature = trailer
         .and_then(|inner| inner.split('|').next())
         .map(|key| key.trim().to_string())
         // Reject template placeholders like `<project>` and anything that
         // isn't a plain routing key.
-        .filter(|key| is_plain_key(key));
+        .filter(|key| is_plain_key(key))
+        // Fall back to the `[CTRL: <project> | …]` trailer's own first field.
+        // Requiring a controller to emit two separate trailers to be routed is
+        // a rule it will eventually forget, and the failure is silent: the
+        // report simply never reaches its project row. The mode trailer already
+        // names the project, so accept it rather than lose the delivery.
+        .or_else(|| {
+            ctrl.and_then(|inner| inner.split('|').next())
+                .map(|key| key.trim().to_string())
+                .filter(|key| is_plain_key(key))
+        });
     // The state descriptor: the trailer minus its routing key. Empty when the
     // controller emitted a key and nothing else, which is not a state.
     let state = trailer
@@ -1015,15 +1031,7 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
     // distinguishable from one stuck on the same blocker. Absent for controllers
     // that predate the convention: the field is then omitted entirely rather
     // than defaulted, so the UI can render exactly as it did before.
-    let mode = content
-        .lines()
-        .rev()
-        .find_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .strip_prefix("[CTRL:")
-                .and_then(|rest| rest.strip_suffix(']'))
-        })
+    let mode = ctrl
         .and_then(|inner| {
             inner
                 .split('|')
@@ -1119,6 +1127,23 @@ mod tests {
         // rather than defaulting to one: the UI must render as it did before.
         let legacy = "[Cron delivery: Lido]\nSomething happened\n[STATE_SIGNATURE: lido|phase|head|none|next]";
         assert!(parse_delivery("s3", 0.0, legacy).mode.is_none());
+
+        // The CTRL trailer alone routes the delivery: requiring two separate
+        // trailers is a rule a controller eventually forgets, and the failure
+        // is silent — the report never reaches its project row.
+        let ctrl_only =
+            "[Cron delivery: Verity]\nDid a thing\n[CTRL: verity | mode=active | wait=0 | next=x]";
+        assert_eq!(
+            parse_delivery("s5", 0.0, ctrl_only).signature.as_deref(),
+            Some("verity")
+        );
+
+        // When both are present the explicit routing trailer still wins.
+        let both = "[Cron delivery: X]\nhi\n[CTRL: ctrl-key | mode=active | wait=0 | next=x]\n[STATE_SIGNATURE: sig-key|a|b|c|d]";
+        assert_eq!(
+            parse_delivery("s6", 0.0, both).signature.as_deref(),
+            Some("sig-key")
+        );
 
         // A malformed mode is dropped rather than surfaced as a chip.
         let bogus = "[Cron delivery: X]\nhi\n[CTRL: x | mode=confused | wait=0 | next=none]";
