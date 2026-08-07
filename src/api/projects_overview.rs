@@ -207,6 +207,12 @@ pub struct DeliveryUpdate {
     /// with the same value reported the same world.
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<String>,
+    /// Controller-reported mode from the `[CTRL: … | mode=… | …]` trailer:
+    /// `active`, `blocked[:cause]` or `paused[:reason]`. Absent for controllers
+    /// that have not adopted the trailer — the three regimes were previously
+    /// indistinguishable, so a quiet tick and a stuck one looked identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
     blocker: Option<String>,
 }
 
@@ -965,6 +971,7 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
         if trimmed.is_empty()
             || trimmed.starts_with("[Cron delivery:")
             || trimmed.starts_with("[STATE_SIGNATURE:")
+            || trimmed.starts_with("[CTRL:")
         {
             continue;
         }
@@ -1002,6 +1009,37 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
         // in the message wins — so an echoed template landing last would be
         // recorded as a genuine state and sit in the durable timeline forever.
         .filter(|rest| !is_placeholder_descriptor(rest));
+
+    // `[CTRL: <project> | mode=active|blocked|paused | wait=<n> | next=…]`.
+    // Emitted on every delivery INCLUDING `[SILENT]`, so a healthy quiet tick is
+    // distinguishable from one stuck on the same blocker. Absent for controllers
+    // that predate the convention: the field is then omitted entirely rather
+    // than defaulted, so the UI can render exactly as it did before.
+    let mode = content
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("[CTRL:")
+                .and_then(|rest| rest.strip_suffix(']'))
+        })
+        .and_then(|inner| {
+            inner
+                .split('|')
+                .filter_map(|field| field.trim().strip_prefix("mode="))
+                .map(|value| value.trim().to_ascii_lowercase())
+                .next()
+        })
+        .filter(|value| {
+            // Only the three known regimes, each optionally carrying a cause
+            // (`blocked:transport-cap`). Anything else is a malformed trailer
+            // and must not reach the UI as a mode chip.
+            let base = value
+                .split_once(':')
+                .map_or(value.as_str(), |(base, _)| base);
+            matches!(base, "active" | "blocked" | "paused")
+        });
 
     // "Bloqué par:" / "Blocked by:" field, when it names a real blocker.
     let blocker = content.lines().find_map(|line| {
@@ -1046,6 +1084,7 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
         at,
         signature,
         state,
+        mode,
         blocker,
     }
 }
@@ -1059,6 +1098,32 @@ mod tests {
         **Changé :** l'audit est terminé.\n\
         **Bloqué par :** lease writer fantôme sur #2219.\n\n\
         [STATE_SIGNATURE: verity|phase-1b|abc123|blocked|lease|next]";
+
+    #[test]
+    fn ctrl_trailer_yields_mode_and_never_becomes_the_headline() {
+        // A quiet tick: the only content is [SILENT] plus the trailer. The
+        // trailer must not be mistaken for the headline.
+        let quiet = "[Cron delivery: Verity]\n[SILENT]\n[CTRL: verity | mode=active | wait=0 | next=certify #2240]";
+        let parsed = parse_delivery("s1", 0.0, quiet);
+        assert_eq!(parsed.mode.as_deref(), Some("active"));
+        assert_eq!(parsed.headline, "[SILENT]");
+
+        // A cause rides along with the mode.
+        let blocked = "[Cron delivery: Bench]\nTransport rejected\n[CTRL: verity-benchmark | mode=blocked:transport-cap | wait=3 | next=shrink tree]";
+        assert_eq!(
+            parse_delivery("s2", 0.0, blocked).mode.as_deref(),
+            Some("blocked:transport-cap")
+        );
+
+        // Controllers that never adopted the trailer report no mode at all,
+        // rather than defaulting to one: the UI must render as it did before.
+        let legacy = "[Cron delivery: Lido]\nSomething happened\n[STATE_SIGNATURE: lido|phase|head|none|next]";
+        assert!(parse_delivery("s3", 0.0, legacy).mode.is_none());
+
+        // A malformed mode is dropped rather than surfaced as a chip.
+        let bogus = "[Cron delivery: X]\nhi\n[CTRL: x | mode=confused | wait=0 | next=none]";
+        assert!(parse_delivery("s4", 0.0, bogus).mode.is_none());
+    }
 
     #[test]
     fn parses_delivery_headline_signature_and_blocker() {
@@ -1148,6 +1213,7 @@ mod tests {
             session_id: "s".into(),
             at: at.into(),
             signature: Some("verity".into()),
+            mode: None,
             state: Some(state.into()),
             blocker: None,
         };
@@ -1288,6 +1354,7 @@ mod tests {
             at: "2026-08-04T12:00:00Z".into(),
             session_id: "cron_e594d751447d_20260804_120931".into(),
             signature: None,
+            mode: None,
             state: None,
             blocker: None,
         });
@@ -1315,6 +1382,7 @@ mod tests {
             at: "2026-08-04T12:00:00Z".into(),
             session_id: "cron_e594d751447d_20260804_120931".into(),
             signature: None,
+            mode: None,
             state: None,
             blocker: None,
         });

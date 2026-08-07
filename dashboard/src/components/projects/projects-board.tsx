@@ -52,6 +52,13 @@ import { hermesChatStream } from "@/lib/api/hermes";
 import { MarkdownContent } from "@/components/markdown-content";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { cn } from "@/lib/utils";
+import {
+  healthDigest,
+  isStale,
+  ModeChip,
+  parseMode,
+  TrackHealthList,
+} from "./project-health";
 
 // Palette discipline: neutrals for structure, indigo for the current
 // selection, amber for problems. Nothing else carries color.
@@ -265,6 +272,7 @@ export default function ProjectsBoard() {
             )}
           >
             <div ref={listRef} className="h-full overflow-y-auto py-1">
+            <SummaryStrip projects={data?.projects ?? []} />
             {sections.map((section) => (
               <div key={section.bucket}>
                 <div className="sticky -top-1 z-10 flex items-center gap-2 border-b border-white/[0.05] bg-[rgb(var(--background))]/95 px-4 py-1.5 backdrop-blur">
@@ -345,6 +353,43 @@ export default function ProjectsBoard() {
   );
 }
 
+/** One-line fleet recap above the list: the "how is everything doing" answer
+ *  that previously required opening each project in turn. Counts blocked and
+ *  silent separately because they are different failures — one reported
+ *  itself, the other stopped reporting at all. */
+function SummaryStrip({ projects }: { projects: ProjectRow[] }) {
+  const counts = useMemo(() => {
+    let blocked = 0;
+    let paused = 0;
+    let silent = 0;
+    let attention = 0;
+    let live = 0;
+    for (const project of projects) {
+      if (project.bucket === "archived") continue;
+      const mode = parseMode(project);
+      if (mode?.base === "blocked") blocked += 1;
+      if (mode?.base === "paused" || project.bucket === "paused") paused += 1;
+      if (isStale(project)) silent += 1;
+      if (project.bucket === "attention") attention += 1;
+      live += liveMissionCount(project);
+    }
+    return { blocked, paused, silent, attention, live };
+  }, [projects]);
+
+  const parts = [
+    counts.live > 0 ? `${counts.live} live` : null,
+    counts.attention > 0 ? `${counts.attention} need attention` : null,
+    counts.blocked > 0 ? `${counts.blocked} blocked` : null,
+    counts.silent > 0 ? `${counts.silent} silent` : null,
+    counts.paused > 0 ? `${counts.paused} paused` : null,
+  ].filter(Boolean) as string[];
+
+  if (parts.length === 0) return null;
+  return (
+    <p className="px-4 py-1.5 text-[11px] text-white/40">{parts.join(" · ")}</p>
+  );
+}
+
 function ProjectListRow({
   project,
   selected,
@@ -356,6 +401,9 @@ function ProjectListRow({
 }) {
   const live = liveMissionCount(project);
   const quiet = isQuiet(project);
+  const mode = parseMode(project);
+  const digest = healthDigest(project.health);
+  const stale = isStale(project);
   return (
     <button
       type="button"
@@ -378,7 +426,10 @@ function ProjectListRow({
           </span>
           {project.latest_update && <UpdateAge at={project.latest_update.at} />}
         </span>
-        {!quiet && (
+        {/* A blocked or stale controller is worth a second line even when the
+            project is otherwise quiet — silence was exactly how a stuck
+            controller used to hide. */}
+        {(!quiet || mode?.base === "blocked" || stale) && (
           <span className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-white/40">
             {live > 0 && (
               <span className="flex shrink-0 items-center gap-1 text-white/55">
@@ -386,13 +437,20 @@ function ProjectListRow({
                 {live}
               </span>
             )}
+            <ModeChip mode={mode} />
+            {stale && (
+              <span className="shrink-0 text-[10px] uppercase tracking-wide text-amber-400/70">
+                silent
+              </span>
+            )}
             <span className="min-w-0 truncate">
-              {stripMarkdown(
-                project.attention_reasons[0] ??
-                  project.latest_update?.headline ??
-                  project.tracker?.status_line ??
-                  "",
-              )}
+              {digest ??
+                stripMarkdown(
+                  project.attention_reasons[0] ??
+                    project.latest_update?.headline ??
+                    project.tracker?.status_line ??
+                    "",
+                )}
             </span>
           </span>
         )}
@@ -824,6 +882,14 @@ function ProjectDetail({
                 {reason}
               </p>
             ))}
+          </div>
+        )}
+        {project.health && project.health.tracks.length > 0 && (
+          <div className="mt-2 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2">
+            <p className="mb-1 text-[10px] uppercase tracking-wider text-white/40">
+              Tracks
+            </p>
+            <TrackHealthList health={project.health} />
           </div>
         )}
         {project.missions.length > 0 && <MissionList missions={project.missions} />}

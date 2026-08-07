@@ -25,7 +25,38 @@ export interface ProjectDeliveryUpdate {
   session_id: string;
   at: string;
   signature: string | null;
+  /** Descriptor fields after the routing key in the `[STATE_SIGNATURE: …]`
+   *  trailer. The board detects a stall by seeing this repeat unchanged. */
+  state?: string | null;
+  /** Controller-reported mode from the `[CTRL: … mode=… ]` trailer:
+   *  `active`, `blocked[:cause]` or `paused[:reason]`. Absent for controllers
+   *  that have not adopted the trailer — render nothing, never "unknown". */
+  mode?: string | null;
   blocker: string | null;
+}
+
+export type TrackVerdict = "failing" | "overdue" | "active" | "done" | "idle";
+
+export interface TrackHealth {
+  track: string | null;
+  verdict: TrackVerdict;
+  missions: number;
+  active: number;
+  failed: number;
+  completed: number;
+  overdue: number;
+  desired_states: Record<string, number>;
+  last_activity_at: string | null;
+}
+
+export interface ProjectHealth {
+  missions: number;
+  active: number;
+  failed: number;
+  overdue: number;
+  tracks_needing_attention: number;
+  /** Worst-first, per the backend rollup. */
+  tracks: TrackHealth[];
 }
 
 export type ProjectBucket = "attention" | "active" | "paused" | "archived";
@@ -47,6 +78,7 @@ export interface ProjectRow {
   latest_update: ProjectDeliveryUpdate | null;
   updates_count: number;
   attention_reasons: string[];
+  health: ProjectHealth;
   conversation?: ProjectConversation | null;
 }
 

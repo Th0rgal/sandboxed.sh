@@ -7,7 +7,12 @@ import {
   getProjectUpdates,
   postProjectAction,
 } from "@/lib/api/projects";
-import type { ProjectRow, ProjectsOverview } from "@/lib/api/projects";
+import type {
+  ProjectHealth,
+  ProjectRow,
+  ProjectsOverview,
+  TrackHealth,
+} from "@/lib/api/projects";
 import { hermesChatStream, listHermesSessions } from "@/lib/api/hermes";
 import ProjectsBoard from "./projects-board";
 
@@ -43,6 +48,34 @@ function project(overrides: Partial<ProjectRow>): ProjectRow {
     latest_update: null,
     updates_count: 0,
     attention_reasons: [],
+    health: health(),
+    ...overrides,
+  };
+}
+
+function health(overrides: Partial<ProjectHealth> = {}): ProjectHealth {
+  return {
+    missions: 0,
+    active: 0,
+    failed: 0,
+    overdue: 0,
+    tracks_needing_attention: 0,
+    tracks: [],
+    ...overrides,
+  };
+}
+
+function track(overrides: Partial<TrackHealth> = {}): TrackHealth {
+  return {
+    track: "phase-a",
+    verdict: "active",
+    missions: 1,
+    active: 1,
+    failed: 0,
+    completed: 0,
+    overdue: 0,
+    desired_states: {},
+    last_activity_at: null,
     ...overrides,
   };
 }
@@ -392,5 +425,103 @@ describe("ProjectsBoard", () => {
     // The slug renders in both the list row and the detail heading.
     expect(await screen.findAllByText("verity")).not.toHaveLength(0);
     expect(screen.queryByTitle("Conversation")).not.toBeInTheDocument();
+  });
+
+  test("surfaces controller mode, and renders nothing when it is absent", async () => {
+    // Absence must be indistinguishable from the pre-trailer board: a
+    // controller that never adopted [CTRL: …] must not gain an "unknown" chip.
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "legacy-project",
+          updates_count: 3,
+          latest_update: {
+            headline: "Rien de neuf",
+            body: null,
+            session_id: "s1",
+            at: new Date().toISOString(),
+            signature: "legacy-project",
+            blocker: null,
+          },
+        }),
+        project({
+          slug: "benchmark",
+          updates_count: 2,
+          latest_update: {
+            headline: "Transport bloqué",
+            body: null,
+            session_id: "s2",
+            at: new Date().toISOString(),
+            signature: "benchmark",
+            mode: "blocked:transport-cap",
+            blocker: null,
+          },
+        }),
+      ]),
+    );
+
+    renderBoard();
+
+    expect(await screen.findByText("blocked: transport-cap")).toBeInTheDocument();
+    expect(screen.queryByText(/unknown/i)).not.toBeInTheDocument();
+    // The legacy row gets no chip at all — absence must look like the old board.
+    expect(screen.queryByTitle("active")).not.toBeInTheDocument();
+  });
+
+  test("shows the health digest when a track needs attention", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity",
+          updates_count: 5,
+          health: health({
+            missions: 4,
+            active: 1,
+            failed: 2,
+            overdue: 1,
+            tracks_needing_attention: 1,
+            tracks: [track({ track: "phase-b", verdict: "failing", failed: 2 })],
+          }),
+          latest_update: {
+            headline: "un titre bien moins utile",
+            body: null,
+            session_id: "s3",
+            at: new Date().toISOString(),
+            signature: "verity",
+            blocker: null,
+          },
+        }),
+      ]),
+    );
+
+    renderBoard();
+
+    // The digest replaces the headline precisely because it is the more
+    // actionable line when a track is failing.
+    expect(await screen.findByText(/2 failing/)).toBeInTheDocument();
+    expect(screen.queryByText("un titre bien moins utile")).not.toBeInTheDocument();
+  });
+
+  test("counts blocked projects in the summary strip", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "benchmark",
+          latest_update: {
+            headline: "bloqué",
+            body: null,
+            session_id: "s4",
+            at: new Date().toISOString(),
+            signature: "benchmark",
+            mode: "blocked",
+            blocker: null,
+          },
+        }),
+      ]),
+    );
+
+    renderBoard();
+
+    expect(await screen.findByText(/1 blocked/)).toBeInTheDocument();
   });
 });
