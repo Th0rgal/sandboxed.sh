@@ -683,12 +683,17 @@ mod tests {
         )
         .await
         .expect("job accepted");
-        for _ in 0..20 {
-            if state.runner.active_count() == 1 {
-                break;
+        // Wait for the async job's process to actually register as active. A
+        // 200ms budget raced with process startup under a heavily parallel test
+        // runner (the scheduled CI run flaked here); match the 5s budget the
+        // terminal-state wait below already uses. Breaks immediately once up.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.runner.active_count() != 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .expect("async job should register as active");
         assert_eq!(state.runner.active_count(), 1);
 
         let execute_claims = LeaseClaims {
