@@ -1,11 +1,11 @@
 import SwiftUI
 
 /// One project in full: the controller-reported state, the cron controller that
-/// drives it, its bound Hermes session (tap to open it in Control), the
-/// autonomy grant, tracks, live mission-agents, and any open decisions.
+/// drives it, its bound control conversation (tap to open it in Control), the
+/// autonomy grant, tracks, live missions, and any open decisions.
 ///
-/// This is where "which controller drives this project, and which session is it
-/// tied to" is answered — the link the switcher never surfaced.
+/// This is where "which controller drives this project, and which conversation
+/// is it tied to" is answered — the link the switcher never surfaced.
 struct ProjectDetailView: View {
     let slug: String
     /// The overview row we came from, used as an instant fallback while the
@@ -38,9 +38,14 @@ struct ProjectDetailView: View {
             .padding(16)
         }
         .background(Theme.backgroundPrimary)
-        .navigationTitle(record?.displayTitle ?? slug)
+        .navigationTitle(record?.displayTitle ?? summary?.displayName ?? slug)
         .navigationBarTitleDisplayMode(.inline)
-        .task { await load() }
+        .task {
+            await load()
+            // Opening the detail marks the project's deliveries as seen — the
+            // list badge is the delta since this moment.
+            if let summary { ProjectUnreadStore.shared.markSeen(summary) }
+        }
         .refreshable { await load() }
     }
 
@@ -52,7 +57,7 @@ struct ProjectDetailView: View {
         GlassCard {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
-                    Text(record?.displayTitle ?? slug)
+                    Text(record?.displayTitle ?? summary?.displayName ?? slug)
                         .font(.system(size: 18, weight: .bold))
                         .foregroundStyle(Theme.textPrimary)
                     if let mode = record?.controllerMode ?? summary?.mode {
@@ -79,7 +84,7 @@ struct ProjectDetailView: View {
         }
     }
 
-    // MARK: controller + bound session
+    // MARK: controller + control conversation
 
     private var controllerSection: some View {
         GlassCard {
@@ -141,14 +146,14 @@ struct ProjectDetailView: View {
             || g.pauseReason != nil || g.resumeCondition != nil
     }
 
-    // MARK: missions (the agents)
+    // MARK: missions
 
     @ViewBuilder private var missionsSection: some View {
         let missions = summary?.missions ?? []
         if !missions.isEmpty {
             GlassCard {
                 VStack(alignment: .leading, spacing: 8) {
-                    sectionTitle("Agents", icon: "cpu")
+                    sectionTitle("Missions", icon: "cpu")
                     ForEach(missions) { m in
                         HStack(spacing: 8) {
                             Circle()

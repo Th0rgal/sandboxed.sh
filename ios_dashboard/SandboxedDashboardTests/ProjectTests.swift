@@ -219,3 +219,107 @@ final class MissionProjectMetadataTests: XCTestCase {
         XCTAssertNil(try mission(project: nil, track: "orphan-track").projectLabel)
     }
 }
+
+/// Roster metadata on the overview row: title replaces the slug on cards,
+/// next_action is only rendered when present.
+final class ProjectRosterMetadataTests: XCTestCase {
+    func testTitleAndNextActionDecodeAndDisplayNamePrefersTitle() throws {
+        let project = try JSONDecoder().decode(
+            ProjectSummary.self,
+            from: Data(
+                """
+                {
+                  "slug": "verity", "bucket": "active",
+                  "title": "Verity 4.31 convergence",
+                  "next_action": "certify #2240"
+                }
+                """.utf8
+            )
+        )
+        XCTAssertEqual(project.title, "Verity 4.31 convergence")
+        XCTAssertEqual(project.nextAction, "certify #2240")
+        XCTAssertEqual(project.displayName, "Verity 4.31 convergence")
+    }
+
+    func testDisplayNameFallsBackToSlug() throws {
+        let project = try JSONDecoder().decode(
+            ProjectSummary.self,
+            from: Data(#"{ "slug": "lido", "bucket": "active" }"#.utf8)
+        )
+        XCTAssertNil(project.title)
+        XCTAssertNil(project.nextAction)
+        XCTAssertEqual(project.displayName, "lido")
+    }
+}
+
+/// The unread badge: new deliveries since the project detail was last opened.
+final class ProjectUnreadTests: XCTestCase {
+    private func seen(_ count: Int, at: String? = nil) -> ProjectLastSeen {
+        ProjectLastSeen(updatesCount: count, latestAt: at)
+    }
+
+    func testNeverOpenedCountsEveryUpdate() {
+        XCTAssertEqual(ProjectUnread.count(updatesCount: 7, latestAt: "2026-08-08T00:00:00Z", seen: nil), 7)
+    }
+
+    func testDeltaSinceLastSeen() {
+        XCTAssertEqual(ProjectUnread.count(updatesCount: 7, latestAt: nil, seen: seen(4)), 3)
+    }
+
+    func testCaughtUpIsZero() {
+        let at = "2026-08-08T00:00:00Z"
+        XCTAssertEqual(ProjectUnread.count(updatesCount: 4, latestAt: at, seen: seen(4, at: at)), 0)
+    }
+
+    /// The updates window is rolling: the count can stay flat while newer
+    /// deliveries replace older ones — a fresher timestamp still means unread.
+    func testFlatCountWithNewerTimestampShowsOne() {
+        XCTAssertEqual(
+            ProjectUnread.count(
+                updatesCount: 4,
+                latestAt: "2026-08-08T12:00:00Z",
+                seen: seen(4, at: "2026-08-08T00:00:00Z")
+            ),
+            1
+        )
+    }
+
+    func testShrunkenCountDoesNotGoNegative() {
+        let at = "2026-08-08T00:00:00Z"
+        XCTAssertEqual(ProjectUnread.count(updatesCount: 2, latestAt: at, seen: seen(10, at: at)), 0)
+    }
+
+    func testFractionalSecondTimestampsParse() {
+        XCTAssertEqual(
+            ProjectUnread.count(
+                updatesCount: 4,
+                latestAt: "2026-08-08T12:00:00.500Z",
+                seen: seen(4, at: "2026-08-08T12:00:00.100Z")
+            ),
+            1
+        )
+    }
+
+    func testStoreRoundTripAndMarkSeen() throws {
+        let suite = "ProjectUnreadTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = ProjectUnreadStore(defaults: defaults)
+
+        let project = try JSONDecoder().decode(
+            ProjectSummary.self,
+            from: Data(
+                """
+                {
+                  "slug": "verity", "bucket": "active", "updates_count": 5,
+                  "latest_update": { "headline": "h", "at": "2026-08-08T00:00:00Z" }
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(store.unreadCount(for: project), 5)
+        store.markSeen(project)
+        XCTAssertEqual(store.unreadCount(for: project), 0)
+    }
+}

@@ -10,6 +10,10 @@ struct ProjectSummary: Codable, Identifiable, Hashable {
     var id: String { slug }
 
     let slug: String
+    /// Roster title, when set — shown instead of the raw slug.
+    let title: String?
+    /// The controller's declared next step, from the roster record.
+    let nextAction: String?
     /// `attention` | `active` | `paused` | anything else the server adds.
     let bucket: String
     let attentionReasons: [String]
@@ -17,11 +21,12 @@ struct ProjectSummary: Codable, Identifiable, Hashable {
     let health: ProjectHealth?
     let conversation: ProjectConversation?
     let latestUpdate: ProjectUpdate?
-    /// Live missions grouped under this project — the "agents" of the fleet.
+    /// Live missions grouped under this project.
     let missions: [ProjectMissionChip]
 
     enum CodingKeys: String, CodingKey {
-        case slug, bucket, health, conversation, missions
+        case slug, title, bucket, health, conversation, missions
+        case nextAction = "next_action"
         case attentionReasons = "attention_reasons"
         case updatesCount = "updates_count"
         case latestUpdate = "latest_update"
@@ -30,6 +35,8 @@ struct ProjectSummary: Codable, Identifiable, Hashable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         slug = try container.decode(String.self, forKey: .slug)
+        title = try container.decodeIfPresent(String.self, forKey: .title)
+        nextAction = try container.decodeIfPresent(String.self, forKey: .nextAction)
         bucket = try container.decodeIfPresent(String.self, forKey: .bucket) ?? "active"
         attentionReasons = try container.decodeIfPresent([String].self, forKey: .attentionReasons) ?? []
         updatesCount = try container.decodeIfPresent(Int.self, forKey: .updatesCount) ?? 0
@@ -37,6 +44,13 @@ struct ProjectSummary: Codable, Identifiable, Hashable {
         conversation = try container.decodeIfPresent(ProjectConversation.self, forKey: .conversation)
         latestUpdate = try container.decodeIfPresent(ProjectUpdate.self, forKey: .latestUpdate)
         missions = try container.decodeIfPresent([ProjectMissionChip].self, forKey: .missions) ?? []
+    }
+
+    /// What to render as the project's name: the roster title when one was
+    /// set, the slug otherwise.
+    var displayName: String {
+        if let title, !title.isEmpty { return title }
+        return slug
     }
 
     /// The controller-reported mode from the latest delivery: `active`,
@@ -351,5 +365,85 @@ struct ProjectState: Codable, Hashable, Identifiable {
         case signature, headline, observations
         case firstSeenAt = "first_seen_at"
         case lastSeenAt = "last_seen_at"
+    }
+}
+
+// MARK: - Unread tracking
+
+/// What the user had seen of a project the last time they opened its detail:
+/// the delivery count and the newest delivery timestamp at that moment.
+struct ProjectLastSeen: Codable, Equatable {
+    let updatesCount: Int
+    let latestAt: String?
+}
+
+/// New deliveries since a project was last opened. Pure so it is testable;
+/// mirrors the web board's `unreadCountFor`.
+///
+/// - Never opened → every update is unread.
+/// - Count grew → the delta.
+/// - Count flat but `latest_update.at` newer → at least 1 (the updates window
+///   is rolling: newer deliveries can replace older ones without moving the
+///   count).
+enum ProjectUnread {
+    static func count(updatesCount: Int, latestAt: String?, seen: ProjectLastSeen?) -> Int {
+        guard let seen else { return max(0, updatesCount) }
+        let delta = updatesCount - seen.updatesCount
+        if delta > 0 { return delta }
+        guard let latestAt else { return 0 }
+        guard let seenAt = seen.latestAt else { return 1 }
+        guard let latest = parseDate(latestAt), let previous = parseDate(seenAt) else { return 0 }
+        return latest > previous ? 1 : 0
+    }
+
+    private static let isoWithFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let iso = ISO8601DateFormatter()
+
+    static func parseDate(_ raw: String) -> Date? {
+        isoWithFractional.date(from: raw) ?? iso.date(from: raw)
+    }
+}
+
+/// Client-side "seen" state for the projects board, persisted in UserDefaults
+/// keyed by project slug — the backend has no per-user read state.
+final class ProjectUnreadStore {
+    static let shared = ProjectUnreadStore()
+
+    private let defaults: UserDefaults
+    private let storageKey = "projects.lastSeen.v1"
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func unreadCount(for project: ProjectSummary) -> Int {
+        ProjectUnread.count(
+            updatesCount: project.updatesCount,
+            latestAt: project.latestUpdate?.at,
+            seen: lastSeen()[project.slug]
+        )
+    }
+
+    /// Opening the project detail marks everything current as seen.
+    func markSeen(_ project: ProjectSummary) {
+        var map = lastSeen()
+        map[project.slug] = ProjectLastSeen(
+            updatesCount: project.updatesCount,
+            latestAt: project.latestUpdate?.at
+        )
+        if let data = try? JSONEncoder().encode(map) {
+            defaults.set(data, forKey: storageKey)
+        }
+    }
+
+    private func lastSeen() -> [String: ProjectLastSeen] {
+        guard let data = defaults.data(forKey: storageKey),
+              let map = try? JSONDecoder().decode([String: ProjectLastSeen].self, from: data)
+        else { return [:] }
+        return map
     }
 }
