@@ -1,16 +1,21 @@
 import SwiftUI
 
 /// The projects surface: every sandboxed.sh project as a card showing its
-/// controller-reported mode, its live mission-agents, and — through the detail
-/// view — the controller that drives it and the session bound to it.
+/// controller-reported mode, its live missions, and — through the detail
+/// view — the controller that drives it and the control conversation bound
+/// to it.
 ///
 /// Unlike the mission-switcher's project rows, this does NOT hide projects
-/// without a bound session: a paused or freshly-seeded project is still a
-/// project worth seeing.
+/// without a bound conversation: a paused or freshly-seeded project is still
+/// a project worth seeing.
 struct ProjectsView: View {
     private let api = APIService.shared
+    private let unreadStore = ProjectUnreadStore.shared
 
     @State private var projects: [ProjectSummary] = []
+    /// Unread deliveries per slug, recomputed on load and whenever the list
+    /// reappears (coming back from a detail view clears that project's badge).
+    @State private var unread: [String: Int] = [:]
     @State private var isLoading = true
     @State private var loadError: String?
 
@@ -72,7 +77,7 @@ struct ProjectsView: View {
                     NavigationLink {
                         ProjectDetailView(slug: project.slug, summary: project)
                     } label: {
-                        ProjectCard(project: project)
+                        ProjectCard(project: project, unread: unread[project.slug] ?? 0)
                     }
                     .buttonStyle(.plain)
                 }
@@ -80,6 +85,14 @@ struct ProjectsView: View {
             .padding(16)
         }
         .background(Theme.backgroundPrimary)
+        .onAppear { refreshUnread() }
+    }
+
+    private func refreshUnread() {
+        unread = Dictionary(
+            projects.map { ($0.slug, unreadStore.unreadCount(for: $0)) },
+            uniquingKeysWith: { first, _ in first }
+        )
     }
 
     private func load() async {
@@ -88,22 +101,26 @@ struct ProjectsView: View {
         do {
             projects = try await api.listProjects()
             loadError = nil
+            refreshUnread()
         } catch {
             loadError = error.localizedDescription
         }
     }
 }
 
-/// One project as a card: title/slug, mode chip, live-agent count, and the
-/// single most useful line (attention reason, blocker, or headline).
+/// One project as a card: title/slug, mode chip, live-mission count, unread
+/// deliveries, and the single most useful line (attention reason, blocker,
+/// or headline).
 struct ProjectCard: View {
     let project: ProjectSummary
+    /// New deliveries since the project was last opened; 0 hides the badge.
+    var unread: Int = 0
 
     var body: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
-                    Text(project.slug)
+                    Text(project.displayName)
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(Theme.textPrimary)
                         .lineLimit(1)
@@ -111,6 +128,15 @@ struct ProjectCard: View {
                         ModeChipView(mode: mode)
                     }
                     Spacer(minLength: 4)
+                    if unread > 0 {
+                        Text(unread > 9 ? "9+" : "\(unread)")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Theme.accent)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Theme.accent.opacity(0.15), in: Capsule())
+                            .accessibilityLabel("\(unread > 9 ? "9 or more" : "\(unread)") new updates")
+                    }
                     if !project.liveMissions.isEmpty {
                         Label("\(project.liveMissions.count)", systemImage: "circle.fill")
                             .labelStyle(.titleAndIcon)

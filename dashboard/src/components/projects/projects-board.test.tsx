@@ -14,7 +14,10 @@ import type {
   TrackHealth,
 } from "@/lib/api/projects";
 import { hermesChatStream, listHermesSessions } from "@/lib/api/hermes";
-import ProjectsBoard from "./projects-board";
+import ProjectsBoard, {
+  unreadCountFor,
+  type ProjectLastSeen,
+} from "./projects-board";
 
 vi.mock("@/lib/api/projects", () => ({
   getProjectsOverview: vi.fn(),
@@ -198,7 +201,7 @@ describe("ProjectsBoard", () => {
     await waitFor(() => expect(mockedUpdates).toHaveBeenCalledWith("beal", 50));
     // First update is expanded by default: body + origin session visible.
     expect(
-      await screen.findByText(/Origin session: sess-42/),
+      await screen.findByText(/Origin conversation: sess-42/),
     ).toBeInTheDocument();
   });
 
@@ -523,5 +526,56 @@ describe("ProjectsBoard", () => {
     renderBoard();
 
     expect(await screen.findByText(/1 blocked/)).toBeInTheDocument();
+  });
+});
+
+describe("unreadCountFor", () => {
+  const seen = (
+    updates_count: number,
+    latest_at: string | null = null,
+  ): ProjectLastSeen => ({ updates_count, latest_at });
+
+  const proj = (updates_count: number, at: string | null) => ({
+    updates_count,
+    latest_update: at
+      ? {
+          headline: "h",
+          body: null,
+          session_id: "s",
+          at,
+          signature: "sig",
+          mode: null,
+          blocker: null,
+        }
+      : null,
+  });
+
+  test("never-opened project counts every update", () => {
+    expect(unreadCountFor(proj(7, "2026-08-08T00:00:00Z"), undefined)).toBe(7);
+  });
+
+  test("delta since last seen", () => {
+    expect(unreadCountFor(proj(7, null), seen(4))).toBe(3);
+  });
+
+  test("caught up means zero", () => {
+    const at = "2026-08-08T00:00:00Z";
+    expect(unreadCountFor(proj(4, at), seen(4, at))).toBe(0);
+  });
+
+  test("flat count with a newer latest_update still shows one", () => {
+    // The updates window is rolling: the count can stay flat while newer
+    // deliveries replace older ones.
+    expect(
+      unreadCountFor(
+        proj(4, "2026-08-08T12:00:00Z"),
+        seen(4, "2026-08-08T00:00:00Z"),
+      ),
+    ).toBe(1);
+  });
+
+  test("count shrinking (server-side trim) does not go negative", () => {
+    const at = "2026-08-08T00:00:00Z";
+    expect(unreadCountFor(proj(2, at), seen(10, at))).toBe(0);
   });
 });

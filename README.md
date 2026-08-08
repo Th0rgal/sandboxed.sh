@@ -64,7 +64,7 @@ building in isolation. Four concepts tie the system together:
 |---|---|---|
 | **Project** | The durable unit of work (an audit, a paper, a benchmark). First-class object with a mode (`active` / `blocked` / `paused`), an autonomy **grant** (merge authority, budget, parallelism), **tracks**, and open **decisions**. | `projects.db` on the sandboxed.sh host, served at `/api/projects/*` |
 | **Controller** | A coordinator cron that wakes on a schedule, reads its control conversation + GitHub + the project state, and dispatches work. It drives exactly one project and reports back with structured status trailers. | Coordinator (e.g. a Hermes cron with the project MCP tools) |
-| **Session** | The durable control conversation bound to a project — where you (or the controller) talk. Continuations roll over, so it's addressed by route, not a frozen ID. | Coordinator, binding stored in `projects.db` |
+| **Conversation** *(control session)* | The durable Hermes chat thread; the one bound to a project is its **control conversation** — where you (or the controller) talk — where you (or the controller) talk. Continuations roll over, so it's addressed by route, not a frozen ID. | Coordinator, binding stored in `projects.db` |
 | **Mission** | One unit of autonomous execution: an agent in an isolated workspace/container running a harness (Claude Code, Codex, …) that writes code, runs builds, opens PRs. Tagged with `project`/`track`. | sandboxed.sh workspaces |
 
 ```
@@ -85,13 +85,14 @@ instead of free text; a state ingestor also folds controller status trailers
 from deliveries into the project record, so the roster stays current even for
 text-only updates.
 
-**Rule of thumb:** *decide/coordinate → the assistant; build/execute in
-isolation → a sandboxed mission.* In-conversation subagents are for quick
+**Rule of thumb:** *a controller drives a project through its control
+conversation by dispatching missions.* Decide/coordinate → the assistant;
+build/execute in isolation → a sandboxed mission. In-conversation subagents are for quick
 reasoning and decomposition; anything needing a real filesystem, git, builds,
 or a PR gets dispatched as a mission.
 
 The same project roster is rendered by three surfaces: the web dashboard's
-board (`/`), the Hermes desktop board plugin, and the iOS app's Projects tab.
+board (`/`), the desktop Projects board, and the iOS app's Projects tab.
 
 ---
 

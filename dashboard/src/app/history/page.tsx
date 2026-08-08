@@ -206,9 +206,9 @@ export default function HistoryPage() {
     <div className="p-6">
       {/* Header */}
       <div className="mb-6">
-        <h1 className="text-xl font-semibold text-white">Agents</h1>
+        <h1 className="text-xl font-semibold text-white">Missions</h1>
         <p className="mt-1 text-sm text-white/50">
-          Mission history and agent tree visualization
+          Mission history and subagent tree visualization
         </p>
       </div>
 
