@@ -211,7 +211,11 @@ export default function ProjectsBoard() {
     const projects = data?.projects ?? [];
     const query = filter.trim().toLowerCase();
     const filtered = query
-      ? projects.filter((p) => p.slug.toLowerCase().includes(query))
+      ? projects.filter(
+          (p) =>
+            p.slug.toLowerCase().includes(query) ||
+            (p.title ?? "").toLowerCase().includes(query),
+        )
       : projects;
     return SECTIONS.map((section) => ({
       ...section,
@@ -529,7 +533,7 @@ function ProjectListRow({
               quiet ? "text-white/45" : "text-white/85",
             )}
           >
-            {project.slug}
+            {project.title || project.slug}
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
             {unread > 0 && (
@@ -967,8 +971,11 @@ function ProjectDetail({
           >
             <ArrowLeft className="h-4 w-4" />
           </button>
-          <h2 className="min-w-0 truncate text-base font-semibold text-white/90">
-            {project.slug}
+          <h2
+            title={project.title ? project.slug : undefined}
+            className="min-w-0 truncate text-base font-semibold text-white/90"
+          >
+            {project.title || project.slug}
           </h2>
           {section && (
             <span className="flex shrink-0 items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-0.5 text-[10px] font-medium text-white/45">

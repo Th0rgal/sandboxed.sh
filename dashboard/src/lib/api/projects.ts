@@ -72,6 +72,10 @@ export interface ProjectConversation {
 
 export interface ProjectRow {
   slug: string;
+  /** Roster title, when set — shown instead of the raw slug. */
+  title?: string | null;
+  /** The controller's declared next step, from the roster record. */
+  next_action?: string | null;
   bucket: ProjectBucket;
   tracker: ProjectTracker | null;
   missions: ProjectMissionChip[];

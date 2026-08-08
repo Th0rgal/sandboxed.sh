@@ -498,6 +498,13 @@ pub struct DeliveryUpdate {
 #[derive(Debug, Serialize)]
 struct ProjectRow {
     slug: String,
+    /// The roster project's title, when one was set — surfaces render it
+    /// instead of the raw slug.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// The controller's declared next step, from the roster record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_action: Option<String>,
     bucket: &'static str,
     tracker: Option<TrackerInfo>,
     missions: Vec<MissionChip>,
@@ -638,8 +645,11 @@ pub async fn projects_overview(
             continue;
         }
         let slug = record.slug.clone();
-        rows.entry(slug.clone())
+        let builder = rows
+            .entry(slug.clone())
             .or_insert_with(|| ProjectRowBuilder::new(slug));
+        builder.title = record.title;
+        builder.next_action = record.next_action;
     }
     let mut unrouted: Vec<DeliveryUpdate> = Vec::new();
     for delivery in deliveries {
@@ -723,6 +733,9 @@ pub async fn project_updates(
 
 struct ProjectRowBuilder {
     slug: String,
+    /// Roster title/next-action, attached when the slug has a roster record.
+    title: Option<String>,
+    next_action: Option<String>,
     tracker: Option<TrackerInfo>,
     missions: Vec<MissionChip>,
     /// Health inputs, accumulated alongside the display chips.
@@ -737,6 +750,8 @@ impl ProjectRowBuilder {
     fn new(slug: String) -> Self {
         Self {
             slug,
+            title: None,
+            next_action: None,
             tracker: None,
             missions: Vec::new(),
             health_inputs: Vec::new(),
@@ -892,6 +907,8 @@ impl ProjectRowBuilder {
 
         ProjectRow {
             slug: self.slug,
+            title: self.title,
+            next_action: self.next_action,
             bucket,
             tracker: self.tracker,
             missions: self.missions,
@@ -1710,5 +1727,31 @@ mod tests {
         let conversation = row.conversation.expect("conversation");
         assert_eq!(conversation.source, "latest_update");
         assert_eq!(conversation.bound_at, None);
+    }
+
+    /// Roster metadata rides on the row: the title replaces the slug on cards
+    /// and the palette; next_action renders on attention cards. Both are
+    /// optional and absent from the JSON when unset.
+    #[test]
+    fn roster_title_and_next_action_ride_on_the_row() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder.title = Some("Verity 4.31 convergence".to_string());
+        builder.next_action = Some("certify #2240".to_string());
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.title.as_deref(), Some("Verity 4.31 convergence"));
+        assert_eq!(row.next_action.as_deref(), Some("certify #2240"));
+
+        let bare = ProjectRowBuilder::new("lido".to_string()).finish(
+            &[],
+            None,
+            None,
+            "2026-08-04T12:00:00Z",
+        );
+        let json = serde_json::to_value(&bare).expect("serialize");
+        assert!(json.get("title").is_none(), "unset title is omitted");
+        assert!(
+            json.get("next_action").is_none(),
+            "unset next_action is omitted"
+        );
     }
 }
