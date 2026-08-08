@@ -17,6 +17,7 @@
   <a href="https://sandboxed.sh">Website</a> ·
   <a href="https://relens.ai/community">Discord</a> ·
   <a href="#vision">Vision</a> ·
+  <a href="#architecture">Architecture</a> ·
   <a href="#features">Features</a> ·
   <a href="#ecosystem">Ecosystem</a> ·
   <a href="#screenshots">Screenshots</a> ·
@@ -52,10 +53,55 @@ literature. Local inference, isolated containers, nothing leaves your machines.
 
 ---
 
+## Architecture
+
+sandboxed.sh is the **execution half** of a two-part system. The other half is a
+coordinator (we use [Hermes](https://github.com/Th0rgal/hermes-agent), but any
+MCP-capable assistant works) that decides *what* to do; sandboxed.sh does the
+building in isolation. Four concepts tie the system together:
+
+| Concept | What it is | Where it lives |
+|---|---|---|
+| **Project** | The durable unit of work (an audit, a paper, a benchmark). First-class object with a mode (`active` / `blocked` / `paused`), an autonomy **grant** (merge authority, budget, parallelism), **tracks**, and open **decisions**. | `projects.db` on the sandboxed.sh host, served at `/api/projects/*` |
+| **Controller** | A coordinator cron that wakes on a schedule, reads its control conversation + GitHub + the project state, and dispatches work. It drives exactly one project and reports back with structured status trailers. | Coordinator (e.g. a Hermes cron with the project MCP tools) |
+| **Session** | The durable control conversation bound to a project — where you (or the controller) talk. Continuations roll over, so it's addressed by route, not a frozen ID. | Coordinator, binding stored in `projects.db` |
+| **Mission** | One unit of autonomous execution: an agent in an isolated workspace/container running a harness (Claude Code, Codex, …) that writes code, runs builds, opens PRs. Tagged with `project`/`track`. | sandboxed.sh workspaces |
+
+```
+             decide / coordinate                      build / execute
+  ┌────────────────────────────────┐      ┌────────────────────────────────────┐
+  │  Coordinator (Hermes)          │ MCP  │  sandboxed.sh                      │
+  │                                ├─────▶│                                    │
+  │  controller crons              │      │  missions in isolated workspaces   │
+  │  control conversations         │      │  (systemd-nspawn / Docker)         │
+  │  project tools + start_mission │◀─────┤  projects.db · event stream        │
+  └────────────────────────────────┘ SSE/ └────────────────────────────────────┘
+                                  webhooks
+```
+
+Controllers write structured project state through MCP tools (`list_projects`,
+`update_project_status`, `set_project_grant`, `link_mission_to_project`, …)
+instead of free text; a state ingestor also folds controller status trailers
+from deliveries into the project record, so the roster stays current even for
+text-only updates.
+
+**Rule of thumb:** *decide/coordinate → the assistant; build/execute in
+isolation → a sandboxed mission.* In-conversation subagents are for quick
+reasoning and decomposition; anything needing a real filesystem, git, builds,
+or a PR gets dispatched as a mission.
+
+The same project roster is rendered by three surfaces: the web dashboard's
+board (`/`), the Hermes desktop board plugin, and the iOS app's Projects tab.
+
+---
+
 ## Features
 
 - **Multi-Runtime Support**: Run Claude Code, OpenCode, Codex, Gemini, and Grok
   agents in the same infrastructure
+- **Projects & Controllers**: First-class projects (mode, autonomy grant,
+  tracks, decisions) driven by scheduled controllers over MCP — structured
+  state, not status prose
 - **Mission Control**: Start, stop, and monitor agents remotely with real-time
   streaming
 - **Isolated Workspaces**: Containerized Linux environments (systemd-nspawn)
