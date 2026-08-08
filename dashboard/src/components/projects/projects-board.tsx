@@ -119,6 +119,71 @@ function stripMarkdown(text: string): string {
     .trim();
 }
 
+// ── Unread tracking ─────────────────────────────────────────────────────────
+// Client-side only: the backend has no per-user read state, so "seen" lives in
+// localStorage keyed by project slug. Opening a project in the detail pane
+// records its current updates_count / latest_update.at; the badge is the delta.
+
+const LAST_SEEN_STORAGE_KEY = "projects-board.last-seen.v1";
+
+export type ProjectLastSeen = {
+  updates_count: number;
+  latest_at: string | null;
+};
+
+function loadLastSeen(): Record<string, ProjectLastSeen> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(LAST_SEEN_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return {};
+    const result: Record<string, ProjectLastSeen> = {};
+    for (const [slug, value] of Object.entries(
+      parsed as Record<string, unknown>,
+    )) {
+      if (!value || typeof value !== "object") continue;
+      const entry = value as Partial<ProjectLastSeen>;
+      if (typeof entry.updates_count !== "number") continue;
+      result[slug] = {
+        updates_count: entry.updates_count,
+        latest_at: typeof entry.latest_at === "string" ? entry.latest_at : null,
+      };
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+function persistLastSeen(map: Record<string, ProjectLastSeen>) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(LAST_SEEN_STORAGE_KEY, JSON.stringify(map));
+  } catch {
+    // Storage full or unavailable — the badge just won't persist.
+  }
+}
+
+/** New deliveries since the project was last opened. Exported for tests. */
+export function unreadCountFor(
+  project: Pick<ProjectRow, "updates_count" | "latest_update">,
+  seen: ProjectLastSeen | undefined,
+): number {
+  if (!seen) return Math.max(0, project.updates_count);
+  const delta = project.updates_count - seen.updates_count;
+  if (delta > 0) return delta;
+  // The rolling updates window can keep the count flat while newer deliveries
+  // replace older ones — a fresher latest_update.at still means "something new".
+  const latest = project.latest_update?.at ?? null;
+  if (!latest) return 0;
+  if (!seen.latest_at) return 1;
+  const latestMs = new Date(latest).getTime();
+  const seenMs = new Date(seen.latest_at).getTime();
+  if (Number.isNaN(latestMs) || Number.isNaN(seenMs)) return 0;
+  return latestMs > seenMs ? 1 : 0;
+}
+
 /** A project with no missions and no updates is a quiet tracker file. */
 function isQuiet(project: ProjectRow): boolean {
   return project.missions.length === 0 && project.updates_count === 0;
@@ -134,6 +199,13 @@ export default function ProjectsBoard() {
   const [filter, setFilter] = useState("");
   const [mobileDetail, setMobileDetail] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
+
+  // Loaded in an effect (not the initial state) so the server render and the
+  // first client render agree — localStorage only exists on the client.
+  const [lastSeen, setLastSeen] = useState<Record<string, ProjectLastSeen>>({});
+  useEffect(() => {
+    setLastSeen(loadLastSeen());
+  }, []);
 
   const sections = useMemo(() => {
     const projects = data?.projects ?? [];
@@ -160,6 +232,33 @@ export default function ProjectsBoard() {
 
   const selected =
     flatList.find((p) => p.slug === selectedSlug) ?? flatList[0] ?? null;
+
+  // Opening a project (it is showing in the detail pane) marks it seen.
+  const selectedUpdatesCount = selected?.updates_count;
+  const selectedLatestAt = selected?.latest_update?.at ?? null;
+  useEffect(() => {
+    if (!selected) return;
+    setLastSeen((prev) => {
+      const entry = prev[selected.slug];
+      if (
+        entry &&
+        entry.updates_count === selected.updates_count &&
+        entry.latest_at === (selected.latest_update?.at ?? null)
+      ) {
+        return prev;
+      }
+      const next = {
+        ...prev,
+        [selected.slug]: {
+          updates_count: selected.updates_count,
+          latest_at: selected.latest_update?.at ?? null,
+        },
+      };
+      persistLastSeen(next);
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected?.slug, selectedUpdatesCount, selectedLatestAt]);
 
   const select = useCallback((slug: string, viaPointer = false) => {
     setSelectedSlug(slug);
@@ -296,6 +395,11 @@ export default function ProjectsBoard() {
                     key={project.slug}
                     project={project}
                     selected={selected?.slug === project.slug}
+                    unread={
+                      selected?.slug === project.slug
+                        ? 0
+                        : unreadCountFor(project, lastSeen[project.slug])
+                    }
                     onSelect={() => select(project.slug, true)}
                   />
                 ))}
@@ -393,10 +497,13 @@ function SummaryStrip({ projects }: { projects: ProjectRow[] }) {
 function ProjectListRow({
   project,
   selected,
+  unread,
   onSelect,
 }: {
   project: ProjectRow;
   selected: boolean;
+  /** New deliveries since this project was last opened; 0 hides the badge. */
+  unread: number;
   onSelect: () => void;
 }) {
   const live = liveMissionCount(project);
@@ -424,7 +531,19 @@ function ProjectListRow({
           >
             {project.slug}
           </span>
-          {project.latest_update && <UpdateAge at={project.latest_update.at} />}
+          <span className="flex shrink-0 items-center gap-1.5">
+            {unread > 0 && (
+              <span
+                title={`${unread > 9 ? "9+" : unread} new update${unread === 1 ? "" : "s"}`}
+                className="rounded-full bg-indigo-500/20 px-1.5 py-px text-[10px] font-semibold tabular-nums text-indigo-200"
+              >
+                {unread > 9 ? "9+" : unread}
+              </span>
+            )}
+            {project.latest_update && (
+              <UpdateAge at={project.latest_update.at} />
+            )}
+          </span>
         </span>
         {/* A blocked or stale controller is worth a second line even when the
             project is otherwise quiet — silence was exactly how a stuck
@@ -625,7 +744,7 @@ function ProjectActions({ project }: { project: ProjectRow }) {
         <ActionButton
           icon={Link2}
           label="Bind…"
-          title="Choose the conversation this project reports into. Until one is declared, the link above follows whichever session sent the last update — for a cron-driven project that is a per-tick session which has already ended."
+          title="Choose the conversation this project reports into. Until one is declared, the link above follows whichever conversation sent the last update — for a cron-driven project that is a per-tick conversation which has already ended."
           busy={busy === "bind"}
           onClick={openPicker}
         />
@@ -688,7 +807,7 @@ function ProjectActions({ project }: { project: ProjectRow }) {
         <ActionButton
           icon={Unlink}
           label="Unbind"
-          title="Stop declaring a control conversation for this project. The link falls back to whichever session sent the last update."
+          title="Stop declaring a control conversation for this project. The link falls back to whichever conversation sent the last update."
           busy={busy === "bind"}
           onClick={unbindConversation}
         />
@@ -778,7 +897,7 @@ function ReplyComposer({ sessionId }: { sessionId: string }) {
               void send();
             }
           }}
-          placeholder={`Reply in session ${sessionId.slice(0, 14)}…`}
+          placeholder={`Reply in conversation ${sessionId.slice(0, 14)}…`}
           rows={message.includes("\n") ? 3 : 1}
           className="min-h-[32px] flex-1 resize-none rounded-lg border border-white/[0.08] bg-white/[0.03] px-2.5 py-1.5 text-xs text-white/80 placeholder:text-white/25 focus:border-indigo-400/40 focus:outline-none"
         />
@@ -812,7 +931,7 @@ function ReplyComposer({ sessionId }: { sessionId: string }) {
           )}
           {replyDone && reply !== "" && (
             <p className="mt-1.5 text-[10px] text-white/30">
-              Reply from session {sessionId.slice(0, 14)}
+              Reply from conversation {sessionId.slice(0, 14)}
             </p>
           )}
         </div>
@@ -1077,7 +1196,7 @@ function UpdateEntry({
               content={bodyWithoutHeadline(update.body, update.headline)}
             />
             <p className="mt-2 text-[11px] text-white/30">
-              Origin session: {update.session_id}
+              Origin conversation: {update.session_id}
             </p>
           </div>
         )}
