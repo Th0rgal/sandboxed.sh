@@ -396,12 +396,12 @@ enum ProjectUnread {
         return latest > previous ? 1 : 0
     }
 
-    private static let isoWithFractional: ISO8601DateFormatter = {
+    private nonisolated(unsafe) static let isoWithFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
-    private static let iso = ISO8601DateFormatter()
+    private nonisolated(unsafe) static let iso = ISO8601DateFormatter()
 
     static func parseDate(_ raw: String) -> Date? {
         isoWithFractional.date(from: raw) ?? iso.date(from: raw)
@@ -410,7 +410,7 @@ enum ProjectUnread {
 
 /// Client-side "seen" state for the projects board, persisted in UserDefaults
 /// keyed by project slug — the backend has no per-user read state.
-final class ProjectUnreadStore {
+final class ProjectUnreadStore: @unchecked Sendable {
     static let shared = ProjectUnreadStore()
 
     private let defaults: UserDefaults
