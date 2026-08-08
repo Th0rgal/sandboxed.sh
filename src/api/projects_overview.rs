@@ -625,6 +625,22 @@ pub async fn projects_overview(
             updated_at: mission.updated_at.clone(),
         });
     }
+    // Roster projects are rows in their own right: a project created and bound
+    // through the API (no tracker file, no tagged mission, no delivery yet)
+    // must still appear on every surface, or "create + bind" looks like a
+    // silent no-op from the board.
+    for record in state
+        .projects
+        .list_projects()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
+    {
+        if deleted(&record.slug) {
+            continue;
+        }
+        let slug = record.slug.clone();
+        rows.entry(slug.clone())
+            .or_insert_with(|| ProjectRowBuilder::new(slug));
+    }
     let mut unrouted: Vec<DeliveryUpdate> = Vec::new();
     for delivery in deliveries {
         let Some(signature_key) = delivery.signature.as_deref().map(str::to_string) else {
