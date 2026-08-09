@@ -77,71 +77,138 @@ pub fn spawn_state_ingestor(state: Arc<AppState>) {
             // The routing key a controller emits (`lido`) and the roster slug
             // (`lido-audit`) don't always coincide; resolve through the same
             // alias map the overview uses so state and mode land on one row.
-            let aliases = hermes_projects_dir()
-                .map(|dir| read_alias_map(&dir))
+            // Overrides gate routing: an alias must not deliver into an
+            // archived target.
+            let (aliases, overrides) = hermes_projects_dir()
+                .map(|dir| (read_alias_map(&dir), read_overrides(&dir)))
                 .unwrap_or_default();
-            // read_deliveries returns newest-first; replay oldest-first so a
-            // run of the same state lands as one extended row rather than
-            // being rejected as out-of-order.
-            for delivery in deliveries.into_iter().rev() {
-                // The routing key is what identifies the project. It comes from
-                // the STATE_SIGNATURE trailer, or the CTRL trailer as a fallback
-                // (#763) — so a controller that emits only `[CTRL: …]` (no
-                // STATE_SIGNATURE, as Lido does) still routes. Without a key
-                // there is nothing to attribute.
-                let Some(raw_key) = delivery.signature.as_deref() else {
-                    continue;
-                };
-                let canonical = resolve_alias(&aliases, raw_key);
-                let slug = canonical.as_str();
-                // Auto-upsert the roster from routed deliveries: a slug that
-                // reports is a real project. This is how projects.db becomes the
-                // complete authoritative list without a manual seed of every
-                // project — in the background ingestor, not on a GET. Cheap when
-                // the row already exists (COALESCE upsert).
-                if let Err(error) = state.projects.upsert_project(slug, None, None, None, None) {
-                    tracing::warn!("state ingest upsert: {slug}: {error}");
-                }
-                // The descriptor (STATE_SIGNATURE tail) records the state
-                // timeline; it may be absent when a controller emits only a CTRL
-                // trailer. `observations` drives `wait`; default 1 (this is the
-                // first sighting) when there is no timeline entry.
-                let observations = if let Some(descriptor) = delivery.state.as_deref() {
-                    let headline = Some(delivery.headline.as_str()).filter(|h| !h.is_empty());
-                    match state
-                        .projects
-                        .record_state(slug, descriptor, headline, &delivery.at)
-                    {
-                        Ok(observations) => observations,
-                        Err(error) => {
-                            tracing::warn!("state ingest: {slug}: {error}");
-                            1
-                        }
-                    }
-                } else {
-                    1
-                };
-                // Project the controller's `[CTRL: … mode=… ]` mode onto the
-                // project record — independent of the descriptor, so a
-                // CTRL-only delivery still updates the mode column. Idempotent
-                // on replay: `wait` comes from the observation count, not a
-                // per-call increment.
-                if let Some(mode) = delivery.mode.as_deref() {
-                    let base = mode.split_once(':').map_or(mode, |(base, _)| base);
-                    let blocker = mode.split_once(':').map(|(_, cause)| cause);
-                    if let Err(error) = state.projects.project_mode_from_signal(
-                        slug,
-                        base,
-                        observations.saturating_sub(1) as i64,
-                        None,
-                        blocker,
-                    ) {
-                        tracing::warn!("state ingest mode: {slug}: {error}");
-                    }
-                }
-            }
+            ingest_deliveries(&state.projects, &aliases, &overrides, deliveries);
         }
     });
+}
+
+/// Marker prefix for state descriptors the ingestor synthesizes for CTRL-only
+/// deliveries (no STATE_SIGNATURE tail). Recording them is what makes the
+/// headline/session of a CTRL-only controller land on its board row; the
+/// prefix lets readers keep rendering `state` as absent for those.
+const CTRL_DESCRIPTOR_PREFIX: &str = "ctrl:";
+
+/// Fold one batch of deliveries into the projects store.
+///
+/// This is THE delivery router: alias resolution, roster auto-upsert, state
+/// and mode recording, and unrouted triage all happen here, once, in the
+/// background — the overview handler only reads the store back.
+fn ingest_deliveries(
+    projects: &super::projects_store::ProjectsStore,
+    aliases: &HashMap<String, String>,
+    overrides: &HashMap<String, String>,
+    deliveries: Vec<DeliveryUpdate>,
+) {
+    // read_deliveries returns newest-first; replay oldest-first so a
+    // run of the same state lands as one extended row rather than
+    // being rejected as out-of-order.
+    for delivery in deliveries.into_iter().rev() {
+        // The routing key is what identifies the project. It comes from
+        // the STATE_SIGNATURE trailer, or the CTRL trailer as a fallback
+        // (#763) — so a controller that emits only `[CTRL: …]` (no
+        // STATE_SIGNATURE, as Lido does) still routes. Without a key the
+        // delivery goes to the unrouted triage inbox instead of vanishing.
+        let Some(raw_key) = delivery.signature.as_deref() else {
+            record_unrouted(projects, &delivery);
+            continue;
+        };
+        let canonical = resolve_alias(aliases, raw_key);
+        // An alias pointing at an archived (or board-deleted) project is a
+        // stale route: delivering through it would silently feed a row nobody
+        // watches. Refuse it — the delivery surfaces as unrouted on the board,
+        // which is what prompts the operator to fix routes.json. The file is
+        // never rewritten here.
+        if aliases.contains_key(raw_key) && slug_is_archived(projects, overrides, &canonical) {
+            record_unrouted(projects, &delivery);
+            continue;
+        }
+        let slug = canonical.as_str();
+        // Auto-upsert the roster from routed deliveries: a slug that
+        // reports is a real project. This is how projects.db becomes the
+        // complete authoritative list without a manual seed of every
+        // project — in the background ingestor, not on a GET. Cheap when
+        // the row already exists (COALESCE upsert).
+        if let Err(error) = projects.upsert_project(slug, None, None, None, None) {
+            tracing::warn!("state ingest upsert: {slug}: {error}");
+        }
+        // The descriptor (STATE_SIGNATURE tail) records the state timeline; it
+        // may be absent when a controller emits only a CTRL trailer. A
+        // synthetic `ctrl:…` descriptor is recorded then, so the delivery's
+        // headline and session still reach the timeline — that is what the
+        // overview builds `latest_update` from. `observations` drives `wait`.
+        let headline = Some(delivery.headline.as_str()).filter(|h| !h.is_empty());
+        let session = Some(delivery.session_id.as_str()).filter(|s| !s.is_empty());
+        let descriptor = delivery.state.clone().unwrap_or_else(|| {
+            format!(
+                "{CTRL_DESCRIPTOR_PREFIX}{}",
+                delivery.mode.as_deref().unwrap_or("report")
+            )
+        });
+        let observations =
+            match projects.record_state(slug, &descriptor, headline, &delivery.at, session) {
+                Ok(observations) => observations,
+                Err(error) => {
+                    tracing::warn!("state ingest: {slug}: {error}");
+                    1
+                }
+            };
+        // Project the controller's `[CTRL: … mode=… ]` mode onto the
+        // project record — independent of the descriptor, so a
+        // CTRL-only delivery still updates the mode column. Idempotent
+        // on replay: `wait` comes from the observation count, not a
+        // per-call increment.
+        if let Some(mode) = delivery.mode.as_deref() {
+            let base = mode.split_once(':').map_or(mode, |(base, _)| base);
+            let blocker = mode.split_once(':').map(|(_, cause)| cause);
+            if let Err(error) = projects.project_mode_from_signal(
+                slug,
+                base,
+                observations.saturating_sub(1) as i64,
+                None,
+                blocker,
+            ) {
+                tracing::warn!("state ingest mode: {slug}: {error}");
+            }
+        }
+    }
+}
+
+/// Whether routing into `slug` should be refused: board override says
+/// archived/deleted, or the roster record itself is archived.
+fn slug_is_archived(
+    projects: &super::projects_store::ProjectsStore,
+    overrides: &HashMap<String, String>,
+    slug: &str,
+) -> bool {
+    if matches!(
+        overrides.get(slug).map(String::as_str),
+        Some("archived") | Some("deleted")
+    ) {
+        return true;
+    }
+    projects
+        .get_project(slug)
+        .ok()
+        .flatten()
+        .is_some_and(|record| record.status == "archived")
+}
+
+fn record_unrouted(projects: &super::projects_store::ProjectsStore, delivery: &DeliveryUpdate) {
+    if let Err(error) = projects.record_unrouted(
+        &delivery.session_id,
+        &delivery.at,
+        &delivery.headline,
+        delivery.signature.as_deref(),
+        delivery.mode.as_deref(),
+        delivery.blocker.as_deref(),
+    ) {
+        tracing::warn!("state ingest unrouted: {error}");
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -575,19 +642,22 @@ pub async fn projects_overview(
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
-    let deliveries = match state_db.as_deref() {
-        Some(path) => {
-            let path = path.to_path_buf();
-            tokio::task::spawn_blocking(move || read_deliveries(&path, DELIVERY_SCAN_LIMIT, None))
-                .await
-                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-                .unwrap_or_else(|error| {
-                    tracing::warn!("hermes deliveries unavailable: {error}");
-                    Vec::new()
-                })
-        }
-        None => Vec::new(),
-    };
+    // Delivery-derived facts come from the projects store, which the
+    // background ingestor keeps current — the overview never scans the Hermes
+    // state DB per request (that scan was a 600-message LIKE over a
+    // multi-gigabyte SQLite file, on every board render).
+    let latest_states = state
+        .projects
+        .latest_states()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let update_totals = state
+        .projects
+        .state_event_totals()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let unrouted_rows = state
+        .projects
+        .unrouted(20)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     // ── Assemble rows: union of tracker slugs, mission project tags, and
     //    routed delivery keys. Every source can create a row; every source
@@ -636,6 +706,9 @@ pub async fn projects_overview(
     // through the API (no tracker file, no tagged mission, no delivery yet)
     // must still appear on every surface, or "create + bind" looks like a
     // silent no-op from the board.
+    // Roster mode/blocker enrich `latest_update` below; capture them before
+    // the record's fields are moved onto the builder.
+    let mut record_signals: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
     for record in state
         .projects
         .list_projects()
@@ -644,6 +717,10 @@ pub async fn projects_overview(
         if deleted(&record.slug) {
             continue;
         }
+        record_signals.insert(
+            record.slug.clone(),
+            (record.mode.clone(), record.blocker.clone()),
+        );
         let slug = record.slug.clone();
         let builder = rows
             .entry(slug.clone())
@@ -651,20 +728,33 @@ pub async fn projects_overview(
         builder.title = record.title;
         builder.next_action = record.next_action;
     }
-    let mut unrouted: Vec<DeliveryUpdate> = Vec::new();
-    for delivery in deliveries {
-        let Some(signature_key) = delivery.signature.as_deref().map(str::to_string) else {
-            unrouted.push(delivery);
-            continue;
-        };
-        let key = resolve_alias(&aliases, &signature_key);
-        if deleted(&key) {
+    // The latest ingested state per project becomes the row's latest_update —
+    // same serialized shape the delivery scan used to produce, now read back
+    // from the store the ingestor maintains.
+    for (slug, project_state) in &latest_states {
+        if deleted(slug) {
             continue;
         }
-        rows.entry(key.clone())
-            .or_insert_with(|| ProjectRowBuilder::new(key))
-            .push_delivery(delivery);
+        let (mode, blocker) = record_signals.get(slug).cloned().unwrap_or_default();
+        let update = store_update(slug, project_state, mode, blocker);
+        let total = update_totals.get(slug).copied().unwrap_or(0);
+        rows.entry(slug.clone())
+            .or_insert_with(|| ProjectRowBuilder::new(slug.clone()))
+            .attach_store_update(update, project_state.observations, total);
     }
+    let unrouted: Vec<DeliveryUpdate> = unrouted_rows
+        .into_iter()
+        .map(|row| DeliveryUpdate {
+            headline: row.headline,
+            body: None,
+            session_id: row.session_id,
+            at: row.at,
+            signature: row.signature,
+            state: None,
+            mode: row.mode,
+            blocker: row.blocker,
+        })
+        .collect();
 
     let mut projects: Vec<ProjectRow> = rows
         .into_values()
@@ -731,6 +821,34 @@ pub async fn project_updates(
     })))
 }
 
+/// The store-held latest state of a project, rendered in the exact serialized
+/// shape the per-request delivery scan used to produce — every surface (web
+/// dashboard, desktop plugin, iOS) consumes `latest_update` as-is.
+///
+/// Field mapping: `headline`/`at`(=last_seen_at)/`session_id` come from the
+/// state event; `signature` is the canonical slug (the routing key the row is
+/// keyed by); `state` is the stored descriptor unless it is a synthetic
+/// `ctrl:` marker (CTRL-only deliveries never had a descriptor); `mode` and
+/// `blocker` come from the roster record; `body` is not stored — `None`.
+fn store_update(
+    slug: &str,
+    state: &super::projects_store::ProjectState,
+    mode: Option<String>,
+    blocker: Option<String>,
+) -> DeliveryUpdate {
+    DeliveryUpdate {
+        headline: state.headline.clone().unwrap_or_default(),
+        body: None,
+        session_id: state.session_id.clone().unwrap_or_default(),
+        at: state.last_seen_at.clone(),
+        signature: Some(slug.to_string()),
+        state: Some(state.signature.clone())
+            .filter(|descriptor| !descriptor.starts_with(CTRL_DESCRIPTOR_PREFIX)),
+        mode,
+        blocker,
+    }
+}
+
 struct ProjectRowBuilder {
     slug: String,
     /// Roster title/next-action, attached when the slug has a roster record.
@@ -741,8 +859,9 @@ struct ProjectRowBuilder {
     /// Health inputs, accumulated alongside the display chips.
     health_inputs: Vec<OwnedHealthInput>,
     latest_update: Option<DeliveryUpdate>,
-    /// The three newest state descriptors, for the stall signal.
-    recent_states: Vec<Option<String>>,
+    /// How many consecutive deliveries reported the latest state — the stall
+    /// signal's input, read from the store's observation count.
+    latest_observations: u32,
     updates_count: usize,
 }
 
@@ -756,21 +875,18 @@ impl ProjectRowBuilder {
             missions: Vec::new(),
             health_inputs: Vec::new(),
             latest_update: None,
-            recent_states: Vec::new(),
+            latest_observations: 0,
             updates_count: 0,
         }
     }
 
-    /// Deliveries arrive newest-first; keep the first as latest and remember
-    /// the three most recent *state descriptors* for the stall signal.
-    fn push_delivery(&mut self, delivery: DeliveryUpdate) {
-        self.updates_count += 1;
-        if self.recent_states.len() < 3 {
-            self.recent_states.push(delivery.state.clone());
-        }
-        if self.latest_update.is_none() {
-            self.latest_update = Some(delivery);
-        }
+    /// Attach the store-derived latest update: the newest state event plus the
+    /// roster's mode/blocker, with the observation count driving the stall
+    /// signal and the timeline total driving `updates_count`.
+    fn attach_store_update(&mut self, update: DeliveryUpdate, observations: u32, total: usize) {
+        self.latest_update = Some(update);
+        self.latest_observations = observations;
+        self.updates_count = total;
     }
 
     fn finish(
@@ -797,18 +913,11 @@ impl ProjectRowBuilder {
             }
             // Same non-silent state three ticks in a row: the controller
             // keeps reporting an unchanged world — the phantom-lease shape.
-            // Compare the state descriptor, not the routing key. The key is
-            // near-constant within a row by construction, so the old
-            // comparison fired for essentially every project with three
-            // updates — carrying no information at all, and flagging projects
-            // making progress every tick identically to genuinely stuck ones.
-            if latest.state.is_some()
-                && self.recent_states.len() >= 3
-                && self
-                    .recent_states
-                    .iter()
-                    .all(|state| state == &latest.state)
-            {
+            // Compare the state descriptor, not the routing key: the store
+            // collapses consecutive identical descriptors into one row and
+            // counts observations, so "three deliveries reported this state
+            // running" is exactly `observations >= 3` on the latest event.
+            if latest.state.is_some() && self.latest_observations >= 3 {
                 attention.push("same state on 3 consecutive updates".to_string());
             }
         }
@@ -1544,22 +1653,21 @@ mod tests {
     /// with three or more deliveries.
     #[test]
     fn the_stall_signal_tracks_the_state_not_the_routing_key() {
-        let delivery = |state: &str, at: &str| DeliveryUpdate {
+        let delivery = |state: &str| DeliveryUpdate {
             headline: "h".into(),
             body: None,
             session_id: "s".into(),
-            at: at.into(),
+            at: "2026-08-04T12:00:00Z".into(),
             signature: Some("verity".into()),
             mode: None,
             state: Some(state.into()),
             blocker: None,
         };
 
-        // Same project, three genuinely different states: not a stall.
+        // A project changing state every tick: the latest state has a single
+        // observation, however many total updates there were. Not a stall.
         let mut moving = ProjectRowBuilder::new("verity".into());
-        for (i, state) in ["a|1", "b|2", "c|3"].iter().enumerate() {
-            moving.push_delivery(delivery(state, &format!("2026-08-04T1{i}:00:00Z")));
-        }
+        moving.attach_store_update(delivery("c|3"), 1, 3);
         let row = moving.finish(&[], None, None, "2026-08-04T20:00:00Z");
         assert!(
             !row.attention_reasons
@@ -1571,9 +1679,7 @@ mod tests {
 
         // Same state three times running: that is the stall worth reporting.
         let mut stuck = ProjectRowBuilder::new("verity".into());
-        for i in 0..3 {
-            stuck.push_delivery(delivery("blocked|same", &format!("2026-08-04T1{i}:00:00Z")));
-        }
+        stuck.attach_store_update(delivery("blocked|same"), 3, 3);
         let row = stuck.finish(&[], None, None, "2026-08-04T20:00:00Z");
         assert!(
             row.attention_reasons
@@ -1582,6 +1688,18 @@ mod tests {
             "an unchanged state must still be flagged: {:?}",
             row.attention_reasons
         );
+
+        // A synthetic CTRL-only marker never surfaces as a state, so repeated
+        // quiet CTRL ticks must not trip the stall signal either.
+        let mut quiet = ProjectRowBuilder::new("verity".into());
+        let mut update = delivery("ignored");
+        update.state = None;
+        quiet.attach_store_update(update, 5, 5);
+        let row = quiet.finish(&[], None, None, "2026-08-04T20:00:00Z");
+        assert!(!row
+            .attention_reasons
+            .iter()
+            .any(|r| r.contains("3 consecutive")));
     }
 
     #[test]
@@ -1602,9 +1720,9 @@ mod tests {
     #[test]
     fn repeated_signature_and_blocker_raise_attention() {
         let mut builder = ProjectRowBuilder::new("verity".to_string());
-        builder.push_delivery(parse_delivery("s", 3.0, SAMPLE));
-        builder.push_delivery(parse_delivery("s", 2.0, SAMPLE));
-        builder.push_delivery(parse_delivery("s", 1.0, SAMPLE));
+        // Three deliveries of SAMPLE collapse in the store into one state
+        // event with observations=3; the builder sees that count.
+        builder.attach_store_update(parse_delivery("s", 3.0, SAMPLE), 3, 3);
         let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
         assert_eq!(row.bucket, "attention");
         assert!(row.attention_reasons.iter().any(|r| r.contains("blocker")));
@@ -1659,9 +1777,7 @@ mod tests {
     #[test]
     fn forced_override_silences_attention() {
         let mut builder = ProjectRowBuilder::new("verity".to_string());
-        builder.push_delivery(parse_delivery("s", 3.0, SAMPLE));
-        builder.push_delivery(parse_delivery("s", 2.0, SAMPLE));
-        builder.push_delivery(parse_delivery("s", 1.0, SAMPLE));
+        builder.attach_store_update(parse_delivery("s", 3.0, SAMPLE), 3, 3);
         let row = builder.finish(&[], Some("paused"), None, "2026-08-04T12:00:00Z");
         assert_eq!(row.bucket, "paused");
         // Reasons stay visible in the detail pane even when silenced.
@@ -1685,16 +1801,20 @@ mod tests {
     #[test]
     fn explicit_binding_wins_over_the_inferred_session() {
         let mut builder = ProjectRowBuilder::new("verity".to_string());
-        builder.push_delivery(DeliveryUpdate {
-            headline: "tick".into(),
-            body: None,
-            at: "2026-08-04T12:00:00Z".into(),
-            session_id: "cron_e594d751447d_20260804_120931".into(),
-            signature: None,
-            mode: None,
-            state: None,
-            blocker: None,
-        });
+        builder.attach_store_update(
+            DeliveryUpdate {
+                headline: "tick".into(),
+                body: None,
+                at: "2026-08-04T12:00:00Z".into(),
+                session_id: "cron_e594d751447d_20260804_120931".into(),
+                signature: None,
+                mode: None,
+                state: None,
+                blocker: None,
+            },
+            1,
+            1,
+        );
         let row = builder.finish(
             &[],
             None,
@@ -1713,16 +1833,20 @@ mod tests {
     #[test]
     fn without_a_binding_the_latest_update_is_offered_as_a_guess() {
         let mut builder = ProjectRowBuilder::new("verity".to_string());
-        builder.push_delivery(DeliveryUpdate {
-            headline: "tick".into(),
-            body: None,
-            at: "2026-08-04T12:00:00Z".into(),
-            session_id: "cron_e594d751447d_20260804_120931".into(),
-            signature: None,
-            mode: None,
-            state: None,
-            blocker: None,
-        });
+        builder.attach_store_update(
+            DeliveryUpdate {
+                headline: "tick".into(),
+                body: None,
+                at: "2026-08-04T12:00:00Z".into(),
+                session_id: "cron_e594d751447d_20260804_120931".into(),
+                signature: None,
+                mode: None,
+                state: None,
+                blocker: None,
+            },
+            1,
+            1,
+        );
         let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
         let conversation = row.conversation.expect("conversation");
         assert_eq!(conversation.source, "latest_update");
@@ -1753,5 +1877,202 @@ mod tests {
             json.get("next_action").is_none(),
             "unset next_action is omitted"
         );
+    }
+
+    // ---- store-driven overview (the ingestor is the only delivery reader) ----
+
+    use super::super::projects_store::{ProjectState, ProjectsStore};
+
+    /// A CTRL-only delivery (no STATE_SIGNATURE descriptor) must still land as
+    /// the row's latest_update — via the store, with no per-request scan of
+    /// HERMES_STATE_DB. The whole path here runs with that env unset.
+    #[test]
+    fn a_ctrl_only_delivery_headline_lands_on_the_row_via_the_store() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        let ctrl_only =
+            "[Cron delivery: Verity]\nDid a thing\n[CTRL: verity | mode=active | wait=0 | next=x]";
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            vec![parse_delivery("sess-1", 1_754_000_000.0, ctrl_only)],
+        );
+
+        let latest = store.latest_states().expect("latest");
+        let event = latest.get("verity").expect("state event recorded");
+        let record = store
+            .get_project("verity")
+            .expect("read")
+            .expect("roster auto-upserted");
+        let update = store_update("verity", event, record.mode, record.blocker);
+        assert_eq!(update.headline, "Did a thing");
+        assert_eq!(update.session_id, "sess-1");
+        assert_eq!(update.signature.as_deref(), Some("verity"));
+        assert_eq!(update.mode.as_deref(), Some("active"));
+        assert_eq!(
+            update.state, None,
+            "the synthetic ctrl descriptor is not a state"
+        );
+    }
+
+    /// The serialized shape of a store-built latest_update is the one every
+    /// surface already consumes: body present (null), state/mode omitted when
+    /// absent, the rest verbatim.
+    #[test]
+    fn the_store_built_latest_update_keeps_the_delivery_shape() {
+        let event = ProjectState {
+            signature: "phase1|abc".into(),
+            headline: Some("Verity — stable".into()),
+            first_seen_at: "2026-08-04T10:00:00Z".into(),
+            last_seen_at: "2026-08-04T12:00:00Z".into(),
+            observations: 2,
+            session_id: Some("sess-9".into()),
+        };
+        let full = store_update(
+            "verity",
+            &event,
+            Some("blocked:cap".into()),
+            Some("cap".into()),
+        );
+        let json = serde_json::to_value(&full).expect("serialize");
+        assert_eq!(json["headline"], "Verity — stable");
+        assert_eq!(json["body"], serde_json::Value::Null);
+        assert_eq!(json["session_id"], "sess-9");
+        assert_eq!(json["at"], "2026-08-04T12:00:00Z");
+        assert_eq!(json["signature"], "verity");
+        assert_eq!(json["state"], "phase1|abc");
+        assert_eq!(json["mode"], "blocked:cap");
+        assert_eq!(json["blocker"], "cap");
+
+        let mut bare_event = event;
+        bare_event.signature = "ctrl:report".into();
+        bare_event.session_id = None;
+        let bare = store_update("verity", &bare_event, None, None);
+        let json = serde_json::to_value(&bare).expect("serialize");
+        assert!(json.get("state").is_none(), "absent state is omitted");
+        assert!(json.get("mode").is_none(), "absent mode is omitted");
+        assert_eq!(json["session_id"], "");
+        assert_eq!(json["blocker"], serde_json::Value::Null);
+    }
+
+    /// An alias whose target is archived — by roster status or board override —
+    /// must refuse the route: the delivery surfaces as unrouted instead of
+    /// silently feeding a row nobody watches. routes.json is never rewritten.
+    #[test]
+    fn an_alias_onto_an_archived_target_is_refused_and_surfaces_as_unrouted() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido-audit", None, None, None, None)
+            .expect("seed");
+        store.set_status("lido-audit", "archived").expect("archive");
+        let aliases: HashMap<String, String> =
+            [("lido".to_string(), "lido-audit".to_string())].into();
+
+        let routed = "[Cron delivery: Lido]\nAudit tick\n[STATE_SIGNATURE: lido|phase3|abc|none]";
+        ingest_deliveries(
+            &store,
+            &aliases,
+            &HashMap::new(),
+            vec![parse_delivery("sess-2", 1_754_000_000.0, routed)],
+        );
+        assert!(
+            store
+                .latest_states()
+                .expect("latest")
+                .get("lido-audit")
+                .is_none(),
+            "nothing may be recorded against the archived target"
+        );
+        let unrouted = store.unrouted(10).expect("unrouted");
+        assert_eq!(unrouted.len(), 1);
+        assert_eq!(unrouted[0].signature.as_deref(), Some("lido"));
+        assert_eq!(unrouted[0].headline, "Audit tick");
+
+        // Board override archived/deleted refuses the route the same way.
+        let aliases2: HashMap<String, String> =
+            [("verity".to_string(), "verity-roadmap".to_string())].into();
+        let overrides: HashMap<String, String> =
+            [("verity-roadmap".to_string(), "archived".to_string())].into();
+        let routed2 = "[Cron delivery: V]\nTick\n[STATE_SIGNATURE: verity|p|x|y]";
+        ingest_deliveries(
+            &store,
+            &aliases2,
+            &overrides,
+            vec![parse_delivery("sess-3", 1_754_000_001.0, routed2)],
+        );
+        assert!(store
+            .latest_states()
+            .expect("latest")
+            .get("verity-roadmap")
+            .is_none());
+        assert_eq!(store.unrouted(10).expect("unrouted").len(), 2);
+
+        // A direct (non-aliased) key still routes even when archived: only a
+        // stale alias is refused.
+        let direct = "[Cron delivery: L]\nDirect\n[STATE_SIGNATURE: lido-audit|p|x|y]";
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            vec![parse_delivery("sess-4", 1_754_000_002.0, direct)],
+        );
+        assert!(store
+            .latest_states()
+            .expect("latest")
+            .get("lido-audit")
+            .is_some());
+    }
+
+    /// A delivery with no routing key at all lands in the triage inbox — this
+    /// used to be derived per request by the overview's own scan.
+    #[test]
+    fn a_keyless_delivery_is_recorded_as_unrouted_by_the_ingestor() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            vec![parse_delivery(
+                "sess-5",
+                1_754_000_000.0,
+                "[Cron delivery: Mystery]\nNo trailer here.",
+            )],
+        );
+        let unrouted = store.unrouted(10).expect("unrouted");
+        assert_eq!(unrouted.len(), 1);
+        assert_eq!(unrouted[0].headline, "No trailer here.");
+        assert!(
+            store.latest_states().expect("latest").is_empty(),
+            "no phantom project was fabricated"
+        );
+    }
+
+    /// Repeated CTRL-only quiet ticks collapse into one state event whose
+    /// observation count and mode projection keep working.
+    #[test]
+    fn repeated_ctrl_only_ticks_collapse_and_project_the_mode() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        for i in 0..3 {
+            let tick = "[Cron delivery: Lido]\n[SILENT]\n[CTRL: lido | mode=blocked:transport-cap | wait=0 | next=x]";
+            ingest_deliveries(
+                &store,
+                &HashMap::new(),
+                &HashMap::new(),
+                vec![parse_delivery(
+                    &format!("sess-{i}"),
+                    1_754_000_000.0 + (i as f64) * 60.0,
+                    tick,
+                )],
+            );
+        }
+        let latest = store.latest_states().expect("latest");
+        let event = latest.get("lido").expect("event");
+        assert_eq!(event.observations, 3);
+        assert_eq!(event.session_id.as_deref(), Some("sess-2"), "newest wins");
+        let record = store.get_project("lido").expect("read").expect("present");
+        assert_eq!(record.mode.as_deref(), Some("blocked"));
+        assert_eq!(record.blocker.as_deref(), Some("transport-cap"));
+        assert_eq!(record.wait_ticks, 2);
+        assert_eq!(store.state_event_totals().expect("totals")["lido"], 3);
     }
 }
