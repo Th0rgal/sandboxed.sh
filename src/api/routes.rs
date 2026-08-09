@@ -625,6 +625,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // mission no longer needs a live harness (see scope_reaper docs).
     super::scope_reaper::spawn(Arc::clone(&state));
 
+    // Boot reconcile: stop scopes leaked by the previous process, interrupt +
+    // auto-resume ghost-active missions, and tag orphaned awaiting_user
+    // missions. Also reachable via POST /api/system/reconcile.
+    super::reconcile::spawn(Arc::clone(&state));
+
     // Re-attach poll loops for async remote jobs that were in flight when
     // the previous process exited (durable handles in remote-jobs.json).
     super::control::spawn_remote_job_reconciler(Arc::clone(&state));
@@ -1296,6 +1301,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     tracing::info!("Server listening on {}", addr);
+
+    // systemd integration: READY=1 now that the listener is bound, then the
+    // runtime-liveness watchdog loop (no-op without NOTIFY_SOCKET /
+    // WATCHDOG_USEC — Docker and dev runs are unaffected).
+    crate::watchdog::notify_ready();
+    crate::watchdog::spawn();
 
     // Setup graceful shutdown on SIGTERM/SIGINT
     let shutdown_state = Arc::clone(&state);

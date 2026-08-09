@@ -335,6 +335,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/components/:name/update", post(update_component))
         .route("/components/:name/uninstall", post(uninstall_component))
         .route("/deploy", post(deploy_sandboxed_sh))
+        .route("/reconcile", post(super::reconcile::reconcile_endpoint))
 }
 
 /// Get information about all system components.

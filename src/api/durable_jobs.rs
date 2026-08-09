@@ -546,6 +546,15 @@ async fn write_job(state: &AppState, job: &DurableJob) -> Result<DurableJob, Str
     Ok(job)
 }
 
+/// Registry lookup for the boot/manual reconciler: `None` when no job.json
+/// exists for `id` (an unknown durable scope), otherwise the persisted status.
+pub(crate) async fn job_status_for_reconcile(
+    state: &AppState,
+    id: Uuid,
+) -> Option<DurableJobStatus> {
+    read_job(state, id).await.ok().map(|job| job.status)
+}
+
 async fn read_job(state: &AppState, id: Uuid) -> Result<DurableJob, String> {
     let bytes = tokio::fs::read(job_file(state, id))
         .await

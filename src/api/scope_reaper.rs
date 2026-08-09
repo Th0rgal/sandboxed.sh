@@ -170,7 +170,7 @@ pub(crate) async fn list_exec_scope_units() -> Vec<String> {
     }
 }
 
-async fn stop_unit(unit: &str, reason: &str) -> bool {
+pub(crate) async fn stop_unit(unit: &str, reason: &str) -> bool {
     match Command::new("systemctl")
         .args(["stop", unit])
         .output()
