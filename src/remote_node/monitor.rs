@@ -83,6 +83,20 @@ pub fn status_after_probe(previous_misses: u32, probe_ok: bool) -> (RemoteNodeSt
 pub struct FleetMonitor {
     statuses: RwLock<HashMap<String, CachedNodeStatus>>,
     recent: RwLock<VecDeque<DispatchOutcome>>,
+    /// Node ids an operator has cordoned: still probed and listed, but
+    /// excluded from automatic placement until uncordoned. Persisted to
+    /// `state_path` (see [`NodeStateFile`]) so a cordon survives restarts.
+    cordoned: RwLock<std::collections::HashSet<String>>,
+    /// Where the cordon set is persisted (`.sandboxed-sh/node_state.json`
+    /// under the working dir). `None` in tests / until startup wiring runs.
+    state_path: RwLock<Option<std::path::PathBuf>>,
+}
+
+/// On-disk shape of `.sandboxed-sh/node_state.json`.
+#[derive(Debug, Default, Serialize, serde::Deserialize)]
+struct NodeStateFile {
+    #[serde(default)]
+    cordoned: Vec<String>,
 }
 
 impl Default for FleetMonitor {
@@ -96,7 +110,66 @@ impl FleetMonitor {
         Self {
             statuses: RwLock::new(HashMap::new()),
             recent: RwLock::new(VecDeque::new()),
+            cordoned: RwLock::new(std::collections::HashSet::new()),
+            state_path: RwLock::new(None),
         }
+    }
+
+    /// Load the persisted cordon set from `path` and remember the path for
+    /// later writes. Missing or unreadable files start with an empty set (a
+    /// lost cordon is recoverable; refusing to start is not).
+    pub fn load_node_state(&self, path: std::path::PathBuf) {
+        let loaded: NodeStateFile = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        {
+            let mut cordoned = self.cordoned.write().unwrap_or_else(|e| e.into_inner());
+            *cordoned = loaded.cordoned.into_iter().collect();
+        }
+        let mut state_path = self.state_path.write().unwrap_or_else(|e| e.into_inner());
+        *state_path = Some(path);
+    }
+
+    pub fn is_cordoned(&self, node_id: &str) -> bool {
+        self.cordoned
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(node_id)
+    }
+
+    /// Cordon (`true`) or uncordon (`false`) a node and persist the set.
+    /// Returns whether the set changed.
+    pub fn set_cordoned(&self, node_id: &str, cordoned: bool) -> Result<bool, String> {
+        let snapshot: Vec<String> = {
+            let mut set = self.cordoned.write().unwrap_or_else(|e| e.into_inner());
+            let changed = if cordoned {
+                set.insert(node_id.to_string())
+            } else {
+                set.remove(node_id)
+            };
+            if !changed {
+                return Ok(false);
+            }
+            let mut nodes: Vec<String> = set.iter().cloned().collect();
+            nodes.sort();
+            nodes
+        };
+        let path = self
+            .state_path
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(path) = path {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create {}: {e}", parent.display()))?;
+            }
+            let body = serde_json::to_string_pretty(&NodeStateFile { cordoned: snapshot })
+                .map_err(|e| e.to_string())?;
+            std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+        }
+        Ok(true)
     }
 
     /// Record a successful heartbeat probe.
@@ -468,15 +541,41 @@ impl FleetMonitor {
         requirements: &[String],
         reservations: &HashMap<String, u32>,
     ) -> Result<String, PlacementError> {
+        let (nodes, mut cordoned_reasons) = self.partition_cordoned(&settings.nodes);
         let statuses = self.statuses.read().unwrap_or_else(|e| e.into_inner());
         select_node_auto_with_reservations(
-            &settings.nodes,
+            &nodes,
             &statuses,
             requirements,
             env_gb_bytes("REMOTE_NODE_MIN_DISK_GB", DEFAULT_MIN_DISK_GB),
             env_gb_bytes("REMOTE_NODE_MIN_MEM_GB", DEFAULT_MIN_MEM_GB),
             reservations,
         )
+        .map_err(|mut error| {
+            cordoned_reasons.append(&mut error.reasons);
+            PlacementError {
+                reasons: cordoned_reasons,
+            }
+        })
+    }
+
+    /// Split configured nodes into placeable ones and `(id, reason)` entries
+    /// for cordoned nodes, so exclusion reports still name every node.
+    fn partition_cordoned(
+        &self,
+        nodes: &[RemoteNodeConfig],
+    ) -> (Vec<RemoteNodeConfig>, Vec<(String, String)>) {
+        let cordoned = self.cordoned.read().unwrap_or_else(|e| e.into_inner());
+        let mut placeable = Vec::new();
+        let mut reasons = Vec::new();
+        for node in nodes {
+            if cordoned.contains(&node.id) {
+                reasons.push((node.id.clone(), "cordoned by operator".to_string()));
+            } else {
+                placeable.push(node.clone());
+            }
+        }
+        (placeable, reasons)
     }
 
     /// Like [`Self::place_auto_with_reservations`], with an explicit disk
@@ -510,9 +609,10 @@ impl FleetMonitor {
         reservations: &HashMap<String, u32>,
         disk_reservations: &HashMap<String, u64>,
     ) -> Result<String, PlacementError> {
+        let (nodes, mut cordoned_reasons) = self.partition_cordoned(&settings.nodes);
         let statuses = self.statuses.read().unwrap_or_else(|e| e.into_inner());
         select_node_auto_with_protocol_and_resource_reservations(
-            &settings.nodes,
+            &nodes,
             &statuses,
             requirements,
             min_disk_bytes,
@@ -521,6 +621,12 @@ impl FleetMonitor {
             reservations,
             disk_reservations,
         )
+        .map_err(|mut error| {
+            cordoned_reasons.append(&mut error.reasons);
+            PlacementError {
+                reasons: cordoned_reasons,
+            }
+        })
     }
 }
 
@@ -561,6 +667,9 @@ pub struct RemoteNodeView {
     pub lean_runtime_ready: Option<bool>,
     pub last_seen: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// Operator-cordoned: still probed and listed, but excluded from
+    /// automatic placement until uncordoned.
+    pub cordoned: bool,
 }
 
 impl RemoteNodeView {
@@ -599,6 +708,7 @@ impl RemoteNodeView {
             lean_runtime_ready: heartbeat.and_then(|h| h.lean_runtime_ready),
             last_seen: cached.and_then(|c| c.last_seen),
             error: cached.and_then(|c| c.last_error.clone()),
+            cordoned: false,
         }
     }
 }
@@ -802,6 +912,62 @@ mod tests {
     }
 
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn cordoned_node_is_excluded_from_auto_placement_with_a_reason() {
+        let fleet = FleetMonitor::new();
+        // Two healthy nodes; "spark" is deliberately the more attractive one
+        // (more memory) so exclusion, not ranking, is what the test proves.
+        for (id, mem) in [("spark", 96), ("cpu1", 16)] {
+            let status = cached_online(id, &["lean"], 100, mem, 2, 0, 0);
+            fleet.record_heartbeat(id, status.last_heartbeat.unwrap());
+        }
+        let settings = RemoteNodeSettings {
+            enabled: true,
+            nodes: vec![node_config("spark"), node_config("cpu1")],
+        };
+        assert_eq!(fleet.place_auto(&settings, &[]).unwrap(), "spark");
+
+        assert!(fleet.set_cordoned("spark", true).unwrap());
+        assert!(fleet.is_cordoned("spark"));
+        assert_eq!(fleet.place_auto(&settings, &[]).unwrap(), "cpu1");
+
+        // With every node cordoned, the exclusion report names them.
+        assert!(fleet.set_cordoned("cpu1", true).unwrap());
+        let error = fleet.place_auto(&settings, &[]).unwrap_err();
+        assert!(error
+            .reasons
+            .iter()
+            .any(|(id, reason)| id == "spark" && reason.contains("cordoned")));
+
+        // Uncordon restores placement; repeat uncordon is a no-op.
+        assert!(fleet.set_cordoned("spark", false).unwrap());
+        assert!(!fleet.set_cordoned("spark", false).unwrap());
+        assert_eq!(fleet.place_auto(&settings, &[]).unwrap(), "spark");
+    }
+
+    #[test]
+    fn cordon_set_persists_via_node_state_file() {
+        let dir = std::env::temp_dir().join(format!("node-state-{}", Uuid::new_v4()));
+        let path = dir.join("node_state.json");
+
+        let fleet = FleetMonitor::new();
+        fleet.load_node_state(path.clone());
+        assert!(fleet.set_cordoned("dgx-spark", true).unwrap());
+
+        // A fresh monitor (restart) reads the same file back.
+        let reloaded = FleetMonitor::new();
+        reloaded.load_node_state(path.clone());
+        assert!(reloaded.is_cordoned("dgx-spark"));
+
+        // Uncordon persists too.
+        assert!(reloaded.set_cordoned("dgx-spark", false).unwrap());
+        let third = FleetMonitor::new();
+        third.load_node_state(path);
+        assert!(!third.is_cordoned("dgx-spark"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn place_auto_filters_by_status_labels_disk_mem_and_load() {

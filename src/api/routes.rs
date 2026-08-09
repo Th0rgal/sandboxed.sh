@@ -558,6 +558,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         projects,
     });
 
+    // Persisted node state (operator cordons) survives restarts.
+    state
+        .fleet
+        .load_node_state(config.working_dir.join(".sandboxed-sh/node_state.json"));
+
     super::validation::spawn_outbox_forwarder(Arc::clone(&state));
     super::projects_overview::spawn_state_ingestor(Arc::clone(&state));
 
@@ -748,6 +753,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let protected_routes = Router::new()
         .route("/api/stats", get(get_stats))
         .route("/api/remote-nodes", get(list_remote_nodes))
+        .route("/api/nodes/:name/cordon", post(cordon_remote_node))
+        .route("/api/nodes/:name/uncordon", post(uncordon_remote_node))
         .route("/api/ai/usage/summary", get(get_ai_usage_summary))
         .route("/api/task", post(create_task))
         .route("/api/task/:id", get(get_task))
@@ -1517,10 +1524,9 @@ async fn list_remote_nodes(
             crate::remote_node::probe_node(&state.fleet, &client, node).await;
         }
         let cached = state.fleet.get(&node.id);
-        nodes.push(crate::remote_node::RemoteNodeView::from_cache(
-            node,
-            cached.as_ref(),
-        ));
+        let mut view = crate::remote_node::RemoteNodeView::from_cache(node, cached.as_ref());
+        view.cordoned = state.fleet.is_cordoned(&node.id);
+        nodes.push(view);
     }
     // The Spark offload lane is separate from the remote-node fleet; expose
     // it alongside so `get_compute_fleet` consumers (Hermes, controllers) see
@@ -1549,6 +1555,54 @@ async fn list_remote_nodes(
             enabled_workspaces: spark_workspaces,
         },
     })
+}
+
+/// Cordon a remote node: keep probing and listing it, but exclude it from
+/// automatic placement until uncordoned. Persisted in
+/// `.sandboxed-sh/node_state.json` so it survives restarts.
+async fn cordon_remote_node(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    set_remote_node_cordon(&state, &name, true)
+}
+
+/// Undo a cordon: the node becomes eligible for automatic placement again.
+async fn uncordon_remote_node(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    set_remote_node_cordon(&state, &name, false)
+}
+
+fn set_remote_node_cordon(
+    state: &AppState,
+    name: &str,
+    cordoned: bool,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Only configured nodes can be (un)cordoned: a typo'd name silently
+    // persisted would look like a successful cordon of the real node.
+    if !state
+        .config
+        .remote_nodes
+        .nodes
+        .iter()
+        .any(|node| node.id == name)
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("unknown remote node '{name}'"),
+        ));
+    }
+    let changed = state
+        .fleet
+        .set_cordoned(name, cordoned)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(serde_json::json!({
+        "node": name,
+        "cordoned": cordoned,
+        "changed": changed,
+    })))
 }
 
 /// Optional query parameters for the stats endpoint.
