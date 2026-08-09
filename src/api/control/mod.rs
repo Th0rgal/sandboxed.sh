@@ -791,6 +791,93 @@ everything is truly done, report completion and stop."
 }
 
 #[cfg(test)]
+mod campaign_guard_tests {
+    use super::*;
+
+    async fn mk_campaign(store: &Arc<dyn MissionStore>, project: &str) -> Uuid {
+        let mission = store
+            .create_mission(Some("campaign"), None, None, None, None, None, None)
+            .await
+            .expect("create");
+        store
+            .update_mission_project(
+                mission.id,
+                mission_store::MissionProjectPatch {
+                    project: Some(Some(project.to_string())),
+                    track: Some(Some("campaign".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag");
+        mission.id
+    }
+
+    #[tokio::test]
+    async fn second_campaign_is_blocked_until_the_first_terminates() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        // No campaign yet: the slot is free (first create would succeed).
+        assert!(find_open_campaign_mission(&store, "verity").await.is_none());
+
+        let first = mk_campaign(&store, "verity").await;
+        // Second create for the same project sees the open campaign → 409.
+        let existing = find_open_campaign_mission(&store, "verity")
+            .await
+            .expect("open campaign found");
+        assert_eq!(existing.id, first);
+        // A different project is unaffected.
+        assert!(find_open_campaign_mission(&store, "other").await.is_none());
+
+        // Every listed non-terminal status holds the slot.
+        for status in [
+            MissionStatus::Active,
+            MissionStatus::AwaitingUser,
+            MissionStatus::WaitingBackground,
+            MissionStatus::Paused,
+        ] {
+            store
+                .update_mission_status(first, status)
+                .await
+                .expect("status");
+            assert!(
+                find_open_campaign_mission(&store, "verity").await.is_some(),
+                "{status} should hold the campaign slot"
+            );
+        }
+
+        // Once the first completes, a new campaign is allowed.
+        store
+            .update_mission_status(first, MissionStatus::Completed)
+            .await
+            .expect("status");
+        assert!(find_open_campaign_mission(&store, "verity").await.is_none());
+        let second = mk_campaign(&store, "verity").await;
+        assert_ne!(first, second);
+        assert_eq!(
+            find_open_campaign_mission(&store, "verity")
+                .await
+                .expect("new open campaign")
+                .id,
+            second
+        );
+    }
+
+    #[test]
+    fn terminal_and_archived_statuses_do_not_hold_the_slot() {
+        for status in [
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::Interrupted,
+            MissionStatus::Blocked,
+            MissionStatus::NotFeasible,
+            MissionStatus::Acknowledged,
+        ] {
+            assert!(!campaign_slot_held_by(status), "{status}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod stall_guard_tests {
     use super::*;
 
@@ -7519,6 +7606,46 @@ async fn find_recent_identical_mission(
     })
 }
 
+/// Whether a mission in this status holds its project's single campaign slot.
+///
+/// Campaign missions are long-running per-project drivers; two of them racing
+/// on the same project duplicate work and fight over the same PRs. Anything
+/// that can still run (or be resumed) blocks a new campaign: `Pending`
+/// (created/queued), `Active`, `AwaitingUser`, `WaitingBackground`, and
+/// `Paused`. `Acknowledged` is archived and terminal-in-practice, so it does
+/// not hold the slot; a genuinely terminal status never does.
+fn campaign_slot_held_by(status: MissionStatus) -> bool {
+    matches!(
+        status,
+        MissionStatus::Pending
+            | MissionStatus::Active
+            | MissionStatus::AwaitingUser
+            | MissionStatus::WaitingBackground
+            | MissionStatus::Paused
+    )
+}
+
+/// Find a non-terminal `track == "campaign"` mission for `project`, if any.
+/// Scan errors return `None` (a duplicate campaign is recoverable; refusing a
+/// legitimate create is not) — same failure direction as the retry coalescer.
+async fn find_open_campaign_mission(
+    mission_store: &Arc<dyn MissionStore>,
+    project: &str,
+) -> Option<Mission> {
+    const PAGE: usize = 200;
+    let filter = crate::api::mission_store::MissionFilter {
+        project: Some(project.to_string()),
+        track: Some("campaign".to_string()),
+        ..Default::default()
+    };
+    mission_store
+        .list_missions_filtered(&filter, PAGE, 0)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|mission| campaign_slot_held_by(mission.status))
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -7600,6 +7727,40 @@ pub async fn create_mission(
                 headers.insert("x-coalesced-with", value);
             }
             return Ok((headers, Json(existing)));
+        }
+    }
+
+    // Campaign uniqueness guard: at most one non-terminal campaign mission per
+    // project. Checked on the explicit request tags (project inherited from a
+    // bound conversation never carries track="campaign").
+    if let (Some(project), Some("campaign")) = (
+        req.project
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        req.track
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    ) {
+        let control_state = control_for_user(&state, &user).await;
+        if let Some(existing) =
+            find_open_campaign_mission(&control_state.mission_store, project).await
+        {
+            tracing::info!(
+                mission_id = %existing.id,
+                project = %project,
+                "create_mission rejected: a non-terminal campaign mission already \
+                 exists for this project"
+            );
+            return Err((
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "campaign_exists",
+                    "mission_id": existing.id.to_string(),
+                })
+                .to_string(),
+            ));
         }
     }
 
