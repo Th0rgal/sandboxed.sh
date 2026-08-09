@@ -42,10 +42,26 @@ CREATE TABLE IF NOT EXISTS project_state_events (
     first_seen_at TEXT NOT NULL,
     last_seen_at  TEXT NOT NULL,
     observations  INTEGER NOT NULL DEFAULT 1,
+    -- Session that produced the newest delivery folded into this row: the
+    -- overview offers it as the inferred conversation for the project.
+    session_id    TEXT,
     PRIMARY KEY (slug, first_seen_at)
 );
 CREATE INDEX IF NOT EXISTS idx_state_events_slug_seen
     ON project_state_events(slug, last_seen_at DESC);
+
+-- Deliveries the ingestor could not attribute to a project: no routing key, or
+-- a key whose alias resolves to an archived/deleted target. Kept small (the
+-- newest ~50) — this is a triage inbox for the board, not an archive.
+CREATE TABLE IF NOT EXISTS unrouted_deliveries (
+    session_id TEXT NOT NULL,
+    at         TEXT NOT NULL,
+    headline   TEXT NOT NULL,
+    signature  TEXT,
+    mode       TEXT,
+    blocker    TEXT,
+    PRIMARY KEY (session_id, at)
+);
 
 -- The authoritative project roster. Today a project is reconstructed on every
 -- read by unioning three sources (markdown trackers, tagged missions, routed
@@ -134,7 +150,7 @@ impl ProjectsStore {
         // Required for `project_grant`'s ON DELETE CASCADE — SQLite defaults it
         // off, so without this a deleted project would strand its grant row.
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.execute_batch(SCHEMA)?;
+        Self::initialize(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -144,10 +160,33 @@ impl ProjectsStore {
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let connection = Connection::open_in_memory()?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.execute_batch(SCHEMA)?;
+        Self::initialize(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    /// Create-or-migrate: `SCHEMA` covers fresh databases, and additive column
+    /// migrations bring an existing database up to the current shape.
+    /// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a new
+    /// column must be reconciled explicitly.
+    fn initialize(connection: &Connection) -> rusqlite::Result<()> {
+        connection.execute_batch(SCHEMA)?;
+        // project_state_events.session_id (2026-08: the overview builds
+        // latest_update from the store, so the delivery's session rides along).
+        let mut statement = connection.prepare("PRAGMA table_info(project_state_events)")?;
+        let has_session_id = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == "session_id");
+        drop(statement);
+        if !has_session_id {
+            connection.execute(
+                "ALTER TABLE project_state_events ADD COLUMN session_id TEXT",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, String> {
@@ -280,6 +319,7 @@ impl ProjectsStore {
         signature: &str,
         headline: Option<&str>,
         at: &str,
+        session_id: Option<&str>,
     ) -> Result<u32, String> {
         let connection = self.lock()?;
         let current: Option<(String, String, String, u32)> = connection
@@ -303,9 +343,10 @@ impl ProjectsStore {
                     .execute(
                         "UPDATE project_state_events \
                          SET last_seen_at = ?1, observations = observations + 1, \
-                             headline = COALESCE(?2, headline) \
+                             headline = COALESCE(?2, headline), \
+                             session_id = COALESCE(?5, session_id) \
                          WHERE slug = ?3 AND first_seen_at = ?4",
-                        params![at, headline, slug, first_seen_at],
+                        params![at, headline, slug, first_seen_at, session_id],
                     )
                     .map_err(|e| e.to_string())?;
                 return Ok(observations + 1);
@@ -321,10 +362,10 @@ impl ProjectsStore {
         connection
             .execute(
                 "INSERT INTO project_state_events \
-                   (slug, signature, headline, first_seen_at, last_seen_at, observations) \
-                 VALUES (?1, ?2, ?3, ?4, ?4, 1) \
+                   (slug, signature, headline, first_seen_at, last_seen_at, observations, session_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?4, 1, ?5) \
                  ON CONFLICT(slug, first_seen_at) DO NOTHING",
-                params![slug, signature, headline, at],
+                params![slug, signature, headline, at, session_id],
             )
             .map_err(|e| e.to_string())?;
         Ok(1)
@@ -335,19 +376,141 @@ impl ProjectsStore {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT signature, headline, first_seen_at, last_seen_at, observations \
+                "SELECT signature, headline, first_seen_at, last_seen_at, observations, session_id \
                  FROM project_state_events WHERE slug = ?1 \
                  ORDER BY last_seen_at DESC LIMIT ?2",
             )
             .map_err(|e| e.to_string())?;
         let rows = statement
-            .query_map(params![slug, limit as i64], |row| {
-                Ok(ProjectState {
-                    signature: row.get(0)?,
-                    headline: row.get(1)?,
-                    first_seen_at: row.get(2)?,
-                    last_seen_at: row.get(3)?,
-                    observations: row.get(4)?,
+            .query_map(params![slug, limit as i64], Self::state_from_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    fn state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectState> {
+        Ok(ProjectState {
+            signature: row.get(0)?,
+            headline: row.get(1)?,
+            first_seen_at: row.get(2)?,
+            last_seen_at: row.get(3)?,
+            observations: row.get(4)?,
+            session_id: row.get(5)?,
+        })
+    }
+
+    /// The state each project is currently in, keyed by slug.
+    ///
+    /// One query for the whole overview: this is what lets the board render
+    /// `latest_update` without scanning the Hermes delivery log per request.
+    pub fn latest_states(&self) -> Result<HashMap<String, ProjectState>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT slug, signature, headline, first_seen_at, last_seen_at, \
+                        observations, session_id \
+                 FROM project_state_events e \
+                 WHERE last_seen_at = ( \
+                   SELECT MAX(last_seen_at) FROM project_state_events \
+                   WHERE slug = e.slug \
+                 )",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ProjectState {
+                        signature: row.get(1)?,
+                        headline: row.get(2)?,
+                        first_seen_at: row.get(3)?,
+                        last_seen_at: row.get(4)?,
+                        observations: row.get(5)?,
+                        session_id: row.get(6)?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Total deliveries folded into each project's timeline (sum of
+    /// observations across its state rows), keyed by slug. The durable form of
+    /// the overview's old per-request `updates_count`.
+    pub fn state_event_totals(&self) -> Result<HashMap<String, usize>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare("SELECT slug, SUM(observations) FROM project_state_events GROUP BY slug")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as usize,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// How many unrouted deliveries the store retains. A triage inbox, not an
+    /// archive: old entries beyond this are dropped on insert.
+    const UNROUTED_RETENTION: usize = 50;
+
+    /// Record a delivery the ingestor could not attribute to a project.
+    ///
+    /// Idempotent on `(session_id, at)` — the ingestor replays an overlapping
+    /// window every cycle. Retention is enforced here rather than by a sweeper.
+    pub fn record_unrouted(
+        &self,
+        session_id: &str,
+        at: &str,
+        headline: &str,
+        signature: Option<&str>,
+        mode: Option<&str>,
+        blocker: Option<&str>,
+    ) -> Result<(), String> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO unrouted_deliveries \
+                   (session_id, at, headline, signature, mode, blocker) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(session_id, at) DO NOTHING",
+                params![session_id, at, headline, signature, mode, blocker],
+            )
+            .map_err(|e| e.to_string())?;
+        connection
+            .execute(
+                "DELETE FROM unrouted_deliveries WHERE (session_id, at) NOT IN ( \
+                   SELECT session_id, at FROM unrouted_deliveries \
+                   ORDER BY at DESC LIMIT ?1)",
+                params![Self::UNROUTED_RETENTION as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// The newest unrouted deliveries, newest first.
+    pub fn unrouted(&self, limit: usize) -> Result<Vec<UnroutedDelivery>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, at, headline, signature, mode, blocker \
+                 FROM unrouted_deliveries ORDER BY at DESC LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![limit as i64], |row| {
+                Ok(UnroutedDelivery {
+                    session_id: row.get(0)?,
+                    at: row.get(1)?,
+                    headline: row.get(2)?,
+                    signature: row.get(3)?,
+                    mode: row.get(4)?,
+                    blocker: row.get(5)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -718,6 +881,22 @@ pub struct ProjectState {
     pub last_seen_at: String,
     /// How many deliveries reported this same state in a row.
     pub observations: u32,
+    /// Session of the newest delivery folded into this row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// A delivery the ingestor refused to route: no key, or a key aliased onto an
+/// archived project. Surfaces on the board so it can be triaged instead of
+/// vanishing.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UnroutedDelivery {
+    pub session_id: String,
+    pub at: String,
+    pub headline: String,
+    pub signature: Option<String>,
+    pub mode: Option<String>,
+    pub blocker: Option<String>,
 }
 
 /// A project as an object in its own right, not a union reconstructed per read.
@@ -917,7 +1096,7 @@ mod tests {
         .enumerate()
         {
             let count = store
-                .record_state("verity", "phase1-blocked", Some("still blocked"), at)
+                .record_state("verity", "phase1-blocked", Some("still blocked"), at, None)
                 .expect("record");
             assert_eq!(count as usize, i + 1);
         }
@@ -932,13 +1111,13 @@ mod tests {
     fn a_new_state_opens_a_new_row_and_leaves_the_old_one_closed() {
         let store = ProjectsStore::open_in_memory().expect("store");
         store
-            .record_state("verity", "blocked", None, "2026-08-04T10:00:00Z")
+            .record_state("verity", "blocked", None, "2026-08-04T10:00:00Z", None)
             .expect("record");
         store
-            .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z")
+            .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z", None)
             .expect("record");
         store
-            .record_state("verity", "merged", None, "2026-08-04T10:30:00Z")
+            .record_state("verity", "merged", None, "2026-08-04T10:30:00Z", None)
             .expect("record");
 
         let timeline = store.state_timeline("verity", 10).expect("timeline");
@@ -957,14 +1136,14 @@ mod tests {
     fn replaying_a_delivery_does_not_inflate_the_count() {
         let store = ProjectsStore::open_in_memory().expect("store");
         store
-            .record_state("verity", "blocked", None, "2026-08-04T10:00:00Z")
+            .record_state("verity", "blocked", None, "2026-08-04T10:00:00Z", None)
             .expect("record");
         store
-            .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z")
+            .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z", None)
             .expect("record");
         for _ in 0..5 {
             store
-                .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z")
+                .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z", None)
                 .expect("replay");
         }
         let timeline = store.state_timeline("verity", 10).expect("timeline");
@@ -978,14 +1157,14 @@ mod tests {
     fn an_older_delivery_never_fabricates_a_transition() {
         let store = ProjectsStore::open_in_memory().expect("store");
         store
-            .record_state("verity", "blocked", None, "2026-08-04T10:00:00Z")
+            .record_state("verity", "blocked", None, "2026-08-04T10:00:00Z", None)
             .expect("record");
         store
-            .record_state("verity", "merged", None, "2026-08-04T11:00:00Z")
+            .record_state("verity", "merged", None, "2026-08-04T11:00:00Z", None)
             .expect("record");
         // Arrives late, older than the current state.
         store
-            .record_state("verity", "blocked", None, "2026-08-04T10:30:00Z")
+            .record_state("verity", "blocked", None, "2026-08-04T10:30:00Z", None)
             .expect("late");
 
         let timeline = store.state_timeline("verity", 10).expect("timeline");
@@ -997,13 +1176,13 @@ mod tests {
     fn projects_keep_separate_timelines() {
         let store = ProjectsStore::open_in_memory().expect("store");
         store
-            .record_state("verity", "a", None, "2026-08-04T10:00:00Z")
+            .record_state("verity", "a", None, "2026-08-04T10:00:00Z", None)
             .expect("record");
         store
-            .record_state("lido", "b", None, "2026-08-04T10:01:00Z")
+            .record_state("lido", "b", None, "2026-08-04T10:01:00Z", None)
             .expect("record");
         store
-            .record_state("lido", "b", None, "2026-08-04T10:02:00Z")
+            .record_state("lido", "b", None, "2026-08-04T10:02:00Z", None)
             .expect("record");
 
         let observations = store.current_state_observations().expect("observations");
@@ -1028,13 +1207,19 @@ mod tests {
     fn a_headline_backfills_but_never_erases() {
         let store = ProjectsStore::open_in_memory().expect("store");
         store
-            .record_state("verity", "s", None, "2026-08-04T10:00:00Z")
+            .record_state("verity", "s", None, "2026-08-04T10:00:00Z", None)
             .expect("record");
         store
-            .record_state("verity", "s", Some("now we know"), "2026-08-04T10:15:00Z")
+            .record_state(
+                "verity",
+                "s",
+                Some("now we know"),
+                "2026-08-04T10:15:00Z",
+                None,
+            )
             .expect("record");
         store
-            .record_state("verity", "s", None, "2026-08-04T10:30:00Z")
+            .record_state("verity", "s", None, "2026-08-04T10:30:00Z", None)
             .expect("record");
         let timeline = store.state_timeline("verity", 10).expect("timeline");
         assert_eq!(timeline[0].headline.as_deref(), Some("now we know"));
@@ -1168,5 +1353,116 @@ mod tests {
             .execute("DELETE FROM projects WHERE slug = 'lido'", [])
             .expect("delete");
         assert!(store.get_grant("lido").expect("read").is_none());
+    }
+
+    // ---- session_id on state events ----
+
+    #[test]
+    fn the_newest_delivery_session_rides_on_the_state_row() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .record_state(
+                "verity",
+                "blocked",
+                None,
+                "2026-08-04T10:00:00Z",
+                Some("s1"),
+            )
+            .expect("record");
+        // Extending the row moves the session to the newest delivery's.
+        store
+            .record_state(
+                "verity",
+                "blocked",
+                None,
+                "2026-08-04T10:15:00Z",
+                Some("s2"),
+            )
+            .expect("extend");
+        // A delivery with no session must not erase what we have.
+        store
+            .record_state("verity", "blocked", None, "2026-08-04T10:30:00Z", None)
+            .expect("extend without session");
+
+        let latest = store.latest_states().expect("latest");
+        let state = latest.get("verity").expect("row");
+        assert_eq!(state.session_id.as_deref(), Some("s2"));
+        assert_eq!(state.signature, "blocked");
+        assert_eq!(state.observations, 3);
+        assert_eq!(store.state_event_totals().expect("totals")["verity"], 3);
+    }
+
+    /// An existing database predating the `session_id` column must gain it on
+    /// open — `CREATE TABLE IF NOT EXISTS` alone would leave it missing.
+    #[test]
+    fn an_old_state_events_table_gains_the_session_column() {
+        let connection = Connection::open_in_memory().expect("conn");
+        connection
+            .execute_batch(
+                "CREATE TABLE project_state_events (
+                    slug TEXT NOT NULL, signature TEXT NOT NULL, headline TEXT,
+                    first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+                    observations INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (slug, first_seen_at));
+                 INSERT INTO project_state_events VALUES
+                    ('verity', 'blocked', NULL, '2026-08-04T10:00:00Z',
+                     '2026-08-04T10:00:00Z', 1);",
+            )
+            .expect("old schema");
+        ProjectsStore::initialize(&connection).expect("migrate");
+        let store = ProjectsStore {
+            connection: Mutex::new(connection),
+        };
+        let timeline = store.state_timeline("verity", 10).expect("timeline");
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].session_id, None);
+        store
+            .record_state(
+                "verity",
+                "blocked",
+                None,
+                "2026-08-04T10:15:00Z",
+                Some("s1"),
+            )
+            .expect("write through the new column");
+        assert_eq!(
+            store.latest_states().expect("latest")["verity"]
+                .session_id
+                .as_deref(),
+            Some("s1")
+        );
+    }
+
+    // ---- unrouted deliveries ----
+
+    #[test]
+    fn unrouted_deliveries_dedupe_and_cap_retention() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        // Replaying the same delivery (overlapping ingest window) is one row.
+        for _ in 0..3 {
+            store
+                .record_unrouted("s1", "2026-08-04T10:00:00Z", "orphan", None, None, None)
+                .expect("record");
+        }
+        assert_eq!(store.unrouted(100).expect("read").len(), 1);
+
+        // Retention keeps only the newest UNROUTED_RETENTION rows.
+        for i in 0..60 {
+            store
+                .record_unrouted(
+                    "s2",
+                    &format!("2026-08-05T10:{i:02}:00Z"),
+                    "orphan",
+                    Some("ghost"),
+                    None,
+                    None,
+                )
+                .expect("record");
+        }
+        let rows = store.unrouted(100).expect("read");
+        assert_eq!(rows.len(), ProjectsStore::UNROUTED_RETENTION);
+        // Newest first, and the oldest batch (including s1) was evicted.
+        assert_eq!(rows[0].at, "2026-08-05T10:59:00Z");
+        assert!(rows.iter().all(|row| row.session_id == "s2"));
     }
 }
