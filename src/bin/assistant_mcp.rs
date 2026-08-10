@@ -754,9 +754,10 @@ fn mission_events_path(
     } else if let Some(since_seq) = since_seq {
         path.push_str(&format!("&since_seq={since_seq}"));
     } else {
-        // The public events endpoint intentionally starts at the oldest row
-        // when no cursor is supplied. Hermes uses this bounded tool for live
-        // reconciliation, so its useful default is the newest page.
+        // The events endpoint already defaults to the newest page when no
+        // cursor is supplied, but Hermes uses this bounded tool for live
+        // reconciliation, so we pin the tail explicitly to stay robust against
+        // any future change to the server-side default.
         path.push_str(&format!("&before_seq={}", i64::MAX));
     }
     path
