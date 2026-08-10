@@ -1357,7 +1357,19 @@ impl ModelChainStore {
                 let provider_is_google =
                     matches!(provider_type, crate::ai_providers::ProviderType::Google);
                 let google_oauth_routable = provider_is_google && account.oauth.is_some();
-                if account.api_key.is_none() && !oauth_is_fresh && !google_oauth_routable {
+                // Kimi tokens live ~300s, so the stored access token is often
+                // expired by the time a request (or a catalog listing) resolves
+                // the chain. The proxy refreshes Kimi OAuth at request time and
+                // retries once on 401, so keep the account routable whenever it
+                // holds OAuth at all instead of dropping it on staleness.
+                let kimi_oauth_routable =
+                    matches!(provider_type, crate::ai_providers::ProviderType::Kimi)
+                        && account.oauth.is_some();
+                if account.api_key.is_none()
+                    && !oauth_is_fresh
+                    && !google_oauth_routable
+                    && !kimi_oauth_routable
+                {
                     tracing::debug!(
                         account_id = %account.id,
                         provider = %entry.provider_id,
@@ -1408,7 +1420,8 @@ impl ModelChainStore {
                         && crate::api::ai_providers::xai_cli_proxy_account_available();
                 let entry_has_oauth = credential_is_oauth_token
                     || google_oauth_routable
-                    || xai_oauth_cli_proxy_routable;
+                    || xai_oauth_cli_proxy_routable
+                    || (kimi_oauth_routable && routed_api_key.is_none());
                 let entry_has_api_key = routed_api_key.is_some();
                 resolved.push(ResolvedEntry {
                     provider_id: entry.provider_id.clone(),
@@ -2194,5 +2207,74 @@ mod tests {
         );
         assert!(resolved[0].has_oauth);
         assert_eq!(resolved[0].model_id, "k3");
+    }
+
+    #[tokio::test]
+    async fn resolve_entries_kimi_stays_routable_with_expired_oauth() {
+        // Kimi tokens live ~300s; between refresh cycles the stored snapshot
+        // is expired. The account must still resolve (api_key: None,
+        // has_oauth: true) so GET /v1/models keeps the kimi catalog and the
+        // proxy can refresh the token at request time.
+        let mut kimi = AIProvider::new(ProviderType::Kimi, "Kimi".to_string());
+        kimi.oauth = Some(OAuthCredentials {
+            access_token: "expired-kimi-token".to_string(),
+            refresh_token: "kimi-rt".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() - 60_000,
+        });
+        kimi.status = ProviderStatus::Connected;
+        let store = store_with(vec![kimi]).await;
+        let chains = store_with_chain("unused", vec![]).await;
+        let tracker = ProviderHealthTracker::new();
+
+        let resolved = chains
+            .resolve_entries(
+                &[ChainEntry {
+                    provider_id: "kimi".to_string(),
+                    model_id: "k3".to_string(),
+                }],
+                &store,
+                &[],
+                &tracker,
+            )
+            .await;
+
+        assert_eq!(
+            resolved.len(),
+            1,
+            "kimi entry with expired OAuth should resolve: {resolved:?}"
+        );
+        assert_eq!(
+            resolved[0].api_key, None,
+            "an expired token must not be hoisted as a Bearer credential"
+        );
+        assert!(resolved[0].has_oauth);
+    }
+
+    #[tokio::test]
+    async fn cooldown_clears_on_success_for_account_and_subscription() {
+        // A rate-limit failure parks the account and its shared subscription;
+        // one successful request through any credential of the subscription
+        // must fully clear both cooldowns.
+        let tracker = ProviderHealthTracker::new();
+        let account = Uuid::new_v4();
+        let key = SubscriptionKey::new("anthropic", "org-x");
+
+        let cd = tracker
+            .record_failure_with_subscription(
+                account,
+                Some(&key),
+                CooldownReason::RateLimit,
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await;
+        assert!(cd >= std::time::Duration::from_secs(600));
+        assert!(!tracker.is_healthy(account).await);
+        assert!(!tracker.subscription_is_healthy(Some(&key)).await);
+
+        tracker
+            .record_success_with_subscription(account, Some(&key))
+            .await;
+        assert!(tracker.is_healthy(account).await);
+        assert!(tracker.subscription_is_healthy(Some(&key)).await);
     }
 }

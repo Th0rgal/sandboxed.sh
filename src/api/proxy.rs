@@ -235,6 +235,13 @@ pub(crate) fn has_routable_proxy_credentials(
                 || (has_oauth && crate::api::ai_providers::xai_cli_proxy_account_available())
         }
         ProviderType::Google => has_api_key || has_oauth,
+        // Kimi access tokens live ~300s, so between refresh cycles the stored
+        // token is routinely expired and the resolved entry carries no
+        // hoisted `api_key`. The proxy refreshes the OAuth token at request
+        // time (and once more on a 401), so a connected Kimi account is
+        // routable whenever it holds OAuth at all — otherwise `GET /v1/models`
+        // drops the kimi catalog every time the snapshot happens to be stale.
+        ProviderType::Kimi => has_api_key || has_oauth,
         _ => has_api_key,
     }
 }
@@ -1276,13 +1283,11 @@ pub(crate) async fn chat_completions_inner(
 
             if status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529 {
                 let elapsed_ms = request_start.elapsed().as_millis() as u64;
-                let retry_after = parse_rate_limit_headers(&response_headers, provider_type);
-                let reason = if status.as_u16() == 529 {
-                    CooldownReason::Overloaded
-                } else if body_is_quota_exhausted(&resp_body) {
-                    CooldownReason::QuotaExhausted
+                let retry_after_hdr = parse_rate_limit_headers(&response_headers, provider_type);
+                let (reason, retry_after) = if status.as_u16() == 529 {
+                    (CooldownReason::Overloaded, retry_after_hdr)
                 } else {
-                    CooldownReason::RateLimit
+                    classify_429(provider_type, retry_after_hdr, &resp_body)
                 };
                 let cooldown = state
                     .health_tracker
@@ -1519,13 +1524,10 @@ pub(crate) async fn chat_completions_inner(
 
             if status == StatusCode::TOO_MANY_REQUESTS {
                 let elapsed_ms = request_start.elapsed().as_millis() as u64;
-                let retry_after = parse_google_retry_after(&response_headers, &resp_body)
+                let retry_after_hdr = parse_google_retry_after(&response_headers, &resp_body)
                     .or_else(|| parse_rate_limit_headers(&response_headers, provider_type));
-                let reason = if body_is_quota_exhausted(&resp_body) {
-                    CooldownReason::QuotaExhausted
-                } else {
-                    CooldownReason::RateLimit
-                };
+                let (reason, retry_after) =
+                    classify_429(provider_type, retry_after_hdr, &resp_body);
                 let cooldown = state
                     .health_tracker
                     .record_entry_failure(entry, reason, retry_after)
@@ -1676,19 +1678,7 @@ pub(crate) async fn chat_completions_inner(
         // Pre-stream error handling: 429, 529, 5xx → cooldown + try next
         if status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529 {
             let elapsed_ms = request_start.elapsed().as_millis() as u64;
-            let mut retry_after = parse_rate_limit_headers(upstream_resp.headers(), provider_type);
-            // Kimi: keep the rate-limit cooldown short instead of letting it grow
-            // exponentially (5s→300s). Its rolling-window quota frees up
-            // continuously and we already throttle via `KIMI_CONCURRENCY`, so a
-            // brief account-wide pause is enough; a multi-minute cooldown would
-            // outlast a caller's retry budget and make the whole run give up.
-            // Honor a real upstream `retry-after` when present (and shorter).
-            if provider_type == ProviderType::Kimi && status == StatusCode::TOO_MANY_REQUESTS {
-                let capped = retry_after
-                    .unwrap_or(std::time::Duration::from_secs(5))
-                    .min(std::time::Duration::from_secs(15));
-                retry_after = Some(capped);
-            }
+            let retry_after_hdr = parse_rate_limit_headers(upstream_resp.headers(), provider_type);
             // Passive Codex usage capture (B): a 429 from the local CLIProxyAPI
             // on the Codex path carries a `model_cooldown` body with the weekly
             // (secondary) window reset. The cli-proxy strips the rich x-codex-*
@@ -1711,12 +1701,10 @@ pub(crate) async fn chat_completions_inner(
                     codex_store.put_passive_cooldown(store_key, reset_at).await;
                 }
             }
-            let reason = if status.as_u16() == 529 {
-                CooldownReason::Overloaded
-            } else if body_is_quota_exhausted(&err_body) {
-                CooldownReason::QuotaExhausted
+            let (reason, retry_after) = if status.as_u16() == 529 {
+                (CooldownReason::Overloaded, retry_after_hdr)
             } else {
-                CooldownReason::RateLimit
+                classify_429(provider_type, retry_after_hdr, &err_body)
             };
             tracing::info!(
                 provider = %entry.provider_id,
@@ -2968,6 +2956,89 @@ fn parse_rate_limit_duration(s: &str) -> Option<std::time::Duration> {
 /// Detect a hard quota/usage-limit exhaustion from a raw upstream error body
 /// (e.g. a 429 response payload). Used to park an exhausted subscription on a
 /// long cooldown instead of the short transient-rate-limit backoff.
+/// Upper bound on the cooldown applied for a *transient* rate-limit 429.
+///
+/// A per-minute (RPM/TPM) limit clears within the minute by definition, so a
+/// longer cooldown only blackholes the provider past the point where it would
+/// already accept traffic again. This bounds both an upstream `Retry-After`
+/// (some providers send pathological values) and our own default.
+const RATE_429_COOLDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Default cooldown for a transient rate-limit 429 when the upstream sent no
+/// usable `Retry-After`/reset header.
+const RATE_429_DEFAULT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Detect rate-limit-style wording (per-minute / TPM / RPM windows) in a 429
+/// body. Such a limit is transient by construction — one oversized request can
+/// trip a tokens-per-minute window even though the account has plenty of quota
+/// left — so it must never be classified as hard quota exhaustion.
+fn body_is_per_minute_rate_limit(body: &[u8]) -> bool {
+    let lower = String::from_utf8_lossy(body).to_ascii_lowercase();
+    lower.contains("per minute")
+        || lower.contains("per-minute")
+        || lower.contains("tokens per min")
+        || lower.contains("requests per min")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("rate-limit")
+        || lower.contains("try again in")
+        || lower.contains("too many requests")
+}
+
+/// Per-provider cooldown policy for transient rate-limit 429s.
+///
+/// - **Kimi**: rolling-window budget frees up continuously and we already
+///   throttle via `KIMI_CONCURRENCY`; a brief pause is enough (≤15s).
+/// - **Anthropic / Z.AI / Muse**: per-minute token windows that a single large
+///   payload (e.g. a big Lean context) can trip on its own; keep the pause
+///   well under a minute so one heavy request can't park the account.
+/// - Everyone else: honor a bounded `Retry-After` when present, otherwise let
+///   the health tracker's exponential backoff decide.
+fn rate_429_cooldown(
+    provider_type: ProviderType,
+    retry_after: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    match provider_type {
+        ProviderType::Kimi => Some(
+            retry_after
+                .unwrap_or(std::time::Duration::from_secs(5))
+                .min(std::time::Duration::from_secs(15)),
+        ),
+        ProviderType::Anthropic | ProviderType::Zai | ProviderType::Muse => Some(
+            retry_after
+                .unwrap_or(RATE_429_DEFAULT_COOLDOWN)
+                .min(RATE_429_COOLDOWN_CAP),
+        ),
+        _ => retry_after.map(|d| d.min(RATE_429_COOLDOWN_CAP)),
+    }
+}
+
+/// Classify an upstream 429 into a cooldown reason plus an explicit cooldown
+/// duration override.
+///
+/// A `Retry-After`/reset header, or per-minute rate-limit wording in the body,
+/// marks the 429 as *transient*: the upstream expects the caller back shortly,
+/// so it gets [`CooldownReason::RateLimit`] with a short bounded cooldown —
+/// even when the body also contains quota-ish phrasing (Z.AI's per-minute 429
+/// says "usage limit", which would otherwise be misread as hard exhaustion and
+/// park the whole subscription for `PROVIDER_QUOTA_COOLDOWN_SECS` ≈ 1h).
+/// Only an explicit quota/billing exhaustion body *without* any transient
+/// signal earns the long [`CooldownReason::QuotaExhausted`] cooldown.
+fn classify_429(
+    provider_type: ProviderType,
+    retry_after: Option<std::time::Duration>,
+    body: &[u8],
+) -> (CooldownReason, Option<std::time::Duration>) {
+    let transient = retry_after.is_some() || body_is_per_minute_rate_limit(body);
+    if !transient && body_is_quota_exhausted(body) {
+        return (CooldownReason::QuotaExhausted, retry_after);
+    }
+    (
+        CooldownReason::RateLimit,
+        rate_429_cooldown(provider_type, retry_after),
+    )
+}
+
 fn body_is_quota_exhausted(body: &[u8]) -> bool {
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
         if matches!(classify_embedded_error(&v), CooldownReason::QuotaExhausted) {
@@ -5705,6 +5776,85 @@ mod tests {
             br#"{"error":{"type":"rate_limit_error"}}"#
         ));
         assert!(!body_is_quota_exhausted(b"plain transient 429"));
+    }
+
+    #[test]
+    fn classify_429_honors_retry_after_capped_at_60s() {
+        // A Retry-After header marks the 429 as transient even when the body
+        // carries quota-ish wording; the cooldown honors it, bounded at 60s.
+        let secs = |s| std::time::Duration::from_secs(s);
+        let quota_body = br#"{"error":{"message":"The usage limit has been reached"}}"#;
+        let (reason, cd) = classify_429(ProviderType::Zai, Some(secs(20)), quota_body);
+        assert!(matches!(reason, CooldownReason::RateLimit));
+        assert_eq!(cd, Some(secs(20)));
+        // Pathologically long Retry-After is capped.
+        let (reason, cd) = classify_429(ProviderType::Anthropic, Some(secs(1800)), b"429");
+        assert!(matches!(reason, CooldownReason::RateLimit));
+        assert_eq!(cd, Some(secs(60)));
+    }
+
+    #[test]
+    fn classify_429_per_minute_body_is_rate_not_quota() {
+        // A tokens-per-minute breach from one oversized payload is transient:
+        // it must never earn the 3600s quota cooldown, even without headers.
+        let secs = |s| std::time::Duration::from_secs(s);
+        let body = br#"{"error":{"type":"rate_limit_error","message":"This request would exceed your organization's rate limit of 80,000 input tokens per minute"}}"#;
+        let (reason, cd) = classify_429(ProviderType::Anthropic, None, body);
+        assert!(matches!(reason, CooldownReason::RateLimit));
+        assert_eq!(cd, Some(secs(30)), "capped provider gets a short default");
+        // Same for a quota-worded body that also mentions the minute window.
+        let zai = br#"{"error":{"message":"The usage limit has been reached, requests per minute exceeded"}}"#;
+        let (reason, _) = classify_429(ProviderType::Zai, None, zai);
+        assert!(matches!(reason, CooldownReason::RateLimit));
+    }
+
+    #[test]
+    fn classify_429_explicit_quota_body_stays_quota() {
+        // No Retry-After, no per-minute wording: hard exhaustion keeps the
+        // long quota cooldown class.
+        let body = br#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota, please check your plan and billing details"}}"#;
+        let (reason, cd) = classify_429(ProviderType::OpenAI, None, body);
+        assert!(matches!(reason, CooldownReason::QuotaExhausted));
+        assert_eq!(cd, None);
+    }
+
+    #[test]
+    fn classify_429_provider_caps() {
+        let secs = |s| std::time::Duration::from_secs(s);
+        // Kimi keeps its short 5s default / 15s cap.
+        let (_, cd) = classify_429(ProviderType::Kimi, None, b"429");
+        assert_eq!(cd, Some(secs(5)));
+        let (_, cd) = classify_429(ProviderType::Kimi, Some(secs(120)), b"429");
+        assert_eq!(cd, Some(secs(15)));
+        // Anthropic / Z.AI / Muse rate 429s are always bounded.
+        for pt in [
+            ProviderType::Anthropic,
+            ProviderType::Zai,
+            ProviderType::Muse,
+        ] {
+            let (_, cd) = classify_429(pt, None, b"429");
+            assert_eq!(cd, Some(secs(30)), "{pt:?}");
+        }
+        // Uncapped providers without headers defer to exponential backoff.
+        let (_, cd) = classify_429(ProviderType::Minimax, None, b"429");
+        assert_eq!(cd, None);
+    }
+
+    #[test]
+    fn kimi_routable_via_oauth_for_catalog() {
+        // A connected Kimi account whose ~300s token snapshot is stale resolves
+        // with `api_key: None, has_oauth: true`; the /v1/models routability
+        // filter must keep it (the proxy refreshes the token at request time).
+        assert!(has_routable_proxy_credentials(
+            ProviderType::Kimi,
+            false,
+            true
+        ));
+        assert!(!has_routable_proxy_credentials(
+            ProviderType::Kimi,
+            false,
+            false
+        ));
     }
 
     #[test]
