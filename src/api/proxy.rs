@@ -3714,20 +3714,37 @@ fn build_anthropic_upstream_request(
     if model_changed {
         strip_thinking_blocks(&mut messages);
     }
-    // OAuth-subscription tokens require the Claude Code identity as the first
-    // system block, else Anthropic returns a misleading 429. Prepend it unless
-    // the caller's own system prompt already leads with it (idempotent so a
-    // retry can't double it).
-    let system = if force_claude_code_identity && !system.starts_with(CLAUDE_CODE_IDENTITY) {
-        if system.is_empty() {
-            CLAUDE_CODE_IDENTITY.to_string()
+    // OAuth-subscription tokens require the Claude Code identity as the FIRST
+    // system block and Anthropic exact-matches that block's text, else it
+    // returns a misleading 429. Merging the identity and the caller's system
+    // prompt into one string breaks the exact match (the first block's text is
+    // then "identity\n\ncustom…"), so with a custom system prompt we must emit
+    // `system` as an array of blocks: block 0 is exactly the identity, the
+    // caller's content follows as its own block. This mirrors what real Claude
+    // Code and CLIProxyAPI send. Idempotent: a system prompt already leading
+    // with the identity has it stripped from the remainder first, so a retry
+    // can't double it.
+    if force_claude_code_identity {
+        let rest = system
+            .strip_prefix(CLAUDE_CODE_IDENTITY)
+            .unwrap_or(&system)
+            .trim_start()
+            .to_string();
+        if rest.is_empty() {
+            out.insert(
+                "system".to_string(),
+                serde_json::Value::String(CLAUDE_CODE_IDENTITY.to_string()),
+            );
         } else {
-            format!("{CLAUDE_CODE_IDENTITY}\n\n{system}")
+            out.insert(
+                "system".to_string(),
+                serde_json::json!([
+                    { "type": "text", "text": CLAUDE_CODE_IDENTITY },
+                    { "type": "text", "text": rest },
+                ]),
+            );
         }
-    } else {
-        system
-    };
-    if !system.is_empty() {
+    } else if !system.is_empty() {
         out.insert("system".to_string(), serde_json::Value::String(system));
     }
     out.insert("messages".to_string(), serde_json::Value::Array(messages));
@@ -6066,8 +6083,9 @@ mod tests {
     #[test]
     fn anthropic_oauth_request_prepends_claude_code_identity() {
         // OAuth path (force_claude_code_identity = true): the Claude Code
-        // identity must lead the system prompt, else Anthropic 429s the
-        // subscription token.
+        // identity must be the first system BLOCK and match exactly (Anthropic
+        // exact-matches block 0's text), else Anthropic 429s the subscription
+        // token. Custom system content follows as its own block.
         let body = serde_json::json!({
             "model": "claude-opus-4-8",
             "messages": [
@@ -6084,10 +6102,11 @@ mod tests {
         )
         .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(bytes.as_ref()).unwrap();
-        assert_eq!(
-            payload["system"],
-            "You are Claude Code, Anthropic's official CLI for Claude.\n\nBe brief."
-        );
+        let expected_blocks = serde_json::json!([
+            { "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." },
+            { "type": "text", "text": "Be brief." },
+        ]);
+        assert_eq!(payload["system"], expected_blocks);
 
         // Idempotent: a system prompt already leading with the identity is not
         // doubled (covers the thinking-strip retry re-running the builder).
@@ -6107,10 +6126,7 @@ mod tests {
         )
         .unwrap();
         let payload2: serde_json::Value = serde_json::from_slice(bytes2.as_ref()).unwrap();
-        assert_eq!(
-            payload2["system"],
-            "You are Claude Code, Anthropic's official CLI for Claude.\n\nBe brief."
-        );
+        assert_eq!(payload2["system"], expected_blocks);
 
         // Empty system + OAuth: identity becomes the whole system prompt.
         let body3 = serde_json::json!({
