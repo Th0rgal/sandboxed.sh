@@ -40,6 +40,23 @@ const DELIVERY_SCAN_LIMIT: usize = 600;
 /// is flagged stale-active.
 const STALE_ACTIVE_HOURS: i64 = 24;
 
+/// How recent the controller's latest state event must be for the row to count
+/// as "the controller is on it". Within this window an `active` record with no
+/// blocker suppresses mission-derived attention (failed/interrupted chips): the
+/// controller has seen those missions and keeps reporting active — flagging the
+/// project anyway is what put 48h-old failures on the attention shelf while the
+/// delivery said "Action: aucune". Default 2700s (45min) ≈ 2–3× a typical
+/// controller cadence; tune with `ATTENTION_FRESH_SIGNAL_SECS`.
+const ATTENTION_FRESH_SIGNAL_SECS_DEFAULT: i64 = 2700;
+
+fn attention_fresh_signal_secs() -> i64 {
+    std::env::var("ATTENTION_FRESH_SIGNAL_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(ATTENTION_FRESH_SIGNAL_SECS_DEFAULT)
+}
+
 /// How often the state ingestor folds new deliveries into the timeline.
 ///
 /// The window it re-reads overlaps generously; `record_state` is idempotent on
@@ -954,18 +971,67 @@ impl ProjectRowBuilder {
                 attention.push("same state on 3 consecutive updates".to_string());
             }
         }
-        // One aggregated line instead of one per mission: the detail pane
-        // already lists every mission chip.
-        let problem_missions: Vec<&MissionChip> = self
+        // A parked question always needs the operator: no freshness or mode
+        // signal from the controller can answer on the human's behalf.
+        let awaiting_user = self
             .missions
             .iter()
-            .filter(|chip| {
-                matches!(
-                    chip.status,
-                    MissionStatus::Failed | MissionStatus::Interrupted
-                )
+            .filter(|chip| chip.status == MissionStatus::AwaitingUser)
+            .count();
+        if awaiting_user > 0 {
+            attention.push(match awaiting_user {
+                1 => "1 mission awaiting user input".to_string(),
+                count => format!("{count} missions awaiting user input"),
+            });
+        }
+
+        // Fresh-active suppression: the controller reported recently (silent
+        // ticks advance `at` too), says it is active, and reports no blocker —
+        // it has seen the failed/interrupted missions and continues, so those
+        // mission-derived reasons are noise, not attention. A stale controller,
+        // a blocker, a non-active mode, or an awaiting_user mission each keep
+        // the reasons. When suppression applies the reasons are not emitted at
+        // all: cards and pills count `attention_reasons` as rendered.
+        let mode_active = self
+            .mode
+            .as_deref()
+            .or_else(|| {
+                self.latest_update
+                    .as_ref()
+                    .and_then(|update| update.mode.as_deref())
             })
-            .collect();
+            .is_some_and(|mode| mode == "active");
+        let signal_fresh = self
+            .latest_update
+            .as_ref()
+            .and_then(|update| chrono::DateTime::parse_from_rfc3339(&update.at).ok())
+            .zip(chrono::DateTime::parse_from_rfc3339(now).ok())
+            .is_some_and(|(at, now)| {
+                let age = now.signed_duration_since(at);
+                age <= chrono::Duration::seconds(attention_fresh_signal_secs())
+            });
+        let blocker_set = self
+            .latest_update
+            .as_ref()
+            .is_some_and(|update| update.blocker.is_some());
+        let suppress_mission_reasons =
+            signal_fresh && mode_active && !blocker_set && awaiting_user == 0;
+
+        // One aggregated line instead of one per mission: the detail pane
+        // already lists every mission chip.
+        let problem_missions: Vec<&MissionChip> = if suppress_mission_reasons {
+            Vec::new()
+        } else {
+            self.missions
+                .iter()
+                .filter(|chip| {
+                    matches!(
+                        chip.status,
+                        MissionStatus::Failed | MissionStatus::Interrupted
+                    )
+                })
+                .collect()
+        };
         match problem_missions.len() {
             0 => {}
             1 => {
@@ -1808,6 +1874,130 @@ mod tests {
             .collect();
         assert_eq!(failed_lines.len(), 1);
         assert!(failed_lines[0].contains("3 missions failed or interrupted"));
+    }
+
+    // ---- fresh-active suppression ----
+
+    fn failed_chip(id: &str) -> MissionChip {
+        MissionChip {
+            id: id.to_string(),
+            status: MissionStatus::Failed,
+            title: None,
+            updated_at: "2026-08-02T00:00:00Z".to_string(),
+            github_pr: None,
+        }
+    }
+
+    fn active_update(at: &str, blocker: Option<&str>) -> DeliveryUpdate {
+        DeliveryUpdate {
+            headline: "tick".into(),
+            body: None,
+            session_id: "s".into(),
+            at: at.into(),
+            signature: Some("verity".into()),
+            state: Some("phase|head|clean".into()),
+            mode: Some("active".into()),
+            blocker: blocker.map(str::to_string),
+        }
+    }
+
+    /// The incident shape: 48h-old failed missions, but the controller
+    /// reported minutes ago, says active, and reports no blocker. It has seen
+    /// those missions and continues — the row must not sit on the attention
+    /// shelf, and the suppressed reasons must not be emitted at all.
+    #[test]
+    fn fresh_active_controller_suppresses_mission_derived_attention() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder.mode = Some("active".to_string());
+        builder
+            .missions
+            .push(failed_chip("00000001-aaaa-bbbb-cccc-dddddddddddd"));
+        builder.attach_store_update(active_update("2026-08-04T11:50:00Z", None), 1, 5);
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.bucket, "active");
+        assert!(
+            row.attention_reasons.is_empty(),
+            "suppressed reasons must not be emitted: {:?}",
+            row.attention_reasons
+        );
+    }
+
+    /// A stale controller cannot vouch for its failures: past the freshness
+    /// window the failed missions flag the row again.
+    #[test]
+    fn stale_controller_with_failed_missions_stays_attention() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder.mode = Some("active".to_string());
+        builder
+            .missions
+            .push(failed_chip("00000001-aaaa-bbbb-cccc-dddddddddddd"));
+        builder.attach_store_update(active_update("2026-08-02T12:00:00Z", None), 1, 5);
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.bucket, "attention");
+        assert!(row.attention_reasons.iter().any(|r| r.contains("Failed")));
+    }
+
+    /// A reported blocker always wins over freshness: the controller itself
+    /// says it is stuck.
+    #[test]
+    fn fresh_controller_with_blocker_stays_attention() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder.mode = Some("active".to_string());
+        builder
+            .missions
+            .push(failed_chip("00000001-aaaa-bbbb-cccc-dddddddddddd"));
+        builder.attach_store_update(
+            active_update("2026-08-04T11:50:00Z", Some("waiting on CI runner")),
+            1,
+            5,
+        );
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.bucket, "attention");
+        assert!(row.attention_reasons.iter().any(|r| r.contains("blocker")));
+        // Suppression is off entirely: the failed mission surfaces too.
+        assert!(row.attention_reasons.iter().any(|r| r.contains("Failed")));
+    }
+
+    /// A parked question is always attention: no controller signal can answer
+    /// on the operator's behalf, and it disables suppression for the row.
+    #[test]
+    fn awaiting_user_is_attention_regardless_of_freshness() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder.mode = Some("active".to_string());
+        builder.missions.push(MissionChip {
+            id: "00000002-aaaa-bbbb-cccc-dddddddddddd".to_string(),
+            status: MissionStatus::AwaitingUser,
+            title: None,
+            updated_at: "2026-08-04T11:00:00Z".to_string(),
+            github_pr: None,
+        });
+        builder
+            .missions
+            .push(failed_chip("00000001-aaaa-bbbb-cccc-dddddddddddd"));
+        builder.attach_store_update(active_update("2026-08-04T11:50:00Z", None), 1, 5);
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.bucket, "attention");
+        assert!(row
+            .attention_reasons
+            .iter()
+            .any(|r| r.contains("awaiting user input")));
+        assert!(row.attention_reasons.iter().any(|r| r.contains("Failed")));
+    }
+
+    /// Freshness alone is not enough: without an active mode the controller
+    /// has not vouched for anything.
+    #[test]
+    fn fresh_signal_without_active_mode_does_not_suppress() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder
+            .missions
+            .push(failed_chip("00000001-aaaa-bbbb-cccc-dddddddddddd"));
+        let mut update = active_update("2026-08-04T11:50:00Z", None);
+        update.mode = None;
+        builder.attach_store_update(update, 1, 5);
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.bucket, "attention");
+        assert!(row.attention_reasons.iter().any(|r| r.contains("Failed")));
     }
 
     #[test]
