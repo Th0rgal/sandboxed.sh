@@ -487,7 +487,6 @@
 				};
 			};
 			buildConfigurationList = 210E554B4D49DD6F4EE7F3FD /* Build configuration list for PBXProject "SandboxedDashboard" */;
-			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -497,6 +496,7 @@
 			mainGroup = 9402FD943158ED3148A81A0C;
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
+			productRefGroup = 057719CAD3366030137C44B3 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (

@@ -23,6 +23,9 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Pinned so CI and local regeneration produce byte-identical pbxproj output.
+  # The committed project.pbxproj must be regenerated with exactly this version.
+  XCODEGEN_VERSION: 2.46.0
 
 jobs:
   ios-build:
@@ -38,15 +41,20 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install xcodegen
-        run: brew install xcodegen
+      - name: Install xcodegen (pinned)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "${RUNNER_TEMP}/xcodegen.zip" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          unzip -oq "${RUNNER_TEMP}/xcodegen.zip" -d "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/xcodegen/bin/xcodegen" --version
 
       - name: Regenerate Xcode project and check for drift
         run: |
           set -euo pipefail
-          xcodegen generate
+          "${RUNNER_TEMP}/xcodegen/bin/xcodegen" generate
           if ! git diff --exit-code SandboxedDashboard.xcodeproj/project.pbxproj; then
-            echo "::error title=pbxproj drift::project.pbxproj is out of date. Run 'xcodegen generate' in ios_dashboard/ and commit the result."
+            echo "::error title=pbxproj drift::project.pbxproj is out of date. Regenerate with xcodegen ${XCODEGEN_VERSION} ('xcodegen generate' in ios_dashboard/) and commit the result."
             exit 1
           fi
 
