@@ -27,6 +27,7 @@ ASSISTANT_TOOLS = [
     "start_mission",
     "send_message_to_mission",
     "ask_mission",
+    "answer_mission_question",
     "cancel_mission",
     "acknowledge_mission",
     "adopt_mission",

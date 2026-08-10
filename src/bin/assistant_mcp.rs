@@ -442,6 +442,18 @@ struct AskMissionParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct AnswerMissionQuestionParams {
+    mission_id: String,
+    /// Target a specific AskUserQuestion call. Omit to auto-resolve the
+    /// mission's single unanswered question.
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    /// One inner array per question; each entry is an option label or free
+    /// text.
+    answers: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
 struct WorkspaceBashParams {
     command: String,
     #[serde(default)]
@@ -748,6 +760,75 @@ fn mission_events_path(
         path.push_str(&format!("&before_seq={}", i64::MAX));
     }
     path
+}
+
+/// One unanswered AskUserQuestion tool call found in a mission's events.
+#[derive(Debug, PartialEq, Eq)]
+struct PendingAskQuestion {
+    tool_call_id: String,
+    sequence: i64,
+    /// Question texts parsed from the call args, best-effort.
+    questions: Vec<String>,
+}
+
+impl PendingAskQuestion {
+    fn summary(&self) -> String {
+        if self.questions.is_empty() {
+            "(question text unavailable)".to_string()
+        } else {
+            self.questions.join(" | ")
+        }
+    }
+}
+
+/// Unanswered AskUserQuestion calls in `events`, newest first. A call is
+/// unanswered when no tool_result event anywhere in the page shares its
+/// tool_call_id.
+fn pending_ask_user_questions(events: &[Value]) -> Vec<PendingAskQuestion> {
+    let mut answered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for event in events {
+        if event.get("event_type").and_then(Value::as_str) == Some("tool_result") {
+            if let Some(id) = event.get("tool_call_id").and_then(Value::as_str) {
+                answered.insert(id);
+            }
+        }
+    }
+    let mut pending = Vec::new();
+    for event in events {
+        if event.get("event_type").and_then(Value::as_str) != Some("tool_call")
+            || event.get("tool_name").and_then(Value::as_str) != Some("AskUserQuestion")
+        {
+            continue;
+        }
+        let Some(id) = event.get("tool_call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if answered.contains(id) {
+            continue;
+        }
+        let questions = event
+            .get("content")
+            .and_then(Value::as_str)
+            .and_then(|content| serde_json::from_str::<Value>(content).ok())
+            .as_ref()
+            .and_then(|args| args.get("questions"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("question").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        pending.push(PendingAskQuestion {
+            tool_call_id: id.to_string(),
+            sequence: event.get("sequence").and_then(Value::as_i64).unwrap_or(0),
+            questions,
+        });
+    }
+    pending.sort_by_key(|question| std::cmp::Reverse(question.sequence));
+    pending
 }
 
 fn insert_optional<T: Serialize>(
@@ -1325,6 +1406,19 @@ impl AssistantMcp {
                         "content": {"type": "string", "description": "The question for the copilot."},
                         "thread_id": {"type": "string", "description": "Optional: continue an existing Ask thread."},
                         "sandbox": {"type": "boolean", "description": "Optional: isolate bash writes in a throwaway copy of the workspace (default false)."}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "answer_mission_question".to_string(),
+                description: "Answer a mission's pending AskUserQuestion so its blocked turn resumes immediately. A mission parked on a question cannot be unblocked with send_message_to_mission — plain messages QUEUE BEHIND the blocked turn — so this is the way a controller answers instead of leaving the mission in awaiting_user. `answers` is an array of arrays: one inner array per question, each entry an option label (preferred) or free text. Omit tool_call_id to auto-target the mission's single unanswered question; if several are pending you get an error listing them.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id", "answers"],
+                    "properties": {
+                        "mission_id": {"type": "string", "description": "Mission UUID or an unambiguous leading fragment."},
+                        "tool_call_id": {"type": "string", "description": "Optional: the AskUserQuestion tool_call id to answer. Omit to use the newest unanswered one."},
+                        "answers": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}, "description": "One inner array per question, e.g. [[\"Option A\"]]."}
                     }
                 }),
             },
@@ -2146,6 +2240,101 @@ impl AssistantMcp {
         }))
     }
 
+    async fn answer_mission_question(
+        &self,
+        params: AnswerMissionQuestionParams,
+    ) -> Result<Value, String> {
+        let id = self.resolve_mission_id(&params.mission_id).await?;
+        if params.answers.is_empty() || params.answers.iter().any(Vec::is_empty) {
+            return Err(
+                "answers must contain one non-empty inner array per question, e.g. [[\"Option A\"]]"
+                    .to_string(),
+            );
+        }
+        let tool_call_id =
+            match params
+                .tool_call_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(explicit) => explicit.to_string(),
+                None => {
+                    // Page backwards from the end of the transcript: the pending
+                    // question is by definition among the NEWEST events, and the
+                    // default (no cursor) pagination returns the oldest rows.
+                    let events = self
+                        .get_mission_events(MissionEventsParams {
+                            mission_id: id.to_string(),
+                            limit: 200,
+                            view: Some("transcript".to_string()),
+                            since_seq: None,
+                            before_seq: Some(i64::MAX),
+                        })
+                        .await?;
+                    let empty = Vec::new();
+                    let events = events.as_array().unwrap_or(&empty);
+                    let pending = pending_ask_user_questions(events);
+                    match pending.as_slice() {
+                        [] => return Err(
+                            "No unanswered AskUserQuestion found in the mission's recent events. \
+                             If the mission is merely idle or awaiting an ack, use \
+                             send_message_to_mission / acknowledge_mission instead."
+                                .to_string(),
+                        ),
+                        [only] => only.tool_call_id.clone(),
+                        many => {
+                            let listing = many
+                                .iter()
+                                .map(|question| {
+                                    format!("{} — {}", question.tool_call_id, question.summary())
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            return Err(format!(
+                                "Multiple unanswered AskUserQuestion calls are pending; pass \
+                             tool_call_id explicitly. Pending (newest first): {listing}"
+                            ));
+                        }
+                    }
+                }
+            };
+        let body = json!({
+            "tool_call_id": tool_call_id,
+            "name": "AskUserQuestion",
+            "result": { "answers": params.answers },
+        });
+        let response = self.api_post("/api/control/tool_result", body).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to submit answer ({status}): {text}"));
+        }
+        let result: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("Failed to parse tool_result response: {error}"))?;
+        // `delivered: false` means no live turn was parked on that call (the
+        // mission ended or was interrupted) and the answer was dropped.
+        let delivered = result
+            .get("delivered")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut out = json!({
+            "mission_id": id.to_string(),
+            "tool_call_id": tool_call_id,
+            "delivered": delivered,
+        });
+        if !delivered {
+            out["note"] = json!(
+                "The answer did not reach a live parked turn — the mission has likely ended or \
+                 been interrupted. Use resume_mission or send_message_to_mission to wake it, \
+                 then answer again if it re-asks."
+            );
+        }
+        Ok(out)
+    }
+
     async fn cancel_mission(&self, params: MissionIdParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
         let response = self
@@ -2916,6 +3105,10 @@ impl AssistantMcp {
             "ask_mission" => {
                 let params: AskMissionParams = parse_params(arguments)?;
                 self.ask_mission(params).await
+            }
+            "answer_mission_question" => {
+                let params: AnswerMissionQuestionParams = parse_params(arguments)?;
+                self.answer_mission_question(params).await
             }
             "cancel_mission" => {
                 let params: MissionIdParams = parse_params(arguments)?;
@@ -3799,6 +3992,128 @@ mod tests {
         // The summary stays a projection, not a passthrough.
         assert!(summary.get("prompt").is_none());
         assert!(summary.get("api_token").is_none());
+    }
+
+    fn seeded_event(
+        sequence: i64,
+        event_type: &str,
+        tool_name: Option<&str>,
+        tool_call_id: Option<&str>,
+        content: &str,
+    ) -> Value {
+        json!({
+            "sequence": sequence,
+            "event_type": event_type,
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "content": content,
+        })
+    }
+
+    #[test]
+    fn pending_question_lookup_finds_unanswered_call() {
+        let events = vec![
+            seeded_event(1, "user_message", None, None, "go"),
+            // An older, already-answered question must NOT be pending.
+            seeded_event(
+                2,
+                "tool_call",
+                Some("AskUserQuestion"),
+                Some("q-old"),
+                r#"{"questions":[{"question":"Old?"}]}"#,
+            ),
+            seeded_event(
+                3,
+                "tool_result",
+                Some("AskUserQuestion"),
+                Some("q-old"),
+                r#"{"answers":[["A"]]}"#,
+            ),
+            // An ordinary in-flight tool call is not a question.
+            seeded_event(4, "tool_call", Some("Bash"), Some("b-1"), r#"{"cmd":"x"}"#),
+            seeded_event(
+                5,
+                "tool_call",
+                Some("AskUserQuestion"),
+                Some("q-new"),
+                r#"{"questions":[{"question":"Deploy to prod?"},{"question":"Which region?"}]}"#,
+            ),
+        ];
+        let pending = pending_ask_user_questions(&events);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tool_call_id, "q-new");
+        assert_eq!(pending[0].sequence, 5);
+        assert_eq!(pending[0].summary(), "Deploy to prod? | Which region?");
+    }
+
+    #[test]
+    fn pending_question_lookup_orders_newest_first_and_survives_bad_args() {
+        let events = vec![
+            // Unparseable args must still surface the pending call.
+            seeded_event(
+                1,
+                "tool_call",
+                Some("AskUserQuestion"),
+                Some("q-1"),
+                "not json",
+            ),
+            seeded_event(
+                7,
+                "tool_call",
+                Some("AskUserQuestion"),
+                Some("q-2"),
+                r#"{"questions":[{"question":"Second?"}]}"#,
+            ),
+        ];
+        let pending = pending_ask_user_questions(&events);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|q| q.tool_call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["q-2", "q-1"]
+        );
+        assert_eq!(pending[1].summary(), "(question text unavailable)");
+    }
+
+    #[test]
+    fn pending_question_lookup_empty_when_all_answered() {
+        let events = vec![
+            seeded_event(
+                1,
+                "tool_call",
+                Some("AskUserQuestion"),
+                Some("q-1"),
+                r#"{"questions":[{"question":"Only?"}]}"#,
+            ),
+            seeded_event(
+                2,
+                "tool_result",
+                None,
+                Some("q-1"),
+                r#"{"answers":[["A"]]}"#,
+            ),
+        ];
+        assert!(pending_ask_user_questions(&events).is_empty());
+    }
+
+    #[test]
+    fn answer_mission_question_params_parse_with_and_without_tool_call_id() {
+        let params: AnswerMissionQuestionParams = parse_params(json!({
+            "mission_id": "abc",
+            "answers": [["Option A"], ["free text"]],
+        }))
+        .expect("parse without tool_call_id");
+        assert!(params.tool_call_id.is_none());
+        assert_eq!(params.answers, vec![vec!["Option A"], vec!["free text"]]);
+
+        let params: AnswerMissionQuestionParams = parse_params(json!({
+            "mission_id": "abc",
+            "tool_call_id": "q-1",
+            "answers": [["Yes"]],
+        }))
+        .expect("parse with tool_call_id");
+        assert_eq!(params.tool_call_id.as_deref(), Some("q-1"));
     }
 
     #[test]
