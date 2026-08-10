@@ -46,6 +46,7 @@ import { useToast } from '@/components/toast';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
 import { EnvVarsEditor, type EnvRow, toEnvRows, envRowsToMap, getEncryptedKeys } from '@/components/env-vars-editor';
 import { WorkspaceResources } from '@/components/workspace-resources';
+import { RemoteNodesPanel } from '@/components/remote-nodes-panel';
 
 // The nil UUID represents the default "host" workspace which cannot be deleted
 const DEFAULT_WORKSPACE_ID = '00000000-0000-0000-0000-000000000000';
@@ -544,6 +545,9 @@ export default function WorkspacesPage() {
           ))}
         </div>
       )}
+
+      {/* Remote runner fleet: status + operator cordons (hidden when none configured) */}
+      <RemoteNodesPanel />
 
       {/* Workspace Details Modal */}
       {selectedWorkspace && (

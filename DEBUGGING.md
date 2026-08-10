@@ -705,3 +705,34 @@ retuned live from the dashboard **Resources** panel (or
 CPU property is also what makes systemd delegate the `cpu` controller into
 `missions.slice` — without it, a per-scope `CPUQuota` is silently unenforced.
 See the "Resource isolation" section in `CLAUDE.md` for the architecture.
+
+## Pausing / Resuming the DGX Spark (node cordon)
+
+To take the Spark (or any remote node) out of rotation without deleting its
+config — e.g. to reclaim it for inference or maintenance:
+
+```bash
+# Cordon: node stays listed and probed, but automatic placement
+# (remote_node_id: "auto") skips it. Persisted in
+# .sandboxed-sh/node_state.json, survives restarts.
+curl -X POST -H "Authorization: Bearer $JWT" \
+  http://localhost:3001/api/nodes/dgx-spark/cordon
+
+# Verify: GET /api/remote-nodes shows the node with "cordoned": true, and
+# controllers consulting get_compute_fleet see the same flag.
+curl -s -H "Authorization: Bearer $JWT" \
+  http://localhost:3001/api/remote-nodes | jq '.nodes[] | {id, status, cordoned}'
+
+# Optionally stop the Spark offload lane too (build offload is a separate
+# lane from the remote-node fleet). On the DGX:
+ssh dgx-spark 'systemctl stop spark-arbiter'
+
+# Resume: restart the arbiter and uncordon.
+ssh dgx-spark 'systemctl start spark-arbiter'
+curl -X POST -H "Authorization: Bearer $JWT" \
+  http://localhost:3001/api/nodes/dgx-spark/uncordon
+```
+
+The dashboard **Workspaces** page has the same toggle per node in the
+"Remote Nodes" panel (cordon badge + Cordon/Uncordon button). A cordoned node
+shows up in `place_auto` exclusion reports as `cordoned by operator`.
