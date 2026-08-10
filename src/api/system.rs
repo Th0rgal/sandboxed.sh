@@ -4571,11 +4571,8 @@ fn stream_deploy(
             );
         }
 
-        // Schedule the restart in a fully detached process so this SSE
-        // response can flush its final event before systemd SIGTERMs us.
-        // `setsid` + `nohup` + `&` puts the restart in a new session that
-        // outlives the API process, so the queued stop/wait/start runs even
-        // after our PID exits.
+        // Schedule the restart so this SSE response can flush its final event
+        // before systemd SIGTERMs us.
         //
         // stop + port-wait + start instead of a bare `systemctl restart`: an
         // orphaned old process still holding the listen port makes the fresh
@@ -4583,6 +4580,18 @@ fn stream_deploy(
         // (seen twice in prod). The script waits up to
         // PORT_RELEASE_GRACE_SECS for the port to be released, then
         // SIGTERM → SIGKILL escalates on any lingering holder before start.
+        //
+        // The script MUST run as a transient systemd unit via `systemd-run`,
+        // NOT as a `setsid`/`nohup` child of this handler. A detached child
+        // still lives inside THIS service's cgroup, so when the script runs
+        // `systemctl stop <svc>` systemd tears the whole cgroup down and kills
+        // the script itself BEFORE it reaches `systemctl start` — the PR #790
+        // regression that left prod stopped (0/SUCCESS) until a manual start.
+        // `systemd-run` launches the script under systemd (PID 1), a sibling
+        // cgroup, so the stop of <svc> does not touch it and it survives to
+        // issue the start. Where systemd is not PID 1 (Docker/dev) we fall
+        // back to a single detached `systemctl restart`, whose restart is
+        // owned atomically by whatever supervises the service.
         let listen_port = state.config.port;
         yield sse(
             "log",
@@ -4593,13 +4602,34 @@ fn stream_deploy(
             Some(90),
         );
         let restart_cmd = guarded_restart_script(&service_name, listen_port);
-        if let Err(e) = Command::new("setsid")
-            .args(["nohup", "bash", "-c", &restart_cmd])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
+        let spawn_result = if systemd_run_available() {
+            let unit = redeploy_unit_name(&service_name);
+            yield sse(
+                "log",
+                format!("Launching guarded restart as transient unit {unit} via systemd-run (survives the service stop)"),
+                Some(91),
+            );
+            Command::new("systemd-run")
+                .args(redeploy_systemd_run_args(&unit, &restart_cmd))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        } else {
+            yield sse(
+                "log",
+                "systemd-run unavailable (no systemd PID 1); falling back to a detached `systemctl restart`".to_string(),
+                Some(91),
+            );
+            let fallback = format!("sleep 2 && systemctl restart {} >/dev/null 2>&1", service_name);
+            Command::new("setsid")
+                .args(["nohup", "bash", "-c", &fallback])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        };
+        if let Err(e) = spawn_result {
             yield sse(
                 "error",
                 format!("Binary installed but failed to schedule restart: {}. Run `systemctl restart {}` manually.", e, service_name),
@@ -5815,13 +5845,14 @@ pub(crate) async fn wait_for_port_release(
     logs
 }
 
-/// Detached restart script used by the deploy endpoint. The handler process
-/// is itself part of the service being restarted, so the stop/wait/start
-/// sequence must run in a detached session that outlives this PID. Mirrors
-/// `wait_for_port_release`: stop, poll the port for up to
-/// `PORT_RELEASE_GRACE_SECS`, SIGTERM → (5s) → SIGKILL any lingering holder,
-/// then start. Uses stop+start instead of `systemctl restart` so the wait can
-/// sit between the two halves.
+/// Restart script used by the deploy endpoint. The handler process is itself
+/// part of the service being restarted, so the stop/wait/start sequence must
+/// run in a context that outlives this PID *and this cgroup* — see
+/// `redeploy_systemd_run_args` for why it is launched via `systemd-run` rather
+/// than as a detached child. Mirrors `wait_for_port_release`: stop, poll the
+/// port for up to `PORT_RELEASE_GRACE_SECS`, SIGTERM → (5s) → SIGKILL any
+/// lingering holder, then start. Uses stop+start instead of `systemctl restart`
+/// so the wait can sit between the two halves.
 pub(crate) fn guarded_restart_script(service_name: &str, port: u16) -> String {
     format!(
         "sleep 2 && systemctl stop {svc} >/dev/null 2>&1; \
@@ -5841,6 +5872,47 @@ pub(crate) fn guarded_restart_script(service_name: &str, port: u16) -> String {
         grace = PORT_RELEASE_GRACE_SECS,
         kill_grace = PORT_RELEASE_KILL_GRACE_SECS,
     )
+}
+
+/// True when the guarded restart can be launched as a transient systemd unit:
+/// systemd must be PID 1 (its runtime API dir exists) and the `systemd-run`
+/// binary must be present. On boxes where this is false (Docker without a
+/// systemd init, dev laptops) the deploy path falls back to a single detached
+/// `systemctl restart`.
+pub(crate) fn systemd_run_available() -> bool {
+    std::path::Path::new("/run/systemd/system").is_dir()
+        && ["/usr/bin/systemd-run", "/bin/systemd-run"]
+            .iter()
+            .any(|p| std::path::Path::new(p).exists())
+}
+
+/// Transient unit name for a redeploy restart. Derived from the service name
+/// (with any `.service` suffix stripped) plus a millisecond timestamp so
+/// back-to-back deploys never collide on a still-lingering unit name.
+pub(crate) fn redeploy_unit_name(service_name: &str) -> String {
+    let base = service_name
+        .strip_suffix(".service")
+        .unwrap_or(service_name);
+    format!("{base}-redeploy-{}", chrono::Utc::now().timestamp_millis())
+}
+
+/// argv for launching the guarded restart script via `systemd-run`. Running
+/// under systemd (PID 1) puts the script in its OWN transient unit/cgroup — a
+/// sibling of the service being restarted — so `systemctl stop <svc>` inside
+/// the script does NOT kill the script along with the service's cgroup. That
+/// cgroup co-location is exactly what broke prod in PR #790 when the same
+/// script ran as a `setsid` child of the service. `--collect` garbage-collects
+/// the transient unit after it exits (including on failure); `Type=oneshot`
+/// matches the run-once stop/wait/start shape.
+pub(crate) fn redeploy_systemd_run_args(unit_name: &str, script: &str) -> Vec<String> {
+    vec![
+        format!("--unit={unit_name}"),
+        "--collect".to_string(),
+        "--property=Type=oneshot".to_string(),
+        "/bin/bash".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -6466,7 +6538,10 @@ mod tests {
 
     // ---- deploy port-release guard -------------------------------------
 
-    use super::{guarded_restart_script, parse_ss_holder_pid, wait_for_port_release, PortProbe};
+    use super::{
+        guarded_restart_script, parse_ss_holder_pid, redeploy_systemd_run_args, redeploy_unit_name,
+        wait_for_port_release, PortProbe,
+    };
 
     /// Scripted probe: `free_after` polls of "held" before the port frees,
     /// optionally freeing only in response to a given signal.
@@ -6619,5 +6694,49 @@ mod tests {
         assert!(!script.contains(":3000"));
         assert!(script.contains("kill -TERM"));
         assert!(script.contains("kill -KILL"));
+    }
+
+    #[test]
+    fn redeploy_launches_via_systemd_run_not_bare_detached_shell() {
+        // The whole point of the PR #790 fix: the guarded restart must run as a
+        // transient systemd unit (PID 1 parent, sibling cgroup) so the script's
+        // own `systemctl stop <svc>` cannot tear it down before `start`.
+        let script = guarded_restart_script("sandboxed-sh-prod.service", 3100);
+        let args = redeploy_systemd_run_args("sandboxed-sh-prod-redeploy-123", &script);
+
+        // Transient unit is named and auto-collected after it exits.
+        assert!(args
+            .iter()
+            .any(|a| a == "--unit=sandboxed-sh-prod-redeploy-123"));
+        assert!(args.iter().any(|a| a == "--collect"));
+        assert!(args.iter().any(|a| a == "--property=Type=oneshot"));
+
+        // It runs the guarded stop/wait/start script through bash.
+        assert!(args.iter().any(|a| a == "/bin/bash"));
+        assert!(args.iter().any(|a| a == "-c"));
+        let body = args.last().expect("script is the final arg");
+        assert!(body.contains("systemctl stop sandboxed-sh-prod.service"));
+        assert!(body.contains("systemctl start sandboxed-sh-prod.service"));
+        // The port-wait / kill-escalation decision logic is preserved verbatim.
+        assert!(body.contains("kill -TERM"));
+        assert!(body.contains("kill -KILL"));
+        assert!(body.contains(":3100"));
+    }
+
+    #[test]
+    fn redeploy_unit_name_strips_service_suffix_and_is_unique() {
+        let a = redeploy_unit_name("sandboxed-sh-prod.service");
+        assert!(a.starts_with("sandboxed-sh-prod-redeploy-"));
+        // The `.service` suffix must not leak into the transient unit name.
+        assert!(!a.contains(".service"));
+
+        // A name without the suffix is handled too.
+        let b = redeploy_unit_name("sandboxed-sh-dev");
+        assert!(b.starts_with("sandboxed-sh-dev-redeploy-"));
+
+        // Back-to-back calls differ so a still-lingering unit never collides.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let c = redeploy_unit_name("sandboxed-sh-prod.service");
+        assert_ne!(a, c);
     }
 }
