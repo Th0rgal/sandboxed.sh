@@ -282,3 +282,12 @@ export {
   listAlerts,
   getHermesMissionControl,
 } from "./hermes";
+
+// Remote runner nodes (fleet + cordons)
+export {
+  type RemoteNodeView,
+  type RemoteNodesResponse,
+  type NodeCordonResponse,
+  getRemoteNodes,
+  setNodeCordon,
+} from "./nodes";
