@@ -61,7 +61,7 @@ final class ControlPerformanceDiagnostics {
         return try operation()
     }
 
-    func measureAsync<T>(
+    func measureAsync<T: Sendable>(
         _ name: StaticString,
         detail: String = "",
         count: Int? = nil,
