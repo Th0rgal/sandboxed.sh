@@ -15378,6 +15378,67 @@ mod tests {
         );
     }
 
+    // The `GET /events` handler routes a cursor-less request to
+    // `get_events_before(i64::MAX)` so the default page is the NEWEST `limit`
+    // events (the tail), ascending — not the oldest rows. This locks in that
+    // contract and the X-Max-Sequence value the handler reports alongside it.
+    #[tokio::test]
+    async fn no_cursor_default_returns_newest_page_ascending() {
+        use crate::api::control::AgentEvent;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("default page"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        for i in 0..10 {
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::UserMessage {
+                        id: Uuid::new_v4(),
+                        content: format!("msg {i}"),
+                        queued: false,
+                        mission_id: Some(mission.id),
+                        source: None,
+                    },
+                )
+                .await
+                .expect("log user message");
+        }
+
+        // No-cursor + limit=3 must yield the newest three (8, 9, 10) ASC,
+        // exactly what the handler now emits for `?limit=3` with no cursor.
+        let newest = store
+            .get_events_before(mission.id, i64::MAX, None, Some(3))
+            .await
+            .expect("get newest page");
+        assert_eq!(
+            newest.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![8, 9, 10],
+            "no-cursor default should return the tail, not the oldest rows"
+        );
+
+        // X-Max-Sequence reflects the true tail regardless of the page limit.
+        let max = store.max_event_sequence(mission.id).await.expect("max seq");
+        assert_eq!(max, 10);
+
+        // Explicit forward replay (`since_seq=0`) still pages from the start —
+        // this path is untouched by the default change.
+        let from_start = store
+            .get_events_since(mission.id, 0, None, Some(3))
+            .await
+            .expect("get_events_since zero");
+        assert_eq!(
+            from_start.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
     #[tokio::test]
     async fn max_event_sequence_is_zero_for_mission_with_no_events() {
         let temp_dir = tempfile::tempdir().expect("temp dir");

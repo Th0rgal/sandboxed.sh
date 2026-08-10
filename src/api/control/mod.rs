@@ -10869,9 +10869,15 @@ pub async fn get_mission_events(
             .await
             .map_err(internal_error)?
     } else {
+        // No cursor: default to the NEWEST `limit` events (the tail), returned
+        // ascending within the page — i.e. behave as `before_seq=MAX`. "Latest
+        // activity" is the overwhelmingly common need (dashboards, debugging a
+        // live mission), so paging from the oldest row by default is a footgun.
+        // Callers that genuinely want a forward replay from the start pass
+        // `since_seq=0` explicitly, which is handled above and is unaffected.
         control
             .mission_store
-            .get_events(mission_id, types.as_deref(), query.limit, None)
+            .get_events_before(mission_id, i64::MAX, types.as_deref(), query.limit)
             .await
             .map_err(internal_error)?
     };
