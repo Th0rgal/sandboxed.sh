@@ -786,6 +786,10 @@ pub(crate) async fn chat_completions_inner(
     let mut pending_fallback_events: Vec<crate::provider_health::FallbackEvent> = Vec::new();
 
     let chain_length = entries.len() as u32;
+    // Accounts whose Kimi OAuth token was already force-refreshed after a 401
+    // in this request — the retry is one-shot per account, never a loop.
+    let mut kimi_auth_refreshed: std::collections::HashSet<uuid::Uuid> =
+        std::collections::HashSet::new();
     for (entry_idx, entry) in entries.iter().enumerate() {
         // Non-builtin prefixes are custom providers referenced by their
         // sanitized name (e.g. "spark"); they all route as `Custom` through the
@@ -990,6 +994,15 @@ pub(crate) async fn chat_completions_inner(
                 extra.insert(header::USER_AGENT, HeaderValue::from_static("KimiCLI/1.5"));
             }
             (url, upstream_body, extra)
+        };
+
+        // Keep the exact request parts around for a one-shot resend when a
+        // Kimi 401 turns out to be a stale access token (see the auth-error
+        // handler below). `Bytes` clones are refcounted, so this is cheap.
+        let kimi_retry_parts = if provider_type == ProviderType::Kimi {
+            Some((url.clone(), upstream_body.clone(), extra_headers.clone()))
+        } else {
+            None
         };
 
         // Forward the request.
@@ -1764,6 +1777,91 @@ pub(crate) async fn chat_completions_inner(
 
         // Auth errors (401/403) — bad credentials, try next account
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            // Kimi first gets ONE token refresh + resend before the account is
+            // cooled down: its access tokens only live ~300s, so an auth error
+            // usually means the routed Bearer went stale between the background
+            // refresh cycles rather than that the subscription is broken.
+            if should_attempt_kimi_auth_refresh(
+                provider_type,
+                kimi_auth_refreshed.insert(entry.account_id),
+            ) {
+                if let Some((retry_url, retry_body, retry_headers)) = kimi_retry_parts.clone() {
+                    match crate::api::ai_providers::refresh_store_account_oauth_locked(
+                        &state.ai_providers,
+                        entry.account_id,
+                        ProviderType::Kimi,
+                        "",
+                    )
+                    .await
+                    {
+                        Ok((fresh_token, _, _))
+                            if !fresh_token.trim().is_empty()
+                                && Some(fresh_token.as_str()) != entry.api_key.as_deref() =>
+                        {
+                            tracing::info!(
+                                provider = %entry.provider_id,
+                                account_id = %entry.account_id,
+                                "Kimi auth error with stale token — refreshed, retrying once"
+                            );
+                            let mut retry_req = state
+                                .http_client
+                                .post(&retry_url)
+                                .header("Content-Type", "application/json")
+                                .header("Authorization", format!("Bearer {}", fresh_token))
+                                .body(retry_body);
+                            for (name, value) in &retry_headers {
+                                retry_req = retry_req.header(name, value);
+                            }
+                            if !is_stream {
+                                retry_req = retry_req.timeout(std::time::Duration::from_secs(300));
+                            }
+                            match retry_req.send().await {
+                                // Only a successful retry rescues the entry;
+                                // any other status keeps the original
+                                // auth-error handling (cooldown + next entry)
+                                // so the chain still fails over.
+                                Ok(resp) if resp.status().is_success() => {
+                                    upstream_resp = resp;
+                                    status = upstream_resp.status();
+                                }
+                                Ok(resp) => {
+                                    tracing::warn!(
+                                        provider = %entry.provider_id,
+                                        account_id = %entry.account_id,
+                                        status = %resp.status(),
+                                        "Kimi retry with refreshed token still failed"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        provider = %entry.provider_id,
+                                        account_id = %entry.account_id,
+                                        error = %e,
+                                        "Kimi retry with refreshed token failed to send"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            // Token unchanged — the 401 wasn't staleness, a
+                            // retry with the same Bearer would fail again.
+                            tracing::debug!(
+                                account_id = %entry.account_id,
+                                "Kimi token refresh returned the same credential; not retrying"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                account_id = %entry.account_id,
+                                error = %e,
+                                "Kimi OAuth refresh after auth error failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             let elapsed_ms = request_start.elapsed().as_millis() as u64;
             tracing::warn!(
                 provider = %entry.provider_id,
@@ -2313,6 +2411,20 @@ fn strip_thinking_blocks(messages: &mut [serde_json::Value]) {
             }));
         }
     }
+}
+
+/// Whether an upstream 401/403 should trigger a one-shot OAuth refresh +
+/// resend instead of immediately cooling the account down. Only Kimi qualifies
+/// (its Bearer is a ~300s OAuth access token, so staleness is the common
+/// cause), and only on the first auth error per account per request —
+/// `first_refresh_for_account` is the result of inserting the account into the
+/// per-request refreshed set, so a second 401 falls through to the normal
+/// cooldown path.
+fn should_attempt_kimi_auth_refresh(
+    provider_type: ProviderType,
+    first_refresh_for_account: bool,
+) -> bool {
+    provider_type == ProviderType::Kimi && first_refresh_for_account
 }
 
 /// Rewrite the model id and normalize sampling params for Kimi's coding endpoint.
@@ -5200,6 +5312,40 @@ mod tests {
         let e2 = parse_direct_model_entry("openai/codex-mini/latest").expect("known provider");
         assert_eq!(e2.provider_id, "openai");
         assert_eq!(e2.model_id, "codex-mini/latest");
+    }
+
+    #[test]
+    fn kimi_k3_routes_as_direct_passthrough_to_coding_endpoint() {
+        // `kimi/k3` (and any `kimi/<model>`) must resolve as a direct
+        // provider/model passthrough entry...
+        let e = parse_direct_model_entry("kimi/k3").expect("kimi is a known provider prefix");
+        assert_eq!(e.provider_id, "kimi");
+        assert_eq!(e.model_id, "k3");
+        let e = parse_direct_model_entry("kimi/k3-256k").expect("kimi is a known provider prefix");
+        assert_eq!(e.model_id, "k3-256k");
+        // ...aimed at the Kimi Code coding endpoint (OpenAI-compatible).
+        assert_eq!(
+            completions_url(ProviderType::Kimi, None).as_deref(),
+            Some("https://api.kimi.com/coding/v1/chat/completions")
+        );
+    }
+
+    #[test]
+    fn kimi_auth_refresh_is_one_shot_and_kimi_only() {
+        // First 401 on a Kimi account → refresh + retry once.
+        assert!(should_attempt_kimi_auth_refresh(ProviderType::Kimi, true));
+        // Second auth error for the same account in the same request → normal
+        // cooldown path, never a refresh loop.
+        assert!(!should_attempt_kimi_auth_refresh(ProviderType::Kimi, false));
+        // Other providers keep their existing 401 handling untouched.
+        assert!(!should_attempt_kimi_auth_refresh(
+            ProviderType::Anthropic,
+            true
+        ));
+        assert!(!should_attempt_kimi_auth_refresh(
+            ProviderType::OpenAI,
+            true
+        ));
     }
 
     #[test]
