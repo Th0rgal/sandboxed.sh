@@ -1,0 +1,68 @@
+name: iOS Build
+
+# Path-gated like android-apk.yml so unrelated PRs don't pay the macOS-runner
+# cost. This exists because the committed pbxproj once silently missed new
+# views for days: we verify the project is regenerated and that it compiles.
+on:
+  push:
+    branches: [master, main, "release/*"]
+    paths:
+      - ".github/workflows/ios-build.yml"
+      - "ios_dashboard/**"
+  pull_request:
+    branches: [master, main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - ".github/workflows/ios-build.yml"
+      - "ios_dashboard/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Pinned so CI and local regeneration produce byte-identical pbxproj output.
+  # The committed project.pbxproj must be regenerated with exactly this version.
+  XCODEGEN_VERSION: 2.46.0
+
+jobs:
+  ios-build:
+    name: iOS Build
+    # macos-15 ships Xcode 16 (project.yml xcodeVersion 16, iOS deployment
+    # target 18) — older images lack the iOS 18 SDK.
+    runs-on: macos-15
+    # Skip CI on draft PRs unless explicitly requested
+    if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    defaults:
+      run:
+        working-directory: ios_dashboard
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install xcodegen (pinned)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "${RUNNER_TEMP}/xcodegen.zip" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          unzip -oq "${RUNNER_TEMP}/xcodegen.zip" -d "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/xcodegen/bin/xcodegen" --version
+
+      - name: Regenerate Xcode project and check for drift
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/xcodegen/bin/xcodegen" generate
+          if ! git diff --exit-code SandboxedDashboard.xcodeproj/project.pbxproj; then
+            echo "::error title=pbxproj drift::project.pbxproj is out of date. Regenerate with xcodegen ${XCODEGEN_VERSION} ('xcodegen generate' in ios_dashboard/) and commit the result."
+            exit 1
+          fi
+
+      - name: Build (compile-only, no signing)
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project SandboxedDashboard.xcodeproj \
+            -scheme SandboxedDashboard \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO
