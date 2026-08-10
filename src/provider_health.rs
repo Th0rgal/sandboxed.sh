@@ -1333,26 +1333,19 @@ impl ModelChainStore {
                 // `api.openai.com/v1/chat/completions`; those accounts keep
                 // `api_key = None, has_oauth = true` and route through the
                 // CLI-proxy adapter instead.
-                let routed_api_key = account.api_key.clone().or_else(|| {
-                    if !matches!(
-                        provider_type,
-                        crate::ai_providers::ProviderType::Anthropic
-                            | crate::ai_providers::ProviderType::Kimi
-                    ) {
-                        return None;
-                    }
-                    if !oauth_is_fresh {
-                        return None;
-                    }
-                    account.oauth.as_ref().and_then(|oauth| {
-                        let token = oauth.access_token.trim();
-                        if token.is_empty() {
-                            None
-                        } else {
-                            Some(token.to_string())
-                        }
-                    })
-                });
+                let fresh_oauth_token = if oauth_is_fresh {
+                    account
+                        .oauth
+                        .as_ref()
+                        .map(|oauth| oauth.access_token.as_str())
+                } else {
+                    None
+                };
+                let (routed_api_key, credential_is_oauth_token) = preferred_store_credential(
+                    provider_type,
+                    account.api_key.as_deref(),
+                    fresh_oauth_token,
+                );
                 // `routed_api_key` is only populated for OpenAI/Anthropic
                 // OAuth (where we can forward the access token as a Bearer
                 // credential). Google OAuth is routed via `get_google_access_token`
@@ -1404,13 +1397,10 @@ impl ModelChainStore {
                 // attaching OAuth-only headers (Bearer + oauth beta) to an
                 // x-api-key request. Google still needs `has_oauth=true` to
                 // trigger its adapter regardless of store-token freshness.
-                let provider_oauth_is_proxy_routable = matches!(
-                    provider_type,
-                    crate::ai_providers::ProviderType::Anthropic
-                        | crate::ai_providers::ProviderType::Kimi
-                );
-                let credential_is_oauth_token =
-                    account.api_key.is_none() && oauth_is_fresh && provider_oauth_is_proxy_routable;
+                // `credential_is_oauth_token` comes from
+                // `preferred_store_credential` above so it always describes the
+                // credential actually routed (Kimi routes the live OAuth token
+                // even when a stale `api_key` snapshot is persisted).
                 let xai_oauth_cli_proxy_routable =
                     matches!(provider_type, crate::ai_providers::ProviderType::Xai)
                         && account.api_key.is_none()
@@ -1521,6 +1511,47 @@ impl ModelChainStore {
         }
 
         resolved
+    }
+}
+
+/// Pick the credential the proxy will forward for a store account, returning
+/// `(credential, credential_is_oauth_token)`.
+///
+/// Only Anthropic and Kimi chat endpoints accept the OAuth access token as a
+/// Bearer credential, so OAuth hoisting is limited to those types. Ordering
+/// differs per provider:
+/// - **Kimi**: the live OAuth token always wins. Kimi Code access tokens live
+///   ~300s and are refreshed in the background, so any `api_key` persisted in
+///   `ai_providers.json` is a stale snapshot of an old token — routing it
+///   produces deterministic 401s. The stored key is only a last-resort
+///   fallback when no fresh OAuth token exists.
+/// - **Anthropic** (and everything else): a real API key wins over OAuth, so
+///   the proxy sends `x-api-key`-style auth when the operator configured one.
+pub(crate) fn preferred_store_credential(
+    provider_type: crate::ai_providers::ProviderType,
+    api_key: Option<&str>,
+    fresh_oauth_access_token: Option<&str>,
+) -> (Option<String>, bool) {
+    use crate::ai_providers::ProviderType as PT;
+    let oauth_routable = matches!(provider_type, PT::Anthropic | PT::Kimi);
+    let oauth_token = fresh_oauth_access_token
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && oauth_routable)
+        .map(str::to_string);
+    let stored_key = api_key
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string);
+    if provider_type == PT::Kimi {
+        if let Some(token) = oauth_token {
+            return (Some(token), true);
+        }
+        return (stored_key, false);
+    }
+    match (stored_key, oauth_token) {
+        (Some(key), _) => (Some(key), false),
+        (None, Some(token)) => (Some(token), true),
+        (None, None) => (None, false),
     }
 }
 
@@ -2088,5 +2119,80 @@ mod tests {
             store_account_subscription_key(ProviderType::Anthropic, &acc),
             None
         );
+    }
+
+    #[test]
+    fn preferred_store_credential_kimi_prefers_live_oauth_over_stored_key() {
+        // Kimi: a persisted api_key is a stale snapshot of a ~300s OAuth
+        // token; the live token must win.
+        assert_eq!(
+            preferred_store_credential(
+                ProviderType::Kimi,
+                Some("stale-snapshot"),
+                Some("live-token")
+            ),
+            (Some("live-token".to_string()), true)
+        );
+        // Without a fresh token, the stored key remains a last-resort fallback.
+        assert_eq!(
+            preferred_store_credential(ProviderType::Kimi, Some("stale-snapshot"), None),
+            (Some("stale-snapshot".to_string()), false)
+        );
+        // Anthropic keeps key-first ordering.
+        assert_eq!(
+            preferred_store_credential(ProviderType::Anthropic, Some("sk-ant"), Some("oauth-at")),
+            (Some("sk-ant".to_string()), false)
+        );
+        assert_eq!(
+            preferred_store_credential(ProviderType::Anthropic, None, Some("oauth-at")),
+            (Some("oauth-at".to_string()), true)
+        );
+        // OAuth hoisting stays limited to Anthropic/Kimi — an xAI token must
+        // never be forwarded as an API key.
+        assert_eq!(
+            preferred_store_credential(ProviderType::Xai, None, Some("grok-oauth")),
+            (None, false)
+        );
+        // Whitespace-only credentials are treated as absent.
+        assert_eq!(
+            preferred_store_credential(ProviderType::Kimi, Some("  "), Some("  ")),
+            (None, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_entries_kimi_routes_live_oauth_not_stale_api_key() {
+        let mut kimi = AIProvider::new(ProviderType::Kimi, "Kimi".to_string());
+        kimi.api_key = Some("stale-snapshot".to_string());
+        kimi.oauth = Some(OAuthCredentials {
+            access_token: "live-kimi-token".to_string(),
+            refresh_token: "kimi-rt".to_string(),
+            expires_at: future_ms(1),
+        });
+        kimi.status = ProviderStatus::Connected;
+        let store = store_with(vec![kimi]).await;
+        let chains = store_with_chain("unused", vec![]).await;
+        let tracker = ProviderHealthTracker::new();
+
+        let resolved = chains
+            .resolve_entries(
+                &[ChainEntry {
+                    provider_id: "kimi".to_string(),
+                    model_id: "k3".to_string(),
+                }],
+                &store,
+                &[],
+                &tracker,
+            )
+            .await;
+
+        assert_eq!(resolved.len(), 1, "kimi entry should resolve: {resolved:?}");
+        assert_eq!(
+            resolved[0].api_key.as_deref(),
+            Some("live-kimi-token"),
+            "must route the live OAuth token, never the persisted api_key snapshot"
+        );
+        assert!(resolved[0].has_oauth);
+        assert_eq!(resolved[0].model_id, "k3");
     }
 }
