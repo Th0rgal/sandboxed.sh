@@ -13,7 +13,7 @@
 import { useState } from 'react';
 import useSWR from 'swr';
 import { Network, ShieldOff, ShieldCheck } from 'lucide-react';
-import { getRemoteNodes, setNodeCordon } from '@/lib/api';
+import { getRemoteNodes, setNodeCordon } from '@/lib/api/nodes';
 import { cn } from '@/lib/utils';
 
 export function RemoteNodesPanel() {
