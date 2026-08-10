@@ -3383,6 +3383,23 @@ fn stream_sandboxed_update(
             .output()
             .await;
 
+        // Wait for the listen port to actually be released before we proceed
+        // to the restart. Twice in prod an orphaned old process kept holding
+        // the port, so the restarted service died with EADDRINUSE while the
+        // orphan served stale code.
+        let listen_port = state.config.port;
+        yield sse("log", format!("Waiting for port {} to be released...", listen_port), Some(76));
+        for line in wait_for_port_release(
+            listen_port,
+            &mut RealPortProbe,
+            std::time::Duration::from_secs(PORT_RELEASE_GRACE_SECS),
+            std::time::Duration::from_secs(PORT_RELEASE_KILL_GRACE_SECS),
+        )
+        .await
+        {
+            yield sse("log", line, Some(76));
+        }
+
         const MAIN_CARGO_BIN: &str = "sandboxed-sh";
         let src = format!("{}/target/debug/{}", repo_path.display(), MAIN_CARGO_BIN);
 
@@ -4557,12 +4574,25 @@ fn stream_deploy(
         // Schedule the restart in a fully detached process so this SSE
         // response can flush its final event before systemd SIGTERMs us.
         // `setsid` + `nohup` + `&` puts the restart in a new session that
-        // outlives the API process, so the queued `systemctl restart` runs
-        // even after our PID exits.
-        let restart_cmd = format!(
-            "sleep 2 && systemctl restart {} >/dev/null 2>&1",
-            service_name
+        // outlives the API process, so the queued stop/wait/start runs even
+        // after our PID exits.
+        //
+        // stop + port-wait + start instead of a bare `systemctl restart`: an
+        // orphaned old process still holding the listen port makes the fresh
+        // service die with EADDRINUSE while the orphan serves stale code
+        // (seen twice in prod). The script waits up to
+        // PORT_RELEASE_GRACE_SECS for the port to be released, then
+        // SIGTERM → SIGKILL escalates on any lingering holder before start.
+        let listen_port = state.config.port;
+        yield sse(
+            "log",
+            format!(
+                "Scheduling guarded restart: stop {}, wait up to {}s for port {} to be released (SIGTERM then SIGKILL any lingering holder), then start",
+                service_name, PORT_RELEASE_GRACE_SECS, listen_port
+            ),
+            Some(90),
         );
+        let restart_cmd = guarded_restart_script(&service_name, listen_port);
         if let Err(e) = Command::new("setsid")
             .args(["nohup", "bash", "-c", &restart_cmd])
             .stdin(std::process::Stdio::null())
@@ -5607,6 +5637,212 @@ fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::conve
     stream_package_uninstall("@anthropic-ai/claude-code", ".claude", "Claude Code")
 }
 
+// ---------------------------------------------------------------------------
+// Deploy port-release guard
+//
+// Twice in prod a deploy restart raced an orphaned old API process that kept
+// LISTENing on the service port: the freshly started service died with
+// EADDRINUSE while the orphan kept serving stale code. The guard below waits
+// for the listen port to actually be released between `systemctl stop` and
+// `systemctl start`, and escalates SIGTERM → SIGKILL on whatever PID still
+// holds it after the grace period.
+// ---------------------------------------------------------------------------
+
+/// Grace period to wait for the port to be released after stopping the
+/// service, before escalating to signals.
+const PORT_RELEASE_GRACE_SECS: u64 = 20;
+/// How long to wait after SIGTERM before escalating to SIGKILL.
+const PORT_RELEASE_KILL_GRACE_SECS: u64 = 5;
+
+/// Injectable view of "is the port free / who holds it / signal it" so the
+/// wait-and-escalate decision logic is unit-testable without spawning real
+/// listeners in CI.
+pub(crate) trait PortProbe {
+    /// True when nothing is LISTENing on `port` (a fresh bind would succeed).
+    fn is_free(&mut self, port: u16) -> bool;
+    /// PID of the process currently LISTENing on `port`, if identifiable.
+    fn holder_pid(&mut self, port: u16) -> Option<u32>;
+    /// Send `sig` ("TERM" or "KILL") to `pid`. Best-effort.
+    fn signal(&mut self, pid: u32, sig: &str);
+    /// PID of the current process (never self-signal: if *we* still hold the
+    /// port, `systemctl start` is what replaces us).
+    fn self_pid(&self) -> u32;
+}
+
+/// Real probe: bind-test the port, identify the holder via
+/// `ss -tlnpH sport = :PORT`, signal via `kill(1)`.
+pub(crate) struct RealPortProbe;
+
+impl RealPortProbe {
+    fn ss_listen_line(port: u16) -> Option<String> {
+        let out = std::process::Command::new("ss")
+            .args(["-tlnpH", &format!("sport = :{port}")])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text.lines().find(|l| !l.trim().is_empty())?;
+        Some(line.to_string())
+    }
+}
+
+impl PortProbe for RealPortProbe {
+    fn is_free(&mut self, port: u16) -> bool {
+        // A successful wildcard bind is definitive: nothing holds the port.
+        if std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() {
+            return true;
+        }
+        // Bind can fail for reasons other than a live LISTEN socket (e.g. a
+        // lingering TIME_WAIT from an accepted connection). Trust `ss`: free
+        // iff no LISTEN socket is reported. If `ss` is unavailable, trust the
+        // failed bind.
+        match std::process::Command::new("ss")
+            .args(["-tlnH", &format!("sport = :{port}")])
+            .output()
+        {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .all(|l| l.trim().is_empty()),
+            _ => false,
+        }
+    }
+
+    fn holder_pid(&mut self, port: u16) -> Option<u32> {
+        parse_ss_holder_pid(&Self::ss_listen_line(port)?)
+    }
+
+    fn signal(&mut self, pid: u32, sig: &str) {
+        let _ = std::process::Command::new("kill")
+            .args([&format!("-{sig}"), &pid.to_string()])
+            .output();
+    }
+
+    fn self_pid(&self) -> u32 {
+        std::process::id()
+    }
+}
+
+/// Extract `pid=N` from an `ss -tlnp` line like
+/// `LISTEN 0 1024 0.0.0.0:3000 0.0.0.0:* users:(("sandboxed-sh",pid=1234,fd=9))`.
+pub(crate) fn parse_ss_holder_pid(line: &str) -> Option<u32> {
+    let idx = line.find("pid=")?;
+    let rest = &line[idx + 4..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Wait for `port` to be released, escalating on the holder if the grace
+/// period expires. Returns human-readable log lines describing each step so
+/// callers can forward them into the deploy SSE stream.
+///
+/// Sequence: poll `is_free` once per second for `grace`; if still held,
+/// identify the holder and SIGTERM it (unless it is this very process); wait
+/// `kill_grace`; SIGKILL if still held; report the final state.
+pub(crate) async fn wait_for_port_release(
+    port: u16,
+    probe: &mut (dyn PortProbe + Send),
+    grace: std::time::Duration,
+    kill_grace: std::time::Duration,
+) -> Vec<String> {
+    let poll = std::time::Duration::from_secs(1);
+    let mut logs = Vec::new();
+
+    let polls = grace.as_secs().max(1);
+    for attempt in 0..=polls {
+        if probe.is_free(port) {
+            if attempt > 0 {
+                logs.push(format!("Port {port} released after {attempt}s"));
+            } else {
+                logs.push(format!("Port {port} is free"));
+            }
+            return logs;
+        }
+        if attempt < polls {
+            tokio::time::sleep(poll).await;
+        }
+    }
+
+    logs.push(format!(
+        "Port {port} still held after {}s grace period",
+        grace.as_secs()
+    ));
+
+    let Some(pid) = probe.holder_pid(port) else {
+        logs.push(format!(
+            "Could not identify the process holding port {port}; proceeding with restart anyway"
+        ));
+        return logs;
+    };
+
+    if pid == probe.self_pid() {
+        // We are the lingering holder (this handler runs inside the service
+        // being redeployed). systemd will terminate us on start; killing
+        // ourselves here would abort the deploy before the start is issued.
+        logs.push(format!(
+            "Port {port} is held by this process (pid {pid}); the service restart will replace it"
+        ));
+        return logs;
+    }
+
+    logs.push(format!(
+        "Port {port} held by orphaned pid {pid}; sending SIGTERM"
+    ));
+    probe.signal(pid, "TERM");
+    let kill_polls = kill_grace.as_secs().max(1);
+    for _ in 0..kill_polls {
+        tokio::time::sleep(poll).await;
+        if probe.is_free(port) {
+            logs.push(format!("Port {port} released after SIGTERM to pid {pid}"));
+            return logs;
+        }
+    }
+
+    logs.push(format!(
+        "Pid {pid} ignored SIGTERM for {}s; sending SIGKILL",
+        kill_grace.as_secs()
+    ));
+    probe.signal(pid, "KILL");
+    for _ in 0..kill_polls {
+        tokio::time::sleep(poll).await;
+        if probe.is_free(port) {
+            logs.push(format!("Port {port} released after SIGKILL to pid {pid}"));
+            return logs;
+        }
+    }
+
+    logs.push(format!(
+        "Port {port} STILL held after SIGKILL; restart may fail with EADDRINUSE"
+    ));
+    logs
+}
+
+/// Detached restart script used by the deploy endpoint. The handler process
+/// is itself part of the service being restarted, so the stop/wait/start
+/// sequence must run in a detached session that outlives this PID. Mirrors
+/// `wait_for_port_release`: stop, poll the port for up to
+/// `PORT_RELEASE_GRACE_SECS`, SIGTERM → (5s) → SIGKILL any lingering holder,
+/// then start. Uses stop+start instead of `systemctl restart` so the wait can
+/// sit between the two halves.
+pub(crate) fn guarded_restart_script(service_name: &str, port: u16) -> String {
+    format!(
+        "sleep 2 && systemctl stop {svc} >/dev/null 2>&1; \
+         for i in $(seq 1 {grace}); do \
+           ss -tlnH 'sport = :{port}' 2>/dev/null | grep -q . || break; sleep 1; \
+         done; \
+         if ss -tlnH 'sport = :{port}' 2>/dev/null | grep -q .; then \
+           pid=$(ss -tlnpH 'sport = :{port}' 2>/dev/null | sed -n 's/.*pid=\\([0-9]*\\).*/\\1/p' | head -n1); \
+           if [ -n \"$pid\" ]; then \
+             kill -TERM \"$pid\" 2>/dev/null; sleep {kill_grace}; \
+             kill -0 \"$pid\" 2>/dev/null && kill -KILL \"$pid\" 2>/dev/null; sleep 1; \
+           fi; \
+         fi; \
+         systemctl start {svc} >/dev/null 2>&1",
+        svc = service_name,
+        port = port,
+        grace = PORT_RELEASE_GRACE_SECS,
+        kill_grace = PORT_RELEASE_KILL_GRACE_SECS,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[tokio::test]
@@ -6226,5 +6462,162 @@ mod tests {
         assert!(is_safe_repo_path(std::path::Path::new(
             crate::settings::DEFAULT_SANDBOXED_REPO_PATH
         )));
+    }
+
+    // ---- deploy port-release guard -------------------------------------
+
+    use super::{guarded_restart_script, parse_ss_holder_pid, wait_for_port_release, PortProbe};
+
+    /// Scripted probe: `free_after` polls of "held" before the port frees,
+    /// optionally freeing only in response to a given signal.
+    struct FakeProbe {
+        polls: u32,
+        free_after_polls: Option<u32>,
+        holder: Option<u32>,
+        self_pid: u32,
+        frees_on_signal: Option<&'static str>,
+        signals: Vec<(u32, String)>,
+        freed_by_signal: bool,
+    }
+
+    impl FakeProbe {
+        fn held(holder: Option<u32>, frees_on_signal: Option<&'static str>) -> Self {
+            Self {
+                polls: 0,
+                free_after_polls: None,
+                holder,
+                self_pid: 999_999,
+                frees_on_signal,
+                signals: Vec::new(),
+                freed_by_signal: false,
+            }
+        }
+    }
+
+    impl PortProbe for FakeProbe {
+        fn is_free(&mut self, _port: u16) -> bool {
+            self.polls += 1;
+            if self.freed_by_signal {
+                return true;
+            }
+            match self.free_after_polls {
+                Some(n) => self.polls > n,
+                None => false,
+            }
+        }
+        fn holder_pid(&mut self, _port: u16) -> Option<u32> {
+            self.holder
+        }
+        fn signal(&mut self, pid: u32, sig: &str) {
+            self.signals.push((pid, sig.to_string()));
+            if Some(sig) == self.frees_on_signal {
+                self.freed_by_signal = true;
+            }
+        }
+        fn self_pid(&self) -> u32 {
+            self.self_pid
+        }
+    }
+
+    fn short() -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
+
+    #[tokio::test]
+    async fn port_free_immediately_needs_no_signals() {
+        let mut probe = FakeProbe::held(Some(42), None);
+        probe.free_after_polls = Some(0);
+        let logs = wait_for_port_release(3000, &mut probe, short(), short()).await;
+        assert!(probe.signals.is_empty(), "must not signal when port frees");
+        assert!(logs.iter().any(|l| l.contains("free")), "{logs:?}");
+    }
+
+    #[tokio::test]
+    async fn holder_gets_sigterm_and_release_stops_escalation() {
+        let mut probe = FakeProbe::held(Some(4242), Some("TERM"));
+        let logs = wait_for_port_release(3000, &mut probe, short(), short()).await;
+        assert_eq!(probe.signals, vec![(4242, "TERM".to_string())]);
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("SIGTERM") && l.contains("4242")),
+            "{logs:?}"
+        );
+        assert!(!logs.iter().any(|l| l.contains("SIGKILL")), "{logs:?}");
+    }
+
+    #[tokio::test]
+    async fn stubborn_holder_escalates_to_sigkill() {
+        let mut probe = FakeProbe::held(Some(4242), Some("KILL"));
+        let logs = wait_for_port_release(3000, &mut probe, short(), short()).await;
+        assert_eq!(
+            probe.signals,
+            vec![(4242, "TERM".to_string()), (4242, "KILL".to_string())]
+        );
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("SIGKILL") && l.contains("4242")),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unkillable_holder_is_reported_not_looped() {
+        let mut probe = FakeProbe::held(Some(4242), None);
+        let logs = wait_for_port_release(3000, &mut probe, short(), short()).await;
+        assert_eq!(probe.signals.len(), 2, "TERM then KILL, then give up");
+        assert!(logs.iter().any(|l| l.contains("STILL held")), "{logs:?}");
+    }
+
+    #[tokio::test]
+    async fn self_holding_process_is_never_signalled() {
+        // The deploy handler runs inside the service being restarted: if the
+        // lingering holder is our own PID, killing it would abort the deploy
+        // before `systemctl start` is issued.
+        let mut probe = FakeProbe::held(Some(999_999), None);
+        let logs = wait_for_port_release(3000, &mut probe, short(), short()).await;
+        assert!(probe.signals.is_empty(), "must never self-signal");
+        assert!(
+            logs.iter().any(|l| l.contains("held by this process")),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unidentifiable_holder_proceeds_without_signals() {
+        let mut probe = FakeProbe::held(None, None);
+        let logs = wait_for_port_release(3000, &mut probe, short(), short()).await;
+        assert!(probe.signals.is_empty());
+        assert!(
+            logs.iter().any(|l| l.contains("Could not identify")),
+            "{logs:?}"
+        );
+    }
+
+    #[test]
+    fn ss_holder_pid_parses_users_clause() {
+        let line = r#"LISTEN 0 1024 0.0.0.0:3000 0.0.0.0:* users:(("sandboxed-sh",pid=1234,fd=9))"#;
+        assert_eq!(parse_ss_holder_pid(line), Some(1234));
+        assert_eq!(
+            parse_ss_holder_pid("LISTEN 0 1024 0.0.0.0:3000 0.0.0.0:*"),
+            None
+        );
+    }
+
+    #[test]
+    fn guarded_restart_uses_stop_wait_start_not_restart() {
+        let script = guarded_restart_script("sandboxed-sh-prod.service", 3100);
+        assert!(script.contains("systemctl stop sandboxed-sh-prod.service"));
+        assert!(script.contains("systemctl start sandboxed-sh-prod.service"));
+        assert!(
+            !script.contains("systemctl restart"),
+            "must stop, wait for the port, then start"
+        );
+        assert!(
+            script.contains(":3100"),
+            "port must come from config, not hardcoded 3000"
+        );
+        assert!(!script.contains(":3000"));
+        assert!(script.contains("kill -TERM"));
+        assert!(script.contains("kill -KILL"));
     }
 }
