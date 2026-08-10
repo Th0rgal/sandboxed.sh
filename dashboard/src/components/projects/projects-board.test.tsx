@@ -249,6 +249,34 @@ describe("ProjectsBoard", () => {
     );
   });
 
+  test("confirmed delete revalidates the overview and the row disappears", async () => {
+    // First load shows the project; the post-delete revalidation returns an
+    // overview without it, so the row must leave the triage list.
+    mockedOverview
+      .mockResolvedValueOnce(
+        overview([project({ slug: "verity" }), project({ slug: "beal" })]),
+      )
+      .mockResolvedValue(overview([project({ slug: "beal" })]));
+    mockedAction.mockResolvedValue(undefined);
+
+    renderBoard();
+
+    fireEvent.click(await screen.findByRole("button", { name: /verity/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Delete/ }));
+    expect(mockedAction).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /Confirm/ }));
+
+    await waitFor(() =>
+      expect(mockedAction).toHaveBeenCalledWith("verity", "delete"),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /verity/ }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: /beal/ })).toBeInTheDocument();
+  });
+
   test("reply composer streams into the update's origin session", async () => {
     mockedOverview.mockResolvedValue(overview([project({ slug: "verity" })]));
     mockedUpdates.mockResolvedValue({
