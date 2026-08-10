@@ -573,6 +573,22 @@ struct ProjectRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     next_action: Option<String>,
     bucket: &'static str,
+    /// The operator's board override for this slug (`"paused"` / `"archived"`),
+    /// when one is set. This is the provenance bit clients need to distinguish
+    /// an operator pause (override present) from a controller that stopped
+    /// itself (`mode` paused/blocked without an override) — overrides are only
+    /// ever written by the board action endpoint, never by controllers.
+    #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
+    board_override: Option<String>,
+    /// The roster record's controller cron id, when declared — the
+    /// controller ↔ project link.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    controller_cron_id: Option<String>,
+    /// The roster record's controller-reported mode (`active` / `blocked` /
+    /// `paused`), surfaced directly on the row. Also still rides on
+    /// `latest_update.mode` for compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
     tracker: Option<TrackerInfo>,
     missions: Vec<MissionChip>,
     latest_update: Option<DeliveryUpdate>,
@@ -727,6 +743,8 @@ pub async fn projects_overview(
             .or_insert_with(|| ProjectRowBuilder::new(slug));
         builder.title = record.title;
         builder.next_action = record.next_action;
+        builder.mode = record.mode;
+        builder.controller_cron_id = record.controller_cron_id;
     }
     // The latest ingested state per project becomes the row's latest_update —
     // same serialized shape the delivery scan used to produce, now read back
@@ -854,6 +872,9 @@ struct ProjectRowBuilder {
     /// Roster title/next-action, attached when the slug has a roster record.
     title: Option<String>,
     next_action: Option<String>,
+    /// Roster mode + controller link, attached alongside title/next_action.
+    mode: Option<String>,
+    controller_cron_id: Option<String>,
     tracker: Option<TrackerInfo>,
     missions: Vec<MissionChip>,
     /// Health inputs, accumulated alongside the display chips.
@@ -871,6 +892,8 @@ impl ProjectRowBuilder {
             slug,
             title: None,
             next_action: None,
+            mode: None,
+            controller_cron_id: None,
             tracker: None,
             missions: Vec::new(),
             health_inputs: Vec::new(),
@@ -1019,6 +1042,9 @@ impl ProjectRowBuilder {
             title: self.title,
             next_action: self.next_action,
             bucket,
+            board_override: forced.map(str::to_string),
+            controller_cron_id: self.controller_cron_id,
+            mode: self.mode,
             tracker: self.tracker,
             missions: self.missions,
             latest_update: self.latest_update,
@@ -1877,6 +1903,45 @@ mod tests {
             json.get("next_action").is_none(),
             "unset next_action is omitted"
         );
+    }
+
+    /// Provenance rides on the row: `override` is the operator's board action,
+    /// `mode` is the controller's own report. An operator pause serializes the
+    /// override; a controller self-pause serializes mode without an override —
+    /// that difference is what lets clients render "paused by you" vs
+    /// "controller stopped itself". All three fields are omitted when unset.
+    #[test]
+    fn override_mode_and_controller_id_expose_stop_provenance() {
+        // Operator pause: board override present, controller still active.
+        let mut operator = ProjectRowBuilder::new("verity".to_string());
+        operator.mode = Some("active".to_string());
+        operator.controller_cron_id = Some("cron-abc123".to_string());
+        let row = operator.finish(&[], Some("paused"), None, "2026-08-04T12:00:00Z");
+        let json = serde_json::to_value(&row).expect("serialize");
+        assert_eq!(json["override"], "paused");
+        assert_eq!(json["mode"], "active");
+        assert_eq!(json["controller_cron_id"], "cron-abc123");
+        assert_eq!(row.bucket, "paused");
+
+        // Controller self-pause: mode says paused, no override.
+        let mut cut = ProjectRowBuilder::new("lido".to_string());
+        cut.mode = Some("paused".to_string());
+        let row = cut.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        let json = serde_json::to_value(&row).expect("serialize");
+        assert!(json.get("override").is_none(), "no override was set");
+        assert_eq!(json["mode"], "paused");
+
+        // Nothing set: all three are omitted from the JSON.
+        let bare = ProjectRowBuilder::new("erc".to_string()).finish(
+            &[],
+            None,
+            None,
+            "2026-08-04T12:00:00Z",
+        );
+        let json = serde_json::to_value(&bare).expect("serialize");
+        assert!(json.get("override").is_none());
+        assert!(json.get("mode").is_none());
+        assert!(json.get("controller_cron_id").is_none());
     }
 
     // ---- store-driven overview (the ingestor is the only delivery reader) ----
