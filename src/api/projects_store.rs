@@ -371,6 +371,67 @@ impl ProjectsStore {
         Ok(1)
     }
 
+    /// Record a `[SILENT]` (or headline-less) delivery for `slug` at `at`.
+    ///
+    /// `[SILENT]` is the controllers-policy convention for "nothing to
+    /// report": the observation must advance freshness (so the controller is
+    /// not flagged silent — that is the point of emitting it), but it must
+    /// never become the headline the board shows. So instead of opening a new
+    /// state event, the newest event is extended — last_seen_at/observations
+    /// move forward while signature and headline stay what the last meaningful
+    /// delivery said, like a repeated-signature fold. Only when no event
+    /// exists at all is one created, with `descriptor` and no headline.
+    ///
+    /// Idempotent on `at`, same as [`Self::record_state`]. Returns the
+    /// resulting observation count.
+    pub fn record_silent_observation(
+        &self,
+        slug: &str,
+        descriptor: &str,
+        at: &str,
+        session_id: Option<&str>,
+    ) -> Result<u32, String> {
+        let connection = self.lock()?;
+        let current: Option<(String, String, u32)> = connection
+            .query_row(
+                "SELECT first_seen_at, last_seen_at, observations \
+                 FROM project_state_events WHERE slug = ?1 \
+                 ORDER BY last_seen_at DESC LIMIT 1",
+                params![slug],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+
+        if let Some((first_seen_at, last_seen_at, observations)) = current {
+            // Already counted, or older than what we have: nothing to do.
+            if at <= last_seen_at.as_str() {
+                return Ok(observations);
+            }
+            connection
+                .execute(
+                    "UPDATE project_state_events \
+                     SET last_seen_at = ?1, observations = observations + 1, \
+                         session_id = COALESCE(?4, session_id) \
+                     WHERE slug = ?2 AND first_seen_at = ?3",
+                    params![at, slug, first_seen_at, session_id],
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(observations + 1);
+        }
+
+        connection
+            .execute(
+                "INSERT INTO project_state_events \
+                   (slug, signature, headline, first_seen_at, last_seen_at, observations, session_id) \
+                 VALUES (?1, ?2, NULL, ?3, ?3, 1, ?4) \
+                 ON CONFLICT(slug, first_seen_at) DO NOTHING",
+                params![slug, descriptor, at, session_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(1)
+    }
+
     /// A project's state history, newest first.
     pub fn state_timeline(&self, slug: &str, limit: usize) -> Result<Vec<ProjectState>, String> {
         let connection = self.lock()?;

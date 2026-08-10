@@ -141,7 +141,7 @@ fn ingest_deliveries(
         // synthetic `ctrl:…` descriptor is recorded then, so the delivery's
         // headline and session still reach the timeline — that is what the
         // overview builds `latest_update` from. `observations` drives `wait`.
-        let headline = Some(delivery.headline.as_str()).filter(|h| !h.is_empty());
+        let headline = Some(delivery.headline.trim()).filter(|h| !h.is_empty());
         let session = Some(delivery.session_id.as_str()).filter(|s| !s.is_empty());
         let descriptor = delivery.state.clone().unwrap_or_else(|| {
             format!(
@@ -149,14 +149,24 @@ fn ingest_deliveries(
                 delivery.mode.as_deref().unwrap_or("report")
             )
         });
-        let observations =
-            match projects.record_state(slug, &descriptor, headline, &delivery.at, session) {
-                Ok(observations) => observations,
-                Err(error) => {
-                    tracing::warn!("state ingest: {slug}: {error}");
-                    1
-                }
-            };
+        // `[SILENT]` is the controllers-policy convention for "nothing to
+        // report". It must advance freshness (a quiet tick is proof of life),
+        // but it must never become the headline the card shows — fold it onto
+        // the previous state event so `latest_update` keeps surfacing the last
+        // meaningful headline with the fresh timestamp.
+        let recorded = match headline {
+            Some("[SILENT]") | None => {
+                projects.record_silent_observation(slug, &descriptor, &delivery.at, session)
+            }
+            Some(_) => projects.record_state(slug, &descriptor, headline, &delivery.at, session),
+        };
+        let observations = match recorded {
+            Ok(observations) => observations,
+            Err(error) => {
+                tracing::warn!("state ingest: {slug}: {error}");
+                1
+            }
+        };
         // Project the controller's `[CTRL: … mode=… ]` mode onto the
         // project record — independent of the descriptor, so a
         // CTRL-only delivery still updates the mode column. Idempotent
@@ -1978,6 +1988,64 @@ mod tests {
             update.state, None,
             "the synthetic ctrl descriptor is not a state"
         );
+    }
+
+    /// A `[SILENT]` tick after a real report must advance freshness without
+    /// stealing the headline: the card keeps the last meaningful headline,
+    /// stamped with the silent delivery's (fresher) time. Observed live on
+    /// verity-lido, where cards showed the literal string "[SILENT]".
+    #[test]
+    fn a_silent_delivery_keeps_the_previous_headline_but_advances_freshness() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        let real = "[Cron delivery: Verity]\nCertify #2240 merged\n\
+                    [CTRL: verity | mode=active | wait=0 | next=x]";
+        let quiet = "[Cron delivery: Verity]\n[SILENT]\n\
+                     [CTRL: verity | mode=active | wait=1 | next=x]";
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            // Newest-first, as read_deliveries returns them.
+            vec![
+                parse_delivery("sess-2", 1_754_003_600.0, quiet),
+                parse_delivery("sess-1", 1_754_000_000.0, real),
+            ],
+        );
+
+        let latest = store.latest_states().expect("latest");
+        let event = latest.get("verity").expect("state event recorded");
+        let update = store_update("verity", event, None, None);
+        assert_eq!(
+            update.headline, "Certify #2240 merged",
+            "the [SILENT] tick must not replace the last meaningful headline"
+        );
+        assert_eq!(
+            update.at,
+            parse_delivery("sess-2", 1_754_003_600.0, quiet).at,
+            "freshness must advance to the silent delivery's time"
+        );
+        assert_eq!(event.observations, 2, "the quiet tick is still counted");
+    }
+
+    /// A controller whose very first delivery is `[SILENT]` must not put the
+    /// literal marker on the card: the event lands with no headline at all.
+    #[test]
+    fn a_silent_first_delivery_records_no_garbage_headline() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        let quiet = "[Cron delivery: Lido]\n[SILENT]\n\
+                     [CTRL: lido | mode=active | wait=0 | next=x]";
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            vec![parse_delivery("sess-1", 1_754_000_000.0, quiet)],
+        );
+
+        let latest = store.latest_states().expect("latest");
+        let event = latest.get("lido").expect("freshness is still recorded");
+        assert_eq!(event.headline, None, "no [SILENT] garbage headline");
+        let update = store_update("lido", event, None, None);
+        assert_eq!(update.headline, "");
     }
 
     /// The serialized shape of a store-built latest_update is the one every
