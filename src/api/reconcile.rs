@@ -35,7 +35,9 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use super::control::{AgentEvent, ControlCommand, MissionStatus};
-use super::mission_store::{MissionExecutionState, MissionMode, MissionProjectPatch};
+use super::mission_store::{
+    MissionExecutionState, MissionFilter, MissionMode, MissionProjectPatch,
+};
 use super::mission_workspace_gc::{build_mission_index, entry_for_workspace};
 use super::routes::AppState;
 use super::scope_reaper::stop_unit;
@@ -87,6 +89,27 @@ fn active_grace() -> chrono::Duration {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(180);
     chrono::Duration::seconds(secs)
+}
+
+/// How far back a `interrupted(service_restart)` mission may have been last
+/// touched and still be re-resumed. Guards against resurrecting ancient rows
+/// left interrupted long ago. Default 6h.
+fn interrupted_horizon() -> chrono::Duration {
+    let secs = std::env::var("RECONCILE_INTERRUPTED_HORIZON_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(6 * 60 * 60);
+    chrono::Duration::seconds(secs)
+}
+
+/// Cap on how many `interrupted(service_restart)` missions a single pass will
+/// re-resume, so a restart storm can't stampede the actor. Default 20.
+fn interrupted_resume_cap() -> usize {
+    std::env::var("RECONCILE_INTERRUPTED_RESUME_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(20)
 }
 
 // ==================== scope-name parsing ====================
@@ -261,6 +284,42 @@ pub fn classify_mission(facts: &MissionFacts) -> MissionVerdict {
     }
 }
 
+/// Inputs for deciding whether an already-`interrupted` mission (from a PRIOR
+/// restart) should be re-resumed. A service restart that interrupts a mission,
+/// followed by a second restart before the auto-resume lands, otherwise leaves
+/// the mission stuck `interrupted` forever (needing a manual resume).
+#[derive(Debug, Clone, Copy)]
+pub struct InterruptedFacts {
+    pub status: MissionStatus,
+    /// The mission's `terminal_reason` is exactly `service_restart`. We NEVER
+    /// touch user-cancelled or genuinely-failed missions — only the ones this
+    /// reconciler itself parked.
+    pub is_service_restart: bool,
+    /// The control actor currently lists this mission as running.
+    pub running_in_actor: bool,
+    /// A live `sandboxed-exec-*` scope carries this mission's short id.
+    pub has_live_scope: bool,
+    /// A detached durable run (remote job) owns liveness.
+    pub has_durable_run: bool,
+    /// The mission row was updated within `RECONCILE_INTERRUPTED_HORIZON_SECS`.
+    pub within_horizon: bool,
+    /// A live mission with the SAME project+track already exists — the
+    /// controller has re-dispatched, so resuming would duplicate it.
+    pub live_retry_exists: bool,
+}
+
+/// True iff an `interrupted(service_restart)` mission with no live backing,
+/// recently touched, and no competing live retry should be auto-resumed.
+pub fn should_reresume_interrupted(facts: &InterruptedFacts) -> bool {
+    facts.status == MissionStatus::Interrupted
+        && facts.is_service_restart
+        && !facts.running_in_actor
+        && !facts.has_live_scope
+        && !facts.has_durable_run
+        && facts.within_horizon
+        && !facts.live_retry_exists
+}
+
 // ==================== systemd enumeration ====================
 
 /// List all sandboxed scope units. `Err` means systemd is unavailable or the
@@ -309,6 +368,9 @@ pub struct ReconcileReport {
     pub missions_scanned: usize,
     pub missions_interrupted: usize,
     pub missions_resumed: usize,
+    /// Missions found already `interrupted(service_restart)` from a prior
+    /// restart (no live backing, within horizon) and re-resumed this pass.
+    pub missions_reresumed: usize,
     pub missions_tagged_orphaned: usize,
     pub errors: usize,
 }
@@ -419,6 +481,10 @@ pub async fn run(state: &Arc<AppState>) -> ReconcileReport {
 
     // ---- Phase 2: missions ----
     let grace = active_grace();
+    let horizon = interrupted_horizon();
+    // Pass-level budget: cap total re-resumes across ALL sessions so a restart
+    // storm can't stampede the actor.
+    let mut reresume_budget = interrupted_resume_cap();
     let now = chrono::Utc::now();
     for session in state.control.all_sessions().await {
         let store = &session.mission_store;
@@ -439,6 +505,19 @@ pub async fn run(state: &Arc<AppState>) -> ReconcileReport {
                 continue;
             }
         };
+        // Snapshot of live (active) project+track pairs, used by phase 2c to
+        // avoid re-resuming an interrupted mission when the controller has
+        // already re-dispatched a fresh worker for the same track.
+        let live_project_tracks: HashSet<(String, Option<String>)> = active
+            .iter()
+            .filter_map(|m| {
+                m.project
+                    .project
+                    .clone()
+                    .map(|p| (p, m.project.track.clone()))
+            })
+            .collect();
+
         for mission in active {
             report.missions_scanned += 1;
             let has_durable_run = match store.get_active_mission_run(mission.id).await {
@@ -588,6 +667,111 @@ send a new message or re-create the mission.",
             let _ = session.events_tx.send(event);
             tracing::warn!(mission_id = %mission.id, "reconcile: tagged awaiting_user mission as orphaned");
         }
+
+        // 2c. Missions ALREADY `interrupted(service_restart)` from a prior
+        // restart, with no live backing, recently touched, and no competing
+        // live retry → re-resume (bounded by `reresume_budget`). Without this,
+        // a restart that interrupts a mission followed by a second restart
+        // before the auto-resume lands strands it `interrupted` forever.
+        if reresume_budget == 0 {
+            continue;
+        }
+        let interrupted = match store
+            .list_missions_filtered(
+                &MissionFilter {
+                    status: Some(MissionStatus::Interrupted.to_string()),
+                    ..Default::default()
+                },
+                500,
+                0,
+            )
+            .await
+        {
+            Ok(missions) => missions,
+            Err(err) => {
+                tracing::warn!(%err, "reconcile: could not list interrupted missions");
+                report.errors += 1;
+                continue;
+            }
+        };
+        for mission in interrupted {
+            if reresume_budget == 0 {
+                break;
+            }
+            report.missions_scanned += 1;
+            // (a) ONLY service_restart — never user-cancelled or genuinely
+            // failed missions.
+            let is_service_restart =
+                mission.terminal_reason.as_deref() == Some(SERVICE_RESTART_REASON);
+            if !is_service_restart {
+                continue;
+            }
+            let has_durable_run = match store.get_active_mission_run(mission.id).await {
+                Ok(run) => run.is_some_and(|run| {
+                    run.execution_state == MissionExecutionState::WaitingRemoteJob
+                }),
+                Err(err) => {
+                    tracing::warn!(mission_id = %mission.id, %err, "reconcile: run lookup failed (interrupted)");
+                    report.errors += 1;
+                    continue;
+                }
+            };
+            let within_horizon = chrono::DateTime::parse_from_rfc3339(&mission.updated_at)
+                .map(|t| now - t.with_timezone(&chrono::Utc) < horizon)
+                .unwrap_or(false);
+            let short = mission.id.simple().to_string()[..8].to_string();
+            // (b) A live mission with the same project+track means the
+            // controller already re-dispatched; don't duplicate it.
+            let live_retry_exists = mission
+                .project
+                .project
+                .as_ref()
+                .map(|p| live_project_tracks.contains(&(p.clone(), mission.project.track.clone())))
+                .unwrap_or(false);
+            let facts = InterruptedFacts {
+                status: mission.status,
+                is_service_restart,
+                running_in_actor: running_ids.contains(&mission.id),
+                has_live_scope: report.systemd_available && live_short_ids.contains(&short),
+                has_durable_run,
+                within_horizon,
+                live_retry_exists,
+            };
+            if !should_reresume_interrupted(&facts) {
+                continue;
+            }
+            tracing::warn!(
+                mission_id = %mission.id,
+                project = ?mission.project.project,
+                track = ?mission.project.track,
+                "reconcile: re-resuming mission stranded interrupted(service_restart) by a prior restart"
+            );
+            let (tx, rx) = oneshot::channel();
+            let sent = session
+                .cmd_tx
+                .send(ControlCommand::ResumeMission {
+                    mission_id: mission.id,
+                    clean_workspace: false,
+                    skip_message: false,
+                    respond: tx,
+                })
+                .await
+                .is_ok();
+            match (sent, if sent { rx.await.ok() } else { None }) {
+                (true, Some(Ok(_))) => {
+                    report.missions_reresumed += 1;
+                    reresume_budget -= 1;
+                }
+                (true, Some(Err(err))) => {
+                    tracing::warn!(mission_id = %mission.id, %err, "reconcile: interrupted re-resume failed");
+                    report.errors += 1;
+                }
+                _ => {
+                    tracing::warn!(mission_id = %mission.id, "reconcile: interrupted re-resume not acknowledged");
+                    report.errors += 1;
+                }
+            }
+        }
     }
 
     report
@@ -608,6 +792,7 @@ pub fn spawn(state: Arc<AppState>) {
             scopes_stopped = report.scopes_stopped,
             missions_interrupted = report.missions_interrupted,
             missions_resumed = report.missions_resumed,
+            missions_reresumed = report.missions_reresumed,
             orphaned = report.missions_tagged_orphaned,
             errors = report.errors,
             "boot reconcile finished"
@@ -839,5 +1024,100 @@ mod tests {
                 "{status} must be kept"
             );
         }
+    }
+
+    // ---------- interrupted(service_restart) re-resume ----------
+
+    fn base_interrupted_facts() -> InterruptedFacts {
+        InterruptedFacts {
+            status: MissionStatus::Interrupted,
+            is_service_restart: true,
+            running_in_actor: false,
+            has_live_scope: false,
+            has_durable_run: false,
+            within_horizon: true,
+            live_retry_exists: false,
+        }
+    }
+
+    #[test]
+    fn interrupted_service_restart_no_scope_recent_is_reresumed() {
+        assert!(should_reresume_interrupted(&base_interrupted_facts()));
+    }
+
+    #[test]
+    fn interrupted_user_cancel_is_not_reresumed() {
+        // Only `service_restart` qualifies — a user-cancelled or genuinely
+        // failed mission has `is_service_restart == false`.
+        let mut facts = base_interrupted_facts();
+        facts.is_service_restart = false;
+        assert!(!should_reresume_interrupted(&facts));
+    }
+
+    #[test]
+    fn interrupted_service_restart_too_old_is_not_reresumed() {
+        let mut facts = base_interrupted_facts();
+        facts.within_horizon = false;
+        assert!(!should_reresume_interrupted(&facts));
+    }
+
+    #[test]
+    fn interrupted_with_live_retry_is_not_reresumed() {
+        let mut facts = base_interrupted_facts();
+        facts.live_retry_exists = true;
+        assert!(!should_reresume_interrupted(&facts));
+    }
+
+    #[test]
+    fn interrupted_with_any_live_backing_is_not_reresumed() {
+        for mutate in [
+            |f: &mut InterruptedFacts| f.running_in_actor = true,
+            |f: &mut InterruptedFacts| f.has_live_scope = true,
+            |f: &mut InterruptedFacts| f.has_durable_run = true,
+        ] {
+            let mut facts = base_interrupted_facts();
+            mutate(&mut facts);
+            assert!(!should_reresume_interrupted(&facts));
+        }
+    }
+
+    #[test]
+    fn non_interrupted_status_is_never_reresumed() {
+        for status in [
+            MissionStatus::Active,
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::AwaitingUser,
+            MissionStatus::Acknowledged,
+        ] {
+            let mut facts = base_interrupted_facts();
+            facts.status = status;
+            assert!(
+                !should_reresume_interrupted(&facts),
+                "{status} must not be re-resumed"
+            );
+        }
+    }
+
+    #[test]
+    fn reresume_cap_is_respected() {
+        // The per-pass budget starts at the cap and decrements per resume;
+        // once exhausted, no further missions are resumed. Model the loop's
+        // budget arithmetic directly against the pure predicate.
+        let cap = 3usize;
+        let mut budget = cap;
+        let candidates = vec![base_interrupted_facts(); 10];
+        let mut resumed = 0usize;
+        for facts in &candidates {
+            if budget == 0 {
+                break;
+            }
+            if should_reresume_interrupted(facts) {
+                resumed += 1;
+                budget -= 1;
+            }
+        }
+        assert_eq!(resumed, cap);
+        assert_eq!(budget, 0);
     }
 }
