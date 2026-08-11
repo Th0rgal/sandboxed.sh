@@ -236,7 +236,7 @@ pub(crate) async fn cleanup_stale_active_missions_once(
                 if cmd_tx
                     .send(ControlCommand::CancelMission {
                         mission_id: mission.id,
-                        min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
+                        min_idle: Some(std::time::Duration::from_secs(stuck_seconds())),
                         respond: tx,
                     })
                     .await
@@ -337,7 +337,7 @@ pub(crate) async fn ack_promotion_loop(
 }
 
 fn inactivity_is_cancellable(seconds_since_activity: u64, tool_call_in_flight: bool) -> bool {
-    seconds_since_activity >= STUCK_SECONDS
+    seconds_since_activity >= stuck_seconds()
         && (!tool_call_in_flight || seconds_since_activity >= TOOL_CALL_STALL_GRACE_SECS)
 }
 
@@ -459,7 +459,7 @@ pub(crate) async fn stuck_mission_watchdog_loop(
         // threshold. Cancel via the actor (clean shutdown) and mark
         // the row Interrupted.
         for info in &running_list {
-            if info.seconds_since_activity < STUCK_SECONDS {
+            if info.seconds_since_activity < stuck_seconds() {
                 continue;
             }
             let is_chatgpt_ui = info.backend_id.as_deref() == Some("chatgpt_ui");
@@ -517,6 +517,27 @@ pub(crate) async fn stuck_mission_watchdog_loop(
                 );
                 continue;
             }
+            // Never silently auto-kill a mission an operator/controller launched
+            // through a control session (`origin == "hermes"` with an
+            // `origin_session_id`). A slow scan/build looks idle but is the
+            // operator's work; killing it out from under a "launch these
+            // missions" request is exactly the confusion we're removing. Skip
+            // the kill and log — Phase 1 routes a rich alert to the owning
+            // controller session so a human/controller can decide, and Phase 2b
+            // will re-narrow this to operator-vs-cron. Dashboard/API-direct
+            // missions (`origin == None`) keep the watchdog protection.
+            if let Ok(Some(mission)) = mission_store.get_mission(info.mission_id).await {
+                if mission.origin.as_deref() == Some("hermes")
+                    && mission.origin_session_id.is_some()
+                {
+                    tracing::warn!(
+                        mission_id = %info.mission_id,
+                        seconds_since_activity = info.seconds_since_activity,
+                        "Stuck-mission watchdog: control-session-launched mission idle past threshold — NOT auto-killing (operator/controller owns it)"
+                    );
+                    continue;
+                }
+            }
             tracing::warn!(
                 "Stuck-mission watchdog: cancelling {} after {}s of inactivity",
                 info.mission_id,
@@ -526,7 +547,7 @@ pub(crate) async fn stuck_mission_watchdog_loop(
             let cancelled = if cmd_tx
                 .send(ControlCommand::CancelMission {
                     mission_id: info.mission_id,
-                    min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
+                    min_idle: Some(std::time::Duration::from_secs(stuck_seconds())),
                     respond: cancel_tx,
                 })
                 .await
