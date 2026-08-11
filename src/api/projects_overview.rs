@@ -1343,6 +1343,7 @@ pub async fn unbind_project_conversation(
 }
 
 pub async fn project_action(
+    State(state): State<Arc<AppState>>,
     AxumPath(slug): AxumPath<String>,
     Json(request): Json<ProjectActionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -1368,6 +1369,12 @@ pub async fn project_action(
         }
         "resume" | "unarchive" | "restore" => {
             overrides.remove(&slug);
+            // Operator intent is authoritative over a stale controller mode:
+            // resuming clears a lingering self-pause/blocked so the project
+            // stops being buried while the operator wants it active. The
+            // controller re-confirms/adjusts its mode on its next tick. Ignore
+            // the "unknown project" error (a project with no roster record).
+            let _ = state.projects.set_mode(&slug, "active", None, None);
         }
         other => {
             return Err((StatusCode::BAD_REQUEST, format!("unknown action '{other}'")));
