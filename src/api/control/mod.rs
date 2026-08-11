@@ -826,6 +826,61 @@ mod campaign_guard_tests {
         mission.id
     }
 
+    async fn mk_tracked(store: &Arc<dyn MissionStore>, project: &str, track: &str) -> Uuid {
+        let mission = store
+            .create_mission(Some(track), None, None, None, None, None, None)
+            .await
+            .expect("create");
+        store
+            .update_mission_project(
+                mission.id,
+                mission_store::MissionProjectPatch {
+                    project: Some(Some(project.to_string())),
+                    track: Some(Some(track.to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag");
+        mission.id
+    }
+
+    #[tokio::test]
+    async fn nonterminal_missions_for_project_counts_the_live_footprint() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        assert!(nonterminal_missions_for_project(&store, "proj")
+            .await
+            .is_empty());
+
+        let a = mk_tracked(&store, "proj", "alpha").await;
+        mk_tracked(&store, "proj", "beta").await;
+        mk_tracked(&store, "other", "alpha").await; // different project — excluded
+
+        let live = nonterminal_missions_for_project(&store, "proj").await;
+        assert_eq!(
+            live.len(),
+            2,
+            "counts only this project's non-terminal missions"
+        );
+        // The (project, track) dedup key: track 'alpha' is present exactly once.
+        assert_eq!(
+            live.iter()
+                .filter(|m| m.project.track.as_deref() == Some("alpha"))
+                .count(),
+            1
+        );
+
+        // A terminal mission drops out of the footprint (frees the cap slot).
+        store
+            .update_mission_status(a, MissionStatus::Completed)
+            .await
+            .expect("complete");
+        assert_eq!(
+            nonterminal_missions_for_project(&store, "proj").await.len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn second_campaign_is_blocked_until_the_first_terminates() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
@@ -7659,6 +7714,29 @@ async fn find_open_campaign_mission(
         .find(|mission| campaign_slot_held_by(mission.status))
 }
 
+/// Non-terminal missions currently held by a project — the live coordination
+/// footprint used to enforce the grant's `parallel_missions` cap and the
+/// per-(project, track) dedup. Mirrors `find_open_campaign_mission`'s "slot
+/// held" notion (`campaign_slot_held_by`) but across all tracks.
+async fn nonterminal_missions_for_project(
+    mission_store: &Arc<dyn MissionStore>,
+    project: &str,
+) -> Vec<Mission> {
+    const PAGE: usize = 200;
+    let filter = crate::api::mission_store::MissionFilter {
+        project: Some(project.to_string()),
+        ..Default::default()
+    };
+    mission_store
+        .list_missions_filtered(&filter, PAGE, 0)
+        .await
+        .ok()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|mission| campaign_slot_held_by(mission.status))
+        .collect()
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -7774,6 +7852,47 @@ pub async fn create_mission(
                 })
                 .to_string(),
             ));
+        }
+    }
+
+    // Native coordination guard (resilient — no external fleet daemon needed):
+    // enforce the project's declared `parallel_missions` cap, which was only
+    // advisory. This is the over-subscription filet that stops two controllers
+    // (or one launching cross-project) from piling missions onto a project past
+    // what its grant allows. Only bites when the grant sets a cap > 0 — projects
+    // without a cap are unaffected. (A per-(project, track) dedup is a
+    // deliberate follow-up: a track is sometimes legitimately shared by a
+    // writer+reviewer pair, so a hard dedup needs track-semantics confirmation
+    // before it can safely reject.)
+    if let Some(project) = req
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(Some(grant)) = state.projects.get_grant(project) {
+            if let Some(cap) = grant.parallel_missions.filter(|&c| c > 0) {
+                let control_state = control_for_user(&state, &user).await;
+                let active =
+                    nonterminal_missions_for_project(&control_state.mission_store, project).await;
+                if active.len() as i64 >= cap {
+                    tracing::info!(
+                        project,
+                        cap,
+                        active = active.len(),
+                        "create_mission rejected: project is at its parallel_missions cap"
+                    );
+                    return Err((
+                        StatusCode::TOO_MANY_REQUESTS,
+                        serde_json::json!({
+                            "error": "parallel_missions_cap",
+                            "cap": cap,
+                            "active": active.len(),
+                        })
+                        .to_string(),
+                    ));
+                }
+            }
         }
     }
 

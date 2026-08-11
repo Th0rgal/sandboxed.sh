@@ -165,15 +165,33 @@ chat session-à-session). La coordination est **décentralisée**, par trois can
   ne passe sans sa revue exact-head (receipts rejouables, head exact, zéro
   `sorry`/`admit`), ce qui rattrape un travail concurrent divergent au merge.
 
-**Coordinateur central optionnel — le fleet-orchestrator.** Un daemon (état dans
-`~/.hermes/fleet/state.json`) peut, quand il tourne, ajouter une garde
-*anti-sur-souscription* (signal `OVER_SUBSCRIPTION` quand plus de missions actives
-que `max_parallel_missions`) et une dédup des signaux au-dessus des canaux
-ci-dessus. **Il est optionnel** : sans lui, la coordination reste correcte
-(canaux 1–3 + verrous), mais il n'y a plus de garde centrale de dédup/débit — à
-forte charge, surveiller le travail redondant (plusieurs sessions lançant des
-missions sur le même projet) via `list_active_missions`. Vérifier qu'il tourne :
-`daemon_last_seen` dans `state.json` doit être récent.
+**Coordinateur central — le fleet-orchestrator (3 composants, pouvoirs
+gradués).** État partagé dans `~/.hermes/fleet/state.json`. Trois scripts sous
+`~/.hermes/scripts/`, à n'activer que selon la responsabilité qu'on accepte de
+leur déléguer :
+
+1. **`fleet-daemon`** *(Couche 1 — observe + ACK + escalate)*. Listener SSE sur
+   `/api/control/stream`. ACK le travail terminé, écrit une alerte pour un vrai
+   blocker (`awaiting_message`). **Ne supprime, n'annule et ne dispatche
+   jamais.** Tourne en permanence via `fleet-daemon.service` (systemd, enabled).
+   C'est le socle sûr — vérifier `daemon_last_seen` récent dans `state.json`.
+2. **`fleet-watcher`** *(Couche 1 — vision, emit-only)*. Poll toutes les 10 min
+   (`fleet-watcher.timer`, `OnCalendar=*:0/10`). Rafraîchit `state.json` et émet
+   des signaux urgents — `OVER_SUBSCRIPTION` (plus de missions actives par backend
+   que `max_parallel_missions`), `MISSION_STUCK`, `WINDOW_BURNING`,
+   `BACKLOG_PRESSURE`. **Aucune action** : les champs `action` qu'il imprime sont
+   du texte consultatif. Silencieux quand rien n'est urgent. Sûr à activer.
+3. **`fleet-heartbeat`** *(Couche 3 — dispatch autonome)*. **Volontairement non
+   planifié.** C'est le seul composant qui *lance* des missions de lui-même ; sa
+   responsabilité (dispatch sans humain dans la boucle) est trop large pour être
+   armée sans supervision dédiée. Le laisser éteint sauf décision explicite.
+
+Note : depuis que la garde native de sandboxed.sh applique le plafond
+`parallel_missions` du grant en dur au `create_mission` (429 `parallel_missions_cap`),
+le signal `OVER_SUBSCRIPTION` du watcher est surtout *redondant* pour la
+sur-souscription — le watcher n'ajoute plus que la vision quota/backlog. La
+coordination reste correcte même watcher éteint (canaux 1–3 + verrous + garde
+native).
 
 ## Références
 

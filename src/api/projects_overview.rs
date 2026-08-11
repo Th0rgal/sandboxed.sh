@@ -2124,9 +2124,11 @@ mod tests {
         assert_eq!(conversation.bound_at, None);
     }
 
-    /// Roster metadata rides on the row: the title replaces the slug on cards
-    /// and the palette; next_action renders on attention cards. Both are
-    /// optional and absent from the JSON when unset.
+    /// Roster metadata rides on the row: a set title replaces the slug on cards
+    /// and the palette; next_action renders on attention cards. next_action is
+    /// optional and absent from the JSON when unset. `title`, however, is never
+    /// absent — when the roster carries no title the row humanizes the slug so a
+    /// surface never falls back to the raw lowercase-hyphenated slug.
     #[test]
     fn roster_title_and_next_action_ride_on_the_row() {
         let mut builder = ProjectRowBuilder::new("verity".to_string());
@@ -2142,8 +2144,15 @@ mod tests {
             None,
             "2026-08-04T12:00:00Z",
         );
+        // A bare row still gets a humanized title ("Lido") — never the raw slug,
+        // never omitted — so notifications and board rows always read as a name.
+        assert_eq!(bare.title.as_deref(), Some("Lido"));
         let json = serde_json::to_value(&bare).expect("serialize");
-        assert!(json.get("title").is_none(), "unset title is omitted");
+        assert_eq!(
+            json.get("title").and_then(|v| v.as_str()),
+            Some("Lido"),
+            "unset title humanizes the slug rather than being omitted"
+        );
         assert!(
             json.get("next_action").is_none(),
             "unset next_action is omitted"
