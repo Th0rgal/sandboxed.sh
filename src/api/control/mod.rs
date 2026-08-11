@@ -205,6 +205,19 @@ async fn pop_next_runnable_control_queue(
 /// CancelMission re-check to keep the two views of "stalled" consistent.
 pub(crate) const STUCK_SECONDS: u64 = 900;
 
+/// The effective stall threshold, overridable at runtime via
+/// `MISSION_STUCK_SECONDS` (clamped to >= 30s so a typo can't make the
+/// watchdog trigger-happy). An ops lever to widen the window for tracks that
+/// legitimately go quiet between tool calls (long scans/builds) without a
+/// redeploy.
+pub(crate) fn stuck_seconds() -> u64 {
+    std::env::var("MISSION_STUCK_SECONDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v >= 30)
+        .unwrap_or(STUCK_SECONDS)
+}
+
 /// Grace period after the user first opens an `AwaitingUser` mission before
 /// the ack-promotion tick auto-archives it to `Acknowledged` (Finished).
 /// Resets whenever the user sends a new message (status returns to Active and
