@@ -886,6 +886,14 @@ fn default_providers_config() -> ProvidersConfig {
                         ),
                     },
                     ProviderModel {
+                        id: "gpt-daybreak-blue-latest".to_string(),
+                        name: "Daybreak Blue".to_string(),
+                        description: Some(
+                            "Frontier model for approved defensive cybersecurity work; requires Daybreak access"
+                                .to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "gpt-5.6-terra".to_string(),
                         name: "GPT-5.6 Terra".to_string(),
                         description: Some(
@@ -2604,22 +2612,7 @@ pub async fn list_backend_model_options(
     // a new slug starts working as soon as the backend recognizes it
     // — there is no hard dependency on the CLI's embedded catalog
     // being up-to-date.
-    let codex_filter: &dyn Fn(&str) -> bool = &|id: &str| {
-        id.contains("codex")
-            || matches!(
-                id,
-                "gpt-5.5"
-                    | "gpt-5.6"
-                    | "gpt-5.6-sol"
-                    | "gpt-5.6-terra"
-                    | "gpt-5.6-luna"
-                    | "gpt-5.5-pro"
-                    | "gpt-5.4"
-                    | "gpt-5.4-pro"
-                    | "gpt-5.4-mini"
-                    | "gpt-5.4-nano"
-            )
-    };
+    let codex_filter: &dyn Fn(&str) -> bool = &|id: &str| is_codex_backend_model_id(id);
     push_options("codex", Some(&["openai"]), false, Some(codex_filter));
     push_options("gemini", Some(&["google"]), false, None);
     push_options("opencode", None, true, None);
@@ -2888,6 +2881,24 @@ fn reject_known_unsupported_codex_model(model_id: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn is_codex_backend_model_id(model_id: &str) -> bool {
+    model_id.contains("codex")
+        || matches!(
+            model_id,
+            "gpt-daybreak-blue-latest"
+                | "gpt-5.5"
+                | "gpt-5.6"
+                | "gpt-5.6-sol"
+                | "gpt-5.6-terra"
+                | "gpt-5.6-luna"
+                | "gpt-5.5-pro"
+                | "gpt-5.4"
+                | "gpt-5.4-pro"
+                | "gpt-5.4-mini"
+                | "gpt-5.4-nano"
+        )
 }
 
 fn is_grok_backend_model_id(model_id: &str) -> bool {
@@ -3162,6 +3173,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for id in [
+            "gpt-daybreak-blue-latest",
             "gpt-5.6",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
@@ -3182,6 +3194,12 @@ mod tests {
                 "bare/non-API slug should not be exposed: {invalid_id}"
             );
         }
+    }
+
+    #[test]
+    fn codex_catalog_accepts_daybreak_blue() {
+        assert!(is_codex_backend_model_id("gpt-daybreak-blue-latest"));
+        assert!(!is_codex_backend_model_id("gpt-daybreak-red-latest"));
     }
 
     #[test]
