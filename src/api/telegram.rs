@@ -120,6 +120,28 @@ struct TelegramReplyRecord {
     created_at: Instant,
 }
 
+/// How long an operator/controller-launched mission may sit in `awaiting_user`
+/// before its question escalates to the human. Within this window the owning
+/// controller is expected to triage it (answer via `answer_mission_question`)
+/// on its own tick, so the human only ever sees questions the controller
+/// couldn't resolve. Overridable via `CONTROLLER_TRIAGE_GRACE_SECS`.
+const CONTROLLER_TRIAGE_GRACE_SECS: i64 = 20 * 60;
+
+/// Whether to HOLD an `awaiting_user` human alert so the owning controller can
+/// triage first. True only for a mission an operator/controller launched
+/// (`has_origin_session`) that has been awaiting for less than the triage
+/// grace. After the grace (controller didn't resolve it) or for a mission with
+/// no owning controller, the human is alerted as before.
+fn holds_for_controller_triage(
+    status: MissionStatus,
+    has_origin_session: bool,
+    awaiting_secs: i64,
+) -> bool {
+    status == MissionStatus::AwaitingUser
+        && has_origin_session
+        && awaiting_secs < CONTROLLER_TRIAGE_GRACE_SECS
+}
+
 const TELEGRAM_UPDATE_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
 const TELEGRAM_REPLY_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
 const TELEGRAM_SCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -1346,6 +1368,31 @@ async fn plan_paloma_alert_for_mission(
         .await
         .unwrap_or_default();
     let alert_now = Utc::now();
+    // Controller-first triage: a mission an operator/controller launched
+    // (origin_session_id present) that is only awaiting_user should be triaged
+    // by its OWNING controller — which reads the question and answers it via
+    // `answer_mission_question` on its tick — not bubbled straight to the human.
+    // Hold the human alert for a grace window; escalate to the human only if the
+    // question is still unanswered after `CONTROLLER_TRIAGE_GRACE_SECS` (the
+    // controller couldn't resolve it), so "needs you" stays rare and qualified.
+    {
+        let awaiting_secs = chrono::DateTime::parse_from_rfc3339(&mission.updated_at)
+            .ok()
+            .map(|t| (alert_now - t.with_timezone(&Utc)).num_seconds())
+            .unwrap_or(i64::MAX);
+        if holds_for_controller_triage(
+            mission.status,
+            mission.origin_session_id.is_some(),
+            awaiting_secs,
+        ) {
+            tracing::debug!(
+                mission_id = %mission.id,
+                awaiting_secs,
+                "Paloma alert: holding awaiting_user alert — owning controller gets first triage"
+            );
+            return;
+        }
+    }
     let policy_snapshot = paloma_policy_snapshot_json(&mission, interest, alert_now);
     if interest == TelegramMissionInterestLevel::Muted {
         log_paloma_alert_decision(
@@ -7579,6 +7626,35 @@ mod tests {
             &assistant,
             &[],
             now
+        ));
+    }
+
+    #[test]
+    fn controller_first_triage_holds_fresh_awaiting_for_controller_owned_missions() {
+        use super::{holds_for_controller_triage, CONTROLLER_TRIAGE_GRACE_SECS};
+        // Owned by a controller + freshly awaiting → hold (controller triages).
+        assert!(holds_for_controller_triage(
+            MissionStatus::AwaitingUser,
+            true,
+            60
+        ));
+        // Past the grace → escalate to the human (controller didn't resolve it).
+        assert!(!holds_for_controller_triage(
+            MissionStatus::AwaitingUser,
+            true,
+            CONTROLLER_TRIAGE_GRACE_SECS + 1
+        ));
+        // No owning controller → alert the human as before.
+        assert!(!holds_for_controller_triage(
+            MissionStatus::AwaitingUser,
+            false,
+            60
+        ));
+        // Not an awaiting-user question → unaffected.
+        assert!(!holds_for_controller_triage(
+            MissionStatus::Failed,
+            true,
+            60
         ));
     }
 
