@@ -715,10 +715,21 @@ pub async fn projects_overview(
         if deleted(&tracker.slug) {
             continue;
         }
-        let slug = tracker.slug.clone();
-        rows.entry(slug.clone())
-            .or_insert_with(|| ProjectRowBuilder::new(slug))
-            .tracker = Some(tracker);
+        // An alias's tracker file (`verity.md`, `verity-roadmap.md`) folds onto
+        // the canonical row too — otherwise a markdown file alone re-forks the
+        // phantom card the roster/mission loops just collapsed. The canonical's
+        // own tracker wins; an alias tracker only fills the gap.
+        let key = resolve_alias(&aliases, &tracker.slug);
+        if deleted(&key) {
+            continue;
+        }
+        let is_canonical = key == tracker.slug;
+        let builder = rows
+            .entry(key.clone())
+            .or_insert_with(|| ProjectRowBuilder::new(key.clone()));
+        if is_canonical || builder.tracker.is_none() {
+            builder.tracker = Some(tracker);
+        }
     }
     for mission in &missions {
         let Some(project) = mission.project.project.as_deref() else {
