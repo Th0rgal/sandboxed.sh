@@ -3578,12 +3578,17 @@ fn stream_sandboxed_update(
         // Small delay to ensure the SSE event is flushed before we restart
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Restart the service - this will terminate our process, so no code after this
-        // will execute. The client should poll /api/health to confirm the new version.
-        let _ = Command::new("systemctl")
-            .args(["start", &service_name])
-            .output()
-            .await;
+        // Use the SAME guarded restart as `/api/system/deploy` (stop → wait for
+        // the listen port to free → SIGTERM/SIGKILL any lingering holder →
+        // start), launched as a transient `systemd-run` unit so it survives the
+        // service stop. The previous bare `systemctl start` was a no-op on an
+        // already-running unit AND carried no orphan-safety: a stranded old
+        // process still holding the port made the fresh binary die with
+        // EADDRINUSE. This process is torn down when the service stops, so no
+        // code after this runs; the client polls /api/health to confirm.
+        if let Err(e) = spawn_guarded_restart(&service_name, state.config.port) {
+            yield sse("error", format!("Binaries installed but failed to schedule restart: {}. Run `systemctl restart {}` manually.", e, service_name), None);
+        }
     }
 }
 
@@ -4601,34 +4606,16 @@ fn stream_deploy(
             ),
             Some(90),
         );
-        let restart_cmd = guarded_restart_script(&service_name, listen_port);
-        let spawn_result = if systemd_run_available() {
-            let unit = redeploy_unit_name(&service_name);
-            yield sse(
-                "log",
-                format!("Launching guarded restart as transient unit {unit} via systemd-run (survives the service stop)"),
-                Some(91),
-            );
-            Command::new("systemd-run")
-                .args(redeploy_systemd_run_args(&unit, &restart_cmd))
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-        } else {
-            yield sse(
-                "log",
-                "systemd-run unavailable (no systemd PID 1); falling back to a detached `systemctl restart`".to_string(),
-                Some(91),
-            );
-            let fallback = format!("sleep 2 && systemctl restart {} >/dev/null 2>&1", service_name);
-            Command::new("setsid")
-                .args(["nohup", "bash", "-c", &fallback])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-        };
+        yield sse(
+            "log",
+            if systemd_run_available() {
+                "Launching guarded restart as a transient systemd-run unit (sibling cgroup, survives the service stop)".to_string()
+            } else {
+                "systemd-run unavailable (no systemd PID 1); falling back to a detached `systemctl restart`".to_string()
+            },
+            Some(91),
+        );
+        let spawn_result = spawn_guarded_restart(&service_name, listen_port);
         if let Err(e) = spawn_result {
             yield sse(
                 "error",
@@ -5851,6 +5838,41 @@ pub(crate) async fn wait_for_port_release(
 /// `redeploy_systemd_run_args` for why it is launched via `systemd-run` rather
 /// than as a detached child. Mirrors `wait_for_port_release`: stop, poll the
 /// port for up to `PORT_RELEASE_GRACE_SECS`, SIGTERM → (5s) → SIGKILL any
+/// Spawn the guarded restart so a freshly deployed binary never races an
+/// orphaned old process still holding the listen port (EADDRINUSE, seen twice
+/// in prod). Prefers a transient `systemd-run` unit — a sibling cgroup that
+/// survives the `systemctl stop` of the service — and falls back to a detached
+/// `setsid`/`nohup systemctl restart` where systemd is not PID 1 (Docker/dev),
+/// whose restart is owned atomically by whatever supervises the service.
+///
+/// Shared by every deploy entry point (`/api/system/deploy` and the one-click
+/// self-update) so both get the same stop → wait-for-port → SIGTERM/SIGKILL →
+/// start guarantee. Returns the spawn result; the detached child owns the
+/// restart, so success here means "scheduled", not "restarted".
+fn spawn_guarded_restart(service_name: &str, port: u16) -> std::io::Result<tokio::process::Child> {
+    if systemd_run_available() {
+        let unit = redeploy_unit_name(service_name);
+        let script = guarded_restart_script(service_name, port);
+        Command::new("systemd-run")
+            .args(redeploy_systemd_run_args(&unit, &script))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    } else {
+        let fallback = format!(
+            "sleep 2 && systemctl restart {} >/dev/null 2>&1",
+            service_name
+        );
+        Command::new("setsid")
+            .args(["nohup", "bash", "-c", &fallback])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    }
+}
+
 /// lingering holder, then start. Uses stop+start instead of `systemctl restart`
 /// so the wait can sit between the two halves.
 pub(crate) fn guarded_restart_script(service_name: &str, port: u16) -> String {
