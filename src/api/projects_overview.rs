@@ -894,6 +894,23 @@ fn store_update(
     }
 }
 
+/// Turn a slug into a readable fallback name: `ec-defensive-research` ->
+/// `Ec Defensive Research`. Used only when the roster carries no explicit
+/// title, so a raw slug never leaks into a notification or a board row.
+pub(crate) fn humanize_slug(slug: &str) -> String {
+    slug.split(['-', '_'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 struct ProjectRowBuilder {
     slug: String,
     /// Roster title/next-action, attached when the slug has a roster record.
@@ -1113,9 +1130,18 @@ impl ProjectRowBuilder {
                 })
         });
 
+        // Never let a surface fall back to the raw lowercase-hyphenated slug
+        // ("ec-security"): when the roster carries no title, present a
+        // humanized slug ("Ec Security") so notifications/board rows always
+        // read as a name. (A project's true display title still wins when set.)
+        let title = self
+            .title
+            .clone()
+            .or_else(|| Some(humanize_slug(&self.slug)));
+
         ProjectRow {
             slug: self.slug,
-            title: self.title,
+            title,
             next_action: self.next_action,
             bucket,
             board_override: forced.map(str::to_string),
@@ -1623,6 +1649,18 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn humanize_slug_makes_a_readable_name() {
+        assert_eq!(
+            humanize_slug("ec-defensive-research"),
+            "Ec Defensive Research"
+        );
+        assert_eq!(humanize_slug("coldcard"), "Coldcard");
+        assert_eq!(humanize_slug("minimax_m3_full263"), "Minimax M3 Full263");
+        assert_eq!(humanize_slug("verity-core"), "Verity Core");
+        assert_eq!(humanize_slug(""), "");
+    }
 
     const SAMPLE: &str = "[Cron delivery: Verity two-phase Fable/Codex progression]\n\
         Verity — BLOQUÉE PAR LE CONTROL PLANE\n\n\
