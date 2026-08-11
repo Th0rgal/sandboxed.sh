@@ -7856,48 +7856,25 @@ pub async fn create_mission(
     }
 
     // Native coordination guard (resilient — no external fleet daemon needed):
-    // (1) per-(project, track) dedup extends the campaign lock to ANY track, and
-    // (2) the project's declared `parallel_missions` cap is enforced, not just
-    // advisory. This is what keeps two controllers (or one launching
-    // cross-project) from duplicating a track or over-subscribing a project.
-    // Only bites when a track is given / a cap is set — projects without either
-    // are unaffected.
+    // enforce the project's declared `parallel_missions` cap, which was only
+    // advisory. This is the over-subscription filet that stops two controllers
+    // (or one launching cross-project) from piling missions onto a project past
+    // what its grant allows. Only bites when the grant sets a cap > 0 — projects
+    // without a cap are unaffected. (A per-(project, track) dedup is a
+    // deliberate follow-up: a track is sometimes legitimately shared by a
+    // writer+reviewer pair, so a hard dedup needs track-semantics confirmation
+    // before it can safely reject.)
     if let Some(project) = req
         .project
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let control_state = control_for_user(&state, &user).await;
-        let active = nonterminal_missions_for_project(&control_state.mission_store, project).await;
-
-        if let Some(track) = req
-            .track
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            if let Some(existing) = active
-                .iter()
-                .find(|m| m.project.track.as_deref() == Some(track))
-            {
-                tracing::info!(
-                    mission_id = %existing.id, project, track,
-                    "create_mission rejected: a non-terminal mission already holds this (project, track)"
-                );
-                return Err((
-                    StatusCode::CONFLICT,
-                    serde_json::json!({
-                        "error": "track_exists",
-                        "mission_id": existing.id.to_string(),
-                    })
-                    .to_string(),
-                ));
-            }
-        }
-
         if let Ok(Some(grant)) = state.projects.get_grant(project) {
             if let Some(cap) = grant.parallel_missions.filter(|&c| c > 0) {
+                let control_state = control_for_user(&state, &user).await;
+                let active =
+                    nonterminal_missions_for_project(&control_state.mission_store, project).await;
                 if active.len() as i64 >= cap {
                     tracing::info!(
                         project,
