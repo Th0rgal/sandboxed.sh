@@ -70,8 +70,8 @@ system together:
 | Concept | What it is | Where it lives |
 |---|---|---|
 | **Project** | The durable unit of work (an audit, a paper, a benchmark). First-class object with a mode (`active` / `blocked` / `paused`), an autonomy **grant** (merge authority, budget, parallelism), **tracks**, and open **decisions**. | `projects.db` on the sandboxed.sh host, served at `/api/projects/*` |
-| **Controller** | A coordinator cron that wakes on a schedule, reads its control conversation + GitHub + the project state, and dispatches work. It drives exactly one project and reports back with structured status trailers. | Coordinator (e.g. a Hermes cron with the project MCP tools) |
-| **Conversation** *(control session)* | The durable Hermes chat thread; the one bound to a project is its **control conversation** — where you (or the controller) talk — where you (or the controller) talk. Continuations roll over, so it's addressed by route, not a frozen ID. | Coordinator, binding stored in `projects.db` |
+| **Controller** | A coordinator cron that wakes on a schedule, reads its control conversation + GitHub + the project state, and dispatches work. Each controller owns its project(s) and reports structured status trailers; it can also launch missions on *another* project when it depends on that project's output (see [Coordination between controllers](docs/CONTROLLERS.md#coordination-between-controllers)). | Coordinator (e.g. a Hermes cron with the project MCP tools) |
+| **Conversation** *(control session)* | The durable Hermes chat thread; the one bound to a project is its **control conversation** — where you (or the controller) talk. Continuations roll over, so it's addressed by route, not a frozen ID. | Coordinator, binding stored in `projects.db` |
 | **Mission** | One unit of autonomous execution: an agent in an isolated workspace/container running a harness (Claude Code, Codex, …) that writes code, runs builds, opens PRs. Tagged with `project`/`track`. | sandboxed.sh workspaces |
 
 ```
