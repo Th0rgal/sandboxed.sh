@@ -5,8 +5,9 @@
 <h1 align="center">sandboxed.sh</h1>
 
 <p align="center">
-  <strong>Self-hosted cloud orchestrator for AI coding agents</strong><br/>
-  Isolated Linux workspaces with Claude Code, OpenCode, Codex, Gemini, and Grok runtimes
+  <strong>Self-hosted mission-execution backend for autonomous AI agents</strong><br/>
+  Isolated Linux workspaces with Claude Code, OpenCode, Codex, Gemini, and Grok runtimes<br/>
+  <em>Driven over MCP by a coordinator like <a href="https://github.com/Th0rgal/hermes-agent">Hermes</a> — sandboxed.sh runs the missions</em>
 </p>
 
 <p align="center">
@@ -55,10 +56,16 @@ literature. Local inference, isolated containers, nothing leaves your machines.
 
 ## Architecture
 
-sandboxed.sh is the **execution half** of a two-part system. The other half is a
-coordinator (we use [Hermes](https://github.com/Th0rgal/hermes-agent), but any
-MCP-capable assistant works) that decides *what* to do; sandboxed.sh does the
-building in isolation. Four concepts tie the system together:
+sandboxed.sh is the **mission-execution backend** of a two-part system — the
+half an autonomous agent drives over MCP to actually *build* things in
+isolation. The other half is a **coordinator** that decides *what* to do and
+*when*: we run our own Hermes fork —
+[hermes-agent](https://github.com/Th0rgal/hermes-agent) (the Python gateway +
+CLI) and its bundled **hermes-desktop** Electron app (`apps/desktop/`) — but any
+MCP-capable assistant works. The agent never runs untrusted code itself; it
+hands each unit of work to sandboxed.sh, which runs it in a throwaway
+workspace/container and streams back structured results. Four concepts tie the
+system together:
 
 | Concept | What it is | Where it lives |
 |---|---|---|
@@ -125,7 +132,20 @@ board (`/`), the desktop Projects board, and the iOS app's Projects tab.
 
 ## Ecosystem
 
-sandboxed.sh orchestrates multiple AI coding agent runtimes:
+**The coordinator** — the agent that decides what to run and drives sandboxed.sh
+over MCP:
+
+- **[Hermes (our fork)](https://github.com/Th0rgal/hermes-agent)**: the
+  coordinator we run in production — a Python gateway + CLI plus the bundled
+  **hermes-desktop** Electron app (`apps/desktop/`). It owns the control
+  conversations, controller crons, and the project MCP tools (`start_mission`,
+  `link_mission_to_project`, …). Any MCP-capable assistant can take this role;
+  Hermes is the reference implementation. See its
+  [`FORK.md`](https://github.com/Th0rgal/hermes-agent/blob/main/FORK.md) for how
+  our changes are layered on upstream to stay easy to update.
+
+**The runtimes** — the coding agents sandboxed.sh executes inside isolated
+workspaces:
 
 - **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**: Anthropic's
   official coding agent with native skills support (`.claude/skills/`)
