@@ -135,6 +135,46 @@ Si un contrôleur ticque `ok` mais que rien ne bouge, la question à poser est
 qu'il doit signaler lui-même ; `blocked` avec un `wait=` qui grimpe veut dire que
 le contournement a échoué et que l'escalade arrive.
 
+## Coordination between controllers
+
+Plusieurs contrôleurs tournent en parallèle, un (ou plusieurs) par projet, chacun
+sur sa propre session de contrôle. Ils **ne se parlent pas directement** (pas de
+chat session-à-session). La coordination est **décentralisée**, par trois canaux :
+
+1. **Le substrat git (producteur / consommateur).** Un projet qui *produit* (ex.
+   Verity merge ses features de langage dans son repo) et un projet qui *consomme*
+   (ex. Lido re-pin sa dépendance sur le HEAD de Verity) se coordonnent en lisant
+   l'état git de l'autre. Le consommateur observe le repo du producteur et re-pin
+   quand il avance — aucune tâche explicite à s'envoyer.
+2. **Lancement de missions cross-projet.** Une session de contrôle peut
+   `start_mission` sur un *autre* projet quand elle a besoin de son output : la
+   mission porte alors l'`origin_session_id` du demandeur mais le `project` tag de
+   la cible. C'est ainsi qu'un contrôleur ajoute une tâche au périmètre d'un autre.
+3. **La DB de missions partagée.** Tous les contrôleurs voient toutes les missions
+   via les outils MCP (`list_missions`, `get_mission_health`, `list_projects`) —
+   visibilité mutuelle, pas de vue privée par contrôleur.
+
+**Évitement de conflit** (il n'y a pas de verrou global unique) :
+
+- **Propriété distincte** : chaque projet a son périmètre ; le pont
+  « consommer X » est un projet dédié (ex. `verity-lido`), pas une intrusion dans
+  le projet producteur.
+- **Verrou de campagne** : une seconde mission de campagne sur le même projet est
+  refusée (`409`) tant que la première n'est pas terminée — empêche le doublon.
+- **Gates de soundness / revue exact-head** : sur les repos formels, aucun merge
+  ne passe sans sa revue exact-head (receipts rejouables, head exact, zéro
+  `sorry`/`admit`), ce qui rattrape un travail concurrent divergent au merge.
+
+**Coordinateur central optionnel — le fleet-orchestrator.** Un daemon (état dans
+`~/.hermes/fleet/state.json`) peut, quand il tourne, ajouter une garde
+*anti-sur-souscription* (signal `OVER_SUBSCRIPTION` quand plus de missions actives
+que `max_parallel_missions`) et une dédup des signaux au-dessus des canaux
+ci-dessus. **Il est optionnel** : sans lui, la coordination reste correcte
+(canaux 1–3 + verrous), mais il n'y a plus de garde centrale de dédup/débit — à
+forte charge, surveiller le travail redondant (plusieurs sessions lançant des
+missions sur le même projet) via `list_active_missions`. Vérifier qu'il tourne :
+`daemon_last_seen` dans `state.json` doit être récent.
+
 ## Références
 
 - Le contrat complet : `skills/controllers-policy/SKILL.md` sur agent-core.
