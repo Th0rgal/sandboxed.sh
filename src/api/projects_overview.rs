@@ -760,31 +760,55 @@ pub async fn projects_overview(
         if deleted(&record.slug) {
             continue;
         }
-        record_signals.insert(
-            record.slug.clone(),
-            (record.mode.clone(), record.blocker.clone()),
-        );
-        let slug = record.slug.clone();
+        // Fold an alias record onto its canonical row, the same way tagged
+        // missions are resolved above — otherwise every alias slug (`lido-audit`
+        // → `verity-lido`, `verity`/`verity-roadmap` → `verity-core`, …) forks a
+        // phantom card next to the real one. The canonical record is
+        // authoritative; an alias record only fills gaps so a merged card never
+        // shows the alias's stale title/mode over the canonical's.
+        let key = resolve_alias(&aliases, &record.slug);
+        if deleted(&key) {
+            continue;
+        }
+        let is_canonical = key == record.slug;
+        if is_canonical || !record_signals.contains_key(&key) {
+            record_signals.insert(key.clone(), (record.mode.clone(), record.blocker.clone()));
+        }
         let builder = rows
-            .entry(slug.clone())
-            .or_insert_with(|| ProjectRowBuilder::new(slug));
-        builder.title = record.title;
-        builder.next_action = record.next_action;
-        builder.mode = record.mode;
-        builder.controller_cron_id = record.controller_cron_id;
+            .entry(key.clone())
+            .or_insert_with(|| ProjectRowBuilder::new(key.clone()));
+        if is_canonical {
+            builder.title = record.title;
+            builder.next_action = record.next_action;
+            builder.mode = record.mode;
+            builder.controller_cron_id = record.controller_cron_id;
+        } else {
+            builder.title = builder.title.take().or(record.title);
+            builder.next_action = builder.next_action.take().or(record.next_action);
+            builder.mode = builder.mode.take().or(record.mode);
+            builder.controller_cron_id = builder
+                .controller_cron_id
+                .take()
+                .or(record.controller_cron_id);
+        }
     }
     // The latest ingested state per project becomes the row's latest_update —
     // same serialized shape the delivery scan used to produce, now read back
     // from the store the ingestor maintains.
     for (slug, project_state) in &latest_states {
-        if deleted(slug) {
+        let key = resolve_alias(&aliases, slug);
+        if deleted(&key) {
             continue;
         }
-        let (mode, blocker) = record_signals.get(slug).cloned().unwrap_or_default();
-        let update = store_update(slug, project_state, mode, blocker);
+        let (mode, blocker) = record_signals
+            .get(&key)
+            .or_else(|| record_signals.get(slug))
+            .cloned()
+            .unwrap_or_default();
+        let update = store_update(&key, project_state, mode, blocker);
         let total = update_totals.get(slug).copied().unwrap_or(0);
-        rows.entry(slug.clone())
-            .or_insert_with(|| ProjectRowBuilder::new(slug.clone()))
+        rows.entry(key.clone())
+            .or_insert_with(|| ProjectRowBuilder::new(key.clone()))
             .attach_store_update(update, project_state.observations, total);
     }
     let unrouted: Vec<DeliveryUpdate> = unrouted_rows
@@ -1667,6 +1691,20 @@ mod tests {
         assert_eq!(humanize_slug("minimax_m3_full263"), "Minimax M3 Full263");
         assert_eq!(humanize_slug("verity-core"), "Verity Core");
         assert_eq!(humanize_slug(""), "");
+    }
+
+    #[test]
+    fn resolve_alias_folds_known_keys_and_passes_through_the_rest() {
+        let mut aliases = HashMap::new();
+        aliases.insert("lido-audit".to_string(), "verity-lido".to_string());
+        aliases.insert("verity-roadmap".to_string(), "verity-core".to_string());
+        // Verity and Lido are kept distinct: an alias only ever resolves to the
+        // canonical its own family declares, never across families.
+        assert_eq!(resolve_alias(&aliases, "lido-audit"), "verity-lido");
+        assert_eq!(resolve_alias(&aliases, "verity-roadmap"), "verity-core");
+        // The canonical resolves to itself, and an unknown slug is untouched.
+        assert_eq!(resolve_alias(&aliases, "verity-lido"), "verity-lido");
+        assert_eq!(resolve_alias(&aliases, "sandboxed-sh"), "sandboxed-sh");
     }
 
     const SAMPLE: &str = "[Cron delivery: Verity two-phase Fable/Codex progression]\n\
