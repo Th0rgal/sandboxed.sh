@@ -315,6 +315,16 @@ impl ProviderHealthTracker {
             .unwrap_or(true) // Unknown accounts are healthy by default
     }
 
+    /// Return true when at least one known account for `provider_id` is in an
+    /// active cooldown. This distinguishes a temporarily unavailable provider
+    /// from a provider that has no configured/routable credentials at all.
+    pub async fn provider_has_active_cooldown(&self, provider_id: &str) -> bool {
+        let accounts = self.accounts.read().await;
+        accounts.values().any(|health| {
+            health.provider_id.as_deref() == Some(provider_id) && health.is_in_cooldown()
+        })
+    }
+
     /// Check whether a shared subscription (e.g. Claude Pro org) is currently
     /// cooling down. Callers pass `None` for accounts without a known shared
     /// identity; those are always healthy at this layer.
@@ -1578,6 +1588,26 @@ mod tests {
         AIProvider, AIProviderStore, OAuthCredentials, ProviderStatus, ProviderType,
     };
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn provider_active_cooldown_is_detected_by_provider_id() {
+        let tracker = ProviderHealthTracker::with_backoff(BackoffConfig {
+            base_delay: std::time::Duration::from_secs(60),
+            max_delay: std::time::Duration::from_secs(60),
+            multiplier: 1.0,
+            circuit_breaker_threshold: 5,
+            degraded_multiplier: 1.0,
+        });
+        let account_id = uuid::Uuid::new_v4();
+        tracker.set_provider_id(account_id, "zai").await;
+
+        assert!(!tracker.provider_has_active_cooldown("zai").await);
+        tracker
+            .record_failure(account_id, CooldownReason::RateLimit, None)
+            .await;
+        assert!(tracker.provider_has_active_cooldown("zai").await);
+        assert!(!tracker.provider_has_active_cooldown("muse").await);
+    }
 
     async fn store_with(providers: Vec<AIProvider>) -> AIProviderStore {
         let tmp = TempDir::new().unwrap();
