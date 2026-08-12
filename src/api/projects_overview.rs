@@ -806,11 +806,28 @@ pub async fn projects_overview(
     // The latest ingested state per project becomes the row's latest_update —
     // same serialized shape the delivery scan used to produce, now read back
     // from the store the ingestor maintains.
+    //
+    // Collapse alias slugs onto their canonical FIRST, keeping only the newest
+    // state per canonical (last_seen_at is an ISO8601 string, so it sorts
+    // chronologically). `attach_store_update` is last-writer-wins, so without
+    // this a stale alias state (e.g. `lido-srv3` @ 08-03) clobbers the
+    // canonical's fresh one (`verity-lido` @ 08-12) and the card's
+    // latest_update goes backwards in time — which reads as "no updates".
+    let mut newest_state: HashMap<String, (&String, &super::projects_store::ProjectState)> =
+        HashMap::new();
     for (slug, project_state) in &latest_states {
         let key = resolve_alias(&aliases, slug);
         if deleted(&key) {
             continue;
         }
+        match newest_state.get(&key) {
+            Some((_, existing)) if existing.last_seen_at >= project_state.last_seen_at => {}
+            _ => {
+                newest_state.insert(key, (slug, project_state));
+            }
+        }
+    }
+    for (key, (slug, project_state)) in newest_state {
         let (mode, blocker) = record_signals
             .get(&key)
             .or_else(|| record_signals.get(slug))
