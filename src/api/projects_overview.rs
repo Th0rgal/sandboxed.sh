@@ -616,6 +616,26 @@ struct ProjectRow {
     /// `latest_update.mode` for compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
+    /// Honesty read-model — derived health axes, computed read-only in
+    /// `finish()` so the board can show "active but its engine is gone" instead
+    /// of a lying `active`. Absent (None) when the project makes no activity
+    /// claim, so a dormant project stays quiet.
+    ///
+    /// `controller_health`: healthy | stale | missing. A project that claims to
+    /// be active but carries no `controller_cron_id` is `missing`; one whose
+    /// controller has not signalled within the stale window is `stale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    controller_health: Option<&'static str>,
+    /// `delivery_health`: reaching_user | misrouted | dropped. Whether the
+    /// controller's output actually reaches a durable conversation, or lands in
+    /// a throwaway per-tick session (the "engine runs but nobody receives" blind
+    /// spot). Coarse in P0 (binding present vs guessed session); refined in P2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery_health: Option<&'static str>,
+    /// `progress_state`: working | waiting_external | blocked. What the project
+    /// is actually doing, separate from the operator's desired state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress_state: Option<&'static str>,
     tracker: Option<TrackerInfo>,
     missions: Vec<MissionChip>,
     latest_update: Option<DeliveryUpdate>,
@@ -1152,6 +1172,70 @@ impl ProjectRowBuilder {
             }
         }
 
+        // ── Honesty read-model: derive controller_health + progress_state
+        //    read-only, BEFORE the bucket so a lying `active` becomes an honest
+        //    `attention`. A project "claims to be active" when its controller
+        //    mode or its tracker says so; only then does a missing/stale
+        //    controller become worth surfacing. A dormant project (no claim, no
+        //    controller link) stays quiet (axes None). delivery_health is
+        //    computed after `conversation` below.
+        let claims_active = mode_active || tracker_active;
+        // Use the single `now` the handler stamped for the whole response (also
+        // what the tests fix), NOT wall-clock — otherwise two rows in one
+        // payload could disagree, and unit tests with a fixed `now` would read
+        // an 8-day-old signal.
+        let now_parsed = chrono::DateTime::parse_from_rfc3339(now).ok();
+        let signal_within_stale_window = self
+            .latest_update
+            .as_ref()
+            .map(|u| u.at.clone())
+            .or_else(|| self.tracker.as_ref().and_then(|t| t.updated_at.clone()))
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .zip(now_parsed)
+            .map(|(at, now)| {
+                now.signed_duration_since(at) <= chrono::Duration::hours(STALE_ACTIVE_HOURS)
+            })
+            .unwrap_or(false);
+        let controller_health: Option<&'static str> =
+            if claims_active || self.controller_cron_id.is_some() {
+                if signal_within_stale_window || has_live_mission {
+                    // Something is clearly driving it (fresh delivery or live
+                    // work) — don't cry wolf over a missing link when the engine
+                    // is demonstrably running. The link mismatch is a P2 concern.
+                    Some("healthy")
+                } else if claims_active && self.controller_cron_id.is_none() {
+                    // Active, but no recent signal, no live work, and no
+                    // controller link at all: the genuine zombie.
+                    Some("missing")
+                } else {
+                    // Has a link but has gone quiet past the stale window.
+                    Some("stale")
+                }
+            } else {
+                None
+            };
+        // The zombie the board used to render as a healthy `active`: an active
+        // project whose engine link is gone. Surface it as attention so the
+        // bucket stops lying. (`stale` is already covered by the tracker block
+        // above; the field alone carries it without forcing attention.)
+        if controller_health == Some("missing") {
+            attention.push("active project has no controller".to_string());
+        }
+        let effective_mode = self
+            .mode
+            .as_deref()
+            .or_else(|| self.latest_update.as_ref().and_then(|u| u.mode.as_deref()));
+        let progress_state: Option<&'static str> =
+            if blocker_set || effective_mode == Some("blocked") {
+                Some("blocked")
+            } else if effective_mode == Some("active") && (has_live_mission || signal_fresh) {
+                Some("working")
+            } else if signal_within_stale_window && !has_live_mission && claims_active {
+                Some("waiting_external")
+            } else {
+                None
+            };
+
         // A board override silences the automatic rules: pausing a project is
         // an explicit "stop flagging this" from the operator.
         let bucket: &'static str = match forced {
@@ -1182,6 +1266,22 @@ impl ProjectRowBuilder {
                 })
         });
 
+        // Coarse in P0: a real binding means the controller's reports have a
+        // durable home; a merely-guessed session (`latest_update` fallback, a
+        // throwaway per-tick cron session) means the output is not reaching a
+        // stable conversation; nothing at all while active means it is dropped.
+        // Refined in P2 once the route has a single authoritative owner.
+        let delivery_health: Option<&'static str> =
+            if claims_active || self.controller_cron_id.is_some() {
+                match conversation.as_ref() {
+                    None => Some("dropped"),
+                    Some(c) if c.source == "latest_update" => Some("misrouted"),
+                    Some(_) => Some("reaching_user"),
+                }
+            } else {
+                None
+            };
+
         // Never let a surface fall back to the raw lowercase-hyphenated slug
         // ("ec-security"): when the roster carries no title, present a
         // humanized slug ("Ec Security") so notifications/board rows always
@@ -1199,6 +1299,9 @@ impl ProjectRowBuilder {
             board_override: forced.map(str::to_string),
             controller_cron_id: self.controller_cron_id,
             mode: self.mode,
+            controller_health,
+            delivery_health,
+            progress_state,
             tracker: self.tracker,
             missions: self.missions,
             latest_update: self.latest_update,
@@ -2076,6 +2179,85 @@ mod tests {
         let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
         assert_eq!(row.bucket, "attention");
         assert!(row.attention_reasons.iter().any(|r| r.contains("Failed")));
+    }
+
+    /// Honesty read-model: an active project whose engine is gone (no fresh
+    /// signal, no live mission, no controller link) is a zombie — surfaced as
+    /// `controller_health=missing` and pushed to the attention bucket instead
+    /// of a lying `active`.
+    #[test]
+    fn zombie_active_project_is_controller_missing_and_attention() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder.mode = Some("active".to_string());
+        // Stale signal (2 days old), no controller_cron_id, no live mission.
+        builder.attach_store_update(active_update("2026-08-02T12:00:00Z", None), 1, 5);
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.controller_health, Some("missing"));
+        assert_eq!(row.bucket, "attention");
+        assert!(row
+            .attention_reasons
+            .iter()
+            .any(|r| r.contains("no controller")));
+    }
+
+    /// A fresh-signalling active controller is `healthy` even without a linked
+    /// cron id — something is demonstrably driving it, so P0 does not cry wolf
+    /// (the link mismatch is a P2 concern). Bucket stays `active`.
+    #[test]
+    fn fresh_signal_is_controller_healthy_not_missing() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder.mode = Some("active".to_string());
+        builder.attach_store_update(active_update("2026-08-04T11:50:00Z", None), 1, 5);
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.controller_health, Some("healthy"));
+        assert_eq!(row.progress_state, Some("working"));
+        assert_eq!(row.bucket, "active");
+    }
+
+    /// delivery_health: a real binding means the reports have a durable home
+    /// (`reaching_user`); with only a guessed per-tick session it is
+    /// `misrouted` — the "engine runs but nobody receives" blind spot.
+    #[test]
+    fn delivery_health_tracks_binding_presence() {
+        let mut misrouted = ProjectRowBuilder::new("verity".to_string());
+        misrouted.mode = Some("active".to_string());
+        misrouted.attach_store_update(active_update("2026-08-04T11:50:00Z", None), 1, 5);
+        let row = misrouted.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.delivery_health, Some("misrouted"));
+
+        let mut bound = ProjectRowBuilder::new("verity".to_string());
+        bound.mode = Some("active".to_string());
+        bound.attach_store_update(active_update("2026-08-04T11:50:00Z", None), 1, 5);
+        let row = bound.finish(
+            &[],
+            None,
+            Some(ProjectConversation {
+                session_id: "20260806_172248_c520d0".into(),
+                source: "binding",
+                bound_at: Some("2026-08-08T12:00:00Z".into()),
+            }),
+            "2026-08-04T12:00:00Z",
+        );
+        assert_eq!(row.delivery_health, Some("reaching_user"));
+    }
+
+    /// A dormant project (no activity claim, no controller link) stays quiet:
+    /// all three honesty axes are absent from the payload.
+    #[test]
+    fn dormant_project_has_no_health_axes() {
+        let row = ProjectRowBuilder::new("collatz-research".to_string()).finish(
+            &[],
+            None,
+            None,
+            "2026-08-04T12:00:00Z",
+        );
+        assert_eq!(row.controller_health, None);
+        assert_eq!(row.delivery_health, None);
+        assert_eq!(row.progress_state, None);
+        let json = serde_json::to_value(&row).expect("serialize");
+        assert!(json.get("controller_health").is_none());
+        assert!(json.get("delivery_health").is_none());
+        assert!(json.get("progress_state").is_none());
     }
 
     /// A reported blocker always wins over freshness: the controller itself
