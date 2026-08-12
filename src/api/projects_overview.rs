@@ -1358,10 +1358,16 @@ fn read_overrides(dir: &Path) -> HashMap<String, String> {
 #[derive(Debug, Deserialize)]
 pub struct ProjectActionRequest {
     action: String,
+    /// Only used by `delete`: `keep_missions` removes project-owned state but
+    /// preserves mission history; `delete_missions` also deletes every mission
+    /// tagged with the exact project slug.
+    #[serde(default)]
+    delete_mode: Option<String>,
 }
 
-/// Apply a board action to a project: `pause` / `archive` / `delete` set the
-/// override, `resume` / `unarchive` / `restore` clear it.
+/// Apply a board action to a project. Delete is a real project deletion, with
+/// an explicit mission-retention policy; its board override remains as a
+/// tombstone so surviving missions or tracker markdown cannot recreate it.
 #[derive(Debug, serde::Deserialize)]
 pub struct BindConversationRequest {
     pub session_id: String,
@@ -1435,6 +1441,8 @@ pub async fn project_action(
         return Err((StatusCode::BAD_REQUEST, "invalid slug".to_string()));
     }
     let mut overrides = read_overrides(&dir);
+    let mut deleted_mission_ids = Vec::new();
+    let mut project_record_deleted = false;
     match request.action.as_str() {
         "pause" => {
             overrides.insert(slug.clone(), "paused".to_string());
@@ -1443,6 +1451,25 @@ pub async fn project_action(
             overrides.insert(slug.clone(), "archived".to_string());
         }
         "delete" => {
+            match request.delete_mode.as_deref().unwrap_or("keep_missions") {
+                "keep_missions" => {}
+                "delete_missions" => {
+                    deleted_mission_ids = state
+                        .control
+                        .delete_project_missions(&slug)
+                        .await
+                        .map_err(|error| (StatusCode::CONFLICT, error))?;
+                }
+                other => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "unknown delete_mode '{other}'; expected keep_missions or delete_missions"
+                        ),
+                    ));
+                }
+            }
+            project_record_deleted = state.projects.delete_project(&slug).map_err(store_err)?;
             overrides.insert(slug.clone(), "deleted".to_string());
         }
         "resume" | "unarchive" | "restore" => {
@@ -1473,6 +1500,9 @@ pub async fn project_action(
     Ok(Json(serde_json::json!({
         "slug": slug,
         "override": overrides.get(&slug),
+        "project_record_deleted": project_record_deleted,
+        "deleted_mission_ids": deleted_mission_ids,
+        "deleted_mission_count": deleted_mission_ids.len(),
     })))
 }
 

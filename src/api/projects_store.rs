@@ -651,6 +651,43 @@ impl ProjectsStore {
             .map_err(|e| e.to_string())
     }
 
+    /// Remove the authoritative project object and every project-owned row.
+    ///
+    /// Missions and Hermes conversation messages live in separate stores and
+    /// are deliberately not touched here. Callers that offer a wider delete
+    /// must remove those explicitly before committing this project deletion.
+    pub fn delete_project(&self, slug: &str) -> Result<bool, String> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction().map_err(|e| e.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM project_bindings WHERE slug = ?1",
+                params![slug],
+            )
+            .map_err(|e| e.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM project_state_events WHERE slug = ?1",
+                params![slug],
+            )
+            .map_err(|e| e.to_string())?;
+        transaction
+            .execute("DELETE FROM project_tracks WHERE slug = ?1", params![slug])
+            .map_err(|e| e.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM project_decisions WHERE slug = ?1",
+                params![slug],
+            )
+            .map_err(|e| e.to_string())?;
+        let removed = transaction
+            .execute("DELETE FROM projects WHERE slug = ?1", params![slug])
+            .map_err(|e| e.to_string())?
+            > 0;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(removed)
+    }
+
     fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
         Ok(ProjectRecord {
             slug: row.get(0)?,
@@ -1407,13 +1444,45 @@ mod tests {
             .expect("dec");
         assert_eq!(store.open_decisions("lido").expect("open").len(), 1);
 
-        // Deleting the project cascades the grant away (FK ON DELETE CASCADE).
         store
-            .lock()
-            .expect("lock")
-            .execute("DELETE FROM projects WHERE slug = 'lido'", [])
-            .expect("delete");
-        assert!(store.get_grant("lido").expect("read").is_none());
+            .set_binding("lido", "control-session", None)
+            .expect("binding");
+        store
+            .record_state(
+                "lido",
+                "active",
+                Some("working"),
+                "2026-08-04T10:00:00Z",
+                Some("delivery-session"),
+            )
+            .expect("state");
+
+        // A true project delete removes every project-owned row. Missions and
+        // conversation messages are separate stores and are not represented
+        // here.
+        assert!(store.delete_project("lido").expect("delete"));
+        assert!(store.get_project("lido").expect("project").is_none());
+        assert!(store
+            .get_grant("lido")
+            .expect("grant after delete")
+            .is_none());
+        assert!(store
+            .tracks("lido")
+            .expect("tracks after delete")
+            .is_empty());
+        assert!(store
+            .open_decisions("lido")
+            .expect("decisions after delete")
+            .is_empty());
+        assert!(store
+            .state_timeline("lido", 10)
+            .expect("timeline after delete")
+            .is_empty());
+        assert!(store
+            .binding("lido")
+            .expect("binding after delete")
+            .is_none());
+        assert!(!store.delete_project("lido").expect("second delete"));
     }
 
     // ---- session_id on state events ----

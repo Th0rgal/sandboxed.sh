@@ -3982,6 +3982,109 @@ impl ControlHub {
         Ok(collected)
     }
 
+    /// Delete every mission tagged with this exact project across live and
+    /// offline stores. This is intentionally fail-closed: a project-wide data
+    /// delete cannot race a running, queued, paused, or otherwise resumable
+    /// mission. The operator must finish or cancel those missions first.
+    pub(crate) async fn delete_project_missions(&self, project: &str) -> Result<Vec<Uuid>, String> {
+        const PAGE_SIZE: usize = 200;
+        let inventory = self.mission_store_inventory().await?;
+        let mut stores: Vec<Arc<dyn MissionStore>> = inventory.live;
+        for user in inventory.offline_file_users {
+            stores.push(Arc::new(
+                mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await?,
+            ));
+        }
+        for path in inventory.offline_sqlite {
+            let Some(user) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("missions-"))
+                .and_then(|name| name.strip_suffix(".db"))
+            else {
+                return Err(format!("invalid mission store path {}", path.display()));
+            };
+            stores.push(Arc::new(
+                mission_store::SqliteMissionStore::new(inventory.base_dir.clone(), user).await?,
+            ));
+        }
+
+        let filter = mission_store::MissionFilter {
+            project: Some(project.to_string()),
+            ..Default::default()
+        };
+        let mut plans: Vec<(Arc<dyn MissionStore>, Vec<Mission>)> = Vec::new();
+        for store in stores {
+            let mut matched = Vec::new();
+            let mut offset = 0;
+            loop {
+                let page = store
+                    .list_missions_filtered(&filter, PAGE_SIZE, offset)
+                    .await?;
+                let page_len = page.len();
+                matched.extend(page);
+                if page_len < PAGE_SIZE {
+                    break;
+                }
+                offset += page_len;
+            }
+            for mission in &matched {
+                if !mission.status.is_terminal() && mission.status != MissionStatus::Acknowledged {
+                    return Err(format!(
+                        "Cannot delete project data while mission {} is {}. Finish or cancel it first.",
+                        mission.id, mission.status
+                    ));
+                }
+                if store.get_active_mission_run(mission.id).await?.is_some() {
+                    return Err(format!(
+                        "Cannot delete project data while mission {} still has an active run.",
+                        mission.id
+                    ));
+                }
+            }
+            plans.push((store, matched));
+        }
+
+        let mut deleted_ids = std::collections::HashSet::new();
+        for (store, missions) in plans {
+            let selected: std::collections::HashSet<Uuid> =
+                missions.iter().map(|mission| mission.id).collect();
+            let roots: Vec<Uuid> = missions
+                .iter()
+                .filter(|mission| {
+                    mission
+                        .parent_mission_id
+                        .is_none_or(|parent| !selected.contains(&parent))
+                })
+                .map(|mission| mission.id)
+                .collect();
+            for mission_id in roots {
+                if store.get_mission(mission_id).await?.is_none() {
+                    continue;
+                }
+                cleanup_mission_workspace_dirs_for_delete(
+                    &store,
+                    &self.workspaces,
+                    mission_id,
+                    &[],
+                )
+                .await
+                .map_err(|(_, error)| error)?;
+                let removed = delete_mission_with_children(&store, mission_id, &[])
+                    .await
+                    .map_err(|(_, error)| error)?;
+                for id in removed {
+                    clear_mission_metadata_refresh_state(id);
+                    deleted_ids.insert(id);
+                }
+            }
+        }
+
+        let mut deleted: Vec<Uuid> = deleted_ids.into_iter().collect();
+        deleted.sort_unstable();
+        Ok(deleted)
+    }
+
     async fn mission_store_inventory(&self) -> Result<MissionStoreInventory, String> {
         let sessions = self.sessions.read().await;
         let live: Vec<Arc<dyn MissionStore>> = sessions
