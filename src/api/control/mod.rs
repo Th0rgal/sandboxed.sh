@@ -881,6 +881,23 @@ mod campaign_guard_tests {
         );
     }
 
+    #[test]
+    fn dispatch_gate_blocks_paused_and_archived_only() {
+        // paused → 423 Locked; archived → 409 Conflict.
+        assert_eq!(
+            dispatch_gate_for_status("paused"),
+            Some((StatusCode::LOCKED, "project_paused"))
+        );
+        assert_eq!(
+            dispatch_gate_for_status("archived"),
+            Some((StatusCode::CONFLICT, "project_archived"))
+        );
+        // Active (and any unknown/legacy status) permits dispatch.
+        assert_eq!(dispatch_gate_for_status("active"), None);
+        assert_eq!(dispatch_gate_for_status(""), None);
+        assert_eq!(dispatch_gate_for_status("blocked"), None);
+    }
+
     #[tokio::test]
     async fn second_campaign_is_blocked_until_the_first_terminates() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
@@ -7821,6 +7838,18 @@ async fn find_open_campaign_mission(
 /// footprint used to enforce the grant's `parallel_missions` cap and the
 /// per-(project, track) dedup. Mirrors `find_open_campaign_mission`'s "slot
 /// held" notion (`campaign_slot_held_by`) but across all tracks.
+/// The server-side dispatch gate for a project's operator status. `paused` and
+/// `archived` block a new mission (with the status code + structured error the
+/// handler returns); anything else (`active`, unknown) permits dispatch. Pure so
+/// the gate is unit-tested without a full handler.
+fn dispatch_gate_for_status(status: &str) -> Option<(StatusCode, &'static str)> {
+    match status {
+        "paused" => Some((StatusCode::LOCKED, "project_paused")),
+        "archived" => Some((StatusCode::CONFLICT, "project_archived")),
+        _ => None,
+    }
+}
+
 async fn nonterminal_missions_for_project(
     mission_store: &Arc<dyn MissionStore>,
     project: &str,
@@ -7973,6 +8002,22 @@ pub async fn create_mission(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
+        // `paused`/`archived` are now a real server-side dispatch gate, not just
+        // a board presentation: an operator who paused a project must not have a
+        // controller keep piling missions onto it. Gates on the authoritative
+        // roster status (`set_project_status`); the board-override pause is a
+        // separate presentation flag reconciled into status in a later phase.
+        if let Ok(Some(record)) = state.projects.get_project(project) {
+            if let Some((code, error)) = dispatch_gate_for_status(&record.status) {
+                tracing::info!(
+                    project,
+                    status = %record.status,
+                    "create_mission rejected: project status blocks dispatch"
+                );
+                return Err((code, serde_json::json!({ "error": error }).to_string()));
+            }
+        }
+
         if let Ok(Some(grant)) = state.projects.get_grant(project) {
             if let Some(cap) = grant.parallel_missions.filter(|&c| c > 0) {
                 let control_state = control_for_user(&state, &user).await;
