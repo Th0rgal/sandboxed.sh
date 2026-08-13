@@ -931,6 +931,36 @@ impl MissionStore for InMemoryMissionStore {
         Ok(tasks)
     }
 
+    async fn list_board_tasks_for_project(&self, project: &str) -> Result<Vec<BoardTask>, String> {
+        // Same family semantics as the sqlite join: exact slug or a literal
+        // `slug-` prefix on the boss mission's project tag.
+        let family_prefix = format!("{project}-");
+        let bosses: std::collections::HashSet<Uuid> = {
+            let missions = self.missions.read().await;
+            missions
+                .values()
+                .filter(|mission| {
+                    mission.project.project.as_deref().is_some_and(|tag| {
+                        tag == project || tag.starts_with(family_prefix.as_str())
+                    })
+                })
+                .map(|mission| mission.id)
+                .collect()
+        };
+        let map = self.board_tasks.read().await;
+        let mut tasks: Vec<BoardTask> = map
+            .values()
+            .filter(|task| bosses.contains(&task.boss_mission_id))
+            .cloned()
+            .collect();
+        tasks.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.task_key.cmp(&b.task_key))
+        });
+        Ok(tasks)
+    }
+
     async fn list_active_board_missions(&self) -> Result<Vec<Uuid>, String> {
         let map = self.board_tasks.read().await;
         let mut ids: Vec<Uuid> = map

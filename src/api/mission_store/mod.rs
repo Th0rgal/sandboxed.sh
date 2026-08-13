@@ -7,7 +7,7 @@
 
 mod file;
 mod memory;
-mod sqlite;
+pub(crate) mod sqlite;
 
 pub use file::FileMissionStore;
 pub use memory::InMemoryMissionStore;
