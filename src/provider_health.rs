@@ -359,6 +359,11 @@ impl ProviderHealthTracker {
         }
     }
 
+    /// Remove all account-scoped health state after its provider account is deleted.
+    pub async fn remove_account(&self, account_id: Uuid) {
+        self.accounts.write().await.remove(&account_id);
+    }
+
     /// Record a successful request for an account.
     ///
     /// When recovering from failure (consecutive_failures > 0), this clears
@@ -1615,6 +1620,27 @@ mod tests {
             .await;
         assert!(tracker.provider_has_active_cooldown("zai").await);
         assert!(!tracker.provider_has_active_cooldown("muse").await);
+    }
+
+    #[tokio::test]
+    async fn removed_account_no_longer_contributes_provider_cooldown() {
+        let tracker = ProviderHealthTracker::with_backoff(BackoffConfig {
+            base_delay: std::time::Duration::from_secs(60),
+            max_delay: std::time::Duration::from_secs(60),
+            multiplier: 1.0,
+            circuit_breaker_threshold: 5,
+            degraded_multiplier: 1.0,
+        });
+        let account_id = uuid::Uuid::new_v4();
+        tracker.set_provider_id(account_id, "zai").await;
+        tracker
+            .record_failure(account_id, CooldownReason::RateLimit, None)
+            .await;
+        assert!(tracker.provider_has_active_cooldown("zai").await);
+
+        tracker.remove_account(account_id).await;
+
+        assert!(!tracker.provider_has_active_cooldown("zai").await);
     }
 
     #[tokio::test]

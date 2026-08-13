@@ -2347,15 +2347,7 @@ pub(crate) async fn chat_completions_inner(
         if defer_on_rate_limit {
             return enqueue_deferred_request(&state, &headers, &chain_id, &body).await;
         }
-        error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "All {} providers in chain '{}' are rate-limited or unavailable",
-                entries.len(),
-                chain_id
-            ),
-            "rate_limit_exceeded",
-        )
+        cooldown_error_response(&chain_id)
     }
 }
 
