@@ -1345,7 +1345,7 @@ mod tests {
             .upsert_project("old-name", Some("Title"), None, None, Some("job123"))
             .expect("create");
         store
-            .set_grant("old-name", Some("full"), None, None, None, None, None)
+            .set_grant("old-name", Some("full"), None, None, None, None, None, None)
             .expect("grant");
         store.set_binding("old-name", "sess-1", None).expect("bind");
         store
