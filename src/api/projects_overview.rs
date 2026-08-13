@@ -711,16 +711,22 @@ pub(crate) fn resolve_decision_disposition(
         }
     };
     if authority == "granted" && status == "decided" {
-        let may_act = matches!(autonomy_level, Some("act_reversible") | Some("act_full"));
+        // Controllers-policy default is *act*. An unset grant is not observe:
+        // treating it as observe made every `[DECISION: authority=granted]`
+        // bounce back to Thomas (Lido #66 / Verity #2332, 2026-08-13).
+        let effective = match autonomy_level.map(str::trim).filter(|s| !s.is_empty()) {
+            None => "act_reversible",
+            Some(level) => level,
+        };
+        let may_act = matches!(effective, "act_reversible" | "act_full");
         if !may_act {
-            let level = autonomy_level.unwrap_or("unset");
             return Ok(DecisionDisposition {
                 authority: "escalation".to_string(),
                 status: "pending_user".to_string(),
-                coerced_reason: Some(format!("autonomy_level={level}")),
+                coerced_reason: Some(format!("autonomy_level={effective}")),
             });
         }
-        if autonomy_level == Some("act_reversible") {
+        if effective == "act_reversible" {
             let irreversible = kind
                 .map(str::trim)
                 .map(str::to_ascii_lowercase)
@@ -3076,8 +3082,8 @@ mod tests {
         store
             .upsert_project("verity", None, None, None, None)
             .expect("seed");
-        // No autonomy level set: a granted act in the trailer must land as a
-        // pending owner escalation.
+        // Unset grant defaults to act_reversible, so a *merge* (irreversible)
+        // still lands as a pending owner escalation.
         let content = "[Cron delivery: verity]\nHeadline\n\
             [DECISION: {\"kind\":\"merge\",\"authority\":\"granted\",\"status\":\"decided\",\"question\":\"Merged #1\"}]\n\
             [STATE_SIGNATURE: verity|phase|head]\n";
@@ -3149,14 +3155,20 @@ mod tests {
 
     #[test]
     fn an_unearned_autonomous_act_is_coerced_into_an_escalation() {
-        // No grant, observe, and propose all deny acting.
-        for level in [None, Some("observe"), Some("propose")] {
+        // observe and propose deny acting. An unset grant follows the
+        // controllers-policy default (act_reversible), not observe.
+        for level in [Some("observe"), Some("propose")] {
             let d = resolve_decision_disposition(level, Some("granted"), Some("decided"), None)
                 .expect("valid");
             assert_eq!(d.authority, "escalation");
             assert_eq!(d.status, "pending_user");
             assert!(d.coerced_reason.is_some(), "level {level:?} must coerce");
         }
+        let unset = resolve_decision_disposition(None, Some("granted"), Some("decided"), None)
+            .expect("valid");
+        assert_eq!(unset.authority, "granted");
+        assert_eq!(unset.status, "decided");
+        assert!(unset.coerced_reason.is_none());
         for level in ["act_reversible", "act_full"] {
             let d =
                 resolve_decision_disposition(Some(level), Some("granted"), Some("decided"), None)

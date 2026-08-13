@@ -229,6 +229,7 @@ repeated failure `repeat-loop-guard` · tool-call limits `context-budget`.
 
 - **Jamais de polling de build en boucle.** Ne relance pas la même commande d inspection de build/CI de façon répétée (un writer a bouclé 14× sur le même poll — pur gaspillage de budget). Vérifie UNE fois avec une attente bornée (`timeout 120s lake build` ou lecture unique du receipt/log), puis poursuis le correctif ; ne re-sonde que si un délai substantiel s est écoulé.
 - **Juge la vivacité d une mission par ses PROCESSUS, pas par son silence.** Les builds/preuves Lean ont de longues phases silencieuses tout en progressant. Avant de conclure qu une mission est bloquée : vérifie la présence d un process `lean`/`lake` vivant et la montée de la séquence d événements. Silence ≠ wedge. N interromps JAMAIS un `make check`/`lake build` en vol — tu perdrais des heures de calcul.
+- **La vivacité d un scan GPU n est pas un `pgrep` local.** Pour Coldcard, appelle `scripts/coldcard-skip-scan-status.sh` (SSH DGX, `scan.log` + process). Un `pgrep` sur agent-core a déclaré DEAD le 2026-08-13 alors que le scan CUDA avançait à 2.75B/4.29B.
 - **API GitHub non réactive = bascule sur git.** Si les appels `gh`/API GitHub pendent, utilise `git ls-remote`/`git fetch` comme source de vérité du head plutôt que d attendre l API ; ne bloque pas la progression sur une lenteur d API externe.
 - **Reviews annulées (CANCELLED) ≠ échec.** Une review OCR/CI `CANCELLED` (souvent supersédée par un push) doit être re-déclenchée, pas traitée comme un blocage de merge.
 
