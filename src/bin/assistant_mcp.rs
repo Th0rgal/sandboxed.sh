@@ -1536,7 +1536,7 @@ impl AssistantMcp {
                     "required": ["slug"],
                     "properties": {
                         "slug": {"type": "string"},
-                        "autonomy_level": {"type": "string", "enum": ["observe", "propose", "act_reversible", "act_full"], "description": "What the controller may do without asking: observe (report only), propose (escalate every act), act_reversible (act except irreversible steps), act_full."},
+                        "autonomy_level": {"type": "string", "enum": ["observe", "propose", "act_reversible", "act_full"], "description": "What the controller may do without asking: observe (report only), propose (escalate every act), act_reversible (act, but irreversible kinds — merge/abandon/delete/publish/deploy/force_push — still escalate), act_full."},
                         "merge_authority": {"type": "string", "description": "full | repo:a,b | review-first"},
                         "budget_per_tick": {"type": "string"},
                         "parallel_missions": {"type": "integer"},
