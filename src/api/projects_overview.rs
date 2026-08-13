@@ -287,12 +287,17 @@ pub async fn get_project(
     let grant = state.projects.get_grant(&slug).map_err(store_err)?;
     let tracks = state.projects.tracks(&slug).map_err(store_err)?;
     let decisions = state.projects.open_decisions(&slug).map_err(store_err)?;
+    let recent = state
+        .projects
+        .recent_decisions(&slug, 20)
+        .map_err(store_err)?;
     let conversation = state.projects.binding(&slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({
         "project": project,
         "grant": grant,
         "tracks": tracks,
         "open_decisions": decisions,
+        "recent_decisions": recent,
         "conversation": conversation,
     })))
 }
@@ -541,7 +546,10 @@ pub struct SetGrantRequest {
     pub pause_reason: Option<String>,
     pub resume_condition: Option<String>,
     pub material_bar: Option<String>,
+    pub autonomy_level: Option<String>,
 }
+
+pub(crate) const AUTONOMY_LEVELS: [&str; 4] = ["observe", "propose", "act_reversible", "act_full"];
 
 /// `POST /api/projects/:slug/grant` — set the autonomy grant. The project must
 /// exist (the grant FK-references it).
@@ -561,6 +569,19 @@ pub async fn set_project_grant(
     {
         return Err((StatusCode::NOT_FOUND, format!("unknown project '{slug}'")));
     }
+    let autonomy_level = match req.autonomy_level.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(level) if AUTONOMY_LEVELS.contains(&level) => Some(level.to_string()),
+        Some(other) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "autonomy_level must be one of {} (got '{other}')",
+                    AUTONOMY_LEVELS.join(", ")
+                ),
+            ));
+        }
+    };
     state
         .projects
         .set_grant(
@@ -571,6 +592,7 @@ pub async fn set_project_grant(
             req.pause_reason.as_deref(),
             req.resume_condition.as_deref(),
             req.material_bar.as_deref(),
+            autonomy_level.as_deref(),
         )
         .map_err(store_err)?;
     let grant = state.projects.get_grant(&slug).map_err(store_err)?;
@@ -581,9 +603,80 @@ pub async fn set_project_grant(
 pub struct RecordDecisionRequest {
     pub question: String,
     pub rationale: Option<String>,
+    /// merge | dispatch | scope | budget | … (free-form label)
+    pub kind: Option<String>,
+    /// granted (autonomous act) | escalation (question for the owner).
+    /// Legacy callers omit it: default escalation.
+    pub authority: Option<String>,
+    /// decided | pending_user. Defaults follow the authority.
+    pub status: Option<String>,
+    /// Supporting links: {"pr_url": …, "mission_id": …}.
+    pub evidence: Option<serde_json::Value>,
 }
 
-/// `POST /api/projects/:slug/decision` — add to the pending-decision ledger.
+/// How a decision request lands in the ledger after the grant is applied.
+pub(crate) struct DecisionDisposition {
+    pub authority: String,
+    pub status: String,
+    /// Set when the grant downgraded a claimed autonomous act to an
+    /// escalation — surfaced to the caller so the controller learns.
+    pub coerced_reason: Option<String>,
+}
+
+/// The enforcement point shared by the HTTP endpoint and the delivery-trailer
+/// ingestor: a controller may only *record* an act as autonomous when its
+/// grant actually allows acting. `observe`/`propose` (or an unset level)
+/// coerce granted+decided into an owner escalation instead of failing, so a
+/// mis-calibrated controller degrades to asking rather than erroring.
+pub(crate) fn resolve_decision_disposition(
+    autonomy_level: Option<&str>,
+    authority: Option<&str>,
+    status: Option<&str>,
+) -> Result<DecisionDisposition, String> {
+    let authority = match authority.map(str::trim).filter(|a| !a.is_empty()) {
+        None => "escalation",
+        Some(a @ ("granted" | "escalation")) => a,
+        Some(other) => {
+            return Err(format!(
+                "authority must be granted or escalation (got '{other}')"
+            ))
+        }
+    };
+    let status = match status.map(str::trim).filter(|s| !s.is_empty()) {
+        None => {
+            if authority == "granted" {
+                "decided"
+            } else {
+                "pending_user"
+            }
+        }
+        Some(s @ ("decided" | "pending_user")) => s,
+        Some(other) => {
+            return Err(format!(
+                "status must be decided or pending_user (got '{other}')"
+            ));
+        }
+    };
+    if authority == "granted" && status == "decided" {
+        let may_act = matches!(autonomy_level, Some("act_reversible") | Some("act_full"));
+        if !may_act {
+            let level = autonomy_level.unwrap_or("unset");
+            return Ok(DecisionDisposition {
+                authority: "escalation".to_string(),
+                status: "pending_user".to_string(),
+                coerced_reason: Some(format!("autonomy_level={level}")),
+            });
+        }
+    }
+    Ok(DecisionDisposition {
+        authority: authority.to_string(),
+        status: status.to_string(),
+        coerced_reason: None,
+    })
+}
+
+/// `POST /api/projects/:slug/decision` — add to the decision ledger: an owner
+/// escalation, or (grant permitting) a declared autonomous act.
 pub async fn record_project_decision(
     State(state): State<Arc<AppState>>,
     AxumPath(slug): AxumPath<String>,
@@ -595,12 +688,77 @@ pub async fn record_project_decision(
     if req.question.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "question is required".to_string()));
     }
-    state
+    let grant = state.projects.get_grant(&slug).map_err(store_err)?;
+    let disposition = resolve_decision_disposition(
+        grant.as_ref().and_then(|g| g.autonomy_level.as_deref()),
+        req.authority.as_deref(),
+        req.status.as_deref(),
+    )
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let decision = super::projects_store::NewDecision {
+        question: req.question.trim().to_string(),
+        rationale: req.rationale.clone(),
+        kind: req
+            .kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(str::to_string),
+        authority: disposition.authority,
+        status: disposition.status,
+        evidence: req.evidence.clone(),
+    };
+    let at = state
         .projects
-        .record_decision(&slug, req.question.trim(), req.rationale.as_deref())
+        .record_decision(&slug, &decision)
         .map_err(store_err)?;
     let open = state.projects.open_decisions(&slug).map_err(store_err)?;
-    Ok(Json(serde_json::json!({ "open_decisions": open })))
+    Ok(Json(serde_json::json!({
+        "at": at,
+        "authority": decision.authority,
+        "status": decision.status,
+        "coerced": disposition.coerced_reason.is_some(),
+        "coerced_reason": disposition.coerced_reason,
+        "open_decisions": open,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnswerDecisionRequest {
+    /// The decision's `at` key.
+    pub at: String,
+    pub answer: String,
+}
+
+/// `POST /api/projects/:slug/decision/answer` — resolve a pending escalation.
+/// Delivery of the answer into the control conversation is the caller's job
+/// (the board relay knows how to address the bound Hermes session); this
+/// endpoint owns only the ledger transition.
+pub async fn answer_project_decision(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(req): Json<AnswerDecisionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err(bad_slug());
+    }
+    if req.answer.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "answer is required".to_string()));
+    }
+    let answered = state
+        .projects
+        .answer_decision(&slug, &req.at, req.answer.trim())
+        .map_err(store_err)?;
+    if !answered {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no pending decision at '{}' for '{slug}'", req.at),
+        ));
+    }
+    let open = state.projects.open_decisions(&slug).map_err(store_err)?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "open_decisions": open }),
+    ))
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -621,6 +779,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/:slug/decision",
             axum::routing::post(record_project_decision),
+        )
+        .route(
+            "/:slug/decision/answer",
+            axum::routing::post(answer_project_decision),
         )
         .route(
             "/:slug/conversation",
@@ -826,6 +988,14 @@ struct ProjectRow {
     missions: Vec<MissionChip>,
     latest_update: Option<DeliveryUpdate>,
     updates_count: usize,
+    /// The grant's normalized autonomy level (observe | propose |
+    /// act_reversible | act_full), surfaced on the row so the card can show it
+    /// without a detail fetch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    autonomy_level: Option<String>,
+    /// Decisions waiting on the owner (`status = pending_user`) — the card
+    /// badge and a standing attention reason.
+    pending_decisions: u32,
     attention_reasons: Vec<String>,
     /// Per-track rollup, worst-first. Answers "which track is stuck" without
     /// making the reader scan a list of 800 mission chips.
@@ -906,6 +1076,14 @@ pub async fn projects_overview(
     let unrouted_rows = state
         .projects
         .unrouted(20)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let autonomy_levels = state
+        .projects
+        .autonomy_levels()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let pending_decisions = state
+        .projects
+        .pending_decision_counts()
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     // ── Assemble rows: union of tracker slugs, mission project tags, and
@@ -1059,6 +1237,24 @@ pub async fn projects_overview(
         })
         .collect();
 
+    // Grant levels and pending-decision counts are keyed by the roster slug the
+    // controller wrote them under; fold them onto canonical rows like every
+    // other source (an alias never hides, only fills).
+    for (slug, level) in &autonomy_levels {
+        let key = resolve_alias(&aliases, slug);
+        if let Some(builder) = rows.get_mut(&key) {
+            if builder.autonomy_level.is_none() || key == *slug {
+                builder.autonomy_level = Some(level.clone());
+            }
+        }
+    }
+    for (slug, count) in &pending_decisions {
+        let key = resolve_alias(&aliases, slug);
+        if let Some(builder) = rows.get_mut(&key) {
+            builder.pending_decisions += count;
+        }
+    }
+
     // Scheduler-side heartbeats, resolved once per request: a controller that
     // ran successfully but delivered nothing ([SILENT] ticks) still proves it
     // is alive.
@@ -1198,6 +1394,8 @@ struct ProjectRowBuilder {
     /// signal's input, read from the store's observation count.
     latest_observations: u32,
     updates_count: usize,
+    autonomy_level: Option<String>,
+    pending_decisions: u32,
 }
 
 impl ProjectRowBuilder {
@@ -1215,6 +1413,8 @@ impl ProjectRowBuilder {
             latest_update: None,
             latest_observations: 0,
             updates_count: 0,
+            autonomy_level: None,
+            pending_decisions: 0,
         }
     }
 
@@ -1270,6 +1470,14 @@ impl ProjectRowBuilder {
             attention.push(match awaiting_user {
                 1 => "1 mission awaiting user input".to_string(),
                 count => format!("{count} missions awaiting user input"),
+            });
+        }
+        // Same rule for ledger escalations: a pending_user decision is a
+        // question only the owner can answer, so freshness never silences it.
+        if self.pending_decisions > 0 {
+            attention.push(match self.pending_decisions {
+                1 => "1 decision awaiting you".to_string(),
+                count => format!("{count} decisions awaiting you"),
             });
         }
 
@@ -1518,6 +1726,8 @@ impl ProjectRowBuilder {
             missions: self.missions,
             latest_update: self.latest_update,
             updates_count: self.updates_count,
+            autonomy_level: self.autonomy_level,
+            pending_decisions: self.pending_decisions,
             attention_reasons: attention,
             health,
             conversation,
@@ -2308,6 +2518,55 @@ mod tests {
             .attention_reasons
             .iter()
             .any(|r| r.contains("3 consecutive")));
+    }
+
+    // ---- decision disposition (the autonomy enforcement point) ----
+
+    #[test]
+    fn an_unearned_autonomous_act_is_coerced_into_an_escalation() {
+        // No grant, observe, and propose all deny acting.
+        for level in [None, Some("observe"), Some("propose")] {
+            let d = resolve_decision_disposition(level, Some("granted"), Some("decided"))
+                .expect("valid");
+            assert_eq!(d.authority, "escalation");
+            assert_eq!(d.status, "pending_user");
+            assert!(d.coerced_reason.is_some(), "level {level:?} must coerce");
+        }
+        for level in ["act_reversible", "act_full"] {
+            let d = resolve_decision_disposition(Some(level), Some("granted"), Some("decided"))
+                .expect("valid");
+            assert_eq!(d.authority, "granted");
+            assert_eq!(d.status, "decided");
+            assert!(d.coerced_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_decision_bodies_default_to_owner_escalations() {
+        // The pre-ledger callers send only question+rationale: no authority,
+        // no status. They must keep meaning "ask the owner".
+        let d = resolve_decision_disposition(Some("act_full"), None, None).expect("valid");
+        assert_eq!(d.authority, "escalation");
+        assert_eq!(d.status, "pending_user");
+        assert!(d.coerced_reason.is_none());
+
+        assert!(resolve_decision_disposition(None, Some("sovereign"), None).is_err());
+        assert!(resolve_decision_disposition(None, None, Some("expired")).is_err());
+    }
+
+    #[test]
+    fn pending_decisions_are_a_standing_attention_reason() {
+        let mut builder = ProjectRowBuilder::new("verity".into());
+        builder.pending_decisions = 2;
+        builder.autonomy_level = Some("propose".into());
+        let row = builder.finish(&[], None, None, "2026-08-04T20:00:00Z");
+        assert_eq!(row.bucket, "attention");
+        assert_eq!(row.pending_decisions, 2);
+        assert_eq!(row.autonomy_level.as_deref(), Some("propose"));
+        assert!(row
+            .attention_reasons
+            .iter()
+            .any(|r| r == "2 decisions awaiting you"));
     }
 
     #[test]
