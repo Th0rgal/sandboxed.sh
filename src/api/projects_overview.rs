@@ -2975,6 +2975,103 @@ mod tests {
     }
 
     #[test]
+    fn pr_links_are_extracted_from_digests_and_nothing_else() {
+        assert_eq!(
+            extract_pr_url("Opened https://github.com/lfglabs-dev/verity/pull/2213 for review."),
+            Some("https://github.com/lfglabs-dev/verity/pull/2213".to_string())
+        );
+        assert_eq!(
+            extract_pr_url("(see https://github.com/x/y/pull/48)"),
+            Some("https://github.com/x/y/pull/48".to_string())
+        );
+        // A repo link BEFORE the PR link must not shadow it.
+        assert_eq!(
+            extract_pr_url("Repo https://github.com/x/y; opened https://github.com/x/y/pull/48"),
+            Some("https://github.com/x/y/pull/48".to_string())
+        );
+        // Repo links, issues, and bare mentions are not PR links.
+        assert_eq!(extract_pr_url("https://github.com/x/y"), None);
+        assert_eq!(extract_pr_url("https://github.com/x/y/issues/12"), None);
+        assert_eq!(extract_pr_url("no links here"), None);
+    }
+
+    // ---- decision disposition (the autonomy enforcement point) ----
+
+    #[test]
+    fn an_unearned_autonomous_act_is_coerced_into_an_escalation() {
+        // No grant, observe, and propose all deny acting.
+        for level in [None, Some("observe"), Some("propose")] {
+            let d = resolve_decision_disposition(level, Some("granted"), Some("decided"), None)
+                .expect("valid");
+            assert_eq!(d.authority, "escalation");
+            assert_eq!(d.status, "pending_user");
+            assert!(d.coerced_reason.is_some(), "level {level:?} must coerce");
+        }
+        for level in ["act_reversible", "act_full"] {
+            let d =
+                resolve_decision_disposition(Some(level), Some("granted"), Some("decided"), None)
+                    .expect("valid");
+            assert_eq!(d.authority, "granted");
+            assert_eq!(d.status, "decided");
+            assert!(d.coerced_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn act_reversible_escalates_the_irreversible_kinds() {
+        for kind in ["merge", "Abandon", " deploy "] {
+            let d = resolve_decision_disposition(
+                Some("act_reversible"),
+                Some("granted"),
+                Some("decided"),
+                Some(kind),
+            )
+            .expect("valid");
+            assert_eq!(d.status, "pending_user", "kind {kind:?} must escalate");
+            assert!(d.coerced_reason.as_deref().unwrap_or("").contains("kind="));
+        }
+        // Reversible work passes at act_reversible; everything passes at act_full.
+        for (level, kind) in [
+            ("act_reversible", Some("dispatch")),
+            ("act_reversible", None),
+            ("act_full", Some("merge")),
+        ] {
+            let d =
+                resolve_decision_disposition(Some(level), Some("granted"), Some("decided"), kind)
+                    .expect("valid");
+            assert_eq!(d.status, "decided", "{level}/{kind:?} must pass");
+        }
+    }
+
+    #[test]
+    fn legacy_decision_bodies_default_to_owner_escalations() {
+        // The pre-ledger callers send only question+rationale: no authority,
+        // no status. They must keep meaning "ask the owner".
+        let d = resolve_decision_disposition(Some("act_full"), None, None, None).expect("valid");
+        assert_eq!(d.authority, "escalation");
+        assert_eq!(d.status, "pending_user");
+        assert!(d.coerced_reason.is_none());
+
+        assert!(resolve_decision_disposition(None, Some("sovereign"), None, None).is_err());
+        assert!(resolve_decision_disposition(None, None, Some("expired"), None).is_err());
+    }
+
+    #[test]
+    fn pending_decisions_are_a_standing_attention_reason() {
+        let mut builder = ProjectRowBuilder::new("verity".into());
+        builder.pending_decisions = 2;
+        builder.autonomy_level = Some("propose".into());
+        let row = builder.finish(&[], None, None, "2026-08-04T20:00:00Z");
+        assert_eq!(row.bucket, "attention");
+        assert_eq!(row.pending_decisions, 2);
+        assert_eq!(row.autonomy_level.as_deref(), Some("propose"));
+        assert!(row
+            .attention_reasons
+            .iter()
+            .any(|r| r == "2 decisions awaiting you"));
+    }
+
+    #[test]
     fn empty_blockers_are_not_blockers() {
         for line in [
             "**Bloqué par :** aucun pour l'instant.",
