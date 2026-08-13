@@ -67,6 +67,52 @@ def resolve_live_session_id(session_id: str, session_db: Any) -> Optional[str]:
     return sid
 
 
+def _recent_message_texts(session_db: Any, session_id: str, limit: int = 400):
+    """Best-effort read of a session's recent message bodies.
+
+    Feature-detected: SessionDB variants expose ``get_messages`` /
+    ``list_messages``. Returns None (not []) when no reader exists, so
+    callers can tell "cannot inspect" apart from "inspected, found nothing".
+    """
+    reader = getattr(session_db, "get_messages", None) or getattr(
+        session_db, "list_messages", None
+    )
+    if not callable(reader):
+        return None
+    try:
+        rows = reader(session_id) or []
+    except Exception:
+        logger.debug("message read failed for %s", session_id, exc_info=True)
+        return None
+    texts = []
+    for row in rows[-limit:]:
+        content = row.get("content") if isinstance(row, dict) else getattr(row, "content", "")
+        if content:
+            texts.append(str(content))
+    return texts
+
+
+def session_references_mission(session_db: Any, session_id: str, mission_id: str) -> bool:
+    """Ownership proof for origin routing: the session must already mention
+    the mission (the dispatch tool result and prior callbacks embed its id).
+
+    HMAC authenticates the *payload*, not the origin hint inside it — any
+    mission creator could name an unrelated conversation. Fail-open only when
+    the store exposes no message reader (legacy DBs), fail-closed otherwise.
+    """
+    mission = (mission_id or "").strip()
+    if not mission:
+        return False
+    texts = _recent_message_texts(session_db, session_id)
+    if texts is None:
+        return True  # cannot inspect — legacy store, keep prior behaviour
+    return any(mission in text for text in texts)
+
+
+def extract_event_id(payload: dict) -> str:
+    return str(payload.get("event_id") or payload.get("delivery_id") or "").strip()
+
+
 def resolve_project_session_id(project: str, session_db: Any = None) -> Optional[str]:
     slug = (project or "").strip()
     if not slug:
@@ -96,7 +142,14 @@ def resolve_mission_delivery_session(payload: dict, session_db: Any) -> Optional
     if origin:
         live = resolve_live_session_id(origin, session_db)
         if live:
-            return live
+            mission_id = str(payload.get("mission_id") or "").strip()
+            if session_references_mission(session_db, live, mission_id):
+                return live
+            logger.info(
+                "origin %s does not reference mission %s — falling back to the project route",
+                live,
+                mission_id,
+            )
     project = extract_project_slug(payload)
     if project:
         return resolve_project_session_id(project, session_db)
@@ -118,9 +171,11 @@ def format_mission_callback(payload: dict) -> str:
     ]
     body = "\n".join(str(b).strip() for b in bits if b and str(b).strip())
     mode = "active" if status == "completed" else "blocked"
+    event_id = extract_event_id(payload)
     lines = [
         f"[Mission callback: {title}]",
         f"status={status} mission={mission_id}"
+        + (f" event={event_id}" if event_id else "")
         + (f" workspace={workspace}" if workspace else ""),
     ]
     if body:
@@ -140,8 +195,26 @@ def format_mission_callback(payload: dict) -> str:
 
 
 def append_mission_callback(session_id: str, payload: dict, session_db: Any) -> str:
-    """Persist the callback on the live session. Returns the live id."""
+    """Persist the callback on the live session. Returns the live id.
+
+    Idempotent per delivery: the producer retries at-least-once on a lost
+    HTTP response, so an ``event=<id>`` already present in the transcript
+    means this exact delivery landed — appending again would double the
+    callback and schedule a second autonomous wake.
+    """
     live = resolve_live_session_id(session_id, session_db) or session_id
+    event_id = extract_event_id(payload)
+    if event_id:
+        texts = _recent_message_texts(session_db, live)
+        if texts is not None:
+            marker = f" event={event_id}"
+            if any("[Mission callback" in t and marker in t for t in texts):
+                logger.info(
+                    "duplicate mission callback event %s for %s — skipping append",
+                    event_id,
+                    live,
+                )
+                return live
     content = format_mission_callback(payload)
     session_db.append_message(session_id=live, role="assistant", content=content)
     return live

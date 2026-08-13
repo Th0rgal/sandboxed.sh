@@ -8260,7 +8260,17 @@ pub async fn create_mission(
     // and cannot auto-install it. Coldcard twice launched Codex on
     // `dgx-spark` (no CLI, no npm/bun); both missions died in minutes
     // and the completion never reached the dedicated session.
-    if let (Some(ws_id), Some(backend_id)) = (workspace_id, backend.as_deref()) {
+    //
+    // Remote-node missions execute on the selected node, not in the local
+    // workspace, so probing the local/container CLI would reject perfectly
+    // runnable work — skip the preflight for them.
+    let runs_locally = req
+        .remote_node_id
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty);
+    if let (true, Some(ws_id), Some(backend_id)) = (runs_locally, workspace_id, backend.as_deref())
+    {
         if matches!(backend_id, "codex" | "claudecode" | "gemini" | "grok") {
             if let Some(workspace) = state.workspaces.get(ws_id).await {
                 let cli_path = if matches!(backend_id, "claudecode" | "codex" | "gemini") {
