@@ -3999,9 +3999,11 @@ impl ControlHub {
         Ok(collected)
     }
 
-    /// Board tasks across every live store whose boss mission belongs to this
-    /// project family. Offline stores are skipped: boards only exist in live
-    /// SQLite stores, and a roadmap read must stay cheap.
+    /// Board tasks across every store whose boss mission belongs to this
+    /// project family. Live stores answer through the trait; persisted SQLite
+    /// databases with no live control session (fresh restart, other users) are
+    /// read directly — otherwise the roadmap goes blank whenever nobody has a
+    /// session open. File stores have no boards and are skipped.
     pub(crate) async fn collect_project_board_tasks(
         &self,
         project: &str,
@@ -4011,6 +4013,19 @@ impl ControlHub {
         let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
         for store in inventory.live {
             for task in store.list_board_tasks_for_project(project).await? {
+                if seen.insert(task.id) {
+                    collected.push(task);
+                }
+            }
+        }
+        for path in inventory.offline_sqlite {
+            let project = project.to_string();
+            let tasks = tokio::task::spawn_blocking(move || {
+                mission_store::sqlite::read_board_tasks_for_project(&path, &project)
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            for task in tasks {
                 if seen.insert(task.id) {
                     collected.push(task);
                 }
