@@ -39,6 +39,8 @@ pub const HERMES_ASSISTANT_TOOL_ALLOWLIST: &[&str] = &[
     "get_project_grant",
     "set_project_grant",
     "record_project_decision",
+    "answer_project_decision",
+    "get_project_tasks",
     "link_mission_to_project",
     "list_workspaces",
     "get_workspace",

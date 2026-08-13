@@ -121,6 +121,8 @@ struct SetProjectGrantParams {
     resume_condition: Option<String>,
     #[serde(default)]
     material_bar: Option<String>,
+    #[serde(default)]
+    autonomy_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +131,26 @@ struct RecordProjectDecisionParams {
     question: String,
     #[serde(default)]
     rationale: Option<String>,
+    /// merge | dispatch | abandon | pause | resume | scope | budget | retry | …
+    #[serde(default)]
+    kind: Option<String>,
+    /// granted (autonomous act) | escalation (question for the owner, default).
+    #[serde(default)]
+    authority: Option<String>,
+    /// decided | pending_user; defaults follow the authority.
+    #[serde(default)]
+    status: Option<String>,
+    /// {"pr_url": …, "mission_id": …}
+    #[serde(default)]
+    evidence: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnswerProjectDecisionParams {
+    slug: String,
+    /// The decision's `at` key, as returned by record/get_project.
+    at: String,
+    answer: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1508,12 +1530,13 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "set_project_grant".to_string(),
-                description: "Record the owner's autonomy grant for a project after they answer the setup questions: merge authority, budget, parallel missions, pause reason + machine-checkable resume condition, and the material-report bar. The project must already exist.".to_string(),
+                description: "Record the owner's autonomy grant for a project after they answer the setup questions: the normalized autonomy level, merge authority, budget, parallel missions, pause reason + machine-checkable resume condition, and the material-report bar. The project must already exist.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["slug"],
                     "properties": {
                         "slug": {"type": "string"},
+                        "autonomy_level": {"type": "string", "enum": ["observe", "propose", "act_reversible", "act_full"], "description": "What the controller may do without asking: observe (report only), propose (escalate every act), act_reversible (act except irreversible steps), act_full."},
                         "merge_authority": {"type": "string", "description": "full | repo:a,b | review-first"},
                         "budget_per_tick": {"type": "string"},
                         "parallel_missions": {"type": "integer"},
@@ -1525,15 +1548,41 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "record_project_decision".to_string(),
-                description: "Add a question to the project's pending-decision ledger for the owner. Non-blocking: batch your questions here and keep working under the conservative in-grant default until answered.".to_string(),
+                description: "Write to the project's decision ledger. Two uses: (1) declare an autonomous act BEFORE doing it (authority=granted, status=decided, kind, evidence with pr_url/mission_id) — if the response says coerced=true your grant does not cover it, treat it as an escalation and do NOT execute; (2) ask the owner a question (authority=escalation or just omit the new fields — the legacy shape still means 'ask'). Non-blocking either way.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["slug", "question"],
                     "properties": {
                         "slug": {"type": "string"},
-                        "question": {"type": "string"},
-                        "rationale": {"type": "string"}
+                        "question": {"type": "string", "description": "The question for the owner, or the past-tense statement of the act ('Merged verity#2213')."},
+                        "rationale": {"type": "string"},
+                        "kind": {"type": "string", "description": "merge | dispatch | abandon | pause | resume | scope | budget | retry | ..."},
+                        "authority": {"type": "string", "enum": ["granted", "escalation"]},
+                        "status": {"type": "string", "enum": ["decided", "pending_user"]},
+                        "evidence": {"type": "object", "description": "Supporting links, e.g. {\"pr_url\": ..., \"mission_id\": ...}."}
                     }
+                }),
+            },
+            ToolDefinition {
+                name: "answer_project_decision".to_string(),
+                description: "Resolve a pending owner escalation in a project's decision ledger with the owner's answer. Use only when relaying a decision the owner actually expressed.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "at", "answer"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "at": {"type": "string", "description": "The decision's 'at' timestamp key from get_project/record_project_decision."},
+                        "answer": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "get_project_tasks".to_string(),
+                description: "The project's roadmap: every board task planned under the project's boss missions, with status, dependencies, result digest, PR link, and worker mission. Read this to see what is done/running/failed across the whole project without walking individual mission boards.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug"],
+                    "properties": {"slug": {"type": "string"}}
                 }),
             },
             ToolDefinition {
@@ -2531,6 +2580,7 @@ impl AssistantMcp {
             "pause_reason": params.pause_reason,
             "resume_condition": params.resume_condition,
             "material_bar": params.material_bar,
+            "autonomy_level": params.autonomy_level,
         });
         let response = self
             .api_post(&format!("/api/projects/{slug}/grant"), body)
@@ -2546,11 +2596,33 @@ impl AssistantMcp {
         let body = json!({
             "question": params.question,
             "rationale": params.rationale,
+            "kind": params.kind,
+            "authority": params.authority,
+            "status": params.status,
+            "evidence": params.evidence,
         });
         let response = self
             .api_post(&format!("/api/projects/{slug}/decision"), body)
             .await?;
         Self::response_value(response, "record project decision").await
+    }
+
+    async fn answer_project_decision(
+        &self,
+        params: AnswerProjectDecisionParams,
+    ) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let body = json!({ "at": params.at, "answer": params.answer });
+        let response = self
+            .api_post(&format!("/api/projects/{slug}/decision/answer"), body)
+            .await?;
+        Self::response_value(response, "answer project decision").await
+    }
+
+    async fn get_project_tasks(&self, params: ProjectSlugParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let response = self.api_get(&format!("/api/projects/{slug}/tasks")).await?;
+        Self::response_value(response, "get project tasks").await
     }
 
     async fn link_mission_to_project(
@@ -3148,6 +3220,14 @@ impl AssistantMcp {
             "record_project_decision" => {
                 let params: RecordProjectDecisionParams = parse_params(arguments)?;
                 self.record_project_decision(params).await
+            }
+            "answer_project_decision" => {
+                let params: AnswerProjectDecisionParams = parse_params(arguments)?;
+                self.answer_project_decision(params).await
+            }
+            "get_project_tasks" => {
+                let params: ProjectSlugParams = parse_params(arguments)?;
+                self.get_project_tasks(params).await
             }
             "link_mission_to_project" => {
                 let params: LinkMissionToProjectParams = parse_params(arguments)?;
@@ -4520,10 +4600,30 @@ mod tests {
             "get_project_grant",
             "set_project_grant",
             "record_project_decision",
+            "answer_project_decision",
+            "get_project_tasks",
             "link_mission_to_project",
         ] {
             assert!(names.contains(&expected), "missing project tool {expected}");
         }
+        // The ledger tool exposes the authority split, and the grant tool the
+        // normalized autonomy level — controllers discover both from schema.
+        let decision = tools
+            .iter()
+            .find(|tool| tool.name == "record_project_decision")
+            .unwrap();
+        let authorities = decision.input_schema["properties"]["authority"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(authorities.contains(&json!("granted")));
+        let grant = tools
+            .iter()
+            .find(|tool| tool.name == "set_project_grant")
+            .unwrap();
+        let levels = grant.input_schema["properties"]["autonomy_level"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(levels.contains(&json!("act_reversible")));
         // The status tool constrains mode to the three known regimes.
         let status = tools
             .iter()
