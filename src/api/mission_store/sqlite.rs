@@ -2,8 +2,8 @@
 
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, AwaitingKind, BoardOutboxItem,
-    BoardProject, BoardTask, BoardTaskOutcome, BoardTaskRole, BoardTaskStatus, CommandSource,
-    DailyUsageStats, ExecutionStatus, FreshSession, HourlyUsageStats, Mission, MissionActivity,
+    BoardTask, BoardTaskOutcome, BoardTaskRole, BoardTaskStatus, CommandSource, DailyUsageStats,
+    ExecutionStatus, FreshSession, HourlyUsageStats, Mission, MissionActivity,
     MissionExecutionState, MissionFilter, MissionHistoryEntry, MissionMode, MissionProject,
     MissionProjectPatch, MissionRun, MissionScheduling, MissionStatus, MissionStatusCounts,
     MissionStore, MissionSummary, MissionToolExecution, MissionToolExecutionState, ModelUsageStats,
@@ -733,19 +733,6 @@ CREATE INDEX IF NOT EXISTS idx_board_tasks_boss ON board_tasks(boss_mission_id);
 CREATE INDEX IF NOT EXISTS idx_board_tasks_worker ON board_tasks(worker_mission_id);
 CREATE INDEX IF NOT EXISTS idx_board_tasks_status ON board_tasks(status);
 
-CREATE TABLE IF NOT EXISTS board_projects (
-    slug TEXT PRIMARY KEY,
-    repository TEXT NOT NULL,
-    workspace_id TEXT NOT NULL,
-    specification_path TEXT NOT NULL,
-    specification_revision TEXT NOT NULL,
-    compute_policy TEXT NOT NULL,
-    budget_policy TEXT NOT NULL DEFAULT '{}',
-    active_controller_lease TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS task_attempts (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
@@ -1380,6 +1367,12 @@ impl SqliteMissionStore {
                 }
             }
         }
+
+        // board_projects never got wired up (the `projects` table in
+        // projects.db is the authoritative project object); every deployment
+        // audited at zero rows, so drop it outright.
+        conn.execute("DROP TABLE IF EXISTS board_projects", [])
+            .map_err(|e| format!("Failed to drop board_projects: {e}"))?;
 
         // Check if 'backend' column exists in missions table
         let has_backend_column: bool = conn
@@ -11184,56 +11177,6 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| format!("Task join error: {e}"))?
     }
 
-    async fn upsert_board_project(&self, project: BoardProject) -> Result<BoardProject, String> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            let now = now_string();
-            let budget = serde_json::to_string(&project.budget_policy)
-                .map_err(|error| format!("Failed to serialize project budget: {error}"))?;
-            conn.execute(
-                "INSERT INTO board_projects (slug, repository, workspace_id, specification_path, \
-                 specification_revision, compute_policy, budget_policy, active_controller_lease, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9) \
-                 ON CONFLICT(slug) DO UPDATE SET repository = excluded.repository, workspace_id = excluded.workspace_id, \
-                 specification_path = excluded.specification_path, specification_revision = excluded.specification_revision, \
-                 compute_policy = excluded.compute_policy, budget_policy = excluded.budget_policy, \
-                 active_controller_lease = excluded.active_controller_lease, updated_at = excluded.updated_at",
-                params![
-                    project.slug,
-                    project.repository,
-                    project.workspace_id.to_string(),
-                    project.specification_path,
-                    project.specification_revision,
-                    project.compute_policy,
-                    budget,
-                    project.active_controller_lease,
-                    now,
-                ],
-            )
-            .map_err(|error| format!("Failed to upsert project: {error}"))?;
-            parse_board_project(
-                &conn,
-                &project.slug,
-            )
-            .map_err(|error| format!("Failed to read project: {error}"))?
-            .ok_or_else(|| "Project disappeared after upsert".to_string())
-        })
-        .await
-        .map_err(|error| format!("Task join error: {error}"))?
-    }
-
-    async fn get_board_project(&self, slug: &str) -> Result<Option<BoardProject>, String> {
-        let conn = self.conn.clone();
-        let slug = slug.to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            parse_board_project(&conn, &slug).map_err(|error| error.to_string())
-        })
-        .await
-        .map_err(|error| format!("Task join error: {error}"))?
-    }
-
     async fn create_task_attempt(&self, attempt: TaskAttempt) -> Result<TaskAttempt, String> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -11462,35 +11405,6 @@ fn parse_board_task_row(row: &rusqlite::Row<'_>) -> Result<BoardTask, rusqlite::
         created_at: row.get(29)?,
         updated_at: row.get(30)?,
     })
-}
-
-fn parse_board_project(
-    conn: &Connection,
-    slug: &str,
-) -> Result<Option<BoardProject>, rusqlite::Error> {
-    conn.query_row(
-        "SELECT slug, repository, workspace_id, specification_path, specification_revision, \
-         compute_policy, budget_policy, active_controller_lease, created_at, updated_at \
-         FROM board_projects WHERE slug = ?1",
-        params![slug],
-        |row| {
-            let workspace_id: String = row.get(2)?;
-            let budget_policy: String = row.get(6)?;
-            Ok(BoardProject {
-                slug: row.get(0)?,
-                repository: row.get(1)?,
-                workspace_id: Uuid::parse_str(&workspace_id).unwrap_or_default(),
-                specification_path: row.get(3)?,
-                specification_revision: row.get(4)?,
-                compute_policy: row.get(5)?,
-                budget_policy: serde_json::from_str(&budget_policy).unwrap_or_default(),
-                active_controller_lease: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
-        },
-    )
-    .optional()
 }
 
 fn parse_task_attempt_row(row: &rusqlite::Row<'_>) -> Result<TaskAttempt, rusqlite::Error> {
@@ -16346,7 +16260,7 @@ mod tests {
     #[tokio::test]
     async fn project_attempt_and_outbox_ledgers_are_idempotent() {
         use crate::api::mission_store::{
-            BoardOutboxItem, BoardProject, BoardTaskRole, NewBoardTask, TaskAttempt,
+            BoardOutboxItem, BoardTaskRole, NewBoardTask, TaskAttempt,
         };
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
@@ -16369,29 +16283,6 @@ mod tests {
             .await
             .expect("task")
             .remove(0);
-
-        let project = BoardProject {
-            slug: "beal".into(),
-            repository: "owner/beal".into(),
-            workspace_id: boss.workspace_id,
-            specification_path: "SPEC.md".into(),
-            specification_revision: "abc123".into(),
-            compute_policy: "remote_required".into(),
-            budget_policy: serde_json::json!({"cost_cents": 500}),
-            active_controller_lease: Some("controller-1".into()),
-            created_at: now_string(),
-            updated_at: now_string(),
-        };
-        store.upsert_board_project(project).await.expect("project");
-        assert_eq!(
-            store
-                .get_board_project("beal")
-                .await
-                .unwrap()
-                .unwrap()
-                .compute_policy,
-            "remote_required"
-        );
 
         let attempt = TaskAttempt {
             id: Uuid::new_v4(),

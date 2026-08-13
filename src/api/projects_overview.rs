@@ -844,7 +844,7 @@ pub async fn project_tasks(
     let mut done = 0usize;
     let mut running = 0usize;
     let mut failed = 0usize;
-    let rows: Vec<serde_json::Value> = tasks
+    let mut rows: Vec<serde_json::Value> = tasks
         .iter()
         .map(|task| {
             let status = task.status.to_string();
@@ -876,6 +876,32 @@ pub async fn project_tasks(
             })
         })
         .collect();
+    // Chat-planned proposals ride the same list as `status: "proposed"`. A
+    // board task under the same key supersedes its proposal — the plan became
+    // real work, so the proposal row disappears from the read.
+    let planned: std::collections::HashSet<&str> =
+        tasks.iter().map(|task| task.task_key.as_str()).collect();
+    let proposals = state
+        .projects
+        .list_open_proposals(&slug)
+        .map_err(store_err)?;
+    rows.extend(
+        proposals
+            .iter()
+            .filter(|proposal| !planned.contains(proposal.task_key.as_str()))
+            .map(|proposal| {
+                serde_json::json!({
+                    "id": null,
+                    "task_key": proposal.task_key,
+                    "title": proposal.title,
+                    "prompt": proposal.prompt,
+                    "status": "proposed",
+                    "depends_on": proposal.depends_on,
+                    "acceptance_criteria": proposal.acceptance_criteria,
+                    "updated_at": proposal.updated_at,
+                })
+            }),
+    );
     Ok(Json(serde_json::json!({
         "slug": slug,
         "tasks": rows,
@@ -886,6 +912,171 @@ pub async fn project_tasks(
             "failed": failed,
         },
     })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProposalInput {
+    pub task_key: String,
+    pub title: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlanTasksRequest {
+    pub tasks: Vec<ProposalInput>,
+}
+
+/// `POST /api/projects/:slug/tasks` — plan roadmap items from chat. Proposals
+/// only: real board tasks stay writable solely by their boss mission, so a
+/// conversation can shape the plan without reaching into a running board.
+pub async fn plan_project_tasks(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(req): Json<PlanTasksRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err(bad_slug());
+    }
+    if state
+        .projects
+        .get_project(&slug)
+        .map_err(store_err)?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, format!("unknown project '{slug}'")));
+    }
+    if req.tasks.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "tasks is required".to_string()));
+    }
+    let mut proposals = Vec::with_capacity(req.tasks.len());
+    for task in &req.tasks {
+        let task_key = task.task_key.trim();
+        if !is_plain_key(task_key) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid task_key '{}'", task.task_key),
+            ));
+        }
+        if task.title.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("task '{task_key}' needs a title"),
+            ));
+        }
+        proposals.push(crate::api::projects_store::NewProposal {
+            task_key: task_key.to_string(),
+            title: task.title.trim().to_string(),
+            prompt: task.prompt.clone(),
+            acceptance_criteria: task.acceptance_criteria.clone(),
+            depends_on: task.depends_on.clone(),
+        });
+    }
+    state
+        .projects
+        .upsert_proposals(&slug, &proposals)
+        .map_err(store_err)?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "proposed": proposals.len() }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateProposalRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub acceptance_criteria: Option<Vec<String>>,
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
+}
+
+/// A proposal whose key a boss mission has planned as a real board task is
+/// *adopted*: the roadmap read hides it, and editing/cancelling the hidden row
+/// would silently succeed while changing nothing the caller can see. Surface
+/// that as a conflict instead.
+async fn assert_not_adopted(
+    state: &Arc<AppState>,
+    slug: &str,
+    task_key: &str,
+) -> Result<(), (StatusCode, String)> {
+    let tasks = state
+        .control
+        .collect_project_board_tasks(slug)
+        .await
+        .map_err(store_err)?;
+    if tasks.iter().any(|task| task.task_key == task_key) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "proposal '{task_key}' was adopted as a board task — steer the boss mission instead"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `PATCH /api/projects/:slug/tasks/:task_key` — edit an open proposal.
+/// 404 covers "never proposed" and "cancelled"; an adopted key is 409 — once a
+/// board task owns the key, edits belong to the boss mission's flow.
+pub async fn update_project_task(
+    State(state): State<Arc<AppState>>,
+    AxumPath((slug, task_key)): AxumPath<(String, String)>,
+    Json(req): Json<UpdateProposalRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) || !is_plain_key(&task_key) {
+        return Err(bad_slug());
+    }
+    assert_not_adopted(&state, &slug, &task_key).await?;
+    let updated = state
+        .projects
+        .update_proposal(
+            &slug,
+            &task_key,
+            req.title
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty()),
+            req.prompt.as_deref(),
+            req.acceptance_criteria.as_deref(),
+            req.depends_on.as_deref(),
+        )
+        .map_err(store_err)?;
+    if !updated {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no open proposal '{task_key}' for '{slug}'"),
+        ));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// `DELETE /api/projects/:slug/tasks/:task_key` — cancel an open proposal.
+pub async fn cancel_project_task(
+    State(state): State<Arc<AppState>>,
+    AxumPath((slug, task_key)): AxumPath<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) || !is_plain_key(&task_key) {
+        return Err(bad_slug());
+    }
+    assert_not_adopted(&state, &slug, &task_key).await?;
+    let cancelled = state
+        .projects
+        .cancel_proposal(&slug, &task_key)
+        .map_err(store_err)?;
+    if !cancelled {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no open proposal '{task_key}' for '{slug}'"),
+        ));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -932,7 +1123,11 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/", axum::routing::put(upsert_project))
         .route("/:slug", get(get_project))
         .route("/:slug/state", get(project_state))
-        .route("/:slug/tasks", get(project_tasks))
+        .route("/:slug/tasks", get(project_tasks).post(plan_project_tasks))
+        .route(
+            "/:slug/tasks/:task_key",
+            axum::routing::patch(update_project_task).delete(cancel_project_task),
+        )
         .route("/:slug/updates", get(project_updates))
         .route("/:slug/action", axum::routing::post(project_action))
         .route("/:slug/rename", axum::routing::post(rename_project))

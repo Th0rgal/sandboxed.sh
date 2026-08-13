@@ -126,6 +126,44 @@ struct SetProjectGrantParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct ProposalTaskInput {
+    task_key: String,
+    title: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanProjectTasksParams {
+    slug: String,
+    tasks: Vec<ProposalTaskInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateProjectTaskParams {
+    slug: String,
+    task_key: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    acceptance_criteria: Option<Vec<String>>,
+    #[serde(default)]
+    depends_on: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelProjectTaskParams {
+    slug: String,
+    task_key: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct RecordProjectDecisionParams {
     slug: String,
     question: String,
@@ -1069,6 +1107,10 @@ struct AssistantMcp {
     api_url: String,
     api_token: Option<String>,
     jwt_secret: Option<String>,
+    /// Slugs this instance may MUTATE (`SANDBOXED_PROJECT_SCOPE`, comma-list).
+    /// None = unrestricted (the owner's interactive Hermes). Reads are never
+    /// scoped — cross-project awareness is a feature, not a leak.
+    project_scope: Option<std::collections::HashSet<String>>,
     client: reqwest::Client,
 }
 
@@ -1088,14 +1130,68 @@ impl AssistantMcp {
         let jwt_secret = std::env::var("JWT_SECRET")
             .ok()
             .filter(|secret| !secret.trim().is_empty());
+        let project_scope = std::env::var("SANDBOXED_PROJECT_SCOPE")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|slug| slug.trim().to_string())
+                    .filter(|slug| !slug.is_empty())
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .filter(|scope| !scope.is_empty());
         Self {
             api_url,
             api_token,
             jwt_secret,
+            project_scope,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+        }
+    }
+
+    /// Scope gate for mission-level mutators. A scoped controller may only
+    /// touch missions tagged with one of its projects — anything else
+    /// (another project's mission, or an untagged one it cannot prove it
+    /// owns) is refused. Unscoped instances skip the lookup entirely.
+    async fn assert_mission_scope(&self, mission_id: Uuid) -> Result<(), String> {
+        if self.project_scope.is_none() {
+            return Ok(());
+        }
+        let response = self
+            .api_get(&format!("/api/control/missions/{mission_id}"))
+            .await?;
+        let mission = Self::response_value(response, "load mission for scope check").await?;
+        let project = mission
+            .get("project")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|slug| !slug.is_empty());
+        match project {
+            Some(slug) => self.assert_project_scope(slug),
+            None => Err(format!(
+                "mission {mission_id} carries no project tag — a scoped controller may only \
+                 act on missions tagged with its own project"
+            )),
+        }
+    }
+
+    /// Gate for MUTATING project tools. Scoped controllers stay inside their
+    /// own project; unscoped instances (owner chat) pass untouched.
+    fn assert_project_scope(&self, slug: &str) -> Result<(), String> {
+        let slug = slug.trim();
+        match &self.project_scope {
+            Some(scope) if !scope.contains(slug) => {
+                let mut allowed: Vec<&str> = scope.iter().map(String::as_str).collect();
+                allowed.sort_unstable();
+                Err(format!(
+                    "project '{slug}' is outside this controller's scope ({}). \
+                     Mutating tools are limited to your own project; reads are unrestricted.",
+                    allowed.join(", ")
+                ))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1586,6 +1682,59 @@ impl AssistantMcp {
                 }),
             },
             ToolDefinition {
+                name: "plan_project_tasks".to_string(),
+                description: "Plan roadmap items for a project from conversation. Creates proposals (status 'proposed') on the project's roadmap — visible to the owner and to the project's controller, which turns them into real board tasks when it dispatches work (a board task under the same task_key supersedes the proposal). Re-planning an existing key updates it.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "tasks"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "tasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["task_key", "title"],
+                                "properties": {
+                                    "task_key": {"type": "string", "description": "Stable kebab-case key, unique within the project."},
+                                    "title": {"type": "string"},
+                                    "prompt": {"type": "string", "description": "What a worker should actually do, if known."},
+                                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                                    "depends_on": {"type": "array", "items": {"type": "string"}}
+                                }
+                            }
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "update_project_task".to_string(),
+                description: "Edit an open roadmap proposal (title, prompt, acceptance criteria, dependencies). Only proposals are editable — once a boss mission plans the key as a real board task, edits flow through that mission.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "task_key"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "task_key": {"type": "string"},
+                        "title": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                        "depends_on": {"type": "array", "items": {"type": "string"}}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "cancel_project_task".to_string(),
+                description: "Cancel an open roadmap proposal. Board tasks already adopted by a boss mission are not touched — cancel those through the mission's own board.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "task_key"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "task_key": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
                 name: "link_mission_to_project".to_string(),
                 description: "Tag a mission as belonging to your project (and optionally a track), so it appears in the project's inventory. Use this for missions you dispatch that must be grouped under the project — a worker with no project tag is invisible in the roster.".to_string(),
                 input_schema: json!({
@@ -2057,6 +2206,19 @@ impl AssistantMcp {
     }
 
     async fn start_mission(&self, params: StartMissionParams) -> Result<Value, String> {
+        // A scoped controller must launch work under its own project — an
+        // untagged mission would escape both the roster and this scope.
+        if self.project_scope.is_some() {
+            match params.project.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                Some(project) => self.assert_project_scope(project)?,
+                None => {
+                    return Err(
+                        "scoped controllers must pass `project` on start_mission so the                          mission stays inside their scope"
+                            .to_string(),
+                    )
+                }
+            }
+        }
         let workspace_id = resolve_default_workspace_id(params.workspace_id);
         let backend = params
             .backend
@@ -2226,6 +2388,7 @@ impl AssistantMcp {
 
     async fn send_message(&self, params: SendMessageParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let response = self
             .api_post(
                 "/api/control/message",
@@ -2247,6 +2410,7 @@ impl AssistantMcp {
 
     async fn ask_mission(&self, params: AskMissionParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let mut body = json!({
             "content": params.content,
             "sandbox": params.sandbox,
@@ -2295,6 +2459,7 @@ impl AssistantMcp {
         params: AnswerMissionQuestionParams,
     ) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         if params.answers.is_empty() || params.answers.iter().any(Vec::is_empty) {
             return Err(
                 "answers must contain one non-empty inner array per question, e.g. [[\"Option A\"]]"
@@ -2387,6 +2552,7 @@ impl AssistantMcp {
 
     async fn cancel_mission(&self, params: MissionIdParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let response = self
             .api_post(&format!("/api/control/missions/{id}/cancel"), json!({}))
             .await?;
@@ -2399,6 +2565,7 @@ impl AssistantMcp {
 
     async fn adopt_mission(&self, params: AdoptMissionParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         // The session id is stamped by the sandboxed-origin-session plugin,
         // exactly as for start_mission. Refuse to adopt into nothing: an
         // adoption without a session would silently CLEAR the mission's
@@ -2438,6 +2605,7 @@ impl AssistantMcp {
 
     async fn acknowledge_mission(&self, params: MissionIdParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let response = self
             .api_get(&format!("/api/control/missions/{id}/digest"))
             .await?;
@@ -2541,6 +2709,7 @@ impl AssistantMcp {
         params: UpdateProjectStatusParams,
     ) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let body = json!({
             "mode": params.mode,
             "next_action": params.next_action,
@@ -2554,6 +2723,7 @@ impl AssistantMcp {
 
     async fn set_project_track(&self, params: SetProjectTrackParams) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let body = json!({
             "track": params.track,
             "desired_state": params.desired_state,
@@ -2573,6 +2743,7 @@ impl AssistantMcp {
 
     async fn set_project_grant(&self, params: SetProjectGrantParams) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let body = json!({
             "merge_authority": params.merge_authority,
             "budget_per_tick": params.budget_per_tick,
@@ -2593,6 +2764,7 @@ impl AssistantMcp {
         params: RecordProjectDecisionParams,
     ) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let body = json!({
             "question": params.question,
             "rationale": params.rationale,
@@ -2612,6 +2784,7 @@ impl AssistantMcp {
         params: AnswerProjectDecisionParams,
     ) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let body = json!({ "at": params.at, "answer": params.answer });
         let response = self
             .api_post(&format!("/api/projects/{slug}/decision/answer"), body)
@@ -2625,10 +2798,64 @@ impl AssistantMcp {
         Self::response_value(response, "get project tasks").await
     }
 
+    async fn plan_project_tasks(&self, params: PlanProjectTasksParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
+        let tasks: Vec<Value> = params
+            .tasks
+            .iter()
+            .map(|task| {
+                json!({
+                    "task_key": task.task_key,
+                    "title": task.title,
+                    "prompt": task.prompt,
+                    "acceptance_criteria": task.acceptance_criteria,
+                    "depends_on": task.depends_on,
+                })
+            })
+            .collect();
+        let response = self
+            .api_post(
+                &format!("/api/projects/{slug}/tasks"),
+                json!({ "tasks": tasks }),
+            )
+            .await?;
+        Self::response_value(response, "plan project tasks").await
+    }
+
+    async fn update_project_task(&self, params: UpdateProjectTaskParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
+        let task_key = params.task_key.trim();
+        let response = self
+            .api_patch(
+                &format!("/api/projects/{slug}/tasks/{task_key}"),
+                json!({
+                    "title": params.title,
+                    "prompt": params.prompt,
+                    "acceptance_criteria": params.acceptance_criteria,
+                    "depends_on": params.depends_on,
+                }),
+            )
+            .await?;
+        Self::response_value(response, "update project task").await
+    }
+
+    async fn cancel_project_task(&self, params: CancelProjectTaskParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
+        let task_key = params.task_key.trim();
+        let response = self
+            .api_delete(&format!("/api/projects/{slug}/tasks/{task_key}"))
+            .await?;
+        Self::response_value(response, "cancel project task").await
+    }
+
     async fn link_mission_to_project(
         &self,
         params: LinkMissionToProjectParams,
     ) -> Result<Value, String> {
+        self.assert_project_scope(&params.slug)?;
         let id = self.resolve_mission_id(&params.mission_id).await?;
         let mut body = serde_json::Map::new();
         body.insert("project".to_string(), json!(params.slug.trim()));
@@ -2817,6 +3044,7 @@ impl AssistantMcp {
 
     async fn update_mission_settings(&self, params: UpdateSettingsParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let mut body = serde_json::Map::new();
         if let Some(backend) = params
             .backend
@@ -2879,6 +3107,7 @@ impl AssistantMcp {
 
     async fn resume_mission(&self, params: ResumeMissionParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let hint = params
             .content
             .as_deref()
@@ -3228,6 +3457,18 @@ impl AssistantMcp {
             "get_project_tasks" => {
                 let params: ProjectSlugParams = parse_params(arguments)?;
                 self.get_project_tasks(params).await
+            }
+            "plan_project_tasks" => {
+                let params: PlanProjectTasksParams = parse_params(arguments)?;
+                self.plan_project_tasks(params).await
+            }
+            "update_project_task" => {
+                let params: UpdateProjectTaskParams = parse_params(arguments)?;
+                self.update_project_task(params).await
+            }
+            "cancel_project_task" => {
+                let params: CancelProjectTaskParams = parse_params(arguments)?;
+                self.cancel_project_task(params).await
             }
             "link_mission_to_project" => {
                 let params: LinkMissionToProjectParams = parse_params(arguments)?;
@@ -4602,6 +4843,9 @@ mod tests {
             "record_project_decision",
             "answer_project_decision",
             "get_project_tasks",
+            "plan_project_tasks",
+            "update_project_task",
+            "cancel_project_task",
             "link_mission_to_project",
         ] {
             assert!(names.contains(&expected), "missing project tool {expected}");
@@ -4742,6 +4986,33 @@ mod tests {
         let backwards = mission_events_path(id, 40, "all", Some(99), Some(17));
         assert!(backwards.ends_with("&before_seq=99"));
         assert!(!backwards.contains("since_seq"));
+    }
+
+    #[test]
+    fn project_scope_gates_mutations_only() {
+        let scoped = AssistantMcp {
+            api_url: "http://127.0.0.1:3000".to_string(),
+            api_token: None,
+            jwt_secret: None,
+            project_scope: Some(["verity".to_string()].into_iter().collect()),
+            client: reqwest::Client::new(),
+        };
+        assert!(scoped.assert_project_scope("verity").is_ok());
+        assert!(
+            scoped.assert_project_scope(" verity ").is_ok(),
+            "slugs are trimmed"
+        );
+        let err = scoped.assert_project_scope("lido").unwrap_err();
+        assert!(err.contains("outside this controller's scope"), "{err}");
+
+        let open = AssistantMcp {
+            api_url: "http://127.0.0.1:3000".to_string(),
+            api_token: None,
+            jwt_secret: None,
+            project_scope: None,
+            client: reqwest::Client::new(),
+        };
+        assert!(open.assert_project_scope("anything").is_ok());
     }
 
     #[test]

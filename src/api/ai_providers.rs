@@ -8448,6 +8448,7 @@ async fn delete_provider(
     if !state.ai_providers.delete(uuid).await {
         return Err((StatusCode::NOT_FOUND, format!("Provider {} not found", id)));
     }
+    state.health_tracker.remove_account(uuid).await;
 
     // Re-sync opencode.json for this provider type (will remove if no more of this type)
     if provider_type != ProviderType::Custom {

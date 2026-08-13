@@ -4605,6 +4605,30 @@ pub struct BoardVerdictRequest {
     /// Required for reject: feedback delivered to the worker.
     #[serde(default)]
     pub feedback: Option<String>,
+    /// The calling boss mission, when the caller IS a mission (orchestrator
+    /// MCP always sends its own id). Must match the task's board — a mission
+    /// may not judge another board's tasks. Absent = owner/dashboard call,
+    /// which passes on auth alone.
+    #[serde(default)]
+    pub boss_mission_id: Option<Uuid>,
+}
+
+/// A mission may only act on its own board; the owner (no mission id) may act
+/// on any.
+fn assert_board_ownership(
+    task: &BoardTask,
+    caller: Option<Uuid>,
+) -> Result<(), (StatusCode, String)> {
+    match caller {
+        Some(caller) if caller != task.boss_mission_id => Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "task `{}` belongs to boss {}, not {} — a mission may only judge its own board",
+                task.task_key, task.boss_mission_id, caller
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// POST /api/control/board/tasks/:task_id/verdict — boss judgment on a
@@ -4623,6 +4647,7 @@ pub async fn board_task_verdict(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or((StatusCode::NOT_FOUND, format!("task {} not found", task_id)))?;
+    assert_board_ownership(&task, req.boss_mission_id)?;
 
     match req.action.as_str() {
         "accept" => {
@@ -4714,12 +4739,20 @@ pub async fn board_task_verdict(
     Ok(Json(task))
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct CancelBoardTaskRequest {
+    /// See `BoardVerdictRequest::boss_mission_id`.
+    #[serde(default)]
+    pub boss_mission_id: Option<Uuid>,
+}
+
 /// POST /api/control/board/tasks/:task_id/cancel — mark a task cancelled.
 /// A running worker is left to finish its current turn; its settle is ignored.
 pub async fn cancel_board_task(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(task_id): Path<Uuid>,
+    body: Option<Json<CancelBoardTaskRequest>>,
 ) -> Result<Json<BoardTask>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let mut task = control
@@ -4728,6 +4761,7 @@ pub async fn cancel_board_task(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or((StatusCode::NOT_FOUND, format!("task {} not found", task_id)))?;
+    assert_board_ownership(&task, body.and_then(|Json(req)| req.boss_mission_id))?;
     if task.status.is_terminal() {
         return Err((
             StatusCode::CONFLICT,

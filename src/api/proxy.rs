@@ -82,6 +82,54 @@ fn error_response(status: StatusCode, message: String, code: &str) -> Response {
     (status, Json(body)).into_response()
 }
 
+const DEFAULT_COOLDOWN_RETRY_AFTER_SECS: u64 = 60;
+const MAX_COOLDOWN_RETRY_AFTER_SECS: u64 = 60;
+
+fn cooldown_retry_after_secs() -> u64 {
+    std::env::var("PROXY_COOLDOWN_RETRY_AFTER_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_COOLDOWN_RETRY_AFTER_SECS)
+        .clamp(1, MAX_COOLDOWN_RETRY_AFTER_SECS)
+}
+
+fn cooldown_error_response_with_retry_after(chain_id: &str, retry_after_secs: u64) -> Response {
+    let mut response = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "All providers in chain '{}' are currently in cooldown or unconfigured",
+            chain_id
+        ),
+        "rate_limit_exceeded",
+    );
+    let retry_after = retry_after_secs
+        .clamp(1, MAX_COOLDOWN_RETRY_AFTER_SECS)
+        .to_string();
+    if let Ok(value) = HeaderValue::from_str(&retry_after) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+fn cooldown_error_response(chain_id: &str) -> Response {
+    cooldown_error_response_with_retry_after(chain_id, cooldown_retry_after_secs())
+}
+
+fn unavailable_chain_response(chain_id: &str, provider_in_cooldown: bool) -> Response {
+    if provider_in_cooldown {
+        cooldown_error_response(chain_id)
+    } else {
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "No configured or routable providers are available for chain '{}'",
+                chain_id
+            ),
+            "provider_configuration_error",
+        )
+    }
+}
+
 #[derive(Serialize)]
 struct DeferredAcceptedResponse {
     request_id: uuid::Uuid,
@@ -725,7 +773,13 @@ pub(crate) async fn chat_completions_inner(
         }
     };
 
-    let (chain_id, entries) = if let Some(id) = resolved_chain_id {
+    let (chain_id, chain_entries, entries) = if let Some(id) = resolved_chain_id {
+        let chain_entries = state
+            .chain_store
+            .get(&id)
+            .await
+            .map(|chain| chain.entries)
+            .unwrap_or_default();
         let entries = state
             .chain_store
             .resolve_chain(
@@ -735,12 +789,13 @@ pub(crate) async fn chat_completions_inner(
                 &state.health_tracker,
             )
             .await;
-        (id, entries)
+        (id, chain_entries, entries)
     } else if let Some(direct) = parse_direct_model_entry(&requested_model)
         .or(parse_custom_direct_model_entry(&state, &requested_model).await)
     {
         // Direct provider/model passthrough (single synthetic entry) — either a
         // built-in provider prefix or a custom provider's sanitized name.
+        let chain_entries = vec![direct.clone()];
         let entries = state
             .chain_store
             .resolve_entries(
@@ -750,7 +805,7 @@ pub(crate) async fn chat_completions_inner(
                 &state.health_tracker,
             )
             .await;
-        (requested_model.clone(), entries)
+        (requested_model.clone(), chain_entries, entries)
     } else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -776,14 +831,26 @@ pub(crate) async fn chat_completions_inner(
         if defer_on_rate_limit {
             return enqueue_deferred_request(&state, &headers, &chain_id, &body).await;
         }
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "All providers in chain '{}' are currently in cooldown or unconfigured",
-                chain_id
-            ),
-            "rate_limit_exceeded",
-        );
+        let candidate_account_ids = state
+            .chain_store
+            .configured_account_ids(&chain_entries, &state.ai_providers, &standard_accounts)
+            .await;
+        let candidate_subscription_keys = state
+            .chain_store
+            .configured_subscription_keys(&chain_entries, &state.ai_providers)
+            .await;
+        // Account-level OR subscription-level: a sibling held back only by a
+        // shared subscription lane (possibly inherited from a since-deleted
+        // account) still means "retry later", not "misconfigured".
+        let provider_in_cooldown = state
+            .health_tracker
+            .any_account_has_active_cooldown(&candidate_account_ids)
+            .await
+            || state
+                .health_tracker
+                .any_subscription_cooldown_active(&candidate_subscription_keys)
+                .await;
+        return unavailable_chain_response(&chain_id, provider_in_cooldown);
     }
 
     // 4. Try each entry in order (waterfall)
@@ -2282,15 +2349,7 @@ pub(crate) async fn chat_completions_inner(
         if defer_on_rate_limit {
             return enqueue_deferred_request(&state, &headers, &chain_id, &body).await;
         }
-        error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "All {} providers in chain '{}' are rate-limited or unavailable",
-                entries.len(),
-                chain_id
-            ),
-            "rate_limit_exceeded",
-        )
+        cooldown_error_response(&chain_id)
     }
 }
 
@@ -5226,6 +5285,51 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::StreamExt;
+
+    #[test]
+    fn cooldown_error_includes_retry_after_header() {
+        let response = cooldown_error_response_with_retry_after("zai/glm-5.2", 60);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("60")
+        );
+    }
+
+    #[test]
+    fn cooldown_retry_after_is_capped_at_sixty_seconds() {
+        let response = cooldown_error_response_with_retry_after("muse/muse-spark-1.2", 3600);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("60")
+        );
+    }
+
+    #[test]
+    fn unconfigured_chain_is_not_reported_as_retryable_cooldown() {
+        let response = unavailable_chain_response("zai/glm-5.2", false);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
+    }
+
+    #[test]
+    fn cooled_down_chain_is_reported_as_retryable() {
+        let response = unavailable_chain_response("zai/glm-5.2", true);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("60")
+        );
+    }
 
     /// Feed an input as a single chunk and flush; the full-content path.
     fn strip_once(input: &str) -> String {
