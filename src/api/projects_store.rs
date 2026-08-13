@@ -201,8 +201,7 @@ impl ProjectsStore {
             "authority",
             "authority TEXT NOT NULL DEFAULT 'escalation'",
         )?;
-        let added_status =
-            Self::ensure_column(connection, "project_decisions", "status", "status TEXT")?;
+        Self::ensure_column(connection, "project_decisions", "status", "status TEXT")?;
         Self::ensure_column(connection, "project_decisions", "answer", "answer TEXT")?;
         Self::ensure_column(
             connection,
@@ -221,16 +220,18 @@ impl ProjectsStore {
             "CREATE INDEX IF NOT EXISTS idx_project_decisions_status \
              ON project_decisions(slug, status);",
         )?;
-        if added_status {
-            // Legacy rows were all owner escalations: open ones become
-            // pending_user, resolved ones answered.
-            connection.execute(
-                "UPDATE project_decisions SET status = \
-                 CASE WHEN answered = 1 THEN 'answered' ELSE 'pending_user' END \
-                 WHERE status IS NULL",
-                [],
-            )?;
-        }
+        // Normalize every row missing a status — unconditionally, not only
+        // when the column was just added: after a rollback, the OLD binary's
+        // legacy INSERT writes rows with `status` NULL into the already-
+        // migrated table, and those must land as escalations on the next
+        // upgrade too. Idempotent (WHERE status IS NULL), so it costs nothing
+        // on a healthy database.
+        connection.execute(
+            "UPDATE project_decisions SET status = \
+             CASE WHEN answered = 1 THEN 'answered' ELSE 'pending_user' END \
+             WHERE status IS NULL",
+            [],
+        )?;
         Ok(())
     }
 
@@ -1856,6 +1857,29 @@ mod tests {
         assert_eq!(open[0].status.as_deref(), Some("pending_user"));
         // Migrating twice is harmless.
         ProjectsStore::initialize(&store.connection.lock().unwrap()).expect("re-migrate");
+
+        // Rollback shape: an OLD binary writing into the already-migrated
+        // table leaves status NULL (its INSERT names only the legacy
+        // columns). The next initialize() must normalize that row even
+        // though the column already exists.
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO project_decisions (slug, at, question, rationale, answered) \
+                 VALUES ('lido', '2026-08-02T10:00:00Z', 'written during rollback', NULL, 0)",
+                [],
+            )
+            .expect("legacy insert");
+        ProjectsStore::initialize(&store.connection.lock().unwrap())
+            .expect("post-rollback migrate");
+        let open = store.open_decisions("lido").expect("open after rollback");
+        assert!(
+            open.iter().any(|d| d.question == "written during rollback"
+                && d.status.as_deref() == Some("pending_user")),
+            "a rollback-era row must surface as a pending escalation: {open:?}"
+        );
     }
 
     // ---- unrouted deliveries ----
