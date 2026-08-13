@@ -84,6 +84,14 @@ export interface ProjectRow {
   attention_reasons: string[];
   health: ProjectHealth;
   conversation?: ProjectConversation | null;
+  /** Roster mode (`active` / `blocked[:cause]` / `paused`). Prefer this over
+   *  guessing from `latest_update` when the last delivery was `[SILENT]`. */
+  mode?: string | null;
+  controller_health?: "healthy" | "stale" | "missing" | null;
+  delivery_health?: "reaching_user" | "misrouted" | "dropped" | null;
+  progress_state?: "working" | "waiting_external" | "blocked" | null;
+  pending_decisions?: number;
+  autonomy_level?: string | null;
 }
 
 export interface ProjectsOverview {

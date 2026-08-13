@@ -7441,7 +7441,7 @@ fn resolve_codex_native_binary_search_paths(
     paths
 }
 
-fn resolve_host_executable(program: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn resolve_host_executable(program: &str) -> Option<std::path::PathBuf> {
     if program.contains('/') {
         let p = std::path::PathBuf::from(program);
         if p.is_file() {
@@ -7521,7 +7521,7 @@ fn host_executable_available(program: &str) -> bool {
     }
 }
 
-fn copy_host_executable_into_container(
+pub(crate) fn copy_host_executable_into_container(
     workspace: &crate::workspace::Workspace,
     host_executable: &std::path::Path,
 ) -> Result<String, String> {
@@ -8968,6 +8968,59 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn copy_host_executable_follows_a_symlink_and_writes_a_real_binary() {
+        let host = tempfile::tempdir().unwrap();
+        let container = tempfile::tempdir().unwrap();
+        let real = host.path().join("grok-linux-x86_64");
+        fs::write(&real, b"#!/bin/sh\necho grok-ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+            symlink(&real, host.path().join("grok")).unwrap();
+        }
+        #[cfg(not(unix))]
+        fs::copy(&real, host.path().join("grok")).unwrap();
+
+        let workspace = crate::workspace::Workspace {
+            id: Uuid::new_v4(),
+            name: "assistant".into(),
+            workspace_type: WorkspaceType::Container,
+            path: container.path().to_path_buf(),
+            status: crate::workspace::WorkspaceStatus::Ready,
+            error_message: None,
+            config: serde_json::json!({}),
+            template: None,
+            distro: None,
+            env_vars: Default::default(),
+            init_scripts: Vec::new(),
+            init_script: None,
+            created_at: chrono::Utc::now(),
+            skills: Vec::new(),
+            plugins: Vec::new(),
+            shared_network: None,
+            tailscale_mode: None,
+            mcps: Vec::new(),
+            mcps_replace_defaults: true,
+            config_profile: None,
+            resolved_git_credentials: None,
+            read_only_command_guard_dir: None,
+            harness_versions: None,
+        };
+        let dest =
+            super::copy_host_executable_into_container(&workspace, &host.path().join("grok"))
+                .expect("copy");
+        assert_eq!(dest, "/usr/local/bin/grok");
+        let copied = container.path().join("usr/local/bin/grok");
+        assert!(copied.is_file(), "copied path must be a regular file");
+        assert!(
+            !copied.symlink_metadata().unwrap().file_type().is_symlink(),
+            "must not re-create the host symlink inside the container"
+        );
+        assert_eq!(fs::read(&copied).unwrap(), fs::read(&real).unwrap());
+    }
 
     #[test]
     fn mission_working_directory_maps_container_guest_absolute_path() {

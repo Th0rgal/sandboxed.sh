@@ -28,6 +28,28 @@ async fn ensure_grok_cli_available(
         return Ok(cli_path.to_string());
     }
 
+    // Host-copy first, same as Codex/OpenCode. The assistant container had a
+    // dangling symlink at /usr/local/bin/grok → /root/.grok/downloads/... so
+    // `ls` on the overlay looked fine and `command -v grok` inside nspawn
+    // failed (Verity #2332 writer 08306fdb, 2026-08-13).
+    if workspace_exec.workspace.workspace_type == crate::workspace::WorkspaceType::Container {
+        if let Some(host) = resolve_host_executable(program)
+            .or_else(|| resolve_host_executable("/usr/local/bin/grok"))
+        {
+            if let Ok(dest) = copy_host_executable_into_container(&workspace_exec.workspace, &host)
+            {
+                if command_available(workspace_exec, cwd, &dest).await {
+                    tracing::info!(
+                        host = %host.display(),
+                        dest,
+                        "Copied host Grok CLI into container workspace"
+                    );
+                    return Ok(dest);
+                }
+            }
+        }
+    }
+
     let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_GROK", true);
     if !auto_install {
         return Err(format!(
