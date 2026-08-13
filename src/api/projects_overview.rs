@@ -894,6 +894,7 @@ pub async fn project_tasks(
                     "id": null,
                     "task_key": proposal.task_key,
                     "title": proposal.title,
+                    "prompt": proposal.prompt,
                     "status": "proposed",
                     "depends_on": proposal.depends_on,
                     "acceptance_criteria": proposal.acceptance_criteria,
@@ -996,8 +997,33 @@ pub struct UpdateProposalRequest {
     pub depends_on: Option<Vec<String>>,
 }
 
+/// A proposal whose key a boss mission has planned as a real board task is
+/// *adopted*: the roadmap read hides it, and editing/cancelling the hidden row
+/// would silently succeed while changing nothing the caller can see. Surface
+/// that as a conflict instead.
+async fn assert_not_adopted(
+    state: &Arc<AppState>,
+    slug: &str,
+    task_key: &str,
+) -> Result<(), (StatusCode, String)> {
+    let tasks = state
+        .control
+        .collect_project_board_tasks(slug)
+        .await
+        .map_err(store_err)?;
+    if tasks.iter().any(|task| task.task_key == task_key) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "proposal '{task_key}' was adopted as a board task — steer the boss mission instead"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// `PATCH /api/projects/:slug/tasks/:task_key` — edit an open proposal.
-/// 404 covers both "never proposed" and "already adopted/cancelled": once a
+/// 404 covers "never proposed" and "cancelled"; an adopted key is 409 — once a
 /// board task owns the key, edits belong to the boss mission's flow.
 pub async fn update_project_task(
     State(state): State<Arc<AppState>>,
@@ -1007,6 +1033,7 @@ pub async fn update_project_task(
     if !is_plain_key(&slug) || !is_plain_key(&task_key) {
         return Err(bad_slug());
     }
+    assert_not_adopted(&state, &slug, &task_key).await?;
     let updated = state
         .projects
         .update_proposal(
@@ -1038,6 +1065,7 @@ pub async fn cancel_project_task(
     if !is_plain_key(&slug) || !is_plain_key(&task_key) {
         return Err(bad_slug());
     }
+    assert_not_adopted(&state, &slug, &task_key).await?;
     let cancelled = state
         .projects
         .cancel_proposal(&slug, &task_key)

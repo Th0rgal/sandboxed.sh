@@ -764,6 +764,12 @@ impl ProjectsStore {
                 params![slug],
             )
             .map_err(|e| e.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM project_roadmap_proposals WHERE slug = ?1",
+                params![slug],
+            )
+            .map_err(|e| e.to_string())?;
         let removed = transaction
             .execute("DELETE FROM projects WHERE slug = ?1", params![slug])
             .map_err(|e| e.to_string())?
@@ -830,6 +836,7 @@ impl ProjectsStore {
             "project_tracks",
             "project_state_events",
             "project_decisions",
+            "project_roadmap_proposals",
         ] {
             transaction
                 .execute(
@@ -2016,6 +2023,16 @@ mod tests {
 
         // Unknown keys report false, not errors.
         assert!(!store.cancel_proposal("lido", "ghost").expect("ghost"));
+
+        // Proposals ride project lifecycle: rename moves them, delete drops them.
+        store.rename_project("lido", "lido-v2").expect("rename");
+        assert!(store.list_open_proposals("lido").expect("old").is_empty());
+        assert_eq!(store.list_open_proposals("lido-v2").expect("new").len(), 1);
+        assert!(store.delete_project("lido-v2").expect("delete"));
+        assert!(store
+            .list_open_proposals("lido-v2")
+            .expect("gone")
+            .is_empty());
     }
 
     #[test]
