@@ -315,22 +315,13 @@ impl ProviderHealthTracker {
             .unwrap_or(true) // Unknown accounts are healthy by default
     }
 
-    /// Return true when at least one known account for `provider_id` is in an
-    /// active cooldown. Built-in aliases are compared by canonical provider
-    /// type so routes such as `openai/...` and `codex/...` share health state.
-    pub async fn provider_has_active_cooldown(&self, provider_id: &str) -> bool {
-        let requested_type = crate::ai_providers::ProviderType::from_id(provider_id);
+    /// Return true when at least one currently configured candidate account is
+    /// in an active cooldown.
+    pub async fn any_account_has_active_cooldown(&self, account_ids: &[Uuid]) -> bool {
         let accounts = self.accounts.read().await;
-        accounts.values().any(|health| {
-            let same_provider = match (requested_type, health.provider_id.as_deref()) {
-                (Some(requested), Some(recorded)) => {
-                    crate::ai_providers::ProviderType::from_id(recorded) == Some(requested)
-                }
-                (None, Some(recorded)) => recorded == provider_id,
-                _ => false,
-            };
-            same_provider && health.is_in_cooldown()
-        })
+        account_ids
+            .iter()
+            .any(|id| accounts.get(id).is_some_and(AccountHealth::is_in_cooldown))
     }
 
     /// Check whether a shared subscription (e.g. Claude Pro org) is currently
@@ -1548,6 +1539,50 @@ impl ModelChainStore {
 
         resolved
     }
+
+    /// Return account IDs that are currently enabled, credentialed, and match
+    /// the requested entries, without filtering them through provider health.
+    /// Used to distinguish a real cooldown from an unconfigured route.
+    pub async fn configured_account_ids(
+        &self,
+        entries: &[ChainEntry],
+        ai_providers: &crate::ai_providers::AIProviderStore,
+        standard_accounts: &[StandardAccount],
+    ) -> Vec<Uuid> {
+        let mut ids = std::collections::HashSet::new();
+        for entry in entries {
+            let provider_type = crate::ai_providers::ProviderType::from_id(&entry.provider_id)
+                .unwrap_or(crate::ai_providers::ProviderType::Custom);
+            for account in ai_providers.get_all_by_type(provider_type).await {
+                if !account.has_credentials() {
+                    continue;
+                }
+                if matches!(provider_type, crate::ai_providers::ProviderType::Custom) {
+                    let matches = if entry.provider_id == "custom" {
+                        account
+                            .custom_models
+                            .as_ref()
+                            .is_some_and(|models| models.iter().any(|m| m.id == entry.model_id))
+                    } else {
+                        crate::api::providers::sanitize_custom_provider_id(&account.name)
+                            == entry.provider_id
+                    };
+                    if !matches {
+                        continue;
+                    }
+                }
+                ids.insert(account.id);
+            }
+            for account in standard_accounts {
+                if account.provider_type == provider_type
+                    && (account.api_key.is_some() || account.has_oauth)
+                {
+                    ids.insert(account.account_id);
+                }
+            }
+        }
+        ids.into_iter().collect()
+    }
 }
 
 /// Pick the credential the proxy will forward for a store account, returning
@@ -1603,7 +1638,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn provider_active_cooldown_is_detected_by_provider_id() {
+    async fn active_cooldown_is_detected_for_candidate_account_ids() {
         let tracker = ProviderHealthTracker::with_backoff(BackoffConfig {
             base_delay: std::time::Duration::from_secs(60),
             max_delay: std::time::Duration::from_secs(60),
@@ -1612,14 +1647,15 @@ mod tests {
             degraded_multiplier: 1.0,
         });
         let account_id = uuid::Uuid::new_v4();
+        let other_id = uuid::Uuid::new_v4();
         tracker.set_provider_id(account_id, "zai").await;
 
-        assert!(!tracker.provider_has_active_cooldown("zai").await);
+        assert!(!tracker.any_account_has_active_cooldown(&[account_id]).await);
         tracker
             .record_failure(account_id, CooldownReason::RateLimit, None)
             .await;
-        assert!(tracker.provider_has_active_cooldown("zai").await);
-        assert!(!tracker.provider_has_active_cooldown("muse").await);
+        assert!(tracker.any_account_has_active_cooldown(&[account_id]).await);
+        assert!(!tracker.any_account_has_active_cooldown(&[other_id]).await);
     }
 
     #[tokio::test]
@@ -1636,29 +1672,11 @@ mod tests {
         tracker
             .record_failure(account_id, CooldownReason::RateLimit, None)
             .await;
-        assert!(tracker.provider_has_active_cooldown("zai").await);
+        assert!(tracker.any_account_has_active_cooldown(&[account_id]).await);
 
         tracker.remove_account(account_id).await;
 
-        assert!(!tracker.provider_has_active_cooldown("zai").await);
-    }
-
-    #[tokio::test]
-    async fn provider_active_cooldown_is_detected_through_builtin_alias() {
-        let tracker = ProviderHealthTracker::with_backoff(BackoffConfig {
-            base_delay: std::time::Duration::from_secs(60),
-            max_delay: std::time::Duration::from_secs(60),
-            multiplier: 1.0,
-            circuit_breaker_threshold: 5,
-            degraded_multiplier: 1.0,
-        });
-        let account_id = uuid::Uuid::new_v4();
-        tracker.set_provider_id(account_id, "openai").await;
-        tracker
-            .record_failure(account_id, CooldownReason::RateLimit, None)
-            .await;
-
-        assert!(tracker.provider_has_active_cooldown("codex").await);
+        assert!(!tracker.any_account_has_active_cooldown(&[account_id]).await);
     }
 
     async fn store_with(providers: Vec<AIProvider>) -> AIProviderStore {
@@ -2045,6 +2063,51 @@ mod tests {
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].model_id, "freshly-discovered");
+    }
+
+    #[tokio::test]
+    async fn configured_account_ids_match_custom_name_and_generic_alias() {
+        let account = custom_account("Spark", "https://spark.example/v1", &["muse-spark-1.2"]);
+        let account_id = account.id;
+        let store = store_with(vec![account]).await;
+        let chains = store_with_chain("noop", vec![]).await;
+
+        for provider_id in ["spark", "custom"] {
+            let ids = chains
+                .configured_account_ids(
+                    &[ChainEntry {
+                        provider_id: provider_id.to_string(),
+                        model_id: "muse-spark-1.2".to_string(),
+                    }],
+                    &store,
+                    &[],
+                )
+                .await;
+            assert_eq!(ids, vec![account_id]);
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_account_ids_exclude_disabled_accounts() {
+        let mut account = custom_account("Spark", "https://spark.example/v1", &["muse-spark-1.2"]);
+        let account_id = account.id;
+        let store = store_with(vec![account.clone()]).await;
+        account.enabled = false;
+        store.update(account_id, account).await.unwrap();
+        let chains = store_with_chain("noop", vec![]).await;
+
+        let ids = chains
+            .configured_account_ids(
+                &[ChainEntry {
+                    provider_id: "spark".to_string(),
+                    model_id: "muse-spark-1.2".to_string(),
+                }],
+                &store,
+                &[],
+            )
+            .await;
+
+        assert!(ids.is_empty());
     }
 
     #[tokio::test]

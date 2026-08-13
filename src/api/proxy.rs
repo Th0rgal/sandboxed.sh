@@ -773,18 +773,12 @@ pub(crate) async fn chat_completions_inner(
         }
     };
 
-    let (chain_id, entries, provider_ids) = if let Some(id) = resolved_chain_id {
-        let provider_ids = state
+    let (chain_id, chain_entries, entries) = if let Some(id) = resolved_chain_id {
+        let chain_entries = state
             .chain_store
             .get(&id)
             .await
-            .map(|chain| {
-                chain
-                    .entries
-                    .iter()
-                    .map(|entry| entry.provider_id.clone())
-                    .collect::<Vec<_>>()
-            })
+            .map(|chain| chain.entries)
             .unwrap_or_default();
         let entries = state
             .chain_store
@@ -795,13 +789,13 @@ pub(crate) async fn chat_completions_inner(
                 &state.health_tracker,
             )
             .await;
-        (id, entries, provider_ids)
+        (id, chain_entries, entries)
     } else if let Some(direct) = parse_direct_model_entry(&requested_model)
         .or(parse_custom_direct_model_entry(&state, &requested_model).await)
     {
         // Direct provider/model passthrough (single synthetic entry) — either a
         // built-in provider prefix or a custom provider's sanitized name.
-        let provider_ids = vec![direct.provider_id.clone()];
+        let chain_entries = vec![direct.clone()];
         let entries = state
             .chain_store
             .resolve_entries(
@@ -811,7 +805,7 @@ pub(crate) async fn chat_completions_inner(
                 &state.health_tracker,
             )
             .await;
-        (requested_model.clone(), entries, provider_ids)
+        (requested_model.clone(), chain_entries, entries)
     } else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -837,17 +831,14 @@ pub(crate) async fn chat_completions_inner(
         if defer_on_rate_limit {
             return enqueue_deferred_request(&state, &headers, &chain_id, &body).await;
         }
-        let mut provider_in_cooldown = false;
-        for provider_id in &provider_ids {
-            if state
-                .health_tracker
-                .provider_has_active_cooldown(provider_id)
-                .await
-            {
-                provider_in_cooldown = true;
-                break;
-            }
-        }
+        let candidate_account_ids = state
+            .chain_store
+            .configured_account_ids(&chain_entries, &state.ai_providers, &standard_accounts)
+            .await;
+        let provider_in_cooldown = state
+            .health_tracker
+            .any_account_has_active_cooldown(&candidate_account_ids)
+            .await;
         return unavailable_chain_response(&chain_id, provider_in_cooldown);
     }
 
