@@ -1160,7 +1160,11 @@ function bodyWithoutHeadline(body: string, headline: string): string {
     .slice(index)
     .filter((line) => {
       const trimmed = line.trim();
-      return trimmed !== "[SILENT]" && !trimmed.startsWith("[STATE_SIGNATURE:");
+      return (
+        trimmed !== "[SILENT]" &&
+        !trimmed.startsWith("[STATE_SIGNATURE:") &&
+        !trimmed.startsWith("[CTRL:")
+      );
     })
     .join("\n");
 }

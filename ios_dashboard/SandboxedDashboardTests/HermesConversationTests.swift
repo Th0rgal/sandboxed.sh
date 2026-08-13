@@ -107,6 +107,45 @@ final class HermesConversationTests: XCTestCase {
         XCTAssertTrue(items.isEmpty)
     }
 
+    func testControllerTrailersAreHiddenFromAssistantHistory() {
+        let report = """
+            Formal repair is active.
+
+            [STATE_SIGNATURE: lean-silicon|formal|ff0f265b]
+            [CTRL: lean-silicon | mode=active | wait=0 | next=repair reachability]
+            """
+        let items = HermesTranscript.chatMessages(from: [
+            makeMessage(id: 1, role: "assistant", content: report)
+        ])
+
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].content, "Formal repair is active.")
+    }
+
+    func testDecisionTrailerIsHiddenFromAssistantHistory() {
+        let report = """
+            Merged the PR.
+
+            [DECISION: {"kind":"merge","authority":"granted","status":"decided","question":"Merged verity#2213"}]
+            [STATE_SIGNATURE: verity|phase|head]
+            """
+        let items = HermesTranscript.chatMessages(from: [
+            makeMessage(id: 1, role: "assistant", content: report)
+        ])
+
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].content, "Merged the PR.")
+    }
+
+    func testQuotedControllerTrailerRemainsVisible() {
+        let prose = "The format is [CTRL: project | mode=active] in old reports."
+        let items = HermesTranscript.chatMessages(from: [
+            makeMessage(id: 1, role: "assistant", content: prose)
+        ])
+
+        XCTAssertEqual(items.first?.content, prose)
+    }
+
     func testToolResultIsFoldedIntoItsCall() throws {
         let history = [
             makeMessage(

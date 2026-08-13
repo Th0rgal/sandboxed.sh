@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   extractStateSignatureKey,
   stateSignatureKeyFromMessages,
+  stripHermesControlTrailers,
   stripStateSignature,
 } from "./hermes-state-signature";
 
@@ -18,6 +19,40 @@ describe("stripStateSignature", () => {
   it("removes stacked trailing signatures", () => {
     const body = `Done.\n\n[STATE_SIGNATURE: a|b]\n[STATE_SIGNATURE: c|d]\n`;
     expect(stripStateSignature(body)).toBe("Done.");
+  });
+
+  it("removes a trailing CTRL status trailer", () => {
+    const body =
+      "Formal repair is active.\n\n[CTRL: lean-silicon | mode=active | wait=0 | next=repair reachability]";
+    expect(stripHermesControlTrailers(body)).toBe("Formal repair is active.");
+  });
+
+  it("removes mixed control trailers in either order", () => {
+    expect(
+      stripHermesControlTrailers(`Done.\n${SIGNATURE}\n[CTRL: lean-silicon | mode=active]`),
+    ).toBe("Done.");
+    expect(
+      stripHermesControlTrailers(`Done.\n[CTRL: lean-silicon | mode=active]\n${SIGNATURE}`),
+    ).toBe("Done.");
+  });
+
+  it("removes a trailing DECISION ledger trailer", () => {
+    const body =
+      'Merged the PR.\n\n[DECISION: {"kind":"merge","authority":"granted","status":"decided","question":"Merged verity#2213"}]';
+    expect(stripHermesControlTrailers(body)).toBe("Merged the PR.");
+    expect(
+      stripHermesControlTrailers(`Done.\n[DECISION: Ship v2?]\n${SIGNATURE}`),
+    ).toBe("Done.");
+  });
+
+  it("leaves DECISION metadata quoted mid-message intact", () => {
+    const body = "Use [DECISION: question] as the fallback format in reports.";
+    expect(stripHermesControlTrailers(body)).toBe(body);
+  });
+
+  it("leaves CTRL metadata quoted mid-message intact", () => {
+    const body = "The old format was [CTRL: project | mode=active] in reports.";
+    expect(stripHermesControlTrailers(body)).toBe(body);
   });
 
   it("leaves a signature quoted mid-message intact", () => {

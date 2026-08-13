@@ -1,6 +1,6 @@
 import type { HermesMessage } from "@/lib/api";
 import type { HermesGatewayEvent } from "@/lib/hermes-gateway";
-import { stripStateSignature } from "@/lib/hermes-state-signature";
+import { stripHermesControlTrailers } from "@/lib/hermes-state-signature";
 import type { ChatItem } from "./events-reducer";
 
 /**
@@ -60,11 +60,10 @@ export function hermesHistoryToItems(messages: HermesMessage[]): ChatItem[] {
       message.id == null ? localId("hh") : `hermes-msg-${String(message.id)}`;
     const timestamp = parseTimestamp(message.timestamp);
     const rawContent = (message.content ?? "").trim();
-    // STATE_SIGNATURE trailers are controller routing metadata, not prose:
-    // strip them from conversational rows. Tool results keep the raw text —
-    // a tool output that legitimately ends with a signature (e.g. reading
-    // the tracker page) must not be truncated.
-    const content = stripStateSignature(rawContent).trim();
+    // Controller trailers are control-plane metadata, not prose: strip them
+    // from conversational rows. Tool results keep the raw text — a tool
+    // output that legitimately ends with a trailer must not be truncated.
+    const content = stripHermesControlTrailers(rawContent).trim();
 
     if (message.role === "user") {
       if (content) {
@@ -276,7 +275,7 @@ export class HermesLiveTranscript {
 
   private finalizeAssistant(finalText?: string) {
     this.finalizeThinking();
-    const text = stripStateSignature(finalText ?? this.streamText).trim();
+    const text = stripHermesControlTrailers(finalText ?? this.streamText).trim();
     const streamId = this.streamItemId;
     this.streamItemId = null;
     this.streamText = "";
