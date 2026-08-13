@@ -335,6 +335,128 @@ pub async fn upsert_project(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RenameProjectRequest {
+    pub new_slug: String,
+}
+
+/// `POST /api/projects/:slug/rename` — move a project to a new slug.
+///
+/// A rename is "move the canonical + leave a forwarding pointer": the store
+/// rows move in one transaction, then the alias map gains `old → new` (and any
+/// alias that pointed at `old` is flattened onto `new` — `resolve_alias` is
+/// single-hop, so a chain would silently stop resolving). External references
+/// — mission project tags, cron `deliver: project:<old>`, `[CTRL: old | …]`
+/// signatures, tracker files — are deliberately not rewritten: the alias
+/// covers them indefinitely.
+///
+/// Renaming onto an existing project or an established alias key is refused:
+/// the first is a merge (explicit, via routes.json), the second would shadow
+/// whatever that key already routes to.
+pub async fn rename_project(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(req): Json<RenameProjectRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let new_slug = req.new_slug.trim();
+    if !is_plain_key(&slug) || !is_plain_key(new_slug) {
+        return Err(bad_slug());
+    }
+    if new_slug == slug {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "new slug is identical to the current one".to_string(),
+        ));
+    }
+    let dir = hermes_projects_dir();
+    if let Some(dir) = &dir {
+        let aliases = read_alias_map(dir);
+        if aliases.contains_key(new_slug) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "'{new_slug}' is already an alias for '{}' — pick another name or remove the alias first",
+                    aliases[new_slug]
+                ),
+            ));
+        }
+    }
+    let record = state
+        .projects
+        .rename_project(&slug, new_slug)
+        .map_err(|error| {
+            if error.contains("not found") {
+                (StatusCode::NOT_FOUND, error)
+            } else if error.contains("already exists") {
+                (StatusCode::CONFLICT, error)
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, error)
+            }
+        })?;
+    let mut aliases_flattened = 0usize;
+    if let Some(dir) = &dir {
+        aliases_flattened = rewrite_aliases_for_rename(dir, &slug, new_slug).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "project rows moved to '{new_slug}' but routes.json update failed ({error}); \
+                     add \"{slug}\": \"{new_slug}\" to it manually or deliveries keyed '{slug}' will unroute"
+                ),
+            )
+        })?;
+        // A board override (paused/archived) follows the project it describes.
+        let mut overrides = read_overrides(dir);
+        if let Some(value) = overrides.remove(&slug) {
+            overrides.insert(new_slug.to_string(), value);
+            write_overrides(dir, &overrides).map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("write board-overrides.json: {error}"),
+                )
+            })?;
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "project": record,
+        "old_slug": slug,
+        "alias_written": dir.is_some(),
+        "aliases_flattened": aliases_flattened,
+    })))
+}
+
+/// Rewrite routes.json for a rename: every alias pointing at `old` is
+/// flattened onto `new` (single-hop resolution — a chain through `old` would
+/// dead-end), then `old → new` itself is added. Returns how many existing
+/// entries were flattened. Written atomically (tmp + rename), like the
+/// overrides file.
+fn rewrite_aliases_for_rename(dir: &Path, old: &str, new: &str) -> std::io::Result<usize> {
+    let mut aliases = read_alias_map(dir);
+    let mut flattened = 0usize;
+    for target in aliases.values_mut() {
+        if target == old {
+            *target = new.to_string();
+            flattened += 1;
+        }
+    }
+    aliases.insert(old.to_string(), new.to_string());
+    let serialized = serde_json::to_string_pretty(&aliases)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let path = dir.join("routes.json");
+    let tmp = dir.join(".routes.json.tmp");
+    std::fs::write(&tmp, serialized)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(flattened)
+}
+
+fn write_overrides(dir: &Path, overrides: &HashMap<String, String>) -> std::io::Result<()> {
+    let serialized = serde_json::to_string_pretty(overrides)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let tmp = dir.join(".board-overrides.json.tmp");
+    std::fs::write(&tmp, serialized)?;
+    std::fs::rename(&tmp, overrides_path(dir))?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SetStatusRequest {
     pub mode: String,
     pub next_action: Option<String>,
@@ -743,6 +865,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/:slug/tasks", get(project_tasks))
         .route("/:slug/updates", get(project_updates))
         .route("/:slug/action", axum::routing::post(project_action))
+        .route("/:slug/rename", axum::routing::post(rename_project))
         .route("/:slug/status", axum::routing::post(set_project_status))
         .route("/:slug/track", axum::routing::post(set_project_track))
         .route(
@@ -780,6 +903,63 @@ fn hermes_state_db() -> Option<PathBuf> {
         .ok()
         .map(PathBuf::from)
         .filter(|path| path.is_file())
+}
+
+/// The Hermes cron scheduler's jobs file, next to `state.db` in the Hermes
+/// home (`<home>/cron/jobs.json`). Overridable for tests and non-standard
+/// layouts via `HERMES_CRON_JOBS`.
+fn hermes_cron_jobs_path() -> Option<PathBuf> {
+    std::env::var("HERMES_CRON_JOBS")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            hermes_state_db().and_then(|db| db.parent().map(|home| home.join("cron/jobs.json")))
+        })
+        .filter(|path| path.is_file())
+}
+
+/// Scheduler-side controller heartbeats: job id → last successful run
+/// (RFC3339). Read from the Hermes cron jobs file; only enabled jobs whose
+/// last run succeeded count — a job erroring every tick is not a heartbeat.
+/// Best-effort: a missing or malformed file yields an empty map, never an
+/// error (the board must render without Hermes on disk).
+fn read_controller_heartbeats(path: Option<PathBuf>) -> HashMap<String, String> {
+    let Some(path) = path else {
+        return HashMap::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return HashMap::new();
+    };
+    let jobs = match &value {
+        serde_json::Value::Object(map) => match map.get("jobs") {
+            Some(serde_json::Value::Array(jobs)) => jobs.as_slice(),
+            _ => return HashMap::new(),
+        },
+        serde_json::Value::Array(jobs) => jobs.as_slice(),
+        _ => return HashMap::new(),
+    };
+    jobs.iter()
+        .filter_map(|job| {
+            let id = job.get("id")?.as_str()?;
+            if !job
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            if job.get("last_status").and_then(|v| v.as_str()) != Some("ok") {
+                return None;
+            }
+            let last_run = job.get("last_run_at")?.as_str()?;
+            // Normalize to RFC3339 UTC so `finish()` parses it uniformly.
+            let at = chrono::DateTime::parse_from_rfc3339(last_run).ok()?;
+            Some((id.to_string(), at.with_timezone(&chrono::Utc).to_rfc3339()))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -869,6 +1049,12 @@ struct ProjectRow {
     /// controller ↔ project link.
     #[serde(skip_serializing_if = "Option::is_none")]
     controller_cron_id: Option<String>,
+    /// When the linked controller job last ran successfully (from the Hermes
+    /// cron scheduler), regardless of whether it delivered anything. A
+    /// controller that answers `[SILENT]` for hours is quiet, not dead — this
+    /// is the signal that lets the board tell the two apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    controller_heartbeat_at: Option<String>,
     /// The roster record's controller-reported mode (`active` / `blocked` /
     /// `paused`), surfaced directly on the row. Also still rides on
     /// `latest_update.mode` for compatibility.
@@ -1165,9 +1351,18 @@ pub async fn projects_overview(
         }
     }
 
+    // Scheduler-side heartbeats, resolved once per request: a controller that
+    // ran successfully but delivered nothing ([SILENT] ticks) still proves it
+    // is alive.
+    let heartbeats = read_controller_heartbeats(hermes_cron_jobs_path());
     let mut projects: Vec<ProjectRow> = rows
         .into_values()
-        .map(|builder| {
+        .map(|mut builder| {
+            builder.controller_heartbeat_at = builder
+                .controller_cron_id
+                .as_ref()
+                .and_then(|id| heartbeats.get(id))
+                .cloned();
             let forced = overrides.get(&builder.slug).cloned();
             let binding = bindings.get(&builder.slug).cloned();
             builder.finish(&archived, forced.as_deref(), binding, &now)
@@ -1283,6 +1478,9 @@ struct ProjectRowBuilder {
     /// Roster mode + controller link, attached alongside title/next_action.
     mode: Option<String>,
     controller_cron_id: Option<String>,
+    /// Last successful run of the linked controller job (scheduler-side
+    /// heartbeat), resolved by the handler from the Hermes cron jobs file.
+    controller_heartbeat_at: Option<String>,
     tracker: Option<TrackerInfo>,
     missions: Vec<MissionChip>,
     /// Health inputs, accumulated alongside the display chips.
@@ -1304,6 +1502,7 @@ impl ProjectRowBuilder {
             next_action: None,
             mode: None,
             controller_cron_id: None,
+            controller_heartbeat_at: None,
             tracker: None,
             missions: Vec::new(),
             health_inputs: Vec::new(),
@@ -1500,9 +1699,21 @@ impl ProjectRowBuilder {
                 now.signed_duration_since(at) <= chrono::Duration::hours(STALE_ACTIVE_HOURS)
             })
             .unwrap_or(false);
+        // Scheduler-side heartbeat: the linked job ran successfully recently,
+        // even if it delivered nothing ([SILENT] ticks produce no state event).
+        // A quiet controller is not a dead one.
+        let heartbeat_within_stale_window = self
+            .controller_heartbeat_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .zip(now_parsed)
+            .map(|(at, now)| {
+                now.signed_duration_since(at) <= chrono::Duration::hours(STALE_ACTIVE_HOURS)
+            })
+            .unwrap_or(false);
         let controller_health: Option<&'static str> =
             if claims_active || self.controller_cron_id.is_some() {
-                if signal_within_stale_window || has_live_mission {
+                if signal_within_stale_window || has_live_mission || heartbeat_within_stale_window {
                     // Something is clearly driving it (fresh delivery or live
                     // work) — don't cry wolf over a missing link when the engine
                     // is demonstrably running. The link mismatch is a P2 concern.
@@ -1602,6 +1813,7 @@ impl ProjectRowBuilder {
             bucket,
             board_override: forced.map(str::to_string),
             controller_cron_id: self.controller_cron_id,
+            controller_heartbeat_at: self.controller_heartbeat_at,
             mode: self.mode,
             controller_health,
             delivery_health,
@@ -2160,6 +2372,56 @@ mod tests {
         assert_eq!(humanize_slug(""), "");
     }
 
+    /// A rename flattens every alias that pointed at the old slug and adds the
+    /// forwarding entry — `resolve_alias` is single-hop, so `x → old → new`
+    /// would dead-end at a slug that no longer exists.
+    #[test]
+    fn rename_alias_rewrite_flattens_chains_and_adds_forwarding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("routes.json"),
+            r#"{"coldcard": "old-name", "coldcard-rng": "old-name", "lido": "verity-lido"}"#,
+        )
+        .expect("seed");
+
+        let flattened =
+            rewrite_aliases_for_rename(dir.path(), "old-name", "new-name").expect("rewrite");
+        assert_eq!(flattened, 2);
+
+        let aliases = read_alias_map(dir.path());
+        assert_eq!(
+            aliases.get("coldcard").map(String::as_str),
+            Some("new-name")
+        );
+        assert_eq!(
+            aliases.get("coldcard-rng").map(String::as_str),
+            Some("new-name")
+        );
+        assert_eq!(
+            aliases.get("old-name").map(String::as_str),
+            Some("new-name")
+        );
+        assert_eq!(aliases.get("lido").map(String::as_str), Some("verity-lido"));
+        // Single-hop resolution now lands every historical key on the new slug.
+        assert_eq!(resolve_alias(&aliases, "coldcard"), "new-name");
+        assert_eq!(resolve_alias(&aliases, "old-name"), "new-name");
+    }
+
+    /// With no routes.json yet, a rename creates one containing only the
+    /// forwarding entry.
+    #[test]
+    fn rename_alias_rewrite_creates_the_map_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let flattened =
+            rewrite_aliases_for_rename(dir.path(), "old-name", "new-name").expect("rewrite");
+        assert_eq!(flattened, 0);
+        let aliases = read_alias_map(dir.path());
+        assert_eq!(
+            aliases.get("old-name").map(String::as_str),
+            Some("new-name")
+        );
+    }
+
     #[test]
     fn resolve_alias_folds_known_keys_and_passes_through_the_rest() {
         let mut aliases = HashMap::new();
@@ -2555,6 +2817,63 @@ mod tests {
         let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
         assert_eq!(row.bucket, "attention");
         assert!(row.attention_reasons.iter().any(|r| r.contains("Failed")));
+    }
+
+    /// A controller that runs on schedule but delivers nothing ([SILENT]
+    /// ticks) is quiet, not dead: a fresh scheduler heartbeat keeps
+    /// `controller_health=healthy` even when the last state event is old.
+    #[test]
+    fn silent_controller_with_fresh_heartbeat_is_healthy() {
+        let mut builder = ProjectRowBuilder::new("lean-silicon".to_string());
+        builder.mode = Some("active".to_string());
+        builder.controller_cron_id = Some("job42".to_string());
+        // Last delivered state is 2 days old …
+        builder.attach_store_update(active_update("2026-08-02T12:00:00Z", None), 1, 5);
+        // … but the job itself ran successfully 10 minutes ago.
+        builder.controller_heartbeat_at = Some("2026-08-04T11:50:00+00:00".to_string());
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.controller_health, Some("healthy"));
+        assert_eq!(
+            row.controller_heartbeat_at.as_deref(),
+            Some("2026-08-04T11:50:00+00:00")
+        );
+    }
+
+    /// Without a heartbeat the same silent controller is `stale` — the field
+    /// is what separates the two regimes.
+    #[test]
+    fn silent_controller_without_heartbeat_stays_stale() {
+        let mut builder = ProjectRowBuilder::new("lean-silicon".to_string());
+        builder.mode = Some("active".to_string());
+        builder.controller_cron_id = Some("job42".to_string());
+        builder.attach_store_update(active_update("2026-08-02T12:00:00Z", None), 1, 5);
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.controller_health, Some("stale"));
+    }
+
+    /// jobs.json → heartbeat map: only enabled jobs whose last run succeeded
+    /// count, and timestamps normalize to UTC.
+    #[test]
+    fn heartbeats_read_only_successful_enabled_jobs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jobs.json");
+        std::fs::write(
+            &path,
+            r#"{"jobs": [
+                {"id": "ok1", "enabled": true, "last_status": "ok", "last_run_at": "2026-08-13T12:33:20.283248+02:00"},
+                {"id": "err1", "enabled": true, "last_status": "error", "last_run_at": "2026-08-13T12:14:43+02:00"},
+                {"id": "off1", "enabled": false, "last_status": "ok", "last_run_at": "2026-08-13T12:14:43+02:00"},
+                {"id": "new1", "enabled": true, "last_status": null, "last_run_at": null}
+            ]}"#,
+        )
+        .expect("seed");
+        let map = read_controller_heartbeats(Some(path));
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get("ok1").map(String::as_str),
+            Some("2026-08-13T10:33:20.283248+00:00")
+        );
+        assert!(read_controller_heartbeats(None).is_empty());
     }
 
     /// Honesty read-model: an active project whose engine is gone (no fresh
