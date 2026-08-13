@@ -126,6 +126,44 @@ struct SetProjectGrantParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct ProposalTaskInput {
+    task_key: String,
+    title: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanProjectTasksParams {
+    slug: String,
+    tasks: Vec<ProposalTaskInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateProjectTaskParams {
+    slug: String,
+    task_key: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    acceptance_criteria: Option<Vec<String>>,
+    #[serde(default)]
+    depends_on: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelProjectTaskParams {
+    slug: String,
+    task_key: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct RecordProjectDecisionParams {
     slug: String,
     question: String,
@@ -1586,6 +1624,59 @@ impl AssistantMcp {
                 }),
             },
             ToolDefinition {
+                name: "plan_project_tasks".to_string(),
+                description: "Plan roadmap items for a project from conversation. Creates proposals (status 'proposed') on the project's roadmap — visible to the owner and to the project's controller, which turns them into real board tasks when it dispatches work (a board task under the same task_key supersedes the proposal). Re-planning an existing key updates it.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "tasks"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "tasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["task_key", "title"],
+                                "properties": {
+                                    "task_key": {"type": "string", "description": "Stable kebab-case key, unique within the project."},
+                                    "title": {"type": "string"},
+                                    "prompt": {"type": "string", "description": "What a worker should actually do, if known."},
+                                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                                    "depends_on": {"type": "array", "items": {"type": "string"}}
+                                }
+                            }
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "update_project_task".to_string(),
+                description: "Edit an open roadmap proposal (title, prompt, acceptance criteria, dependencies). Only proposals are editable — once a boss mission plans the key as a real board task, edits flow through that mission.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "task_key"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "task_key": {"type": "string"},
+                        "title": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                        "depends_on": {"type": "array", "items": {"type": "string"}}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "cancel_project_task".to_string(),
+                description: "Cancel an open roadmap proposal. Board tasks already adopted by a boss mission are not touched — cancel those through the mission's own board.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "task_key"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "task_key": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
                 name: "link_mission_to_project".to_string(),
                 description: "Tag a mission as belonging to your project (and optionally a track), so it appears in the project's inventory. Use this for missions you dispatch that must be grouped under the project — a worker with no project tag is invisible in the roster.".to_string(),
                 input_schema: json!({
@@ -2625,6 +2716,56 @@ impl AssistantMcp {
         Self::response_value(response, "get project tasks").await
     }
 
+    async fn plan_project_tasks(&self, params: PlanProjectTasksParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let tasks: Vec<Value> = params
+            .tasks
+            .iter()
+            .map(|task| {
+                json!({
+                    "task_key": task.task_key,
+                    "title": task.title,
+                    "prompt": task.prompt,
+                    "acceptance_criteria": task.acceptance_criteria,
+                    "depends_on": task.depends_on,
+                })
+            })
+            .collect();
+        let response = self
+            .api_post(
+                &format!("/api/projects/{slug}/tasks"),
+                json!({ "tasks": tasks }),
+            )
+            .await?;
+        Self::response_value(response, "plan project tasks").await
+    }
+
+    async fn update_project_task(&self, params: UpdateProjectTaskParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let task_key = params.task_key.trim();
+        let response = self
+            .api_patch(
+                &format!("/api/projects/{slug}/tasks/{task_key}"),
+                json!({
+                    "title": params.title,
+                    "prompt": params.prompt,
+                    "acceptance_criteria": params.acceptance_criteria,
+                    "depends_on": params.depends_on,
+                }),
+            )
+            .await?;
+        Self::response_value(response, "update project task").await
+    }
+
+    async fn cancel_project_task(&self, params: CancelProjectTaskParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let task_key = params.task_key.trim();
+        let response = self
+            .api_delete(&format!("/api/projects/{slug}/tasks/{task_key}"))
+            .await?;
+        Self::response_value(response, "cancel project task").await
+    }
+
     async fn link_mission_to_project(
         &self,
         params: LinkMissionToProjectParams,
@@ -3228,6 +3369,18 @@ impl AssistantMcp {
             "get_project_tasks" => {
                 let params: ProjectSlugParams = parse_params(arguments)?;
                 self.get_project_tasks(params).await
+            }
+            "plan_project_tasks" => {
+                let params: PlanProjectTasksParams = parse_params(arguments)?;
+                self.plan_project_tasks(params).await
+            }
+            "update_project_task" => {
+                let params: UpdateProjectTaskParams = parse_params(arguments)?;
+                self.update_project_task(params).await
+            }
+            "cancel_project_task" => {
+                let params: CancelProjectTaskParams = parse_params(arguments)?;
+                self.cancel_project_task(params).await
             }
             "link_mission_to_project" => {
                 let params: LinkMissionToProjectParams = parse_params(arguments)?;
@@ -4602,6 +4755,9 @@ mod tests {
             "record_project_decision",
             "answer_project_decision",
             "get_project_tasks",
+            "plan_project_tasks",
+            "update_project_task",
+            "cancel_project_task",
             "link_mission_to_project",
         ] {
             assert!(names.contains(&expected), "missing project tool {expected}");

@@ -133,6 +133,24 @@ CREATE INDEX IF NOT EXISTS idx_project_decisions_open
     ON project_decisions(slug, answered);
 -- idx_project_decisions_status is created in initialize(), after the additive
 -- column migration guarantees `status` exists on legacy tables.
+
+-- Chat-planned roadmap items. Board tasks live in the mission store and are
+-- writable only by their boss mission; a proposal is the project-scoped,
+-- owner/assistant-writable precursor. The roadmap read unions proposals in as
+-- `status = "proposed"`, deduped by task_key — a boss planning a real task
+-- under the same key silently supersedes ("adopts") the proposal.
+CREATE TABLE IF NOT EXISTS project_roadmap_proposals (
+    slug                TEXT NOT NULL,
+    task_key            TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    prompt              TEXT,
+    acceptance_criteria TEXT,                             -- JSON array of strings
+    depends_on          TEXT,                             -- JSON array of task keys
+    status              TEXT NOT NULL DEFAULT 'proposed', -- proposed|cancelled
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    PRIMARY KEY (slug, task_key)
+);
 "#;
 
 /// A project's control conversation and how we know about it.
@@ -746,6 +764,12 @@ impl ProjectsStore {
                 params![slug],
             )
             .map_err(|e| e.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM project_roadmap_proposals WHERE slug = ?1",
+                params![slug],
+            )
+            .map_err(|e| e.to_string())?;
         let removed = transaction
             .execute("DELETE FROM projects WHERE slug = ?1", params![slug])
             .map_err(|e| e.to_string())?
@@ -812,6 +836,7 @@ impl ProjectsStore {
             "project_tracks",
             "project_state_events",
             "project_decisions",
+            "project_roadmap_proposals",
         ] {
             transaction
                 .execute(
@@ -1079,6 +1104,124 @@ impl ProjectsStore {
         Ok(())
     }
 
+    /// Create-or-refresh chat-planned roadmap items. Re-proposing an existing
+    /// key updates it in place and revives a cancelled one — the caller's
+    /// latest intent wins; there is nothing destructive to protect here.
+    pub fn upsert_proposals(&self, slug: &str, proposals: &[NewProposal]) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.lock()?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        for proposal in proposals {
+            let criteria =
+                serde_json::to_string(&proposal.acceptance_criteria).map_err(|e| e.to_string())?;
+            let depends = serde_json::to_string(&proposal.depends_on).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO project_roadmap_proposals \
+                   (slug, task_key, title, prompt, acceptance_criteria, depends_on, status, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'proposed', ?7, ?7) \
+                 ON CONFLICT(slug, task_key) DO UPDATE SET \
+                   title = excluded.title, \
+                   prompt = COALESCE(excluded.prompt, project_roadmap_proposals.prompt), \
+                   acceptance_criteria = excluded.acceptance_criteria, \
+                   depends_on = excluded.depends_on, \
+                   status = 'proposed', \
+                   updated_at = excluded.updated_at",
+                params![
+                    slug,
+                    proposal.task_key,
+                    proposal.title,
+                    proposal.prompt,
+                    criteria,
+                    depends,
+                    now
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Patch an open proposal. Returns false when the key doesn't exist or is
+    /// cancelled — an adopted (board-shadowed) key is the mission's to edit,
+    /// but the proposal row itself stays patchable until cancelled.
+    pub fn update_proposal(
+        &self,
+        slug: &str,
+        task_key: &str,
+        title: Option<&str>,
+        prompt: Option<&str>,
+        acceptance_criteria: Option<&[String]>,
+        depends_on: Option<&[String]>,
+    ) -> Result<bool, String> {
+        let now = Utc::now().to_rfc3339();
+        let criteria = acceptance_criteria
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let depends = depends_on
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let connection = self.lock()?;
+        let changed = connection
+            .execute(
+                "UPDATE project_roadmap_proposals SET \
+                   title = COALESCE(?3, title), \
+                   prompt = COALESCE(?4, prompt), \
+                   acceptance_criteria = COALESCE(?5, acceptance_criteria), \
+                   depends_on = COALESCE(?6, depends_on), \
+                   updated_at = ?7 \
+                 WHERE slug = ?1 AND task_key = ?2 AND status = 'proposed'",
+                params![slug, task_key, title, prompt, criteria, depends, now],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(changed > 0)
+    }
+
+    /// Cancel an open proposal. Returns false when there was nothing open.
+    pub fn cancel_proposal(&self, slug: &str, task_key: &str) -> Result<bool, String> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        let changed = connection
+            .execute(
+                "UPDATE project_roadmap_proposals SET status = 'cancelled', updated_at = ?3 \
+                 WHERE slug = ?1 AND task_key = ?2 AND status = 'proposed'",
+                params![slug, task_key, now],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(changed > 0)
+    }
+
+    /// Open (non-cancelled) proposals for a project, oldest first — the order
+    /// they were planned in is the order the roadmap shows them.
+    pub fn list_open_proposals(&self, slug: &str) -> Result<Vec<RoadmapProposal>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT task_key, title, prompt, acceptance_criteria, depends_on, created_at, updated_at \
+                 FROM project_roadmap_proposals \
+                 WHERE slug = ?1 AND status = 'proposed' ORDER BY created_at, task_key",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![slug], |row| {
+                let criteria: Option<String> = row.get(3)?;
+                let depends: Option<String> = row.get(4)?;
+                Ok(RoadmapProposal {
+                    task_key: row.get(0)?,
+                    title: row.get(1)?,
+                    prompt: row.get(2)?,
+                    acceptance_criteria: parse_string_list(criteria),
+                    depends_on: parse_string_list(depends),
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
     /// Record a decision and return its `at` key. The legacy `answered` flag is
     /// dual-written: only `pending_user` rows count as open, so an older binary
     /// reading `answered = 0` never surfaces autonomous acts.
@@ -1308,6 +1451,36 @@ pub struct ProjectRecord {
     pub repository: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// A chat-planned roadmap item: the project-scoped precursor of a board task.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RoadmapProposal {
+    pub task_key: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Input for `upsert_proposals`.
+#[derive(Debug, Clone)]
+pub struct NewProposal {
+    pub task_key: String,
+    pub title: String,
+    pub prompt: Option<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub depends_on: Vec<String>,
+}
+
+/// JSON-array column → Vec, treating NULL/garbage as empty rather than erroring
+/// the whole roadmap read.
+fn parse_string_list(raw: Option<String>) -> Vec<String> {
+    raw.and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
 }
 
 /// The autonomy grant, structured so it outlives a controller's prompt.
@@ -1793,6 +1966,73 @@ mod tests {
         assert_eq!(p.mode.as_deref(), Some("blocked"));
         assert_eq!(p.wait_ticks, 2);
         assert_eq!(p.blocker.as_deref(), Some("transport-cap"));
+    }
+
+    #[test]
+    fn roadmap_proposals_upsert_update_cancel_revive() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+
+        let plan = |key: &str, title: &str| NewProposal {
+            task_key: key.to_string(),
+            title: title.to_string(),
+            prompt: None,
+            acceptance_criteria: vec!["lane green".to_string()],
+            depends_on: vec![],
+        };
+        store
+            .upsert_proposals("lido", &[plan("guarantee-3", "Third guarantee")])
+            .expect("plan");
+
+        let open = store.list_open_proposals("lido").expect("list");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].task_key, "guarantee-3");
+        assert_eq!(open[0].acceptance_criteria, vec!["lane green"]);
+
+        // Patch title only — everything else survives.
+        assert!(store
+            .update_proposal(
+                "lido",
+                "guarantee-3",
+                Some("Third guarantee (srv3)"),
+                None,
+                None,
+                None
+            )
+            .expect("update"));
+        let open = store.list_open_proposals("lido").expect("list");
+        assert_eq!(open[0].title, "Third guarantee (srv3)");
+        assert_eq!(open[0].acceptance_criteria, vec!["lane green"]);
+
+        // Cancel closes it; updates then miss; re-planning revives it.
+        assert!(store
+            .cancel_proposal("lido", "guarantee-3")
+            .expect("cancel"));
+        assert!(store.list_open_proposals("lido").expect("list").is_empty());
+        assert!(!store
+            .update_proposal("lido", "guarantee-3", Some("x"), None, None, None)
+            .expect("update-cancelled"));
+        store
+            .upsert_proposals("lido", &[plan("guarantee-3", "Back on the plan")])
+            .expect("revive");
+        let open = store.list_open_proposals("lido").expect("list");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].title, "Back on the plan");
+
+        // Unknown keys report false, not errors.
+        assert!(!store.cancel_proposal("lido", "ghost").expect("ghost"));
+
+        // Proposals ride project lifecycle: rename moves them, delete drops them.
+        store.rename_project("lido", "lido-v2").expect("rename");
+        assert!(store.list_open_proposals("lido").expect("old").is_empty());
+        assert_eq!(store.list_open_proposals("lido-v2").expect("new").len(), 1);
+        assert!(store.delete_project("lido-v2").expect("delete"));
+        assert!(store
+            .list_open_proposals("lido-v2")
+            .expect("gone")
+            .is_empty());
     }
 
     #[test]
