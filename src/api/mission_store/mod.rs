@@ -3590,6 +3590,15 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Every board task whose boss mission belongs to this project family
+    /// (exact slug or `slug-*` prefix, matching `project_prefix` filter
+    /// semantics). Resolved through the missions join at read time — no
+    /// denormalized slug column to go stale when a family is retagged.
+    async fn list_board_tasks_for_project(&self, project: &str) -> Result<Vec<BoardTask>, String> {
+        let _ = project;
+        Ok(vec![])
+    }
+
     /// Boss mission ids that have at least one non-terminal task. Drives the
     /// scheduler's per-tick scan.
     async fn list_active_board_missions(&self) -> Result<Vec<Uuid>, String> {

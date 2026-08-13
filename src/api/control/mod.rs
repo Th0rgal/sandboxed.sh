@@ -3999,6 +3999,26 @@ impl ControlHub {
         Ok(collected)
     }
 
+    /// Board tasks across every live store whose boss mission belongs to this
+    /// project family. Offline stores are skipped: boards only exist in live
+    /// SQLite stores, and a roadmap read must stay cheap.
+    pub(crate) async fn collect_project_board_tasks(
+        &self,
+        project: &str,
+    ) -> Result<Vec<mission_store::BoardTask>, String> {
+        let inventory = self.mission_store_inventory().await?;
+        let mut collected = Vec::new();
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        for store in inventory.live {
+            for task in store.list_board_tasks_for_project(project).await? {
+                if seen.insert(task.id) {
+                    collected.push(task);
+                }
+            }
+        }
+        Ok(collected)
+    }
+
     /// Delete every mission tagged with this exact project across live and
     /// offline stores. This is intentionally fail-closed: a project-wide data
     /// delete cannot race a running, queued, paused, or otherwise resumable

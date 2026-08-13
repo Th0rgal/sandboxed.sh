@@ -601,6 +601,93 @@ pub async fn record_project_decision(
     })))
 }
 
+/// Extract the first GitHub PR link from free text (result digests and notes
+/// routinely quote one). Read-time extraction, nothing stored.
+pub(crate) fn extract_pr_url(text: &str) -> Option<String> {
+    let start = text.find("https://github.com/")?;
+    let candidate = &text[start..];
+    let end = candidate
+        .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'' | ','))
+        .unwrap_or(candidate.len());
+    let url = candidate[..end].trim_end_matches(['.', ';', ':']);
+    // Only PR links qualify: /owner/repo/pull/N
+    let path: Vec<&str> = url
+        .strip_prefix("https://github.com/")?
+        .split('/')
+        .collect();
+    match path.as_slice() {
+        [_, _, kind, number, ..]
+            if *kind == "pull" && number.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            Some(url.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// `GET /api/projects/:slug/tasks` — the project's roadmap: every board task
+/// planned under a boss mission of this project family, in planning order,
+/// with the per-item detail (digest, PR link, worker mission) the drawer's
+/// checklist expands into.
+pub async fn project_tasks(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err(bad_slug());
+    }
+    let tasks = state
+        .control
+        .collect_project_board_tasks(&slug)
+        .await
+        .map_err(store_err)?;
+    let mut done = 0usize;
+    let mut running = 0usize;
+    let mut failed = 0usize;
+    let rows: Vec<serde_json::Value> = tasks
+        .iter()
+        .map(|task| {
+            let status = task.status.to_string();
+            match status.as_str() {
+                "accepted" => done += 1,
+                "running" | "settled" => running += 1,
+                "failed" => failed += 1,
+                _ => {}
+            }
+            let pr_url = task
+                .result_digest
+                .as_deref()
+                .and_then(extract_pr_url)
+                .or_else(|| task.notes.as_deref().and_then(extract_pr_url));
+            serde_json::json!({
+                "id": task.id,
+                "task_key": task.task_key,
+                "title": task.title,
+                "status": status,
+                "outcome": task.outcome,
+                "depends_on": task.depends_on,
+                "acceptance_criteria": task.acceptance_criteria,
+                "result_digest": task.result_digest,
+                "pr_url": pr_url,
+                "worker_mission_id": task.worker_mission_id,
+                "boss_mission_id": task.boss_mission_id,
+                "attempts": task.attempts,
+                "updated_at": task.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "slug": slug,
+        "tasks": rows,
+        "summary": {
+            "total": rows.len(),
+            "done": done,
+            "running": running,
+            "failed": failed,
+        },
+    })))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AnswerDecisionRequest {
     /// The decision's `at` key.
@@ -645,6 +732,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/", axum::routing::put(upsert_project))
         .route("/:slug", get(get_project))
         .route("/:slug/state", get(project_state))
+        .route("/:slug/tasks", get(project_tasks))
         .route("/:slug/updates", get(project_updates))
         .route("/:slug/action", axum::routing::post(project_action))
         .route("/:slug/status", axum::routing::post(set_project_status))
@@ -2256,6 +2344,22 @@ mod tests {
             .attention_reasons
             .iter()
             .any(|r| r.contains("3 consecutive")));
+    }
+
+    #[test]
+    fn pr_links_are_extracted_from_digests_and_nothing_else() {
+        assert_eq!(
+            extract_pr_url("Opened https://github.com/lfglabs-dev/verity/pull/2213 for review."),
+            Some("https://github.com/lfglabs-dev/verity/pull/2213".to_string())
+        );
+        assert_eq!(
+            extract_pr_url("(see https://github.com/x/y/pull/48)"),
+            Some("https://github.com/x/y/pull/48".to_string())
+        );
+        // Repo links, issues, and bare mentions are not PR links.
+        assert_eq!(extract_pr_url("https://github.com/x/y"), None);
+        assert_eq!(extract_pr_url("https://github.com/x/y/issues/12"), None);
+        assert_eq!(extract_pr_url("no links here"), None);
     }
 
     // ---- decision disposition (the autonomy enforcement point) ----

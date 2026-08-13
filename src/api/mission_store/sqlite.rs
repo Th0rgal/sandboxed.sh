@@ -10994,6 +10994,36 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| format!("Task join error: {e}"))?
     }
 
+    async fn list_board_tasks_for_project(&self, project: &str) -> Result<Vec<BoardTask>, String> {
+        let conn = self.conn.clone();
+        let project = project.to_string();
+        // Qualify every column so the missions join can't shadow board task
+        // columns (both tables have id/status/created_at/...).
+        let columns = BOARD_TASK_COLUMNS
+            .split(',')
+            .map(|column| format!("bt.{}", column.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {columns} FROM board_tasks bt \
+                     JOIN missions m ON m.id = bt.boss_mission_id \
+                     WHERE m.project = ?1 OR m.project LIKE ?1 || '-%' \
+                     ORDER BY bt.created_at ASC, bt.task_key ASC"
+                ))
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![project], parse_board_task_row)
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+
     async fn list_active_board_missions(&self) -> Result<Vec<Uuid>, String> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -16108,6 +16138,97 @@ mod tests {
             .expect("get")
             .expect("some");
         assert_eq!(fetched.task_key, "t2");
+    }
+
+    /// The roadmap read: tasks resolve to a project through their boss
+    /// mission's tag with family-prefix semantics, so `verity` sees the tasks
+    /// of a boss tagged `verity-core` — and `verity-x` never leaks into `ver`.
+    #[tokio::test]
+    async fn board_tasks_resolve_to_their_boss_missions_project_family() {
+        use crate::api::mission_store::NewBoardTask;
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("store");
+
+        let tag = |project: &str| MissionProjectPatch {
+            project: Some(Some(project.to_string())),
+            track: None,
+            intent: None,
+            github_pr: None,
+            tags: None,
+            desired_state: None,
+            next_check_at: None,
+        };
+        let task = |key: &str| NewBoardTask {
+            task_key: key.to_string(),
+            title: format!("title-{key}"),
+            prompt: "p".to_string(),
+            backend: "codex".to_string(),
+            ..Default::default()
+        };
+
+        let core_boss = store
+            .create_mission(Some("core boss"), None, None, None, None, None, None)
+            .await
+            .expect("boss");
+        store
+            .update_mission_project(core_boss.id, tag("verity-core"))
+            .await
+            .expect("tag core");
+        store
+            .upsert_board_tasks(core_boss.id, vec![task("c1"), task("c2")])
+            .await
+            .expect("core tasks");
+
+        let exact_boss = store
+            .create_mission(Some("exact boss"), None, None, None, None, None, None)
+            .await
+            .expect("boss");
+        store
+            .update_mission_project(exact_boss.id, tag("verity"))
+            .await
+            .expect("tag exact");
+        store
+            .upsert_board_tasks(exact_boss.id, vec![task("e1")])
+            .await
+            .expect("exact tasks");
+
+        let other_boss = store
+            .create_mission(Some("other boss"), None, None, None, None, None, None)
+            .await
+            .expect("boss");
+        store
+            .update_mission_project(other_boss.id, tag("lido"))
+            .await
+            .expect("tag other");
+        store
+            .upsert_board_tasks(other_boss.id, vec![task("o1")])
+            .await
+            .expect("other tasks");
+
+        let verity = store
+            .list_board_tasks_for_project("verity")
+            .await
+            .expect("verity tasks");
+        let keys: Vec<&str> = verity.iter().map(|t| t.task_key.as_str()).collect();
+        assert_eq!(verity.len(), 3, "family = exact + prefixed: {keys:?}");
+        assert!(keys.contains(&"c1") && keys.contains(&"c2") && keys.contains(&"e1"));
+
+        // `ver` is not a family of `verity` (prefix must break on '-').
+        assert!(store
+            .list_board_tasks_for_project("ver")
+            .await
+            .expect("ver")
+            .is_empty());
+        assert_eq!(
+            store
+                .list_board_tasks_for_project("lido")
+                .await
+                .expect("lido")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
