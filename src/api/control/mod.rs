@@ -13282,10 +13282,25 @@ async fn paloma_webhook_forwarder_loop(
                 },
                 None => None,
             };
+            // The mission's ACTUAL final output — not just status metadata — so
+            // a mission-backed delegation returns a real work product to the
+            // delegating Hermes agent (the fold prefers `result_summary`).
+            // Fetched only for terminal (forwardable) transitions; best-effort.
+            let result_summary: Option<String> = if webhook_forwardable_status(status) {
+                mission_store
+                    .latest_assistant_text(mission_id)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             let body = serde_json::json!({
                 // Idempotency / ordering (P#6): consumers dedupe on
                 // `event_id` and may order by `sequence`.
                 "event_id": event_id,
+                // The mission's final assistant output on terminal transitions.
+                "result_summary": result_summary,
                 "sequence": seq,
                 "mission_id": mission_id,
                 "old_status": old_status,
