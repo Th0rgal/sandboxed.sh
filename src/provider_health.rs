@@ -324,6 +324,22 @@ impl ProviderHealthTracker {
             .any(|id| accounts.get(id).is_some_and(AccountHealth::is_in_cooldown))
     }
 
+    /// Return true when any of the given subscription keys has an active
+    /// shared cooldown. Complements `any_account_has_active_cooldown`: a
+    /// sibling filtered out by a subscription lane (whose original offender
+    /// may since have been deleted) must still classify the empty chain as
+    /// retryable rather than as a configuration error.
+    pub async fn any_subscription_cooldown_active(&self, keys: &[SubscriptionKey]) -> bool {
+        let cooldowns = self.subscription_cooldowns.read().await;
+        let now = std::time::Instant::now();
+        keys.iter().any(|key| {
+            cooldowns
+                .get(key)
+                .and_then(|entry| entry.cooldown_until)
+                .is_some_and(|until| now < until)
+        })
+    }
+
     /// Check whether a shared subscription (e.g. Claude Pro org) is currently
     /// cooling down. Callers pass `None` for accounts without a known shared
     /// identity; those are always healthy at this layer.
@@ -1583,6 +1599,30 @@ impl ModelChainStore {
         }
         ids.into_iter().collect()
     }
+
+    /// Subscription keys of the same candidate set `configured_account_ids`
+    /// derives, for classifying an empty chain. Standard (auth.json) accounts
+    /// resolve with no subscription key, matching `resolve_entries`.
+    pub async fn configured_subscription_keys(
+        &self,
+        entries: &[ChainEntry],
+        ai_providers: &crate::ai_providers::AIProviderStore,
+    ) -> Vec<SubscriptionKey> {
+        let mut keys = std::collections::HashSet::new();
+        for entry in entries {
+            let provider_type = crate::ai_providers::ProviderType::from_id(&entry.provider_id)
+                .unwrap_or(crate::ai_providers::ProviderType::Custom);
+            for account in ai_providers.get_all_by_type(provider_type).await {
+                if !account.has_credentials() {
+                    continue;
+                }
+                if let Some(key) = store_account_subscription_key(provider_type, &account) {
+                    keys.insert(key);
+                }
+            }
+        }
+        keys.into_iter().collect()
+    }
 }
 
 /// Pick the credential the proxy will forward for a store account, returning
@@ -1631,6 +1671,35 @@ pub type SharedModelChainStore = Arc<ModelChainStore>;
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn subscription_cooldown_classifies_empty_chain_as_retryable() {
+        use super::*;
+        let tracker = ProviderHealthTracker::new();
+        let key = SubscriptionKey("anthropic:org-123".to_string());
+        let other = SubscriptionKey("openai:org-999".to_string());
+        let offender = Uuid::new_v4();
+
+        tracker
+            .record_failure_with_subscription(
+                offender,
+                Some(&key),
+                CooldownReason::RateLimit,
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await;
+        // The offending account is deleted; only the shared lane remains.
+        tracker.remove_account(offender).await;
+
+        assert!(!tracker.any_account_has_active_cooldown(&[offender]).await);
+        assert!(
+            tracker
+                .any_subscription_cooldown_active(&[key.clone()])
+                .await
+        );
+        assert!(!tracker.any_subscription_cooldown_active(&[other]).await);
+        assert!(!tracker.any_subscription_cooldown_active(&[]).await);
+    }
     use super::*;
     use crate::ai_providers::{
         AIProvider, AIProviderStore, OAuthCredentials, ProviderStatus, ProviderType,

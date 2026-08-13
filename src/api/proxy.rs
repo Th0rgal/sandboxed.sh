@@ -835,10 +835,21 @@ pub(crate) async fn chat_completions_inner(
             .chain_store
             .configured_account_ids(&chain_entries, &state.ai_providers, &standard_accounts)
             .await;
+        let candidate_subscription_keys = state
+            .chain_store
+            .configured_subscription_keys(&chain_entries, &state.ai_providers)
+            .await;
+        // Account-level OR subscription-level: a sibling held back only by a
+        // shared subscription lane (possibly inherited from a since-deleted
+        // account) still means "retry later", not "misconfigured".
         let provider_in_cooldown = state
             .health_tracker
             .any_account_has_active_cooldown(&candidate_account_ids)
-            .await;
+            .await
+            || state
+                .health_tracker
+                .any_subscription_cooldown_active(&candidate_subscription_keys)
+                .await;
         return unavailable_chain_response(&chain_id, provider_in_cooldown);
     }
 
