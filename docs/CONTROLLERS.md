@@ -31,7 +31,9 @@ hermes cron create --name "<nom>" --every 30m \
 
 `--deliver project:<slug>` est important : la livraison suit le projet, pas une
 session qui peut être compactée ou abandonnée. `--deliver origin` gèle la cible
-sur la session de création — à éviter pour tout ce qui doit durer.
+sur la session de création — à éviter pour tout ce qui doit durer. Un job en
+`deliver: origin` sans `origin` capturé ne livre nulle part : refuse-le et
+recréé-le en `project:<slug>`.
 
 **3. Répondre une fois à ses cinq questions.** Au premier tick, le contrôleur te
 demande : périmètre, autorité de merge, plafond de budget, ce qui doit le mettre
@@ -48,6 +50,11 @@ pas la permission.
 **Trois choses seulement l'arrêtent** : détruire une donnée irrécupérable,
 dépenser hors du budget de sa campagne, ou toucher un dépôt hors périmètre.
 Tout le reste lui appartient.
+
+Un prompt « surveillance only / ne jamais relancer » n'est **pas** un
+contrôleur. C'est de la passivité déguisée : le skill l'ignore, et le
+contrôleur doit soit agir, soit poser **une** question `[DECISION:]`.
+Répéter `SCANNER DEAD` n'est pas une escalade.
 
 Corollaire important : « je m'en remets à l'autre contrôleur » est un blocage
 déguisé. S'il décline une tâche parce qu'elle « appartient » à quelqu'un

@@ -99,9 +99,9 @@ Match the signal to the fix. The health `recommendation` usually tells you which
 ## Mission results come back to their conversation — your job to wire it
 
 A mission started from a conversation must deliver its result back into that
-conversation. Nothing does this implicitly: the mission-status webhook lane
-spawns an isolated `webhook:mission-complete` session per event, and it can
-only find its way home when the mission carries its origin. Binding rules for
+conversation. The mission-status webhook routes into `origin_session` (then
+`project:<slug>`) when those resolve; it must not open a throwaway
+`webhook:mission-complete` session if either target is live. Binding rules for
 every conversational `start_mission`:
 
 1. **Always pass `origin_session_id`** — your CURRENT session id, never

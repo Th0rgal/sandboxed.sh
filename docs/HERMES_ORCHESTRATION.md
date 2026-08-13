@@ -102,6 +102,15 @@ The plugin refuses to stamp an id prefixed `cron_`. A per-tick session dies with
 its tick, so a mission filed under one is unreachable forever. An unstamped
 mission is honestly unattributed and can be adopted later.
 
+The `mission-complete` webhook must **not** open a throwaway
+`webhook:mission-complete:<delivery>` session when it can route. After HMAC
+auth: deliver into `origin_session` (follow continuations) if that session
+exists; otherwise resolve `project:<slug>` via the explicit route store.
+Only an unroutable payload may spawn an isolated webhook conversation.
+Coldcard `acfb03d2` (2026-08-13) finished `Codex CLI not found` in a
+throwaway session; the dedicated conversation stayed silent until Thomas
+asked.
+
 sandboxed.sh completes the picture: when a mission is created from a bound
 conversation without a `project`, the server fills it in from the binding. An
 explicit value always wins, including a deliberate blank. An unbound session
