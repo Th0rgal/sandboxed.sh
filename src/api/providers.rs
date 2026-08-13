@@ -96,6 +96,7 @@ const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
 /// backend only offers canonical IDs documented for Grok Build. Actual access
 /// remains account/region-dependent and is diagnosed by the CLI at runtime.
 const GROK_CLI_TEXT_MODEL_IDS: &[&str] = &[
+    "grok-4.6",
     "grok-4.5",
     "grok-build-0.1",
     "grok-4.3",
@@ -1035,9 +1036,19 @@ fn default_providers_config() -> ProvidersConfig {
                 description: "Grok models via xAI API key".to_string(),
                 models: vec![
                     ProviderModel {
+                        id: "grok-4.6".to_string(),
+                        name: "Grok 4.6".to_string(),
+                        description: Some("Latest flagship Grok model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "grok-4.6-latest".to_string(),
+                        name: "Grok 4.6 (Latest)".to_string(),
+                        description: Some("Rolling alias for Grok 4.6".to_string()),
+                    },
+                    ProviderModel {
                         id: "grok-4.5".to_string(),
                         name: "Grok 4.5".to_string(),
-                        description: Some("Latest flagship Grok model".to_string()),
+                        description: Some("Previous flagship Grok model".to_string()),
                     },
                     ProviderModel {
                         id: "grok-4.5-latest".to_string(),

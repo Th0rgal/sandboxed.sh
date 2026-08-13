@@ -262,6 +262,13 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         pricing: pricing(75, 300, None, None),
     },
     PricingEntry {
+        // grok-4.6 list price not yet published separately; mirrors grok-4.5
+        // ($2/$6 per Mtok, $0.5 cached) until xAI publishes it.
+        canonical: "grok-4.6",
+        aliases: &["grok-4.6", "grok-4.6-latest"],
+        pricing: pricing(2_000, 6_000, None, Some(500)),
+    },
+    PricingEntry {
         canonical: "grok-4.5",
         aliases: &["grok-4.5", "grok-4.5-latest", "grok-build-latest"],
         pricing: pricing(2_000, 6_000, None, Some(500)),
@@ -618,6 +625,8 @@ mod tests {
         assert_eq!(normalize_model("gemini-3-pro-preview"), "gemini-3-pro");
         assert_eq!(normalize_model("grok-4-fast-reasoning"), "grok-4-fast");
         assert_eq!(normalize_model("xAI/Grok Inference"), "grok-4-fast");
+        assert_eq!(normalize_model("xai/grok-4.6"), "grok-4.6");
+        assert_eq!(normalize_model("xai/grok-4.6-latest"), "grok-4.6");
         assert_eq!(normalize_model("xai/grok-4.5"), "grok-4.5");
         assert_eq!(normalize_model("xai/grok-4.5-latest"), "grok-4.5");
         assert_eq!(normalize_model("xai/grok-build-latest"), "grok-4.5");
@@ -660,6 +669,8 @@ mod tests {
         assert!(pricing_for_model("gemini-3-flash-preview").is_some());
         assert!(pricing_for_model("grok-4-fast").is_some());
         assert!(pricing_for_model("xAI/Grok Inference").is_some());
+        assert!(pricing_for_model("xai/grok-4.6").is_some());
+        assert!(pricing_for_model("xai/grok-4.6-latest").is_some());
         assert!(pricing_for_model("xai/grok-4.5").is_some());
         assert!(pricing_for_model("grok-build").is_some());
         assert!(pricing_for_model("glm-5").is_some());
