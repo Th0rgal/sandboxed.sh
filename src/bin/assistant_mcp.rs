@@ -1151,6 +1151,32 @@ impl AssistantMcp {
         }
     }
 
+    /// Scope gate for mission-level mutators. A scoped controller may only
+    /// touch missions tagged with one of its projects — anything else
+    /// (another project's mission, or an untagged one it cannot prove it
+    /// owns) is refused. Unscoped instances skip the lookup entirely.
+    async fn assert_mission_scope(&self, mission_id: Uuid) -> Result<(), String> {
+        if self.project_scope.is_none() {
+            return Ok(());
+        }
+        let response = self
+            .api_get(&format!("/api/control/missions/{mission_id}"))
+            .await?;
+        let mission = Self::response_value(response, "load mission for scope check").await?;
+        let project = mission
+            .get("project")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|slug| !slug.is_empty());
+        match project {
+            Some(slug) => self.assert_project_scope(slug),
+            None => Err(format!(
+                "mission {mission_id} carries no project tag — a scoped controller may only \
+                 act on missions tagged with its own project"
+            )),
+        }
+    }
+
     /// Gate for MUTATING project tools. Scoped controllers stay inside their
     /// own project; unscoped instances (owner chat) pass untouched.
     fn assert_project_scope(&self, slug: &str) -> Result<(), String> {
@@ -2180,6 +2206,19 @@ impl AssistantMcp {
     }
 
     async fn start_mission(&self, params: StartMissionParams) -> Result<Value, String> {
+        // A scoped controller must launch work under its own project — an
+        // untagged mission would escape both the roster and this scope.
+        if self.project_scope.is_some() {
+            match params.project.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                Some(project) => self.assert_project_scope(project)?,
+                None => {
+                    return Err(
+                        "scoped controllers must pass `project` on start_mission so the                          mission stays inside their scope"
+                            .to_string(),
+                    )
+                }
+            }
+        }
         let workspace_id = resolve_default_workspace_id(params.workspace_id);
         let backend = params
             .backend
@@ -2349,6 +2388,7 @@ impl AssistantMcp {
 
     async fn send_message(&self, params: SendMessageParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let response = self
             .api_post(
                 "/api/control/message",
@@ -2370,6 +2410,7 @@ impl AssistantMcp {
 
     async fn ask_mission(&self, params: AskMissionParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let mut body = json!({
             "content": params.content,
             "sandbox": params.sandbox,
@@ -2418,6 +2459,7 @@ impl AssistantMcp {
         params: AnswerMissionQuestionParams,
     ) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         if params.answers.is_empty() || params.answers.iter().any(Vec::is_empty) {
             return Err(
                 "answers must contain one non-empty inner array per question, e.g. [[\"Option A\"]]"
@@ -2510,6 +2552,7 @@ impl AssistantMcp {
 
     async fn cancel_mission(&self, params: MissionIdParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let response = self
             .api_post(&format!("/api/control/missions/{id}/cancel"), json!({}))
             .await?;
@@ -2522,6 +2565,7 @@ impl AssistantMcp {
 
     async fn adopt_mission(&self, params: AdoptMissionParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         // The session id is stamped by the sandboxed-origin-session plugin,
         // exactly as for start_mission. Refuse to adopt into nothing: an
         // adoption without a session would silently CLEAR the mission's
@@ -2561,6 +2605,7 @@ impl AssistantMcp {
 
     async fn acknowledge_mission(&self, params: MissionIdParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let response = self
             .api_get(&format!("/api/control/missions/{id}/digest"))
             .await?;
@@ -2999,6 +3044,7 @@ impl AssistantMcp {
 
     async fn update_mission_settings(&self, params: UpdateSettingsParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let mut body = serde_json::Map::new();
         if let Some(backend) = params
             .backend
@@ -3061,6 +3107,7 @@ impl AssistantMcp {
 
     async fn resume_mission(&self, params: ResumeMissionParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(id).await?;
         let hint = params
             .content
             .as_deref()
