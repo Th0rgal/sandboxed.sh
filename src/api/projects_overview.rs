@@ -2616,6 +2616,55 @@ mod tests {
             .any(|r| r.contains("3 consecutive")));
     }
 
+    // ---- decision disposition (the autonomy enforcement point) ----
+
+    #[test]
+    fn an_unearned_autonomous_act_is_coerced_into_an_escalation() {
+        // No grant, observe, and propose all deny acting.
+        for level in [None, Some("observe"), Some("propose")] {
+            let d = resolve_decision_disposition(level, Some("granted"), Some("decided"))
+                .expect("valid");
+            assert_eq!(d.authority, "escalation");
+            assert_eq!(d.status, "pending_user");
+            assert!(d.coerced_reason.is_some(), "level {level:?} must coerce");
+        }
+        for level in ["act_reversible", "act_full"] {
+            let d = resolve_decision_disposition(Some(level), Some("granted"), Some("decided"))
+                .expect("valid");
+            assert_eq!(d.authority, "granted");
+            assert_eq!(d.status, "decided");
+            assert!(d.coerced_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_decision_bodies_default_to_owner_escalations() {
+        // The pre-ledger callers send only question+rationale: no authority,
+        // no status. They must keep meaning "ask the owner".
+        let d = resolve_decision_disposition(Some("act_full"), None, None).expect("valid");
+        assert_eq!(d.authority, "escalation");
+        assert_eq!(d.status, "pending_user");
+        assert!(d.coerced_reason.is_none());
+
+        assert!(resolve_decision_disposition(None, Some("sovereign"), None).is_err());
+        assert!(resolve_decision_disposition(None, None, Some("expired")).is_err());
+    }
+
+    #[test]
+    fn pending_decisions_are_a_standing_attention_reason() {
+        let mut builder = ProjectRowBuilder::new("verity".into());
+        builder.pending_decisions = 2;
+        builder.autonomy_level = Some("propose".into());
+        let row = builder.finish(&[], None, None, "2026-08-04T20:00:00Z");
+        assert_eq!(row.bucket, "attention");
+        assert_eq!(row.pending_decisions, 2);
+        assert_eq!(row.autonomy_level.as_deref(), Some("propose"));
+        assert!(row
+            .attention_reasons
+            .iter()
+            .any(|r| r == "2 decisions awaiting you"));
+    }
+
     #[test]
     fn pr_links_are_extracted_from_digests_and_nothing_else() {
         assert_eq!(
