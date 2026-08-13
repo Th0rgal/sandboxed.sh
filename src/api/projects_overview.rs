@@ -202,6 +202,43 @@ fn ingest_deliveries(
                 tracing::warn!("state ingest mode: {slug}: {error}");
             }
         }
+        // A `[DECISION: …]` trailer reaches the ledger through the same
+        // enforcement gate as the HTTP endpoint: a claimed autonomous act is
+        // coerced to an owner escalation unless the grant's autonomy level
+        // covers acting. Keyed by the delivery's timestamp (INSERT OR IGNORE),
+        // so overlapping ingest windows record it once and never reopen an
+        // answered row.
+        if let Some(trailer) = delivery.decision.as_ref() {
+            let autonomy = projects
+                .get_grant(slug)
+                .ok()
+                .flatten()
+                .and_then(|grant| grant.autonomy_level);
+            match resolve_decision_disposition(
+                autonomy.as_deref(),
+                trailer.authority.as_deref(),
+                trailer.status.as_deref(),
+            ) {
+                Ok(disposition) => {
+                    let decision = super::projects_store::NewDecision {
+                        question: trailer.question.clone(),
+                        rationale: trailer.rationale.clone(),
+                        kind: trailer.kind.clone(),
+                        authority: disposition.authority,
+                        status: disposition.status,
+                        evidence: trailer.evidence.clone(),
+                    };
+                    if let Err(error) =
+                        projects.record_decision_from_delivery(slug, &delivery.at, &decision)
+                    {
+                        tracing::warn!("state ingest decision: {slug}: {error}");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("state ingest decision trailer rejected: {slug}: {error}");
+                }
+            }
+        }
     }
 }
 
@@ -837,6 +874,63 @@ pub struct DeliveryUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
     blocker: Option<String>,
+    /// A `[DECISION: …]` trailer, when the delivery carried one. Ingest-only:
+    /// the ledger is served through the decision endpoints, never re-emitted
+    /// on delivery payloads.
+    #[serde(skip)]
+    decision: Option<DecisionTrailer>,
+}
+
+/// The parsed `[DECISION: {json}]` (or `[DECISION: plain question]`) trailer —
+/// the MCP-less fallback for controllers to reach the decision ledger.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DecisionTrailer {
+    question: String,
+    rationale: Option<String>,
+    kind: Option<String>,
+    authority: Option<String>,
+    status: Option<String>,
+    evidence: Option<serde_json::Value>,
+}
+
+impl DecisionTrailer {
+    /// `{json}` form → full shape; anything else → a plain owner escalation.
+    /// Malformed JSON (starts with `{` but does not parse, or lacks a
+    /// question) is dropped rather than guessed at.
+    fn parse(inner: &str) -> Option<Self> {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            return None;
+        }
+        if inner.starts_with('{') {
+            let value: serde_json::Value = serde_json::from_str(inner).ok()?;
+            let text = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            let question = text("question")?;
+            return Some(Self {
+                question,
+                rationale: text("rationale"),
+                kind: text("kind"),
+                authority: text("authority"),
+                status: text("status"),
+                evidence: value.get("evidence").filter(|v| v.is_object()).cloned(),
+            });
+        }
+        Some(Self {
+            question: inner.to_string(),
+            rationale: None,
+            kind: None,
+            authority: None,
+            status: None,
+            evidence: None,
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1136,6 +1230,7 @@ pub async fn projects_overview(
             state: None,
             mode: row.mode,
             blocker: row.blocker,
+            decision: None,
         })
         .collect();
 
@@ -1247,6 +1342,7 @@ fn store_update(
             .filter(|descriptor| !descriptor.starts_with(CTRL_DESCRIPTOR_PREFIX)),
         mode,
         blocker,
+        decision: None,
     }
 }
 
@@ -2011,6 +2107,7 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
             || trimmed.starts_with("[Cron delivery:")
             || trimmed.starts_with("[STATE_SIGNATURE:")
             || trimmed.starts_with("[CTRL:")
+            || trimmed.starts_with("[DECISION:")
         {
             continue;
         }
@@ -2036,6 +2133,18 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
             .strip_prefix("[CTRL:")
             .and_then(|rest| rest.strip_suffix(']'))
     });
+    // `[DECISION: {json}]` / `[DECISION: plain question]` — the ledger's
+    // trailer fallback (last one wins, like the other trailers).
+    let decision = content
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("[DECISION:")
+                .and_then(|rest| rest.strip_suffix(']'))
+        })
+        .and_then(DecisionTrailer::parse);
     let signature = trailer
         .and_then(|inner| inner.split('|').next())
         .map(|key| key.trim().to_string())
@@ -2133,6 +2242,7 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
         state,
         mode,
         blocker,
+        decision,
     }
 }
 
@@ -2306,6 +2416,7 @@ mod tests {
             mode: None,
             state: Some(state.into()),
             blocker: None,
+            decision: None,
         };
 
         // A project changing state every tick: the latest state has a single
@@ -2344,6 +2455,105 @@ mod tests {
             .attention_reasons
             .iter()
             .any(|r| r.contains("3 consecutive")));
+    }
+
+    // ---- [DECISION:] trailer ----
+
+    #[test]
+    fn a_decision_trailer_parses_json_and_plain_forms_and_never_becomes_the_headline() {
+        let content = "[Cron delivery: verity]\nReal headline\n\
+            [DECISION: {\"kind\":\"merge\",\"authority\":\"granted\",\"status\":\"decided\",\
+             \"question\":\"Merged verity#2213\",\"evidence\":{\"pr_url\":\"https://github.com/x/y/pull/2213\"}}]\n\
+            [STATE_SIGNATURE: verity|phase|head|clean]\n";
+        let parsed = parse_delivery("s", 1_754_000_000.0, content);
+        assert_eq!(parsed.headline, "Real headline");
+        let decision = parsed.decision.expect("decision");
+        assert_eq!(decision.question, "Merged verity#2213");
+        assert_eq!(decision.authority.as_deref(), Some("granted"));
+        assert_eq!(decision.kind.as_deref(), Some("merge"));
+        assert_eq!(
+            decision.evidence.unwrap()["pr_url"],
+            "https://github.com/x/y/pull/2213"
+        );
+
+        // Plain-text form = owner escalation (fields defaulted downstream).
+        let plain = parse_delivery(
+            "s",
+            1.0,
+            "[Cron delivery: x]\nTitle\n[DECISION: Ship v2 now or wait for audit?]\n",
+        );
+        let decision = plain.decision.expect("decision");
+        assert_eq!(decision.question, "Ship v2 now or wait for audit?");
+        assert_eq!(decision.authority, None);
+
+        // A trailer alone must not become the headline (tag title fallback).
+        let only = parse_delivery("s", 1.0, "[Cron delivery: x]\n[DECISION: Question?]\n");
+        assert_eq!(only.headline, "x");
+
+        // Malformed JSON is dropped, not guessed at.
+        assert_eq!(
+            parse_delivery("s", 1.0, "t\n[DECISION: {\"kind\":]\n").decision,
+            None
+        );
+        // JSON without a question is dropped too.
+        assert_eq!(
+            parse_delivery("s", 1.0, "t\n[DECISION: {\"kind\":\"merge\"}]\n").decision,
+            None
+        );
+    }
+
+    #[test]
+    fn ingested_decision_trailers_are_coerced_and_idempotent() {
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity", None, None, None, None)
+            .expect("seed");
+        // No autonomy level set: a granted act in the trailer must land as a
+        // pending owner escalation.
+        let content = "[Cron delivery: verity]\nHeadline\n\
+            [DECISION: {\"kind\":\"merge\",\"authority\":\"granted\",\"status\":\"decided\",\"question\":\"Merged #1\"}]\n\
+            [STATE_SIGNATURE: verity|phase|head]\n";
+        let delivery = parse_delivery("s1", 1_754_000_000.0, content);
+        let aliases = HashMap::new();
+        let overrides = HashMap::new();
+        ingest_deliveries(&store, &aliases, &overrides, vec![delivery.clone()]);
+        let open = store.open_decisions("verity").expect("open");
+        assert_eq!(open.len(), 1, "coerced to escalation");
+        assert_eq!(open[0].status.as_deref(), Some("pending_user"));
+
+        // Replaying the same delivery window must not duplicate the row —
+        // and must not reopen it once answered.
+        ingest_deliveries(&store, &aliases, &overrides, vec![delivery.clone()]);
+        assert_eq!(store.open_decisions("verity").expect("open").len(), 1);
+        let at = store.open_decisions("verity").expect("open")[0].at.clone();
+        assert!(store.answer_decision("verity", &at, "ok").expect("answer"));
+        ingest_deliveries(&store, &aliases, &overrides, vec![delivery]);
+        assert!(
+            store.open_decisions("verity").expect("open").is_empty(),
+            "an answered decision must stay answered across ingest replays"
+        );
+
+        // With an acting grant, the same trailer records an autonomous act.
+        store
+            .set_grant(
+                "verity",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("act_full"),
+            )
+            .expect("grant");
+        let content2 = content.replace("Merged #1", "Merged #2");
+        let delivery2 = parse_delivery("s1", 1_754_000_100.0, &content2);
+        ingest_deliveries(&store, &aliases, &overrides, vec![delivery2]);
+        assert!(store.open_decisions("verity").expect("open").is_empty());
+        let recent = store.recent_decisions("verity", 10).expect("recent");
+        assert!(recent
+            .iter()
+            .any(|d| d.question == "Merged #2" && d.status.as_deref() == Some("decided")));
     }
 
     #[test]
@@ -2505,6 +2715,7 @@ mod tests {
             state: Some("phase|head|clean".into()),
             mode: Some("active".into()),
             blocker: blocker.map(str::to_string),
+            decision: None,
         }
     }
 
@@ -2723,6 +2934,7 @@ mod tests {
                 mode: None,
                 state: None,
                 blocker: None,
+                decision: None,
             },
             1,
             1,
@@ -2755,6 +2967,7 @@ mod tests {
                 mode: None,
                 state: None,
                 blocker: None,
+                decision: None,
             },
             1,
             1,

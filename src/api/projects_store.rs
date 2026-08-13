@@ -1027,6 +1027,40 @@ impl ProjectsStore {
         Ok(now)
     }
 
+    /// Ingest a decision carried by a delivery trailer. Keyed by the
+    /// delivery's own timestamp and INSERT OR IGNORE, so the overlapping
+    /// ingest windows replaying the same delivery record it exactly once —
+    /// and a later answer is never clobbered back to pending.
+    pub fn record_decision_from_delivery(
+        &self,
+        slug: &str,
+        at: &str,
+        decision: &NewDecision,
+    ) -> Result<bool, String> {
+        let answered = i64::from(decision.status != "pending_user");
+        let evidence = decision.evidence.as_ref().map(|value| value.to_string());
+        let connection = self.lock()?;
+        let inserted = connection
+            .execute(
+                "INSERT OR IGNORE INTO project_decisions \
+                   (slug, at, question, rationale, answered, kind, authority, status, evidence) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    slug,
+                    at,
+                    decision.question,
+                    decision.rationale,
+                    answered,
+                    decision.kind,
+                    decision.authority,
+                    decision.status,
+                    evidence
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(inserted > 0)
+    }
+
     /// Answer a pending escalation. Returns false when no pending decision
     /// exists at that key (already answered, expired, or never recorded).
     pub fn answer_decision(&self, slug: &str, at: &str, answer: &str) -> Result<bool, String> {
