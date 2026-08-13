@@ -1,9 +1,9 @@
 //! In-memory mission store (non-persistent).
 
 use super::{
-    now_string, BoardOutboxItem, BoardProject, BoardTask, BoardTaskStatus, Mission,
-    MissionExecutionState, MissionHistoryEntry, MissionRun, MissionStatus, MissionStatusCounts,
-    MissionStore, MissionToolExecution, MissionToolExecutionState, NewBoardTask, TaskAttempt,
+    now_string, BoardOutboxItem, BoardTask, BoardTaskStatus, Mission, MissionExecutionState,
+    MissionHistoryEntry, MissionRun, MissionStatus, MissionStatusCounts, MissionStore,
+    MissionToolExecution, MissionToolExecutionState, NewBoardTask, TaskAttempt,
 };
 use crate::api::control::{AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
@@ -25,7 +25,6 @@ pub struct InMemoryMissionStore {
     deferred_goals: Arc<RwLock<HashMap<Uuid, String>>>,
     runs: Arc<RwLock<HashMap<Uuid, MissionRun>>>,
     tool_executions: Arc<RwLock<HashMap<(Uuid, String), MissionToolExecution>>>,
-    board_projects: Arc<RwLock<HashMap<String, BoardProject>>>,
     task_attempts: Arc<RwLock<HashMap<(Uuid, u32), TaskAttempt>>>,
     board_outbox: Arc<RwLock<HashMap<String, BoardOutboxItem>>>,
 }
@@ -39,7 +38,6 @@ impl InMemoryMissionStore {
             deferred_goals: Arc::new(RwLock::new(HashMap::new())),
             runs: Arc::new(RwLock::new(HashMap::new())),
             tool_executions: Arc::new(RwLock::new(HashMap::new())),
-            board_projects: Arc::new(RwLock::new(HashMap::new())),
             task_attempts: Arc::new(RwLock::new(HashMap::new())),
             board_outbox: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -998,23 +996,6 @@ impl MissionStore for InMemoryMissionStore {
         saved.updated_at = now_string();
         map.insert(task.id, saved);
         Ok(())
-    }
-
-    async fn upsert_board_project(
-        &self,
-        mut project: BoardProject,
-    ) -> Result<BoardProject, String> {
-        let mut projects = self.board_projects.write().await;
-        if let Some(existing) = projects.get(&project.slug) {
-            project.created_at = existing.created_at.clone();
-        }
-        project.updated_at = now_string();
-        projects.insert(project.slug.clone(), project.clone());
-        Ok(project)
-    }
-
-    async fn get_board_project(&self, slug: &str) -> Result<Option<BoardProject>, String> {
-        Ok(self.board_projects.read().await.get(slug).cloned())
     }
 
     async fn create_task_attempt(&self, attempt: TaskAttempt) -> Result<TaskAttempt, String> {

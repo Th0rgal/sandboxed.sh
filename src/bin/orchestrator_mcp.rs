@@ -2201,7 +2201,9 @@ impl OrchestratorMcp {
         let response = self
             .api_post(
                 &format!("/api/control/board/tasks/{}/verdict", id),
-                json!({ "action": action, "feedback": feedback }),
+                // Sending our own mission id lets the server enforce that a
+                // boss only judges its own board.
+                json!({ "action": action, "feedback": feedback, "boss_mission_id": self.mission_id }),
             )
             .await?;
         if !response.status().is_success() {
