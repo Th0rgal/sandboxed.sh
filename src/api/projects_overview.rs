@@ -623,15 +623,30 @@ pub(crate) struct DecisionDisposition {
     pub coerced_reason: Option<String>,
 }
 
+/// Decision kinds that are irreversible once executed: under `act_reversible`
+/// these coerce to an owner escalation exactly like any act under `propose`.
+/// Free-form kinds outside this list pass — the list is the deny set for the
+/// reversible tier, not a taxonomy.
+pub(crate) const IRREVERSIBLE_KINDS: [&str; 6] = [
+    "merge",
+    "abandon",
+    "delete",
+    "publish",
+    "deploy",
+    "force_push",
+];
+
 /// The enforcement point shared by the HTTP endpoint and the delivery-trailer
 /// ingestor: a controller may only *record* an act as autonomous when its
 /// grant actually allows acting. `observe`/`propose` (or an unset level)
 /// coerce granted+decided into an owner escalation instead of failing, so a
-/// mis-calibrated controller degrades to asking rather than erroring.
+/// mis-calibrated controller degrades to asking rather than erroring — and
+/// `act_reversible` additionally escalates the irreversible kinds.
 pub(crate) fn resolve_decision_disposition(
     autonomy_level: Option<&str>,
     authority: Option<&str>,
     status: Option<&str>,
+    kind: Option<&str>,
 ) -> Result<DecisionDisposition, String> {
     let authority = match authority.map(str::trim).filter(|a| !a.is_empty()) {
         None => "escalation",
@@ -667,6 +682,22 @@ pub(crate) fn resolve_decision_disposition(
                 coerced_reason: Some(format!("autonomy_level={level}")),
             });
         }
+        if autonomy_level == Some("act_reversible") {
+            let irreversible = kind
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .is_some_and(|k| IRREVERSIBLE_KINDS.contains(&k.as_str()));
+            if irreversible {
+                return Ok(DecisionDisposition {
+                    authority: "escalation".to_string(),
+                    status: "pending_user".to_string(),
+                    coerced_reason: Some(format!(
+                        "autonomy_level=act_reversible kind={}",
+                        kind.unwrap_or_default().trim()
+                    )),
+                });
+            }
+        }
     }
     Ok(DecisionDisposition {
         authority: authority.to_string(),
@@ -693,6 +724,7 @@ pub async fn record_project_decision(
         grant.as_ref().and_then(|g| g.autonomy_level.as_deref()),
         req.authority.as_deref(),
         req.status.as_deref(),
+        req.kind.as_deref(),
     )
     .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let decision = super::projects_store::NewDecision {
@@ -2616,55 +2648,6 @@ mod tests {
             .any(|r| r.contains("3 consecutive")));
     }
 
-    // ---- decision disposition (the autonomy enforcement point) ----
-
-    #[test]
-    fn an_unearned_autonomous_act_is_coerced_into_an_escalation() {
-        // No grant, observe, and propose all deny acting.
-        for level in [None, Some("observe"), Some("propose")] {
-            let d = resolve_decision_disposition(level, Some("granted"), Some("decided"))
-                .expect("valid");
-            assert_eq!(d.authority, "escalation");
-            assert_eq!(d.status, "pending_user");
-            assert!(d.coerced_reason.is_some(), "level {level:?} must coerce");
-        }
-        for level in ["act_reversible", "act_full"] {
-            let d = resolve_decision_disposition(Some(level), Some("granted"), Some("decided"))
-                .expect("valid");
-            assert_eq!(d.authority, "granted");
-            assert_eq!(d.status, "decided");
-            assert!(d.coerced_reason.is_none());
-        }
-    }
-
-    #[test]
-    fn legacy_decision_bodies_default_to_owner_escalations() {
-        // The pre-ledger callers send only question+rationale: no authority,
-        // no status. They must keep meaning "ask the owner".
-        let d = resolve_decision_disposition(Some("act_full"), None, None).expect("valid");
-        assert_eq!(d.authority, "escalation");
-        assert_eq!(d.status, "pending_user");
-        assert!(d.coerced_reason.is_none());
-
-        assert!(resolve_decision_disposition(None, Some("sovereign"), None).is_err());
-        assert!(resolve_decision_disposition(None, None, Some("expired")).is_err());
-    }
-
-    #[test]
-    fn pending_decisions_are_a_standing_attention_reason() {
-        let mut builder = ProjectRowBuilder::new("verity".into());
-        builder.pending_decisions = 2;
-        builder.autonomy_level = Some("propose".into());
-        let row = builder.finish(&[], None, None, "2026-08-04T20:00:00Z");
-        assert_eq!(row.bucket, "attention");
-        assert_eq!(row.pending_decisions, 2);
-        assert_eq!(row.autonomy_level.as_deref(), Some("propose"));
-        assert!(row
-            .attention_reasons
-            .iter()
-            .any(|r| r == "2 decisions awaiting you"));
-    }
-
     #[test]
     fn pr_links_are_extracted_from_digests_and_nothing_else() {
         assert_eq!(
@@ -2692,15 +2675,16 @@ mod tests {
     fn an_unearned_autonomous_act_is_coerced_into_an_escalation() {
         // No grant, observe, and propose all deny acting.
         for level in [None, Some("observe"), Some("propose")] {
-            let d = resolve_decision_disposition(level, Some("granted"), Some("decided"))
+            let d = resolve_decision_disposition(level, Some("granted"), Some("decided"), None)
                 .expect("valid");
             assert_eq!(d.authority, "escalation");
             assert_eq!(d.status, "pending_user");
             assert!(d.coerced_reason.is_some(), "level {level:?} must coerce");
         }
         for level in ["act_reversible", "act_full"] {
-            let d = resolve_decision_disposition(Some(level), Some("granted"), Some("decided"))
-                .expect("valid");
+            let d =
+                resolve_decision_disposition(Some(level), Some("granted"), Some("decided"), None)
+                    .expect("valid");
             assert_eq!(d.authority, "granted");
             assert_eq!(d.status, "decided");
             assert!(d.coerced_reason.is_none());
@@ -2708,16 +2692,42 @@ mod tests {
     }
 
     #[test]
+    fn act_reversible_escalates_the_irreversible_kinds() {
+        for kind in ["merge", "Abandon", " deploy "] {
+            let d = resolve_decision_disposition(
+                Some("act_reversible"),
+                Some("granted"),
+                Some("decided"),
+                Some(kind),
+            )
+            .expect("valid");
+            assert_eq!(d.status, "pending_user", "kind {kind:?} must escalate");
+            assert!(d.coerced_reason.as_deref().unwrap_or("").contains("kind="));
+        }
+        // Reversible work passes at act_reversible; everything passes at act_full.
+        for (level, kind) in [
+            ("act_reversible", Some("dispatch")),
+            ("act_reversible", None),
+            ("act_full", Some("merge")),
+        ] {
+            let d =
+                resolve_decision_disposition(Some(level), Some("granted"), Some("decided"), kind)
+                    .expect("valid");
+            assert_eq!(d.status, "decided", "{level}/{kind:?} must pass");
+        }
+    }
+
+    #[test]
     fn legacy_decision_bodies_default_to_owner_escalations() {
         // The pre-ledger callers send only question+rationale: no authority,
         // no status. They must keep meaning "ask the owner".
-        let d = resolve_decision_disposition(Some("act_full"), None, None).expect("valid");
+        let d = resolve_decision_disposition(Some("act_full"), None, None, None).expect("valid");
         assert_eq!(d.authority, "escalation");
         assert_eq!(d.status, "pending_user");
         assert!(d.coerced_reason.is_none());
 
-        assert!(resolve_decision_disposition(None, Some("sovereign"), None).is_err());
-        assert!(resolve_decision_disposition(None, None, Some("expired")).is_err());
+        assert!(resolve_decision_disposition(None, Some("sovereign"), None, None).is_err());
+        assert!(resolve_decision_disposition(None, None, Some("expired"), None).is_err());
     }
 
     #[test]
