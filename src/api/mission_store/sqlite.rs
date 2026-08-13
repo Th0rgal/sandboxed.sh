@@ -5007,6 +5007,43 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn latest_assistant_text(&self, mission_id: Uuid) -> Result<Option<String>, String> {
+        let conn = self.conn.clone();
+        let id_str = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let row = conn
+                .query_row(
+                    "SELECT content, content_file FROM mission_events
+                     WHERE mission_id = ?1
+                       AND event_type IN ('assistant_message', 'assistant_message_canonical')
+                     ORDER BY sequence DESC LIMIT 1",
+                    params![id_str],
+                    |row| {
+                        let content: Option<String> = row.get(0)?;
+                        let content_file: Option<String> = row.get(1)?;
+                        Ok((content, content_file))
+                    },
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            Ok(match row {
+                Some((content, content_file)) => {
+                    let text = Self::load_content(content.as_deref(), content_file.as_deref());
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }
+                None => None,
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     // === Event logging methods ===
 
     async fn log_event(&self, mission_id: Uuid, event: &AgentEvent) -> Result<(), String> {
