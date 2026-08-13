@@ -2335,6 +2335,16 @@ pub trait MissionStore: Send + Sync {
         success: bool,
     ) -> Result<(), String>;
 
+    /// The text of the mission's most recent assistant message (its final
+    /// output/result), or None when there is none. Used to include the actual
+    /// work product — not just status metadata — in the terminal mission-status
+    /// webhook, so a mission-backed delegation returns a real result to the
+    /// delegating agent. Default None; overridden by the SQLite store.
+    async fn latest_assistant_text(&self, mission_id: Uuid) -> Result<Option<String>, String> {
+        let _ = mission_id;
+        Ok(None)
+    }
+
     // === Event logging methods (default no-op for backward compatibility) ===
 
     /// Log a streaming event. Called for every AgentEvent during execution.

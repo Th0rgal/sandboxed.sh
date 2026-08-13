@@ -754,6 +754,86 @@ impl ProjectsStore {
         Ok(removed)
     }
 
+    /// Move a project to a new slug across every table that keys on it, in one
+    /// transaction. This is only the store-side move: the caller owns alias
+    /// forwarding (routes.json) so external references — mission tags, cron
+    /// `deliver: project:<old>`, `[CTRL:]` signatures — keep resolving.
+    ///
+    /// Refuses to clobber: the target slug must not already be a roster
+    /// project. Historical rows that would collide under the new slug (state
+    /// events, tracks, decisions ingested under it before the rename) keep the
+    /// target's copy and drop the source's, so the move never fails midway on
+    /// a primary-key conflict.
+    pub fn rename_project(&self, old: &str, new: &str) -> Result<ProjectRecord, String> {
+        if old == new {
+            return Err("new slug is identical to the current one".to_string());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction().map_err(|e| e.to_string())?;
+        // `project_grant` references projects(slug) with no ON UPDATE action,
+        // so parent and child must both move before constraints are checked.
+        transaction
+            .pragma_update(None, "defer_foreign_keys", "ON")
+            .map_err(|e| e.to_string())?;
+        let exists: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM projects WHERE slug = ?1",
+                params![old],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if exists.is_none() {
+            return Err(format!("project '{old}' not found"));
+        }
+        let taken: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM projects WHERE slug = ?1",
+                params![new],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if taken.is_some() {
+            return Err(format!(
+                "project '{new}' already exists — renaming onto an existing project is a merge, which stays explicit via the alias map"
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        transaction
+            .execute(
+                "UPDATE projects SET slug = ?2, updated_at = ?3 WHERE slug = ?1",
+                params![old, new, now],
+            )
+            .map_err(|e| e.to_string())?;
+        for table in [
+            "project_grant",
+            "project_bindings",
+            "project_tracks",
+            "project_state_events",
+            "project_decisions",
+        ] {
+            transaction
+                .execute(
+                    &format!("UPDATE OR IGNORE {table} SET slug = ?2 WHERE slug = ?1"),
+                    params![old, new],
+                )
+                .map_err(|e| e.to_string())?;
+            // Rows OR IGNORE skipped collided with an existing row under the
+            // new slug; the target's copy wins and the leftover is dropped.
+            transaction
+                .execute(
+                    &format!("DELETE FROM {table} WHERE slug = ?1"),
+                    params![old],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+        drop(connection);
+        self.get_project(new)?
+            .ok_or_else(|| "project vanished after rename".to_string())
+    }
+
     fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
         Ok(ProjectRecord {
             slug: row.get(0)?,
@@ -1254,6 +1334,85 @@ pub struct ProjectDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rename moves every table that keys on the slug — record, grant
+    /// (FK child), binding, tracks, state events, decisions — and the old
+    /// slug is gone from all of them.
+    #[test]
+    fn rename_moves_every_slug_keyed_row() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("old-name", Some("Title"), None, None, Some("job123"))
+            .expect("create");
+        store
+            .set_grant("old-name", Some("full"), None, None, None, None, None)
+            .expect("grant");
+        store.set_binding("old-name", "sess-1", None).expect("bind");
+        store
+            .set_track("old-name", "track-a", Some("green"), Some("running"))
+            .expect("track");
+        store
+            .record_state(
+                "old-name",
+                "sig|state",
+                Some("headline"),
+                "2026-08-13T10:00:00Z",
+                None,
+            )
+            .expect("state");
+
+        let renamed = store
+            .rename_project("old-name", "new-name")
+            .expect("rename");
+        assert_eq!(renamed.slug, "new-name");
+        assert_eq!(renamed.controller_cron_id.as_deref(), Some("job123"));
+
+        assert!(store.get_project("old-name").expect("read").is_none());
+        assert_eq!(
+            store
+                .binding("new-name")
+                .expect("read")
+                .expect("bound")
+                .session_id,
+            "sess-1"
+        );
+        assert!(store.binding("old-name").expect("read").is_none());
+        assert_eq!(store.tracks("new-name").expect("tracks").len(), 1);
+        assert_eq!(
+            store
+                .state_timeline("new-name", 10)
+                .expect("timeline")
+                .len(),
+            1
+        );
+        assert!(store
+            .state_timeline("old-name", 10)
+            .expect("timeline")
+            .is_empty());
+    }
+
+    /// Renaming onto an existing project is refused: a merge stays an explicit
+    /// alias-map operation, never an accidental clobber.
+    #[test]
+    fn rename_refuses_to_clobber_an_existing_project() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("a", None, None, None, None)
+            .expect("a");
+        store
+            .upsert_project("b", None, None, None, None)
+            .expect("b");
+        let error = store.rename_project("a", "b").expect_err("must refuse");
+        assert!(error.contains("already exists"), "{error}");
+        assert!(store.get_project("a").expect("read").is_some());
+    }
+
+    #[test]
+    fn rename_of_a_missing_project_is_not_found() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        let error = store.rename_project("ghost", "x").expect_err("must fail");
+        assert!(error.contains("not found"), "{error}");
+    }
 
     #[test]
     fn binding_round_trips_and_rebinds_in_place() {
