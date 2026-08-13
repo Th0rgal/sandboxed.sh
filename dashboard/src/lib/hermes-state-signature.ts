@@ -15,7 +15,7 @@
 // A control-plane trailer at the very END of a message, tolerating trailing
 // whitespace. `[^\]]` (not `.`) allows a trailer spanning lines.
 const TRAILING_CONTROL_TRAILER_RE =
-  /\s*\[(?:STATE_SIGNATURE|CTRL):[^\]]*\]\s*$/;
+  /\s*\[(?:STATE_SIGNATURE|CTRL|DECISION):[^\]]*\]\s*$/;
 
 const SIGNATURE_KEY_RE = /\[STATE_SIGNATURE:\s*([^|\]]+)/g;
 

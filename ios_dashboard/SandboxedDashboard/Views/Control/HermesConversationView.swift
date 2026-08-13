@@ -547,7 +547,7 @@ enum HermesTranscript {
     /// Strip only complete trailers at the end so quoted examples remain.
     static func strippingControlTrailers(from content: String) -> String {
         var output = content
-        let pattern = #"\s*\[(?:STATE_SIGNATURE|CTRL):[^\]]*\]\s*$"#
+        let pattern = #"\s*\[(?:STATE_SIGNATURE|CTRL|DECISION):[^\]]*\]\s*$"#
         while let range = output.range(of: pattern, options: .regularExpression) {
             output.removeSubrange(range)
         }

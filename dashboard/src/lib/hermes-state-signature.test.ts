@@ -36,6 +36,20 @@ describe("stripStateSignature", () => {
     ).toBe("Done.");
   });
 
+  it("removes a trailing DECISION ledger trailer", () => {
+    const body =
+      'Merged the PR.\n\n[DECISION: {"kind":"merge","authority":"granted","status":"decided","question":"Merged verity#2213"}]';
+    expect(stripHermesControlTrailers(body)).toBe("Merged the PR.");
+    expect(
+      stripHermesControlTrailers(`Done.\n[DECISION: Ship v2?]\n${SIGNATURE}`),
+    ).toBe("Done.");
+  });
+
+  it("leaves DECISION metadata quoted mid-message intact", () => {
+    const body = "Use [DECISION: question] as the fallback format in reports.";
+    expect(stripHermesControlTrailers(body)).toBe(body);
+  });
+
   it("leaves CTRL metadata quoted mid-message intact", () => {
     const body = "The old format was [CTRL: project | mode=active] in reports.";
     expect(stripHermesControlTrailers(body)).toBe(body);

@@ -218,6 +218,7 @@ fn ingest_deliveries(
                 autonomy.as_deref(),
                 trailer.authority.as_deref(),
                 trailer.status.as_deref(),
+                trailer.kind.as_deref(),
             ) {
                 Ok(disposition) => {
                     let decision = super::projects_store::NewDecision {
@@ -2174,10 +2175,18 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
             .and_then(|rest| rest.strip_suffix(']'))
     });
     // `[DECISION: {json}]` / `[DECISION: plain question]` — the ledger's
-    // trailer fallback (last one wins, like the other trailers).
+    // trailer fallback. Unlike the state/ctrl trailers (which only route and
+    // describe), this one CREATES a durable ledger row, so it is only honored
+    // inside the trailing control block: consecutive trailer/empty lines at
+    // the end of the message. A `[DECISION:` line quoted mid-prose (a
+    // controller echoing its own instructions) never reaches the ledger.
     let decision = content
         .lines()
         .rev()
+        .take_while(|line| {
+            let trimmed = line.trim();
+            trimmed.is_empty() || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        })
         .find_map(|line| {
             let trimmed = line.trim();
             trimmed
@@ -2529,6 +2538,16 @@ mod tests {
         // A trailer alone must not become the headline (tag title fallback).
         let only = parse_delivery("s", 1.0, "[Cron delivery: x]\n[DECISION: Question?]\n");
         assert_eq!(only.headline, "x");
+
+        // A [DECISION:] line quoted mid-prose (followed by ordinary text) is
+        // an example, not a trailer — it must never reach the ledger.
+        let quoted = parse_delivery(
+            "s",
+            1.0,
+            "[Cron delivery: x]\nTitle\n[DECISION: use this format]\nas documented, \
+             append the trailer to your report.\n[STATE_SIGNATURE: verity|phase]\n",
+        );
+        assert_eq!(quoted.decision, None, "mid-prose DECISION must be ignored");
 
         // Malformed JSON is dropped, not guessed at.
         assert_eq!(

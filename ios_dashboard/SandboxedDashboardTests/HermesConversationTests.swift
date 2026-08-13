@@ -122,6 +122,21 @@ final class HermesConversationTests: XCTestCase {
         XCTAssertEqual(items[0].content, "Formal repair is active.")
     }
 
+    func testDecisionTrailerIsHiddenFromAssistantHistory() {
+        let report = """
+            Merged the PR.
+
+            [DECISION: {"kind":"merge","authority":"granted","status":"decided","question":"Merged verity#2213"}]
+            [STATE_SIGNATURE: verity|phase|head]
+            """
+        let items = HermesTranscript.chatMessages(from: [
+            makeMessage(id: 1, role: "assistant", content: report)
+        ])
+
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].content, "Merged the PR.")
+    }
+
     func testQuotedControllerTrailerRemainsVisible() {
         let prose = "The format is [CTRL: project | mode=active] in old reports."
         let items = HermesTranscript.chatMessages(from: [
