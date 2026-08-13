@@ -6161,27 +6161,143 @@ pub(crate) fn resolve_opencode_model_from_config(
     None
 }
 
+/// Guest PATH dirs mirrored onto the host-visible container rootfs.
+/// Keep in lockstep with `workspace_exec::CONTAINER_DEFAULT_PATH_DIRS`.
+const CONTAINER_OVERLAY_PATH_DIRS: &[&str] = &[
+    "root/.bun/bin",
+    "root/.cache/.bun/bin",
+    "root/.local/bin",
+    "usr/local/sbin",
+    "usr/local/bin",
+    "usr/sbin",
+    "usr/bin",
+    "sbin",
+    "bin",
+];
+
+fn path_is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Look for `program` on the host-visible container rootfs. The nspawn
+/// overlay is a normal directory (`workspace.path/usr/local/bin/grok`);
+/// reading it does not need nsenter and cannot time out.
+pub(crate) fn container_overlay_command_path(
+    workspace: &Workspace,
+    program: &str,
+) -> Option<PathBuf> {
+    if workspace.workspace_type != WorkspaceType::Container {
+        return None;
+    }
+    let guest = program.trim();
+    if guest.is_empty() {
+        return None;
+    }
+    if guest.contains('/') {
+        let rel = guest.trim_start_matches('/');
+        if rel.is_empty() {
+            return None;
+        }
+        let candidate = workspace.path.join(rel);
+        return path_is_executable(&candidate).then_some(candidate);
+    }
+    for dir in CONTAINER_OVERLAY_PATH_DIRS {
+        let candidate = workspace.path.join(dir).join(guest);
+        if path_is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Guest-absolute path for an overlay hit, e.g. `/usr/local/bin/grok`.
+pub(crate) fn container_overlay_guest_path(
+    workspace: &Workspace,
+    overlay_path: &Path,
+    program: &str,
+) -> String {
+    if program.contains('/') {
+        return program.to_string();
+    }
+    overlay_path
+        .strip_prefix(&workspace.path)
+        .ok()
+        .map(|rel| format!("/{}", rel.to_string_lossy()))
+        .filter(|guest| guest != "/")
+        .unwrap_or_else(|| format!("/usr/local/bin/{program}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandPresence {
+    Present,
+    Absent,
+    /// An nsenter probe timed out. This is not proof the binary is missing
+    /// (Verity #2332, 2026-08-13: grok 0.2.93 sat on the overlay while
+    /// ~146 stuck nsenter made `command -v` exceed 30s).
+    Inconclusive,
+}
+
+/// Combine an overlay hit with an optional nsenter probe. A timeout
+/// (`probe == None`) is never mapped to [`CommandPresence::Absent`].
+pub(crate) fn resolve_command_presence(overlay_hit: bool, probe: Option<bool>) -> CommandPresence {
+    if overlay_hit {
+        return CommandPresence::Present;
+    }
+    match probe {
+        Some(true) => CommandPresence::Present,
+        Some(false) => CommandPresence::Absent,
+        None => CommandPresence::Inconclusive,
+    }
+}
+
 pub(crate) async fn command_available(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     program: &str,
 ) -> bool {
+    matches!(
+        command_presence(workspace_exec, cwd, program).await,
+        CommandPresence::Present
+    )
+}
+
+pub(crate) async fn command_presence(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    program: &str,
+) -> CommandPresence {
     if workspace_exec.workspace.workspace_type == WorkspaceType::Host {
-        if program.contains('/') {
-            return std::path::Path::new(program).is_file();
-        }
-        if let Ok(path_var) = std::env::var("PATH") {
-            for dir in path_var.split(':') {
-                if dir.is_empty() {
-                    continue;
-                }
-                let candidate = std::path::Path::new(dir).join(program);
-                if candidate.is_file() {
-                    return true;
-                }
-            }
-        }
-        return false;
+        let present = if program.contains('/') {
+            std::path::Path::new(program).is_file()
+        } else {
+            std::env::var("PATH").ok().is_some_and(|path_var| {
+                path_var
+                    .split(':')
+                    .filter(|dir| !dir.is_empty())
+                    .any(|dir| std::path::Path::new(dir).join(program).is_file())
+            })
+        };
+        return if present {
+            CommandPresence::Present
+        } else {
+            CommandPresence::Absent
+        };
+    }
+
+    if container_overlay_command_path(&workspace_exec.workspace, program).is_some() {
+        return CommandPresence::Present;
     }
 
     async fn check_dir(
@@ -6217,7 +6333,8 @@ pub(crate) async fn command_available(
                 tracing::warn!(
                     program = %program,
                     timeout_secs = probe_timeout,
-                    "Workspace command probe timed out — host overloaded? Treating as unavailable"
+                    "Workspace command probe timed out — host overloaded? \
+                     Treating as inconclusive, not absent"
                 );
                 return None;
             }
@@ -6232,20 +6349,21 @@ pub(crate) async fn command_available(
         Some(!stdout.trim().is_empty())
     }
 
-    if let Some(found) = check_dir(workspace_exec, cwd, program).await {
-        if found {
-            return true;
+    match check_dir(workspace_exec, cwd, program).await {
+        Some(true) => CommandPresence::Present,
+        Some(false) => {
+            let fallback_dir = &workspace_exec.workspace.path;
+            if cwd != fallback_dir {
+                resolve_command_presence(
+                    false,
+                    check_dir(workspace_exec, fallback_dir, program).await,
+                )
+            } else {
+                CommandPresence::Absent
+            }
         }
+        None => CommandPresence::Inconclusive,
     }
-
-    let fallback_dir = &workspace_exec.workspace.path;
-    if cwd != fallback_dir {
-        if let Some(found) = check_dir(workspace_exec, fallback_dir, program).await {
-            return found;
-        }
-    }
-
-    false
 }
 
 async fn available_bun_command(
@@ -7922,25 +8040,37 @@ pub async fn check_backend_prerequisites(
         }
         "grok" => {
             let cli = cli_path.unwrap_or("grok");
-            let available = command_available(&workspace_exec, cwd, cli).await;
+            let overlay = container_overlay_command_path(workspace, cli).is_some()
+                || container_overlay_command_path(workspace, "/usr/local/bin/grok").is_some();
+            let presence = if overlay {
+                CommandPresence::Present
+            } else {
+                command_presence(&workspace_exec, cwd, cli).await
+            };
+            let available = matches!(presence, CommandPresence::Present);
             BackendPreflightResult {
                 backend_id: "grok".to_string(),
                 available,
                 cli_available: available,
-                auto_install_possible: false,
+                // A timed-out probe is not "harness missing": allow create to
+                // proceed so the turn can use the overlay / host-copy path.
+                auto_install_possible: !available,
                 missing_dependencies: if available {
+                    Vec::new()
+                } else if matches!(presence, CommandPresence::Inconclusive) {
                     Vec::new()
                 } else {
                     vec!["grok CLI".to_string()]
                 },
-                message: if available {
-                    Some("Grok Build CLI is available".to_string())
-                } else {
-                    Some(
-                        "Grok Build CLI not found. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash"
-                            .to_string(),
-                    )
-                },
+                message: Some(match presence {
+                    CommandPresence::Present => "Grok Build CLI is available".to_string(),
+                    CommandPresence::Inconclusive => {
+                        "Grok CLI nsenter probe timed out; not treating as absent".to_string()
+                    }
+                    CommandPresence::Absent => {
+                        "Grok Build CLI not found. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash".to_string()
+                    }
+                }),
             }
         }
         "chatgpt_ui" => {
@@ -9020,6 +9150,109 @@ mod tests {
             "must not re-create the host symlink inside the container"
         );
         assert_eq!(fs::read(&copied).unwrap(), fs::read(&real).unwrap());
+    }
+
+    fn container_workspace_at(path: &std::path::Path) -> crate::workspace::Workspace {
+        crate::workspace::Workspace {
+            id: Uuid::new_v4(),
+            name: "verity".into(),
+            workspace_type: WorkspaceType::Container,
+            path: path.to_path_buf(),
+            status: crate::workspace::WorkspaceStatus::Ready,
+            error_message: None,
+            config: serde_json::json!({}),
+            template: None,
+            distro: None,
+            env_vars: Default::default(),
+            init_scripts: Vec::new(),
+            init_script: None,
+            created_at: chrono::Utc::now(),
+            skills: Vec::new(),
+            plugins: Vec::new(),
+            shared_network: None,
+            tailscale_mode: None,
+            mcps: Vec::new(),
+            mcps_replace_defaults: true,
+            config_profile: None,
+            resolved_git_credentials: None,
+            read_only_command_guard_dir: None,
+            harness_versions: None,
+        }
+    }
+
+    #[test]
+    fn container_overlay_finds_grok_and_curl_without_nsenter() {
+        let root = tempfile::tempdir().unwrap();
+        let grok = root.path().join("usr/local/bin/grok");
+        let curl = root.path().join("usr/bin/curl");
+        fs::create_dir_all(grok.parent().unwrap()).unwrap();
+        fs::create_dir_all(curl.parent().unwrap()).unwrap();
+        fs::write(&grok, b"#!/bin/sh\necho grok\n").unwrap();
+        fs::write(&curl, b"#!/bin/sh\necho curl\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&grok, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let workspace = container_workspace_at(root.path());
+        let grok_hit =
+            super::container_overlay_command_path(&workspace, "grok").expect("grok on overlay");
+        assert_eq!(grok_hit, grok);
+        assert_eq!(
+            super::container_overlay_guest_path(&workspace, &grok_hit, "grok"),
+            "/usr/local/bin/grok"
+        );
+        assert_eq!(
+            super::container_overlay_command_path(&workspace, "/usr/bin/curl").as_deref(),
+            Some(curl.as_path())
+        );
+        assert!(super::container_overlay_command_path(&workspace, "missing").is_none());
+    }
+
+    #[test]
+    fn probe_timeout_is_inconclusive_not_absent() {
+        assert_eq!(
+            super::resolve_command_presence(true, None),
+            super::CommandPresence::Present
+        );
+        assert_eq!(
+            super::resolve_command_presence(false, None),
+            super::CommandPresence::Inconclusive
+        );
+        assert_eq!(
+            super::resolve_command_presence(false, Some(false)),
+            super::CommandPresence::Absent
+        );
+        assert_eq!(
+            super::resolve_command_presence(false, Some(true)),
+            super::CommandPresence::Present
+        );
+        assert_ne!(
+            super::resolve_command_presence(false, None),
+            super::CommandPresence::Absent,
+            "a 30s nsenter timeout must not be mapped to grok/curl absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_available_uses_container_overlay_without_nsenter() {
+        let root = tempfile::tempdir().unwrap();
+        let grok = root.path().join("usr/local/bin/grok");
+        fs::create_dir_all(grok.parent().unwrap()).unwrap();
+        fs::write(&grok, b"#!/bin/sh\necho grok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&grok, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let workspace = container_workspace_at(root.path());
+        let exec = crate::workspace_exec::WorkspaceExec::new(workspace);
+        assert!(
+            super::command_available(&exec, root.path(), "grok").await,
+            "overlay grok must be visible without nsenter"
+        );
+        assert!(super::command_available(&exec, root.path(), "/usr/local/bin/grok").await);
     }
 
     #[test]
