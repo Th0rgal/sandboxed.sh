@@ -1,8 +1,9 @@
 /**
- * Hermes controller sessions (crons especially) end their replies with a
- * machine-readable trailer the projects board uses for routing:
+ * Hermes controller sessions (crons especially) can end their replies with
+ * machine-readable trailers the projects board uses for routing and health:
  *
  *   [STATE_SIGNATURE: lean-silicon|phase-c-bridges|7a1c0aab/…|external-ci-wait]
+ *   [CTRL: lean-silicon | mode=active | wait=0 | next=certify]
  *
  * The first field is the controller's routing key (project slug). The trailer
  * is control-plane metadata, not prose — transcripts shown to a human must
@@ -11,21 +12,25 @@
  * cron_bef…").
  */
 
-// A trailer at the very END of a message, tolerating trailing whitespace.
-// `[^\]]` (not `.`) so a signature spanning lines still matches.
-const TRAILING_SIGNATURE_RE = /\s*\[STATE_SIGNATURE:[^\]]*\]\s*$/;
+// A control-plane trailer at the very END of a message, tolerating trailing
+// whitespace. `[^\]]` (not `.`) allows a trailer spanning lines.
+const TRAILING_CONTROL_TRAILER_RE =
+  /\s*\[(?:STATE_SIGNATURE|CTRL):[^\]]*\]\s*$/;
 
 const SIGNATURE_KEY_RE = /\[STATE_SIGNATURE:\s*([^|\]]+)/g;
 
-/** Remove trailing `[STATE_SIGNATURE: …]` trailer(s) from a message body.
- * Only trailers are stripped — a signature quoted mid-text stays intact. */
-export function stripStateSignature(content: string): string {
+/** Remove trailing Hermes control-plane trailer(s) from a message body.
+ * Only trailers are stripped — metadata quoted mid-text stays intact. */
+export function stripHermesControlTrailers(content: string): string {
   let out = content;
-  while (TRAILING_SIGNATURE_RE.test(out)) {
-    out = out.replace(TRAILING_SIGNATURE_RE, "");
+  while (TRAILING_CONTROL_TRAILER_RE.test(out)) {
+    out = out.replace(TRAILING_CONTROL_TRAILER_RE, "");
   }
   return out;
 }
+
+/** Backward-compatible name for callers outside the dashboard bundle. */
+export const stripStateSignature = stripHermesControlTrailers;
 
 /** Routing key (first `|`-separated field) of the LAST state signature in a
  * body, or null when the body carries none. */

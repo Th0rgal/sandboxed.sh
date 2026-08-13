@@ -470,7 +470,11 @@ struct HermesConversationView: View {
     /// Close the in-flight assistant bubble (if any) so later rows append after it.
     private func flushAssistantBubble() {
         finalizeThinking()
+        streamText = HermesTranscript.strippingControlTrailers(from: streamText)
         guard !streamText.isEmpty else {
+            if let streamId {
+                messages.removeAll { $0.id == streamId }
+            }
             streamId = nil
             return
         }
@@ -538,6 +542,18 @@ struct HermesConversationView: View {
 
 /// Maps persisted Hermes messages onto the shared `ChatMessage` model.
 enum HermesTranscript {
+    /// Hermes controller status/routing trailers are persisted with assistant
+    /// prose for the projects board, but are not part of the human transcript.
+    /// Strip only complete trailers at the end so quoted examples remain.
+    static func strippingControlTrailers(from content: String) -> String {
+        var output = content
+        let pattern = #"\s*\[(?:STATE_SIGNATURE|CTRL):[^\]]*\]\s*$"#
+        while let range = output.range(of: pattern, options: .regularExpression) {
+            output.removeSubrange(range)
+        }
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func chatMessages(from history: [HermesMessage]) -> [ChatMessage] {
         var result: [ChatMessage] = []
         // Assistant tool_calls create the bubble; the later `tool` role message
@@ -556,6 +572,7 @@ enum HermesTranscript {
                         id: message.id, type: .user, content: content, timestamp: timestamp))
 
             case "assistant":
+                let visibleContent = strippingControlTrailers(from: content)
                 if let reasoning = message.reasoningText {
                     result.append(
                         ChatMessage(
@@ -566,14 +583,14 @@ enum HermesTranscript {
                         )
                     )
                 }
-                if !content.isEmpty {
+                if !visibleContent.isEmpty {
                     result.append(
                         ChatMessage(
                             id: message.id,
                             type: .assistant(
                                 success: true, costCents: 0, costSource: .unknown,
                                 model: nil, sharedFiles: nil),
-                            content: content,
+                            content: visibleContent,
                             timestamp: timestamp
                         )
                     )
