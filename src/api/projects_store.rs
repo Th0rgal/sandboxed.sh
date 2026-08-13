@@ -95,7 +95,8 @@ CREATE TABLE IF NOT EXISTS project_grant (
     pause_reason      TEXT,
     resume_condition  TEXT,        -- the structured, checkable resume gate
     material_bar      TEXT,
-    answered_at       TEXT
+    answered_at       TEXT,
+    autonomy_level    TEXT         -- observe | propose | act_reversible | act_full
 );
 
 -- One row per workstream. `desired_state` is what the track should reach;
@@ -109,18 +110,29 @@ CREATE TABLE IF NOT EXISTS project_tracks (
     PRIMARY KEY (slug, track)
 );
 
--- The pending-decision ledger: questions the controller batched for the owner,
--- requestable rather than buried in a markdown file.
+-- The decision ledger. Two kinds of rows share it: escalations (questions the
+-- controller batched for the owner, `authority = 'escalation'`) and autonomous
+-- acts the controller declared before doing (`authority = 'granted'`). The
+-- legacy `answered` flag is dual-written (1 for anything not pending) so an
+-- older binary's "open decisions" query never surfaces autonomous acts.
 CREATE TABLE IF NOT EXISTS project_decisions (
-    slug      TEXT NOT NULL,
-    at        TEXT NOT NULL,
-    question  TEXT NOT NULL,
-    rationale TEXT,
-    answered  INTEGER NOT NULL DEFAULT 0,
+    slug        TEXT NOT NULL,
+    at          TEXT NOT NULL,
+    question    TEXT NOT NULL,
+    rationale   TEXT,
+    answered    INTEGER NOT NULL DEFAULT 0,
+    kind        TEXT,                                    -- merge|dispatch|scope|budget|...
+    authority   TEXT NOT NULL DEFAULT 'escalation',      -- granted|escalation
+    status      TEXT,                                    -- decided|pending_user|answered|expired
+    answer      TEXT,
+    answered_at TEXT,
+    evidence    TEXT,                                    -- JSON: {pr_url, mission_id, ...}
     PRIMARY KEY (slug, at)
 );
 CREATE INDEX IF NOT EXISTS idx_project_decisions_open
     ON project_decisions(slug, answered);
+-- idx_project_decisions_status is created in initialize(), after the additive
+-- column migration guarantees `status` exists on legacy tables.
 "#;
 
 /// A project's control conversation and how we know about it.
@@ -174,19 +186,72 @@ impl ProjectsStore {
         connection.execute_batch(SCHEMA)?;
         // project_state_events.session_id (2026-08: the overview builds
         // latest_update from the store, so the delivery's session rides along).
-        let mut statement = connection.prepare("PRAGMA table_info(project_state_events)")?;
-        let has_session_id = statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .filter_map(Result::ok)
-            .any(|name| name == "session_id");
-        drop(statement);
-        if !has_session_id {
+        Self::ensure_column(
+            connection,
+            "project_state_events",
+            "session_id",
+            "session_id TEXT",
+        )?;
+        // 2026-08: the decision ledger grew authority/status/evidence, and the
+        // grant grew a normalized autonomy level.
+        Self::ensure_column(connection, "project_decisions", "kind", "kind TEXT")?;
+        Self::ensure_column(
+            connection,
+            "project_decisions",
+            "authority",
+            "authority TEXT NOT NULL DEFAULT 'escalation'",
+        )?;
+        let added_status =
+            Self::ensure_column(connection, "project_decisions", "status", "status TEXT")?;
+        Self::ensure_column(connection, "project_decisions", "answer", "answer TEXT")?;
+        Self::ensure_column(
+            connection,
+            "project_decisions",
+            "answered_at",
+            "answered_at TEXT",
+        )?;
+        Self::ensure_column(connection, "project_decisions", "evidence", "evidence TEXT")?;
+        Self::ensure_column(
+            connection,
+            "project_grant",
+            "autonomy_level",
+            "autonomy_level TEXT",
+        )?;
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_project_decisions_status \
+             ON project_decisions(slug, status);",
+        )?;
+        if added_status {
+            // Legacy rows were all owner escalations: open ones become
+            // pending_user, resolved ones answered.
             connection.execute(
-                "ALTER TABLE project_state_events ADD COLUMN session_id TEXT",
+                "UPDATE project_decisions SET status = \
+                 CASE WHEN answered = 1 THEN 'answered' ELSE 'pending_user' END \
+                 WHERE status IS NULL",
                 [],
             )?;
         }
         Ok(())
+    }
+
+    /// Additive column migration; returns true when the column was added.
+    fn ensure_column(
+        connection: &Connection,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> rusqlite::Result<bool> {
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        let exists = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == column);
+        drop(statement);
+        if exists {
+            return Ok(false);
+        }
+        connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
+        Ok(true)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, String> {
@@ -868,7 +933,7 @@ impl ProjectsStore {
         connection
             .query_row(
                 "SELECT merge_authority, budget_per_tick, parallel_missions, \
-                 pause_reason, resume_condition, material_bar, answered_at \
+                 pause_reason, resume_condition, material_bar, answered_at, autonomy_level \
                  FROM project_grant WHERE slug = ?1",
                 params![slug],
                 |row| {
@@ -880,6 +945,7 @@ impl ProjectsStore {
                         resume_condition: row.get(4)?,
                         material_bar: row.get(5)?,
                         answered_at: row.get(6)?,
+                        autonomy_level: row.get(7)?,
                     })
                 },
             )
@@ -897,6 +963,7 @@ impl ProjectsStore {
         pause_reason: Option<&str>,
         resume_condition: Option<&str>,
         material_bar: Option<&str>,
+        autonomy_level: Option<&str>,
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
@@ -904,8 +971,8 @@ impl ProjectsStore {
             .execute(
                 "INSERT INTO project_grant \
                    (slug, merge_authority, budget_per_tick, parallel_missions, \
-                    pause_reason, resume_condition, material_bar, answered_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                    pause_reason, resume_condition, material_bar, answered_at, autonomy_level) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(slug) DO UPDATE SET \
                    merge_authority = COALESCE(excluded.merge_authority, project_grant.merge_authority), \
                    budget_per_tick = COALESCE(excluded.budget_per_tick, project_grant.budget_per_tick), \
@@ -913,7 +980,8 @@ impl ProjectsStore {
                    pause_reason = COALESCE(excluded.pause_reason, project_grant.pause_reason), \
                    resume_condition = COALESCE(excluded.resume_condition, project_grant.resume_condition), \
                    material_bar = COALESCE(excluded.material_bar, project_grant.material_bar), \
-                   answered_at = excluded.answered_at",
+                   answered_at = excluded.answered_at, \
+                   autonomy_level = COALESCE(excluded.autonomy_level, project_grant.autonomy_level)",
                 params![
                     slug,
                     merge_authority,
@@ -922,51 +990,157 @@ impl ProjectsStore {
                     pause_reason,
                     resume_condition,
                     material_bar,
-                    now
+                    now,
+                    autonomy_level
                 ],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub fn record_decision(
-        &self,
-        slug: &str,
-        question: &str,
-        rationale: Option<&str>,
-    ) -> Result<(), String> {
+    /// Record a decision and return its `at` key. The legacy `answered` flag is
+    /// dual-written: only `pending_user` rows count as open, so an older binary
+    /// reading `answered = 0` never surfaces autonomous acts.
+    pub fn record_decision(&self, slug: &str, decision: &NewDecision) -> Result<String, String> {
         let now = Utc::now().to_rfc3339();
+        let answered = i64::from(decision.status != "pending_user");
+        let evidence = decision.evidence.as_ref().map(|value| value.to_string());
         let connection = self.lock()?;
         connection
             .execute(
-                "INSERT OR REPLACE INTO project_decisions (slug, at, question, rationale, answered) \
-                 VALUES (?1, ?2, ?3, ?4, 0)",
-                params![slug, now, question, rationale],
+                "INSERT OR REPLACE INTO project_decisions \
+                   (slug, at, question, rationale, answered, kind, authority, status, evidence) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    slug,
+                    now,
+                    decision.question,
+                    decision.rationale,
+                    answered,
+                    decision.kind,
+                    decision.authority,
+                    decision.status,
+                    evidence
+                ],
             )
             .map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(now)
+    }
+
+    /// Answer a pending escalation. Returns false when no pending decision
+    /// exists at that key (already answered, expired, or never recorded).
+    pub fn answer_decision(&self, slug: &str, at: &str, answer: &str) -> Result<bool, String> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        let changed = connection
+            .execute(
+                "UPDATE project_decisions \
+                 SET status = 'answered', answer = ?3, answered_at = ?4, answered = 1 \
+                 WHERE slug = ?1 AND at = ?2 AND status = 'pending_user'",
+                params![slug, at, answer, now],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(changed > 0)
     }
 
     pub fn open_decisions(&self, slug: &str) -> Result<Vec<ProjectDecision>, String> {
+        self.decisions_where(slug, "status = 'pending_user'", "ORDER BY at", None)
+    }
+
+    /// Newest-first autonomous acts (`status = 'decided'`) plus recently
+    /// answered escalations, for the "recent activity" panel.
+    pub fn recent_decisions(&self, slug: &str, limit: u32) -> Result<Vec<ProjectDecision>, String> {
+        self.decisions_where(
+            slug,
+            "status IN ('decided', 'answered')",
+            "ORDER BY at DESC",
+            Some(limit),
+        )
+    }
+
+    fn decisions_where(
+        &self,
+        slug: &str,
+        predicate: &str,
+        order: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<ProjectDecision>, String> {
+        let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
         let connection = self.lock()?;
         let mut statement = connection
-            .prepare(
-                "SELECT at, question, rationale FROM project_decisions \
-                 WHERE slug = ?1 AND answered = 0 ORDER BY at",
-            )
+            .prepare(&format!(
+                "SELECT at, question, rationale, kind, authority, status, answer, answered_at, evidence \
+                 FROM project_decisions WHERE slug = ?1 AND {predicate} {order}{limit_clause}",
+            ))
             .map_err(|e| e.to_string())?;
         let rows = statement
             .query_map(params![slug], |row| {
+                let evidence: Option<String> = row.get(8)?;
                 Ok(ProjectDecision {
                     at: row.get(0)?,
                     question: row.get(1)?,
                     rationale: row.get(2)?,
+                    kind: row.get(3)?,
+                    authority: row.get(4)?,
+                    status: row.get(5)?,
+                    answer: row.get(6)?,
+                    answered_at: row.get(7)?,
+                    evidence: evidence.and_then(|raw| serde_json::from_str(&raw).ok()),
                 })
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
     }
+
+    /// Bulk autonomy levels, one board render = one query.
+    pub fn autonomy_levels(&self) -> Result<HashMap<String, String>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT slug, autonomy_level FROM project_grant WHERE autonomy_level IS NOT NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Count of decisions waiting on the owner, for the board row badge.
+    pub fn pending_decision_counts(&self) -> Result<HashMap<String, u32>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT slug, COUNT(*) FROM project_decisions \
+                 WHERE status = 'pending_user' GROUP BY slug",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Input for [`ProjectsStore::record_decision`], already validated/coerced by
+/// the caller (see `resolve_decision_disposition` in `projects_overview`).
+#[derive(Debug, Clone)]
+pub struct NewDecision {
+    pub question: String,
+    pub rationale: Option<String>,
+    pub kind: Option<String>,
+    /// granted | escalation
+    pub authority: String,
+    /// decided | pending_user | answered | expired
+    pub status: String,
+    pub evidence: Option<serde_json::Value>,
 }
 
 /// One distinct state a project reported, with how long it stayed there.
@@ -1038,6 +1212,9 @@ pub struct ProjectGrant {
     pub material_bar: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<String>,
+    /// observe | propose | act_reversible | act_full
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autonomy_level: Option<String>,
 }
 
 /// One workstream within a project.
@@ -1051,13 +1228,26 @@ pub struct ProjectTrack {
     pub updated_at: String,
 }
 
-/// An open question the controller batched for the owner.
+/// One ledger entry: an owner escalation or a declared autonomous act.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProjectDecision {
     pub at: String,
     pub question: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rationale: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// granted | escalation
+    pub authority: String,
+    /// decided | pending_user | answered | expired
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -1426,11 +1616,17 @@ mod tests {
                 None,
                 None,
                 Some("only merged PRs"),
+                Some("act_reversible"),
             )
             .expect("grant");
         let g = store.get_grant("lido").expect("read").expect("present");
         assert_eq!(g.merge_authority.as_deref(), Some("review-first"));
         assert_eq!(g.parallel_missions, Some(3));
+        assert_eq!(g.autonomy_level.as_deref(), Some("act_reversible"));
+        assert_eq!(
+            store.autonomy_levels().expect("levels")["lido"],
+            "act_reversible"
+        );
 
         store
             .set_track("lido", "P-ETH-1", Some("proved"), Some("in-progress"))
@@ -1440,7 +1636,7 @@ mod tests {
         assert_eq!(tracks[0].track, "P-ETH-1");
 
         store
-            .record_decision("lido", "merge #48?", Some("blocks A.2"))
+            .record_decision("lido", &escalation("merge #48?", Some("blocks A.2")))
             .expect("dec");
         assert_eq!(store.open_decisions("lido").expect("open").len(), 1);
 
@@ -1561,6 +1757,105 @@ mod tests {
                 .as_deref(),
             Some("s1")
         );
+    }
+
+    // ---- decision ledger ----
+
+    fn escalation(question: &str, rationale: Option<&str>) -> NewDecision {
+        NewDecision {
+            question: question.to_string(),
+            rationale: rationale.map(str::to_string),
+            kind: None,
+            authority: "escalation".to_string(),
+            status: "pending_user".to_string(),
+            evidence: None,
+        }
+    }
+
+    #[test]
+    fn autonomous_acts_never_appear_open_and_answers_close_escalations() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        let act = NewDecision {
+            question: "Merged PR #2213".to_string(),
+            rationale: Some("CI green, criteria met".to_string()),
+            kind: Some("merge".to_string()),
+            authority: "granted".to_string(),
+            status: "decided".to_string(),
+            evidence: Some(serde_json::json!({"pr_url": "https://github.com/x/y/pull/2213"})),
+        };
+        store.record_decision("verity", &act).expect("act");
+        let at = store
+            .record_decision("verity", &escalation("Ship v2?", None))
+            .expect("escalation");
+
+        // The act is activity, not a question: open shows only the escalation.
+        let open = store.open_decisions("verity").expect("open");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].question, "Ship v2?");
+
+        // Answering closes it and stamps the answer.
+        assert!(store
+            .answer_decision("verity", &at, "yes, ship")
+            .expect("answer"));
+        assert!(store.open_decisions("verity").expect("open").is_empty());
+        // Answering twice (or a bogus key) is a no-op, not an error.
+        assert!(!store
+            .answer_decision("verity", &at, "again")
+            .expect("re-answer"));
+
+        // Recent activity = the act plus the answered escalation, newest first.
+        let recent = store.recent_decisions("verity", 10).expect("recent");
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].answer.as_deref(), Some("yes, ship"));
+        assert_eq!(recent[1].kind.as_deref(), Some("merge"));
+        assert_eq!(
+            recent[1].evidence.as_ref().unwrap()["pr_url"],
+            "https://github.com/x/y/pull/2213"
+        );
+
+        assert_eq!(store.pending_decision_counts().expect("counts").len(), 0);
+        store
+            .record_decision("verity", &escalation("Another?", None))
+            .expect("second escalation");
+        assert_eq!(
+            store.pending_decision_counts().expect("counts")["verity"],
+            1
+        );
+    }
+
+    /// A database from before the ledger columns must migrate: legacy rows are
+    /// owner escalations (open → pending_user, resolved → answered), and the
+    /// legacy `answered` flag keeps meaning "not open" for old binaries.
+    #[test]
+    fn a_legacy_decisions_table_backfills_status_on_open() {
+        let connection = Connection::open_in_memory().expect("conn");
+        connection
+            .execute_batch(
+                "CREATE TABLE project_decisions (
+                    slug TEXT NOT NULL, at TEXT NOT NULL, question TEXT NOT NULL,
+                    rationale TEXT, answered INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (slug, at));
+                 CREATE TABLE project_grant (
+                    slug TEXT PRIMARY KEY NOT NULL, merge_authority TEXT,
+                    budget_per_tick TEXT, parallel_missions INTEGER,
+                    pause_reason TEXT, resume_condition TEXT, material_bar TEXT,
+                    answered_at TEXT);
+                 INSERT INTO project_decisions VALUES
+                    ('lido', '2026-08-01T10:00:00Z', 'open one', NULL, 0),
+                    ('lido', '2026-08-01T11:00:00Z', 'closed one', NULL, 1);",
+            )
+            .expect("old schema");
+        ProjectsStore::initialize(&connection).expect("migrate");
+        let store = ProjectsStore {
+            connection: Mutex::new(connection),
+        };
+        let open = store.open_decisions("lido").expect("open");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].question, "open one");
+        assert_eq!(open[0].authority, "escalation");
+        assert_eq!(open[0].status.as_deref(), Some("pending_user"));
+        // Migrating twice is harmless.
+        ProjectsStore::initialize(&store.connection.lock().unwrap()).expect("re-migrate");
     }
 
     // ---- unrouted deliveries ----
