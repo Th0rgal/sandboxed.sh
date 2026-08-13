@@ -330,6 +330,128 @@ pub async fn upsert_project(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RenameProjectRequest {
+    pub new_slug: String,
+}
+
+/// `POST /api/projects/:slug/rename` — move a project to a new slug.
+///
+/// A rename is "move the canonical + leave a forwarding pointer": the store
+/// rows move in one transaction, then the alias map gains `old → new` (and any
+/// alias that pointed at `old` is flattened onto `new` — `resolve_alias` is
+/// single-hop, so a chain would silently stop resolving). External references
+/// — mission project tags, cron `deliver: project:<old>`, `[CTRL: old | …]`
+/// signatures, tracker files — are deliberately not rewritten: the alias
+/// covers them indefinitely.
+///
+/// Renaming onto an existing project or an established alias key is refused:
+/// the first is a merge (explicit, via routes.json), the second would shadow
+/// whatever that key already routes to.
+pub async fn rename_project(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(req): Json<RenameProjectRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let new_slug = req.new_slug.trim();
+    if !is_plain_key(&slug) || !is_plain_key(new_slug) {
+        return Err(bad_slug());
+    }
+    if new_slug == slug {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "new slug is identical to the current one".to_string(),
+        ));
+    }
+    let dir = hermes_projects_dir();
+    if let Some(dir) = &dir {
+        let aliases = read_alias_map(dir);
+        if aliases.contains_key(new_slug) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "'{new_slug}' is already an alias for '{}' — pick another name or remove the alias first",
+                    aliases[new_slug]
+                ),
+            ));
+        }
+    }
+    let record = state
+        .projects
+        .rename_project(&slug, new_slug)
+        .map_err(|error| {
+            if error.contains("not found") {
+                (StatusCode::NOT_FOUND, error)
+            } else if error.contains("already exists") {
+                (StatusCode::CONFLICT, error)
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, error)
+            }
+        })?;
+    let mut aliases_flattened = 0usize;
+    if let Some(dir) = &dir {
+        aliases_flattened = rewrite_aliases_for_rename(dir, &slug, new_slug).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "project rows moved to '{new_slug}' but routes.json update failed ({error}); \
+                     add \"{slug}\": \"{new_slug}\" to it manually or deliveries keyed '{slug}' will unroute"
+                ),
+            )
+        })?;
+        // A board override (paused/archived) follows the project it describes.
+        let mut overrides = read_overrides(dir);
+        if let Some(value) = overrides.remove(&slug) {
+            overrides.insert(new_slug.to_string(), value);
+            write_overrides(dir, &overrides).map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("write board-overrides.json: {error}"),
+                )
+            })?;
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "project": record,
+        "old_slug": slug,
+        "alias_written": dir.is_some(),
+        "aliases_flattened": aliases_flattened,
+    })))
+}
+
+/// Rewrite routes.json for a rename: every alias pointing at `old` is
+/// flattened onto `new` (single-hop resolution — a chain through `old` would
+/// dead-end), then `old → new` itself is added. Returns how many existing
+/// entries were flattened. Written atomically (tmp + rename), like the
+/// overrides file.
+fn rewrite_aliases_for_rename(dir: &Path, old: &str, new: &str) -> std::io::Result<usize> {
+    let mut aliases = read_alias_map(dir);
+    let mut flattened = 0usize;
+    for target in aliases.values_mut() {
+        if target == old {
+            *target = new.to_string();
+            flattened += 1;
+        }
+    }
+    aliases.insert(old.to_string(), new.to_string());
+    let serialized = serde_json::to_string_pretty(&aliases)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let path = dir.join("routes.json");
+    let tmp = dir.join(".routes.json.tmp");
+    std::fs::write(&tmp, serialized)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(flattened)
+}
+
+fn write_overrides(dir: &Path, overrides: &HashMap<String, String>) -> std::io::Result<()> {
+    let serialized = serde_json::to_string_pretty(overrides)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let tmp = dir.join(".board-overrides.json.tmp");
+    std::fs::write(&tmp, serialized)?;
+    std::fs::rename(&tmp, overrides_path(dir))?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SetStatusRequest {
     pub mode: String,
     pub next_action: Option<String>,
@@ -489,6 +611,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/:slug/state", get(project_state))
         .route("/:slug/updates", get(project_updates))
         .route("/:slug/action", axum::routing::post(project_action))
+        .route("/:slug/rename", axum::routing::post(rename_project))
         .route("/:slug/status", axum::routing::post(set_project_status))
         .route("/:slug/track", axum::routing::post(set_project_track))
         .route(
@@ -1852,6 +1975,56 @@ mod tests {
         assert_eq!(humanize_slug("minimax_m3_full263"), "Minimax M3 Full263");
         assert_eq!(humanize_slug("verity-core"), "Verity Core");
         assert_eq!(humanize_slug(""), "");
+    }
+
+    /// A rename flattens every alias that pointed at the old slug and adds the
+    /// forwarding entry — `resolve_alias` is single-hop, so `x → old → new`
+    /// would dead-end at a slug that no longer exists.
+    #[test]
+    fn rename_alias_rewrite_flattens_chains_and_adds_forwarding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("routes.json"),
+            r#"{"coldcard": "old-name", "coldcard-rng": "old-name", "lido": "verity-lido"}"#,
+        )
+        .expect("seed");
+
+        let flattened =
+            rewrite_aliases_for_rename(dir.path(), "old-name", "new-name").expect("rewrite");
+        assert_eq!(flattened, 2);
+
+        let aliases = read_alias_map(dir.path());
+        assert_eq!(
+            aliases.get("coldcard").map(String::as_str),
+            Some("new-name")
+        );
+        assert_eq!(
+            aliases.get("coldcard-rng").map(String::as_str),
+            Some("new-name")
+        );
+        assert_eq!(
+            aliases.get("old-name").map(String::as_str),
+            Some("new-name")
+        );
+        assert_eq!(aliases.get("lido").map(String::as_str), Some("verity-lido"));
+        // Single-hop resolution now lands every historical key on the new slug.
+        assert_eq!(resolve_alias(&aliases, "coldcard"), "new-name");
+        assert_eq!(resolve_alias(&aliases, "old-name"), "new-name");
+    }
+
+    /// With no routes.json yet, a rename creates one containing only the
+    /// forwarding entry.
+    #[test]
+    fn rename_alias_rewrite_creates_the_map_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let flattened =
+            rewrite_aliases_for_rename(dir.path(), "old-name", "new-name").expect("rewrite");
+        assert_eq!(flattened, 0);
+        let aliases = read_alias_map(dir.path());
+        assert_eq!(
+            aliases.get("old-name").map(String::as_str),
+            Some("new-name")
+        );
     }
 
     #[test]
