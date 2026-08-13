@@ -7945,7 +7945,7 @@ pub async fn create_mission(
 ) -> Result<(axum::http::HeaderMap, Json<Mission>), (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
-    let req = body.map(|b| b.0).unwrap_or(CreateMissionRequest {
+    let mut req = body.map(|b| b.0).unwrap_or(CreateMissionRequest {
         title: None,
         workspace_id: None,
         agent: None,
@@ -7977,6 +7977,27 @@ pub async fn create_mission(
         origin_session_id: None,
         extra: Default::default(),
     });
+
+    // Persist the roster slug, not a nickname. An inverted alias
+    // (`coldcard-rng-cracker` → `ec-defensive-research`) made Coldcard
+    // missions and STATE_SIGNATURE trailers unroutable.
+    if let Some(raw) = req
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+        .map(str::to_string)
+    {
+        let canonical = super::projects_overview::canonicalize_project_slug(&raw);
+        if canonical != raw {
+            tracing::info!(
+                from = %raw,
+                to = %canonical,
+                "canonicalized mission project tag via routes.json alias"
+            );
+            req.project = Some(canonical);
+        }
+    }
 
     // Fail loud on unrecognized fields: log + surface in a response header so
     // a client bug (typo, field sent to the wrong endpoint) is observable
@@ -8266,6 +8287,68 @@ pub async fn create_mission(
                 .await
         {
             model_override = Some(default_model);
+        }
+    }
+
+    // Fail before persist when the chosen workspace cannot run the harness
+    // and cannot auto-install it. Coldcard twice launched Codex on
+    // `dgx-spark` (no CLI, no npm/bun); both missions died in minutes
+    // and the completion never reached the dedicated session.
+    //
+    // Remote-node missions execute on the selected node, not in the local
+    // workspace, so probing the local/container CLI would reject perfectly
+    // runnable work — skip the preflight for them.
+    let runs_locally = req
+        .remote_node_id
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty);
+    if let (true, Some(ws_id), Some(backend_id)) = (runs_locally, workspace_id, backend.as_deref())
+    {
+        if matches!(backend_id, "codex" | "claudecode" | "gemini" | "grok") {
+            if let Some(workspace) = state.workspaces.get(ws_id).await {
+                let cli_path = if matches!(backend_id, "claudecode" | "codex" | "gemini") {
+                    state
+                        .backend_configs
+                        .get(backend_id)
+                        .await
+                        .and_then(|config| {
+                            config
+                                .settings
+                                .get("cli_path")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string)
+                        })
+                } else {
+                    None
+                };
+                let preflight = super::mission_runner::check_backend_prerequisites(
+                    &workspace,
+                    backend_id,
+                    cli_path.as_deref(),
+                )
+                .await;
+                if !preflight.available && !preflight.auto_install_possible {
+                    tracing::warn!(
+                        workspace_id = %ws_id,
+                        backend = backend_id,
+                        message = ?preflight.message,
+                        "create_mission rejected: harness unavailable in workspace"
+                    );
+                    return Err((
+                        StatusCode::CONFLICT,
+                        serde_json::json!({
+                            "error": "harness_unavailable",
+                            "backend": backend_id,
+                            "workspace_id": ws_id,
+                            "workspace_name": workspace.name,
+                            "missing": preflight.missing_dependencies,
+                            "message": preflight.message,
+                        })
+                        .to_string(),
+                    ));
+                }
+            }
         }
     }
 

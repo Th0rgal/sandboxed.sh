@@ -2255,6 +2255,30 @@ fn resolve_alias(aliases: &HashMap<String, String>, key: &str) -> String {
     aliases.get(key).cloned().unwrap_or_else(|| key.to_string())
 }
 
+/// Fold a mission/controller project tag through `routes.json`.
+///
+/// An inverted alias (canonical slug pointing at a phantom name) is how
+/// Coldcard reports signed `ec-defensive-research` and never reached the
+/// bound session. Callers that persist a project tag must store the
+/// canonical roster slug, not a nickname.
+pub fn canonicalize_project_slug(slug: &str) -> String {
+    canonicalize_project_slug_with(
+        &hermes_projects_dir()
+            .map(|dir| read_alias_map(&dir))
+            .unwrap_or_default(),
+        slug,
+    )
+}
+
+/// Test seam: same fold as [`canonicalize_project_slug`] with an explicit map.
+pub fn canonicalize_project_slug_with(aliases: &HashMap<String, String>, slug: &str) -> String {
+    let trimmed = slug.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    resolve_alias(aliases, trimmed)
+}
+
 /// True when every field of a state descriptor is an unfilled `<placeholder>`.
 ///
 /// Deliberately narrow: a descriptor is rejected only when it carries no real
@@ -2780,6 +2804,34 @@ mod tests {
         // The canonical resolves to itself, and an unknown slug is untouched.
         assert_eq!(resolve_alias(&aliases, "verity-lido"), "verity-lido");
         assert_eq!(resolve_alias(&aliases, "sandboxed-sh"), "sandboxed-sh");
+    }
+
+    #[test]
+    fn canonicalize_project_slug_folds_nicknames_and_keeps_the_canonical() {
+        let mut aliases = HashMap::new();
+        aliases.insert("coldcard".to_string(), "coldcard-rng-cracker".to_string());
+        aliases.insert(
+            "coldcard-rng".to_string(),
+            "coldcard-rng-cracker".to_string(),
+        );
+        aliases.insert(
+            "ec-defensive-research".to_string(),
+            "coldcard-rng-cracker".to_string(),
+        );
+        assert_eq!(
+            canonicalize_project_slug_with(&aliases, "coldcard"),
+            "coldcard-rng-cracker"
+        );
+        assert_eq!(
+            canonicalize_project_slug_with(&aliases, "  ec-defensive-research  "),
+            "coldcard-rng-cracker"
+        );
+        assert_eq!(
+            canonicalize_project_slug_with(&aliases, "coldcard-rng-cracker"),
+            "coldcard-rng-cracker"
+        );
+        assert_eq!(canonicalize_project_slug_with(&aliases, "verity"), "verity");
+        assert_eq!(canonicalize_project_slug_with(&aliases, "   "), "");
     }
 
     const SAMPLE: &str = "[Cron delivery: Verity two-phase Fable/Codex progression]\n\

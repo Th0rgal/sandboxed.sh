@@ -1,0 +1,84 @@
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -335,8 +335,42 @@
+             # send_message, which passes HERMES_SESSION_USER_ID to
+             # gateway.mirror.mirror_to_session. Harmless for DMs/shared sessions.
+             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
++        }
++    # Desktop / API-server turns bind a raw session id and often omit the
++    # structured platform/chat_id pair. Without this fallback, deliver=origin
++    # jobs created from those sessions have origin=None and never reach the
++    # conversation (Coldcard skip-scan watch, 2026-08-13).
++    raw_sid = (
++        get_session_env("HERMES_SESSION_ID")
++        or get_session_env("HERMES_UI_SESSION_ID")
++        or ""
++    ).strip()
++    if raw_sid:
++        return {
++            "platform": "api_server",
++            "chat_id": raw_sid,
+         }
+     return None
++
++
++def _origin_deliver_needs_target(deliver: Optional[str], origin: Optional[dict]) -> Optional[str]:
++    """Refuse deliver=origin when no origin was captured and no project: slug is set."""
++    tokens = [
++        part.strip().lower()
++        for part in str(deliver or "").split(",")
++        if part.strip()
++    ]
++    if not tokens or "origin" not in tokens:
++        return None
++    if any(part.startswith("project:") for part in tokens):
++        return None
++    if origin and origin.get("chat_id"):
++        return None
++    return (
++        "deliver=origin has no captured origin session. "
++        "Use deliver='project:<slug>' so the job writes into the dedicated "
++        "project conversation."
++    )
+ 
+ 
+ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
+@@ -1120,14 +1154,20 @@
+                 create_job_with_scheduler_registration,
+             )
+ 
++            _deliver = _normalize_deliver_param(deliver)
++            _origin = _origin_from_env()
++            _origin_err = _origin_deliver_needs_target(_deliver, _origin)
++            if _origin_err:
++                return tool_error(_origin_err, success=False)
++
+             try:
+                 job = create_job_with_scheduler_registration(
+                     prompt=prompt or "",
+                     schedule=schedule,
+                     name=name,
+                     repeat=repeat,
+-                    deliver=_normalize_deliver_param(deliver),
+-                    origin=_origin_from_env(),
++                    deliver=_deliver,
++                    origin=_origin,
+                     skills=canonical_skills,
+                     model=_normalize_optional_job_value(model),
+                     provider=_normalize_optional_job_value(provider),
+@@ -1309,7 +1349,13 @@
+             if name is not None:
+                 updates["name"] = name
+             if deliver is not None:
+-                updates["deliver"] = _normalize_deliver_param(deliver)
++                _deliver = _normalize_deliver_param(deliver)
++                _origin_err = _origin_deliver_needs_target(
++                    _deliver, job.get("origin") or _origin_from_env()
++                )
++                if _origin_err:
++                    return tool_error(_origin_err, success=False)
++                updates["deliver"] = _deliver
+             if skills is not None or skill is not None:
+                 canonical_skills = _canonical_skills(skill, skills)
+                 updates["skills"] = canonical_skills

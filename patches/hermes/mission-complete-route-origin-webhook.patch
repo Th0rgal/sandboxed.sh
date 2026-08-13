@@ -1,0 +1,111 @@
+diff --git a/gateway/platforms/webhook.py b/gateway/platforms/webhook.py
+--- a/gateway/platforms/webhook.py
++++ b/gateway/platforms/webhook.py
+@@ -665,8 +665,94 @@
+             return None  # race: bound between the two lookups — fall through
+         return web.json_response(
+             {"status": "delivered", "mission_id": mission_id, "outcome": outcome}
++        )
++
++    async def _maybe_route_mission_status(self, payload: dict) -> "Optional[web.Response]":
++        """Append a mission-complete callback into the dedicated session.
++
++        Isolated ``webhook:mission-complete:<delivery>`` sessions are how
++        Coldcard ``acfb03d2`` finished without writing into Coldcard #3.
++        After HMAC, route to origin_session (continuations followed) or
++        ``project:<slug>``. Unroutable payloads return None so the existing
++        isolated path still runs.
++        """
++        from aiohttp import web
++
++        try:
++            from gateway.platforms.mission_status_route import (
++                append_mission_callback,
++                resolve_mission_delivery_session,
++            )
++        except Exception:
++            logger.exception("[webhook] mission status router unavailable")
++            return None
++
++        runner = self.gateway_runner
++        session_db = getattr(runner, "_session_db", None) if runner is not None else None
++        owned_db = None
++        if session_db is None:
++            try:
++                from hermes_state import SessionDB
++
++                owned_db = SessionDB()
++                session_db = owned_db
++            except Exception:
++                logger.exception("[webhook] SessionDB unavailable for mission route")
++                return None
++        try:
++            target = resolve_mission_delivery_session(payload, session_db)
++            if not target:
++                return None
++            live = append_mission_callback(target, payload, session_db)
++        except Exception:
++            logger.exception("[webhook] failed to append routed mission callback")
++            return None
++        finally:
++            if owned_db is not None:
++                try:
++                    owned_db.close()
++                except Exception:
++                    pass
++
++        logger.info(
++            "[webhook] routed mission %s status=%s into session %s",
++            payload.get("mission_id"),
++            payload.get("status"),
++            live,
+         )
++        # Best-effort wake so the dedicated session can act; the append
++        # already made the notice durable if the wake cannot start.
++        try:
++            from gateway.config import Platform
++            from gateway.wake import deliver_wake
+ 
++            adapter = None
++            if runner is not None:
++                adapter = (getattr(runner, "adapters", {}) or {}).get(Platform.API_SERVER)
++            if adapter is not None:
++                prompt = (
++                    "A routed mission-complete callback was just appended to "
++                    "this conversation. Read the latest [Mission callback] "
++                    "message. If Thomas must act, write one non-silent "
++                    "controller update here. If you can continue autonomously, "
++                    "do that. Do not open another session."
++                )
++                task = asyncio.create_task(
++                    deliver_wake(adapter, text=prompt, session_id=live)
++                )
++                self._background_tasks.add(task)
++                task.add_done_callback(self._background_tasks.discard)
++        except Exception:
++            logger.warning("[webhook] routed mission wake not scheduled", exc_info=True)
++        return web.json_response(
++            {
++                "status": "routed",
++                "mission_id": payload.get("mission_id"),
++                "session_id": live,
++            },
++            status=202,
++        )
++
+     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
+         """POST /webhooks/{route_name} — receive and process a webhook event."""
+         # Hot-reload dynamic subscriptions on each request (mtime-gated, cheap)
+@@ -888,6 +974,12 @@
+                         )
+             except Exception as e:
+                 logger.warning("[webhook] Skill loading failed: %s", e)
++
++        # Route sandboxed.sh mission-status events into the dedicated
++        # conversation before minting a throwaway webhook session.
++        _routed = await self._maybe_route_mission_status(payload)
++        if _routed is not None:
++            return _routed
+ 
+         # Build a unique delivery ID
+         delivery_id = request.headers.get(

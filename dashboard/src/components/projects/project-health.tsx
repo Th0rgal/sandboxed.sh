@@ -29,11 +29,7 @@ export type ControllerMode = {
   cause: string | null;
 };
 
-/** Read the controller mode off the newest delivery. Returns null when the
- *  controller has not adopted the trailer — callers must render nothing in
- *  that case rather than inventing an "unknown" state. */
-export function parseMode(project: ProjectRow): ControllerMode | null {
-  const raw = project.latest_update?.mode;
+function parseModeRaw(raw: string | null | undefined): ControllerMode | null {
   if (!raw) return null;
   const [base, ...rest] = raw.trim().toLowerCase().split(":");
   if (base !== "active" && base !== "blocked" && base !== "paused") return null;
@@ -41,11 +37,25 @@ export function parseMode(project: ProjectRow): ControllerMode | null {
   return { base, cause: cause.length > 0 ? cause : null };
 }
 
+/** Read the controller mode off the roster first, then the newest delivery.
+ *  A `[SILENT]` tick used to wipe the chip even while the store still knew
+ *  the project was `blocked`. */
+export function parseMode(project: ProjectRow): ControllerMode | null {
+  return parseModeRaw(project.mode) ?? parseModeRaw(project.latest_update?.mode);
+}
+
 /** True when a project has gone quiet for long enough that its controller may
- *  have died rather than simply having nothing to say. */
+ *  have died rather than simply having nothing to say. An active/attention
+ *  project with *no* delivery at all is also stale — Verity #2 sat empty
+ *  for two days and `isStale` used to return false. */
 export function isStale(project: ProjectRow): boolean {
+  if (project.controller_health === "stale" || project.controller_health === "missing") {
+    return true;
+  }
   const at = project.latest_update?.at;
-  if (!at) return false;
+  if (!at) {
+    return project.bucket === "active" || project.bucket === "attention";
+  }
   const ms = Date.now() - new Date(at).getTime();
   return Number.isFinite(ms) && ms > STALE_UPDATE_HOURS * 3600_000;
 }

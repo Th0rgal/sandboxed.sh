@@ -561,6 +561,15 @@ function ProjectListRow({
               </span>
             )}
             <ModeChip mode={mode} />
+            {project.delivery_health === "dropped" ||
+            project.delivery_health === "misrouted" ? (
+              <span
+                title={project.delivery_health}
+                className="shrink-0 text-[10px] uppercase tracking-wide text-amber-400/70"
+              >
+                {project.delivery_health === "dropped" ? "undelivered" : "misrouted"}
+              </span>
+            ) : null}
             {stale && (
               <span className="shrink-0 text-[10px] uppercase tracking-wide text-amber-400/70">
                 silent
