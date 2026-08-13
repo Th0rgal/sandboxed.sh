@@ -604,25 +604,33 @@ pub async fn record_project_decision(
 /// Extract the first GitHub PR link from free text (result digests and notes
 /// routinely quote one). Read-time extraction, nothing stored.
 pub(crate) fn extract_pr_url(text: &str) -> Option<String> {
-    let start = text.find("https://github.com/")?;
-    let candidate = &text[start..];
-    let end = candidate
-        .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'' | ','))
-        .unwrap_or(candidate.len());
-    let url = candidate[..end].trim_end_matches(['.', ';', ':']);
-    // Only PR links qualify: /owner/repo/pull/N
-    let path: Vec<&str> = url
-        .strip_prefix("https://github.com/")?
-        .split('/')
-        .collect();
-    match path.as_slice() {
-        [_, _, kind, number, ..]
-            if *kind == "pull" && number.chars().all(|c| c.is_ascii_digit()) =>
-        {
-            Some(url.to_string())
-        }
-        _ => None,
-    }
+    // Scan every GitHub URL in the text, not just the first: digests routinely
+    // mention the repo before the PR ("Repo https://github.com/x/y; opened
+    // https://github.com/x/y/pull/48"), and locking onto the first hit would
+    // reject the repo link and never reach the PR.
+    text.match_indices("https://github.com/")
+        .find_map(|(start, _)| {
+            let candidate = &text[start..];
+            let end = candidate
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'' | ',')
+                })
+                .unwrap_or(candidate.len());
+            let url = candidate[..end].trim_end_matches(['.', ';', ':']);
+            // Only PR links qualify: /owner/repo/pull/N
+            let path: Vec<&str> = url
+                .strip_prefix("https://github.com/")?
+                .split('/')
+                .collect();
+            match path.as_slice() {
+                [_, _, kind, number, ..]
+                    if *kind == "pull" && number.chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    Some(url.to_string())
+                }
+                _ => None,
+            }
+        })
 }
 
 /// `GET /api/projects/:slug/tasks` — the project's roadmap: every board task
@@ -2354,6 +2362,11 @@ mod tests {
         );
         assert_eq!(
             extract_pr_url("(see https://github.com/x/y/pull/48)"),
+            Some("https://github.com/x/y/pull/48".to_string())
+        );
+        // A repo link BEFORE the PR link must not shadow it.
+        assert_eq!(
+            extract_pr_url("Repo https://github.com/x/y; opened https://github.com/x/y/pull/48"),
             Some("https://github.com/x/y/pull/48".to_string())
         );
         // Repo links, issues, and bare mentions are not PR links.
