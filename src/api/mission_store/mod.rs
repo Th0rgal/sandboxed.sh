@@ -7,7 +7,7 @@
 
 mod file;
 mod memory;
-mod sqlite;
+pub(crate) mod sqlite;
 
 pub use file::FileMissionStore;
 pub use memory::InMemoryMissionStore;
@@ -3597,6 +3597,15 @@ pub trait MissionStore: Send + Sync {
     /// All tasks on a boss mission's board, oldest first.
     async fn list_board_tasks(&self, boss_mission_id: Uuid) -> Result<Vec<BoardTask>, String> {
         let _ = boss_mission_id;
+        Ok(vec![])
+    }
+
+    /// Every board task whose boss mission belongs to this project family
+    /// (exact slug or `slug-*` prefix, matching `project_prefix` filter
+    /// semantics). Resolved through the missions join at read time — no
+    /// denormalized slug column to go stale when a family is retagged.
+    async fn list_board_tasks_for_project(&self, project: &str) -> Result<Vec<BoardTask>, String> {
+        let _ = project;
         Ok(vec![])
     }
 

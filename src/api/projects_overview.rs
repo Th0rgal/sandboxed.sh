@@ -723,6 +723,101 @@ pub async fn record_project_decision(
     })))
 }
 
+/// Extract the first GitHub PR link from free text (result digests and notes
+/// routinely quote one). Read-time extraction, nothing stored.
+pub(crate) fn extract_pr_url(text: &str) -> Option<String> {
+    // Scan every GitHub URL in the text, not just the first: digests routinely
+    // mention the repo before the PR ("Repo https://github.com/x/y; opened
+    // https://github.com/x/y/pull/48"), and locking onto the first hit would
+    // reject the repo link and never reach the PR.
+    text.match_indices("https://github.com/")
+        .find_map(|(start, _)| {
+            let candidate = &text[start..];
+            let end = candidate
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'' | ',')
+                })
+                .unwrap_or(candidate.len());
+            let url = candidate[..end].trim_end_matches(['.', ';', ':']);
+            // Only PR links qualify: /owner/repo/pull/N
+            let path: Vec<&str> = url
+                .strip_prefix("https://github.com/")?
+                .split('/')
+                .collect();
+            match path.as_slice() {
+                [_, _, kind, number, ..]
+                    if *kind == "pull" && number.chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    Some(url.to_string())
+                }
+                _ => None,
+            }
+        })
+}
+
+/// `GET /api/projects/:slug/tasks` — the project's roadmap: every board task
+/// planned under a boss mission of this project family, in planning order,
+/// with the per-item detail (digest, PR link, worker mission) the drawer's
+/// checklist expands into.
+pub async fn project_tasks(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&slug) {
+        return Err(bad_slug());
+    }
+    let tasks = state
+        .control
+        .collect_project_board_tasks(&slug)
+        .await
+        .map_err(store_err)?;
+    let mut done = 0usize;
+    let mut running = 0usize;
+    let mut failed = 0usize;
+    let rows: Vec<serde_json::Value> = tasks
+        .iter()
+        .map(|task| {
+            let status = task.status.to_string();
+            match status.as_str() {
+                "accepted" => done += 1,
+                "running" | "settled" => running += 1,
+                "failed" => failed += 1,
+                _ => {}
+            }
+            let pr_url = task
+                .result_digest
+                .as_deref()
+                .and_then(extract_pr_url)
+                .or_else(|| task.notes.as_deref().and_then(extract_pr_url));
+            serde_json::json!({
+                "id": task.id,
+                "task_key": task.task_key,
+                "title": task.title,
+                "status": status,
+                "outcome": task.outcome,
+                "depends_on": task.depends_on,
+                "acceptance_criteria": task.acceptance_criteria,
+                "result_digest": task.result_digest,
+                "pr_url": pr_url,
+                "worker_mission_id": task.worker_mission_id,
+                "boss_mission_id": task.boss_mission_id,
+                "attempts": task.attempts,
+                "updated_at": task.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "slug": slug,
+        "tasks": rows,
+        "summary": {
+            "total": rows.len(),
+            "done": done,
+            "running": running,
+            "failed": failed,
+        },
+    })))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AnswerDecisionRequest {
     /// The decision's `at` key.
@@ -767,6 +862,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/", axum::routing::put(upsert_project))
         .route("/:slug", get(get_project))
         .route("/:slug/state", get(project_state))
+        .route("/:slug/tasks", get(project_tasks))
         .route("/:slug/updates", get(project_updates))
         .route("/:slug/action", axum::routing::post(project_action))
         .route("/:slug/rename", axum::routing::post(rename_project))
@@ -2518,6 +2614,76 @@ mod tests {
             .attention_reasons
             .iter()
             .any(|r| r.contains("3 consecutive")));
+    }
+
+    // ---- decision disposition (the autonomy enforcement point) ----
+
+    #[test]
+    fn an_unearned_autonomous_act_is_coerced_into_an_escalation() {
+        // No grant, observe, and propose all deny acting.
+        for level in [None, Some("observe"), Some("propose")] {
+            let d = resolve_decision_disposition(level, Some("granted"), Some("decided"))
+                .expect("valid");
+            assert_eq!(d.authority, "escalation");
+            assert_eq!(d.status, "pending_user");
+            assert!(d.coerced_reason.is_some(), "level {level:?} must coerce");
+        }
+        for level in ["act_reversible", "act_full"] {
+            let d = resolve_decision_disposition(Some(level), Some("granted"), Some("decided"))
+                .expect("valid");
+            assert_eq!(d.authority, "granted");
+            assert_eq!(d.status, "decided");
+            assert!(d.coerced_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_decision_bodies_default_to_owner_escalations() {
+        // The pre-ledger callers send only question+rationale: no authority,
+        // no status. They must keep meaning "ask the owner".
+        let d = resolve_decision_disposition(Some("act_full"), None, None).expect("valid");
+        assert_eq!(d.authority, "escalation");
+        assert_eq!(d.status, "pending_user");
+        assert!(d.coerced_reason.is_none());
+
+        assert!(resolve_decision_disposition(None, Some("sovereign"), None).is_err());
+        assert!(resolve_decision_disposition(None, None, Some("expired")).is_err());
+    }
+
+    #[test]
+    fn pending_decisions_are_a_standing_attention_reason() {
+        let mut builder = ProjectRowBuilder::new("verity".into());
+        builder.pending_decisions = 2;
+        builder.autonomy_level = Some("propose".into());
+        let row = builder.finish(&[], None, None, "2026-08-04T20:00:00Z");
+        assert_eq!(row.bucket, "attention");
+        assert_eq!(row.pending_decisions, 2);
+        assert_eq!(row.autonomy_level.as_deref(), Some("propose"));
+        assert!(row
+            .attention_reasons
+            .iter()
+            .any(|r| r == "2 decisions awaiting you"));
+    }
+
+    #[test]
+    fn pr_links_are_extracted_from_digests_and_nothing_else() {
+        assert_eq!(
+            extract_pr_url("Opened https://github.com/lfglabs-dev/verity/pull/2213 for review."),
+            Some("https://github.com/lfglabs-dev/verity/pull/2213".to_string())
+        );
+        assert_eq!(
+            extract_pr_url("(see https://github.com/x/y/pull/48)"),
+            Some("https://github.com/x/y/pull/48".to_string())
+        );
+        // A repo link BEFORE the PR link must not shadow it.
+        assert_eq!(
+            extract_pr_url("Repo https://github.com/x/y; opened https://github.com/x/y/pull/48"),
+            Some("https://github.com/x/y/pull/48".to_string())
+        );
+        // Repo links, issues, and bare mentions are not PR links.
+        assert_eq!(extract_pr_url("https://github.com/x/y"), None);
+        assert_eq!(extract_pr_url("https://github.com/x/y/issues/12"), None);
+        assert_eq!(extract_pr_url("no links here"), None);
     }
 
     // ---- decision disposition (the autonomy enforcement point) ----
