@@ -1586,24 +1586,6 @@ impl BoardTaskRole {
     }
 }
 
-/// Canonical project record. Repository markdown remains the source of human
-/// intent; only its path and immutable revision are stored here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoardProject {
-    pub slug: String,
-    pub repository: String,
-    pub workspace_id: Uuid,
-    pub specification_path: String,
-    pub specification_revision: String,
-    pub compute_policy: String,
-    #[serde(default)]
-    pub budget_policy: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_controller_lease: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
 /// Immutable history for one task execution attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAttempt {
@@ -3633,16 +3615,6 @@ pub trait MissionStore: Send + Sync {
     async fn save_board_task(&self, task: &BoardTask) -> Result<(), String> {
         let _ = task;
         Err("Task board not supported by this mission store".to_string())
-    }
-
-    async fn upsert_board_project(&self, project: BoardProject) -> Result<BoardProject, String> {
-        let _ = project;
-        Err("Project ledger not supported by this mission store".to_string())
-    }
-
-    async fn get_board_project(&self, slug: &str) -> Result<Option<BoardProject>, String> {
-        let _ = slug;
-        Ok(None)
     }
 
     async fn create_task_attempt(&self, attempt: TaskAttempt) -> Result<TaskAttempt, String> {

@@ -1107,6 +1107,10 @@ struct AssistantMcp {
     api_url: String,
     api_token: Option<String>,
     jwt_secret: Option<String>,
+    /// Slugs this instance may MUTATE (`SANDBOXED_PROJECT_SCOPE`, comma-list).
+    /// None = unrestricted (the owner's interactive Hermes). Reads are never
+    /// scoped — cross-project awareness is a feature, not a leak.
+    project_scope: Option<std::collections::HashSet<String>>,
     client: reqwest::Client,
 }
 
@@ -1126,14 +1130,42 @@ impl AssistantMcp {
         let jwt_secret = std::env::var("JWT_SECRET")
             .ok()
             .filter(|secret| !secret.trim().is_empty());
+        let project_scope = std::env::var("SANDBOXED_PROJECT_SCOPE")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|slug| slug.trim().to_string())
+                    .filter(|slug| !slug.is_empty())
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .filter(|scope| !scope.is_empty());
         Self {
             api_url,
             api_token,
             jwt_secret,
+            project_scope,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+        }
+    }
+
+    /// Gate for MUTATING project tools. Scoped controllers stay inside their
+    /// own project; unscoped instances (owner chat) pass untouched.
+    fn assert_project_scope(&self, slug: &str) -> Result<(), String> {
+        let slug = slug.trim();
+        match &self.project_scope {
+            Some(scope) if !scope.contains(slug) => {
+                let mut allowed: Vec<&str> = scope.iter().map(String::as_str).collect();
+                allowed.sort_unstable();
+                Err(format!(
+                    "project '{slug}' is outside this controller's scope ({}). \
+                     Mutating tools are limited to your own project; reads are unrestricted.",
+                    allowed.join(", ")
+                ))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -2632,6 +2664,7 @@ impl AssistantMcp {
         params: UpdateProjectStatusParams,
     ) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let body = json!({
             "mode": params.mode,
             "next_action": params.next_action,
@@ -2645,6 +2678,7 @@ impl AssistantMcp {
 
     async fn set_project_track(&self, params: SetProjectTrackParams) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let body = json!({
             "track": params.track,
             "desired_state": params.desired_state,
@@ -2664,6 +2698,7 @@ impl AssistantMcp {
 
     async fn set_project_grant(&self, params: SetProjectGrantParams) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let body = json!({
             "merge_authority": params.merge_authority,
             "budget_per_tick": params.budget_per_tick,
@@ -2684,6 +2719,7 @@ impl AssistantMcp {
         params: RecordProjectDecisionParams,
     ) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let body = json!({
             "question": params.question,
             "rationale": params.rationale,
@@ -2703,6 +2739,7 @@ impl AssistantMcp {
         params: AnswerProjectDecisionParams,
     ) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let body = json!({ "at": params.at, "answer": params.answer });
         let response = self
             .api_post(&format!("/api/projects/{slug}/decision/answer"), body)
@@ -2718,6 +2755,7 @@ impl AssistantMcp {
 
     async fn plan_project_tasks(&self, params: PlanProjectTasksParams) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let tasks: Vec<Value> = params
             .tasks
             .iter()
@@ -2742,6 +2780,7 @@ impl AssistantMcp {
 
     async fn update_project_task(&self, params: UpdateProjectTaskParams) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let task_key = params.task_key.trim();
         let response = self
             .api_patch(
@@ -2759,6 +2798,7 @@ impl AssistantMcp {
 
     async fn cancel_project_task(&self, params: CancelProjectTaskParams) -> Result<Value, String> {
         let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
         let task_key = params.task_key.trim();
         let response = self
             .api_delete(&format!("/api/projects/{slug}/tasks/{task_key}"))
@@ -2770,6 +2810,7 @@ impl AssistantMcp {
         &self,
         params: LinkMissionToProjectParams,
     ) -> Result<Value, String> {
+        self.assert_project_scope(&params.slug)?;
         let id = self.resolve_mission_id(&params.mission_id).await?;
         let mut body = serde_json::Map::new();
         body.insert("project".to_string(), json!(params.slug.trim()));
@@ -4898,6 +4939,33 @@ mod tests {
         let backwards = mission_events_path(id, 40, "all", Some(99), Some(17));
         assert!(backwards.ends_with("&before_seq=99"));
         assert!(!backwards.contains("since_seq"));
+    }
+
+    #[test]
+    fn project_scope_gates_mutations_only() {
+        let scoped = AssistantMcp {
+            api_url: "http://127.0.0.1:3000".to_string(),
+            api_token: None,
+            jwt_secret: None,
+            project_scope: Some(["verity".to_string()].into_iter().collect()),
+            client: reqwest::Client::new(),
+        };
+        assert!(scoped.assert_project_scope("verity").is_ok());
+        assert!(
+            scoped.assert_project_scope(" verity ").is_ok(),
+            "slugs are trimmed"
+        );
+        let err = scoped.assert_project_scope("lido").unwrap_err();
+        assert!(err.contains("outside this controller's scope"), "{err}");
+
+        let open = AssistantMcp {
+            api_url: "http://127.0.0.1:3000".to_string(),
+            api_token: None,
+            jwt_secret: None,
+            project_scope: None,
+            client: reqwest::Client::new(),
+        };
+        assert!(open.assert_project_scope("anything").is_ok());
     }
 
     #[test]
