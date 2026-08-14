@@ -62,6 +62,25 @@ def test_acknowledged_is_not_routable():
     assert not is_routable_mission_status({"status": "failed"})
 
 
+def test_wake_session_is_used_as_is_without_child_walk():
+    db = _FakeSessionDB(
+        {
+            "20260814_094937_8c5097": {"source": "desktop"},
+            "3abf1a_review": {"source": "desktop"},
+        },
+        resumes={"20260814_094937_8c5097": "3abf1a_review"},
+    )
+    payload = {
+        "mission_id": "acfb03d2",
+        "status": "awaiting_user",
+        "origin_session": "20260814_review_child",
+        "project": "verity-benchmark",
+        "wake_session": "20260814_094937_8c5097",
+        "wake_source": "project",
+    }
+    assert resolve_mission_delivery_session(payload, db) == "20260814_094937_8c5097"
+
+
 def test_prefers_live_origin_over_project():
     db = _FakeSessionDB(
         {"20260813_111430_1310a9": {"source": "desktop"}},

@@ -17,6 +17,7 @@ use super::{
     TelegramStructuredMemoryScope, TelegramStructuredMemorySearchHit, TelegramUser,
     TelegramUserCursor, TelegramUserRole, TelegramWorkflow, TelegramWorkflowEvent,
     TelegramWorkflowKind, TelegramWorkflowStatus, ToolCallSummary, TriggerType, WebhookConfig,
+    SUPERSEDED_TAG,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo, TextOp};
 use async_trait::async_trait;
@@ -2921,7 +2922,7 @@ impl MissionStore for SqliteMissionStore {
 
             let mut clauses: Vec<String> = Vec::new();
             let mut binds: Vec<String> = Vec::new();
-            let mut bind =
+            let bind =
                 |clause: &str, value: &str, clauses: &mut Vec<String>, binds: &mut Vec<String>| {
                     binds.push(value.to_string());
                     clauses.push(clause.replace("?n", &format!("?{}", binds.len())));
@@ -2975,6 +2976,26 @@ impl MissionStore for SqliteMissionStore {
                     .replace('_', "\\_");
                 bind(
                     r"tags LIKE '%' || ?n || '%' ESCAPE '\'",
+                    &pattern,
+                    &mut clauses,
+                    &mut binds,
+                );
+            }
+            if filter.attention_only {
+                clauses.push(
+                    "status NOT IN ('acknowledged', 'completed')".to_string(),
+                );
+                // Tags are a JSON array. The superseded token is stored as
+                // the JSON string `"superseded"`; this is a prefilter — the
+                // Rust `matches` call below is the authority.
+                let encoded = serde_json::to_string(SUPERSEDED_TAG)
+                    .unwrap_or_else(|_| format!("\"{SUPERSEDED_TAG}\""));
+                let pattern = encoded
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                bind(
+                    r"(tags IS NULL OR tags = '' OR tags = '[]' OR tags NOT LIKE '%' || ?n || '%' ESCAPE '\')",
                     &pattern,
                     &mut clauses,
                     &mut binds,
@@ -16804,6 +16825,55 @@ mod filter_tests {
             .expect("filtered list");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].project.project.as_deref(), Some("verity"));
+    }
+
+    #[tokio::test]
+    async fn attention_only_hides_acknowledged_completed_and_superseded() {
+        use crate::api::control::events::MissionStatus;
+        use crate::api::mission_store::{MissionStore, SUPERSEDED_TAG};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+        let live = seed(&store, "live", Some("verity"), Some("core"), None).await;
+        let acked = seed(&store, "acked", Some("verity"), Some("old"), None).await;
+        let done = seed(&store, "done", Some("verity"), Some("old"), None).await;
+        let absorbed = seed(&store, "absorbed", Some("verity"), Some("core"), None).await;
+        store
+            .update_mission_status(acked, MissionStatus::Acknowledged)
+            .await
+            .expect("ack");
+        store
+            .update_mission_status(done, MissionStatus::Completed)
+            .await
+            .expect("complete");
+        store
+            .update_mission_project(
+                absorbed,
+                MissionProjectPatch {
+                    tags: Some(vec![SUPERSEDED_TAG.to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag superseded");
+
+        let found = store
+            .list_missions_filtered(
+                &MissionFilter {
+                    project: Some("verity".into()),
+                    attention_only: true,
+                    ..Default::default()
+                },
+                50,
+                0,
+            )
+            .await
+            .expect("filtered list");
+        let ids: Vec<_> = found.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&live));
+        assert!(!ids.contains(&acked));
+        assert!(!ids.contains(&done));
+        assert!(!ids.contains(&absorbed));
     }
 
     #[tokio::test]

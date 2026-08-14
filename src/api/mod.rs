@@ -40,6 +40,7 @@ pub(crate) mod grok_tool_bridge;
 pub mod library;
 pub mod mcp;
 pub mod metadata_llm;
+pub mod mission_horizon;
 pub mod mission_runner;
 pub mod mission_store;
 pub mod mission_workspace_gc;

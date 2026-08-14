@@ -4045,6 +4045,62 @@ impl ControlHub {
         Ok(collected)
     }
 
+    /// Attention-horizon missions for one project: live / waiting / blocked
+    /// and unabsorbed failed/interrupted attempts. Used by the item-first
+    /// project read so controllers do not walk historical missions.
+    pub(crate) async fn collect_attention_missions_for_project(
+        &self,
+        project: &str,
+    ) -> Result<Vec<Mission>, String> {
+        const PAGE_SIZE: usize = 200;
+        let inventory = self.mission_store_inventory().await?;
+        let mut stores: Vec<Arc<dyn MissionStore>> = inventory.live;
+        for user in inventory.offline_file_users {
+            stores.push(Arc::new(
+                mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await?,
+            ));
+        }
+        for path in inventory.offline_sqlite {
+            let Some(user) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("missions-"))
+                .and_then(|name| name.strip_suffix(".db"))
+            else {
+                continue;
+            };
+            stores.push(Arc::new(
+                mission_store::SqliteMissionStore::new(inventory.base_dir.clone(), user).await?,
+            ));
+        }
+        let filter = mission_store::MissionFilter {
+            project: Some(project.to_string()),
+            attention_only: true,
+            ..Default::default()
+        };
+        let mut collected = Vec::new();
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        for store in stores {
+            let mut offset = 0;
+            loop {
+                let page = store
+                    .list_missions_filtered(&filter, PAGE_SIZE, offset)
+                    .await?;
+                let page_len = page.len();
+                for mission in page {
+                    if seen.insert(mission.id) {
+                        collected.push(mission);
+                    }
+                }
+                if page_len < PAGE_SIZE {
+                    break;
+                }
+                offset += page_len;
+            }
+        }
+        Ok(collected)
+    }
+
     /// Delete every mission tagged with this exact project across live and
     /// offline stores. This is intentionally fail-closed: a project-wide data
     /// delete cannot race a running, queued, paused, or otherwise resumable
@@ -5313,6 +5369,9 @@ pub async fn list_missions(
         track: query.track.clone(),
         tag: query.tag.clone(),
         origin_session_id: query.origin_session_id.clone(),
+        // Default listings (no explicit status) hide acknowledged / completed /
+        // absorbed attempts. An explicit status is a precise query.
+        attention_only: query.status.is_none(),
     };
     // Workspace is the one predicate the store cannot answer: matching by
     // name needs `populate_workspace_names`, and the persisted
@@ -8716,6 +8775,18 @@ pub async fn create_mission(
         mission.project.next_check_at = next_check_at.or(mission.project.next_check_at);
         if let Some(v) = tags {
             mission.project.tags = v;
+        }
+        if let Err(error) = super::mission_horizon::supersede_prior_attempts(
+            control.mission_store.as_ref(),
+            &mission,
+        )
+        .await
+        {
+            tracing::warn!(
+                mission_id = %mission.id,
+                %error,
+                "could not absorb prior attempts on the same item"
+            );
         }
     }
     drop(pr_writer_guard);
@@ -13458,6 +13529,9 @@ async fn paloma_webhook_forwarder_loop(
             } else {
                 None
             };
+            let wake = mission
+                .as_ref()
+                .map(|m| super::mission_horizon::wake_fields_for_mission(m, &working_dir));
             let body = serde_json::json!({
                 // Idempotency / ordering (P#6): consumers dedupe on
                 // `event_id` and may order by `sequence`.
@@ -13529,6 +13603,11 @@ async fn paloma_webhook_forwarder_loop(
                 "origin_session": mission
                     .as_ref()
                     .and_then(|m| m.origin_session_id.clone()),
+                // Producer-resolved wake tip: the bound project conversation
+                // if one exists, else the creating origin. Hermes prefers
+                // this over opening an isolated webhook session.
+                "wake_session": wake.as_ref().and_then(|w| w.session.clone()),
+                "wake_source": wake.as_ref().map(|w| w.source),
                 // Track state so a watchdog can tell "intentionally
                 // waiting (CI/review/external)" from "no worker = stuck".
                 "desired_state": project.and_then(|p| p.desired_state.clone()),

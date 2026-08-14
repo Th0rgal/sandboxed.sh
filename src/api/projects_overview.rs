@@ -346,10 +346,21 @@ pub async fn get_project(
         .recent_decisions(&slug, 20)
         .map_err(store_err)?;
     let conversation = state.projects.binding(&slug).map_err(store_err)?;
+    let proposals = state
+        .projects
+        .list_open_proposals(&slug)
+        .map_err(store_err)?;
+    let missions = state
+        .control
+        .collect_attention_missions_for_project(&slug)
+        .await
+        .unwrap_or_default();
+    let items = super::mission_horizon::project_items(&tracks, &proposals, &missions);
     Ok(Json(serde_json::json!({
         "project": project,
         "grant": grant,
         "tracks": tracks,
+        "items": items,
         "open_decisions": decisions,
         "recent_decisions": recent,
         "conversation": conversation,
