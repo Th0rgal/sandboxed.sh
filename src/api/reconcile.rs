@@ -47,6 +47,32 @@ use crate::workspace_exec::{
 
 /// `end_reason` recorded on missions interrupted by this reconciler.
 pub const SERVICE_RESTART_REASON: &str = "service_restart";
+/// Graceful SIGTERM / SIGINT drain (see `routes::shutdown_signal`).
+pub const SERVER_SHUTDOWN_REASON: &str = "server_shutdown";
+/// Cancel token fired but the JoinHandle never resolved. During a deploy
+/// this overwrites the `server_shutdown` the drain just wrote — treat it
+/// as the same class when a deploy marker is fresh.
+pub const FORCE_KILLED_CANCEL_TIMEOUT_REASON: &str = "force_killed_after_cancel_timeout";
+/// How recent a `/api/system/deploy` marker must be for a
+/// `force_killed_after_cancel_timeout` row to count as a deploy interrupt.
+const DEPLOY_FORCE_KILL_WINDOW_SECS: u64 = 30 * 60;
+
+/// Reasons a restart/deploy may leave on a still-resumable mission.
+pub fn is_recoverable_restart_reason(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some(SERVICE_RESTART_REASON) | Some(SERVER_SHUTDOWN_REASON)
+    )
+}
+
+/// A cancel-timeout kill that landed inside a just-finished deploy is the
+/// drain race (SIGTERM → cancel → JoinHandle hung → force-kill overwrites
+/// `server_shutdown`). User-cancelled stuck runners outside that window
+/// stay interrupted.
+pub fn is_recent_deploy_force_kill(reason: Option<&str>, deploy_age_secs: Option<u64>) -> bool {
+    reason == Some(FORCE_KILLED_CANCEL_TIMEOUT_REASON)
+        && deploy_age_secs.is_some_and(|age| age < DEPLOY_FORCE_KILL_WINDOW_SECS)
+}
 /// Tag appended to a mission's project tags when its harness session state is
 /// gone (see module docs, class 3).
 pub const ORPHANED_TAG: &str = "orphaned";
@@ -291,9 +317,10 @@ pub fn classify_mission(facts: &MissionFacts) -> MissionVerdict {
 #[derive(Debug, Clone, Copy)]
 pub struct InterruptedFacts {
     pub status: MissionStatus,
-    /// The mission's `terminal_reason` is exactly `service_restart`. We NEVER
-    /// touch user-cancelled or genuinely-failed missions — only the ones this
-    /// reconciler itself parked.
+    /// The mission's `terminal_reason` is a restart/deploy interrupt
+    /// (`service_restart`, `server_shutdown`, or a cancel-timeout kill
+    /// inside the deploy window). User-cancelled and genuinely-failed
+    /// missions stay false.
     pub is_service_restart: bool,
     /// The control actor currently lists this mission as running.
     pub running_in_actor: bool,
@@ -699,10 +726,16 @@ send a new message or re-create the mission.",
                 break;
             }
             report.missions_scanned += 1;
-            // (a) ONLY service_restart — never user-cancelled or genuinely
-            // failed missions.
+            // (a) ONLY restart/deploy interrupts — never user-cancelled
+            // or genuinely-failed missions. `force_killed_after_cancel_timeout`
+            // qualifies only while the deploy marker is still fresh: that
+            // is the SIGTERM drain race that used to strand writers.
             let is_service_restart =
-                mission.terminal_reason.as_deref() == Some(SERVICE_RESTART_REASON);
+                is_recoverable_restart_reason(mission.terminal_reason.as_deref())
+                    || is_recent_deploy_force_kill(
+                        mission.terminal_reason.as_deref(),
+                        super::system::last_deploy_age_secs(),
+                    );
             if !is_service_restart {
                 continue;
             }
@@ -1046,9 +1079,37 @@ mod tests {
     }
 
     #[test]
+    fn server_shutdown_and_service_restart_are_recoverable() {
+        assert!(is_recoverable_restart_reason(Some(SERVICE_RESTART_REASON)));
+        assert!(is_recoverable_restart_reason(Some(SERVER_SHUTDOWN_REASON)));
+        assert!(!is_recoverable_restart_reason(Some(
+            FORCE_KILLED_CANCEL_TIMEOUT_REASON
+        )));
+        assert!(!is_recoverable_restart_reason(Some("cancelled")));
+        assert!(!is_recoverable_restart_reason(None));
+    }
+
+    #[test]
+    fn force_kill_is_recoverable_only_inside_the_deploy_window() {
+        assert!(is_recent_deploy_force_kill(
+            Some(FORCE_KILLED_CANCEL_TIMEOUT_REASON),
+            Some(60)
+        ));
+        assert!(!is_recent_deploy_force_kill(
+            Some(FORCE_KILLED_CANCEL_TIMEOUT_REASON),
+            Some(31 * 60)
+        ));
+        assert!(!is_recent_deploy_force_kill(
+            Some(FORCE_KILLED_CANCEL_TIMEOUT_REASON),
+            None
+        ));
+        assert!(!is_recent_deploy_force_kill(Some("cancelled"), Some(10)));
+    }
+
+    #[test]
     fn interrupted_user_cancel_is_not_reresumed() {
-        // Only `service_restart` qualifies — a user-cancelled or genuinely
-        // failed mission has `is_service_restart == false`.
+        // Only restart/deploy interrupts qualify — a user-cancelled or
+        // genuinely failed mission has `is_service_restart == false`.
         let mut facts = base_interrupted_facts();
         facts.is_service_restart = false;
         assert!(!should_reresume_interrupted(&facts));
