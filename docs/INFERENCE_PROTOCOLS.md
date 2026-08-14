@@ -33,7 +33,7 @@ items, response bodies, and SSE events are relayed without Chat translation.
 | xAI Grok models that advertise Responses | Responses | `previous_response_id` and `function_call_output` | Chat Completions | Long tool loops benefit from native state; Chat remains the comparable baseline |
 | Muse Spark models | Responses | `previous_response_id` and `function_call_output` | Chat Completions | Benchmark evidence shows material improvement from retained reasoning continuity |
 | Anthropic Claude/Opus/Fable with a direct API-key route | Anthropic Messages | replay signed `thinking`/`redacted_thinking`, `tool_use`, and `tool_result` blocks unchanged | Chat Completions adapter | Messages is Claude's native structured protocol; Chat translation can discard signed thinking blocks |
-| Kimi K3 and compatible Kimi thinking models | Chat Completions with `reasoning_content` replay | preserve the complete assistant message, including `reasoning_content` and `tool_calls` | ordinary Chat Completions | Kimi exposes continuity in an explicit Chat field; Responses emulation would add no native guarantee |
+| Kimi K3 and compatible Kimi thinking models | Ordinary Chat Completions | visible transcript | Chat with capability-gated `reasoning_content` replay as an explicit experimental mode | On STRAT-50 v0.2, ordinary Chat scored 14/50 versus 12/50 with replay, while using fewer tokens; fidelity support remains available but is not the empirical default |
 | Z.AI GLM, MiniMax, and other OpenAI-compatible models without advertised native state | Chat Completions | visible transcript only, plus any explicitly advertised replay field | ordinary Chat Completions | Do not claim stateful reasoning without a provider contract and verified route |
 | OAuth/CLI adapters | Chat Completions unless native support is explicitly advertised | adapter-defined | Chat Completions | Subscription OAuth credentials are not automatically valid native API credentials |
 
@@ -143,10 +143,11 @@ Every cohort should record:
 - request-shape policy;
 - valid terminal verdicts, infrastructure retries, tokens, and requests.
 
-Chat Completions remains the portable leaderboard baseline. Native-stateful
-cohorts measure the best faithful integration available for a model. A gain in a
-native cohort can reflect both better continuity and greater effective budget
-utilization, so report score and cost together.
+Chat Completions remains the portable leaderboard baseline. A model's recommended
+integration is the highest-scoring completed comparable cohort, not automatically
+the most stateful protocol. Native-stateful and replay cohorts remain available as
+separate evidence even when they lose. A gain can reflect both better continuity
+and greater effective budget utilization, so report score and cost together.
 
 ## Current evidence and planned evaluations
 
@@ -157,14 +158,18 @@ Observed evidence motivating this architecture:
 - Grok Chat failures were dominated by repetition and absent Lean submissions,
   motivating a separate Responses ablation rather than rewriting its Chat score.
 - Kimi responses already contained `reasoning_content`; the client was dropping
-  it before later tool turns.
+  it before later tool turns. Preserving it was protocol-faithful but did not
+  improve this benchmark: ordinary Chat scored 14/50 at 1,595,122 tokens, while
+  replay scored 12/50 at 1,868,907 tokens. Ordinary Chat therefore remains the
+  recommended Kimi integration for this measured workload.
 - Anthropic's Chat adapter cannot faithfully expose every signed native thinking
   block, motivating a separate Messages cohort.
 
 Ordered evaluation roadmap:
 
 1. Keep Chat Completions cohorts as the common baseline.
-2. Complete Kimi K3 with `reasoning_content` replay.
+2. Retain ordinary Chat as the Kimi K3 winner; keep the completed
+   `reasoning_content` replay cohort as a separately labelled negative ablation.
 3. Run Grok via native xAI Responses after capability and affinity probes.
 4. Run Claude Opus via native Anthropic Messages with thinking-block replay.
 5. Run GPT-5.6 Sol via native Responses.
