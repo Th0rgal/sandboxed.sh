@@ -915,7 +915,7 @@ impl ModelChainStore {
                     },
                     ChainEntry {
                         provider_id: "zai".to_string(),
-                        model_id: "glm-5.2".to_string(),
+                        model_id: "glm-5.3".to_string(),
                     },
                     ChainEntry {
                         provider_id: "muse".to_string(),
@@ -935,9 +935,9 @@ impl ModelChainStore {
                 let mut migrated = false;
                 for entry in &mut chain.entries {
                     if entry.provider_id == "zai"
-                        && matches!(entry.model_id.as_str(), "glm-5" | "glm-5.1")
+                        && matches!(entry.model_id.as_str(), "glm-5" | "glm-5.1" | "glm-5.2")
                     {
-                        entry.model_id = "glm-5.2".to_string();
+                        entry.model_id = "glm-5.3".to_string();
                         migrated = true;
                     }
                     if entry.provider_id == "minimax"
@@ -1851,8 +1851,8 @@ mod tests {
             models,
             vec![
                 ("minimax".to_string(), "MiniMax-M3".to_string()),
-                // glm-5.1 is migrated to glm-5.2 by ensure_default_chain.
-                ("zai".to_string(), "glm-5.2".to_string()),
+                // glm-5.1 is migrated to glm-5.3 by ensure_default_chain.
+                ("zai".to_string(), "glm-5.3".to_string()),
                 ("cerebras".to_string(), "zai-glm-4.7".to_string()),
                 // The 2026-08-06 migration appends Meta Muse as a tail
                 // fallback to persisted chains, never reordering them.
@@ -1863,6 +1863,42 @@ mod tests {
         let custom = store.get("user/custom").await.unwrap();
         assert_eq!(custom.entries.len(), 1);
         assert_eq!(custom.entries[0].model_id, "gpt-oss-120b");
+    }
+
+    #[tokio::test]
+    async fn ensure_defaults_migrates_stock_glm_52_to_53() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("chains.json");
+        let now = chrono::Utc::now();
+        let chains = vec![ModelChain {
+            id: "builtin/smart".to_string(),
+            name: "Smart (Default)".to_string(),
+            entries: vec![
+                ChainEntry {
+                    provider_id: "minimax".to_string(),
+                    model_id: "MiniMax-M3".to_string(),
+                },
+                ChainEntry {
+                    provider_id: "zai".to_string(),
+                    model_id: "glm-5.2".to_string(),
+                },
+            ],
+            is_default: true,
+            strip_thinking: false,
+            created_at: now,
+            updated_at: now,
+        }];
+        std::fs::write(&path, serde_json::to_string(&chains).unwrap()).unwrap();
+        let store = ModelChainStore::new(path).await;
+        std::mem::forget(tmp);
+
+        let smart = store.get("builtin/smart").await.unwrap();
+        let zai = smart
+            .entries
+            .iter()
+            .find(|e| e.provider_id == "zai")
+            .expect("zai entry");
+        assert_eq!(zai.model_id, "glm-5.3");
     }
 
     fn past_ms(hours: i64) -> i64 {

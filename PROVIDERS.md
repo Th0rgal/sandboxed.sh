@@ -70,7 +70,8 @@ curl -X POST https://YOUR-BACKEND/api/ai/providers \
 **Get API Key:** https://bigmodel.cn
 
 **Recommended Models:**
-- `glm-5.1` - Current flagship GLM reasoning and coding model
+- `glm-5.3` - Current flagship GLM reasoning and coding model
+- `glm-5.3[1m]` - Same weights with the Coding Plan 1M-token context window
 - `glm-5-turbo` - Fast reasoning model with deep thinking
 - `glm-4.7` - Strong general-purpose GLM model
 
@@ -110,7 +111,7 @@ curl -X POST https://YOUR-BACKEND/api/ai/providers \
 ```
 
 Use OpenCode model overrides in `provider/model` format, for example
-`zai/glm-5.1` or `minimax/MiniMax-M3`.
+`zai/glm-5.3` or `minimax/MiniMax-M3`.
 
 ### DeepInfra
 
