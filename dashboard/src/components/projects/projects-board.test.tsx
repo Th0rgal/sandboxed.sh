@@ -3,6 +3,7 @@ import { SWRConfig } from "swr";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
+  getProject,
   getProjectsOverview,
   getProjectUpdates,
   postProjectAction,
@@ -21,6 +22,7 @@ import ProjectsBoard, {
 
 vi.mock("@/lib/api/projects", () => ({
   getProjectsOverview: vi.fn(),
+  getProject: vi.fn(),
   getProjectUpdates: vi.fn(),
   postProjectAction: vi.fn(),
   bindProjectConversation: vi.fn(),
@@ -37,6 +39,7 @@ vi.mock("@/components/markdown-content", () => ({
 }));
 
 const mockedOverview = vi.mocked(getProjectsOverview);
+const mockedProject = vi.mocked(getProject);
 const mockedListHermesSessions = vi.mocked(listHermesSessions);
 const mockedUpdates = vi.mocked(getProjectUpdates);
 const mockedAction = vi.mocked(postProjectAction);
@@ -103,10 +106,12 @@ function renderBoard() {
 describe("ProjectsBoard", () => {
   beforeEach(() => {
     mockedOverview.mockReset();
+    mockedProject.mockReset();
     mockedUpdates.mockReset();
     mockedAction.mockReset();
     mockedChat.mockReset();
     mockedUpdates.mockResolvedValue({ slug: "verity", updates: [] });
+    mockedProject.mockResolvedValue({ items: [], open_decisions: [] });
   });
 
   afterEach(() => {
@@ -161,12 +166,80 @@ describe("ProjectsBoard", () => {
     renderBoard();
 
     // Missions are behind a collapsible summary now — expand it first.
-    fireEvent.click(await screen.findByRole("button", { name: /Missions \(1\)/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Attempts \(1\)/ }));
     const row = await screen.findByRole("link", { name: /Phase 1C slice/ });
     expect(row).toHaveAttribute(
       "href",
       "/control?mission=f98e1ee2-0000-0000-0000-000000000000",
     );
+  });
+
+  test("card and detail lead with next_action, pending decisions, and open items", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity",
+          title: "Verity",
+          next_action: "rebase/repair #2332 onto main after #2333",
+          pending_decisions: 1,
+          mode: "active",
+          health: health({
+            active: 1,
+            tracks_needing_attention: 1,
+            tracks: [track({ track: "c5-preflight-pr2332", verdict: "failing" })],
+          }),
+        }),
+      ]),
+    );
+    mockedProject.mockResolvedValue({
+      project: {
+        slug: "verity",
+        mode: "active",
+        next_action: "rebase/repair #2332 onto main after #2333",
+        blocker: "source #2332 dirty",
+      },
+      items: [
+        {
+          key: "c5-preflight-pr2332",
+          kind: "track",
+          open: true,
+          attempts: [
+            {
+              id: "live-1",
+              status: "active",
+              title: "repair #2332",
+              updated_at: "2026-08-14T12:00:00Z",
+            },
+          ],
+        },
+        {
+          key: "old-merged",
+          kind: "track",
+          open: false,
+          attempts: [
+            {
+              id: "done-1",
+              status: "completed",
+              title: "merged last week",
+              updated_at: "2026-08-01T00:00:00Z",
+            },
+          ],
+        },
+      ],
+      open_decisions: [{ question: "merge #2332?", status: "pending_user" }],
+    });
+
+    renderBoard();
+
+    expect(
+      await screen.findAllByText("rebase/repair #2332 onto main after #2333"),
+    ).not.toHaveLength(0);
+    expect(screen.getAllByText(/need you/).length).toBeGreaterThan(0);
+    expect(await screen.findByText(/Open items \(1\)/)).toBeInTheDocument();
+    expect(screen.getByText("c5-preflight-pr2332")).toBeInTheDocument();
+    expect(screen.queryByText("old-merged")).not.toBeInTheDocument();
+    expect(screen.queryByText("merged last week")).not.toBeInTheDocument();
+    expect(screen.getByText("source #2332 dirty")).toBeInTheDocument();
   });
 
   test("selecting a project loads its updates timeline in the detail pane", async () => {
@@ -493,7 +566,9 @@ describe("ProjectsBoard", () => {
 
     renderBoard();
 
-    expect(await screen.findByText("blocked: transport-cap")).toBeInTheDocument();
+    expect(
+      await screen.findAllByText("blocked: transport-cap"),
+    ).not.toHaveLength(0);
     expect(screen.queryByText(/unknown/i)).not.toBeInTheDocument();
     // The legacy row gets no chip at all — absence must look like the old board.
     expect(screen.queryByTitle("active")).not.toBeInTheDocument();

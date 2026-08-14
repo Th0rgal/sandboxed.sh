@@ -35,6 +35,7 @@ import {
   bindProjectConversation,
   unbindProjectConversation,
   type ProjectConversation,
+  getProject,
   getProjectsOverview,
   getProjectUpdates,
   postProjectAction,
@@ -44,6 +45,12 @@ import {
   type ProjectMissionChip,
   type ProjectRow,
 } from "@/lib/api/projects";
+import {
+  cardSummary,
+  viewControllerSignal,
+  viewOpenItems,
+  type ViewItem,
+} from "./project-card-view";
 import {
   listHermesSessions,
   type HermesSession,
@@ -184,9 +191,14 @@ export function unreadCountFor(
   return latestMs > seenMs ? 1 : 0;
 }
 
-/** A project with no missions and no updates is a quiet tracker file. */
+/** A project with no missions, no updates, and no declared next step. */
 function isQuiet(project: ProjectRow): boolean {
-  return project.missions.length === 0 && project.updates_count === 0;
+  return (
+    project.missions.length === 0 &&
+    project.updates_count === 0 &&
+    !project.next_action &&
+    (project.pending_decisions ?? 0) === 0
+  );
 }
 
 export default function ProjectsBoard() {
@@ -515,6 +527,7 @@ function ProjectListRow({
   const mode = parseMode(project);
   const digest = healthDigest(project.health);
   const stale = isStale(project);
+  const summary = cardSummary(project);
   return (
     <button
       type="button"
@@ -536,6 +549,14 @@ function ProjectListRow({
             {project.title || project.slug}
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
+            {summary.pendingDecisions > 0 && (
+              <span
+                title={`${summary.pendingDecisions} pending owner decision${summary.pendingDecisions === 1 ? "" : "s"}`}
+                className="rounded-full bg-amber-500/20 px-1.5 py-px text-[10px] font-semibold tabular-nums text-amber-200"
+              >
+                {summary.pendingDecisions} need you
+              </span>
+            )}
             {unread > 0 && (
               <span
                 title={`${unread > 9 ? "9+" : unread} new update${unread === 1 ? "" : "s"}`}
@@ -544,16 +565,19 @@ function ProjectListRow({
                 {unread > 9 ? "9+" : unread}
               </span>
             )}
-            {project.latest_update && (
-              <UpdateAge at={project.latest_update.at} />
-            )}
+            {summary.lastSignalAt && <UpdateAge at={summary.lastSignalAt} />}
           </span>
         </span>
         {/* A blocked or stale controller is worth a second line even when the
             project is otherwise quiet — silence was exactly how a stuck
             controller used to hide. */}
-        {(!quiet || mode?.base === "blocked" || stale) && (
+        {(!quiet || mode?.base === "blocked" || stale || summary.nextAction) && (
           <span className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-white/40">
+            {summary.openTrackCount > 0 && (
+              <span className="shrink-0 text-white/55">
+                {summary.openTrackCount} item{summary.openTrackCount === 1 ? "" : "s"}
+              </span>
+            )}
             {live > 0 && (
               <span className="flex shrink-0 items-center gap-1 text-white/55">
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[rgb(var(--text)/0.6)]" />
@@ -576,13 +600,15 @@ function ProjectListRow({
               </span>
             )}
             <span className="min-w-0 truncate">
-              {digest ??
-                stripMarkdown(
-                  project.attention_reasons[0] ??
-                    project.latest_update?.headline ??
-                    project.tracker?.status_line ??
-                    "",
-                )}
+              {summary.headline
+                ? stripMarkdown(summary.headline)
+                : (digest ??
+                  stripMarkdown(
+                    project.attention_reasons[0] ??
+                      project.latest_update?.headline ??
+                      project.tracker?.status_line ??
+                      "",
+                  ))}
             </span>
           </span>
         )}
@@ -965,8 +991,16 @@ function ProjectDetail({
     () => getProjectUpdates(project.slug, 50),
     { revalidateOnFocus: false },
   );
+  const { data: detail } = useSWR(
+    ["project-detail", project.slug],
+    () => getProject(project.slug),
+    { revalidateOnFocus: false },
+  );
   const updates = data?.updates ?? [];
   const section = SECTIONS.find((s) => s.bucket === project.bucket);
+  const summary = cardSummary(project);
+  const signal = detail ? viewControllerSignal(detail) : null;
+  const items = detail ? viewOpenItems(detail) : [];
 
   return (
     <div className="flex min-h-full flex-col">
@@ -1001,6 +1035,13 @@ function ProjectDetail({
             <ProjectActions project={project} />
           </span>
         </div>
+        <ControllerSignal
+          nextAction={signal?.nextAction ?? summary.nextAction}
+          blocker={signal?.blocker ?? summary.blocker}
+          mode={parseMode(project)}
+          pendingDecisions={signal?.pendingDecisions ?? summary.pendingDecisions}
+          lastSignalAt={summary.lastSignalAt}
+        />
         {project.tracker?.status_line && (
           <p className="mt-1.5 text-xs leading-relaxed text-white/55">
             {project.tracker.status_line}
@@ -1019,14 +1060,16 @@ function ProjectDetail({
             ))}
           </div>
         )}
-        {project.health && project.health.tracks.length > 0 && (
+        {items.length > 0 ? (
+          <ItemList items={items} />
+        ) : project.health && project.health.tracks.length > 0 ? (
           <div className="mt-2 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2">
             <p className="mb-1 text-[10px] uppercase tracking-wider text-white/40">
-              Tracks
+              Open items
             </p>
             <TrackHealthList health={project.health} />
           </div>
-        )}
+        ) : null}
         {project.missions.length > 0 && <MissionList missions={project.missions} />}
       </div>
 
@@ -1069,7 +1112,119 @@ function ProjectDetail({
   );
 }
 
-/** Collapsible mission list for the detail header: summary row, expand for detail. */
+function ControllerSignal({
+  nextAction,
+  blocker,
+  mode,
+  pendingDecisions,
+  lastSignalAt,
+}: {
+  nextAction: string | null;
+  blocker: string | null;
+  mode: ReturnType<typeof parseMode>;
+  pendingDecisions: number;
+  lastSignalAt: string | null;
+}) {
+  if (!nextAction && !blocker && pendingDecisions === 0 && !mode) {
+    return null;
+  }
+  return (
+    <div className="mt-2 space-y-1 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2">
+      <div className="flex flex-wrap items-center gap-2 text-[11px] text-white/45">
+        <ModeChip mode={mode} />
+        {pendingDecisions > 0 && (
+          <span className="text-amber-200/80">
+            {pendingDecisions} pending decision{pendingDecisions === 1 ? "" : "s"}
+          </span>
+        )}
+        {lastSignalAt && (
+          <span className="ml-auto flex items-center gap-1 text-white/35">
+            last signal <UpdateAge at={lastSignalAt} />
+          </span>
+        )}
+      </div>
+      {nextAction && (
+        <p className="text-xs text-white/75">
+          <span className="text-white/40">Next: </span>
+          {nextAction}
+        </p>
+      )}
+      {blocker && (
+        <p className="flex items-start gap-1.5 text-xs text-amber-200/80">
+          <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+          {blocker}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ItemList({ items }: { items: ViewItem[] }) {
+  const [expanded, setExpanded] = useState(true);
+  const live = items.reduce(
+    (count, item) => count + item.attempts.filter((attempt) => attempt.live).length,
+    0,
+  );
+  return (
+    <div className="mt-2.5">
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        className="flex w-full items-center gap-1.5 rounded-md py-1 text-left text-[11px] font-semibold uppercase tracking-wider text-white/35 transition-colors hover:text-white/60"
+      >
+        {expanded ? (
+          <ChevronDown className="h-3 w-3" />
+        ) : (
+          <ChevronRight className="h-3 w-3" />
+        )}
+        Open items ({items.length})
+        <span className="font-normal normal-case tracking-normal text-white/30">
+          {live > 0 && ` · ${live} live`}
+        </span>
+      </button>
+      {expanded && (
+        <div className="mt-1 divide-y divide-white/[0.04] rounded-lg border border-white/[0.06] bg-white/[0.02]">
+          {items.map((item) => (
+            <div key={item.key} className="px-3 py-1.5">
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="truncate text-xs text-white/80">{item.key}</span>
+                {item.desiredState && (
+                  <span className="shrink-0 text-[10px] text-white/35">
+                    {item.desiredState}
+                  </span>
+                )}
+              </div>
+              {item.attempts.slice(0, 2).map((attempt) => (
+                <Link
+                  key={attempt.id}
+                  href={`/control?mission=${attempt.id}`}
+                  className="mt-0.5 flex items-center gap-2 !no-underline"
+                >
+                  <span
+                    className={cn(
+                      "h-1.5 w-1.5 shrink-0 rounded-full",
+                      attempt.live
+                        ? "animate-pulse bg-[rgb(var(--text)/0.65)]"
+                        : "bg-[rgb(var(--text)/0.25)]",
+                    )}
+                  />
+                  <span className="min-w-0 flex-1 truncate text-[11px] text-white/50">
+                    {attempt.title || attempt.id.slice(0, 8)}
+                  </span>
+                  <span className="shrink-0 text-[10px] text-white/35">
+                    {attempt.status}
+                  </span>
+                </Link>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Collapsible attempt list — lineage, not the work inventory. */
 function MissionList({ missions }: { missions: ProjectMissionChip[] }) {
   const [expanded, setExpanded] = useState(false);
   const live = missions.filter((m) => LIVE_STATUSES.has(m.status)).length;
@@ -1086,7 +1241,7 @@ function MissionList({ missions }: { missions: ProjectMissionChip[] }) {
         ) : (
           <ChevronRight className="h-3 w-3" />
         )}
-        Missions ({missions.length})
+        Attempts ({missions.length})
         <span className="font-normal normal-case tracking-normal text-white/30">
           {live > 0 && ` · ${live} live`}
           {problems > 0 && ` · ${problems} failed`}

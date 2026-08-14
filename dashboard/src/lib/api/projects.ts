@@ -87,6 +87,8 @@ export interface ProjectRow {
   /** Roster mode (`active` / `blocked[:cause]` / `paused`). Prefer this over
    *  guessing from `latest_update` when the last delivery was `[SILENT]`. */
   mode?: string | null;
+  /** Last successful controller cron run, even if the tick was `[SILENT]`. */
+  controller_heartbeat_at?: string | null;
   controller_health?: "healthy" | "stale" | "missing" | null;
   delivery_health?: "reaching_user" | "misrouted" | "dropped" | null;
   progress_state?: "working" | "waiting_external" | "blocked" | null;
@@ -106,8 +108,58 @@ export interface ProjectUpdatesResponse {
   updates: ProjectDeliveryUpdate[];
 }
 
+export interface ProjectItemAttempt {
+  id: string;
+  status: string;
+  title?: string | null;
+  updated_at: string;
+  role?: string | null;
+}
+
+export interface ProjectItem {
+  key: string;
+  kind: string;
+  desired_state?: string | null;
+  status?: string | null;
+  open: boolean;
+  attempts: ProjectItemAttempt[];
+}
+
+export interface ProjectDecision {
+  question?: string;
+  kind?: string;
+  status?: string;
+  created_at?: string;
+  at?: string;
+}
+
+export interface ProjectRecord {
+  slug?: string;
+  title?: string | null;
+  status?: string | null;
+  mode?: string | null;
+  next_action?: string | null;
+  blocker?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ProjectDetailPayload {
+  project?: ProjectRecord;
+  items?: ProjectItem[];
+  open_decisions?: ProjectDecision[];
+  conversation?: ProjectConversation | null;
+  tracks?: unknown[];
+}
+
 export function getProjectsOverview(): Promise<ProjectsOverview> {
   return apiGet("/api/projects/overview", "Failed to load projects overview");
+}
+
+export function getProject(slug: string): Promise<ProjectDetailPayload> {
+  return apiGet(
+    `/api/projects/${encodeURIComponent(slug)}`,
+    "Failed to load project",
+  );
 }
 
 export function getProjectUpdates(
