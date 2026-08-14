@@ -20907,6 +20907,20 @@ async fn control_actor_loop(
                 }
             }, if runner_force_clear_deadline.is_some() && running.is_some() => {
                 let stuck_mid = running_mission_id;
+                let still_progressing = main_runner_active_tool_calls
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0
+                    || main_runner_last_activity.elapsed()
+                        < super::controller_honesty::CANCEL_TIMEOUT_FRESH_PROGRESS;
+                if still_progressing {
+                    tracing::info!(
+                        mission_id = ?stuck_mid,
+                        "Deferring cancel-timeout force-clear: runner still has fresh progress"
+                    );
+                    runner_force_clear_deadline = Some(
+                        tokio::time::Instant::now() + RUNNER_FORCE_CLEAR_GRACE,
+                    );
+                } else {
                 tracing::warn!(
                     mission_id = ?stuck_mid,
                     "Force-aborting stuck runner: cancel fired but JoinHandle never resolved within {}s",
@@ -20985,6 +20999,7 @@ async fn control_actor_loop(
                         &config.working_dir,
                     )
                     .await;
+                }
                 }
             }
             // Update last_activity for runners when we receive events for them
