@@ -341,6 +341,22 @@ fn inactivity_is_cancellable(seconds_since_activity: u64, tool_call_in_flight: b
         && (!tool_call_in_flight || seconds_since_activity >= TOOL_CALL_STALL_GRACE_SECS)
 }
 
+/// Control-owned writers must not be auto-killed for a quiet Lean/Grok turn.
+/// The stored `origin` field is sometimes missing even when the MCP tagged
+/// the mission `origin:hermes-assistant` — Verity's overnight flap
+/// (cancel every ~15m) was that hole.
+pub(crate) fn watchdog_skips_control_owned_mission(
+    origin: Option<&str>,
+    origin_session_id: Option<&str>,
+    tags: &[String],
+) -> bool {
+    if origin == Some("hermes") && origin_session_id.is_some() {
+        return true;
+    }
+    tags.iter()
+        .any(|tag| tag == "origin:hermes-assistant" || tag == "pr-writer" || tag == "origin:hermes")
+}
+
 fn execution_state_proves_durable_liveness(state: &str) -> bool {
     state == "waiting_remote_job"
 }
@@ -527,9 +543,11 @@ pub(crate) async fn stuck_mission_watchdog_loop(
             // will re-narrow this to operator-vs-cron. Dashboard/API-direct
             // missions (`origin == None`) keep the watchdog protection.
             if let Ok(Some(mission)) = mission_store.get_mission(info.mission_id).await {
-                if mission.origin.as_deref() == Some("hermes")
-                    && mission.origin_session_id.is_some()
-                {
+                if watchdog_skips_control_owned_mission(
+                    mission.origin.as_deref(),
+                    mission.origin_session_id.as_deref(),
+                    &mission.project.tags,
+                ) {
                     tracing::warn!(
                         mission_id = %info.mission_id,
                         seconds_since_activity = info.seconds_since_activity,
@@ -1029,6 +1047,31 @@ mod tests {
     #[test]
     fn inactivity_watchdog_cancels_idle_runner_at_threshold() {
         assert!(inactivity_is_cancellable(STUCK_SECONDS, false));
+    }
+
+    #[test]
+    fn watchdog_skips_hermes_tag_even_when_origin_field_is_empty() {
+        assert!(watchdog_skips_control_owned_mission(
+            None,
+            None,
+            &["origin:hermes-assistant".to_string()]
+        ));
+        assert!(watchdog_skips_control_owned_mission(
+            None,
+            None,
+            &["pr-writer".to_string()]
+        ));
+        assert!(watchdog_skips_control_owned_mission(
+            Some("hermes"),
+            Some("20260814_224352_2a62eb"),
+            &[]
+        ));
+        assert!(!watchdog_skips_control_owned_mission(None, None, &[]));
+        assert!(!watchdog_skips_control_owned_mission(
+            Some("hermes"),
+            None,
+            &[]
+        ));
     }
 
     #[test]
