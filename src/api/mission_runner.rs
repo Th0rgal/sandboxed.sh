@@ -8055,9 +8055,10 @@ pub async fn check_backend_prerequisites(
                 // A timed-out probe is not "harness missing": allow create to
                 // proceed so the turn can use the overlay / host-copy path.
                 auto_install_possible: !available,
-                missing_dependencies: if available {
-                    Vec::new()
-                } else if matches!(presence, CommandPresence::Inconclusive) {
+                missing_dependencies: if matches!(
+                    presence,
+                    CommandPresence::Present | CommandPresence::Inconclusive
+                ) {
                     Vec::new()
                 } else {
                     vec!["grok CLI".to_string()]
