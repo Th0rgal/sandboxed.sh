@@ -131,6 +131,7 @@ export interface ProjectDecision {
   status?: string;
   created_at?: string;
   at?: string;
+  rationale?: string | null;
 }
 
 export interface ProjectRecord {

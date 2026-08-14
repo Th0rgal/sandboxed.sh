@@ -5,7 +5,14 @@ import type {
   ProjectItem,
   ProjectRow,
 } from "@/lib/api/projects";
-import { cardSummary, viewControllerSignal, viewOpenItems } from "./project-card-view";
+import {
+  cardSummary,
+  viewControllerSignal,
+  viewMovingItems,
+  viewOpenItems,
+  viewPendingDecisions,
+  viewStalledItems,
+} from "./project-card-view";
 
 function row(overrides: Partial<ProjectRow> = {}): ProjectRow {
   return {
@@ -186,6 +193,16 @@ function payload(overrides: Partial<ProjectDetailPayload> = {}): ProjectDetailPa
       }),
     ],
     open_decisions: [
+      {
+        question: "relancer coldcard_skip depuis le checkpoint ?",
+        status: "pending_user",
+        at: "2026-08-13T20:22:14.411515235+00:00",
+      },
+      {
+        question: "relancer coldcard_skip depuis le checkpoint ?",
+        status: "pending_user",
+        at: "2026-08-13T20:22:12.331480026+00:00",
+      },
       { question: "merge #2332?", status: "pending_user" },
     ],
     ...overrides,
@@ -213,6 +230,28 @@ describe("viewOpenItems / viewControllerSignal", () => {
     );
     expect(signal.blocker).toBe("source #2332 dirty");
     expect(signal.mode).toBe("active");
-    expect(signal.pendingDecisions).toBe(1);
+    expect(signal.pendingDecisions).toBe(3);
+
+    expect(viewMovingItems(items).map((entry) => entry.key)).toEqual([
+      "c5-preflight-pr2332",
+    ]);
+    expect(viewStalledItems(items).map((entry) => entry.key)).toEqual(["core"]);
+    expect(items[0].moving).toBe(true);
+
+    const decisions = viewPendingDecisions(payload());
+    expect(decisions).toEqual([
+      {
+        question: "relancer coldcard_skip depuis le checkpoint ?",
+        at: "2026-08-13T20:22:12.331480026+00:00",
+        count: 2,
+        status: "pending_user",
+      },
+      {
+        question: "merge #2332?",
+        at: null,
+        count: 1,
+        status: "pending_user",
+      },
+    ]);
   });
 });
