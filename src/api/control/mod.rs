@@ -44,7 +44,7 @@ use uuid::Uuid;
 use super::supervision::{
     ack_promotion_loop, background_task_autoresume_loop, cleanup_stale_active_missions_once,
     recover_server_shutdown_missions, reset_waiting_background_on_boot, stale_mission_cleanup_loop,
-    stuck_mission_watchdog_loop,
+    stuck_mission_watchdog_loop, watchdog_skips_control_owned_mission,
 };
 use crate::agents::{AgentContext, AgentRef, TerminalReason};
 use crate::config::Config;
@@ -66,6 +66,20 @@ use super::routes::AppState;
 
 pub(crate) const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
 const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
+
+/// The 15-minute registered-liveness interrupt is a second idle gate beside
+/// the stuck-mission watchdog. #840 taught the watchdog to skip Hermes-tagged
+/// writers; this gate still force-aborted Lido `04b0a5d8` after the watchdog
+/// correctly logged NOT auto-killing. Same ownership rule applies here.
+fn skip_idle_registered_liveness_interrupt(
+    backend_id: Option<&str>,
+    origin: Option<&str>,
+    origin_session_id: Option<&str>,
+    tags: &[String],
+) -> bool {
+    backend_id == Some("chatgpt_ui")
+        || watchdog_skips_control_owned_mission(origin, origin_session_id, tags)
+}
 
 fn parse_durable_job_result(result: &serde_json::Value) -> Option<serde_json::Value> {
     fn visit(value: &serde_json::Value, depth: u8) -> Option<serde_json::Value> {
@@ -16746,12 +16760,26 @@ async fn control_actor_loop(
                         && state != MissionExecutionState::WaitingRemoteJob
                         && live_registered_tools == 0
                     {
-                        if backend_id.as_deref() == Some("chatgpt_ui") {
-                            tracing::debug!(
+                        let owned = match mission_store.get_mission(run.mission_id).await {
+                            Ok(Some(mission)) => skip_idle_registered_liveness_interrupt(
+                                backend_id.as_deref(),
+                                mission.origin.as_deref(),
+                                mission.origin_session_id.as_deref(),
+                                &mission.project.tags,
+                            ),
+                            _ => skip_idle_registered_liveness_interrupt(
+                                backend_id.as_deref(),
+                                None,
+                                None,
+                                &[],
+                            ),
+                        };
+                        if owned {
+                            tracing::warn!(
                                 mission_id = %run.mission_id,
                                 run_id = %run.run_id,
                                 idle_secs,
-                                "Keeping ChatGPT UI run alive until its managed absolute timeout"
+                                "Registered-liveness interrupt: control-owned mission idle — NOT interrupting"
                             );
                             continue;
                         }
@@ -24963,6 +24991,28 @@ pub async fn telegram_webhook_receiver(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registered_liveness_interrupt_skips_hermes_tagged_writer() {
+        assert!(super::skip_idle_registered_liveness_interrupt(
+            Some("codex"),
+            None,
+            None,
+            &["origin:hermes-assistant".to_string()],
+        ));
+        assert!(super::skip_idle_registered_liveness_interrupt(
+            Some("chatgpt_ui"),
+            None,
+            None,
+            &[],
+        ));
+        assert!(!super::skip_idle_registered_liveness_interrupt(
+            Some("codex"),
+            None,
+            None,
+            &[],
+        ));
+    }
+
     mod fabricated_origin {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
