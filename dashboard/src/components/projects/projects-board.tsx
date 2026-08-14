@@ -48,7 +48,11 @@ import {
 import {
   cardSummary,
   viewControllerSignal,
+  viewMovingItems,
   viewOpenItems,
+  viewPendingDecisions,
+  viewStalledItems,
+  type ViewDecision,
   type ViewItem,
 } from "./project-card-view";
 import {
@@ -1001,6 +1005,9 @@ function ProjectDetail({
   const summary = cardSummary(project);
   const signal = detail ? viewControllerSignal(detail) : null;
   const items = detail ? viewOpenItems(detail) : [];
+  const decisions = detail ? viewPendingDecisions(detail) : [];
+  const moving = viewMovingItems(items);
+  const stalled = viewStalledItems(items);
 
   return (
     <div className="flex min-h-full flex-col">
@@ -1041,6 +1048,7 @@ function ProjectDetail({
           mode={parseMode(project)}
           pendingDecisions={signal?.pendingDecisions ?? summary.pendingDecisions}
           lastSignalAt={summary.lastSignalAt}
+          decisions={decisions}
         />
         {project.tracker?.status_line && (
           <p className="mt-1.5 text-xs leading-relaxed text-white/55">
@@ -1060,9 +1068,11 @@ function ProjectDetail({
             ))}
           </div>
         )}
-        {items.length > 0 ? (
-          <ItemList items={items} />
-        ) : project.health && project.health.tracks.length > 0 ? (
+        {moving.length > 0 && <ItemList items={moving} heading="Moving" />}
+        {stalled.length > 0 && (
+          <ItemList items={stalled} heading="Stalled items" defaultExpanded={moving.length === 0} />
+        )}
+        {items.length === 0 && project.health && project.health.tracks.length > 0 ? (
           <div className="mt-2 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2">
             <p className="mb-1 text-[10px] uppercase tracking-wider text-white/40">
               Open items
@@ -1118,14 +1128,16 @@ function ControllerSignal({
   mode,
   pendingDecisions,
   lastSignalAt,
+  decisions,
 }: {
   nextAction: string | null;
   blocker: string | null;
   mode: ReturnType<typeof parseMode>;
   pendingDecisions: number;
   lastSignalAt: string | null;
+  decisions: ViewDecision[];
 }) {
-  if (!nextAction && !blocker && pendingDecisions === 0 && !mode) {
+  if (!nextAction && !blocker && pendingDecisions === 0 && !mode && decisions.length === 0) {
     return null;
   }
   return (
@@ -1134,7 +1146,9 @@ function ControllerSignal({
         <ModeChip mode={mode} />
         {pendingDecisions > 0 && (
           <span className="text-amber-200/80">
-            {pendingDecisions} pending decision{pendingDecisions === 1 ? "" : "s"}
+            {decisions.length > 0
+              ? `${decisions.length} pending decision${decisions.length === 1 ? "" : "s"}`
+              : `${pendingDecisions} pending decision${pendingDecisions === 1 ? "" : "s"}`}
           </span>
         )}
         {lastSignalAt && (
@@ -1155,12 +1169,32 @@ function ControllerSignal({
           {blocker}
         </p>
       )}
+      {decisions.map((decision) => (
+        <p
+          key={decision.question}
+          className="flex items-start gap-1.5 text-xs text-amber-100/90"
+        >
+          <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+          {decision.question}
+          {decision.count > 1 && (
+            <span className="text-white/35">×{decision.count}</span>
+          )}
+        </p>
+      ))}
     </div>
   );
 }
 
-function ItemList({ items }: { items: ViewItem[] }) {
-  const [expanded, setExpanded] = useState(true);
+function ItemList({
+  items,
+  heading,
+  defaultExpanded = true,
+}: {
+  items: ViewItem[];
+  heading?: string;
+  defaultExpanded?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const live = items.reduce(
     (count, item) => count + item.attempts.filter((attempt) => attempt.live).length,
     0,
@@ -1177,7 +1211,7 @@ function ItemList({ items }: { items: ViewItem[] }) {
         ) : (
           <ChevronRight className="h-3 w-3" />
         )}
-        Open items ({items.length})
+        {heading ?? "Open items"} ({items.length})
         <span className="font-normal normal-case tracking-normal text-white/30">
           {live > 0 && ` · ${live} live`}
         </span>

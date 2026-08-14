@@ -7,6 +7,7 @@
  */
 
 import type {
+  ProjectDecision,
   ProjectDetailPayload,
   ProjectItem,
   ProjectItemAttempt,
@@ -98,6 +99,14 @@ export type ViewItem = {
   open: boolean;
   desiredState: string | null;
   attempts: ViewAttempt[];
+  moving: boolean;
+};
+
+export type ViewDecision = {
+  question: string;
+  at: string | null;
+  count: number;
+  status: string | null;
 };
 
 export type ViewSignal = {
@@ -109,31 +118,78 @@ export type ViewSignal = {
 };
 
 /** Items still open on the shipped get_project payload. Historical
- *  (acknowledged / completed / superseded) attempts never appear here. */
+ *  (acknowledged / completed / superseded) attempts never appear here.
+ *  Live attempts sort first so a graveyard of failed retries cannot bury
+ *  the one item that is actually moving. */
 export function viewOpenItems(payload: ProjectDetailPayload): ViewItem[] {
   return (payload.items ?? [])
     .filter((item) => item.open)
-    .map(toViewItem);
+    .map(toViewItem)
+    .sort((left, right) => Number(right.moving) - Number(left.moving));
+}
+
+export function viewMovingItems(items: ViewItem[]): ViewItem[] {
+  return items.filter((item) => item.moving);
+}
+
+export function viewStalledItems(items: ViewItem[]): ViewItem[] {
+  return items.filter((item) => !item.moving);
+}
+
+/** Collapse duplicate owner questions (Coldcard recorded the same
+ *  checkpoint prompt twice two seconds apart). */
+export function viewPendingDecisions(
+  payload: ProjectDetailPayload,
+): ViewDecision[] {
+  const grouped = new Map<string, ViewDecision>();
+  for (const raw of payload.open_decisions ?? []) {
+    if (!isPendingDecision(raw)) continue;
+    const question = nonblank(raw.question);
+    if (!question) continue;
+    const key = question.toLowerCase();
+    const existing = grouped.get(key);
+    const at = raw.at ?? raw.created_at ?? null;
+    if (!existing) {
+      grouped.set(key, {
+        question,
+        at,
+        count: 1,
+        status: raw.status ?? null,
+      });
+      continue;
+    }
+    existing.count += 1;
+    if (at && (!existing.at || at < existing.at)) existing.at = at;
+  }
+  return [...grouped.values()];
 }
 
 export function viewControllerSignal(payload: ProjectDetailPayload): ViewSignal {
   const record = payload.project ?? {};
+  const pending = viewPendingDecisions(payload);
   return {
     mode: record.mode ?? null,
     nextAction: nonblank(record.next_action),
     blocker: nonblank(record.blocker),
     updatedAt: record.updated_at ?? null,
-    pendingDecisions: (payload.open_decisions ?? []).length,
+    pendingDecisions: pending.reduce((sum, decision) => sum + decision.count, 0),
   };
 }
 
 function toViewItem(item: ProjectItem): ViewItem {
+  const attempts = (item.attempts ?? []).map(toViewAttempt);
   return {
     key: item.key,
     open: item.open,
     desiredState: item.desired_state ?? item.status ?? null,
-    attempts: (item.attempts ?? []).map(toViewAttempt),
+    attempts,
+    moving: attempts.some((attempt) => attempt.live),
   };
+}
+
+function isPendingDecision(decision: ProjectDecision): boolean {
+  const status = decision.status?.trim();
+  return !status || status === "pending_user";
 }
 
 function toViewAttempt(attempt: ProjectItemAttempt): ViewAttempt {

@@ -235,11 +235,12 @@ describe("ProjectsBoard", () => {
       await screen.findAllByText("rebase/repair #2332 onto main after #2333"),
     ).not.toHaveLength(0);
     expect(screen.getAllByText(/need you/).length).toBeGreaterThan(0);
-    expect(await screen.findByText(/Open items \(1\)/)).toBeInTheDocument();
+    expect(await screen.findByText(/Moving \(1\)/)).toBeInTheDocument();
     expect(screen.getByText("c5-preflight-pr2332")).toBeInTheDocument();
     expect(screen.queryByText("old-merged")).not.toBeInTheDocument();
     expect(screen.queryByText("merged last week")).not.toBeInTheDocument();
     expect(screen.getByText("source #2332 dirty")).toBeInTheDocument();
+    expect(screen.getByText("merge #2332?")).toBeInTheDocument();
   });
 
   test("selecting a project loads its updates timeline in the detail pane", async () => {
