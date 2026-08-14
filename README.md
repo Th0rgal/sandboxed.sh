@@ -125,6 +125,9 @@ board (`/`), the desktop Projects board, and the iOS app's Projects tab.
   needed
 - **OpenAI-compatible Proxy Queue Mode**: Optional deferred execution for
   `/v1/chat/completions` when all routed providers are temporarily rate-limited
+- **Native Inference Protocols**: Capability-gated Chat Completions, Responses,
+  and Anthropic Messages with provider-specific reasoning continuity; see
+  [`docs/INFERENCE_PROTOCOLS.md`](docs/INFERENCE_PROTOCOLS.md)
 - **Multi-platform**: Web dashboard (Next.js) and iOS app (SwiftUI) with
   Picture-in-Picture
 
