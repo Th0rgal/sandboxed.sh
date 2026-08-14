@@ -609,6 +609,14 @@ function ProjectListRow({
                 no live attempt
               </span>
             )}
+            {summary.controllerBehind && (
+              <span
+                title="live work is newer than the last controller signal"
+                className="shrink-0 text-[10px] uppercase tracking-wide text-amber-400/70"
+              >
+                controller behind
+              </span>
+            )}
             <span className="min-w-0 truncate">
               {summary.headline
                 ? stripMarkdown(summary.headline)
@@ -1054,8 +1062,10 @@ function ProjectDetail({
           mode={parseMode(project)}
           pendingDecisions={signal?.pendingDecisions ?? summary.pendingDecisions}
           lastSignalAt={summary.lastSignalAt}
+          lastWorkAt={summary.lastWorkAt}
           decisions={decisions}
           idleNextAction={summary.idleNextAction}
+          controllerBehind={summary.controllerBehind}
         />
         {project.tracker?.status_line && (
           <p className="mt-1.5 text-xs leading-relaxed text-white/55">
@@ -1135,16 +1145,20 @@ function ControllerSignal({
   mode,
   pendingDecisions,
   lastSignalAt,
+  lastWorkAt,
   decisions,
   idleNextAction,
+  controllerBehind,
 }: {
   nextAction: string | null;
   blocker: string | null;
   mode: ReturnType<typeof parseMode>;
   pendingDecisions: number;
   lastSignalAt: string | null;
+  lastWorkAt: string | null;
   decisions: ViewDecision[];
   idleNextAction: boolean;
+  controllerBehind: boolean;
 }) {
   if (
     !nextAction &&
@@ -1162,6 +1176,9 @@ function ControllerSignal({
         {idleNextAction && (
           <span className="text-amber-200/80">no live attempt</span>
         )}
+        {controllerBehind && (
+          <span className="text-amber-200/80">controller behind</span>
+        )}
         {pendingDecisions > 0 && (
           <span className="text-amber-200/80">
             {decisions.length > 0
@@ -1169,9 +1186,19 @@ function ControllerSignal({
               : `${pendingDecisions} pending decision${pendingDecisions === 1 ? "" : "s"}`}
           </span>
         )}
-        {lastSignalAt && (
+        {(lastWorkAt || lastSignalAt) && (
           <span className="ml-auto flex items-center gap-1 text-white/35">
-            last signal <UpdateAge at={lastSignalAt} />
+            {lastWorkAt && controllerBehind ? (
+              <>
+                work <UpdateAge at={lastWorkAt} />
+                <span aria-hidden="true">·</span>
+              </>
+            ) : null}
+            {lastSignalAt && (
+              <>
+                last signal <UpdateAge at={lastSignalAt} />
+              </>
+            )}
           </span>
         )}
       </div>

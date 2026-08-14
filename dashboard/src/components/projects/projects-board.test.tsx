@@ -268,6 +268,58 @@ describe("ProjectsBoard", () => {
     expect(screen.getAllByText("repin Verity after #66 merge").length).toBeGreaterThan(0);
   });
 
+  test("shows controller behind when live work is newer than the last signal", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity-core",
+          title: "Verity",
+          next_action: "rebase/repair #2332 onto main after #2333",
+          pending_decisions: 0,
+          mode: "active",
+          latest_update: {
+            headline: "Verity #2332 — BLOQUÉE PAR LEASE WRITER",
+            body: null,
+            session_id: "s",
+            at: "2026-08-14T14:30:54Z",
+            signature: "verity",
+            blocker: "source #2332 dirty",
+          },
+          missions: [
+            {
+              id: "08306fdb",
+              status: "active",
+              title: "Grok 4.6 — repair Verity PR #2332",
+              updated_at: "2026-08-14T15:35:08Z",
+              github_pr: null,
+            },
+          ],
+          health: health({
+            active: 2,
+            failed: 5,
+            tracks_needing_attention: 3,
+            tracks: [
+              track({
+                track: "c5-preflight-pr2332",
+                verdict: "active",
+                active: 1,
+                failed: 1,
+                last_activity_at: "2026-08-14T15:35:08Z",
+              }),
+            ],
+          }),
+        }),
+      ]),
+    );
+
+    renderBoard();
+
+    expect(await screen.findAllByText("controller behind")).not.toHaveLength(0);
+    expect(
+      screen.getAllByText("rebase/repair #2332 onto main after #2333").length,
+    ).toBeGreaterThan(0);
+  });
+
   test("selecting a project loads its updates timeline in the detail pane", async () => {
     mockedOverview.mockResolvedValue(
       overview([
