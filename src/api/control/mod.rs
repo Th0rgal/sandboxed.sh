@@ -237,6 +237,17 @@ pub(crate) const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration =
 /// (see `MissionStore::update_mission_status`) — otherwise the stale timestamp
 /// survives the later demotion back to `AwaitingUser` and the ack-promotion
 /// sweep can archive a mission whose next turn just started.
+/// Reason written when a cancel's JoinHandle never resolves. During a
+/// deploy/SIGTERM drain this must stay `server_shutdown` so boot recovery
+/// and reconcile resume the writer instead of leaving it stranded.
+fn cancel_timeout_interrupt_reason() -> &'static str {
+    if super::routes::is_shutdown_initiated() {
+        super::reconcile::SERVER_SHUTDOWN_REASON
+    } else {
+        super::reconcile::FORCE_KILLED_CANCEL_TIMEOUT_REASON
+    }
+}
+
 pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
     matches!(
         status,
@@ -20058,17 +20069,18 @@ async fn control_actor_loop(
                             mission_id = %mission_id,
                             "Force-aborting stuck parallel runner after cancellation grace period"
                         );
+                        let kill_reason = cancel_timeout_interrupt_reason();
                         runner
                             .finish_durable_run(
                                 &mission_store,
-                                Some("force_killed_after_cancel_timeout"),
+                                Some(kill_reason),
                             )
                             .await;
                         if let Err(error) = mission_store
                             .update_mission_status_with_reason(
                                 *mission_id,
                                 MissionStatus::Interrupted,
-                                Some("force_killed_after_cancel_timeout"),
+                                Some(kill_reason),
                             )
                             .await
                         {
@@ -20670,14 +20682,22 @@ async fn control_actor_loop(
                         .finish_mission_run(
                             run.run_id,
                             run.generation,
-                            Some("force_killed_after_cancel_timeout"),
+                            Some(cancel_timeout_interrupt_reason()),
                         )
                         .await;
                 }
                 if let Some(mid) = stuck_mid {
                     // Mark mission as Interrupted so it stays resumable.
+                    // During a deploy drain this must stay `server_shutdown`
+                    // — overwriting it with force_killed strands the writer
+                    // (startup recovery and reconcile only resume restart
+                    // reasons).
                     if let Err(e) = mission_store
-                        .update_mission_status(mid, MissionStatus::Interrupted)
+                        .update_mission_status_with_reason(
+                            mid,
+                            MissionStatus::Interrupted,
+                            Some(cancel_timeout_interrupt_reason()),
+                        )
                         .await
                     {
                         tracing::warn!(

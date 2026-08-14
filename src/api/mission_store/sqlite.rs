@@ -4945,7 +4945,7 @@ impl MissionStore for SqliteMissionStore {
                      FROM missions
                      WHERE status = 'interrupted'
                        AND resumable = 1
-                       AND terminal_reason = 'server_shutdown'
+                       AND terminal_reason IN ('server_shutdown', 'service_restart')
                        AND COALESCE(mission_mode, 'task') != 'assistant'
                        AND interrupted_at IS NOT NULL
                        AND interrupted_at >= ?1
@@ -15627,6 +15627,40 @@ mod tests {
 
         assert!(mission_ids.contains(&task_mission.id));
         assert!(!mission_ids.contains(&assistant_mission.id));
+
+        let restart_mission = store
+            .create_mission(Some("restart"), None, None, None, None, None, None)
+            .await
+            .expect("restart mission");
+        store
+            .update_mission_status_with_reason(
+                restart_mission.id,
+                MissionStatus::Interrupted,
+                Some("service_restart"),
+            )
+            .await
+            .expect("mark service_restart");
+        let cancelled = store
+            .create_mission(Some("cancelled"), None, None, None, None, None, None)
+            .await
+            .expect("cancelled mission");
+        store
+            .update_mission_status_with_reason(
+                cancelled.id,
+                MissionStatus::Interrupted,
+                Some("cancelled"),
+            )
+            .await
+            .expect("mark cancelled");
+        let mission_ids = store
+            .get_recent_server_shutdown_mission_ids(48)
+            .await
+            .expect("recent restart missions");
+        assert!(
+            mission_ids.contains(&restart_mission.id),
+            "service_restart must be recovered with server_shutdown"
+        );
+        assert!(!mission_ids.contains(&cancelled.id));
     }
 
     #[tokio::test]

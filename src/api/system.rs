@@ -3640,6 +3640,13 @@ fn evaluate_debounce(
     }
 }
 
+/// Seconds since the last `/api/system/deploy` marker was touched.
+/// Used by boot reconcile to treat a just-killed runner as a deploy
+/// interrupt rather than a user cancel.
+pub(crate) fn last_deploy_age_secs() -> Option<u64> {
+    deploy_marker_age_secs(&deploy_marker_path())
+}
+
 /// Read `mtime` of the deploy marker, return seconds since it was written.
 /// `None` if the file doesn't exist or its mtime is in the future (clock skew).
 fn deploy_marker_age_secs(path: &std::path::Path) -> Option<u64> {
