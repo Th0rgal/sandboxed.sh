@@ -227,6 +227,8 @@ repeated failure `repeat-loop-guard` · tool-call limits `context-budget`.
 - **Do not delete the project's controller because it is noisy.** A repeating `blocked` trailer is a stall to escalate, not spam to silence. Removing the cron removes the only path that can write into the dedicated session.
 - **Acknowledge what you have absorbed.** When a failed/interrupted mission has been superseded (retry dispatched, work re-planned, or intentionally dropped), immediately mark it `acknowledged` — an unacknowledged terminal mission is an open operator alert. The attention surface only counts UNacknowledged failures; leaving absorbed failures unacknowledged cries wolf on every board.
 - **A mission asking a question gets an answer or an escalation, never silence.** Use `answer_mission_question` to respond to a mission blocked on AskUserQuestion — plain messages queue behind the blocked turn and will not unblock it.
+- **The store refuses two classes of lie.** A headline that only restates an auto-resume (`RELANCÉE`, `relaunch`) is ingested as `[SILENT]`. A writer-lease claim while a writer is live is coerced to `mode=active` and also silenced. Do not fight this: if the campaign actually changed heads or gates, change the `STATE_SIGNATURE` fields.
+- **Owner questions are unique and expire.** The same `pending_user` question is recorded once. After 24h unanswered it becomes `expired`; act on the conservative in-grant default, do not re-ask.
 
 ## Optimisations d exécution (2026-08-10, leçons terrain)
 

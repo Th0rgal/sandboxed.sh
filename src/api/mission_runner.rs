@@ -2813,6 +2813,16 @@ impl MissionRunner {
         self.last_activity = Instant::now();
     }
 
+    /// Live tool or a recent event — do not treat this runner as stuck
+    /// in a cancel drain. See [`crate::api::controller_honesty::CANCEL_TIMEOUT_FRESH_PROGRESS`].
+    pub fn has_fresh_progress(&self) -> bool {
+        self.active_tool_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+            || self.last_activity.elapsed()
+                < crate::api::controller_honesty::CANCEL_TIMEOUT_FRESH_PROGRESS
+    }
+
     /// Clear turn-scoped tool hints before a runner is reused. Some harnesses
     /// can omit a terminal ToolResult, so the counter must not survive into a
     /// later queued turn and incorrectly extend its watchdog grace period.
@@ -2906,6 +2916,10 @@ impl MissionRunner {
     /// Returns `true` when the runner should be removed from the actor's
     /// registry. A handle which has already finished is left for the normal
     /// completion path so its terminal result can still be recorded.
+    ///
+    /// A runner that still has a live tool or a recent event is *not*
+    /// force-killed: that is the cancel-timeout drain race that turned
+    /// Lido's same writer into a "CAMPAGNE RELANCÉE" every ~30 minutes.
     pub fn force_clear_cancelled_if_due(&mut self) -> bool {
         if !self.cancellation_requested
             || self
@@ -2920,6 +2934,12 @@ impl MissionRunner {
             .as_ref()
             .is_some_and(|handle| handle.is_finished())
         {
+            return false;
+        }
+
+        if self.has_fresh_progress() {
+            self.cancellation_force_clear_deadline =
+                Some(Instant::now() + RUNNER_FORCE_CLEAR_GRACE);
             return false;
         }
 
@@ -12801,11 +12821,43 @@ mod tests {
         runner.cancel();
         runner.cancellation_force_clear_deadline =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        // Age last_activity so the cancel-timeout fresh-progress gate does
+        // not keep a truly stuck handle alive.
+        runner.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(120);
 
         assert!(runner.force_clear_cancelled_if_due());
         assert!(runner.running_handle.is_none());
         assert!(matches!(runner.state, MissionRunState::Finished));
         assert!(!runner.force_clear_cancelled_if_due());
+    }
+
+    #[tokio::test]
+    async fn cancel_timeout_does_not_kill_a_runner_with_fresh_progress() {
+        let mut runner = MissionRunner::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        runner.state = MissionRunState::Running;
+        runner.running_handle = Some(tokio::spawn(async {
+            std::future::pending::<(Uuid, String, AgentResult)>().await
+        }));
+        runner
+            .active_tool_calls
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        runner.cancel();
+        runner.cancellation_force_clear_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+
+        assert!(!runner.force_clear_cancelled_if_due());
+        assert!(runner.running_handle.is_some());
+        assert!(matches!(runner.state, MissionRunState::Running));
     }
 
     #[test]

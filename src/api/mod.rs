@@ -26,6 +26,7 @@ pub mod codex_usage;
 mod console;
 pub mod control;
 pub mod control_metrics;
+pub(crate) mod controller_honesty;
 pub mod deferred_proxy;
 pub mod desktop;
 mod desktop_stream;

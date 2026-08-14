@@ -15,7 +15,7 @@
 //! anything still unmatched surfaces in an explicit `unrouted` bucket rather
 //! than being dropped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -99,9 +99,41 @@ pub fn spawn_state_ingestor(state: Arc<AppState>) {
             let (aliases, overrides) = hermes_projects_dir()
                 .map(|dir| (read_alias_map(&dir), read_overrides(&dir)))
                 .unwrap_or_default();
-            ingest_deliveries(&state.projects, &aliases, &overrides, deliveries);
+            let live = live_writer_project_slugs(&state).await;
+            ingest_deliveries_with_live(&state.projects, &aliases, &overrides, deliveries, &live);
+            if let Err(error) = state
+                .projects
+                .expire_pending_decisions(super::controller_honesty::PENDING_DECISION_TTL)
+            {
+                tracing::warn!("state ingest expire decisions: {error}");
+            }
         }
     });
+}
+
+/// Roster slugs that currently have an executing writer. Used so ingest can
+/// refuse a lease-writer headline while work is live.
+async fn live_writer_project_slugs(state: &super::routes::AppState) -> HashSet<String> {
+    let Ok(projects) = state.projects.list_projects() else {
+        return HashSet::new();
+    };
+    let mut live = HashSet::new();
+    for project in projects {
+        let Ok(missions) = state
+            .control
+            .collect_attention_missions_for_project(&project.slug)
+            .await
+        else {
+            continue;
+        };
+        if missions
+            .iter()
+            .any(|mission| super::controller_honesty::is_live_writer_status(mission.status))
+        {
+            live.insert(project.slug);
+        }
+    }
+    live
 }
 
 /// Marker prefix for state descriptors the ingestor synthesizes for CTRL-only
@@ -120,6 +152,16 @@ fn ingest_deliveries(
     aliases: &HashMap<String, String>,
     overrides: &HashMap<String, String>,
     deliveries: Vec<DeliveryUpdate>,
+) {
+    ingest_deliveries_with_live(projects, aliases, overrides, deliveries, &HashSet::new());
+}
+
+fn ingest_deliveries_with_live(
+    projects: &super::projects_store::ProjectsStore,
+    aliases: &HashMap<String, String>,
+    overrides: &HashMap<String, String>,
+    deliveries: Vec<DeliveryUpdate>,
+    live_projects: &HashSet<String>,
 ) {
     // read_deliveries returns newest-first; replay oldest-first so a
     // run of the same state lands as one extended row rather than
@@ -158,24 +200,32 @@ fn ingest_deliveries(
         // synthetic `ctrl:…` descriptor is recorded then, so the delivery's
         // headline and session still reach the timeline — that is what the
         // overview builds `latest_update` from. `observations` drives `wait`.
+        let has_live_writer = live_projects.contains(slug);
+        let (gated_mode, _) = super::controller_honesty::coerce_mode_against_live(
+            delivery.mode.as_deref(),
+            delivery.blocker.as_deref(),
+            has_live_writer,
+        );
         let headline = Some(delivery.headline.trim()).filter(|h| !h.is_empty());
         let session = Some(delivery.session_id.as_str()).filter(|s| !s.is_empty());
         let descriptor = delivery.state.clone().unwrap_or_else(|| {
-            format!(
-                "{CTRL_DESCRIPTOR_PREFIX}{}",
-                delivery.mode.as_deref().unwrap_or("report")
-            )
+            format!("{CTRL_DESCRIPTOR_PREFIX}{}", gated_mode.unwrap_or("report"))
         });
         // `[SILENT]` is the controllers-policy convention for "nothing to
         // report". It must advance freshness (a quiet tick is proof of life),
         // but it must never become the headline the card shows — fold it onto
         // the previous state event so `latest_update` keeps surfacing the last
         // meaningful headline with the fresh timestamp.
-        let recorded = match headline {
-            Some("[SILENT]") | None => {
-                projects.record_silent_observation(slug, &descriptor, &delivery.at, session)
-            }
-            Some(_) => projects.record_state(slug, &descriptor, headline, &delivery.at, session),
+        //
+        // A relaunch-after-cancel-timeout or a lease-writer claim while a
+        // writer is live is the same class: infra / a lie, not a chapter.
+        let silence = headline.is_none_or(|text| {
+            super::controller_honesty::should_silence_headline(text, has_live_writer)
+        });
+        let recorded = if silence {
+            projects.record_silent_observation(slug, &descriptor, &delivery.at, session)
+        } else {
+            projects.record_state(slug, &descriptor, headline, &delivery.at, session)
         };
         let observations = match recorded {
             Ok(observations) => observations,
@@ -189,7 +239,7 @@ fn ingest_deliveries(
         // CTRL-only delivery still updates the mode column. Idempotent
         // on replay: `wait` comes from the observation count, not a
         // per-call increment.
-        if let Some(mode) = delivery.mode.as_deref() {
+        if let Some(mode) = gated_mode {
             let base = mode.split_once(':').map_or(mode, |(base, _)| base);
             let blocker = mode.split_once(':').map(|(_, cause)| cause);
             if let Err(error) = projects.project_mode_from_signal(
@@ -545,21 +595,33 @@ pub async fn set_project_status(
     if !is_plain_key(&slug) {
         return Err(bad_slug());
     }
-    let mode = req.mode.trim().to_ascii_lowercase();
+    let mut mode = req.mode.trim().to_ascii_lowercase();
     if !matches!(mode.as_str(), "active" | "blocked" | "paused") {
         return Err((
             StatusCode::BAD_REQUEST,
             "mode must be active, blocked, or paused".to_string(),
         ));
     }
+    let mut blocker = req.blocker.clone();
+    if mode == "blocked" && super::controller_honesty::is_lease_blocker(blocker.as_deref()) {
+        let has_live = state
+            .control
+            .collect_attention_missions_for_project(&slug)
+            .await
+            .ok()
+            .is_some_and(|missions| {
+                missions
+                    .iter()
+                    .any(|mission| super::controller_honesty::is_live_writer_status(mission.status))
+            });
+        if has_live {
+            mode = "active".to_string();
+            blocker = None;
+        }
+    }
     state
         .projects
-        .set_mode(
-            &slug,
-            &mode,
-            req.next_action.as_deref(),
-            req.blocker.as_deref(),
-        )
+        .set_mode(&slug, &mode, req.next_action.as_deref(), blocker.as_deref())
         .map_err(|error| (StatusCode::NOT_FOUND, error))?;
     let project = state.projects.get_project(&slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({ "project": project })))
@@ -3442,6 +3504,70 @@ mod tests {
         let open = store.open_decisions("verity").expect("open");
         assert_eq!(open.len(), 1, "coerced merge stays pending");
         assert_eq!(open[0].question, "Merged #2333");
+    }
+
+    #[test]
+    fn relaunch_and_stale_lease_deliveries_are_folded_silent() {
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity-lido", None, None, None, None)
+            .expect("seed lido");
+        store
+            .upsert_project("verity-core", None, None, None, None)
+            .expect("seed verity");
+        let aliases = HashMap::new();
+        let overrides = HashMap::new();
+        let first = parse_delivery(
+            "s",
+            1_754_000_000.0,
+            "[Cron delivery: verity-lido]\nLido closure-v2 — re-pin started\n\
+             [CTRL: verity-lido | mode=active | wait=0 | next=repin]\n\
+             [STATE_SIGNATURE: verity-lido|closure|04729a9|none|repin]\n",
+        );
+        ingest_deliveries(&store, &aliases, &overrides, vec![first]);
+        let relaunch = parse_delivery(
+            "s",
+            1_754_000_100.0,
+            "[Cron delivery: verity-lido]\nLido audit — CAMPAGNE RELANCÉE\n\
+             [CTRL: verity-lido | mode=active | wait=0 | next=repin]\n\
+             [STATE_SIGNATURE: verity-lido|closure|04729a9|none|repin]\n",
+        );
+        ingest_deliveries(&store, &aliases, &overrides, vec![relaunch]);
+        let lido = &store.latest_states().expect("latest")["verity-lido"];
+        assert_eq!(
+            lido.headline.as_deref(),
+            Some("Lido closure-v2 — re-pin started"),
+            "relaunch prose must not become the card headline"
+        );
+        assert!(lido.observations >= 2);
+
+        let live = HashSet::from(["verity-core".to_string()]);
+        let lease = parse_delivery(
+            "s",
+            1_754_000_200.0,
+            "[Cron delivery: verity-core]\nVerity #2332 — BLOQUÉE PAR LEASE WRITER\n\
+             [CTRL: verity-core | mode=blocked:lease-writer | wait=3 | next=wait]\n\
+             [STATE_SIGNATURE: verity-core|c5|#2332|lease|wait]\n",
+        );
+        ingest_deliveries_with_live(&store, &aliases, &overrides, vec![lease], &live);
+        let verity = store
+            .get_project("verity-core")
+            .expect("row")
+            .expect("exists");
+        assert_eq!(
+            verity.mode.as_deref(),
+            Some("active"),
+            "a live writer cannot stay blocked:lease"
+        );
+        assert!(
+            store
+                .latest_states()
+                .expect("latest")
+                .get("verity-core")
+                .and_then(|s| s.headline.as_deref())
+                .is_none(),
+            "lease-writer lie must not open a headline while a writer is live"
+        );
     }
 
     #[test]

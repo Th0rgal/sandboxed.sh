@@ -273,7 +273,7 @@ impl ProjectsStore {
         Ok(true)
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, Connection>, String> {
+    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, String> {
         self.connection
             .lock()
             .map_err(|_| "projects database lock poisoned".to_string())
@@ -1226,6 +1226,11 @@ impl ProjectsStore {
     /// dual-written: only `pending_user` rows count as open, so an older binary
     /// reading `answered = 0` never surfaces autonomous acts.
     pub fn record_decision(&self, slug: &str, decision: &NewDecision) -> Result<String, String> {
+        if decision.status == "pending_user" {
+            if let Some(existing) = self.pending_question_at(slug, &decision.question)? {
+                return Ok(existing);
+            }
+        }
         let now = Utc::now().to_rfc3339();
         let answered = i64::from(decision.status != "pending_user");
         let evidence = decision.evidence.as_ref().map(|value| value.to_string());
@@ -1261,6 +1266,13 @@ impl ProjectsStore {
         at: &str,
         decision: &NewDecision,
     ) -> Result<bool, String> {
+        if decision.status == "pending_user"
+            && self
+                .pending_question_at(slug, &decision.question)?
+                .is_some()
+        {
+            return Ok(false);
+        }
         let answered = i64::from(decision.status != "pending_user");
         let evidence = decision.evidence.as_ref().map(|value| value.to_string());
         let connection = self.lock()?;
@@ -1334,6 +1346,36 @@ impl ProjectsStore {
 
     pub fn open_decisions(&self, slug: &str) -> Result<Vec<ProjectDecision>, String> {
         self.decisions_where(slug, "status = 'pending_user'", "ORDER BY at", None)
+    }
+
+    /// Existing open row for this question, if any. Used so Coldcard cannot
+    /// record the same checkpoint prompt twice two seconds apart.
+    fn pending_question_at(&self, slug: &str, question: &str) -> Result<Option<String>, String> {
+        let needle = super::controller_honesty::normalize_decision_question(question);
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.open_decisions(slug)?.into_iter().find_map(|decision| {
+            (super::controller_honesty::normalize_decision_question(&decision.question) == needle)
+                .then_some(decision.at)
+        }))
+    }
+
+    /// Expire unanswered owner questions older than `max_age`. Returns how
+    /// many rows flipped. The card then stops showing them; the controller
+    /// must act on the conservative default instead of re-asking.
+    pub fn expire_pending_decisions(&self, max_age: chrono::Duration) -> Result<u32, String> {
+        let cutoff = (Utc::now() - max_age).to_rfc3339();
+        let connection = self.lock()?;
+        let changed = connection
+            .execute(
+                "UPDATE project_decisions \
+                 SET status = 'expired', answered = 1 \
+                 WHERE status = 'pending_user' AND at < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(changed as u32)
     }
 
     /// Newest-first autonomous acts (`status = 'decided'`) plus recently
@@ -2325,6 +2367,50 @@ mod tests {
             store.pending_decision_counts().expect("counts")["verity"],
             1
         );
+    }
+
+    #[test]
+    fn pending_user_questions_dedupe_and_expire() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        let first = store
+            .record_decision(
+                "coldcard",
+                &escalation("relancer coldcard_skip depuis le checkpoint ?", None),
+            )
+            .expect("first");
+        let second = store
+            .record_decision(
+                "coldcard",
+                &escalation("Relancer  coldcard_skip depuis le checkpoint ?", None),
+            )
+            .expect("dup");
+        assert_eq!(first, second, "duplicate question must reuse the row");
+        assert_eq!(store.open_decisions("coldcard").expect("open").len(), 1);
+
+        let inserted = store
+            .record_decision_from_delivery(
+                "coldcard",
+                "2026-08-13T20:22:14Z",
+                &escalation("relancer coldcard_skip depuis le checkpoint ?", None),
+            )
+            .expect("from delivery");
+        assert!(!inserted, "ingest must not insert a second pending row");
+
+        {
+            let aged = (Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+            let connection = store.lock().expect("lock");
+            connection
+                .execute(
+                    "UPDATE project_decisions SET at = ?1 WHERE slug = 'coldcard'",
+                    params![aged],
+                )
+                .expect("age");
+        }
+        let expired = store
+            .expire_pending_decisions(chrono::Duration::hours(24))
+            .expect("expire");
+        assert_eq!(expired, 1);
+        assert!(store.open_decisions("coldcard").expect("open").is_empty());
     }
 
     #[test]
