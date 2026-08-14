@@ -90,8 +90,6 @@ const LIVE_STATUSES = new Set([
   "active",
   "pending",
   "waiting_background",
-  "awaiting_user",
-  "paused",
 ]);
 
 const PROBLEM_STATUSES = new Set([

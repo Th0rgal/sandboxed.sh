@@ -288,6 +288,63 @@ describe("viewOpenItems / viewControllerSignal", () => {
     ]);
     expect(viewStalledItems(items).map((entry) => entry.key)).toEqual(["core"]);
     expect(items[0].moving).toBe(true);
+  });
+
+  test("paused and awaiting_user items are parked, not moving", () => {
+    const items = viewOpenItems(
+      payload({
+        items: [
+          item({
+            key: "tier2-helpers",
+            attempts: [
+              {
+                id: "old-await",
+                status: "awaiting_user",
+                title: "assign helper bridge catalog",
+                updated_at: "2026-07-30T18:27:55Z",
+              },
+            ],
+          }),
+          item({
+            key: "core-proven-fragment-review",
+            attempts: [
+              {
+                id: "paused-review",
+                status: "paused",
+                title: "adversarial review of #2205",
+                updated_at: "2026-08-10T00:00:00Z",
+              },
+            ],
+          }),
+          item({
+            key: "c5-preflight-pr2332",
+            attempts: [
+              {
+                id: "live-writer",
+                status: "active",
+                title: "repair #2332",
+                updated_at: "2026-08-14T15:35:00Z",
+              },
+            ],
+          }),
+        ],
+      }),
+    );
+    expect(items.map((entry) => entry.key)).toEqual([
+      "c5-preflight-pr2332",
+      "tier2-helpers",
+      "core-proven-fragment-review",
+    ]);
+    expect(viewMovingItems(items).map((entry) => entry.key)).toEqual([
+      "c5-preflight-pr2332",
+    ]);
+    expect(viewStalledItems(items).map((entry) => entry.key)).toEqual([
+      "tier2-helpers",
+      "core-proven-fragment-review",
+    ]);
+    expect(items.find((entry) => entry.key === "tier2-helpers")?.attempts[0].live).toBe(
+      false,
+    );
 
     const decisions = viewPendingDecisions(payload());
     expect(decisions).toEqual([
