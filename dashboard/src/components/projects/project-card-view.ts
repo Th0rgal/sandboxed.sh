@@ -16,14 +16,15 @@ import type {
 } from "@/lib/api/projects";
 import { healthDigest, isStale, parseMode } from "./project-health";
 
+/** Actually executing. Parked `paused` / `awaiting_user` rows are open
+ *  items, not movement — Verity was ranking five paused bosses above
+ *  the two writers that were running. */
 const LIVE_ATTEMPT = new Set([
   "created",
   "queued",
   "active",
   "pending",
   "waiting_background",
-  "awaiting_user",
-  "paused",
 ]);
 
 export type CardOpenTrack = {
