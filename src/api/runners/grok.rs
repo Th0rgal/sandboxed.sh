@@ -24,8 +24,26 @@ async fn ensure_grok_cli_available(
     cli_path: &str,
 ) -> Result<String, String> {
     let program = cli_path.split(' ').next().unwrap_or(cli_path);
-    if command_available(workspace_exec, cwd, program).await {
-        return Ok(cli_path.to_string());
+    if let Some(overlay) = container_overlay_command_path(&workspace_exec.workspace, program)
+        .or_else(|| {
+            container_overlay_command_path(&workspace_exec.workspace, "/usr/local/bin/grok")
+        })
+    {
+        return Ok(container_overlay_guest_path(
+            &workspace_exec.workspace,
+            &overlay,
+            program,
+        ));
+    }
+    match command_presence(workspace_exec, cwd, program).await {
+        CommandPresence::Present => return Ok(cli_path.to_string()),
+        CommandPresence::Inconclusive => {
+            tracing::warn!(
+                program,
+                "Grok CLI nsenter probe timed out; not treating as absent"
+            );
+        }
+        CommandPresence::Absent => {}
     }
 
     // Host-copy first, same as Codex/OpenCode. The assistant container had a
@@ -38,7 +56,9 @@ async fn ensure_grok_cli_available(
         {
             if let Ok(dest) = copy_host_executable_into_container(&workspace_exec.workspace, &host)
             {
-                if command_available(workspace_exec, cwd, &dest).await {
+                if container_overlay_command_path(&workspace_exec.workspace, &dest).is_some()
+                    || command_available(workspace_exec, cwd, &dest).await
+                {
                     tracing::info!(
                         host = %host.display(),
                         dest,
@@ -58,11 +78,25 @@ async fn ensure_grok_cli_available(
         ));
     }
 
-    if !command_available(workspace_exec, cwd, "curl").await {
-        return Err(format!(
-            "Grok Build CLI '{}' not found and curl is not available in the workspace. Install curl or install Grok manually.",
-            cli_path
-        ));
+    match command_presence(workspace_exec, cwd, "curl").await {
+        CommandPresence::Present => {}
+        CommandPresence::Inconclusive => {
+            return Err(format!(
+                "Grok Build CLI '{}' probe timed out and the binary is not visible on the container overlay. Not treating grok/curl as absent (host nsenter overloaded).",
+                cli_path
+            ));
+        }
+        CommandPresence::Absent => {
+            if container_overlay_command_path(&workspace_exec.workspace, "curl").is_none()
+                && container_overlay_command_path(&workspace_exec.workspace, "/usr/bin/curl")
+                    .is_none()
+            {
+                return Err(format!(
+                    "Grok Build CLI '{}' not found and curl is not available in the workspace. Install curl or install Grok manually.",
+                    cli_path
+                ));
+            }
+        }
     }
 
     tracing::info!("Auto-installing Grok Build CLI");

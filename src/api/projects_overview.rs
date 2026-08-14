@@ -209,13 +209,12 @@ fn ingest_deliveries(
         // so overlapping ingest windows record it once and never reopen an
         // answered row.
         if let Some(trailer) = delivery.decision.as_ref() {
-            let autonomy = projects
-                .get_grant(slug)
-                .ok()
-                .flatten()
-                .and_then(|grant| grant.autonomy_level);
-            match resolve_decision_disposition(
+            let grant = projects.get_grant(slug).ok().flatten();
+            let autonomy = grant.as_ref().and_then(|g| g.autonomy_level.clone());
+            let merge_authority = grant.as_ref().and_then(|g| g.merge_authority.clone());
+            match resolve_decision_disposition_for_grant(
                 autonomy.as_deref(),
+                merge_authority.as_deref(),
                 trailer.authority.as_deref(),
                 trailer.status.as_deref(),
                 trailer.kind.as_deref(),
@@ -686,6 +685,20 @@ pub(crate) fn resolve_decision_disposition(
     status: Option<&str>,
     kind: Option<&str>,
 ) -> Result<DecisionDisposition, String> {
+    resolve_decision_disposition_for_grant(autonomy_level, None, authority, status, kind)
+}
+
+/// Same gate as [`resolve_decision_disposition`], honoring `merge_authority`.
+/// `act_reversible` still escalates destroy/publish/deploy/force_push, but a
+/// `merge` is allowed when the grant says `full` — otherwise controllers with
+/// `merge_authority=full` keep asking Thomas (Verity/Lido, 2026-08-14).
+pub(crate) fn resolve_decision_disposition_for_grant(
+    autonomy_level: Option<&str>,
+    merge_authority: Option<&str>,
+    authority: Option<&str>,
+    status: Option<&str>,
+    kind: Option<&str>,
+) -> Result<DecisionDisposition, String> {
     let authority = match authority.map(str::trim).filter(|a| !a.is_empty()) {
         None => "escalation",
         Some(a @ ("granted" | "escalation")) => a,
@@ -711,20 +724,31 @@ pub(crate) fn resolve_decision_disposition(
         }
     };
     if authority == "granted" && status == "decided" {
-        let may_act = matches!(autonomy_level, Some("act_reversible") | Some("act_full"));
+        // Controllers-policy default is *act*. An unset grant is not observe:
+        // treating it as observe made every `[DECISION: authority=granted]`
+        // bounce back to Thomas (Lido #66 / Verity #2332, 2026-08-13).
+        let effective = match autonomy_level.map(str::trim).filter(|s| !s.is_empty()) {
+            None => "act_reversible",
+            Some(level) => level,
+        };
+        let may_act = matches!(effective, "act_reversible" | "act_full");
         if !may_act {
-            let level = autonomy_level.unwrap_or("unset");
             return Ok(DecisionDisposition {
                 authority: "escalation".to_string(),
                 status: "pending_user".to_string(),
-                coerced_reason: Some(format!("autonomy_level={level}")),
+                coerced_reason: Some(format!("autonomy_level={effective}")),
             });
         }
-        if autonomy_level == Some("act_reversible") {
-            let irreversible = kind
-                .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .is_some_and(|k| IRREVERSIBLE_KINDS.contains(&k.as_str()));
+        if effective == "act_reversible" {
+            let kind_norm = kind.map(str::trim).map(str::to_ascii_lowercase);
+            let merge_ok = kind_norm.as_deref() == Some("merge")
+                && merge_authority
+                    .map(str::trim)
+                    .is_some_and(|a| a.eq_ignore_ascii_case("full"));
+            let irreversible = kind_norm
+                .as_deref()
+                .is_some_and(|k| IRREVERSIBLE_KINDS.contains(&k))
+                && !merge_ok;
             if irreversible {
                 return Ok(DecisionDisposition {
                     authority: "escalation".to_string(),
@@ -758,8 +782,9 @@ pub async fn record_project_decision(
         return Err((StatusCode::BAD_REQUEST, "question is required".to_string()));
     }
     let grant = state.projects.get_grant(&slug).map_err(store_err)?;
-    let disposition = resolve_decision_disposition(
+    let disposition = resolve_decision_disposition_for_grant(
         grant.as_ref().and_then(|g| g.autonomy_level.as_deref()),
+        grant.as_ref().and_then(|g| g.merge_authority.as_deref()),
         req.authority.as_deref(),
         req.status.as_deref(),
         req.kind.as_deref(),
@@ -3076,8 +3101,8 @@ mod tests {
         store
             .upsert_project("verity", None, None, None, None)
             .expect("seed");
-        // No autonomy level set: a granted act in the trailer must land as a
-        // pending owner escalation.
+        // Unset grant defaults to act_reversible, so a *merge* (irreversible)
+        // still lands as a pending owner escalation.
         let content = "[Cron delivery: verity]\nHeadline\n\
             [DECISION: {\"kind\":\"merge\",\"authority\":\"granted\",\"status\":\"decided\",\"question\":\"Merged #1\"}]\n\
             [STATE_SIGNATURE: verity|phase|head]\n";
@@ -3149,14 +3174,20 @@ mod tests {
 
     #[test]
     fn an_unearned_autonomous_act_is_coerced_into_an_escalation() {
-        // No grant, observe, and propose all deny acting.
-        for level in [None, Some("observe"), Some("propose")] {
+        // observe and propose deny acting. An unset grant follows the
+        // controllers-policy default (act_reversible), not observe.
+        for level in [Some("observe"), Some("propose")] {
             let d = resolve_decision_disposition(level, Some("granted"), Some("decided"), None)
                 .expect("valid");
             assert_eq!(d.authority, "escalation");
             assert_eq!(d.status, "pending_user");
             assert!(d.coerced_reason.is_some(), "level {level:?} must coerce");
         }
+        let unset = resolve_decision_disposition(None, Some("granted"), Some("decided"), None)
+            .expect("valid");
+        assert_eq!(unset.authority, "granted");
+        assert_eq!(unset.status, "decided");
+        assert!(unset.coerced_reason.is_none());
         for level in ["act_reversible", "act_full"] {
             let d =
                 resolve_decision_disposition(Some(level), Some("granted"), Some("decided"), None)
@@ -3191,6 +3222,42 @@ mod tests {
                     .expect("valid");
             assert_eq!(d.status, "decided", "{level}/{kind:?} must pass");
         }
+    }
+
+    #[test]
+    fn merge_authority_full_lets_act_reversible_record_a_merge() {
+        let denied = resolve_decision_disposition_for_grant(
+            Some("act_reversible"),
+            Some("review-first"),
+            Some("granted"),
+            Some("decided"),
+            Some("merge"),
+        )
+        .expect("valid");
+        assert_eq!(denied.status, "pending_user");
+
+        let allowed = resolve_decision_disposition_for_grant(
+            Some("act_reversible"),
+            Some("full"),
+            Some("granted"),
+            Some("decided"),
+            Some("merge"),
+        )
+        .expect("valid");
+        assert_eq!(allowed.authority, "granted");
+        assert_eq!(allowed.status, "decided");
+        assert!(allowed.coerced_reason.is_none());
+
+        // force_push stays banned even with merge_authority=full
+        let force = resolve_decision_disposition_for_grant(
+            Some("act_reversible"),
+            Some("full"),
+            Some("granted"),
+            Some("decided"),
+            Some("force_push"),
+        )
+        .expect("valid");
+        assert_eq!(force.status, "pending_user");
     }
 
     #[test]
