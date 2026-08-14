@@ -58,6 +58,13 @@ struct ChatCompletionRequest {
     stream: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct NativeProtocolRequest {
+    model: String,
+    #[serde(default)]
+    stream: Option<bool>,
+}
+
 /// Minimal error response matching OpenAI's format.
 #[derive(Serialize)]
 struct ErrorResponse {
@@ -84,6 +91,20 @@ fn error_response(status: StatusCode, message: String, code: &str) -> Response {
 
 const DEFAULT_COOLDOWN_RETRY_AFTER_SECS: u64 = 60;
 const MAX_COOLDOWN_RETRY_AFTER_SECS: u64 = 60;
+
+fn preserved_upstream_error_response(
+    status: StatusCode,
+    response_headers: &HeaderMap,
+    response_body: bytes::Bytes,
+) -> Response {
+    let mut response = (status, Body::from(response_body)).into_response();
+    for name in [header::CONTENT_TYPE, header::RETRY_AFTER] {
+        if let Some(value) = response_headers.get(&name) {
+            response.headers_mut().insert(name, value.clone());
+        }
+    }
+    response
+}
 
 fn cooldown_retry_after_secs() -> u64 {
     std::env::var("PROXY_COOLDOWN_RETRY_AFTER_SECS")
@@ -228,6 +249,62 @@ fn completions_url(provider_type: ProviderType, account_base_url: Option<&str>) 
     Some(format!("{}/chat/completions", base))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeProtocol {
+    Responses,
+    AnthropicMessages,
+}
+
+fn protocol_url(
+    protocol: NativeProtocol,
+    provider_type: ProviderType,
+    account_base_url: Option<&str>,
+) -> Option<String> {
+    let default = match protocol {
+        NativeProtocol::Responses => match provider_type {
+            ProviderType::OpenAI | ProviderType::Xai | ProviderType::Muse => {
+                default_base_url(provider_type)
+            }
+            _ => None,
+        },
+        NativeProtocol::AnthropicMessages => match provider_type {
+            ProviderType::Anthropic => Some("https://api.anthropic.com/v1"),
+            _ => None,
+        },
+    };
+    let base = account_base_url.or(default)?.trim_end_matches('/');
+    let suffix = match protocol {
+        NativeProtocol::Responses => "responses",
+        NativeProtocol::AnthropicMessages => "messages",
+    };
+    if base.ends_with(&format!("/{suffix}")) {
+        Some(base.to_string())
+    } else {
+        Some(format!("{base}/{suffix}"))
+    }
+}
+
+fn native_protocol_supported(
+    protocol: NativeProtocol,
+    provider_type: ProviderType,
+    has_api_key: bool,
+    has_oauth: bool,
+) -> bool {
+    match protocol {
+        NativeProtocol::Responses => {
+            matches!(
+                provider_type,
+                ProviderType::OpenAI | ProviderType::Xai | ProviderType::Muse
+            ) && has_api_key
+        }
+        // Direct OAuth records carry a hoisted access token. The synthetic CLI
+        // adapter has no key and therefore fails closed.
+        NativeProtocol::AnthropicMessages => {
+            provider_type == ProviderType::Anthropic && has_api_key && !has_oauth
+        }
+    }
+}
+
 fn cli_proxy_chat_completions_url() -> String {
     // Alias precedence lives in `util::CLI_PROXY_BASE_URL_ENV_VARS` so every
     // CLI-proxy code path agrees. `env_var_nonempty` (used by the helper)
@@ -301,6 +378,9 @@ pub(crate) fn has_routable_proxy_credentials(
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
     Router::new()
         .route("/chat/completions", post(chat_completions))
+        .route("/responses", post(responses))
+        .route("/messages", post(anthropic_messages))
+        .route("/capabilities", get(list_capabilities))
         .route("/deferred/:id", get(get_deferred_request))
         .route("/deferred/:id", delete(cancel_deferred_request))
         .route("/models", axum::routing::get(list_models))
@@ -322,6 +402,98 @@ struct ModelObject {
     object: &'static str,
     created: i64,
     owned_by: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ProtocolCapabilities {
+    chat_completions: bool,
+    responses: bool,
+    anthropic_messages: bool,
+    previous_response_id: bool,
+    reasoning_content_replay: bool,
+    thinking_blocks_replay: bool,
+    native_function_tools: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderProtocolCapabilities {
+    provider: String,
+    model: String,
+    currently_available: bool,
+    capabilities: ProtocolCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ModelProtocolCapabilities {
+    id: String,
+    providers: Vec<ProviderProtocolCapabilities>,
+}
+
+#[derive(Serialize)]
+struct CapabilitiesResponse {
+    object: &'static str,
+    data: Vec<ModelProtocolCapabilities>,
+}
+
+fn protocol_capabilities(
+    provider_type: ProviderType,
+    has_api_key: bool,
+    has_oauth: bool,
+) -> ProtocolCapabilities {
+    let responses = native_protocol_supported(
+        NativeProtocol::Responses,
+        provider_type,
+        has_api_key,
+        has_oauth,
+    );
+    let anthropic_messages = native_protocol_supported(
+        NativeProtocol::AnthropicMessages,
+        provider_type,
+        has_api_key,
+        has_oauth,
+    );
+    match provider_type {
+        ProviderType::OpenAI | ProviderType::Xai | ProviderType::Muse => ProtocolCapabilities {
+            chat_completions: has_routable_proxy_credentials(provider_type, has_api_key, has_oauth),
+            responses,
+            anthropic_messages,
+            previous_response_id: responses,
+            reasoning_content_replay: false,
+            thinking_blocks_replay: false,
+            native_function_tools: responses,
+        },
+        ProviderType::Anthropic => ProtocolCapabilities {
+            chat_completions: has_routable_proxy_credentials(provider_type, has_api_key, has_oauth),
+            responses,
+            anthropic_messages,
+            previous_response_id: false,
+            reasoning_content_replay: false,
+            thinking_blocks_replay: anthropic_messages,
+            native_function_tools: anthropic_messages,
+        },
+        ProviderType::Kimi => ProtocolCapabilities {
+            chat_completions: has_routable_proxy_credentials(provider_type, has_api_key, has_oauth),
+            responses,
+            anthropic_messages,
+            previous_response_id: false,
+            reasoning_content_replay: true,
+            thinking_blocks_replay: false,
+            native_function_tools: true,
+        },
+        _ => ProtocolCapabilities {
+            chat_completions: has_routable_proxy_credentials(provider_type, has_api_key, has_oauth),
+            responses,
+            anthropic_messages,
+            previous_response_id: false,
+            reasoning_content_replay: false,
+            thinking_blocks_replay: false,
+            native_function_tools: has_routable_proxy_credentials(
+                provider_type,
+                has_api_key,
+                has_oauth,
+            ),
+        },
+    }
 }
 
 /// Verify the proxy bearer token from the Authorization header.
@@ -366,6 +538,156 @@ pub(crate) async fn verify_proxy_auth(
         "Invalid or missing proxy authorization".to_string(),
         "authentication_error",
     ))
+}
+
+async fn list_capabilities(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = verify_proxy_auth(&headers, &state).await {
+        return resp;
+    }
+    let standard_accounts =
+        crate::api::ai_providers::read_standard_accounts(&state.config.working_dir);
+    let mut by_model: HashMap<String, Vec<ProviderProtocolCapabilities>> = HashMap::new();
+    let capability_tracker = Arc::new(crate::provider_health::ProviderHealthTracker::new());
+    for chain in state.chain_store.list().await {
+        let configured_account_ids = state
+            .chain_store
+            .configured_account_ids(&chain.entries, &state.ai_providers, &standard_accounts)
+            .await;
+        let stateful_affinity = chain.entries.len() == 1 && configured_account_ids.len() == 1;
+        let available = state
+            .chain_store
+            .resolve_entries(
+                &chain.entries,
+                &state.ai_providers,
+                &standard_accounts,
+                &state.health_tracker,
+            )
+            .await;
+        let available_ids: HashSet<_> = available.iter().map(|entry| entry.account_id).collect();
+        let configured = state
+            .chain_store
+            .resolve_entries(
+                &chain.entries,
+                &state.ai_providers,
+                &standard_accounts,
+                &capability_tracker,
+            )
+            .await;
+        let mut provider_map: HashMap<(String, String), ProviderProtocolCapabilities> =
+            HashMap::new();
+        for entry in configured {
+            let provider_type =
+                ProviderType::from_id(&entry.provider_id).unwrap_or(ProviderType::Custom);
+            let mut capabilities =
+                protocol_capabilities(provider_type, entry.api_key.is_some(), entry.has_oauth);
+            if !stateful_affinity {
+                capabilities.previous_response_id = false;
+                capabilities.thinking_blocks_replay = false;
+            }
+            let key = (entry.provider_id.clone(), entry.model_id.clone());
+            let currently_available = available_ids.contains(&entry.account_id);
+            provider_map
+                .entry(key)
+                .and_modify(|provider| {
+                    provider.currently_available |= currently_available;
+                    provider.capabilities.chat_completions |= capabilities.chat_completions;
+                    provider.capabilities.responses |= capabilities.responses;
+                    provider.capabilities.anthropic_messages |= capabilities.anthropic_messages;
+                    provider.capabilities.native_function_tools |=
+                        capabilities.native_function_tools;
+                })
+                .or_insert(ProviderProtocolCapabilities {
+                    provider: entry.provider_id,
+                    model: entry.model_id,
+                    currently_available,
+                    capabilities,
+                });
+        }
+        let mut providers: Vec<_> = provider_map.into_values().collect();
+        providers.sort_by(|left, right| {
+            (&left.provider, &left.model).cmp(&(&right.provider, &right.model))
+        });
+        by_model.insert(chain.id, providers);
+    }
+    let direct_models =
+        crate::api::providers::catalog_model_options_for_state(&state, true, true).await;
+    for model in routable_direct_catalog_models(&state, direct_models).await {
+        let provider_type =
+            ProviderType::from_id(&model.provider_id).unwrap_or(ProviderType::Custom);
+        let synthetic = crate::provider_health::ChainEntry {
+            provider_id: model.provider_id.clone(),
+            model_id: model.id.clone(),
+        };
+        let configured_account_ids = state
+            .chain_store
+            .configured_account_ids(
+                std::slice::from_ref(&synthetic),
+                &state.ai_providers,
+                &standard_accounts,
+            )
+            .await;
+        let stateful_affinity = configured_account_ids.len() == 1;
+        let available = state
+            .chain_store
+            .resolve_entries(
+                std::slice::from_ref(&synthetic),
+                &state.ai_providers,
+                &standard_accounts,
+                &state.health_tracker,
+            )
+            .await;
+        let available_ids: HashSet<_> = available.iter().map(|entry| entry.account_id).collect();
+        let configured = state
+            .chain_store
+            .resolve_entries(
+                std::slice::from_ref(&synthetic),
+                &state.ai_providers,
+                &standard_accounts,
+                &capability_tracker,
+            )
+            .await;
+        let mut aggregate: Option<ProtocolCapabilities> = None;
+        for entry in configured {
+            let mut capabilities =
+                protocol_capabilities(provider_type, entry.api_key.is_some(), entry.has_oauth);
+            if !stateful_affinity {
+                capabilities.previous_response_id = false;
+                capabilities.thinking_blocks_replay = false;
+            }
+            if let Some(existing) = aggregate.as_mut() {
+                existing.chat_completions |= capabilities.chat_completions;
+                existing.responses |= capabilities.responses;
+                existing.anthropic_messages |= capabilities.anthropic_messages;
+                existing.reasoning_content_replay |= capabilities.reasoning_content_replay;
+                existing.native_function_tools |= capabilities.native_function_tools;
+            } else {
+                aggregate = Some(capabilities);
+            }
+        }
+        if let Some(capabilities) = aggregate {
+            by_model.entry(model.value).or_insert_with(|| {
+                vec![ProviderProtocolCapabilities {
+                    provider: model.provider_id,
+                    model: model.id,
+                    currently_available: !available_ids.is_empty(),
+                    capabilities,
+                }]
+            });
+        }
+    }
+    let mut data: Vec<_> = by_model
+        .into_iter()
+        .map(|(id, providers)| ModelProtocolCapabilities { id, providers })
+        .collect();
+    data.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(CapabilitiesResponse {
+        object: "list",
+        data,
+    })
+    .into_response()
 }
 
 async fn list_models(
@@ -667,7 +989,351 @@ fn proxy_usage_sink(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Handler
+// Native protocol handlers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn native_response_usage(body: &[u8]) -> Option<(u64, u64)> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let usage = value.get("usage")?;
+    let input = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    (input > 0 || output > 0).then_some((input, output))
+}
+
+fn native_request_has_continuation(protocol: NativeProtocol, body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    match protocol {
+        NativeProtocol::Responses => {
+            value
+                .get("previous_response_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+                || value
+                    .get("input")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.get("type").and_then(serde_json::Value::as_str)
+                                == Some("function_call_output")
+                        })
+                    })
+        }
+        NativeProtocol::AnthropicMessages => value
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|blocks| {
+                            blocks.iter().any(|block| {
+                                matches!(
+                                    block.get("type").and_then(serde_json::Value::as_str),
+                                    Some("thinking" | "redacted_thinking" | "tool_result")
+                                )
+                            })
+                        })
+                })
+            }),
+    }
+}
+
+async fn responses(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Response {
+    native_protocol_proxy(state, headers, body, NativeProtocol::Responses).await
+}
+
+async fn anthropic_messages(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Response {
+    native_protocol_proxy(state, headers, body, NativeProtocol::AnthropicMessages).await
+}
+
+async fn native_protocol_proxy(
+    state: Arc<super::routes::AppState>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+    protocol: NativeProtocol,
+) -> Response {
+    if let Err(resp) = verify_proxy_auth(&headers, &state).await {
+        return resp;
+    }
+    let req: NativeProtocolRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid request body: {error}"),
+                "invalid_request_error",
+            );
+        }
+    };
+    let requested_model = req.model;
+    let is_stream = req.stream.unwrap_or(false);
+    let standard_accounts = super::ai_providers::read_standard_accounts(&state.config.working_dir);
+    let exact_chain_exists = state.chain_store.get(&requested_model).await.is_some();
+    let resolved_chain_id = if exact_chain_exists {
+        Some(requested_model.clone())
+    } else {
+        let prefixed = format!("builtin/{requested_model}");
+        state.chain_store.get(&prefixed).await.map(|_| prefixed)
+    };
+    let (chain_id, chain_entries, entries) = if let Some(id) = resolved_chain_id {
+        let configured = state
+            .chain_store
+            .get(&id)
+            .await
+            .map(|chain| chain.entries)
+            .unwrap_or_default();
+        let resolved = state
+            .chain_store
+            .resolve_chain(
+                &id,
+                &state.ai_providers,
+                &standard_accounts,
+                &state.health_tracker,
+            )
+            .await;
+        (id, configured, resolved)
+    } else if let Some(direct) = parse_direct_model_entry(&requested_model)
+        .or(parse_custom_direct_model_entry(&state, &requested_model).await)
+    {
+        let resolved = state
+            .chain_store
+            .resolve_entries(
+                std::slice::from_ref(&direct),
+                &state.ai_providers,
+                &standard_accounts,
+                &state.health_tracker,
+            )
+            .await;
+        (requested_model.clone(), vec![direct], resolved)
+    } else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Model '{requested_model}' is not a known chain or provider/model id"),
+            "model_not_found",
+        );
+    };
+
+    if entries.is_empty() {
+        let candidate_ids = state
+            .chain_store
+            .configured_account_ids(&chain_entries, &state.ai_providers, &standard_accounts)
+            .await;
+        let cooling = state
+            .health_tracker
+            .any_account_has_active_cooldown(&candidate_ids)
+            .await;
+        return unavailable_chain_response(&chain_id, cooling);
+    }
+
+    if native_request_has_continuation(protocol, &body) {
+        let candidate_ids = state
+            .chain_store
+            .configured_account_ids(&chain_entries, &state.ai_providers, &standard_accounts)
+            .await;
+        if chain_entries.len() != 1 || candidate_ids.len() != 1 || entries.len() != 1 {
+            return error_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "Stateful continuation for chain '{chain_id}' requires exactly one provider/model and one configured account"
+                ),
+                "stateful_affinity_required",
+            );
+        }
+    }
+
+    let mut supported_entries = 0usize;
+    let mut last_upstream_error: Option<(StatusCode, HeaderMap, bytes::Bytes)> = None;
+    for entry in &entries {
+        let provider_type =
+            ProviderType::from_id(&entry.provider_id).unwrap_or(ProviderType::Custom);
+        if !native_protocol_supported(
+            protocol,
+            provider_type,
+            entry.api_key.is_some(),
+            entry.has_oauth,
+        ) {
+            continue;
+        }
+        let Some(url) = protocol_url(protocol, provider_type, entry.base_url.as_deref()) else {
+            continue;
+        };
+        let Some(credential) = entry.api_key.as_deref().filter(|v| !v.trim().is_empty()) else {
+            continue;
+        };
+        supported_entries += 1;
+        let upstream_body = match rewrite_model(&body, &entry.model_id) {
+            Ok(body) => body,
+            Err(error) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Could not rewrite request model: {error}"),
+                    "invalid_request_error",
+                );
+            }
+        };
+        let mut request = state
+            .http_client
+            .post(&url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(upstream_body);
+        match protocol {
+            NativeProtocol::Responses => {
+                request = request.bearer_auth(credential);
+            }
+            NativeProtocol::AnthropicMessages => {
+                for (name, value) in build_anthropic_proxy_headers(credential, entry.has_oauth) {
+                    if let Some(name) = name {
+                        request = request.header(name, value);
+                    }
+                }
+                // Preserve explicit protocol/beta selection from the native client.
+                for name in ["anthropic-version", "anthropic-beta"] {
+                    if let Some(value) = headers.get(name) {
+                        request = request.header(name, value);
+                    }
+                }
+            }
+        }
+        if !is_stream {
+            request = request.timeout(Duration::from_secs(300));
+        }
+        state
+            .health_tracker
+            .set_provider_id(entry.account_id, &entry.provider_id)
+            .await;
+        let upstream = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let reason = if error.is_timeout() {
+                    CooldownReason::Timeout
+                } else {
+                    CooldownReason::ServerError
+                };
+                state
+                    .health_tracker
+                    .record_entry_failure(entry, reason, None)
+                    .await;
+                continue;
+            }
+        };
+        let status = upstream.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            let _ = upstream.bytes().await;
+            state
+                .health_tracker
+                .record_entry_failure(entry, CooldownReason::AuthError, None)
+                .await;
+            continue;
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            let response_headers = upstream.headers().clone();
+            let retry_after = parse_rate_limit_headers(&response_headers, provider_type);
+            let response_body = upstream.bytes().await.unwrap_or_default();
+            let reason = if status.as_u16() == 529 {
+                CooldownReason::Overloaded
+            } else if status == StatusCode::TOO_MANY_REQUESTS {
+                CooldownReason::RateLimit
+            } else {
+                CooldownReason::ServerError
+            };
+            state
+                .health_tracker
+                .record_entry_failure(entry, reason, retry_after)
+                .await;
+            last_upstream_error = Some((status, response_headers, response_body));
+            continue;
+        }
+        let response_headers = upstream.headers().clone();
+        if is_stream && status.is_success() {
+            let liveness_mission_id = headers
+                .get(crate::api::proxy_liveness::MISSION_ID_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| uuid::Uuid::parse_str(value.trim()).ok());
+            let upstream_stream = upstream
+                .bytes_stream()
+                .map(|item| item.map_err(|error| std::io::Error::other(error.to_string())));
+            let tracked_stream = track_stream_health(
+                upstream_stream,
+                state.health_tracker.clone(),
+                entry.account_id,
+                None,
+                entry.subscription_key.clone(),
+                Some(proxy_usage_sink(state.clone(), entry.model_id.clone())),
+                liveness_mission_id,
+            );
+            let mut response = (status, Body::from_stream(tracked_stream)).into_response();
+            for name in [header::CONTENT_TYPE, header::CACHE_CONTROL] {
+                if let Some(value) = response_headers.get(&name) {
+                    response.headers_mut().insert(name, value.clone());
+                }
+            }
+            return response;
+        }
+        let response_body = match upstream.bytes().await {
+            Ok(body) => body,
+            Err(error) => {
+                state
+                    .health_tracker
+                    .record_entry_failure(entry, CooldownReason::ServerError, None)
+                    .await;
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to read upstream response: {error}"),
+                    "upstream_error",
+                );
+            }
+        };
+        if status.is_success() {
+            state.health_tracker.record_entry_success(entry).await;
+            if let Some((input_tokens, output_tokens)) = native_response_usage(&response_body) {
+                state
+                    .health_tracker
+                    .record_token_usage(entry.account_id, input_tokens, output_tokens)
+                    .await;
+                record_proxy_usage(&state, &entry.model_id, input_tokens, output_tokens).await;
+            }
+        }
+        let mut response = (status, Body::from(response_body)).into_response();
+        for name in [header::CONTENT_TYPE, header::CACHE_CONTROL] {
+            if let Some(value) = response_headers.get(&name) {
+                response.headers_mut().insert(name, value.clone());
+            }
+        }
+        return response;
+    }
+
+    if let Some((status, response_headers, response_body)) = last_upstream_error {
+        return preserved_upstream_error_response(status, &response_headers, response_body);
+    }
+    let message = if supported_entries == 0 {
+        format!("Chain '{chain_id}' has no entries with native support for this protocol")
+    } else {
+        format!("All native protocol providers in chain '{chain_id}' failed")
+    };
+    error_response(StatusCode::BAD_GATEWAY, message, "unsupported_protocol")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chat handler
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn chat_completions(
@@ -3582,6 +4248,84 @@ fn build_flush_chunk_line(
 /// timeout fire and fail the whole mission turn.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+fn take_sse_event(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| (index, 4));
+    let (index, delimiter_len) = match (lf, crlf) {
+        (Some(left), Some(right)) => {
+            if left.0 <= right.0 {
+                left
+            } else {
+                right
+            }
+        }
+        (Some(found), None) | (None, Some(found)) => found,
+        (None, None) => return None,
+    };
+    let event = buffer.drain(..index).collect();
+    buffer.drain(..delimiter_len);
+    Some(event)
+}
+
+fn usage_from_sse_event(event: &[u8]) -> Option<(Option<u64>, Option<u64>)> {
+    let text = std::str::from_utf8(event).ok()?;
+    for line in text.lines() {
+        let Some(data) = line.trim_end_matches('\r').strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        for usage in [
+            value.get("usage"),
+            value.pointer("/response/usage"),
+            value.pointer("/message/usage"),
+            value.pointer("/delta/usage"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let input = usage
+                .get("prompt_tokens")
+                .or_else(|| usage.get("input_tokens"))
+                .and_then(serde_json::Value::as_u64);
+            let output = usage
+                .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens"))
+                .and_then(serde_json::Value::as_u64);
+            if input.is_some() || output.is_some() {
+                return Some((input, output));
+            }
+        }
+    }
+    None
+}
+
+fn update_sse_usage(
+    buffer: &mut Vec<u8>,
+    chunk: &[u8],
+    input_tokens: &mut u64,
+    output_tokens: &mut u64,
+) {
+    buffer.extend_from_slice(chunk);
+    while let Some(event) = take_sse_event(buffer) {
+        if let Some((input, output)) = usage_from_sse_event(&event) {
+            if let Some(value) = input {
+                *input_tokens = (*input_tokens).max(value);
+            }
+            if let Some(value) = output {
+                *output_tokens = (*output_tokens).max(value);
+            }
+        }
+    }
+}
+
 fn track_stream_health(
     inner: impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
     health_tracker: crate::provider_health::SharedProviderHealthTracker,
@@ -3598,6 +4342,7 @@ fn track_stream_health(
         let mut idle_timeout = false;
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
+        let mut sse_buffer = Vec::new();
         loop {
             match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
                 Err(_) => {
@@ -3625,29 +4370,27 @@ fn track_stream_health(
                             if let Some(id) = liveness_mission_id {
                                 crate::api::proxy_liveness::note_activity(id);
                             }
-                            // Scan SSE data lines for usage in the final chunk.
-                            // OpenAI-compatible providers include a `usage` object
-                            // in the last `data:` event of the stream.
-                            if let Ok(text) = std::str::from_utf8(chunk) {
-                                for line in text.lines() {
-                                    if let Some(json_str) = line.strip_prefix("data: ") {
-                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                                            if let Some(usage) = v.get("usage") {
-                                                if let Some(pt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
-                                                    input_tokens = pt;
-                                                }
-                                                if let Some(ct) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
-                                                    output_tokens = ct;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            // Decode complete SSE events without altering the relayed bytes.
+                            update_sse_usage(
+                                &mut sse_buffer,
+                                chunk,
+                                &mut input_tokens,
+                                &mut output_tokens,
+                            );
                         }
                         Err(_) => errored = true,
                     }
                     yield item;
+                }
+            }
+        }
+        if !sse_buffer.is_empty() {
+            if let Some((input, output)) = usage_from_sse_event(&sse_buffer) {
+                if let Some(value) = input {
+                    input_tokens = input_tokens.max(value);
+                }
+                if let Some(value) = output {
+                    output_tokens = output_tokens.max(value);
                 }
             }
         }
@@ -5285,6 +6028,166 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::StreamExt;
+
+    #[test]
+    fn protocol_capabilities_are_credential_aware_and_fail_closed() {
+        let xai_key = protocol_capabilities(ProviderType::Xai, true, false);
+        assert!(xai_key.chat_completions && xai_key.responses && xai_key.previous_response_id);
+        assert!(!xai_key.anthropic_messages && !xai_key.thinking_blocks_replay);
+
+        let xai_oauth = protocol_capabilities(ProviderType::Xai, false, true);
+        assert!(!xai_oauth.responses && !xai_oauth.previous_response_id);
+
+        let anthropic_key = protocol_capabilities(ProviderType::Anthropic, true, false);
+        assert!(anthropic_key.chat_completions && anthropic_key.anthropic_messages);
+        assert!(anthropic_key.thinking_blocks_replay);
+        assert!(!anthropic_key.responses && !anthropic_key.previous_response_id);
+
+        let anthropic_cli = protocol_capabilities(ProviderType::Anthropic, false, true);
+        assert!(!anthropic_cli.anthropic_messages);
+        let anthropic_oauth_token_hoisted_as_key =
+            protocol_capabilities(ProviderType::Anthropic, true, true);
+        assert!(!anthropic_oauth_token_hoisted_as_key.anthropic_messages);
+
+        let kimi = protocol_capabilities(ProviderType::Kimi, true, false);
+        assert!(kimi.chat_completions && kimi.reasoning_content_replay);
+        assert!(!kimi.responses && !kimi.anthropic_messages);
+    }
+
+    #[test]
+    fn native_protocol_urls_honor_overrides_and_fail_closed() {
+        assert_eq!(
+            protocol_url(NativeProtocol::Responses, ProviderType::Xai, None).as_deref(),
+            Some("https://api.x.ai/v1/responses")
+        );
+        assert_eq!(
+            protocol_url(
+                NativeProtocol::Responses,
+                ProviderType::OpenAI,
+                Some("https://gateway.example/v1/")
+            )
+            .as_deref(),
+            Some("https://gateway.example/v1/responses")
+        );
+        assert_eq!(
+            protocol_url(
+                NativeProtocol::AnthropicMessages,
+                ProviderType::Anthropic,
+                None
+            )
+            .as_deref(),
+            Some("https://api.anthropic.com/v1/messages")
+        );
+        assert!(protocol_url(NativeProtocol::Responses, ProviderType::Kimi, None).is_none());
+        assert!(!native_protocol_supported(
+            NativeProtocol::Responses,
+            ProviderType::OpenAI,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn native_body_rewrite_preserves_protocol_fields() {
+        let body = br#"{"model":"chain","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}],"stream":true,"thinking":{"type":"enabled","budget_tokens":1024},"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":"ok"}]}]}"#;
+        let rewritten = rewrite_model(body, "native-model").unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(value["model"], "native-model");
+        assert_eq!(value["previous_response_id"], "resp_1");
+        assert_eq!(value["input"][0]["type"], "function_call_output");
+        assert_eq!(value["thinking"]["type"], "enabled");
+        assert_eq!(value["messages"][0]["content"][0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn native_continuation_detection_covers_stateful_protocol_items() {
+        assert!(native_request_has_continuation(
+            NativeProtocol::Responses,
+            br#"{"model":"x","previous_response_id":"resp_1","input":[]}"#
+        ));
+        assert!(native_request_has_continuation(
+            NativeProtocol::Responses,
+            br#"{"model":"x","input":[{"type":"function_call_output","call_id":"c","output":"ok"}]}"#
+        ));
+        assert!(native_request_has_continuation(
+            NativeProtocol::AnthropicMessages,
+            br#"{"model":"x","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok"}]}]}"#
+        ));
+        assert!(!native_request_has_continuation(
+            NativeProtocol::Responses,
+            br#"{"model":"x","input":"hello"}"#
+        ));
+    }
+
+    #[test]
+    fn fragmented_native_sse_usage_is_buffered_and_protocol_aware() {
+        let mut buffer = Vec::new();
+        let mut input = 0;
+        let mut output = 0;
+        update_sse_usage(
+            &mut buffer,
+            b"event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tok",
+            &mut input,
+            &mut output,
+        );
+        assert_eq!((input, output), (0, 0));
+        update_sse_usage(
+            &mut buffer,
+            b"ens\":12,\"output_tokens\":4}}}\n\n",
+            &mut input,
+            &mut output,
+        );
+        assert_eq!((input, output), (12, 4));
+
+        update_sse_usage(
+            &mut buffer,
+            b"event: message_start\r\ndata: {\"message\":{\"usage\":{\"input_tokens\":20}}}\r\n\r\n",
+            &mut input,
+            &mut output,
+        );
+        update_sse_usage(
+            &mut buffer,
+            b"event: message_delta\ndata: {\"usage\":{\"output_tokens\":9}}\n\n",
+            &mut input,
+            &mut output,
+        );
+        assert_eq!((input, output), (20, 9));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn native_usage_accepts_responses_and_chat_field_names() {
+        assert_eq!(
+            native_response_usage(br#"{"usage":{"input_tokens":12,"output_tokens":3}}"#),
+            Some((12, 3))
+        );
+        assert_eq!(
+            native_response_usage(br#"{"usage":{"prompt_tokens":7,"completion_tokens":2}}"#),
+            Some((7, 2))
+        );
+        assert_eq!(native_response_usage(br#"{"usage":{}}"#), None);
+    }
+
+    #[test]
+    fn terminal_upstream_error_preserves_status_and_retry_after() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("17"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let response = preserved_upstream_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            bytes::Bytes::from_static(br#"{"error":"slow down"}"#),
+        );
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "17");
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
 
     #[test]
     fn cooldown_error_includes_retry_after_header() {
