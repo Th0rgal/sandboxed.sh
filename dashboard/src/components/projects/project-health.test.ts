@@ -43,6 +43,11 @@ describe("parseMode", () => {
     expect(mode).toEqual({ base: "blocked", cause: "scanner-dead" });
   });
 
+  test("renders a parked-decision mode as blocked:decision", () => {
+    const mode = parseMode(row({ mode: "blocked:decision" }));
+    expect(mode).toEqual({ base: "blocked", cause: "decision" });
+  });
+
   test("falls back to the delivery trailer when the roster has no mode", () => {
     const mode = parseMode(
       row({
