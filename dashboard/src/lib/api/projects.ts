@@ -163,6 +163,15 @@ export function getProject(slug: string): Promise<ProjectDetailPayload> {
   );
 }
 
+export function getProjectBySession(
+  sessionId: string,
+): Promise<{ slug: string; session_id: string }> {
+  return apiGet(
+    `/api/projects/by-session/${encodeURIComponent(sessionId)}`,
+    "Failed to resolve project for session",
+  );
+}
+
 export function getProjectUpdates(
   slug: string,
   limit = 50,

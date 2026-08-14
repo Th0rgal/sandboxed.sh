@@ -94,6 +94,28 @@ pub fn ancestry(db_path: &Path, session_id: &str) -> Vec<String> {
     chain
 }
 
+/// Which project owns `session_id`, walking the continuation chain both ways.
+///
+/// A binding names the session the operator declared. Hermes then forks
+/// children (`parent_session_id`). Looking up the tip must still find the
+/// project; looking up an ancestor must too.
+pub fn slug_for_bound_session(
+    session_id: &str,
+    bindings: &[(String, String)],
+    ancestry: &[String],
+    tip_of: impl Fn(&str) -> String,
+) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    for (slug, bound) in bindings {
+        if ancestry.iter().any(|id| id == bound) || tip_of(bound) == session_id {
+            return Some(slug.clone());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +199,33 @@ mod tests {
     fn a_blank_parent_is_no_parent() {
         let (_dir, path) = db(&[("root", Some("")), ("child", Some("root"))]);
         assert_eq!(ancestry(&path, "child"), vec!["child", "root"]);
+    }
+
+    #[test]
+    fn a_continuation_tip_resolves_to_the_bound_project() {
+        let (_dir, path) = db(&[
+            ("74bd9b", None),
+            ("202eac", Some("74bd9b")),
+            ("7fdc25", Some("202eac")),
+            ("2a62eb", Some("7fdc25")),
+        ]);
+        let bindings = vec![("verity-core".to_string(), "74bd9b".to_string())];
+        let chain = ancestry(&path, "2a62eb");
+        assert_eq!(
+            slug_for_bound_session("2a62eb", &bindings, &chain, |id| live_tip(&path, id)),
+            Some("verity-core".to_string())
+        );
+        assert_eq!(
+            slug_for_bound_session("74bd9b", &bindings, &ancestry(&path, "74bd9b"), |id| {
+                live_tip(&path, id)
+            }),
+            Some("verity-core".to_string())
+        );
+        assert_eq!(
+            slug_for_bound_session("ghost", &bindings, &ancestry(&path, "ghost"), |id| {
+                live_tip(&path, id)
+            }),
+            None
+        );
     }
 }

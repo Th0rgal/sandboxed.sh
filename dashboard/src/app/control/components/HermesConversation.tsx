@@ -30,6 +30,7 @@ import { EnhancedInput } from "@/components/enhanced-input";
 import { stateSignatureKeyFromMessages } from "@/lib/hermes-state-signature";
 import { cn } from "@/lib/utils";
 
+import { SessionProjectRail } from "./session-project-rail";
 import {
   ChatItemRow,
   deriveItemViews,
@@ -558,7 +559,8 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
   const noop = useCallback(() => {}, []);
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex h-full min-h-0">
+    <div className="flex min-w-0 flex-1 flex-col">
       {/* Header */}
       <div className="flex items-center gap-2 border-b border-white/5 px-4 py-2.5">
         <Sparkles className="h-4 w-4 shrink-0 text-indigo-400" />
@@ -669,6 +671,8 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
           />
         </div>
       </div>
+    </div>
+    <SessionProjectRail sessionId={sessionId} />
     </div>
   );
 }
