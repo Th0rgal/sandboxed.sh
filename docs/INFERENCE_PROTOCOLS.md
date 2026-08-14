@@ -68,10 +68,15 @@ Protocol support and health are distinct:
 A client should select a protocol in this order:
 
 1. Fetch capabilities for the exact requested model or chain.
-2. Prefer the native protocol from the policy table when its capability is true
-   and `currently_available` is true.
-3. For Kimi-style Chat extensions, preserve the advertised reasoning field in the
-   complete assistant message on every subsequent tool turn.
+2. For a stateful native session, require all three signals: the endpoint
+   capability, `currently_available`, and its protocol-specific continuity flag.
+   Responses requires `responses` plus `previous_response_id`; Anthropic Messages
+   requires `anthropic_messages` plus `thinking_blocks_replay`. If the endpoint is
+   available but its continuity flag is false, it may be used only as an
+   explicitly stateless cohort; do not start a session that expects continuation.
+3. For Kimi-style Chat extensions, require `reasoning_content_replay` and preserve
+   the advertised reasoning field in the complete assistant message on every
+   subsequent tool turn.
 4. Otherwise use Chat Completions.
 5. If the preferred route is temporarily unavailable, either wait according to
    `Retry-After` or start a separately labelled Chat fallback session. Never move
