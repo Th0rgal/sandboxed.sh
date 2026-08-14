@@ -59,8 +59,11 @@ Protocol support and health are distinct:
 - a configured capability remains visible while an account is temporarily in
   cooldown;
 - `currently_available` reports whether at least one matching account is healthy;
-- continuity flags are cleared unless the route guarantees singleton
-  provider/model/account affinity.
+- stateful continuity flags (`previous_response_id`, `thinking_blocks_replay`)
+  are cleared unless the route guarantees singleton provider/model/account
+  affinity. `reasoning_content_replay` is exempt: it is stateless — the client
+  replays the reasoning field inside each Chat request — so it needs no account
+  affinity and stays set whenever the route is otherwise usable.
 
 A client should select a protocol in this order:
 
