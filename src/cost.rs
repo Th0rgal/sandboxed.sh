@@ -299,6 +299,17 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         pricing: pricing(1_250, 2_500, None, Some(200)),
     },
     PricingEntry {
+        // Pay-as-you-go list for glm-5.3 is not on
+        // https://docs.z.ai/guides/overview/pricing yet. Coding Plan
+        // treats it as the successor of glm-5.2/5.1 and auto-routes those
+        // IDs to glm-5.3, so keep the published 5.2 rates ($1.4/$4.4 per
+        // Mtok, $0.26 cached) until Z.AI posts a distinct 5.3 row.
+        // `glm-5.3[1m]` is the 1M-context Coding Plan alias.
+        canonical: "glm-5.3",
+        aliases: &["glm-5.3", "glm-5-3", "glm-5.3[1m]"],
+        pricing: pricing(1_400, 4_400, None, Some(260)),
+    },
+    PricingEntry {
         // glm-5.2 list price not yet published separately; mirrors glm-5.1
         // ($1.4/$4.4 per Mtok, $0.26 cached) until Z.AI publishes it.
         canonical: "glm-5.2",
@@ -632,6 +643,8 @@ mod tests {
         assert_eq!(normalize_model("xai/grok-build-latest"), "grok-4.5");
         assert_eq!(normalize_model("grok-build"), "grok-build");
         assert_eq!(normalize_model("zai/glm-5"), "glm-5");
+        assert_eq!(normalize_model("zai/glm-5.3"), "glm-5.3");
+        assert_eq!(normalize_model("zai/glm-5.3[1m]"), "glm-5.3");
         assert_eq!(normalize_model("zai/glm-5.2"), "glm-5.2");
         assert_eq!(normalize_model("zai/glm-5.1"), "glm-5.1");
         assert_eq!(normalize_model("zai/glm-5-turbo"), "glm-5-turbo");
@@ -674,6 +687,8 @@ mod tests {
         assert!(pricing_for_model("xai/grok-4.5").is_some());
         assert!(pricing_for_model("grok-build").is_some());
         assert!(pricing_for_model("glm-5").is_some());
+        assert!(pricing_for_model("zai/glm-5.3").is_some());
+        assert!(pricing_for_model("zai/glm-5.3[1m]").is_some());
         assert!(pricing_for_model("zai/glm-5.2").is_some());
         assert!(pricing_for_model("glm-5.1").is_some());
         assert!(pricing_for_model("zai/glm-5-turbo").is_some());
@@ -705,9 +720,12 @@ mod tests {
         assert_eq!(grok_45.output_nano_per_token, 6_000);
         assert_eq!(grok_45.cache_read_nano_per_token, Some(500));
 
-        let glm = pricing_for_model("zai/glm-5.1").expect("glm-5.1 pricing");
+        let glm = pricing_for_model("zai/glm-5.3").expect("glm-5.3 pricing");
         assert_eq!(glm.input_nano_per_token, 1_400);
         assert_eq!(glm.output_nano_per_token, 4_400);
+        assert_eq!(glm.cache_read_nano_per_token, Some(260));
+        let glm_1m = pricing_for_model("zai/glm-5.3[1m]").expect("glm-5.3[1m] pricing");
+        assert_eq!(glm_1m.input_nano_per_token, glm.input_nano_per_token);
 
         let minimax = pricing_for_model("minimax/MiniMax-M3").expect("minimax pricing");
         assert_eq!(minimax.input_nano_per_token, 600);

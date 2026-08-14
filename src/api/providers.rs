@@ -1125,9 +1125,25 @@ fn default_providers_config() -> ProvidersConfig {
                     // Check Z.AI / GLM model IDs here:
                     // https://docs.z.ai/guides/llm/glm
                     ProviderModel {
+                        id: "glm-5.3".to_string(),
+                        name: "GLM-5.3".to_string(),
+                        description: Some(
+                            "Current flagship GLM reasoning and coding model".to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "glm-5.3[1m]".to_string(),
+                        name: "GLM-5.3 (1M context)".to_string(),
+                        description: Some(
+                            "GLM-5.3 with the Coding Plan 1M-token context window".to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "glm-5.2".to_string(),
                         name: "GLM-5.2".to_string(),
-                        description: Some("Most capable GLM reasoning model".to_string()),
+                        description: Some(
+                            "Previous flagship; Coding Plan routes this to GLM-5.3".to_string(),
+                        ),
                     },
                     ProviderModel {
                         id: "glm-5.1".to_string(),

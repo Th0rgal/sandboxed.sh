@@ -160,7 +160,7 @@ export interface CatalogModel {
   provider_id: string;
   provider_name: string;
   id: string;
-  /** The `provider/model` id to pass to the router (e.g. "zai/glm-5.2"). */
+  /** The `provider/model` id to pass to the router (e.g. "zai/glm-5.3"). */
   value: string;
   name: string;
   description?: string;
