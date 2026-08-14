@@ -175,10 +175,13 @@ any prompt rewrite — see `references/controller-setup-questions.md`.
 6. Patch paired trackers from the final snapshot. Deliver only verified IDs, immutable
    heads, receipts, or owner decisions; otherwise `[SILENT]`. Always append the trailer.
 
-Context budget: bounded reads only — `list_missions` with a filter and `limit <= 12`;
-prefer `get_mission_digest` over `get_mission` over `get_mission_events`; never call
-synchronous `ask_mission` or `execute_code` from cron; stop broadening past a 20 kB tool
-result. Full rules: `references/context-budget.md`.
+Context budget: bounded reads only — `get_project` is already a capped snapshot
+(`items_omitted` / `item_counts`); do not follow it with an unfiltered `list_missions`.
+`list_missions` only with a track filter and `limit <= 12`; prefer `get_mission_digest`
+over `get_mission` over `get_mission_events`; never call synchronous `ask_mission` or
+`execute_code` from cron; stop broadening past a 20 kB tool result. Acknowledge absorbed
+failed/interrupted attempts so they leave the snapshot. Full rules:
+`references/context-budget.md`.
 
 ## Topic router
 
