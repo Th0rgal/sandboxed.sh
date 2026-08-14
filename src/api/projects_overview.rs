@@ -373,6 +373,50 @@ fn store_err(error: String) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error)
 }
 
+/// `GET /api/projects/by-session/:session_id` — resolve a Hermes conversation
+/// (or any continuation in its chain) to the bound project slug.
+pub async fn project_by_session(
+    State(state): State<Arc<AppState>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_id = session_id.trim();
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "session_id must be 1-128 chars of [A-Za-z0-9._:-]".to_string(),
+        ));
+    }
+    let bindings = state.projects.bindings().map_err(store_err)?;
+    let pairs: Vec<(String, String)> = bindings
+        .iter()
+        .map(|(slug, conversation)| (slug.clone(), conversation.session_id.clone()))
+        .collect();
+    let chain = match hermes_state_db() {
+        Some(path) => super::session_chain::ancestry(&path, session_id),
+        None => vec![session_id.to_string()],
+    };
+    let slug = super::session_chain::slug_for_bound_session(session_id, &pairs, &chain, |bound| {
+        match hermes_state_db() {
+            Some(path) => super::session_chain::live_tip(&path, bound),
+            None => bound.to_string(),
+        }
+    });
+    let Some(slug) = slug else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no project bound to session '{session_id}'"),
+        ));
+    };
+    Ok(Json(
+        serde_json::json!({ "slug": slug, "session_id": session_id }),
+    ))
+}
+
 /// `GET /api/projects/:slug` — the structured project object: record, grant,
 /// tracks, and open decisions. This is what `get_project` (MCP) returns to a
 /// controller instead of it scanning markdown.
@@ -1314,6 +1358,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/overview", get(projects_overview))
         .route("/", axum::routing::put(upsert_project))
+        .route("/by-session/:session_id", get(project_by_session))
         .route("/:slug", get(get_project))
         .route("/:slug/state", get(project_state))
         .route("/:slug/tasks", get(project_tasks).post(plan_project_tasks))
