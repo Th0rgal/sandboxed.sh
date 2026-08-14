@@ -208,6 +208,7 @@ fn ingest_deliveries(
         // covers acting. Keyed by the delivery's timestamp (INSERT OR IGNORE),
         // so overlapping ingest windows record it once and never reopen an
         // answered row.
+        let mut recorded_decided = false;
         if let Some(trailer) = delivery.decision.as_ref() {
             let grant = projects.get_grant(slug).ok().flatten();
             let autonomy = grant.as_ref().and_then(|g| g.autonomy_level.clone());
@@ -220,6 +221,7 @@ fn ingest_deliveries(
                 trailer.kind.as_deref(),
             ) {
                 Ok(disposition) => {
+                    recorded_decided = disposition.status == "decided";
                     let decision = super::projects_store::NewDecision {
                         question: trailer.question.clone(),
                         rationale: trailer.rationale.clone(),
@@ -237,6 +239,21 @@ fn ingest_deliveries(
                 Err(error) => {
                     tracing::warn!("state ingest decision trailer rejected: {slug}: {error}");
                 }
+            }
+        }
+        // A merge announcement (headline or a grant-allowed decided act)
+        // retires older "merge #N?" questions so the card stops asking
+        // about a PR that already landed. The current delivery's own
+        // coerced trailer is skipped — it stays the escalation.
+        let needles = merge_announcement_needles(&delivery, recorded_decided);
+        if !needles.is_empty() {
+            if let Err(error) = projects.close_pending_decisions_referencing(
+                slug,
+                &needles,
+                "closed: referenced PR merged",
+                Some(delivery.at.as_str()),
+            ) {
+                tracing::warn!("state ingest close merged decisions: {slug}: {error}");
             }
         }
     }
@@ -848,6 +865,78 @@ pub(crate) fn extract_pr_url(text: &str) -> Option<String> {
                 _ => None,
             }
         })
+}
+
+/// `#N` hashes and GitHub PR URLs a later merge announcement can match
+/// against pending ledger rows. `#1` is kept distinct from `#10`.
+pub(crate) fn extract_pr_needles(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(url) = extract_pr_url(text) {
+        out.push(url.clone());
+        if let Some(number) = url.rsplit('/').next() {
+            let hash = format!("#{number}");
+            if !out.contains(&hash) {
+                out.push(hash);
+            }
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'#' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            let hash = format!("#{}", &text[start..end]);
+            if !out.contains(&hash) {
+                out.push(hash);
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn delivery_looks_merged(headline: &str) -> bool {
+    let lower = headline.to_ascii_lowercase();
+    lower.contains("merged") || lower.contains("mergé")
+}
+
+fn merge_announcement_needles(delivery: &DeliveryUpdate, recorded_decided: bool) -> Vec<String> {
+    if !recorded_decided && !delivery_looks_merged(&delivery.headline) {
+        return Vec::new();
+    }
+    let mut blobs: Vec<&str> = vec![delivery.headline.as_str()];
+    if let Some(body) = delivery.body.as_deref() {
+        blobs.push(body);
+    }
+    if let Some(decision) = delivery.decision.as_ref() {
+        blobs.push(decision.question.as_str());
+        if let Some(rationale) = decision.rationale.as_deref() {
+            blobs.push(rationale);
+        }
+        if let Some(url) = decision
+            .evidence
+            .as_ref()
+            .and_then(|value| value.get("pr_url"))
+            .and_then(|value| value.as_str())
+        {
+            blobs.push(url);
+        }
+    }
+    let mut needles = Vec::new();
+    for blob in blobs {
+        for needle in extract_pr_needles(blob) {
+            if !needles.contains(&needle) {
+                needles.push(needle);
+            }
+        }
+    }
+    needles
 }
 
 /// `GET /api/projects/:slug/tasks` — the project's roadmap: every board task
@@ -1819,6 +1908,29 @@ pub(crate) fn humanize_slug(slug: &str) -> String {
         .join(" ")
 }
 
+/// Roster/CTRL mode is the default; live work and parked decisions win.
+/// `paused` is never overridden — the operator (or controller) parked it.
+pub(crate) fn honest_controller_mode(
+    store_mode: Option<&str>,
+    has_live_mission: bool,
+    awaiting_user: bool,
+    pending_decisions: u32,
+) -> Option<String> {
+    let base = store_mode
+        .map(|mode| mode.split_once(':').map_or(mode, |(head, _)| head))
+        .unwrap_or("");
+    if base.eq_ignore_ascii_case("paused") {
+        return store_mode.map(str::to_string);
+    }
+    if has_live_mission && !awaiting_user {
+        return Some("active".to_string());
+    }
+    if pending_decisions > 0 {
+        return Some("blocked:decision".to_string());
+    }
+    store_mode.map(str::to_string)
+}
+
 struct ProjectRowBuilder {
     slug: String,
     /// Roster title/next-action, attached when the slug has a roster record.
@@ -1911,6 +2023,24 @@ impl ProjectRowBuilder {
             .iter()
             .filter(|chip| chip.status == MissionStatus::AwaitingUser)
             .count();
+        let has_live_mission = self
+            .missions
+            .iter()
+            .any(|chip| !chip.status.is_terminal() && chip.status != MissionStatus::Acknowledged);
+        // Live work and parked decisions beat the last CTRL trailer. A
+        // writer already running is `active` even if the last cron said
+        // `blocked:cannot-merge`; a pending question with no writer is
+        // `blocked:decision`. Operator `paused` is never overridden.
+        self.mode = honest_controller_mode(
+            self.mode.as_deref().or_else(|| {
+                self.latest_update
+                    .as_ref()
+                    .and_then(|update| update.mode.as_deref())
+            }),
+            has_live_mission,
+            awaiting_user > 0,
+            self.pending_decisions,
+        );
         if awaiting_user > 0 {
             attention.push(match awaiting_user {
                 1 => "1 mission awaiting user input".to_string(),
@@ -2002,10 +2132,6 @@ impl ProjectRowBuilder {
             .and_then(|t| t.status_line.as_deref())
             .map(|line| line.to_lowercase().contains("paused"))
             .unwrap_or(false);
-        let has_live_mission = self
-            .missions
-            .iter()
-            .any(|chip| !chip.status.is_terminal() && chip.status != MissionStatus::Acknowledged);
         if tracker_active && !has_live_mission {
             let last_signal = self
                 .latest_update
@@ -3168,6 +3294,101 @@ mod tests {
         assert_eq!(extract_pr_url("https://github.com/x/y"), None);
         assert_eq!(extract_pr_url("https://github.com/x/y/issues/12"), None);
         assert_eq!(extract_pr_url("no links here"), None);
+    }
+
+    #[test]
+    fn pr_needles_include_hashes_and_urls_without_prefix_collisions() {
+        let needles = extract_pr_needles(
+            "Certify #2240 merged via https://github.com/lfglabs-dev/verity/pull/2240",
+        );
+        assert!(needles.contains(&"https://github.com/lfglabs-dev/verity/pull/2240".to_string()));
+        assert!(needles.contains(&"#2240".to_string()));
+        assert!(!needles.iter().any(|n| n == "#224" || n == "#2"));
+    }
+
+    #[test]
+    fn a_merge_headline_closes_older_pending_questions_for_that_pr() {
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+        store
+            .record_decision(
+                "lido",
+                &super::super::projects_store::NewDecision {
+                    question: "merge #66?".to_string(),
+                    rationale: Some("blocks A.2".to_string()),
+                    kind: Some("merge".to_string()),
+                    authority: "escalation".to_string(),
+                    status: "pending_user".to_string(),
+                    evidence: None,
+                },
+            )
+            .expect("pending");
+        let aliases = HashMap::new();
+        let overrides = HashMap::new();
+        let delivery = parse_delivery(
+            "s",
+            1_754_000_500.0,
+            "[Cron delivery: lido]\n#66 MERGED\n[STATE_SIGNATURE: lido|done|02a0da1]\n",
+        );
+        ingest_deliveries(&store, &aliases, &overrides, vec![delivery]);
+        assert!(
+            store.open_decisions("lido").expect("open").is_empty(),
+            "the merge headline must retire the older merge #66? question"
+        );
+    }
+
+    #[test]
+    fn a_coerced_merge_trailer_does_not_close_itself() {
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity", None, None, None, None)
+            .expect("seed");
+        let content = "[Cron delivery: verity]\nHeadline\n\
+            [DECISION: {\"kind\":\"merge\",\"authority\":\"granted\",\"status\":\"decided\",\"question\":\"Merged #2333\"}]\n\
+            [STATE_SIGNATURE: verity|phase|head]\n";
+        let delivery = parse_delivery("s1", 1_754_000_000.0, content);
+        ingest_deliveries(&store, &HashMap::new(), &HashMap::new(), vec![delivery]);
+        let open = store.open_decisions("verity").expect("open");
+        assert_eq!(open.len(), 1, "coerced merge stays pending");
+        assert_eq!(open[0].question, "Merged #2333");
+    }
+
+    #[test]
+    fn honest_mode_prefers_live_work_and_parked_decisions_over_cron_prose() {
+        assert_eq!(
+            honest_controller_mode(Some("blocked:cannot-merge"), true, false, 1).as_deref(),
+            Some("active")
+        );
+        assert_eq!(
+            honest_controller_mode(Some("active"), false, false, 2).as_deref(),
+            Some("blocked:decision")
+        );
+        assert_eq!(
+            honest_controller_mode(Some("paused:owner"), true, false, 1).as_deref(),
+            Some("paused:owner")
+        );
+        assert_eq!(
+            honest_controller_mode(Some("blocked:transport-cap"), false, false, 0).as_deref(),
+            Some("blocked:transport-cap")
+        );
+    }
+
+    #[test]
+    fn a_live_writer_makes_the_card_mode_active_despite_a_blocked_ctrl() {
+        let mut builder = ProjectRowBuilder::new("verity".into());
+        builder.mode = Some("blocked:cannot-merge".into());
+        builder.pending_decisions = 1;
+        builder.missions.push(MissionChip {
+            id: "abcd1234".into(),
+            status: MissionStatus::Active,
+            title: Some("rebase #2332".into()),
+            updated_at: "2026-08-14T06:00:00Z".into(),
+            github_pr: None,
+        });
+        let row = builder.finish(&[], None, None, "2026-08-14T06:05:00Z");
+        assert_eq!(row.mode.as_deref(), Some("active"));
     }
 
     // ---- decision disposition (the autonomy enforcement point) ----

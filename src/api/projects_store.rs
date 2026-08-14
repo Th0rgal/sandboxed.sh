@@ -1301,6 +1301,37 @@ impl ProjectsStore {
         Ok(changed > 0)
     }
 
+    /// Close pending escalations that mention any of `needles` (a `#N` hash
+    /// or a full GitHub PR URL). Used when a later delivery reports that PR
+    /// as merged, so the board stops asking about a decision that is already
+    /// done. `except_at` skips the delivery that just recorded itself — a
+    /// coerced "Merged #N" trailer must stay pending, not close itself.
+    pub fn close_pending_decisions_referencing(
+        &self,
+        slug: &str,
+        needles: &[String],
+        answer: &str,
+        except_at: Option<&str>,
+    ) -> Result<u32, String> {
+        if needles.is_empty() {
+            return Ok(0);
+        }
+        let open = self.open_decisions(slug)?;
+        let mut closed = 0u32;
+        for decision in open {
+            if except_at.is_some_and(|at| at == decision.at) {
+                continue;
+            }
+            if !decision_mentions_any(&decision, needles) {
+                continue;
+            }
+            if self.answer_decision(slug, &decision.at, answer)? {
+                closed += 1;
+            }
+        }
+        Ok(closed)
+    }
+
     pub fn open_decisions(&self, slug: &str) -> Result<Vec<ProjectDecision>, String> {
         self.decisions_where(slug, "status = 'pending_user'", "ORDER BY at", None)
     }
@@ -1514,6 +1545,45 @@ pub struct ProjectTrack {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     pub updated_at: String,
+}
+
+/// True when `needle` appears in `hay` without being a prefix of a longer
+/// number (`#1` must not match `#10`).
+fn text_mentions_needle(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    if needle.starts_with('#') {
+        let mut start = 0;
+        while let Some(rel) = hay[start..].find(needle) {
+            let abs = start + rel;
+            let after = &hay[abs + needle.len()..];
+            if after
+                .chars()
+                .next()
+                .map(|c| !c.is_ascii_digit())
+                .unwrap_or(true)
+            {
+                return true;
+            }
+            start = abs + 1;
+        }
+        return false;
+    }
+    hay.contains(needle)
+}
+
+fn decision_mentions_any(decision: &ProjectDecision, needles: &[String]) -> bool {
+    let evidence = decision
+        .evidence
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let rationale = decision.rationale.as_deref().unwrap_or("");
+    let hay = format!("{} {} {}", decision.question, rationale, evidence);
+    needles
+        .iter()
+        .any(|needle| text_mentions_needle(&hay, needle))
 }
 
 /// One ledger entry: an owner escalation or a declared autonomous act.
@@ -2254,6 +2324,80 @@ mod tests {
         assert_eq!(
             store.pending_decision_counts().expect("counts")["verity"],
             1
+        );
+    }
+
+    #[test]
+    fn a_merged_pr_closes_only_the_pending_decisions_that_name_it() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .record_decision("lido", &escalation("merge #66?", Some("blocks A.2")))
+            .expect("66");
+        store
+            .record_decision("lido", &escalation("merge #70?", None))
+            .expect("70");
+        let same_delivery = store
+            .record_decision(
+                "lido",
+                &escalation("Merged #66", Some("just recorded this tick")),
+            )
+            .expect("same-tick");
+
+        let closed = store
+            .close_pending_decisions_referencing(
+                "lido",
+                &["#66".to_string()],
+                "closed: referenced PR merged",
+                Some(same_delivery.as_str()),
+            )
+            .expect("close");
+        assert_eq!(closed, 1, "only the older #66 question closes");
+
+        let open = store.open_decisions("lido").expect("open");
+        let questions: Vec<&str> = open.iter().map(|d| d.question.as_str()).collect();
+        assert!(questions.contains(&"merge #70?"));
+        assert!(questions.contains(&"Merged #66"));
+        assert!(!questions.iter().any(|q| q.contains("#66?")));
+
+        // `#6` is not `#66`.
+        assert_eq!(
+            store
+                .close_pending_decisions_referencing(
+                    "lido",
+                    &["#6".to_string()],
+                    "should not match",
+                    None,
+                )
+                .expect("narrow"),
+            0
+        );
+
+        // A URL needle matches evidence.pr_url.
+        let mut with_url = escalation("ship the cert?", None);
+        with_url.evidence = Some(serde_json::json!({
+            "pr_url": "https://github.com/lfglabs-dev/verity/pull/70"
+        }));
+        store.record_decision("lido", &with_url).expect("url");
+        assert_eq!(
+            store
+                .close_pending_decisions_referencing(
+                    "lido",
+                    &["https://github.com/lfglabs-dev/verity/pull/70".to_string()],
+                    "closed: referenced PR merged",
+                    None,
+                )
+                .expect("url close"),
+            1
+        );
+        let left: Vec<String> = store
+            .open_decisions("lido")
+            .expect("left")
+            .into_iter()
+            .map(|d| d.question)
+            .collect();
+        assert_eq!(
+            left,
+            vec!["merge #70?".to_string(), "Merged #66".to_string()]
         );
     }
 
