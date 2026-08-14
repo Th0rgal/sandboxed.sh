@@ -47,12 +47,41 @@ if [ -n "$log" ]; then
   age=$((now - mt))
 fi
 
+reason=ok
 # A fresh log is liveness even if pgrep missed the binary name.
 if [ "$status" = DEAD ] && [ "$age" -lt 120 ]; then
   status=LIVE
   reason=log_heartbeat
-else
-  reason=ok
+fi
+
+# Restart here — do not wait for an LLM to SSH. Hermes ticks died for hours
+# because the model "successfully" ran a non-detached restart (2026-08-14).
+if [ "$status" = DEAD ]; then
+  python3 - <<'PY'
+import os, subprocess
+os.chdir("/tmp/coldcard")
+if os.path.isfile("./coldcard_skip"):
+    subprocess.Popen(
+        ["./coldcard_skip", "0", "4294967295", "65536", "3103", "3161"],
+        stdout=open("coldcard_skip.log", "a"),
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+PY
+  sleep 2
+  if pgrep -x coldcard_skip >/dev/null 2>&1 \
+    || pgrep -f '/tmp/coldcard/coldcard_skip( |$)' >/dev/null 2>&1; then
+    status=LIVE
+    reason=auto_restarted
+    if [ -f /tmp/coldcard/coldcard_skip.log ]; then
+      last=$(tail -1 /tmp/coldcard/coldcard_skip.log 2>/dev/null)
+      log=/tmp/coldcard/coldcard_skip.log
+      age=0
+    fi
+  else
+    reason=restart_failed
+  fi
 fi
 
 hits=""

@@ -55,7 +55,10 @@ review-first), the budget, and any `pause_reason`/`resume_condition`. These are 
 durable, authoritative values — they outlive a prompt rewrite. When they and the prompt
 disagree, the grant wins. If the grant is empty, the setup questions have not been
 answered: ask them once (see `references/controller-setup-questions.md`) and operate
-under this skill's defaults meanwhile.
+under this skill's defaults meanwhile. **`merge_authority=full` is permission to
+merge.** Do not open a `[DECISION:]` asking Thomas to bless a green in-scope merge;
+record the merge as a granted act and do it. `review-first` is the only merge
+posture that must escalate.
 
 Precedence, highest wins:
 
