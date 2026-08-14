@@ -471,15 +471,21 @@ fn protocol_capabilities(
             thinking_blocks_replay: anthropic_messages,
             native_function_tools: anthropic_messages,
         },
-        ProviderType::Kimi => ProtocolCapabilities {
-            chat_completions: has_routable_proxy_credentials(provider_type, has_api_key, has_oauth),
-            responses,
-            anthropic_messages,
-            previous_response_id: false,
-            reasoning_content_replay: true,
-            thinking_blocks_replay: false,
-            native_function_tools: true,
-        },
+        ProviderType::Kimi => {
+            let chat_completions =
+                has_routable_proxy_credentials(provider_type, has_api_key, has_oauth);
+            ProtocolCapabilities {
+                chat_completions,
+                responses,
+                anthropic_messages,
+                previous_response_id: false,
+                // Stateless replay carried in each Chat request, so it needs no
+                // account affinity — but it is only meaningful on a routable route.
+                reasoning_content_replay: chat_completions,
+                thinking_blocks_replay: false,
+                native_function_tools: chat_completions,
+            }
+        }
         _ => ProtocolCapabilities {
             chat_completions: has_routable_proxy_credentials(provider_type, has_api_key, has_oauth),
             responses,
