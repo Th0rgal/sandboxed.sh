@@ -1580,7 +1580,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_project".to_string(),
-                description: "Get one project's structured state. `items` are the durable work (track / task_key) with only live or unabsorbed attempts attached — do not treat the mission list as the inventory. Also includes record (objective, status, mode, blocker), autonomy grant, tracks, open decisions, and the bound control conversation. Prefer this over list_missions and over markdown trackers.".to_string(),
+                description: "Get one project's compact snapshot: slug, mode, next_action, blocker, grant, open decisions, bound conversation, and the highest-priority items (live / awaiting / recent unabsorbed attempts). `items` are the durable work — do not treat the mission list as the inventory. The snapshot is capped (see items_omitted / item_counts); call list_missions with a track filter for one item. Prefer this over an unfiltered list_missions and over markdown trackers.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["slug"],
@@ -2701,7 +2701,8 @@ impl AssistantMcp {
     async fn get_project(&self, params: ProjectSlugParams) -> Result<Value, String> {
         let slug = params.slug.trim();
         let response = self.api_get(&format!("/api/projects/{slug}")).await?;
-        Self::response_value(response, "get project").await
+        let raw = Self::response_value(response, "get project").await?;
+        Ok(compact_project(raw))
     }
 
     async fn update_project_status(
@@ -3710,6 +3711,193 @@ fn compact_mission_summary(mission: Value) -> Value {
         "awaiting_kind": mission.get("awaiting_kind").cloned().unwrap_or(Value::Null),
         "last_activity_at": mission.get("last_activity_at").cloned().unwrap_or(Value::Null),
         "last_status_change_at": mission.get("last_status_change_at").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// Verity's HTTP `get_project` is ~120 unabsorbed tracks / ~64KB. Dumping that
+/// on every controller tick is what exhausted the bound Hermes session
+/// (159,959 tokens, "Cannot compress further"). The dashboard still reads the
+/// full HTTP payload; MCP gets a ranked, capped snapshot.
+const MCP_PROJECT_ITEM_CAP: usize = 20;
+const MCP_PROJECT_ATTEMPT_CAP: usize = 2;
+const MCP_PROJECT_DECISION_CAP: usize = 8;
+const MCP_PROJECT_TEXT_CAP: usize = 200;
+
+fn attempt_priority(status: &str) -> u8 {
+    match status {
+        "active" | "starting" | "queued" | "running" => 0,
+        "awaiting_user" => 1,
+        "paused" => 2,
+        "failed" | "interrupted" => 3,
+        _ => 4,
+    }
+}
+
+fn item_status_bucket(item: &Value) -> &'static str {
+    let Some(attempts) = item.get("attempts").and_then(Value::as_array) else {
+        return "other";
+    };
+    let best = attempts
+        .iter()
+        .map(|row| row.get("status").and_then(Value::as_str).unwrap_or(""))
+        .min_by_key(|status| attempt_priority(status))
+        .unwrap_or("");
+    match best {
+        "active" | "starting" | "queued" | "running" => "active",
+        "awaiting_user" => "awaiting_user",
+        "paused" => "paused",
+        "failed" => "failed",
+        "interrupted" => "interrupted",
+        _ => "other",
+    }
+}
+
+fn item_sort_key(item: &Value) -> (u8, std::cmp::Reverse<String>) {
+    let attempts = item.get("attempts").and_then(Value::as_array);
+    let best = attempts
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    attempt_priority(row.get("status").and_then(Value::as_str).unwrap_or(""))
+                })
+                .min()
+                .unwrap_or(5)
+        })
+        .unwrap_or(5);
+    let latest = attempts
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("updated_at"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    (best, std::cmp::Reverse(latest))
+}
+
+fn compact_opt_text(value: Option<&Value>, max: usize) -> Value {
+    match value.and_then(Value::as_str) {
+        Some(text) => Value::String(truncate_snippet(text, max)),
+        None => Value::Null,
+    }
+}
+
+fn compact_attempt(attempt: &Value) -> Value {
+    json!({
+        "id": attempt.get("id").cloned().unwrap_or(Value::Null),
+        "status": attempt.get("status").cloned().unwrap_or(Value::Null),
+        "title": compact_opt_text(attempt.get("title"), 80),
+        "updated_at": attempt.get("updated_at").cloned().unwrap_or(Value::Null),
+        "role": attempt.get("role").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn compact_item(item: &Value) -> Value {
+    let attempts = item
+        .get("attempts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let kept: Vec<Value> = attempts
+        .iter()
+        .take(MCP_PROJECT_ATTEMPT_CAP)
+        .map(compact_attempt)
+        .collect();
+    let omitted = attempts.len().saturating_sub(kept.len());
+    let mut out = json!({
+        "key": item.get("key").cloned().unwrap_or(Value::Null),
+        "kind": item.get("kind").cloned().unwrap_or(Value::Null),
+        "open": item.get("open").cloned().unwrap_or(Value::Null),
+        "status": compact_opt_text(item.get("status"), MCP_PROJECT_TEXT_CAP),
+        "desired_state": compact_opt_text(item.get("desired_state"), MCP_PROJECT_TEXT_CAP),
+        "attempts": kept,
+    });
+    if omitted > 0 {
+        out["attempts_omitted"] = json!(omitted);
+    }
+    out
+}
+
+fn compact_grant(grant: &Value) -> Value {
+    if grant.is_null() {
+        return Value::Null;
+    }
+    json!({
+        "autonomy_level": grant.get("autonomy_level").cloned().unwrap_or(Value::Null),
+        "merge_authority": grant.get("merge_authority").cloned().unwrap_or(Value::Null),
+        "budget_per_tick": grant.get("budget_per_tick").cloned().unwrap_or(Value::Null),
+        "parallel_missions": grant.get("parallel_missions").cloned().unwrap_or(Value::Null),
+        "pause_reason": compact_opt_text(grant.get("pause_reason"), MCP_PROJECT_TEXT_CAP),
+        "resume_condition": compact_opt_text(grant.get("resume_condition"), MCP_PROJECT_TEXT_CAP),
+    })
+}
+
+fn compact_decision(decision: &Value) -> Value {
+    json!({
+        "at": decision.get("at").cloned().unwrap_or(Value::Null),
+        "question": compact_opt_text(decision.get("question"), MCP_PROJECT_TEXT_CAP),
+        "status": decision.get("status").cloned().unwrap_or(Value::Null),
+        "authority": decision.get("authority").cloned().unwrap_or(Value::Null),
+        "kind": decision.get("kind").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn compact_project(raw: Value) -> Value {
+    let project = raw.get("project").cloned().unwrap_or(json!({}));
+    let mut items = raw
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut counts = serde_json::Map::new();
+    for item in &items {
+        let bucket = item_status_bucket(item).to_string();
+        let next = counts.get(&bucket).and_then(Value::as_u64).unwrap_or(0) + 1;
+        counts.insert(bucket, json!(next));
+    }
+    items.sort_by_key(item_sort_key);
+    let items_total = items.len();
+    let kept_items: Vec<Value> = items
+        .iter()
+        .take(MCP_PROJECT_ITEM_CAP)
+        .map(compact_item)
+        .collect();
+
+    let decisions = raw
+        .get("open_decisions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let decisions_total = decisions.len();
+    let kept_decisions: Vec<Value> = decisions
+        .iter()
+        .take(MCP_PROJECT_DECISION_CAP)
+        .map(compact_decision)
+        .collect();
+
+    let conversation = raw.get("conversation").map(|conversation| {
+        json!({
+            "session_id": conversation.get("session_id").cloned().unwrap_or(Value::Null),
+            "source": conversation.get("source").cloned().unwrap_or(Value::Null),
+        })
+    });
+
+    json!({
+        "slug": project.get("slug").cloned().unwrap_or(Value::Null),
+        "title": project.get("title").cloned().unwrap_or(Value::Null),
+        "objective": compact_opt_text(project.get("objective"), 400),
+        "status": project.get("status").cloned().unwrap_or(Value::Null),
+        "mode": project.get("mode").cloned().unwrap_or(Value::Null),
+        "wait_ticks": project.get("wait_ticks").cloned().unwrap_or(Value::Null),
+        "next_action": compact_opt_text(project.get("next_action"), MCP_PROJECT_TEXT_CAP),
+        "blocker": compact_opt_text(project.get("blocker"), MCP_PROJECT_TEXT_CAP),
+        "repository": project.get("repository").cloned().unwrap_or(Value::Null),
+        "grant": compact_grant(raw.get("grant").unwrap_or(&Value::Null)),
+        "items": kept_items,
+        "items_total": items_total,
+        "items_omitted": items_total.saturating_sub(kept_items.len()),
+        "item_counts": counts,
+        "open_decisions": kept_decisions,
+        "open_decisions_omitted": decisions_total.saturating_sub(kept_decisions.len()),
+        "conversation": conversation,
     })
 }
 
@@ -4971,6 +5159,135 @@ mod tests {
         assert!(compact["nodes"][0].get("base_url").is_none());
         assert_eq!(compact["nodes"][2]["error"], "probe degraded");
         assert_eq!(compact["recent_jobs"][0]["node_id"], "cpu");
+    }
+
+    #[test]
+    fn compact_project_ranks_live_items_and_caps_the_dump() {
+        let mut items = Vec::new();
+        for i in 0..30 {
+            items.push(json!({
+                "key": format!("old-{i}"),
+                "kind": "track",
+                "open": true,
+                "status": "failed",
+                "desired_state": "x".repeat(400),
+                "attempts": [{
+                    "id": format!("fail-{i}"),
+                    "status": "failed",
+                    "title": "old failure",
+                    "updated_at": format!("2026-08-01T00:{i:02}:00Z"),
+                    "role": "pr-writer",
+                    "prompt": "secret"
+                }]
+            }));
+        }
+        items.push(json!({
+            "key": "live-writer",
+            "kind": "track",
+            "open": true,
+            "status": "working",
+            "attempts": [
+                {
+                    "id": "live-1",
+                    "status": "active",
+                    "title": "Grok #2332",
+                    "updated_at": "2026-08-14T20:00:00Z",
+                    "role": "pr-writer"
+                },
+                {
+                    "id": "live-old",
+                    "status": "interrupted",
+                    "title": "previous",
+                    "updated_at": "2026-08-14T18:00:00Z"
+                },
+                {
+                    "id": "live-older",
+                    "status": "failed",
+                    "title": "older",
+                    "updated_at": "2026-08-14T16:00:00Z"
+                }
+            ]
+        }));
+        items.push(json!({
+            "key": "needs-owner",
+            "kind": "track",
+            "open": true,
+            "attempts": [{
+                "id": "ask-1",
+                "status": "awaiting_user",
+                "title": "question",
+                "updated_at": "2026-08-14T19:00:00Z"
+            }]
+        }));
+
+        let compact = compact_project(json!({
+            "project": {
+                "slug": "verity",
+                "title": "Verity",
+                "objective": "prove the world",
+                "status": "active",
+                "mode": "active",
+                "wait_ticks": 2,
+                "next_action": "rebase/repair #2332 onto main after #2333",
+                "blocker": "source #2332 dirty",
+                "repository": "lfglabs-dev/verity",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-08-14T20:00:00Z"
+            },
+            "grant": {
+                "autonomy_level": "act_full",
+                "merge_authority": "full",
+                "budget_per_tick": "generous",
+                "material_bar": "omit me",
+                "answered_at": "2026-08-01T00:00:00Z"
+            },
+            "tracks": [{"track": "noise", "status": "done", "updated_at": "2026-01-01T00:00:00Z"}],
+            "items": items,
+            "open_decisions": [{
+                "at": "2026-08-14T12:00:00Z",
+                "question": "merge #69?",
+                "status": "pending_user",
+                "authority": "escalation",
+                "rationale": "long rationale that controllers do not need here"
+            }],
+            "recent_decisions": [{"at": "2026-07-01T00:00:00Z", "question": "old"}],
+            "conversation": {
+                "session_id": "20260813_213628_202eac",
+                "source": "binding",
+                "bound_at": "2026-08-13T20:57:04Z"
+            }
+        }));
+
+        assert_eq!(compact["slug"], "verity");
+        assert_eq!(compact["mode"], "active");
+        assert_eq!(
+            compact["next_action"],
+            "rebase/repair #2332 onto main after #2333"
+        );
+        assert_eq!(compact["items_total"], 32);
+        assert_eq!(compact["items_omitted"], 12);
+        assert_eq!(compact["items"].as_array().unwrap().len(), 20);
+        assert_eq!(compact["items"][0]["key"], "live-writer");
+        assert_eq!(compact["items"][1]["key"], "needs-owner");
+        assert_eq!(compact["items"][0]["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(compact["items"][0]["attempts_omitted"], 1);
+        assert_eq!(compact["item_counts"]["active"], 1);
+        assert_eq!(compact["item_counts"]["awaiting_user"], 1);
+        assert_eq!(compact["item_counts"]["failed"], 30);
+        assert_eq!(compact["grant"]["autonomy_level"], "act_full");
+        assert!(compact["grant"].get("material_bar").is_none());
+        assert!(compact.get("tracks").is_none());
+        assert!(compact.get("recent_decisions").is_none());
+        assert!(compact["open_decisions"][0].get("rationale").is_none());
+        assert_eq!(
+            compact["conversation"]["session_id"],
+            "20260813_213628_202eac"
+        );
+        assert!(compact["conversation"].get("bound_at").is_none());
+        assert!(compact["items"][0]["attempts"][0].get("prompt").is_none());
+        let desired = compact["items"][2]["desired_state"].as_str().unwrap();
+        assert!(desired.chars().count() <= 201, "{desired}");
+        assert!(desired.ends_with('…'));
     }
 
     #[test]
