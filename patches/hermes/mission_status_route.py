@@ -134,10 +134,25 @@ def resolve_project_session_id(project: str, session_db: Any = None) -> Optional
         return None
 
 
+def extract_wake_session(payload: dict) -> str:
+    return str(payload.get("wake_session") or "").strip()
+
+
 def resolve_mission_delivery_session(payload: dict, session_db: Any) -> Optional[str]:
     """Pick the dedicated conversation for this mission-status event."""
     if not is_routable_mission_status(payload):
         return None
+    # Producer-resolved tip (project binding, else origin). Use the id as-is
+    # when the row exists: walking resume children is how a project click
+    # used to land on a live review thread instead of the bound session.
+    hinted = extract_wake_session(payload)
+    if hinted:
+        row = session_db.get_session(hinted)
+        if row:
+            return hinted
+        live = resolve_live_session_id(hinted, session_db)
+        if live:
+            return live
     origin = extract_origin_session(payload)
     if origin:
         live = resolve_live_session_id(origin, session_db)

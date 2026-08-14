@@ -1394,7 +1394,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "list_missions".to_string(),
-                description: "List recent missions, optionally filtered by status, project, or tag.".to_string(),
+                description: "List missions on the attention horizon: live, waiting, blocked, and unabsorbed failed/interrupted attempts. Acknowledged, completed, and replaced attempts are omitted unless you pass an explicit status. Filter by project or track to see attempts on one item. Prefer get_project for the item-first inventory.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -1474,7 +1474,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "start_mission".to_string(),
-                description: "Create a new sandboxed.sh mission and send its initial prompt. Set backend explicitly when possible. For Codex GPT-5.6/5.5/5.4, set fast_mode=true to request the native fast service tier; this consumes ChatGPT credits faster. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Reviewers and certifiers must use writer=false: the server tags them pr-readonly and blocks git/gh mutations. Any PR-changing mission must use writer=true; the API rejects concurrent writers for the same PR.".to_string(),
+                description: "Start a new attempt on a work item. Pass project+track (the durable item); a new start on the same project/track/writer role absorbs the previous attempt so you do not have to acknowledge it. Missions are attempts, not the work itself — use get_project to read open items. Set backend explicitly when possible. For Codex GPT-5.6/5.5/5.4, set fast_mode=true to request the native fast service tier; this consumes ChatGPT credits faster. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Reviewers and certifiers must use writer=false: the server tags them pr-readonly and blocks git/gh mutations. Any PR-changing mission must use writer=true; the API rejects concurrent writers for the same PR.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -1580,7 +1580,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_project".to_string(),
-                description: "Get one project's structured state: record (objective, status, mode, blocker), autonomy grant, tracks, open decisions for the owner, and the bound control conversation. This is the source of truth for your project — prefer it over reading markdown trackers.".to_string(),
+                description: "Get one project's structured state. `items` are the durable work (track / task_key) with only live or unabsorbed attempts attached — do not treat the mission list as the inventory. Also includes record (objective, status, mode, blocker), autonomy grant, tracks, open decisions, and the bound control conversation. Prefer this over list_missions and over markdown trackers.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["slug"],

@@ -43,6 +43,10 @@ pub struct MissionScheduling {
     pub deadline: Option<String>,
 }
 
+/// Tag written on an attempt that a later start on the same item replaced.
+/// Default listings hide these without requiring a separate acknowledge.
+pub const SUPERSEDED_TAG: &str = "superseded";
+
 /// Which missions a listing wants. One value, one predicate — so the SQL
 /// pushdown and the in-memory scan can never disagree about what a filter
 /// means.
@@ -52,6 +56,10 @@ pub struct MissionScheduling {
 /// instead, which matches a project family (`verity` covers `verity-core`,
 /// `verity-phase1d`, …) while a project is being migrated onto the
 /// `project` + `track` convention.
+///
+/// `attention_only` is the default MCP/API horizon: hide `acknowledged`,
+/// `completed`, and absorbed/replaced attempts. Supervision and reconcile
+/// keep the empty filter (this flag off) so they still see the full fleet.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MissionFilter {
     pub status: Option<String>,
@@ -62,6 +70,22 @@ pub struct MissionFilter {
     pub tag: Option<String>,
     /// The conversation a mission was launched from (Hermes session id).
     pub origin_session_id: Option<String>,
+    /// When true, keep only live / waiting / blocked / unabsorbed-failed
+    /// attempts. Default listings set this; internal scanners do not.
+    pub attention_only: bool,
+}
+
+/// Live / waiting / blocked, plus unabsorbed `failed` / `interrupted`.
+/// Acknowledged, completed, and absorbed/replaced attempts drop out.
+pub fn default_attention_keeps(mission: &Mission) -> bool {
+    if mission.project.tags.iter().any(|tag| tag == SUPERSEDED_TAG) {
+        return false;
+    }
+    !matches!(
+        mission.status,
+        crate::api::control::events::MissionStatus::Acknowledged
+            | crate::api::control::events::MissionStatus::Completed
+    )
 }
 
 impl MissionFilter {
@@ -80,6 +104,9 @@ impl MissionFilter {
     }
 
     pub fn matches(&self, mission: &Mission) -> bool {
+        if self.attention_only && !default_attention_keeps(mission) {
+            return false;
+        }
         self.status
             .as_deref()
             .is_none_or(|s| mission.status.to_string() == s)
