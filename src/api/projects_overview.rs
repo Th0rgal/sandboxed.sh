@@ -350,11 +350,17 @@ pub async fn get_project(
         .projects
         .list_open_proposals(&slug)
         .map_err(store_err)?;
-    let missions = state
+    let missions = match state
         .control
         .collect_attention_missions_for_project(&slug)
         .await
-        .unwrap_or_default();
+    {
+        Ok(missions) => missions,
+        Err(error) => {
+            tracing::warn!(project = %slug, %error, "get_project: attention collect failed");
+            Vec::new()
+        }
+    };
     let items = super::mission_horizon::project_items(&tracks, &proposals, &missions);
     Ok(Json(serde_json::json!({
         "project": project,
@@ -2441,6 +2447,45 @@ pub fn canonicalize_project_slug_with(aliases: &HashMap<String, String>, slug: &
     resolve_alias(aliases, trimmed)
 }
 
+/// Mission `project` tags that belong on this project's item view.
+///
+/// Creates persist the canonical slug, but historical rows and some
+/// controllers still stamp an alias (`coldcard`, `ec-defensive-research`).
+/// The item inventory has to gather every tag that folds onto the same
+/// canonical, otherwise `get_project("coldcard")` looks empty while
+/// `coldcard-rng-cracker` / `ec-defensive-research` hold the attempts.
+pub fn project_tag_keys(slug: &str) -> Vec<String> {
+    project_tag_keys_with(
+        &hermes_projects_dir()
+            .map(|dir| read_alias_map(&dir))
+            .unwrap_or_default(),
+        slug,
+    )
+}
+
+pub fn project_tag_keys_with(aliases: &HashMap<String, String>, slug: &str) -> Vec<String> {
+    let trimmed = slug.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let canonical = canonicalize_project_slug_with(aliases, trimmed);
+    let mut keys = vec![canonical.clone()];
+    if trimmed != canonical && !keys.iter().any(|key| key == trimmed) {
+        keys.push(trimmed.to_string());
+    }
+    let mut extras: Vec<String> = aliases
+        .keys()
+        .filter(|alias| {
+            canonicalize_project_slug_with(aliases, alias) == canonical
+                && !keys.iter().any(|key| key == *alias)
+        })
+        .cloned()
+        .collect();
+    extras.sort();
+    keys.extend(extras);
+    keys
+}
+
 /// True when every field of a state descriptor is an unfilled `<placeholder>`.
 ///
 /// Deliberately narrow: a descriptor is rejected only when it carries no real
@@ -2994,6 +3039,39 @@ mod tests {
         );
         assert_eq!(canonicalize_project_slug_with(&aliases, "verity"), "verity");
         assert_eq!(canonicalize_project_slug_with(&aliases, "   "), "");
+    }
+
+    #[test]
+    fn project_tag_keys_include_canonical_and_every_alias() {
+        let mut aliases = HashMap::new();
+        aliases.insert("coldcard".to_string(), "coldcard-rng-cracker".to_string());
+        aliases.insert(
+            "coldcard-rng".to_string(),
+            "coldcard-rng-cracker".to_string(),
+        );
+        aliases.insert(
+            "ec-defensive-research".to_string(),
+            "coldcard-rng-cracker".to_string(),
+        );
+        aliases.insert("lido-audit".to_string(), "verity-lido".to_string());
+
+        let from_nick = project_tag_keys_with(&aliases, "coldcard");
+        assert!(from_nick.contains(&"coldcard-rng-cracker".to_string()));
+        assert!(from_nick.contains(&"coldcard".to_string()));
+        assert!(from_nick.contains(&"ec-defensive-research".to_string()));
+        assert!(from_nick.contains(&"coldcard-rng".to_string()));
+        assert!(!from_nick.contains(&"verity-lido".to_string()));
+
+        let mut from_canonical = project_tag_keys_with(&aliases, "coldcard-rng-cracker");
+        let mut from_nick_sorted = from_nick.clone();
+        from_nick_sorted.sort();
+        from_canonical.sort();
+        assert_eq!(from_nick_sorted, from_canonical);
+
+        assert_eq!(
+            project_tag_keys_with(&aliases, "verity"),
+            vec!["verity".to_string()]
+        );
     }
 
     const SAMPLE: &str = "[Cron delivery: Verity two-phase Fable/Codex progression]\n\

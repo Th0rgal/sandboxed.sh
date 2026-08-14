@@ -4048,54 +4048,114 @@ impl ControlHub {
     /// Attention-horizon missions for one project: live / waiting / blocked
     /// and unabsorbed failed/interrupted attempts. Used by the item-first
     /// project read so controllers do not walk historical missions.
+    ///
+    /// `project` may be a roster nickname; every `routes.json` alias that
+    /// folds onto the same canonical is queried. Offline sqlite is read
+    /// read-only — opening a second writer on `missions-prod.db` is how a
+    /// `get_project` would lock or fail closed to an empty item list.
     pub(crate) async fn collect_attention_missions_for_project(
         &self,
         project: &str,
     ) -> Result<Vec<Mission>, String> {
         const PAGE_SIZE: usize = 200;
+        let keys = super::projects_overview::project_tag_keys(project);
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
         let inventory = self.mission_store_inventory().await?;
-        let mut stores: Vec<Arc<dyn MissionStore>> = inventory.live;
-        for user in inventory.offline_file_users {
-            stores.push(Arc::new(
-                mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await?,
-            ));
-        }
-        for path in inventory.offline_sqlite {
-            let Some(user) = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_prefix("missions-"))
-                .and_then(|name| name.strip_suffix(".db"))
-            else {
-                continue;
-            };
-            stores.push(Arc::new(
-                mission_store::SqliteMissionStore::new(inventory.base_dir.clone(), user).await?,
-            ));
-        }
-        let filter = mission_store::MissionFilter {
-            project: Some(project.to_string()),
-            attention_only: true,
-            ..Default::default()
-        };
         let mut collected = Vec::new();
         let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        for store in stores {
-            let mut offset = 0;
-            loop {
-                let page = store
-                    .list_missions_filtered(&filter, PAGE_SIZE, offset)
-                    .await?;
-                let page_len = page.len();
-                for mission in page {
-                    if seen.insert(mission.id) {
-                        collected.push(mission);
+        let mut push = |mission: Mission| {
+            if seen.insert(mission.id) {
+                collected.push(mission);
+            }
+        };
+        for store in inventory.live {
+            for key in &keys {
+                let filter = mission_store::MissionFilter {
+                    project: Some(key.clone()),
+                    attention_only: true,
+                    ..Default::default()
+                };
+                let mut offset = 0;
+                loop {
+                    let page = match store
+                        .list_missions_filtered(&filter, PAGE_SIZE, offset)
+                        .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            tracing::warn!(
+                                project = %key,
+                                %error,
+                                "attention collect: live store list failed"
+                            );
+                            break;
+                        }
+                    };
+                    let page_len = page.len();
+                    for mission in page {
+                        push(mission);
+                    }
+                    if page_len < PAGE_SIZE {
+                        break;
+                    }
+                    offset += page_len;
+                }
+            }
+        }
+        for user in inventory.offline_file_users {
+            let store =
+                match mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await
+                {
+                    Ok(store) => store,
+                    Err(error) => {
+                        tracing::warn!(%user, %error, "attention collect: file store skipped");
+                        continue;
+                    }
+                };
+            for key in &keys {
+                let filter = mission_store::MissionFilter {
+                    project: Some(key.clone()),
+                    attention_only: true,
+                    ..Default::default()
+                };
+                if let Ok(page) = store.list_missions_filtered(&filter, PAGE_SIZE, 0).await {
+                    for mission in page {
+                        push(mission);
                     }
                 }
-                if page_len < PAGE_SIZE {
-                    break;
+            }
+        }
+        for path in inventory.offline_sqlite {
+            for key in keys.clone() {
+                let path_for_scan = path.clone();
+                let path_label = path.display().to_string();
+                match tokio::task::spawn_blocking(move || {
+                    collect_attention_missions_from_sqlite(&path_for_scan, &key)
+                })
+                .await
+                {
+                    Ok(Ok(rows)) => {
+                        for mission in rows {
+                            push(mission);
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            path = %path_label,
+                            %error,
+                            "attention collect: offline sqlite skipped"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path_label,
+                            %error,
+                            "attention collect: offline sqlite join failed"
+                        );
+                    }
                 }
-                offset += page_len;
             }
         }
         Ok(collected)
@@ -5362,9 +5422,17 @@ pub async fn list_missions(
     let control = control_for_user(&state, &user).await;
     // Default to the most recent 50; honor an explicit limit so callers (e.g.
     // the assistant MCP) can request more, capped to keep the response bounded.
+    let project = query.project.as_deref().map(|raw| {
+        let canonical = super::projects_overview::canonicalize_project_slug(raw);
+        if canonical.is_empty() {
+            raw.to_string()
+        } else {
+            canonical
+        }
+    });
     let filter = crate::api::mission_store::MissionFilter {
         status: query.status.clone(),
-        project: query.project.clone(),
+        project,
         project_prefix: query.project_prefix.clone(),
         track: query.track.clone(),
         tag: query.tag.clone(),
@@ -6560,6 +6628,104 @@ fn collect_project_missions_from_sqlite(
         mission.project.intent = intent;
         mission.project.github_pr = github_pr;
         collected.push(mission);
+    }
+    Ok(collected)
+}
+
+/// Read-only attention-horizon slice of one project tag from an offline store.
+fn collect_attention_missions_from_sqlite(
+    path: &std::path::Path,
+    project: &str,
+) -> Result<Vec<Mission>, String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
+    let columns: std::collections::HashSet<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('missions')")
+        .and_then(|mut st| {
+            st.query_map([], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .map_err(|error| error.to_string())?;
+    if !columns.contains("project") {
+        return Ok(Vec::new());
+    }
+    let has_tags = columns.contains("tags");
+    let sql = if has_tags {
+        "SELECT id, status, title, workspace_id, backend, created_at, updated_at, \
+         project, track, intent, github_pr, tags \
+         FROM missions WHERE project = ?1 AND status NOT IN ('acknowledged', 'completed')"
+    } else {
+        "SELECT id, status, title, workspace_id, backend, created_at, updated_at, \
+         project, track, intent, github_pr, NULL \
+         FROM missions WHERE project = ?1 AND status NOT IN ('acknowledged', 'completed')"
+    };
+    let mut statement = connection.prepare(sql).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([project], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut collected = Vec::new();
+    for row in rows {
+        let (
+            id,
+            status,
+            title,
+            workspace_id,
+            backend,
+            created_at,
+            updated_at,
+            project,
+            track,
+            intent,
+            github_pr,
+            tags_raw,
+        ) = row.map_err(|error| error.to_string())?;
+        let Ok(id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
+            .unwrap_or(MissionStatus::Active);
+        let tags: Vec<String> = tags_raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+        let mut mission: Mission = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "status": status,
+            "workspace_id": workspace_id
+                .as_deref()
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+                .unwrap_or_else(Uuid::nil),
+            "backend": backend.unwrap_or_default(),
+            "history": [],
+            "created_at": created_at.unwrap_or_default(),
+            "updated_at": updated_at.unwrap_or_default(),
+        }))
+        .map_err(|error| error.to_string())?;
+        mission.title = title;
+        mission.project.project = project;
+        mission.project.track = track;
+        mission.project.intent = intent;
+        mission.project.github_pr = github_pr;
+        mission.project.tags = tags;
+        if crate::api::mission_store::default_attention_keeps(&mission) {
+            collected.push(mission);
+        }
     }
     Ok(collected)
 }
