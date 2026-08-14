@@ -43,9 +43,14 @@ export type CardSummary = {
   openTrackCount: number;
   liveAttempts: number;
   lastSignalAt: string | null;
+  /** Newest live mission / active-track activity. Distinct from lastSignalAt
+   *  so a silent controller cannot hide writers that are still ticking. */
+  lastWorkAt: string | null;
   stale: boolean;
   /** next_action is set, nothing is running, and the owner is not being asked. */
   idleNextAction: boolean;
+  /** Live work is more than 15 minutes newer than the last controller signal. */
+  controllerBehind: boolean;
 };
 
 /** Overview-row facts the card should lead with. */
@@ -67,6 +72,7 @@ export function cardSummary(project: ProjectRow): CardSummary {
     nonblank(project.tracker?.status_line);
   const lastSignalAt =
     project.latest_update?.at ?? project.controller_heartbeat_at ?? null;
+  const lastWorkAt = latestLiveWorkAt(project);
   const liveAttempts = project.health?.active ?? 0;
   const pendingDecisions = project.pending_decisions ?? 0;
   const mode = parseMode(project);
@@ -79,13 +85,52 @@ export function cardSummary(project: ProjectRow): CardSummary {
     openTrackCount: tracks.length,
     liveAttempts,
     lastSignalAt,
+    lastWorkAt,
     stale: isStale(project),
     idleNextAction:
       nextAction !== null &&
       liveAttempts === 0 &&
       pendingDecisions === 0 &&
       mode?.base !== "paused",
+    controllerBehind: isControllerBehind(lastSignalAt, lastWorkAt, liveAttempts),
   };
+}
+
+const CONTROLLER_BEHIND_MS = 15 * 60 * 1000;
+
+function latestLiveWorkAt(project: ProjectRow): string | null {
+  const fromMissions = (project.missions ?? [])
+    .filter((mission) => LIVE_ATTEMPT.has(mission.status))
+    .map((mission) => mission.updated_at);
+  const fromTracks = (project.health?.tracks ?? [])
+    .filter((track) => track.active > 0)
+    .map((track) => track.last_activity_at);
+  return latestTimestamp([...fromMissions, ...fromTracks]);
+}
+
+function isControllerBehind(
+  lastSignalAt: string | null,
+  lastWorkAt: string | null,
+  liveAttempts: number,
+): boolean {
+  if (liveAttempts < 1 || !lastSignalAt || !lastWorkAt) return false;
+  const signalMs = Date.parse(lastSignalAt);
+  const workMs = Date.parse(lastWorkAt);
+  if (!Number.isFinite(signalMs) || !Number.isFinite(workMs)) return false;
+  return workMs - signalMs > CONTROLLER_BEHIND_MS;
+}
+
+function latestTimestamp(values: Array<string | null | undefined>): string | null {
+  let best: string | null = null;
+  let bestMs = Number.NEGATIVE_INFINITY;
+  for (const value of values) {
+    if (!value) continue;
+    const ms = Date.parse(value);
+    if (!Number.isFinite(ms) || ms <= bestMs) continue;
+    bestMs = ms;
+    best = value;
+  }
+  return best;
 }
 
 function toOpenTrack(track: TrackHealth): CardOpenTrack {

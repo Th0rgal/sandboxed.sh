@@ -66,7 +66,7 @@ function row(overrides: Partial<ProjectRow> = {}): ProjectRow {
           completed: 8,
           overdue: 0,
           desired_states: {},
-          last_activity_at: "2026-08-14T12:00:00Z",
+          last_activity_at: "2026-08-14T05:52:00Z",
         },
         {
           track: "core",
@@ -117,6 +117,59 @@ describe("cardSummary", () => {
       "landed-old",
     );
     expect(summary.lastSignalAt).toBe("2026-08-14T05:50:00Z");
+    expect(summary.lastWorkAt).toBe("2026-08-14T05:52:00Z");
+    expect(summary.idleNextAction).toBe(false);
+    expect(summary.controllerBehind).toBe(false);
+  });
+
+  test("flags a controller whose last signal is older than live work", () => {
+    const summary = cardSummary(
+      row({
+        pending_decisions: 0,
+        latest_update: {
+          headline: "Verity #2332 — BLOQUÉE PAR LEASE WRITER",
+          body: null,
+          session_id: "s",
+          at: "2026-08-14T14:30:54Z",
+          signature: "verity",
+          mode: "active",
+          blocker: "source #2332 dirty",
+        },
+        missions: [
+          {
+            id: "08306fdb",
+            status: "active",
+            title: "Grok 4.6 — repair Verity PR #2332",
+            updated_at: "2026-08-14T15:35:08Z",
+            github_pr: null,
+          },
+        ],
+        health: {
+          missions: 8,
+          active: 2,
+          failed: 5,
+          overdue: 0,
+          tracks_needing_attention: 3,
+          tracks: [
+            {
+              track: "c5-preflight-pr2332",
+              verdict: "active",
+              missions: 2,
+              active: 1,
+              failed: 1,
+              completed: 0,
+              overdue: 0,
+              desired_states: {},
+              last_activity_at: "2026-08-14T15:35:08Z",
+            },
+          ],
+        },
+      }),
+    );
+    expect(summary.liveAttempts).toBe(2);
+    expect(summary.lastSignalAt).toBe("2026-08-14T14:30:54Z");
+    expect(summary.lastWorkAt).toBe("2026-08-14T15:35:08Z");
+    expect(summary.controllerBehind).toBe(true);
     expect(summary.idleNextAction).toBe(false);
   });
 
