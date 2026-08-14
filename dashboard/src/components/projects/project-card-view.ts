@@ -43,6 +43,8 @@ export type CardSummary = {
   liveAttempts: number;
   lastSignalAt: string | null;
   stale: boolean;
+  /** next_action is set, nothing is running, and the owner is not being asked. */
+  idleNextAction: boolean;
 };
 
 /** Overview-row facts the card should lead with. */
@@ -64,16 +66,24 @@ export function cardSummary(project: ProjectRow): CardSummary {
     nonblank(project.tracker?.status_line);
   const lastSignalAt =
     project.latest_update?.at ?? project.controller_heartbeat_at ?? null;
+  const liveAttempts = project.health?.active ?? 0;
+  const pendingDecisions = project.pending_decisions ?? 0;
+  const mode = parseMode(project);
   return {
     headline,
     nextAction,
     blocker: blocker ?? null,
-    pendingDecisions: project.pending_decisions ?? 0,
+    pendingDecisions,
     openTracks: tracks.slice(0, 3).map(toOpenTrack),
     openTrackCount: tracks.length,
-    liveAttempts: project.health?.active ?? 0,
+    liveAttempts,
     lastSignalAt,
     stale: isStale(project),
+    idleNextAction:
+      nextAction !== null &&
+      liveAttempts === 0 &&
+      pendingDecisions === 0 &&
+      mode?.base !== "paused",
   };
 }
 

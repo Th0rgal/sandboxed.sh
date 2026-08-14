@@ -243,6 +243,31 @@ describe("ProjectsBoard", () => {
     expect(screen.getByText("merge #2332?")).toBeInTheDocument();
   });
 
+  test("shows no live attempt when next_action is set and nothing is running", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity-lido",
+          title: "Lido SRv3 audit",
+          next_action: "repin Verity after #66 merge",
+          pending_decisions: 0,
+          mode: "active",
+          health: health({
+            active: 0,
+            failed: 9,
+            tracks_needing_attention: 5,
+            tracks: [track({ track: "lido-verity-closure-v2", verdict: "failing", active: 0, failed: 1 })],
+          }),
+        }),
+      ]),
+    );
+
+    renderBoard();
+
+    expect(await screen.findAllByText("no live attempt")).not.toHaveLength(0);
+    expect(screen.getAllByText("repin Verity after #66 merge").length).toBeGreaterThan(0);
+  });
+
   test("selecting a project loads its updates timeline in the detail pane", async () => {
     mockedOverview.mockResolvedValue(
       overview([

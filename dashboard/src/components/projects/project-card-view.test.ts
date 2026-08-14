@@ -117,6 +117,57 @@ describe("cardSummary", () => {
       "landed-old",
     );
     expect(summary.lastSignalAt).toBe("2026-08-14T05:50:00Z");
+    expect(summary.idleNextAction).toBe(false);
+  });
+
+  test("flags next_action with zero live attempts when the owner is not asked", () => {
+    const summary = cardSummary(
+      row({
+        next_action: "repin Verity after #66 merge",
+        pending_decisions: 0,
+        health: {
+          missions: 9,
+          active: 0,
+          failed: 9,
+          overdue: 0,
+          tracks_needing_attention: 5,
+          tracks: [
+            {
+              track: "lido-verity-closure-v2",
+              verdict: "failing",
+              missions: 1,
+              active: 0,
+              failed: 1,
+              completed: 0,
+              overdue: 0,
+              desired_states: {},
+              last_activity_at: "2026-08-14T15:31:26Z",
+            },
+          ],
+        },
+      }),
+    );
+    expect(summary.nextAction).toBe("repin Verity after #66 merge");
+    expect(summary.liveAttempts).toBe(0);
+    expect(summary.idleNextAction).toBe(true);
+  });
+
+  test("does not flag idle next_action while owner decisions are pending", () => {
+    const summary = cardSummary(
+      row({
+        next_action: "wait for checkpoint answer",
+        pending_decisions: 2,
+        health: {
+          missions: 0,
+          active: 0,
+          failed: 0,
+          overdue: 0,
+          tracks_needing_attention: 0,
+          tracks: [],
+        },
+      }),
+    );
+    expect(summary.idleNextAction).toBe(false);
   });
 
   test("falls back to the attention reason when the controller left no next_action", () => {

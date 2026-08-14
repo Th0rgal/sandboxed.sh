@@ -603,6 +603,14 @@ function ProjectListRow({
                 silent
               </span>
             )}
+            {summary.idleNextAction && (
+              <span
+                title="next_action is set but nothing is running"
+                className="shrink-0 text-[10px] uppercase tracking-wide text-amber-400/70"
+              >
+                no live attempt
+              </span>
+            )}
             <span className="min-w-0 truncate">
               {summary.headline
                 ? stripMarkdown(summary.headline)
@@ -1049,6 +1057,7 @@ function ProjectDetail({
           pendingDecisions={signal?.pendingDecisions ?? summary.pendingDecisions}
           lastSignalAt={summary.lastSignalAt}
           decisions={decisions}
+          idleNextAction={summary.idleNextAction}
         />
         {project.tracker?.status_line && (
           <p className="mt-1.5 text-xs leading-relaxed text-white/55">
@@ -1129,6 +1138,7 @@ function ControllerSignal({
   pendingDecisions,
   lastSignalAt,
   decisions,
+  idleNextAction,
 }: {
   nextAction: string | null;
   blocker: string | null;
@@ -1136,14 +1146,24 @@ function ControllerSignal({
   pendingDecisions: number;
   lastSignalAt: string | null;
   decisions: ViewDecision[];
+  idleNextAction: boolean;
 }) {
-  if (!nextAction && !blocker && pendingDecisions === 0 && !mode && decisions.length === 0) {
+  if (
+    !nextAction &&
+    !blocker &&
+    pendingDecisions === 0 &&
+    !mode &&
+    decisions.length === 0
+  ) {
     return null;
   }
   return (
     <div className="mt-2 space-y-1 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2">
       <div className="flex flex-wrap items-center gap-2 text-[11px] text-white/45">
         <ModeChip mode={mode} />
+        {idleNextAction && (
+          <span className="text-amber-200/80">no live attempt</span>
+        )}
         {pendingDecisions > 0 && (
           <span className="text-amber-200/80">
             {decisions.length > 0
