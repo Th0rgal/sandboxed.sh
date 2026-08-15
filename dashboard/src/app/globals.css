@@ -385,8 +385,15 @@ select:focus-visible {
   [class~="text-indigo-400/60"],
   [class~="text-indigo-400/50"],
   [class~="text-indigo-300/80"],
+  [class~="text-indigo-300/70"],
   [class~="text-indigo-300/60"] {
-    color: rgb(79 70 229 / 0.86);
+    color: rgb(67 56 202);
+  }
+
+  [class~="text-indigo-200"],
+  [class~="text-indigo-200/90"],
+  [class~="text-indigo-200/80"] {
+    color: rgb(67 56 202);
   }
 
   [class~="text-emerald-400"] {
