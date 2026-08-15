@@ -446,7 +446,11 @@ pub async fn get_project(
         .projects
         .recent_decisions(&slug, 20)
         .map_err(store_err)?;
-    let conversation = state.projects.binding(&slug).map_err(store_err)?;
+    let conversation = state
+        .projects
+        .binding(&slug)
+        .map_err(store_err)?
+        .map(follow_live_conversation);
     let proposals = state
         .projects
         .list_open_proposals(&slug)
@@ -1413,6 +1417,29 @@ fn hermes_state_db() -> Option<PathBuf> {
         .ok()
         .map(PathBuf::from)
         .filter(|path| path.is_file())
+}
+
+/// Follow a stored binding forward to the live Hermes continuation.
+///
+/// Bindings freeze a session id at bind time; compressions fork new ids.
+/// Overview already does this walk so the sidebar opens the live chat.
+/// `GET /api/projects/:slug` must do the same — otherwise the card's
+/// Conversation button opens the dead parent and owner messages vanish.
+fn follow_live_conversation(conversation: ProjectConversation) -> ProjectConversation {
+    follow_live_conversation_at(conversation, hermes_state_db().as_deref())
+}
+
+fn follow_live_conversation_at(
+    mut conversation: ProjectConversation,
+    db_path: Option<&Path>,
+) -> ProjectConversation {
+    if let Some(path) = db_path {
+        let tip = super::session_chain::live_tip(path, &conversation.session_id);
+        if tip != conversation.session_id {
+            conversation.session_id = tip;
+        }
+    }
+    conversation
 }
 
 /// The Hermes cron scheduler's jobs file, next to `state.db` in the Hermes
@@ -4232,6 +4259,44 @@ mod tests {
         });
         let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
         assert_eq!(row.bucket, "paused");
+    }
+
+    #[test]
+    fn get_project_conversation_follows_the_live_continuation() {
+        // Coldcard was bound to ff644f; Hermes compressed it eight times to
+        // 1310a9. Opening the frozen id is why an owner message "does not
+        // work" — the submit lands on a dead parent.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("state.db");
+        let connection = rusqlite::Connection::open(&path).expect("open");
+        connection
+            .execute(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT)",
+                [],
+            )
+            .expect("schema");
+        for (id, parent) in [
+            ("20260806_231844_ff644f", None),
+            ("20260809_005018_564a75", Some("20260806_231844_ff644f")),
+            ("20260813_111430_1310a9", Some("20260809_005018_564a75")),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sessions (id, parent_session_id) VALUES (?1, ?2)",
+                    rusqlite::params![id, parent],
+                )
+                .expect("insert");
+        }
+        let conversation = follow_live_conversation_at(
+            ProjectConversation {
+                session_id: "20260806_231844_ff644f".into(),
+                source: "binding",
+                bound_at: Some("2026-08-08T12:43:56Z".into()),
+            },
+            Some(&path),
+        );
+        assert_eq!(conversation.session_id, "20260813_111430_1310a9");
+        assert_eq!(conversation.source, "binding");
     }
 
     /// An explicit binding must win over the inferred session, and the
