@@ -36,6 +36,8 @@ async function mountThemeFixture(page: import("@playwright/test").Page) {
         <div class="mission-switcher-row-selected" data-testid="mission-row">
           Selected mission row
         </div>
+        <span class="text-[10px] uppercase text-indigo-300/70" data-testid="mode-chip-active">active</span>
+        <span class="rounded-full bg-indigo-500/20 text-[10px] font-semibold tabular-nums text-indigo-200" data-testid="unread-badge">9+</span>
       </div>
     `;
     document.body.appendChild(fixture);
@@ -143,6 +145,20 @@ test("semantic components switch to light theme via data-theme", async ({ page }
     expect(color[0]).toBeLessThan(90);
     expect(color[1]).toBeLessThan(90);
     expect(color[2]).toBeLessThan(160);
+  }
+
+  const modeChip = parseRgb(
+    await page.getByTestId("mode-chip-active").evaluate((el) => getComputedStyle(el).color),
+  );
+  const unread = parseRgb(
+    await page.getByTestId("unread-badge").evaluate((el) => getComputedStyle(el).color),
+  );
+  // Pale indigo-200 / indigo-300/70 are unreadable on white; remaps must land
+  // on a dark indigo (indigo-700-ish) so 10px labels stay above ~4.5:1.
+  for (const color of [modeChip, unread]) {
+    expect(color[0]).toBeLessThan(90);
+    expect(color[1]).toBeLessThan(80);
+    expect(color[2]).toBeGreaterThan(180);
   }
 });
 
