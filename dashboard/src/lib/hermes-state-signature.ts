@@ -17,15 +17,23 @@
 const TRAILING_CONTROL_TRAILER_RE =
   /\s*\[(?:STATE_SIGNATURE|CTRL|DECISION):[^\]]*\]\s*$/;
 
+// Empty-tag improvisation: `[CTRL:]` then prose *outside* the brackets.
+// Structured form is `[CTRL: project | mode=…]`; models sometimes emit
+// `[CTRL:] #2332 repair active; …` which the closer-inside-brackets
+// matcher cannot consume.
+const TRAILING_EMPTY_CTRL_LINE_RE = /\s*\[CTRL:\][^\n]*\s*$/i;
+
 const SIGNATURE_KEY_RE = /\[STATE_SIGNATURE:\s*([^|\]]+)/g;
 
 /** Remove trailing Hermes control-plane trailer(s) from a message body.
  * Only trailers are stripped — metadata quoted mid-text stays intact. */
 export function stripHermesControlTrailers(content: string): string {
   let out = content;
-  while (TRAILING_CONTROL_TRAILER_RE.test(out)) {
-    out = out.replace(TRAILING_CONTROL_TRAILER_RE, "");
-  }
+  let next = out;
+  do {
+    out = next;
+    next = out.replace(TRAILING_CONTROL_TRAILER_RE, "").replace(TRAILING_EMPTY_CTRL_LINE_RE, "");
+  } while (next !== out);
   return out;
 }
 

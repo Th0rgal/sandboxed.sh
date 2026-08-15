@@ -55,6 +55,14 @@ describe("stripStateSignature", () => {
     expect(stripHermesControlTrailers(body)).toBe(body);
   });
 
+  it("removes a trailing empty-tag [CTRL:] line with prose outside the brackets", () => {
+    const body =
+      "Action Thomas : aucune pour l’instant.\n\n" +
+      "[CTRL:] #2332 repair active; both workers recovered after server restart; waiting for successor head or concrete blocker.\n\n" +
+      "[STATE_SIGNATURE: verity|pr2332|none|repair-active|source|successor-head-or-blocker]";
+    expect(stripHermesControlTrailers(body)).toBe("Action Thomas : aucune pour l’instant.");
+  });
+
   it("leaves a signature quoted mid-message intact", () => {
     const body = `The trailer looks like ${SIGNATURE} and routes the reply.`;
     expect(stripStateSignature(body)).toBe(body);
