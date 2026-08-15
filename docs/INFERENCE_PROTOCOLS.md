@@ -5,10 +5,11 @@ preserves every provider's reasoning state faithfully.
 
 The routing rule is:
 
-> Prefer the provider-native stateful protocol when its capability is advertised
-> and the route can guarantee provider/model/account affinity. Otherwise preserve
-> the provider's explicit reasoning field over Chat Completions. Fall back to
-> ordinary Chat Completions when neither option is available.
+> Start from the measured policy in the table below. Prefer a provider-native
+> stateful protocol only when it is the selected policy, its capability is
+> advertised, and the route can guarantee provider/model/account affinity.
+> Provider-specific Chat replay is opt-in evidence, not an automatic upgrade;
+> otherwise use ordinary Chat Completions.
 
 Protocol selection must use `GET /v1/capabilities`. Clients must not infer support
 from a model-name prefix or silently translate one protocol into another.
@@ -74,10 +75,12 @@ A client should select a protocol in this order:
    requires `anthropic_messages` plus `thinking_blocks_replay`. If the endpoint is
    available but its continuity flag is false, it may be used only as an
    explicitly stateless cohort; do not start a session that expects continuation.
-3. For Kimi-style Chat extensions, require `reasoning_content_replay` and preserve
-   the advertised reasoning field in the complete assistant message on every
-   subsequent tool turn.
-4. Otherwise use Chat Completions.
+3. For Kimi, use ordinary Chat Completions by default even when
+   `reasoning_content_replay` is advertised. Enable replay only for an explicitly
+   selected, separately labelled experimental cohort; that cohort must require
+   the capability and preserve the complete assistant message on every subsequent
+   tool turn.
+4. Otherwise use ordinary Chat Completions.
 5. If the preferred route is temporarily unavailable, either wait according to
    `Retry-After` or start a separately labelled Chat fallback session. Never move
    an existing stateful continuation to another provider, model, or account.
@@ -116,11 +119,14 @@ a native Responses or Messages session.
 
 ### Kimi Chat clients
 
-- retain the complete assistant message;
-- replay `reasoning_content`, `content`, and `tool_calls` unchanged;
-- do not log the reasoning field and then omit it from the next request;
-- keep this behavior capability-gated so unrelated models do not receive
-  synthetic fields.
+- default to ordinary Chat transcript continuity (`content` and `tool_calls`)
+  without replaying `reasoning_content`, even when replay is advertised;
+- enable `reasoning_content` replay only through an explicit experimental-cohort
+  configuration, never by capability discovery alone;
+- in that replay cohort, retain and replay `reasoning_content`, `content`, and
+  `tool_calls` unchanged in the complete assistant message;
+- keep replay capability-gated so unrelated models do not receive synthetic
+  fields.
 
 ## Benchmark methodology
 
