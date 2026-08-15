@@ -214,6 +214,23 @@ pub(crate) async fn cleanup_stale_active_missions_once(
     match mission_store.get_stale_active_missions(stale_hours).await {
         Ok(stale_missions) => {
             for mission in stale_missions {
+                // Sqlite `get_stale_active_missions` used to project a stub
+                // Mission with empty `origin` / tags. The skip below then
+                // saw a bare worker and marked Grok 08306fdb / cert 203a49d5
+                // Completed (#842 shipped, skip never fired). Reload the
+                // full row before deciding.
+                let mission = match mission_store.get_mission(mission.id).await {
+                    Ok(Some(full)) => full,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            mission_id = %mission.id,
+                            %error,
+                            "Stale cleanup: could not reload mission; using scan row"
+                        );
+                        mission
+                    }
+                };
                 // Same ownership rule as the 15-minute watchdog (#840) and
                 // registered-liveness interrupt (#841). Grok 08306fdb / Kimi
                 // c91618dc / cert 203a49d5 were still in a long turn (CPU

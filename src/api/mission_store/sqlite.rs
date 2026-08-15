@@ -4644,75 +4644,26 @@ impl MissionStore for SqliteMissionStore {
         // fall back to `updated_at` via COALESCE.
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
-                            created_at, updated_at, interrupted_at, resumable, desktop_sessions,
-                            COALESCE(backend, 'opencode') as backend, COALESCE(goal_mode, 0) as goal_mode, goal_objective FROM missions m
-                     WHERE status = 'active'
-                       AND max(
-                             m.updated_at,
-                             COALESCE(
-                               (SELECT MAX(timestamp) FROM mission_events
-                                WHERE mission_id = m.id),
-                               m.updated_at
-                             )
-                           ) < ?1",
-                )
-                .map_err(|e| e.to_string())?;
+            // Must use MISSION_LIST_COLUMNS / row_to_mission so origin +
+            // project.tags survive. A stub projection left those empty and
+            // the 2h cleanup treated Hermes writers as untagged (#842 skip
+            // never fired on 08306fdb / 203a49d5).
+            let sql = format!(
+                "SELECT {MISSION_LIST_COLUMNS} FROM missions
+                 WHERE status = 'active'
+                   AND max(
+                         updated_at,
+                         COALESCE(
+                           (SELECT MAX(timestamp) FROM mission_events
+                            WHERE mission_id = missions.id),
+                           updated_at
+                         )
+                       ) < ?1"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
             let missions = stmt
-                .query_map(params![cutoff_str], |row| {
-                    let id_str: String = row.get(0)?;
-                    let status_str: String = row.get(1)?;
-                    let workspace_id_str: String = row.get(3)?;
-                    let desktop_sessions_json: Option<String> = row.get(11)?;
-                    let backend: String = row.get(12)?;
-
-                    Ok(Mission {
-                        id: parse_uuid_or_nil(&id_str),
-                        status: parse_status(&status_str),
-                        title: row.get(2)?,
-                        short_description: None,
-                        metadata_updated_at: None,
-                        metadata_source: None,
-                        metadata_model: None,
-                        metadata_version: None,
-                        workspace_id: Uuid::parse_str(&workspace_id_str)
-                            .unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID),
-                        workspace_name: row.get(4)?,
-                        agent: row.get(5)?,
-                        model_override: row.get(6)?,
-                        model_effort: None, // Not needed for stale mission checks
-                        fast_mode: false,
-                        backend,
-                        config_profile: None, // Not needed for stale mission checks
-                        history: vec![],
-                        created_at: row.get(7)?,
-                        updated_at: row.get(8)?,
-                        interrupted_at: row.get(9)?,
-                        paused_at: None,
-                        resumable: row.get::<_, i32>(10)? != 0,
-                        desktop_sessions: desktop_sessions_json
-                            .and_then(|s| serde_json::from_str(&s).ok())
-                            .unwrap_or_default(),
-                        session_id: None, // Not needed for stale mission checks
-                        terminal_reason: None,
-                        terminal_evidence: None,
-                        parent_mission_id: None,
-                        working_directory: None,
-                        mission_mode: MissionMode::default(),
-                        goal_mode: false,
-                        goal_objective: None,
-                        first_viewed_at: None,
-                        scheduling: Default::default(),
-                        project: MissionProject::default(),
-                        activity: MissionActivity::default(),
-                        awaiting_kind: None,
-                        origin: None,
-                        origin_session_id: None,
-                    })
-                })
+                .query_map(params![cutoff_str], row_to_mission)
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
@@ -16693,7 +16644,9 @@ mod tests {
 #[cfg(test)]
 mod filter_tests {
     use super::SqliteMissionStore;
-    use crate::api::mission_store::{MissionFilter, MissionProjectPatch, MissionStore};
+    use crate::api::mission_store::{
+        MissionFilter, MissionProjectPatch, MissionStatus, MissionStore,
+    };
 
     async fn store(dir: &tempfile::TempDir) -> SqliteMissionStore {
         SqliteMissionStore::new(dir.path().to_path_buf(), "filter-user")
@@ -17133,6 +17086,54 @@ mod filter_tests {
             .expect("filtered list");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, tagged);
+    }
+
+    #[tokio::test]
+    async fn stale_active_scan_keeps_hermes_ownership_tags() {
+        // Prod 2026-08-15: the short stale SELECT dropped origin/tags, so
+        // cleanup treated Hermes writers as untagged and Completed them.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store(&dir).await;
+        let mission = store
+            .create_mission(Some("Grok repair"), None, None, None, None, None, None)
+            .await
+            .expect("create");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("active");
+        store
+            .update_mission_project(
+                mission.id,
+                MissionProjectPatch {
+                    tags: Some(vec!["origin:hermes-assistant".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tags");
+        store
+            .force_backdate_for_test(mission.id, "2026-08-15T00:00:00+00:00")
+            .await
+            .expect("backdate");
+
+        let stale = store
+            .get_stale_active_missions(2)
+            .await
+            .expect("stale scan");
+        let found = stale
+            .iter()
+            .find(|row| row.id == mission.id)
+            .expect("mission should be in the stale set");
+        assert!(
+            found
+                .project
+                .tags
+                .iter()
+                .any(|tag| tag == "origin:hermes-assistant"),
+            "stale scan must keep Hermes tags, got {:?}",
+            found.project.tags
+        );
     }
 }
 
