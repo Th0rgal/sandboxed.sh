@@ -1203,6 +1203,7 @@ pub async fn project_tasks(
     let mut failed = 0usize;
     let rows: Vec<serde_json::Value> = items
         .iter()
+        .filter(|item| item_belongs_on_roadmap(item))
         .map(|item| {
             let status = item_roadmap_status(item);
             match status {
@@ -2920,6 +2921,25 @@ fn item_attempt_is_live(status: &str) -> bool {
     matches!(status, "active" | "pending" | "running" | "awaiting_user")
 }
 
+/// The public roadmap is the plan, not the unacknowledged graveyard.
+/// Controllers still see every attention item on `get_project`.
+fn item_belongs_on_roadmap(item: &super::mission_horizon::ProjectItem) -> bool {
+    if item
+        .attempts
+        .iter()
+        .any(|attempt| item_attempt_is_live(&attempt.status))
+    {
+        return true;
+    }
+    if item.kind == "task" {
+        return item.open;
+    }
+    matches!(
+        item.status.as_deref(),
+        Some("open") | Some("active") | Some("proposed") | Some("done")
+    )
+}
+
 /// Map an item onto the existing `/tasks` row shape the desktop already
 /// renders. Status vocabulary stays the checklist's: accepted / running /
 /// failed / proposed / pending.
@@ -3678,6 +3698,25 @@ mod tests {
             ..open_live.clone()
         };
         assert_eq!(item_roadmap_status(&done), "accepted");
+        assert!(item_belongs_on_roadmap(&open_live));
+        assert!(item_belongs_on_roadmap(&done));
+        let zombie = ProjectItem {
+            open: true,
+            status: None,
+            desired_state: None,
+            attempts: vec![ProjectItemAttempt {
+                id: Uuid::nil(),
+                status: "failed".into(),
+                title: Some("old cert".into()),
+                updated_at: "2026-08-01T00:00:00Z".into(),
+                role: None,
+            }],
+            ..open_live.clone()
+        };
+        assert!(
+            !item_belongs_on_roadmap(&zombie),
+            "unacknowledged failed attempts are not the roadmap"
+        );
     }
 
     const SAMPLE: &str = "[Cron delivery: Verity two-phase Fable/Codex progression]\n\
