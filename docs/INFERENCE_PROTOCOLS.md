@@ -5,10 +5,11 @@ preserves every provider's reasoning state faithfully.
 
 The routing rule is:
 
-> Prefer the provider-native stateful protocol when its capability is advertised
-> and the route can guarantee provider/model/account affinity. Otherwise preserve
-> the provider's explicit reasoning field over Chat Completions. Fall back to
-> ordinary Chat Completions when neither option is available.
+> Start from the measured policy in the table below. Prefer a provider-native
+> stateful protocol only when it is the selected policy, its capability is
+> advertised, and the route can guarantee provider/model/account affinity.
+> Provider-specific Chat replay is opt-in evidence, not an automatic upgrade;
+> otherwise use ordinary Chat Completions.
 
 Protocol selection must use `GET /v1/capabilities`. Clients must not infer support
 from a model-name prefix or silently translate one protocol into another.
@@ -29,11 +30,11 @@ items, response bodies, and SSE events are relayed without Chat translation.
 
 | Provider / model family | Preferred protocol | Continuity contract | Fallback | Rationale |
 |---|---|---|---|---|
-| OpenAI reasoning models, including GPT-5.x | Responses | `previous_response_id` plus native response items | Chat Completions | Responses can retain provider reasoning items across tool turns |
-| xAI Grok models that advertise Responses | Responses | `previous_response_id` and `function_call_output` | Chat Completions | Long tool loops benefit from native state; Chat remains the comparable baseline |
+| OpenAI reasoning models, including GPT-5.x | Chat Completions | visible transcript | capability-gated Responses as an explicit experimental cohort | Chat is the completed comparable baseline; Responses can retain provider reasoning items but must win a completed cohort before promotion |
+| xAI Grok models that advertise Responses | Chat Completions | visible transcript | capability-gated Responses as an explicit experimental cohort | Chat is the completed baseline; the planned Responses cohort will test whether native state improves long tool loops |
 | Muse Spark models | Responses | `previous_response_id` and `function_call_output` | Chat Completions | Benchmark evidence shows material improvement from retained reasoning continuity |
-| Anthropic Claude/Opus/Fable with a direct API-key route | Anthropic Messages | replay signed `thinking`/`redacted_thinking`, `tool_use`, and `tool_result` blocks unchanged | Chat Completions adapter | Messages is Claude's native structured protocol; Chat translation can discard signed thinking blocks |
-| Kimi K3 and compatible Kimi thinking models | Chat Completions with `reasoning_content` replay | preserve the complete assistant message, including `reasoning_content` and `tool_calls` | ordinary Chat Completions | Kimi exposes continuity in an explicit Chat field; Responses emulation would add no native guarantee |
+| Anthropic Claude/Opus/Fable with a direct API-key route | Chat Completions adapter | visible transcript | capability-gated Anthropic Messages as an explicit experimental cohort | Chat is the completed baseline; Messages preserves signed thinking blocks but must be measured before promotion |
+| Kimi K3 and compatible Kimi thinking models | Ordinary Chat Completions | visible transcript | Chat with capability-gated `reasoning_content` replay as an explicit experimental mode | On STRAT-50 v0.2, ordinary Chat scored 14/50 versus 12/50 with replay, while using fewer tokens; fidelity support remains available but is not the empirical default |
 | Z.AI GLM, MiniMax, and other OpenAI-compatible models without advertised native state | Chat Completions | visible transcript only, plus any explicitly advertised replay field | ordinary Chat Completions | Do not claim stateful reasoning without a provider contract and verified route |
 | OAuth/CLI adapters | Chat Completions unless native support is explicitly advertised | adapter-defined | Chat Completions | Subscription OAuth credentials are not automatically valid native API credentials |
 
@@ -74,10 +75,12 @@ A client should select a protocol in this order:
    requires `anthropic_messages` plus `thinking_blocks_replay`. If the endpoint is
    available but its continuity flag is false, it may be used only as an
    explicitly stateless cohort; do not start a session that expects continuation.
-3. For Kimi-style Chat extensions, require `reasoning_content_replay` and preserve
-   the advertised reasoning field in the complete assistant message on every
-   subsequent tool turn.
-4. Otherwise use Chat Completions.
+3. For Kimi, use ordinary Chat Completions by default even when
+   `reasoning_content_replay` is advertised. Enable replay only for an explicitly
+   selected, separately labelled experimental cohort; that cohort must require
+   the capability and preserve the complete assistant message on every subsequent
+   tool turn.
+4. Otherwise use ordinary Chat Completions.
 5. If the preferred route is temporarily unavailable, either wait according to
    `Retry-After` or start a separately labelled Chat fallback session. Never move
    an existing stateful continuation to another provider, model, or account.
@@ -116,11 +119,14 @@ a native Responses or Messages session.
 
 ### Kimi Chat clients
 
-- retain the complete assistant message;
-- replay `reasoning_content`, `content`, and `tool_calls` unchanged;
-- do not log the reasoning field and then omit it from the next request;
-- keep this behavior capability-gated so unrelated models do not receive
-  synthetic fields.
+- default to ordinary Chat transcript continuity (`content` and `tool_calls`)
+  without replaying `reasoning_content`, even when replay is advertised;
+- enable `reasoning_content` replay only through an explicit experimental-cohort
+  configuration, never by capability discovery alone;
+- in that replay cohort, retain and replay `reasoning_content`, `content`, and
+  `tool_calls` unchanged in the complete assistant message;
+- keep replay capability-gated so unrelated models do not receive synthetic
+  fields.
 
 ## Benchmark methodology
 
@@ -143,10 +149,11 @@ Every cohort should record:
 - request-shape policy;
 - valid terminal verdicts, infrastructure retries, tokens, and requests.
 
-Chat Completions remains the portable leaderboard baseline. Native-stateful
-cohorts measure the best faithful integration available for a model. A gain in a
-native cohort can reflect both better continuity and greater effective budget
-utilization, so report score and cost together.
+Chat Completions remains the portable leaderboard baseline. A model's recommended
+integration is the highest-scoring completed comparable cohort, not automatically
+the most stateful protocol. Native-stateful and replay cohorts remain available as
+separate evidence even when they lose. A gain can reflect both better continuity
+and greater effective budget utilization, so report score and cost together.
 
 ## Current evidence and planned evaluations
 
@@ -157,14 +164,18 @@ Observed evidence motivating this architecture:
 - Grok Chat failures were dominated by repetition and absent Lean submissions,
   motivating a separate Responses ablation rather than rewriting its Chat score.
 - Kimi responses already contained `reasoning_content`; the client was dropping
-  it before later tool turns.
+  it before later tool turns. Preserving it was protocol-faithful but did not
+  improve this benchmark: ordinary Chat scored 14/50 at 1,595,122 tokens, while
+  replay scored 12/50 at 1,868,907 tokens. Ordinary Chat therefore remains the
+  recommended Kimi integration for this measured workload.
 - Anthropic's Chat adapter cannot faithfully expose every signed native thinking
   block, motivating a separate Messages cohort.
 
 Ordered evaluation roadmap:
 
 1. Keep Chat Completions cohorts as the common baseline.
-2. Complete Kimi K3 with `reasoning_content` replay.
+2. Retain ordinary Chat as the Kimi K3 winner; keep the completed
+   `reasoning_content` replay cohort as a separately labelled negative ablation.
 3. Run Grok via native xAI Responses after capability and affinity probes.
 4. Run Claude Opus via native Anthropic Messages with thinking-block replay.
 5. Run GPT-5.6 Sol via native Responses.
