@@ -262,3 +262,56 @@ function nonblank(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
 }
+
+/** Overview row the session rail should load.
+ *
+ * `/api/projects/by-session` first-matches a binding slug. Alias bindings
+ * (`verity-roadmap`, title-case `Verity`) are not roster rows — the board
+ * folds them onto `verity-core`, and `GET /api/projects/Verity` 404s.
+ * Prefer the overview project bound to this session, then an exact /
+ * case-insensitive slug, then a title match. Fall back to the raw slug so
+ * a brand-new project still resolves after the roster catches up. */
+export function resolveSessionProjectSlug(args: {
+  resolvedSlug?: string | null;
+  sessionId: string;
+  projects: Array<{
+    slug: string;
+    title?: string | null;
+    conversation?: { session_id?: string } | null;
+  }>;
+}): string | null {
+  const sessionId = args.sessionId.trim();
+  const resolved = args.resolvedSlug?.trim() || null;
+  if (!sessionId && !resolved) {
+    return null;
+  }
+  const bound = sessionId
+    ? args.projects.find(
+        (project) => project.conversation?.session_id === sessionId,
+      )
+    : undefined;
+  if (bound) {
+    return bound.slug;
+  }
+  if (!resolved) {
+    return null;
+  }
+  const exact = args.projects.find((project) => project.slug === resolved);
+  if (exact) {
+    return exact.slug;
+  }
+  const folded = resolved.toLowerCase();
+  const caseMatch = args.projects.find(
+    (project) => project.slug.toLowerCase() === folded,
+  );
+  if (caseMatch) {
+    return caseMatch.slug;
+  }
+  const titleMatch = args.projects.find(
+    (project) => (project.title ?? "").trim().toLowerCase() === folded,
+  );
+  if (titleMatch) {
+    return titleMatch.slug;
+  }
+  return resolved;
+}

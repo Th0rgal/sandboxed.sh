@@ -7,6 +7,7 @@ import type {
 } from "@/lib/api/projects";
 import {
   cardSummary,
+  resolveSessionProjectSlug,
   viewControllerSignal,
   viewMovingItems,
   viewOpenItems,
@@ -414,5 +415,71 @@ describe("viewOpenItems / viewControllerSignal", () => {
         status: "pending_user",
       },
     ]);
+  });
+});
+
+describe("resolveSessionProjectSlug", () => {
+  const sessionId = "20260814_224352_2a62eb";
+  const projects = [
+    {
+      slug: "verity-core",
+      title: "Verity",
+      conversation: { session_id: sessionId },
+    },
+    {
+      slug: "verity-lido",
+      title: "Lido SRv3 audit",
+      conversation: { session_id: "20260810_112100_35e1a0" },
+    },
+  ];
+
+  test("prefers the overview row bound to this session over an alias binding", () => {
+    expect(
+      resolveSessionProjectSlug({
+        resolvedSlug: "verity-roadmap",
+        sessionId,
+        projects,
+      }),
+    ).toBe("verity-core");
+  });
+
+  test("does not 404 a title-case slug when the roster title matches", () => {
+    expect(
+      resolveSessionProjectSlug({
+        resolvedSlug: "Verity",
+        sessionId: "unbound-session",
+        projects,
+      }),
+    ).toBe("verity-core");
+  });
+
+  test("matches a roster slug case-insensitively", () => {
+    expect(
+      resolveSessionProjectSlug({
+        resolvedSlug: "Verity-Core",
+        sessionId: "unbound-session",
+        projects,
+      }),
+    ).toBe("verity-core");
+  });
+
+  test("keeps an unknown slug so a new project can still load", () => {
+    expect(
+      resolveSessionProjectSlug({
+        resolvedSlug: "brand-new",
+        sessionId: "unbound-session",
+        projects,
+      }),
+    ).toBe("brand-new");
+  });
+
+  test("returns null when nothing resolved", () => {
+    expect(
+      resolveSessionProjectSlug({
+        resolvedSlug: null,
+        sessionId: "   ",
+        projects,
+      }),
+    ).toBeNull();
   });
 });

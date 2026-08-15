@@ -228,4 +228,27 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn an_alias_binding_is_the_first_match_the_handler_must_canonicalize() {
+        // Prod 2026-08-15: /by-session returned `verity-roadmap` because that
+        // binding is listed before `verity-core`. The HTTP handler folds it.
+        let (_dir, path) = db(&[("74bd9b", None), ("2a62eb", Some("74bd9b"))]);
+        let bindings = vec![
+            ("verity-roadmap".to_string(), "74bd9b".to_string()),
+            ("verity-core".to_string(), "74bd9b".to_string()),
+        ];
+        let chain = ancestry(&path, "2a62eb");
+        let raw = slug_for_bound_session("2a62eb", &bindings, &chain, |id| live_tip(&path, id));
+        assert_eq!(raw.as_deref(), Some("verity-roadmap"));
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("verity-roadmap".to_string(), "verity-core".to_string());
+        assert_eq!(
+            crate::api::projects_overview::canonicalize_project_slug_with(
+                &aliases,
+                raw.as_deref().unwrap()
+            ),
+            "verity-core"
+        );
+    }
 }

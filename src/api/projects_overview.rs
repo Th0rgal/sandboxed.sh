@@ -412,6 +412,10 @@ pub async fn project_by_session(
             format!("no project bound to session '{session_id}'"),
         ));
     };
+    // Bindings can name an alias (`verity-roadmap`) or a display title
+    // (`Verity`). The session rail then GET /api/projects/:slug — that
+    // must be the roster card, not a 404 nickname.
+    let slug = canonicalize_project_slug(&slug);
     Ok(Json(
         serde_json::json!({ "slug": slug, "session_id": session_id }),
     ))
@@ -427,6 +431,9 @@ pub async fn get_project(
     if !is_plain_key(&slug) {
         return Err(bad_slug());
     }
+    let Some(slug) = resolve_roster_slug(&state.projects, &slug).map_err(store_err)? else {
+        return Err((StatusCode::NOT_FOUND, format!("unknown project '{slug}'")));
+    };
     let project = state
         .projects
         .get_project(&slug)
@@ -2551,7 +2558,59 @@ pub fn canonicalize_project_slug_with(aliases: &HashMap<String, String>, slug: &
     if trimmed.is_empty() {
         return String::new();
     }
+    if let Some(canonical) = aliases.get(trimmed) {
+        return canonical.clone();
+    }
+    // Display titles (`Verity`) and mixed-case route keys must fold the
+    // same way as the lowercase nickname already in routes.json.
+    let lower = trimmed.to_ascii_lowercase();
+    if lower != trimmed {
+        if let Some(canonical) = aliases.get(&lower) {
+            return canonical.clone();
+        }
+    }
     resolve_alias(aliases, trimmed)
+}
+
+/// Roster keys to try for `GET /api/projects/:slug`, first hit wins.
+///
+/// Canonical alias first (`verity-roadmap` / `Verity` → `verity-core`),
+/// then ASCII-lower of the request, then the raw slug so a brand-new
+/// roster row is still reachable before `routes.json` knows about it.
+pub fn roster_lookup_keys_with(aliases: &HashMap<String, String>, requested: &str) -> Vec<String> {
+    let trimmed = requested.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let canonical = canonicalize_project_slug_with(aliases, trimmed);
+    let lower = trimmed.to_ascii_lowercase();
+    let mut keys = Vec::new();
+    for key in [canonical, lower, trimmed.to_string()] {
+        if !key.is_empty() && !keys.iter().any(|seen| seen == &key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+fn resolve_roster_slug(
+    store: &super::projects_store::ProjectsStore,
+    requested: &str,
+) -> Result<Option<String>, String> {
+    for key in roster_lookup_keys_with(
+        &hermes_projects_dir()
+            .map(|dir| read_alias_map(&dir))
+            .unwrap_or_default(),
+        requested,
+    ) {
+        if !is_plain_key(&key) {
+            continue;
+        }
+        if store.get_project(&key)?.is_some() {
+            return Ok(Some(key));
+        }
+    }
+    Ok(None)
 }
 
 /// Mission `project` tags that belong on this project's item view.
@@ -3146,6 +3205,57 @@ mod tests {
         );
         assert_eq!(canonicalize_project_slug_with(&aliases, "verity"), "verity");
         assert_eq!(canonicalize_project_slug_with(&aliases, "   "), "");
+    }
+
+    #[test]
+    fn canonicalize_project_slug_folds_title_case_and_roadmap_aliases() {
+        // Prod routes.json (2026-08-15): display title + tracker nickname
+        // both point at the roster card the session rail must load.
+        let mut aliases = HashMap::new();
+        aliases.insert("verity".to_string(), "verity-core".to_string());
+        aliases.insert("verity-roadmap".to_string(), "verity-core".to_string());
+        aliases.insert("Verity".to_string(), "verity-core".to_string());
+        assert_eq!(
+            canonicalize_project_slug_with(&aliases, "verity-roadmap"),
+            "verity-core"
+        );
+        assert_eq!(
+            canonicalize_project_slug_with(&aliases, "Verity"),
+            "verity-core"
+        );
+        // Title-case still folds when only the lowercase nickname is mapped.
+        aliases.remove("Verity");
+        assert_eq!(
+            canonicalize_project_slug_with(&aliases, "Verity"),
+            "verity-core"
+        );
+        assert_eq!(
+            canonicalize_project_slug_with(&aliases, "verity-core"),
+            "verity-core"
+        );
+    }
+
+    #[test]
+    fn roster_lookup_keys_prefer_canonical_then_casefold() {
+        let mut aliases = HashMap::new();
+        aliases.insert("verity".to_string(), "verity-core".to_string());
+        aliases.insert("verity-roadmap".to_string(), "verity-core".to_string());
+        assert_eq!(
+            roster_lookup_keys_with(&aliases, "Verity"),
+            vec![
+                "verity-core".to_string(),
+                "verity".to_string(),
+                "Verity".to_string()
+            ]
+        );
+        assert_eq!(
+            roster_lookup_keys_with(&aliases, "verity-roadmap"),
+            vec!["verity-core".to_string(), "verity-roadmap".to_string()]
+        );
+        assert_eq!(
+            roster_lookup_keys_with(&HashMap::new(), "Verity"),
+            vec!["Verity".to_string(), "verity".to_string()]
+        );
     }
 
     #[test]
