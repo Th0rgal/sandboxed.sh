@@ -10,6 +10,7 @@ import {
 } from "@/lib/api/projects";
 import {
   cardSummary,
+  resolveSessionProjectSlug,
   viewMovingItems,
   viewOpenItems,
   viewPendingDecisions,
@@ -34,12 +35,17 @@ export function SessionProjectRail({ sessionId }: { sessionId: string }) {
     },
     { revalidateOnFocus: false, shouldRetryOnError: false },
   );
-  const slug = resolved?.slug;
+  const rawSlug = resolved?.slug;
   const { data: overview } = useSWR(
-    slug ? "projects-overview" : null,
+    rawSlug ? "projects-overview" : null,
     getProjectsOverview,
     { revalidateOnFocus: false },
   );
+  const slug = resolveSessionProjectSlug({
+    resolvedSlug: rawSlug,
+    sessionId,
+    projects: overview?.projects ?? [],
+  });
   const { data: detail } = useSWR(
     slug ? ["project-detail", slug] : null,
     () => getProject(slug!),
