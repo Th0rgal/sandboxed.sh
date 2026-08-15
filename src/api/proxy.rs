@@ -291,16 +291,30 @@ fn native_protocol_supported(
     has_oauth: bool,
 ) -> bool {
     match protocol {
-        NativeProtocol::Responses => {
-            matches!(
-                provider_type,
-                ProviderType::OpenAI | ProviderType::Xai | ProviderType::Muse
-            ) && has_api_key
-        }
-        // Direct OAuth records carry a hoisted access token. The synthetic CLI
-        // adapter has no key and therefore fails closed.
+        NativeProtocol::Responses => match provider_type {
+            ProviderType::Muse => has_api_key,
+            // OAuth-only OpenAI (Codex) and xAI (Grok Build) accounts route
+            // native Responses through the local CLI proxy, which owns the
+            // credential. The CLI-proxy route is stateless: it does not honor
+            // `previous_response_id`, so continuity there is items-replay only.
+            ProviderType::OpenAI => {
+                has_api_key
+                    || (has_oauth && crate::api::ai_providers::openai_cli_proxy_account_available())
+            }
+            ProviderType::Xai => {
+                has_api_key
+                    || (has_oauth && crate::api::ai_providers::xai_cli_proxy_account_available())
+            }
+            _ => false,
+        },
+        // Direct API keys hit api.anthropic.com. OAuth (subscription) accounts
+        // route native Messages through the local CLI proxy, which owns the
+        // Claude credential and preserves signed thinking blocks on replay.
         NativeProtocol::AnthropicMessages => {
-            provider_type == ProviderType::Anthropic && has_api_key && !has_oauth
+            provider_type == ProviderType::Anthropic
+                && ((has_api_key && !has_oauth)
+                    || (has_oauth
+                        && crate::api::ai_providers::anthropic_cli_proxy_account_available()))
         }
     }
 }
@@ -319,6 +333,18 @@ fn cli_proxy_chat_completions_url() -> String {
         format!("{}/chat/completions", base)
     } else {
         format!("{}/v1/chat/completions", base)
+    }
+}
+
+fn cli_proxy_native_url(suffix: &str) -> String {
+    let base = crate::util::cli_proxy_base_url_from_env()
+        .unwrap_or_else(|| DEFAULT_CLI_PROXY_API_BASE_URL.to_string());
+    let base = base.trim_end_matches('/');
+    let base = base.strip_suffix("/chat/completions").unwrap_or(base);
+    if base.ends_with("/v1") {
+        format!("{}/{}", base, suffix)
+    } else {
+        format!("{}/v1/{}", base, suffix)
     }
 }
 
@@ -457,7 +483,10 @@ fn protocol_capabilities(
             chat_completions: has_routable_proxy_credentials(provider_type, has_api_key, has_oauth),
             responses,
             anthropic_messages,
-            previous_response_id: responses,
+            // The CLI-proxy Responses route (OAuth-only OpenAI/xAI) is
+            // stateless and ignores `previous_response_id`; only a direct
+            // API-key route offers server-side continuation.
+            previous_response_id: responses && has_api_key,
             reasoning_content_replay: false,
             thinking_blocks_replay: false,
             native_function_tools: responses,
@@ -481,6 +510,22 @@ fn protocol_capabilities(
                 previous_response_id: false,
                 // Stateless replay carried in each Chat request, so it needs no
                 // account affinity — but it is only meaningful on a routable route.
+                reasoning_content_replay: chat_completions,
+                thinking_blocks_replay: false,
+                native_function_tools: chat_completions,
+            }
+        }
+        // Z.AI GLM chat returns `reasoning_content` on thinking models and
+        // accepts the complete assistant message (including that field) on
+        // replay — the same stateless Kimi-style continuity contract.
+        ProviderType::Zai => {
+            let chat_completions =
+                has_routable_proxy_credentials(provider_type, has_api_key, has_oauth);
+            ProtocolCapabilities {
+                chat_completions,
+                responses,
+                anthropic_messages,
+                previous_response_id: false,
                 reasoning_content_replay: chat_completions,
                 thinking_blocks_replay: false,
                 native_function_tools: chat_completions,
@@ -1014,6 +1059,18 @@ fn native_response_usage(body: &[u8]) -> Option<(u64, u64)> {
     (input > 0 || output > 0).then_some((input, output))
 }
 
+fn body_has_previous_response_id(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("previous_response_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| !id.is_empty())
+        })
+        .unwrap_or(false)
+}
+
 fn native_request_has_continuation(protocol: NativeProtocol, body: &[u8]) -> bool {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
@@ -1179,12 +1236,58 @@ async fn native_protocol_proxy(
         ) {
             continue;
         }
-        let Some(url) = protocol_url(protocol, provider_type, entry.base_url.as_deref()) else {
-            continue;
+        // OAuth entries reach native protocols through the local CLI proxy,
+        // which owns the credential:
+        //   - Responses for OAuth-only OpenAI (Codex) / xAI (Grok Build);
+        //   - Anthropic Messages for Claude subscription OAuth.
+        // The CLI-proxy Responses route is stateless: it silently ignores
+        // `previous_response_id`, so reject stateful continuation instead of
+        // pretending it was honored. Messages continuity is client-side block
+        // replay, which the CLI proxy preserves.
+        let via_cli_proxy = match protocol {
+            NativeProtocol::Responses => {
+                matches!(provider_type, ProviderType::OpenAI | ProviderType::Xai)
+                    && entry
+                        .api_key
+                        .as_deref()
+                        .filter(|v| !v.trim().is_empty())
+                        .is_none()
+            }
+            NativeProtocol::AnthropicMessages => {
+                provider_type == ProviderType::Anthropic && entry.has_oauth
+            }
         };
-        let Some(credential) = entry.api_key.as_deref().filter(|v| !v.trim().is_empty()) else {
-            continue;
+        let (url, credential) = if via_cli_proxy {
+            if matches!(protocol, NativeProtocol::Responses) && body_has_previous_response_id(&body)
+            {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Chain '{chain_id}' routes Responses through the stateless CLI proxy, which does not honor 'previous_response_id'; replay prior output items in 'input' instead"
+                    ),
+                    "unsupported_parameter",
+                );
+            }
+            let Some(key) =
+                crate::util::cli_proxy_api_key_from_env().filter(|v| !v.trim().is_empty())
+            else {
+                continue;
+            };
+            let suffix = match protocol {
+                NativeProtocol::Responses => "responses",
+                NativeProtocol::AnthropicMessages => "messages",
+            };
+            (cli_proxy_native_url(suffix), key)
+        } else {
+            let Some(url) = protocol_url(protocol, provider_type, entry.base_url.as_deref()) else {
+                continue;
+            };
+            let Some(credential) = entry.api_key.as_deref().filter(|v| !v.trim().is_empty()) else {
+                continue;
+            };
+            (url, credential.to_string())
         };
+        let credential = credential.as_str();
         supported_entries += 1;
         let upstream_body = match rewrite_model(&body, &entry.model_id) {
             Ok(body) => body,
@@ -1204,6 +1307,17 @@ async fn native_protocol_proxy(
         match protocol {
             NativeProtocol::Responses => {
                 request = request.bearer_auth(credential);
+            }
+            // The CLI proxy authenticates with its own bearer key and injects
+            // the Claude credential itself — Anthropic auth headers would be
+            // wrong there.
+            NativeProtocol::AnthropicMessages if via_cli_proxy => {
+                request = request.bearer_auth(credential);
+                for name in ["anthropic-version", "anthropic-beta"] {
+                    if let Some(value) = headers.get(name) {
+                        request = request.header(name, value);
+                    }
+                }
             }
             NativeProtocol::AnthropicMessages => {
                 for (name, value) in build_anthropic_proxy_headers(credential, entry.has_oauth) {
@@ -6058,6 +6172,38 @@ mod tests {
         let kimi = protocol_capabilities(ProviderType::Kimi, true, false);
         assert!(kimi.chat_completions && kimi.reasoning_content_replay);
         assert!(!kimi.responses && !kimi.anthropic_messages);
+
+        let kimi_no_creds = protocol_capabilities(ProviderType::Kimi, false, false);
+        assert!(!kimi_no_creds.reasoning_content_replay && !kimi_no_creds.native_function_tools);
+
+        let zai = protocol_capabilities(ProviderType::Zai, true, false);
+        assert!(zai.chat_completions && zai.reasoning_content_replay);
+        assert!(!zai.responses && !zai.anthropic_messages && !zai.previous_response_id);
+        let zai_no_creds = protocol_capabilities(ProviderType::Zai, false, false);
+        assert!(!zai_no_creds.reasoning_content_replay);
+
+        // Direct API keys keep server-side continuation; the stateless
+        // CLI-proxy route must never advertise `previous_response_id`.
+        let openai_key = protocol_capabilities(ProviderType::OpenAI, true, false);
+        assert!(openai_key.responses && openai_key.previous_response_id);
+    }
+
+    #[test]
+    fn cli_proxy_native_url_derives_from_base() {
+        std::env::remove_var("CLI_PROXY_API_BASE_URL");
+        assert!(cli_proxy_native_url("responses").ends_with("/v1/responses"));
+        assert!(cli_proxy_native_url("messages").ends_with("/v1/messages"));
+    }
+
+    #[test]
+    fn body_previous_response_id_detection() {
+        assert!(body_has_previous_response_id(
+            br#"{"previous_response_id":"resp_1"}"#
+        ));
+        assert!(!body_has_previous_response_id(
+            br#"{"previous_response_id":""}"#
+        ));
+        assert!(!body_has_previous_response_id(br#"{"input":"hi"}"#));
     }
 
     #[test]
