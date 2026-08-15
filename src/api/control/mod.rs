@@ -4043,10 +4043,9 @@ impl ControlHub {
     }
 
     /// Board tasks across every store whose boss mission belongs to this
-    /// project family. Live stores answer through the trait; persisted SQLite
-    /// databases with no live control session (fresh restart, other users) are
-    /// read directly — otherwise the roadmap goes blank whenever nobody has a
-    /// session open. File stores have no boards and are skipped.
+    /// project family. Kept for boss-internal / debug reads. The public
+    /// project roadmap is the item list (`load_project_items`), not this.
+    #[allow(dead_code)]
     pub(crate) async fn collect_project_board_tasks(
         &self,
         project: &str,
@@ -10852,7 +10851,19 @@ pub async fn update_mission_project(
             })
         })
     };
-    let project = normalize(req.project);
+    let project = normalize(req.project).map(|inner| {
+        inner.map(|raw| {
+            let canonical = crate::api::projects_overview::canonicalize_project_slug(&raw);
+            if canonical != raw {
+                tracing::info!(
+                    from = %raw,
+                    to = %canonical,
+                    "canonicalized mission project patch via routes.json alias"
+                );
+            }
+            canonical
+        })
+    });
     let track = normalize(req.track);
     let intent = normalize(req.intent);
     let github_pr = normalize(req.github_pr);

@@ -161,7 +161,7 @@ pub fn project_items(
                 kind: "track",
                 desired_state: track.desired_state.clone(),
                 status: track.status.clone(),
-                open: track.status.as_deref() != Some("done"),
+                open: !matches!(track.status.as_deref(), Some("done") | Some("cancelled")),
                 attempts: Vec::new(),
             },
         );
@@ -562,6 +562,16 @@ mod tests {
             .attempts
             .iter()
             .all(|attempt| attempt.id != live.id || item.key == "core")));
+
+        let cancelled = vec![ProjectTrack {
+            track: "old-pr46".to_string(),
+            desired_state: Some("certify PR 46".to_string()),
+            status: Some("cancelled".to_string()),
+            updated_at: "2026-08-01T00:00:00Z".to_string(),
+        }];
+        let closed = project_items(&cancelled, &[], &[]);
+        assert_eq!(closed.len(), 1);
+        assert!(!closed[0].open, "cancelled tracks are not open items");
         let historical = missions
             .iter()
             .filter(|mission| {

@@ -150,11 +150,18 @@ reach your project's row at all.**
 Before the two text trailers, record your state in the durable project store — the board
 and any live surface read *this*, not a parsed trailer. Once per tick:
 
-- `update_project_status(slug, mode, next_action, blocker)` with your exact project slug
-  (`verity`, `lido-audit`, `verity-benchmark`, `lean-silicon`, `coldcard-rng-cracker`).
-  Same mode vocabulary as the trailer; the store counts your consecutive-tick `wait`.
+- `update_project_status(slug, mode, next_action, blocker)` with your **canonical**
+  roster slug (`verity-core`, `verity-lido`, `verity-benchmark`, `lean-silicon`,
+  `coldcard-rng-cracker`). Nicknames (`verity`, `lido`, `lido-audit`) resolve, but
+  do not invent a new slug. Same mode vocabulary as the trailer; the store counts
+  your consecutive-tick `wait`.
+- The project's **items are the only roadmap**. `get_project` / `get_project_tasks`
+  return the same list (tracks + live attempts). `plan_project_tasks` upserts an
+  item (`project_tracks`). Do not create a second plan (no extra cron "roadmap
+  watcher", no `/goal` as the program, no new `project=` for a workstream — that
+  is a `track`).
 - For every mission you dispatch this tick, `link_mission_to_project(mission_id, slug,
-  track)` so it appears in the project's inventory. An unlinked worker is invisible.
+  track)` so it appears on that item. An unlinked worker is invisible.
 - At your first tick (or after the prompt changed), read `get_project_grant(slug)` — the
   merge authority, budget, and any PAUSED live there and outrank the prompt.
 - Each tick, `set_project_track` for every open in-scope PR and issue so the roadmap
@@ -266,6 +273,7 @@ repeated failure `repeat-loop-guard` · tool-call limits `context-budget`.
 - **Never cancel operator-relaunched missions without explicit confirmation.** If a mission you previously owned was relaunched or resumed by the operator, it is no longer yours to reap: do not cancel, pause, or supersede it unless the operator explicitly confirms. When in doubt, ask and keep your own work in a separate mission.
 - **Campaigns are one host-workspace mission with `track=campaign` — never hand-written systemd units.** Long-running or recurring campaign work runs as a single mission on a host workspace tagged `track=campaign`; do not create ad-hoc systemd services/timers for it. The API enforces campaign uniqueness and returns **409 Conflict** on a duplicate — treat a 409 as "the campaign already exists", not an error to retry around.
 - **STATE_SIGNATURE key = your project canonical roster slug, always.** Use exactly the slug of the project you drive (e.g. `verity-core`, `verity-lido`, `lean-silicon`, `verity-benchmark`, `coldcard-rng-cracker`). Never invent new keys (no camelCase names, phase names, or sub-tracks as keys — use the `track` field for that); a novel key creates a duplicate project on every surface. Nicknames (`coldcard`, `ec-defensive-research`) are aliases — they must resolve to the roster slug, never replace it.
+- **One list, one controller.** Do not add a second cron that "watches the roadmap". The bound conversation already is the project. A `/goal` is not a second roadmap.
 - **Deliver into the project session, never `origin` without an origin.** Cron jobs for a project use `deliver: project:<slug>`. `deliver: origin` with `origin: None` is a silent drop (Coldcard skip-scan watch, 2026-08-13). If you cannot capture origin, you must name the project.
 - **Do not delete the project's controller because it is noisy.** A repeating `blocked` trailer is a stall to escalate, not spam to silence. Removing the cron removes the only path that can write into the dedicated session.
 - **Acknowledge what you have absorbed.** When a failed/interrupted mission has been superseded (retry dispatched, work re-planned, or intentionally dropped), immediately mark it `acknowledged` — an unacknowledged terminal mission is an open operator alert. The attention surface only counts UNacknowledged failures; leaving absorbed failures unacknowledged cries wolf on every board.
