@@ -214,6 +214,23 @@ pub(crate) async fn cleanup_stale_active_missions_once(
     match mission_store.get_stale_active_missions(stale_hours).await {
         Ok(stale_missions) => {
             for mission in stale_missions {
+                // Same ownership rule as the 15-minute watchdog (#840) and
+                // registered-liveness interrupt (#841). Grok 08306fdb / Kimi
+                // c91618dc / cert 203a49d5 were still in a long turn (CPU
+                // 11–14%) when this 2-hour net marked them Completed with
+                // "Auto-closed after 2 hours of inactivity" — a false
+                // terminal that resume() then refuses.
+                if watchdog_skips_control_owned_mission(
+                    mission.origin.as_deref(),
+                    mission.origin_session_id.as_deref(),
+                    &mission.project.tags,
+                ) {
+                    tracing::warn!(
+                        mission_id = %mission.id,
+                        "Stale cleanup: control-owned mission idle — NOT auto-closing"
+                    );
+                    continue;
+                }
                 tracing::info!(
                     "Auto-closing stale mission {}: '{}' (inactive since {})",
                     mission.id,
