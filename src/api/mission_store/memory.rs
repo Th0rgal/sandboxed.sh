@@ -42,6 +42,22 @@ impl InMemoryMissionStore {
             board_outbox: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    /// Test-only: backdate `updated_at` so `get_stale_active_missions` can
+    /// select a row without waiting real hours.
+    #[cfg(test)]
+    pub(crate) async fn test_set_updated_at(
+        &self,
+        id: Uuid,
+        updated_at: String,
+    ) -> Result<(), String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {id} not found"))?;
+        mission.updated_at = updated_at;
+        Ok(())
+    }
 }
 
 impl Default for InMemoryMissionStore {

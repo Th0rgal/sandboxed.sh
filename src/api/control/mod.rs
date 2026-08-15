@@ -26930,6 +26930,59 @@ mod tests {
         assert_eq!(stored.status, MissionStatus::Active);
     }
 
+    #[tokio::test]
+    async fn cleanup_stale_active_missions_once_skips_hermes_tagged_writer() {
+        let inner = Arc::new(mission_store::InMemoryMissionStore::new());
+        let store: Arc<dyn MissionStore> = inner.clone();
+        let mission = store
+            .create_mission(
+                Some("Grok 4.6 — repair Verity PR #2332"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("mission should become active");
+        store
+            .update_mission_project(
+                mission.id,
+                mission_store::MissionProjectPatch {
+                    project: None,
+                    track: None,
+                    intent: None,
+                    github_pr: None,
+                    tags: Some(vec!["origin:hermes-assistant".to_string()]),
+                    desired_state: None,
+                    next_check_at: None,
+                },
+            )
+            .await
+            .expect("tags should apply");
+        let stale_at = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        inner
+            .test_set_updated_at(mission.id, stale_at)
+            .await
+            .expect("updated_at should backdate");
+
+        let (events_tx, _events_rx) = broadcast::channel(8);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        cleanup_stale_active_missions_once(&store, 2, &events_tx, &cmd_tx).await;
+
+        let stored = store
+            .get_mission(mission.id)
+            .await
+            .expect("mission lookup should succeed")
+            .expect("mission should exist");
+        assert_eq!(stored.status, MissionStatus::Active);
+    }
+
     #[test]
     fn test_parse_image_tag() {
         let tags = parse_rich_tags(r#"<image path="./chart.png" alt="My Chart" />"#);
