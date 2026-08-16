@@ -61,8 +61,7 @@ async fn run_loop(state: Arc<AppState>) {
         // Roots persisted for active missions can outlive a configuration
         // change, so sample every filesystem that can still host one rather
         // than only today's MISSION_WORKSPACE_ROOT.
-        let workspace =
-            crate::workspace::Workspace::default_host(state.config.working_dir.clone());
+        let workspace = crate::workspace::Workspace::default_host(state.config.working_dir.clone());
         let usage = crate::workspace::mission_workspace_roots_for_workspace(&workspace)
             .into_iter()
             .filter_map(|root| match monitoring::disk_usage_for_path(&root) {
