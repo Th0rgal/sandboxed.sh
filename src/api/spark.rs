@@ -276,6 +276,28 @@ async fn offload_build(
             .into_response();
     }
 
+    // The capability belongs to a persisted mission placement.  Do this after
+    // authorization (so it is not a mount-probing oracle), but before rsync
+    // can read from or write to a stale mountpoint on the root filesystem.
+    let mission_store = state.control.get_mission_store().await;
+    let mission = match mission_store.get_mission(req.mission_id).await {
+        Ok(Some(mission)) => mission,
+        _ => return (StatusCode::NOT_FOUND, "mission not found").into_response(),
+    };
+    let workspace = match state.workspaces.get(mission.workspace_id).await {
+        Some(workspace) => workspace,
+        None => return (StatusCode::NOT_FOUND, "mission workspace not found").into_response(),
+    };
+    if let Err(error) =
+        crate::workspace::ensure_persisted_mission_root_is_available(&workspace, req.mission_id)
+    {
+        return (
+            StatusCode::CONFLICT,
+            format!("persisted mission workspace root is unavailable: {error}"),
+        )
+            .into_response();
+    }
+
     // Availability check runs AFTER authorization so an unauthorized caller can
     // never probe whether Spark is configured. All three must be set, else tell
     // the (authorized) caller to build locally via a 503.

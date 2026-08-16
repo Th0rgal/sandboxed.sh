@@ -12717,6 +12717,10 @@ async fn cleanup_mission_workspace_dirs_for_delete(
         let Some(ws) = workspaces.get(mission.workspace_id).await else {
             continue;
         };
+        if let Err(error) = workspace::ensure_persisted_mission_root_is_available(&ws, mission.id) {
+            tracing::warn!(mission_id = %mission.id, %error, "refusing to delete workspace with unavailable persisted root");
+            continue;
+        }
         let dir = workspace::mission_workspace_dir_for_workspace(&ws, mission.id);
         if !dir.exists() {
             continue;

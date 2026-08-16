@@ -898,18 +898,96 @@ pub fn mission_workspace_dir_for_root(root: &Path, mission_id: Uuid) -> PathBuf 
 const MISSION_WORKSPACE_ROOTS_FILE: &str = "mission-workspace-roots.json";
 static MISSION_WORKSPACE_ROOTS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// The filesystem that owned a mission root when it was selected.  A path is
+/// not an identity: after an unmount its mountpoint can remain as an ordinary
+/// directory on the parent filesystem.  On Unix `st_dev` is the kernel's
+/// filesystem/device identity and changes in precisely that situation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct MissionWorkspaceRootRecord {
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filesystem_identity: Option<String>,
+}
+
+/// Accept the path-only format written by releases before filesystem identity
+/// was recorded.  The first successful use upgrades it under the registry
+/// lock; an unavailable legacy root is never replaced by the configured root.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MissionWorkspaceRootRecordOnDisk {
+    Legacy(String),
+    Current(MissionWorkspaceRootRecord),
+}
+
+impl From<MissionWorkspaceRootRecordOnDisk> for MissionWorkspaceRootRecord {
+    fn from(value: MissionWorkspaceRootRecordOnDisk) -> Self {
+        match value {
+            MissionWorkspaceRootRecordOnDisk::Legacy(path) => Self {
+                path,
+                filesystem_identity: None,
+            },
+            MissionWorkspaceRootRecordOnDisk::Current(record) => record,
+        }
+    }
+}
+
 fn mission_workspace_roots_path(workspace: &Workspace) -> PathBuf {
     config_root(&workspace.path).join(MISSION_WORKSPACE_ROOTS_FILE)
 }
 
-fn persisted_mission_workspace_root(workspace: &Workspace, mission_id: Uuid) -> Option<PathBuf> {
-    let contents = std::fs::read_to_string(mission_workspace_roots_path(workspace)).ok()?;
-    let roots: HashMap<String, String> = serde_json::from_str(&contents).ok()?;
-    let root = PathBuf::from(roots.get(&mission_id.to_string())?);
-    // This is persisted local state, but it is still untrusted after a manual
-    // edit.  Do not turn a corrupt registry into an API path escape.
-    let root = root.canonicalize().ok()?;
-    root.is_dir().then_some(root)
+fn filesystem_identity(path: &Path) -> std::io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!("dev:{}", std::fs::metadata(path)?.dev()))
+    }
+    #[cfg(not(unix))]
+    {
+        // The production deployment is Linux.  Keep non-Unix builds safe by
+        // requiring the resolved location to remain unchanged rather than
+        // pretending that an unverified path is a stable filesystem identity.
+        Ok(format!("path:{}", path.canonicalize()?.display()))
+    }
+}
+
+fn read_mission_workspace_roots(
+    workspace: &Workspace,
+) -> std::io::Result<HashMap<String, MissionWorkspaceRootRecord>> {
+    let contents = std::fs::read_to_string(mission_workspace_roots_path(workspace))?;
+    let roots: HashMap<String, MissionWorkspaceRootRecordOnDisk> = serde_json::from_str(&contents)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(roots
+        .into_iter()
+        .map(|(id, root)| (id, root.into()))
+        .collect())
+}
+
+fn validate_mission_workspace_root(
+    record: &MissionWorkspaceRootRecord,
+) -> std::io::Result<(PathBuf, String)> {
+    let root = PathBuf::from(&record.path).canonicalize()?;
+    if !root.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "persisted mission workspace root {} is not a directory",
+                record.path
+            ),
+        ));
+    }
+    let actual_identity = filesystem_identity(&root)?;
+    if let Some(expected_identity) = &record.filesystem_identity {
+        if expected_identity != &actual_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "persisted mission workspace root {} changed filesystem identity (expected {}, got {})",
+                    root.display(), expected_identity, actual_identity
+                ),
+            ));
+        }
+    }
+    Ok((root, actual_identity))
 }
 
 /// Refuse to create a replacement directory when an existing mission's
@@ -920,25 +998,31 @@ pub fn ensure_persisted_mission_root_is_available(
     mission_id: Uuid,
 ) -> std::io::Result<()> {
     let path = mission_workspace_roots_path(workspace);
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
+    let contents = match std::fs::read_to_string(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
+        Ok(contents) => contents,
     };
-    let roots: HashMap<String, String> = serde_json::from_str(&contents)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if let Some(root) = roots.get(&mission_id.to_string()) {
-        let root = PathBuf::from(root);
-        let canonical = root.canonicalize()?;
-        if !canonical.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "persisted mission workspace root {} is not a directory",
-                    root.display()
-                ),
-            ));
-        }
+    let mut roots: HashMap<String, MissionWorkspaceRootRecordOnDisk> =
+        serde_json::from_str(&contents)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let Some(on_disk) = roots.remove(&mission_id.to_string()) else {
+        return Ok(());
+    };
+    let record: MissionWorkspaceRootRecord = on_disk.into();
+    let (_, identity) = validate_mission_workspace_root(&record)?;
+    if record.filesystem_identity.is_none() {
+        // Compatibility migration: bind the identity only after the legacy
+        // path was successfully reached.  This closes the mountpoint hole for
+        // every later caller and never permits a fallback while unavailable.
+        persist_mission_workspace_root_record(
+            workspace,
+            mission_id,
+            MissionWorkspaceRootRecord {
+                path: record.path,
+                filesystem_identity: Some(identity),
+            },
+        )?;
     }
     Ok(())
 }
@@ -948,7 +1032,7 @@ pub fn ensure_persisted_mission_root_is_available(
 /// complete old JSON document or a complete new one, never a truncation.
 fn atomic_write_mission_workspace_roots(
     path: &Path,
-    roots: &HashMap<String, String>,
+    roots: &HashMap<String, MissionWorkspaceRootRecord>,
 ) -> std::io::Result<()> {
     let parent = path.parent().expect("mission root registry has parent");
     let temp = parent.join(format!(
@@ -981,6 +1065,23 @@ fn persist_mission_workspace_root(
     mission_id: Uuid,
     root: &Path,
 ) -> std::io::Result<()> {
+    let canonical = root.canonicalize()?;
+    let identity = filesystem_identity(&canonical)?;
+    persist_mission_workspace_root_record(
+        workspace,
+        mission_id,
+        MissionWorkspaceRootRecord {
+            path: canonical.to_string_lossy().into_owned(),
+            filesystem_identity: Some(identity),
+        },
+    )
+}
+
+fn persist_mission_workspace_root_record(
+    workspace: &Workspace,
+    mission_id: Uuid,
+    record: MissionWorkspaceRootRecord,
+) -> std::io::Result<()> {
     if workspace.id != DEFAULT_WORKSPACE_ID {
         return Ok(());
     }
@@ -1001,16 +1102,26 @@ fn persist_mission_workspace_root(
             .truncate(false)
             .open(lock_path)?;
         fs2::FileExt::lock_exclusive(&lock_file)?;
-        let mut roots: HashMap<String, String> = match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(error) => return Err(error),
-        };
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            roots.entry(mission_id.to_string())
-        {
-            entry.insert(root.to_string_lossy().into_owned());
+        let mut roots: HashMap<String, MissionWorkspaceRootRecord> =
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => serde_json::from_str::<
+                    HashMap<String, MissionWorkspaceRootRecordOnDisk>,
+                >(&contents)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+                .into_iter()
+                .map(|(id, value)| (id, value.into()))
+                .collect(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+                Err(error) => return Err(error),
+            };
+        let entry = roots.entry(mission_id.to_string());
+        if matches!(entry, std::collections::hash_map::Entry::Vacant(_)) {
+            entry.or_insert(record);
+            atomic_write_mission_workspace_roots(&path, &roots)?;
+        } else if entry.into_mut().filesystem_identity.is_none() {
+            *roots
+                .get_mut(&mission_id.to_string())
+                .expect("entry exists") = record;
             atomic_write_mission_workspace_roots(&path, &roots)?;
         }
         fs2::FileExt::unlock(&lock_file)?;
@@ -1085,8 +1196,14 @@ fn mission_workspace_root_is_writable(root: &Path) -> bool {
 /// Existing generated directories always win, which keeps active missions and
 /// historic workspace records compatible after an operator enables a new root.
 pub fn mission_workspace_root_for_workspace(workspace: &Workspace, mission_id: Uuid) -> PathBuf {
-    if let Some(root) = persisted_mission_workspace_root(workspace, mission_id) {
-        return root;
+    // All operational callers must use `ensure_persisted_mission_root_is_available`
+    // before resolving.  Do not silently treat an invalid persisted record as
+    // absent here: retain its path so an accidental caller cannot create under
+    // today's configured root.
+    if let Ok(roots) = read_mission_workspace_roots(workspace) {
+        if let Some(record) = roots.get(&mission_id.to_string()) {
+            return PathBuf::from(&record.path);
+        }
     }
     let legacy = mission_workspace_dir_for_root(&workspace.path, mission_id);
     if legacy.exists() || workspace.id != DEFAULT_WORKSPACE_ID {
@@ -1111,10 +1228,14 @@ pub fn mission_workspace_roots_for_workspace(workspace: &Workspace) -> Vec<PathB
     if workspace.id == DEFAULT_WORKSPACE_ID {
         roots.push(configured_mission_workspace_root(&workspace.path));
         if let Ok(contents) = std::fs::read_to_string(mission_workspace_roots_path(workspace)) {
-            if let Ok(saved) = serde_json::from_str::<HashMap<String, String>>(&contents) {
+            if let Ok(saved) =
+                serde_json::from_str::<HashMap<String, MissionWorkspaceRootRecordOnDisk>>(&contents)
+            {
                 roots.extend(saved.into_values().filter_map(|root| {
-                    let root = PathBuf::from(root).canonicalize().ok()?;
-                    root.is_dir().then_some(root)
+                    let record: MissionWorkspaceRootRecord = root.into();
+                    validate_mission_workspace_root(&record)
+                        .ok()
+                        .map(|(root, _)| root)
                 }));
             }
         }
@@ -5045,6 +5166,66 @@ WORKING_DIR = "/workspaces/mission-old"
         assert!(!mission_workspace_dir_for_root(temp.path(), mission).exists());
     }
 
+    #[tokio::test]
+    async fn persisted_root_identity_mismatch_fails_closed_without_recreating_on_mountpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("mountpoint-left-after-unmount");
+        std::fs::create_dir_all(&storage).unwrap();
+        let mission = Uuid::new_v4();
+        let workspace = Workspace::default_host(temp.path().to_path_buf());
+        let registry_dir = config_root(&workspace.path);
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        // This models the same path after its volume was unmounted: it is
+        // still a directory, but `st_dev` no longer matches the identity that
+        // was recorded when the mission was placed there.
+        std::fs::write(
+            mission_workspace_roots_path(&workspace),
+            serde_json::json!({mission.to_string(): {
+                "path": storage,
+                "filesystem_identity": "dev:identity-before-unmount"
+            }})
+            .to_string(),
+        )
+        .unwrap();
+
+        let mcp = McpRegistry::new(temp.path()).await;
+        let result = prepare_mission_workspace_in(&workspace, &mcp, mission).await;
+        assert!(result.is_err());
+        assert!(!mission_workspace_dir_for_root(temp.path(), mission).exists());
+        assert!(ensure_persisted_mission_root_is_available(&workspace, mission).is_err());
+    }
+
+    #[test]
+    fn legacy_path_only_record_is_migrated_only_after_the_root_is_reachable() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("legacy-storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let mission = Uuid::new_v4();
+        let workspace = Workspace::default_host(temp.path().to_path_buf());
+        std::fs::create_dir_all(config_root(&workspace.path)).unwrap();
+        std::fs::write(
+            mission_workspace_roots_path(&workspace),
+            serde_json::json!({mission.to_string(): storage}).to_string(),
+        )
+        .unwrap();
+
+        ensure_persisted_mission_root_is_available(&workspace, mission).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mission_workspace_roots_path(&workspace)).unwrap(),
+        )
+        .unwrap();
+        assert!(saved[mission.to_string()]["filesystem_identity"].is_string());
+        // A fresh workspace models restart: the migrated entry still resolves
+        // to the selected root rather than today's configured placement.
+        assert_eq!(
+            mission_workspace_root_for_workspace(
+                &Workspace::default_host(temp.path().to_path_buf()),
+                mission
+            ),
+            storage.canonicalize().unwrap()
+        );
+    }
+
     #[test]
     fn mission_root_registry_serializes_concurrent_writers_and_readers() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -5066,8 +5247,9 @@ WORKING_DIR = "/workspaces/mission-old"
             while !reader_finished.load(Ordering::Acquire) {
                 let path = mission_workspace_roots_path(&reader_workspace);
                 if let Ok(contents) = std::fs::read_to_string(path) {
-                    let _: HashMap<String, String> = serde_json::from_str(&contents)
-                        .expect("readers must never observe partial registry JSON");
+                    let _: HashMap<String, MissionWorkspaceRootRecordOnDisk> =
+                        serde_json::from_str(&contents)
+                            .expect("readers must never observe partial registry JSON");
                 }
             }
         });
@@ -5095,7 +5277,8 @@ WORKING_DIR = "/workspaces/mission-old"
         let after_restart = Workspace::default_host(temp.path().to_path_buf());
         let contents =
             std::fs::read_to_string(mission_workspace_roots_path(&after_restart)).unwrap();
-        let roots: HashMap<String, String> = serde_json::from_str(&contents).unwrap();
+        let roots: HashMap<String, MissionWorkspaceRootRecordOnDisk> =
+            serde_json::from_str(&contents).unwrap();
         assert_eq!(
             roots.len(),
             missions.len(),

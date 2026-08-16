@@ -12,7 +12,7 @@
 //! always fires; the webhook only when `PALOMA_WEBHOOK_FORWARD_URL` is set.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 

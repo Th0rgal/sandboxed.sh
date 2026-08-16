@@ -611,6 +611,21 @@ pub async fn resolve_path_for_workspace(
         )
     })?;
 
+    // A persisted placement is a capability, not a hint.  In particular, a
+    // vanished mount can leave an identically named directory on the parent
+    // disk.  Validate it before any path rewriting or create-on-upload path
+    // can reach that directory.
+    if let Some(mid) = mission_id {
+        crate::workspace::ensure_persisted_mission_root_is_available(&workspace, mid).map_err(
+            |error| {
+                (
+                    StatusCode::CONFLICT,
+                    format!("persisted mission workspace root is unavailable: {error}"),
+                )
+            },
+        )?;
+    }
+
     let workspace_root = workspace.path.canonicalize().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -790,6 +790,16 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
                         continue;
                     }
                 };
+                // A recorded root which now names a different filesystem is
+                // not an orphan on the parent disk.  Never inspect or remove
+                // its look-alike mission path until the original filesystem
+                // is back and its persisted identity verifies.
+                if let Err(error) =
+                    workspace::ensure_persisted_mission_root_is_available(&ws, mission.id)
+                {
+                    tracing::warn!(mission_id = %mission.id, %error, "mission GC: persisted root is unavailable; skipping collection");
+                    continue;
+                }
                 let dir = workspace::mission_workspace_dir_for_workspace(&ws, mission.id);
                 if !dir.exists() {
                     continue;

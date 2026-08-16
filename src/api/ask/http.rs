@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_persisted_root_rejects_ask_fallback() {
+    fn unavailable_or_replaced_persisted_root_rejects_ask_fallback() {
         let root = tempdir().unwrap();
         let storage = root.path().join("temporarily-unmounted-storage");
         std::fs::create_dir_all(&storage).unwrap();
@@ -517,6 +517,27 @@ mod tests {
         let error = resolve_base_work_dir(None, &workspace, false, mission).unwrap_err();
         assert!(error.contains("persisted mission workspace root is unavailable"));
         assert_ne!(error, workspace.path.display().to_string());
+
+        // An unmount can leave the mountpoint itself behind.  The path is
+        // reachable again here, but represents a different filesystem and
+        // must remain just as unavailable to Ask.
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(
+            registry_dir.join("mission-workspace-roots.json"),
+            serde_json::json!({ mission.to_string(): {
+                "path": storage,
+                "filesystem_identity": "dev:before-unmount"
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let error = resolve_base_work_dir(None, &workspace, false, mission).unwrap_err();
+        assert!(error.contains("persisted mission workspace root is unavailable"));
+        assert!(!workspace
+            .path
+            .join("workspaces")
+            .join(format!("mission-{}", &mission.to_string()[..8]))
+            .exists());
     }
 
     #[test]
