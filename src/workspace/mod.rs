@@ -1004,13 +1004,13 @@ fn validate_mission_workspace_root(
     }
     let actual_identity = filesystem_identity(&root)?;
     if let Some(expected_identity) = &record.filesystem_identity {
-        // `dev:<n>` was written by the first version of persisted placement.
-        // It cannot detect a same-device bind-mount replacement, but it is
-        // only accepted once for a reachable matching device and immediately
-        // upgraded below; unavailable roots still fail before any fallback.
-        let legacy_device_only = is_legacy_device_only_identity(expected_identity)
-            && actual_identity.starts_with(&format!("{expected_identity}:"));
-        if expected_identity != &actual_identity && !legacy_device_only {
+        // The immediately preceding build recorded a namespace-local mount
+        // ID before the stable `dev:…:ino:…` suffix.  Preserve that upgrade
+        // path, but never accept a device-only identity: a bind mount can be
+        // unmounted to reveal a same-device directory at the same path.
+        let legacy_mount_identity =
+            legacy_mount_identity_matches(expected_identity, &actual_identity);
+        if expected_identity != &actual_identity && !legacy_mount_identity {
             return Err(std::io::Error::other(format!(
                     "persisted mission workspace root {} changed filesystem identity (expected {}, got {})",
                     root.display(), expected_identity, actual_identity
@@ -1020,8 +1020,15 @@ fn validate_mission_workspace_root(
     Ok((root, actual_identity))
 }
 
-fn is_legacy_device_only_identity(identity: &str) -> bool {
-    identity.starts_with("dev:") && !identity.contains(":ino:")
+fn legacy_mount_identity_matches(identity: &str, actual_identity: &str) -> bool {
+    identity
+        .strip_prefix("mount:")
+        .and_then(|value| value.find(":dev:").map(|offset| &value[offset + 1..]))
+        .is_some_and(|stable_suffix| stable_suffix == actual_identity)
+}
+
+fn is_legacy_mount_identity(identity: &str) -> bool {
+    identity.starts_with("mount:") && identity.contains(":dev:") && identity.contains(":ino:")
 }
 
 /// Refuse to create a replacement directory when an existing mission's
@@ -1048,7 +1055,7 @@ pub fn ensure_persisted_mission_root_is_available(
     if record
         .filesystem_identity
         .as_deref()
-        .is_none_or(is_legacy_device_only_identity)
+        .is_none_or(is_legacy_mount_identity)
     {
         // Compatibility migration: bind the identity only after the legacy
         // path was successfully reached.  This closes the mountpoint hole for
@@ -1162,7 +1169,7 @@ fn persist_mission_workspace_root_record(
                     .get()
                     .filesystem_identity
                     .as_deref()
-                    .is_none_or(is_legacy_device_only_identity) =>
+                    .is_none_or(is_legacy_mount_identity) =>
             {
                 entry.insert(record);
                 true
@@ -5302,7 +5309,7 @@ WORKING_DIR = "/workspaces/mission-old"
     }
 
     #[test]
-    fn legacy_device_only_identity_is_upgraded_after_verification() {
+    fn legacy_mount_identity_is_upgraded_after_verification() {
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("legacy-device-storage");
         std::fs::create_dir_all(&storage).unwrap();
@@ -5310,12 +5317,12 @@ WORKING_DIR = "/workspaces/mission-old"
         let workspace = Workspace::default_host(temp.path().to_path_buf());
         std::fs::create_dir_all(config_root(&workspace.path)).unwrap();
         let current = filesystem_identity(&storage).unwrap();
-        let device_only = current.split(":ino:").next().unwrap();
+        let mount_formatted = format!("mount:12345:{current}");
         std::fs::write(
             mission_workspace_roots_path(&workspace),
             serde_json::json!({mission.to_string(): {
                 "path": storage,
-                "filesystem_identity": device_only,
+                "filesystem_identity": mount_formatted,
             }})
             .to_string(),
         )
@@ -5330,6 +5337,33 @@ WORKING_DIR = "/workspaces/mission-old"
             saved[mission.to_string()]["filesystem_identity"],
             serde_json::Value::String(current)
         );
+    }
+
+    #[test]
+    fn device_only_identity_fails_closed_instead_of_accepting_bind_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("legacy-device-storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let mission = Uuid::new_v4();
+        let workspace = Workspace::default_host(temp.path().to_path_buf());
+        std::fs::create_dir_all(config_root(&workspace.path)).unwrap();
+        let device_only = filesystem_identity(&storage)
+            .unwrap()
+            .split(":ino:")
+            .next()
+            .unwrap()
+            .to_owned();
+        std::fs::write(
+            mission_workspace_roots_path(&workspace),
+            serde_json::json!({mission.to_string(): {
+                "path": storage,
+                "filesystem_identity": device_only,
+            }})
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(ensure_persisted_mission_root_is_available(&workspace, mission).is_err());
     }
 
     #[test]
