@@ -181,8 +181,8 @@ async fn run_loop(state: Arc<AppState>) {
                 }
                 AlertAction::Recover => {
                     let message = format!(
-                        "Disk recovered: mission filesystem back to {percent:.1}% used; \
-                 mission admission restored."
+                        "Disk recovered: mission filesystem {} back to {percent:.1}% used.",
+                        mission_root.display()
                     );
                     tracing::info!(percent, "{message}");
                     deliver_webhook(&state, DiskHealthLevel::Ok, used, total, percent, &message)

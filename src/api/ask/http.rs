@@ -110,7 +110,10 @@ fn resolve_base_work_dir(
     if per_mission_dir.exists() {
         Ok(per_mission_dir)
     } else {
-        Ok(workspace_path.to_path_buf())
+        Err(format!(
+            "mission workspace is unavailable or not prepared: {}",
+            per_mission_dir.display()
+        ))
     }
 }
 
@@ -514,5 +517,13 @@ mod tests {
         let error = resolve_base_work_dir(None, &workspace, false, mission).unwrap_err();
         assert!(error.contains("persisted mission workspace root is unavailable"));
         assert_ne!(error, workspace.path.display().to_string());
+    }
+
+    #[test]
+    fn missing_selected_mission_directory_rejects_ask_fallback() {
+        let root = tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::default_host(root.path().to_path_buf());
+        let error = resolve_base_work_dir(None, &workspace, false, Uuid::new_v4()).unwrap_err();
+        assert!(error.contains("not prepared"));
     }
 }
