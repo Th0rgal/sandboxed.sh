@@ -93,11 +93,13 @@ Chaque livraison, **y compris les `[SILENT]`**, se termine par :
   dit depuis combien de ticks. `blocked:<cause>` est le seul suffixe autorisé
   et nomme la cause (`blocked:disk` est un vrai no-lane ; `blocked:harness`
   n'en est pas un).
-- `blocked:harness` — suffixe temporaire (≤ 3 ticks) pour un CLI manquant, un
-  binaire mauvaise arch, ou un `nsenter` cassé, puis contournement (autre
-  backend, workspace host). Ce n'est **pas** un projet bloqué. Préférer
-  `mode=active` + `next=` changer de backend / réparer le harness. Ne jamais
-  poser un `blocked` nu pour un échec de harness.
+- `blocked:harness` — suffixe de **trailer** temporaire (≤ 3 ticks) pour un
+  CLI manquant, un binaire mauvaise arch, ou un `nsenter` cassé, puis
+  contournement (autre backend, workspace host). Ce n'est **pas** un projet
+  bloqué. L'appel structuré `update_project_status` n'accepte que
+  `active`/`blocked`/`paused` : écrire `mode=blocked` + `blocker=harness`.
+  Préférer `mode=active` + `next=` changer de backend / réparer le harness.
+  Ne jamais poser un `blocked` nu pour un échec de harness.
 - `mode=paused` — dormant volontairement.
 
 Avant, ces trois régimes te parvenaient tous sous la forme d'un `[SILENT]`
