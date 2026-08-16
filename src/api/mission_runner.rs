@@ -3645,7 +3645,6 @@ async fn run_mission_turn(
             "Failed to sync MCP binaries into workspace"
         );
     }
-    let workspace_root = workspace.path.clone();
     let mission_work_dir_result = {
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
@@ -3673,8 +3672,14 @@ async fn run_mission_turn(
             dir
         }
         Err(e) => {
-            tracing::warn!("Failed to prepare mission workspace, using default: {}", e);
-            workspace_root
+            // A persisted placement error means the original filesystem is
+            // unavailable or has changed identity. Running against the raw
+            // workspace root would silently write a different tree.
+            tracing::warn!(mission_id = %mission_id, error = %e, "refusing to run mission without its verified workspace");
+            return AgentResult::failure(
+                format!("Failed to prepare verified mission workspace: {e}"),
+                0,
+            );
         }
     };
 

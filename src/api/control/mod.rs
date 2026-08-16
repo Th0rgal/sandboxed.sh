@@ -12715,12 +12715,31 @@ async fn cleanup_mission_workspace_dirs_for_delete(
     let mut deleted_dirs = Vec::new();
     for mission in missions {
         let Some(ws) = workspaces.get(mission.workspace_id).await else {
-            continue;
+            // Do not finalize the database deletion when the workspace that
+            // owns a mission's persisted placement cannot be consulted.  A
+            // relocated directory may still exist on a temporarily missing
+            // volume, and treating that as an already-clean workspace would
+            // orphan it permanently.
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "Cannot verify workspace placement for mission {} because workspace {} is unavailable",
+                    mission.id, mission.workspace_id
+                ),
+            ));
         };
-        if let Err(error) = workspace::ensure_persisted_mission_root_is_available(&ws, mission.id) {
-            tracing::warn!(mission_id = %mission.id, %error, "refusing to delete workspace with unavailable persisted root");
-            continue;
-        }
+        workspace::ensure_persisted_mission_root_is_available(&ws, mission.id).map_err(
+            |error| {
+                tracing::warn!(mission_id = %mission.id, %error, "refusing to delete workspace with unavailable persisted root");
+                (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Cannot delete mission {}: persisted mission workspace root is unavailable: {}",
+                        mission.id, error
+                    ),
+                )
+            },
+        )?;
         let dir = workspace::mission_workspace_dir_for_workspace(&ws, mission.id);
         if !dir.exists() {
             continue;
@@ -21864,8 +21883,14 @@ async fn run_single_control_turn(
         {
             Ok(dir) => dir,
             Err(e) => {
-                tracing::warn!("Failed to prepare mission workspace: {}", e);
-                ws.path.clone()
+                // The persisted mission root is a placement capability, not
+                // a hint. Do not run an Ask/control turn in the workspace
+                // root if its selected filesystem cannot be verified.
+                tracing::warn!(mission_id = %mid, error = %e, "refusing control turn without its verified mission workspace");
+                return crate::agents::AgentResult::failure(
+                    format!("Failed to prepare verified mission workspace: {e}"),
+                    0,
+                );
             }
         };
         (dir, Some(ws))
@@ -26998,6 +27023,97 @@ mod tests {
         assert!(!worker_dir.exists());
         assert!(store.get_mission(boss.id).await.unwrap().is_some());
         assert!(store.get_mission(worker.id).await.unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_refuses_changed_persisted_filesystem_until_identity_is_restored() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let storage = temp.path().join("relocated-storage");
+        std::fs::create_dir_all(&storage).expect("storage should be created");
+        let workspaces = Arc::new(workspace::WorkspaceStore::new(temp.path().to_path_buf()).await);
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(
+                Some("relocated mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission should be created");
+        let mission_dir = workspace::mission_workspace_dir_for_root(&storage, mission.id);
+        std::fs::create_dir_all(&mission_dir).expect("mission directory should be created");
+
+        let registry_dir = temp.path().join(".sandboxed-sh");
+        std::fs::create_dir_all(&registry_dir).expect("registry directory should be created");
+        let registry_path = registry_dir.join("mission-workspace-roots.json");
+        let actual_identity = format!("dev:{}", std::fs::metadata(&storage).unwrap().dev());
+        std::fs::write(
+            &registry_path,
+            serde_json::json!({ mission.id.to_string(): {
+                "path": storage,
+                "filesystem_identity": actual_identity
+            }})
+            .to_string(),
+        )
+        .expect("registry should be written");
+
+        // A completely unavailable persisted root must leave both the
+        // checkout and its database record intact.
+        let unavailable_storage = temp.path().join("temporarily-unmounted-storage");
+        std::fs::rename(&storage, &unavailable_storage).expect("storage should disappear");
+        let error = cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, mission.id, &[])
+            .await
+            .expect_err("deletion must fail closed for an unavailable filesystem");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(store.get_mission(mission.id).await.unwrap().is_some());
+        assert!(unavailable_storage
+            .join(mission_dir.file_name().unwrap())
+            .exists());
+        std::fs::rename(&unavailable_storage, &storage).expect("storage should be restored");
+
+        // An unmount can also leave the mountpoint path behind on a different
+        // filesystem. That identity mismatch is equally unsafe to delete.
+        std::fs::write(
+            &registry_path,
+            serde_json::json!({ mission.id.to_string(): {
+                "path": storage,
+                "filesystem_identity": "dev:changed-after-unmount"
+            }})
+            .to_string(),
+        )
+        .expect("mismatched registry should be written");
+        let error = cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, mission.id, &[])
+            .await
+            .expect_err("deletion must fail closed for a replaced filesystem");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(store.get_mission(mission.id).await.unwrap().is_some());
+        assert!(mission_dir.exists());
+
+        std::fs::write(
+            &registry_path,
+            serde_json::json!({ mission.id.to_string(): {
+                "path": storage,
+                "filesystem_identity": actual_identity
+            }})
+            .to_string(),
+        )
+        .expect("restored registry should be written");
+
+        cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, mission.id, &[])
+            .await
+            .expect("deletion should proceed after the original filesystem is restored");
+        delete_mission_with_children(&store, mission.id, &[])
+            .await
+            .expect("database record should delete only after verified cleanup");
+        assert!(!mission_dir.exists());
+        assert!(store.get_mission(mission.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
