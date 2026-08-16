@@ -1293,6 +1293,36 @@ async fn paloma_pending_alert_still_eligible(
     let Ok(Some(mission)) = ctx.mission_store.get_mission(mission_id).await else {
         return false;
     };
+    let active_run = ctx
+        .mission_store
+        .get_active_mission_run(mission.id)
+        .await
+        .ok()
+        .flatten();
+    let waiting_for_user_tool = active_run.as_ref().is_some_and(|run| {
+        run.execution_state == crate::api::mission_store::MissionExecutionState::WaitingUser
+    });
+    // Live AskUserQuestion alerts are keyed `mission_awaiting_user:<start>`
+    // while the stored mission stays Active. Kind-from-status would derive
+    // `mission_long_running` and drop the pending page before delivery.
+    if alert.event_kind.starts_with("mission_awaiting_user") {
+        if !waiting_for_user_tool {
+            return false;
+        }
+        let wait_started_at = match active_run.as_ref() {
+            Some(run) => {
+                crate::api::control::user_wait_tool_started_at(ctx.mission_store.as_ref(), run)
+                    .await
+            }
+            None => None,
+        };
+        return crate::api::operator_attention::mission_needs_operator(
+            &mission,
+            true,
+            wait_started_at.as_deref(),
+            now,
+        );
+    }
     let Some(current_kind) = paloma_alert_kind_for_status(mission.status) else {
         return false;
     };
