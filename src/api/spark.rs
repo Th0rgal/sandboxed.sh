@@ -147,6 +147,23 @@ fn canonical_mission_host_dir(raw: &str) -> Result<String, &'static str> {
         .ok_or("invalid host_dir")
 }
 
+/// A syntactically valid `workspaces/mission-*` directory is not enough: a
+/// worker may name an ancestor's short id at another root.  Match the actual
+/// canonical directory selected for that *owner* before rsync is allowed.
+fn host_dir_matches_mission_owner(
+    host_dir: &str,
+    workspace: &crate::workspace::Workspace,
+    mission_id: Uuid,
+) -> Result<(), &'static str> {
+    let expected = crate::workspace::mission_workspace_dir_for_workspace(workspace, mission_id);
+    let expected = std::fs::canonicalize(expected).map_err(|_| "mission workspace unavailable")?;
+    if expected == std::path::Path::new(host_dir) {
+        Ok(())
+    } else {
+        Err("host_dir is not the persisted mission owner's workspace")
+    }
+}
+
 /// Run a host subprocess, returning (success, combined output).
 async fn run(args: &[&str]) -> (bool, String) {
     match tokio::process::Command::new(args[0])
@@ -295,6 +312,9 @@ async fn offload_build(
             format!("persisted mission workspace root is unavailable: {error}"),
         )
             .into_response();
+    }
+    if let Err(error) = host_dir_matches_mission_owner(&host_dir, &workspace, host_owner.id) {
+        return (StatusCode::FORBIDDEN, error).into_response();
     }
 
     // Availability check runs AFTER authorization so an unauthorized caller can
@@ -459,8 +479,7 @@ async fn offload_build(
 
 #[cfg(test)]
 mod tests {
-    use super::mission_ancestor_by_short;
-    use super::rel_path_is_safe;
+    use super::{host_dir_matches_mission_owner, mission_ancestor_by_short, rel_path_is_safe};
     use crate::api::mission_store::{InMemoryMissionStore, MissionStore};
     use std::sync::Arc;
 
@@ -531,6 +550,41 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ancestor_host_dir_must_be_the_owners_verified_placement() {
+        let root = tempfile::tempdir().unwrap();
+        let owner_root = root.path().join("owner-root");
+        let requester_root = root.path().join("requester-root");
+        std::fs::create_dir_all(&owner_root).unwrap();
+        std::fs::create_dir_all(&requester_root).unwrap();
+        let owner = uuid::Uuid::new_v4();
+        let owner_workspace = crate::workspace::Workspace::default_host(owner_root.clone());
+        let fake_owner_dir = requester_root
+            .join("workspaces")
+            .join(format!("mission-{}", &owner.to_string()[..8]));
+        let real_owner_dir = owner_root
+            .join("workspaces")
+            .join(format!("mission-{}", &owner.to_string()[..8]));
+        std::fs::create_dir_all(&fake_owner_dir).unwrap();
+        std::fs::create_dir_all(&real_owner_dir).unwrap();
+
+        // The worker may use an ancestor's directory, but only the exact
+        // directory selected for that ancestor—not an identically named one
+        // under the requester's (or any other) root.
+        assert!(host_dir_matches_mission_owner(
+            real_owner_dir.to_str().unwrap(),
+            &owner_workspace,
+            owner,
+        )
+        .is_ok());
+        assert!(host_dir_matches_mission_owner(
+            fake_owner_dir.to_str().unwrap(),
+            &owner_workspace,
+            owner,
+        )
+        .is_err());
     }
 
     #[test]

@@ -517,7 +517,13 @@ mod tests {
         .unwrap();
         std::fs::remove_dir(&storage).unwrap();
 
-        let error = resolve_base_work_dir(None, &workspace, false, mission).unwrap_err();
+        let explicit = storage
+            .join("workspaces")
+            .join(format!("mission-{}", &mission.to_string()[..8]))
+            .join("worker-worktree");
+        std::fs::create_dir_all(&explicit).unwrap();
+        let error =
+            resolve_base_work_dir(explicit.to_str(), &workspace, false, mission).unwrap_err();
         assert!(error.contains("persisted mission workspace root is unavailable"));
         assert_ne!(error, workspace.path.display().to_string());
 
