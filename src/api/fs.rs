@@ -620,8 +620,21 @@ pub async fn resolve_path_for_workspace(
 
     let input = Path::new(path);
 
+    // Older dashboard clients derive an absolute mission path from the
+    // workspace's legacy root. Preserve that request shape after a mission
+    // has been placed under MISSION_WORKSPACE_ROOT by translating only the
+    // exact legacy mission prefix to its persisted workspace-aware location.
+    let relocated_input = mission_id.and_then(|mid| {
+        let legacy = crate::workspace::mission_workspace_dir_for_root(&workspace.path, mid);
+        input.strip_prefix(&legacy).ok().map(|tail| {
+            crate::workspace::mission_workspace_dir_for_workspace(&workspace, mid).join(tail)
+        })
+    });
+
     // Resolve the final path based on input type
-    let mut resolved = if input.is_absolute() {
+    let mut resolved = if let Some(relocated) = relocated_input {
+        relocated
+    } else if input.is_absolute() {
         if workspace.workspace_type == WorkspaceType::Container {
             if input.starts_with(&workspace_root) {
                 input.to_path_buf()

@@ -58,7 +58,22 @@ async fn run_loop(state: Arc<AppState>) {
     let mut last_alert_at: Option<tokio::time::Instant> = None;
     loop {
         interval.tick().await;
-        let (used, total, percent) = monitoring::current_disk_usage();
+        let mission_root =
+            crate::workspace::configured_mission_workspace_root(&state.config.working_dir);
+        let usage = match monitoring::disk_usage_for_path(&mission_root) {
+            Ok(usage) => usage,
+            Err(error) => {
+                tracing::warn!(path = %mission_root.display(), %error, "disk watcher: cannot measure mission workspace filesystem");
+                continue;
+            }
+        };
+        let used = usage.used;
+        let total = usage.total;
+        let percent = if total == 0 {
+            100.0
+        } else {
+            used as f32 / total as f32 * 100.0
+        };
         let level = DiskHealthLevel::from_percent(percent);
 
         let escalated = rank(level) > rank(alerted_level);
