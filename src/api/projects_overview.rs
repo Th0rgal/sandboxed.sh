@@ -1981,12 +1981,26 @@ pub async fn projects_overview(
     // silent no-op from the board.
     // Roster mode/blocker enrich `latest_update` below; capture them before
     // the record's fields are moved onto the builder.
-    let mut record_signals: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
-    for record in state
+    let records = state
         .projects
         .list_projects()
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
-    {
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    // Canonical slugs that have their own roster row. An alias next_action
+    // may fill only when this set does not contain the fold target —
+    // otherwise a NULL (or live) canonical value is authoritative.
+    let canonical_roster: HashSet<String> = records
+        .iter()
+        .filter(|record| {
+            if deleted(&record.slug) {
+                return false;
+            }
+            let key = resolve_alias(&aliases, &record.slug);
+            !deleted(&key) && key == record.slug
+        })
+        .map(|record| record.slug.clone())
+        .collect();
+    let mut record_signals: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    for record in records {
         if deleted(&record.slug) {
             continue;
         }
@@ -2001,31 +2015,14 @@ pub async fn projects_overview(
             continue;
         }
         let is_canonical = key == record.slug;
-        if is_canonical || !record_signals.contains_key(&key) {
+        let canonical_has_roster = canonical_roster.contains(&key);
+        if is_canonical || (!canonical_has_roster && !record_signals.contains_key(&key)) {
             record_signals.insert(key.clone(), (record.mode.clone(), record.blocker.clone()));
         }
         let builder = rows
             .entry(key.clone())
             .or_insert_with(|| ProjectRowBuilder::new(key.clone()));
-        let mode_signal_at = record.mode_signal_at.or(Some(record.updated_at));
-        if is_canonical {
-            builder.title = record.title;
-            builder.next_action = record.next_action;
-            builder.mode = record.mode;
-            builder.controller_cron_id = record.controller_cron_id;
-            builder.mode_signal_at = mode_signal_at;
-        } else {
-            builder.title = builder.title.take().or(record.title);
-            // A NULL canonical next_action is authoritative. Filling it from
-            // an alias showed Lido's day-old "Drain CLEAN PRs; pin is #81"
-            // over two live writers.
-            builder.mode = builder.mode.take().or(record.mode);
-            builder.controller_cron_id = builder
-                .controller_cron_id
-                .take()
-                .or(record.controller_cron_id);
-            builder.mode_signal_at = builder.mode_signal_at.take().or(mode_signal_at);
-        }
+        builder.apply_roster(record, canonical_has_roster);
     }
     // The latest ingested state per project becomes the row's latest_update —
     // same serialized shape the delivery scan used to produce, now read back
@@ -2290,6 +2287,34 @@ impl ProjectRowBuilder {
             autonomy_level: None,
             pending_decisions: 0,
         }
+    }
+
+    /// Fold one roster record onto this (canonical) board row.
+    ///
+    /// A canonical record is authoritative, including a NULL `next_action`.
+    /// An alias record fills `next_action` only when the canonical slug has
+    /// no roster row of its own — `update_project_status` / ingest can write
+    /// the alias first, and that value must survive the fold. Title, mode,
+    /// and controller link still gap-fill either way. Live writers overlay
+    /// `next_action` later in `finish()`.
+    fn apply_roster(&mut self, record: ProjectRecord, canonical_has_roster: bool) {
+        let is_canonical = record.slug == self.slug;
+        let mode_signal_at = record.mode_signal_at.or(Some(record.updated_at));
+        if is_canonical {
+            self.title = record.title;
+            self.next_action = record.next_action;
+            self.mode = record.mode;
+            self.controller_cron_id = record.controller_cron_id;
+            self.mode_signal_at = mode_signal_at;
+            return;
+        }
+        self.title = self.title.take().or(record.title);
+        if !canonical_has_roster {
+            self.next_action = self.next_action.take().or(record.next_action);
+        }
+        self.mode = self.mode.take().or(record.mode);
+        self.controller_cron_id = self.controller_cron_id.take().or(record.controller_cron_id);
+        self.mode_signal_at = self.mode_signal_at.take().or(mode_signal_at);
     }
 
     /// Attach the store-derived latest update: the newest state event plus the
@@ -4747,6 +4772,60 @@ mod tests {
         assert!(next.starts_with("2 live:"), "{next}");
         assert!(next.contains("#88"), "{next}");
         assert!(next.contains("P-RESERVE-RELATIONAL"), "{next}");
+    }
+
+    fn roster_record(slug: &str, next_action: Option<&str>) -> ProjectRecord {
+        ProjectRecord {
+            slug: slug.to_string(),
+            title: Some(slug.to_string()),
+            objective: None,
+            status: "active".to_string(),
+            mode: Some("active".to_string()),
+            wait_ticks: 0,
+            next_action: next_action.map(str::to_string),
+            blocker: Some("lease".to_string()),
+            controller_cron_id: None,
+            repository: None,
+            created_at: "2026-08-16T00:00:00Z".to_string(),
+            updated_at: "2026-08-16T00:00:00Z".to_string(),
+            mode_signal_at: None,
+        }
+    }
+
+    /// `routes.json` maps an existing roster slug onto a canonical slug that
+    /// has no roster row of its own (`update_project_status` / ingest wrote
+    /// next_action onto the alias first). The fold must keep that value.
+    #[test]
+    fn alias_only_roster_row_keeps_next_action_on_canonical_fold() {
+        let mut builder = ProjectRowBuilder::new("verity-lido".to_string());
+        builder.apply_roster(roster_record("lido-audit", Some("certify #88")), false);
+        let row = builder.finish(&[], None, None, "2026-08-16T19:05:00Z");
+        assert_eq!(row.next_action.as_deref(), Some("certify #88"));
+        assert_eq!(row.title.as_deref(), Some("lido-audit"));
+        assert_eq!(row.mode.as_deref(), Some("active"));
+    }
+
+    /// A canonical roster row owns next_action, including an explicit NULL.
+    /// An alias must not fill that hole (Lido's day-old "Drain CLEAN PRs").
+    #[test]
+    fn alias_does_not_overwrite_canonical_next_action() {
+        let mut populated = ProjectRowBuilder::new("verity-lido".to_string());
+        populated.apply_roster(roster_record("verity-lido", Some("certify #88")), true);
+        populated.apply_roster(
+            roster_record("lido-audit", Some("Drain CLEAN Lido PRs; pin is #81")),
+            true,
+        );
+        let row = populated.finish(&[], None, None, "2026-08-16T19:05:00Z");
+        assert_eq!(row.next_action.as_deref(), Some("certify #88"));
+
+        let mut empty = ProjectRowBuilder::new("verity-lido".to_string());
+        empty.apply_roster(roster_record("verity-lido", None), true);
+        empty.apply_roster(
+            roster_record("lido-audit", Some("Drain CLEAN Lido PRs; pin is #81")),
+            true,
+        );
+        let row = empty.finish(&[], None, None, "2026-08-16T19:05:00Z");
+        assert_eq!(row.next_action, None);
     }
 
     /// Provenance rides on the row: `override` is the operator's board action,
