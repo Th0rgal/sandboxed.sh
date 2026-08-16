@@ -619,6 +619,12 @@ pub struct MissionSummary {
     pub awaiting_kind: Option<String>,
     /// Qualified operator page — computed at read time from kind/origin/grace.
     pub needs_operator: bool,
+    /// Clock + origin for recomputing `needs_operator` once live WaitingUser
+    /// is known. Not on the wire.
+    #[serde(skip)]
+    pub origin_session_id: Option<String>,
+    #[serde(skip)]
+    pub updated_at: String,
 }
 
 /// Persisted summary for one tool call across all of its stored events.

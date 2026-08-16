@@ -4415,7 +4415,7 @@ impl MissionStore for SqliteMissionStore {
             let placeholders = vec!["?"; id_strings.len()].join(",");
             let sql = format!(
                 "SELECT id, title, status, workspace_name, awaiting_kind, \
-                 origin_session_id, COALESCE(last_status_change_at, updated_at) \
+                 origin_session_id, updated_at, last_status_change_at \
                  FROM missions WHERE id IN ({placeholders})"
             );
             let now = chrono::Utc::now();
@@ -4427,6 +4427,10 @@ impl MissionStore for SqliteMissionStore {
                     let awaiting_kind: Option<String> = row.get(4)?;
                     let origin_session_id: Option<String> = row.get(5)?;
                     let updated_at: String = row.get(6)?;
+                    let last_status_change_at: Option<String> = row.get(7)?;
+                    let persisted_clock = last_status_change_at
+                        .as_deref()
+                        .unwrap_or(updated_at.as_str());
                     let parsed_status =
                         serde_json::from_value::<crate::api::control::events::MissionStatus>(
                             serde_json::Value::String(status.clone()),
@@ -4439,7 +4443,7 @@ impl MissionStore for SqliteMissionStore {
                             has_origin_session: origin_session_id
                                 .as_deref()
                                 .is_some_and(|id| !id.is_empty()),
-                            updated_at: &updated_at,
+                            updated_at: persisted_clock,
                             waiting_for_user_tool: false,
                         },
                         now,
@@ -4452,6 +4456,8 @@ impl MissionStore for SqliteMissionStore {
                             workspace_name: row.get(3)?,
                             awaiting_kind,
                             needs_operator,
+                            origin_session_id,
+                            updated_at,
                         },
                     ))
                 })

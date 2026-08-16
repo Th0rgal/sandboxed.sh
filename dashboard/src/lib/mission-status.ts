@@ -59,7 +59,8 @@ export function finishedTone(status: MissionStatus): FinishedTone {
  *    operator page (controller still has first triage).
  * 3. Finished — completed/acked/failed/blocked, plus awaiting_user ack
  *    (sky Awaiting Review).
- * 4. Other — anything else (active-but-not-running, in-grace decisions).
+ * 4. Running — in-grace parked decisions (controller still owns triage).
+ * 5. Other — anything else (active-but-not-running).
  */
 export function categorizeMission(
   status: MissionStatus,
@@ -88,6 +89,12 @@ export function categorizeMission(
 
   if (isFinishedStatus(status) || (status === 'awaiting_user' && awaitingKind !== 'decision')) {
     return 'finished';
+  }
+
+  // Controller still owns triage — keep the card on the board in Running
+  // rather than dropping it into the unrendered `other` bucket.
+  if (status === 'awaiting_user' && awaitingKind === 'decision') {
+    return 'running';
   }
 
   return 'other';
