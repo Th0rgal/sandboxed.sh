@@ -978,13 +978,10 @@ fn validate_mission_workspace_root(
     let actual_identity = filesystem_identity(&root)?;
     if let Some(expected_identity) = &record.filesystem_identity {
         if expected_identity != &actual_identity {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
+            return Err(std::io::Error::other(format!(
                     "persisted mission workspace root {} changed filesystem identity (expected {}, got {})",
                     root.display(), expected_identity, actual_identity
-                ),
-            ));
+                )));
         }
     }
     Ok((root, actual_identity))
@@ -1114,14 +1111,20 @@ fn persist_mission_workspace_root_record(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
                 Err(error) => return Err(error),
             };
-        let entry = roots.entry(mission_id.to_string());
-        if matches!(entry, std::collections::hash_map::Entry::Vacant(_)) {
-            entry.or_insert(record);
-            atomic_write_mission_workspace_roots(&path, &roots)?;
-        } else if entry.into_mut().filesystem_identity.is_none() {
-            *roots
-                .get_mut(&mission_id.to_string())
-                .expect("entry exists") = record;
+        let changed = match roots.entry(mission_id.to_string()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(record);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry)
+                if entry.get().filesystem_identity.is_none() =>
+            {
+                entry.insert(record);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        };
+        if changed {
             atomic_write_mission_workspace_roots(&path, &roots)?;
         }
         fs2::FileExt::unlock(&lock_file)?;

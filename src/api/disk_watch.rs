@@ -197,6 +197,7 @@ async fn run_loop(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn alerts_and_recoveries_are_independent_per_persisted_root() {
