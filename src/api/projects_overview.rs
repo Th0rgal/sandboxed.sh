@@ -161,6 +161,7 @@ struct PendingModeWrite {
     mode: String,
     wait: i64,
     blocker: Option<String>,
+    next_action: Option<String>,
 }
 
 /// Fold one batch of deliveries into the projects store.
@@ -283,6 +284,7 @@ fn ingest_deliveries_with_live(
                     mode: base.to_string(),
                     wait,
                     blocker: blocker.map(str::to_string),
+                    next_action: delivery.next_action.clone(),
                 };
                 if pending_modes.get(slug).is_none_or(|existing| {
                     !super::projects_store::rfc3339_after(&existing.at, &write.at)
@@ -391,7 +393,7 @@ fn ingest_deliveries_with_live(
             &slug,
             &write.mode,
             write.wait,
-            None,
+            write.next_action.as_deref(),
             write.blocker.as_deref(),
             Some(write.at.as_str()),
         ) {
@@ -558,6 +560,21 @@ pub async fn get_project(
         }
     };
     let items = super::mission_horizon::project_items(&tracks, &proposals, &missions);
+    let mut project = project;
+    if let Some(derived) = next_action_from_live_titles(
+        missions
+            .iter()
+            .filter_map(|mission| {
+                live_mission_title(
+                    mission.status,
+                    mission.title.as_deref(),
+                    &mission.id.to_string(),
+                )
+            })
+            .collect(),
+    ) {
+        project.next_action = Some(derived);
+    }
     Ok(Json(serde_json::json!({
         "project": project,
         "grant": grant,
@@ -1597,6 +1614,29 @@ struct TrackerInfo {
     updated_at: Option<String>,
 }
 
+/// Header copy Hermes shows under ACTIVE. Prefer live writers over a
+/// stored `next_action` that ingest used to wipe on every `[CTRL:]` tick.
+fn next_action_from_live_titles(titles: Vec<String>) -> Option<String> {
+    match titles.as_slice() {
+        [] => None,
+        [one] => Some(one.clone()),
+        many => Some(format!("{} live: {}", many.len(), many.join(" · "))),
+    }
+}
+
+fn live_mission_title(status: MissionStatus, title: Option<&str>, id: &str) -> Option<String> {
+    if !super::controller_honesty::is_live_writer_status(status) {
+        return None;
+    }
+    Some(
+        title
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| id.chars().take(8).collect()),
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct MissionChip {
     id: String,
@@ -1656,6 +1696,10 @@ pub struct DeliveryUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
     blocker: Option<String>,
+    /// `next=` from the `[CTRL: …]` trailer. Ingest-only: the roster column
+    /// is the durable copy; delivery payloads keep omitting this.
+    #[serde(skip)]
+    next_action: Option<String>,
     /// A `[DECISION: …]` trailer, when the delivery carried one. Ingest-only:
     /// the ledger is served through the decision endpoints, never re-emitted
     /// on delivery payloads.
@@ -1937,12 +1981,26 @@ pub async fn projects_overview(
     // silent no-op from the board.
     // Roster mode/blocker enrich `latest_update` below; capture them before
     // the record's fields are moved onto the builder.
-    let mut record_signals: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
-    for record in state
+    let records = state
         .projects
         .list_projects()
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
-    {
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    // Canonical slugs that have their own roster row. An alias next_action
+    // may fill only when this set does not contain the fold target —
+    // otherwise a NULL (or live) canonical value is authoritative.
+    let canonical_roster: HashSet<String> = records
+        .iter()
+        .filter(|record| {
+            if deleted(&record.slug) {
+                return false;
+            }
+            let key = resolve_alias(&aliases, &record.slug);
+            !deleted(&key) && key == record.slug
+        })
+        .map(|record| record.slug.clone())
+        .collect();
+    let mut record_signals: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    for record in records {
         if deleted(&record.slug) {
             continue;
         }
@@ -1957,29 +2015,14 @@ pub async fn projects_overview(
             continue;
         }
         let is_canonical = key == record.slug;
-        if is_canonical || !record_signals.contains_key(&key) {
+        let canonical_has_roster = canonical_roster.contains(&key);
+        if is_canonical || (!canonical_has_roster && !record_signals.contains_key(&key)) {
             record_signals.insert(key.clone(), (record.mode.clone(), record.blocker.clone()));
         }
         let builder = rows
             .entry(key.clone())
             .or_insert_with(|| ProjectRowBuilder::new(key.clone()));
-        let mode_signal_at = record.mode_signal_at.or(Some(record.updated_at));
-        if is_canonical {
-            builder.title = record.title;
-            builder.next_action = record.next_action;
-            builder.mode = record.mode;
-            builder.controller_cron_id = record.controller_cron_id;
-            builder.mode_signal_at = mode_signal_at;
-        } else {
-            builder.title = builder.title.take().or(record.title);
-            builder.next_action = builder.next_action.take().or(record.next_action);
-            builder.mode = builder.mode.take().or(record.mode);
-            builder.controller_cron_id = builder
-                .controller_cron_id
-                .take()
-                .or(record.controller_cron_id);
-            builder.mode_signal_at = builder.mode_signal_at.take().or(mode_signal_at);
-        }
+        builder.apply_roster(record, canonical_has_roster);
     }
     // The latest ingested state per project becomes the row's latest_update —
     // same serialized shape the delivery scan used to produce, now read back
@@ -2028,6 +2071,7 @@ pub async fn projects_overview(
             state: None,
             mode: row.mode,
             blocker: row.blocker,
+            next_action: None,
             decision: None,
         })
         .collect();
@@ -2149,6 +2193,7 @@ fn store_update(
             .filter(|descriptor| !descriptor.starts_with(CTRL_DESCRIPTOR_PREFIX)),
         mode,
         blocker,
+        next_action: None,
         decision: None,
     }
 }
@@ -2242,6 +2287,34 @@ impl ProjectRowBuilder {
             autonomy_level: None,
             pending_decisions: 0,
         }
+    }
+
+    /// Fold one roster record onto this (canonical) board row.
+    ///
+    /// A canonical record is authoritative, including a NULL `next_action`.
+    /// An alias record fills `next_action` only when the canonical slug has
+    /// no roster row of its own — `update_project_status` / ingest can write
+    /// the alias first, and that value must survive the fold. Title, mode,
+    /// and controller link still gap-fill either way. Live writers overlay
+    /// `next_action` later in `finish()`.
+    fn apply_roster(&mut self, record: ProjectRecord, canonical_has_roster: bool) {
+        let is_canonical = record.slug == self.slug;
+        let mode_signal_at = record.mode_signal_at.or(Some(record.updated_at));
+        if is_canonical {
+            self.title = record.title;
+            self.next_action = record.next_action;
+            self.mode = record.mode;
+            self.controller_cron_id = record.controller_cron_id;
+            self.mode_signal_at = mode_signal_at;
+            return;
+        }
+        self.title = self.title.take().or(record.title);
+        if !canonical_has_roster {
+            self.next_action = self.next_action.take().or(record.next_action);
+        }
+        self.mode = self.mode.take().or(record.mode);
+        self.controller_cron_id = self.controller_cron_id.take().or(record.controller_cron_id);
+        self.mode_signal_at = self.mode_signal_at.take().or(mode_signal_at);
     }
 
     /// Attach the store-derived latest update: the newest state event plus the
@@ -2564,10 +2637,20 @@ impl ProjectRowBuilder {
             .clone()
             .or_else(|| Some(humanize_slug(&self.slug)));
 
+        let next_action = next_action_from_live_titles(
+            self.missions
+                .iter()
+                .filter_map(|mission| {
+                    live_mission_title(mission.status, mission.title.as_deref(), &mission.id)
+                })
+                .collect(),
+        )
+        .or(self.next_action);
+
         ProjectRow {
             slug: self.slug,
             title,
-            next_action: self.next_action,
+            next_action,
             bucket,
             board_override: forced.map(str::to_string),
             controller_cron_id: self.controller_cron_id,
@@ -3249,6 +3332,15 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
         }
     });
 
+    let next_action = ctrl.and_then(|inner| {
+        inner
+            .split('|')
+            .filter_map(|field| field.trim().strip_prefix("next="))
+            .map(str::trim)
+            .find(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
+            .map(|value| value.chars().take(200).collect())
+    });
+
     DeliveryUpdate {
         headline,
         body: Some(content.chars().take(8000).collect()),
@@ -3258,6 +3350,7 @@ fn parse_delivery(session_id: &str, timestamp: f64, content: &str) -> DeliveryUp
         state,
         mode,
         blocker,
+        next_action,
         decision,
     }
 }
@@ -3486,10 +3579,9 @@ mod tests {
         // is silent — the report never reaches its project row.
         let ctrl_only =
             "[Cron delivery: Verity]\nDid a thing\n[CTRL: verity | mode=active | wait=0 | next=x]";
-        assert_eq!(
-            parse_delivery("s5", 0.0, ctrl_only).signature.as_deref(),
-            Some("verity")
-        );
+        let parsed_ctrl = parse_delivery("s5", 0.0, ctrl_only);
+        assert_eq!(parsed_ctrl.signature.as_deref(), Some("verity"));
+        assert_eq!(parsed_ctrl.next_action.as_deref(), Some("x"));
 
         // When both are present the explicit routing trailer still wins.
         let both = "[Cron delivery: X]\nhi\n[CTRL: ctrl-key | mode=active | wait=0 | next=x]\n[STATE_SIGNATURE: sig-key|a|b|c|d]";
@@ -3501,6 +3593,7 @@ mod tests {
         // A malformed mode is dropped rather than surfaced as a chip.
         let bogus = "[Cron delivery: X]\nhi\n[CTRL: x | mode=confused | wait=0 | next=none]";
         assert!(parse_delivery("s4", 0.0, bogus).mode.is_none());
+        assert!(parse_delivery("s4", 0.0, bogus).next_action.is_none());
     }
 
     #[test]
@@ -3594,6 +3687,7 @@ mod tests {
             mode: None,
             state: Some(state.into()),
             blocker: None,
+            next_action: None,
             decision: None,
         };
 
@@ -4200,6 +4294,7 @@ mod tests {
             state: Some("phase|head|clean".into()),
             mode: Some("active".into()),
             blocker: blocker.map(str::to_string),
+            next_action: None,
             decision: None,
         }
     }
@@ -4571,6 +4666,7 @@ mod tests {
                 mode: None,
                 state: None,
                 blocker: None,
+                next_action: None,
                 decision: None,
             },
             1,
@@ -4604,6 +4700,7 @@ mod tests {
                 mode: None,
                 state: None,
                 blocker: None,
+                next_action: None,
                 decision: None,
             },
             1,
@@ -4648,6 +4745,87 @@ mod tests {
             json.get("next_action").is_none(),
             "unset next_action is omitted"
         );
+    }
+
+    #[test]
+    fn live_writers_override_a_stale_or_empty_next_action() {
+        let mut builder = ProjectRowBuilder::new("verity-lido".to_string());
+        builder.next_action = Some("Drain CLEAN Lido PRs; pin is #81".to_string());
+        builder.missions.push(MissionChip {
+            id: "b466f65d-798b-467b-b20c-f1433c3b52a4".to_string(),
+            status: MissionStatus::Active,
+            title: Some("Certify Lido PR #88 exact head".to_string()),
+            updated_at: "2026-08-16T19:00:00Z".to_string(),
+            github_pr: None,
+            needs_operator: false,
+        });
+        builder.missions.push(MissionChip {
+            id: "8cc8df04-b8f4-4003-b668-d17f7d3e8def".to_string(),
+            status: MissionStatus::Active,
+            title: Some("Design P-RESERVE-RELATIONAL implementation packet".to_string()),
+            updated_at: "2026-08-16T19:00:01Z".to_string(),
+            github_pr: None,
+            needs_operator: false,
+        });
+        let row = builder.finish(&[], None, None, "2026-08-16T19:05:00Z");
+        let next = row.next_action.expect("derived");
+        assert!(next.starts_with("2 live:"), "{next}");
+        assert!(next.contains("#88"), "{next}");
+        assert!(next.contains("P-RESERVE-RELATIONAL"), "{next}");
+    }
+
+    fn roster_record(slug: &str, next_action: Option<&str>) -> ProjectRecord {
+        ProjectRecord {
+            slug: slug.to_string(),
+            title: Some(slug.to_string()),
+            objective: None,
+            status: "active".to_string(),
+            mode: Some("active".to_string()),
+            wait_ticks: 0,
+            next_action: next_action.map(str::to_string),
+            blocker: Some("lease".to_string()),
+            controller_cron_id: None,
+            repository: None,
+            created_at: "2026-08-16T00:00:00Z".to_string(),
+            updated_at: "2026-08-16T00:00:00Z".to_string(),
+            mode_signal_at: None,
+        }
+    }
+
+    /// `routes.json` maps an existing roster slug onto a canonical slug that
+    /// has no roster row of its own (`update_project_status` / ingest wrote
+    /// next_action onto the alias first). The fold must keep that value.
+    #[test]
+    fn alias_only_roster_row_keeps_next_action_on_canonical_fold() {
+        let mut builder = ProjectRowBuilder::new("verity-lido".to_string());
+        builder.apply_roster(roster_record("lido-audit", Some("certify #88")), false);
+        let row = builder.finish(&[], None, None, "2026-08-16T19:05:00Z");
+        assert_eq!(row.next_action.as_deref(), Some("certify #88"));
+        assert_eq!(row.title.as_deref(), Some("lido-audit"));
+        assert_eq!(row.mode.as_deref(), Some("active"));
+    }
+
+    /// A canonical roster row owns next_action, including an explicit NULL.
+    /// An alias must not fill that hole (Lido's day-old "Drain CLEAN PRs").
+    #[test]
+    fn alias_does_not_overwrite_canonical_next_action() {
+        let mut populated = ProjectRowBuilder::new("verity-lido".to_string());
+        populated.apply_roster(roster_record("verity-lido", Some("certify #88")), true);
+        populated.apply_roster(
+            roster_record("lido-audit", Some("Drain CLEAN Lido PRs; pin is #81")),
+            true,
+        );
+        let row = populated.finish(&[], None, None, "2026-08-16T19:05:00Z");
+        assert_eq!(row.next_action.as_deref(), Some("certify #88"));
+
+        let mut empty = ProjectRowBuilder::new("verity-lido".to_string());
+        empty.apply_roster(roster_record("verity-lido", None), true);
+        empty.apply_roster(
+            roster_record("lido-audit", Some("Drain CLEAN Lido PRs; pin is #81")),
+            true,
+        );
+        let row = empty.finish(&[], None, None, "2026-08-16T19:05:00Z");
+        assert_eq!(row.next_action, None);
     }
 
     /// Provenance rides on the row: `override` is the operator's board action,
@@ -5067,6 +5245,7 @@ mod tests {
                 state: Some("mission-callback|acfb03d2|failed|inspect".into()),
                 mode: None,
                 blocker: None,
+                next_action: None,
                 decision: None,
             },
             1,
@@ -5095,6 +5274,7 @@ mod tests {
                 state: Some("mission-callback|acfb03d2|failed|inspect".into()),
                 mode: Some("blocked".into()),
                 blocker: Some("transport-cap".into()),
+                next_action: None,
                 decision: None,
             },
             1,
