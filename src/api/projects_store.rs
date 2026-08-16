@@ -1003,7 +1003,8 @@ impl ProjectsStore {
                 }
                 connection
                     .execute(
-                        "UPDATE projects SET mode = ?2, wait_ticks = ?3, next_action = ?4, \
+                        "UPDATE projects SET mode = ?2, wait_ticks = ?3, \
+                         next_action = COALESCE(?4, next_action), \
                          blocker = ?5, updated_at = ?6, mode_signal_at = ?7 \
                          WHERE slug = ?1",
                         params![slug, mode, wait, next_action, blocker, now, at],
@@ -1013,7 +1014,8 @@ impl ProjectsStore {
             None => {
                 connection
                     .execute(
-                        "UPDATE projects SET mode = ?2, wait_ticks = ?3, next_action = ?4, \
+                        "UPDATE projects SET mode = ?2, wait_ticks = ?3, \
+                         next_action = COALESCE(?4, next_action), \
                          blocker = ?5, updated_at = ?6 WHERE slug = ?1",
                         params![slug, mode, wait, next_action, blocker, now],
                     )
@@ -2226,6 +2228,37 @@ mod tests {
         assert_eq!(p.mode.as_deref(), Some("blocked"));
         assert_eq!(p.wait_ticks, 2);
         assert_eq!(p.blocker.as_deref(), Some("transport-cap"));
+    }
+
+    #[test]
+    fn mode_projection_does_not_wipe_next_action_when_ingest_passes_none() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+        store
+            .set_mode("lido", "active", Some("certify #88"), None)
+            .expect("set");
+        store
+            .project_mode_from_signal("lido", "active", 0, None, None, None)
+            .expect("ingest wipe?");
+        let p = store.get_project("lido").expect("read").expect("present");
+        assert_eq!(p.next_action.as_deref(), Some("certify #88"));
+        store
+            .project_mode_from_signal(
+                "lido",
+                "active",
+                0,
+                Some("2 live: certify #88 · reserve scout"),
+                None,
+                None,
+            )
+            .expect("explicit");
+        let p = store.get_project("lido").expect("read").expect("present");
+        assert_eq!(
+            p.next_action.as_deref(),
+            Some("2 live: certify #88 · reserve scout")
+        );
     }
 
     #[test]
