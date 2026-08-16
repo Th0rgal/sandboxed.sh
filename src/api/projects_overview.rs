@@ -330,6 +330,46 @@ fn ingest_deliveries_with_live(
                 }
             }
         }
+        // A material chapter without a `[DECISION:]` trailer still belongs
+        // on Recent activity. Controllers were told not to open owner
+        // questions for in-grant work, so they stopped emitting trailers
+        // entirely — and the panel froze on the last answered escalation
+        // (Lido SRv3, 2026-08-16). Inspect callbacks stay out.
+        if !recorded_decided {
+            if let Some(text) = headline {
+                if super::controller_honesty::is_material_activity_headline(text) {
+                    let grant = projects.get_grant(slug).ok().flatten();
+                    let autonomy = grant.as_ref().and_then(|g| g.autonomy_level.clone());
+                    let merge_authority = grant.as_ref().and_then(|g| g.merge_authority.clone());
+                    if let Ok(disposition) = resolve_decision_disposition_for_grant(
+                        autonomy.as_deref(),
+                        merge_authority.as_deref(),
+                        Some("granted"),
+                        Some("decided"),
+                        Some("report"),
+                    ) {
+                        if disposition.status == "decided" {
+                            recorded_decided = true;
+                            let decision = super::projects_store::NewDecision {
+                                question: text.to_string(),
+                                rationale: None,
+                                kind: Some("report".to_string()),
+                                authority: disposition.authority,
+                                status: disposition.status,
+                                evidence: None,
+                            };
+                            if let Err(error) = projects.record_decision_from_delivery(
+                                slug,
+                                &delivery.at,
+                                &decision,
+                            ) {
+                                tracing::warn!("state ingest activity: {slug}: {error}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // A merge announcement (headline or a grant-allowed decided act)
         // retires older "merge #N?" questions so the card stops asking
         // about a PR that already landed. The current delivery's own
@@ -495,7 +535,7 @@ pub async fn get_project(
     let decisions = state.projects.open_decisions(&slug).map_err(store_err)?;
     let recent = state
         .projects
-        .recent_decisions(&slug, 20)
+        .recent_activity(&slug, 20)
         .map_err(store_err)?;
     let conversation = state
         .projects
@@ -3702,6 +3742,57 @@ mod tests {
         assert!(recent
             .iter()
             .any(|d| d.question == "Merged #2" && d.status.as_deref() == Some("decided")));
+    }
+
+    #[test]
+    fn material_headlines_without_a_decision_trailer_still_land_on_recent_activity() {
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity-lido", None, None, None, None)
+            .expect("seed");
+        store
+            .set_grant(
+                "verity-lido",
+                Some("review-first"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("act_reversible"),
+            )
+            .expect("grant");
+        let aliases = HashMap::new();
+        let overrides = HashMap::new();
+        let chapter = parse_delivery(
+            "cron_1",
+            1_755_360_000.0,
+            "[Cron delivery: Lido]\nLido #81 — RÉPARATION/REVIEW EN COURS\n\
+             [CTRL: verity-lido | mode=active | wait=0 | next=review-81]\n\
+             [STATE_SIGNATURE: verity-lido|pr-81|review]\n",
+        );
+        let inspect = parse_delivery(
+            "s",
+            1_755_360_100.0,
+            "[Cron delivery: Lido]\n[Mission callback: Repair Lido #76]\n\
+             [STATE_SIGNATURE: verity-lido|mission-callback|inspect]\n",
+        );
+        ingest_deliveries(&store, &aliases, &overrides, vec![chapter, inspect]);
+        let recent = store.recent_activity("verity-lido", 10).expect("activity");
+        assert!(
+            recent.iter().any(|d| d.question.contains("#81")),
+            "controller chapter must become a decided act"
+        );
+        assert!(
+            recent
+                .iter()
+                .all(|d| !d.question.starts_with("[Mission callback:")),
+            "inspect callbacks stay off the panel"
+        );
+        assert!(store
+            .open_decisions("verity-lido")
+            .expect("open")
+            .is_empty());
     }
 
     #[test]

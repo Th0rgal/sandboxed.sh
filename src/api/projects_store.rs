@@ -13,7 +13,7 @@
 //! file on any shape change, and it is read-modify-write — fine for a human
 //! toggling a bucket, not for something written per tick.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -1439,6 +1439,49 @@ impl ProjectsStore {
         )
     }
 
+    /// What the Hermes project rail shows as Recent activity: the ledger
+    /// (`decided` / `answered`) plus material controller state headlines that
+    /// never carried a `[DECISION:]` trailer. Without the union the panel
+    /// freezes on the last owner question even while the controller is
+    /// merging and ticking (Lido SRv3, 2026-08-16).
+    pub fn recent_activity(&self, slug: &str, limit: u32) -> Result<Vec<ProjectDecision>, String> {
+        let mut items = self.recent_decisions(slug, limit)?;
+        let seen_at: HashSet<String> = items.iter().map(|item| item.at.clone()).collect();
+        let seen_question: HashSet<String> = items
+            .iter()
+            .map(|item| super::controller_honesty::normalize_decision_question(&item.question))
+            .collect();
+        for state in self.state_timeline(slug, limit as usize)? {
+            let Some(headline) = state.headline.as_deref() else {
+                continue;
+            };
+            if !super::controller_honesty::is_material_activity_headline(headline) {
+                continue;
+            }
+            if seen_at.contains(&state.last_seen_at) {
+                continue;
+            }
+            let normalized = super::controller_honesty::normalize_decision_question(headline);
+            if seen_question.contains(&normalized) {
+                continue;
+            }
+            items.push(ProjectDecision {
+                at: state.last_seen_at,
+                question: headline.to_string(),
+                rationale: None,
+                kind: Some("report".to_string()),
+                authority: "granted".to_string(),
+                status: Some("decided".to_string()),
+                answer: None,
+                answered_at: None,
+                evidence: None,
+            });
+        }
+        items.sort_by(|a, b| b.at.cmp(&a.at));
+        items.truncate(limit as usize);
+        Ok(items)
+    }
+
     fn decisions_where(
         &self,
         slug: &str,
@@ -2559,6 +2602,38 @@ mod tests {
         assert_eq!(
             recent[1].evidence.as_ref().unwrap()["pr_url"],
             "https://github.com/x/y/pull/2213"
+        );
+
+        store
+            .record_state(
+                "verity",
+                "pr-81|review",
+                Some("Lido #81 — RÉPARATION/REVIEW EN COURS"),
+                "2026-08-16T15:30:54Z",
+                Some("cron_1"),
+            )
+            .expect("state");
+        store
+            .record_state(
+                "verity",
+                "mission-callback|x",
+                Some("[Mission callback: Repair Lido #76]"),
+                "2026-08-16T15:31:00Z",
+                Some("s"),
+            )
+            .expect("inspect");
+        let activity = store.recent_activity("verity", 10).expect("activity");
+        assert!(
+            activity
+                .iter()
+                .any(|d| d.question.contains("#81") && d.status.as_deref() == Some("decided")),
+            "controller chapter must surface on Recent activity"
+        );
+        assert!(
+            activity
+                .iter()
+                .all(|d| !d.question.starts_with("[Mission callback:")),
+            "inspect callbacks must not flood Recent activity"
         );
 
         assert_eq!(store.pending_decision_counts().expect("counts").len(), 0);

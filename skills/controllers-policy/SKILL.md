@@ -57,8 +57,17 @@ disagree, the grant wins. If the grant is empty, the setup questions have not be
 answered: ask them once (see `references/controller-setup-questions.md`) and operate
 under this skill's defaults meanwhile. **`merge_authority=full` is permission to
 merge.** Do not open a `[DECISION:]` asking Thomas to bless a green in-scope merge;
-record the merge as a granted act and do it. `review-first` is the only merge
-posture that must escalate.
+record the merge as a granted act and do it. **`review-first` means get or do a
+review, then merge** — it is not "ask Thomas". After a review exists (yours or a
+bot's), merge and start the next item. Do not open a decision to bless the merge.
+
+**Missing or red GitHub CI is not a blocker when a local or previous exact-head
+proof already exists.** Merge (or land on the campaign branch) and start the next
+item. Do not open a decision. Do not wait for the next tick to "re-check CI."
+
+**One live writer per branch, not per project.** Two writers may run at once when
+they do not share a branch (repair on `#76` plus merge of `#85` is allowed). A
+second writer on the *same* branch is the lease violation.
 
 **Owner chat updates the grant only when the order is durable.** An explicit
 standing grant — "you may merge in this repo", "review-first from now on" —
@@ -148,6 +157,9 @@ and any live surface read *this*, not a parsed trailer. Once per tick:
   track)` so it appears in the project's inventory. An unlinked worker is invisible.
 - At your first tick (or after the prompt changed), read `get_project_grant(slug)` — the
   merge authority, budget, and any PAUSED live there and outrank the prompt.
+- Each tick, `set_project_track` for every open in-scope PR and issue so the roadmap
+  stays populated even when no mission is live. Open tracks must not be dropped just
+  because the writer finished.
 
 Keep emitting the two text trailers below during this transition (dual-write); the
 structured call is authoritative, the trailers are the compatibility path.

@@ -94,6 +94,22 @@ pub fn should_silence_headline(headline: &str, has_live_writer: bool) -> bool {
     has_live_writer && is_stale_lease_claim(headline)
 }
 
+/// Mission-complete inspect callbacks are real events for the timeline but
+/// they are not autonomous acts — they used to steal the card's latest
+/// headline ("Needs You") and they must not flood Recent activity.
+pub fn is_inspect_callback_headline(headline: &str) -> bool {
+    headline.trim().starts_with("[Mission callback:")
+}
+
+/// Headline that should appear on the Recent activity panel: a controller
+/// chapter, not silence, not a relaunch, not an inspect callback.
+pub fn is_material_activity_headline(headline: &str) -> bool {
+    let trimmed = headline.trim();
+    !trimmed.is_empty()
+        && !should_silence_headline(trimmed, false)
+        && !is_inspect_callback_headline(trimmed)
+}
+
 /// Collapse a question so "relancer X ?" and "Relancer  X?" are one row.
 pub fn normalize_decision_question(question: &str) -> String {
     question
@@ -142,6 +158,23 @@ mod tests {
         assert!(is_lease_blocker(Some("source #2332 dirty lease writer")));
         assert!(mode_claims_lease_block(Some("blocked:lease-writer")));
         assert!(!is_stale_lease_claim("blocked by dirty source"));
+    }
+
+    #[test]
+    fn inspect_callbacks_are_not_recent_activity() {
+        assert!(is_inspect_callback_headline(
+            "[Mission callback: Lido closure v2 — re-pin Verity from minimal-11]"
+        ));
+        assert!(!is_material_activity_headline(
+            "[Mission callback: Repair Lido #76 false receipt provenance]"
+        ));
+        assert!(!is_material_activity_headline("[SILENT]"));
+        assert!(!is_material_activity_headline(
+            "Lido audit — RE-PIN RELANCÉ"
+        ));
+        assert!(is_material_activity_headline(
+            "Lido #81 — RÉPARATION/REVIEW EN COURS"
+        ));
     }
 
     #[test]
