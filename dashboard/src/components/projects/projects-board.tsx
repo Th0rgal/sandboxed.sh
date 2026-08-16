@@ -700,6 +700,10 @@ function ProjectActions({ project }: { project: ProjectRow }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  useEffect(() => {
+    setConfirmDelete(false);
+  }, [project.slug]);
+
   const run = useCallback(
     async (action: ProjectAction) => {
       setBusy(action);

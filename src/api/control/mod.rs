@@ -4257,6 +4257,17 @@ impl ControlHub {
                         mission.id
                     ));
                 }
+                let children = collect_child_mission_ids(&store, mission.id)
+                    .await
+                    .map_err(|(_, error)| error)?;
+                for child_id in children {
+                    if !seen_ids.contains(&child_id) {
+                        return Err(format!(
+                            "Cannot delete project data while mission {} has descendant {} tagged outside this project. Re-tag or delete that child first.",
+                            mission.id, child_id
+                        ));
+                    }
+                }
             }
             plans.push((store, matched));
         }

@@ -402,6 +402,31 @@ describe("ProjectsBoard", () => {
     );
   });
 
+  test("delete confirmation does not carry over to another project", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([project({ slug: "verity" }), project({ slug: "beal" })]),
+    );
+    mockedAction.mockResolvedValue(undefined);
+
+    renderBoard();
+
+    fireEvent.click(await screen.findByRole("button", { name: /verity/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Delete$/ }));
+    expect(screen.getByRole("button", { name: /Delete all/ })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /beal/ }));
+    expect(
+      screen.queryByRole("button", { name: /Delete all/ }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: /^Delete$/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Delete all/ }));
+    await waitFor(() =>
+      expect(mockedAction).toHaveBeenCalledWith("beal", "delete", {
+        deleteMode: "delete_missions",
+      }),
+    );
+  });
+
   test("confirmed delete revalidates the overview and the row disappears", async () => {
     // First load shows the project; the post-delete revalidation returns an
     // overview without it, so the row must leave the triage list.
