@@ -858,25 +858,30 @@ async fn requester_descends_from(
     requester: uuid::Uuid,
     owner: uuid::Uuid,
 ) -> Result<bool, String> {
-    let (_, mut mission) = control
+    let (store, mission) = control
         .find_mission_store_owner(requester)
         .await?
         .ok_or_else(|| "requesting mission is unavailable".to_string())?;
+    mission_descends_from_in_store(store.as_ref(), mission, owner).await
+}
+
+async fn mission_descends_from_in_store(
+    store: &dyn crate::api::mission_store::MissionStore,
+    mut mission: crate::api::mission_store::Mission,
+    owner: uuid::Uuid,
+) -> Result<bool, String> {
     for _ in 0..64 {
         if mission.id == owner {
             return Ok(true);
         }
-        let Some(parent) = mission.parent_mission_id else {
+        let Some(parent_id) = mission.parent_mission_id else {
             return Ok(false);
         };
-        let (store, parent) = control
-            .find_mission_store_owner(parent)
-            .await?
-            .ok_or_else(|| "mission ancestor is unavailable".to_string())?;
-        // Parent links must stay within their owning store; accepting a
-        // cross-store coincidence would recreate the same confused-deputy
-        // problem this bound prevents.
-        let _ = store;
+        // Stay inside the requester's store. A parent id that only exists in
+        // another user's store is not an ancestor for path authorization.
+        let Some(parent) = store.get_mission(parent_id).await? else {
+            return Ok(false);
+        };
         mission = parent;
     }
     Err("mission ancestry exceeds safe depth".to_string())
@@ -1537,6 +1542,7 @@ mod tests {
         path_is_under_allowed_roots, sanitize_path_component, upload_display_path,
         validate_chunk_upload_shape, MAX_CHUNK_UPLOAD_CHUNKS,
     };
+    use crate::api::mission_store::MissionStore;
     use crate::config::Config;
     use crate::workspace::Workspace;
     use std::path::{Path, PathBuf};
@@ -1728,5 +1734,36 @@ mod tests {
             workspace,
             Some(mission)
         ));
+    }
+
+    #[tokio::test]
+    async fn ancestry_does_not_follow_parent_ids_from_another_store() {
+        let victim_store = crate::api::mission_store::InMemoryMissionStore::new();
+        let attacker_store = crate::api::mission_store::InMemoryMissionStore::new();
+        let victim = victim_store
+            .create_mission(Some("victim"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let attacker = attacker_store
+            .create_mission_with_parent(
+                Some("attacker"),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                Some(victim.id),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !super::mission_descends_from_in_store(&attacker_store, attacker, victim.id)
+                .await
+                .unwrap()
+        );
     }
 }
