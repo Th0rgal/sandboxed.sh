@@ -7302,6 +7302,135 @@ fn apply_native_backend_agent_selector(
 static PR_WRITER_CREATE_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
 
+// Admission is deliberately a durable, filesystem-scoped lease rather than an
+// in-memory counter.  More than one control process can use the same mission
+// store and a restart must not forget work that is already consuming scratch.
+static DISK_ADMISSION_LOCK: std::sync::LazyLock<Mutex<()>> =
+    std::sync::LazyLock::new(|| Mutex::new(()));
+
+struct DurableDiskAdmissionLockGuard {
+    _process_guard: tokio::sync::MutexGuard<'static, ()>,
+    file: std::fs::File,
+}
+
+impl Drop for DurableDiskAdmissionLockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+async fn acquire_durable_disk_admission_lock(
+    config: &Config,
+) -> Result<DurableDiskAdmissionLockGuard, String> {
+    let process_guard = DISK_ADMISSION_LOCK.lock().await;
+    let lock_dir = config.working_dir.join(".sandboxed-sh").join("missions");
+    tokio::fs::create_dir_all(&lock_dir)
+        .await
+        .map_err(|error| format!("create disk admission lock directory: {error}"))?;
+    let lock_path = lock_dir.join(".disk-admission.lock");
+    let file = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("open {}: {error}", lock_path.display()))?;
+        fs2::FileExt::lock_exclusive(&file)
+            .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
+        Ok::<_, String>(file)
+    })
+    .await
+    .map_err(|error| format!("join disk admission lock task: {error}"))??;
+    Ok(DurableDiskAdmissionLockGuard {
+        _process_guard: process_guard,
+        file,
+    })
+}
+
+const DISK_RESERVATION_TAG_PREFIX: &str = "disk-reservation-v1:";
+
+fn disk_reservation_tag(filesystem: &str, bytes: u64) -> String {
+    // `filesystem` is a local statvfs identifier, not a path or secret.  The
+    // trailing byte count makes parsing unambiguous even though the identity
+    // itself contains colons.
+    format!("{DISK_RESERVATION_TAG_PREFIX}{filesystem}:{bytes}")
+}
+
+fn parse_disk_reservation_tag(tag: &str) -> Option<(&str, u64)> {
+    let value = tag.strip_prefix(DISK_RESERVATION_TAG_PREFIX)?;
+    let (filesystem, bytes) = value.rsplit_once(':')?;
+    Some((filesystem, bytes.parse().ok()?))
+}
+
+fn mission_holds_disk_reservation(status: MissionStatus) -> bool {
+    !status.is_terminal() && status != MissionStatus::Acknowledged
+}
+
+fn disk_admission_required_bytes(emergency: u64, reserved: u64, candidate: u64) -> u64 {
+    emergency.saturating_add(reserved).saturating_add(candidate)
+}
+
+async fn reserved_disk_bytes_for_filesystem(
+    mission_store: &Arc<dyn MissionStore>,
+    filesystem: &str,
+) -> Result<u64, String> {
+    let missions = mission_store.list_missions(usize::MAX, 0).await?;
+    Ok(missions
+        .iter()
+        .filter(|mission| mission_holds_disk_reservation(mission.status))
+        .flat_map(|mission| mission.project.tags.iter())
+        .filter_map(parse_disk_reservation_tag)
+        .filter(|(reserved_filesystem, _)| *reserved_filesystem == filesystem)
+        .fold(0u64, |total, (_, bytes)| total.saturating_add(bytes)))
+}
+
+/// The caller must retain the returned lock through mission persistence and
+/// its reservation-tag write.  That makes admission, creation and durable
+/// reconstruction one atomic protocol across local control processes.
+async fn reserve_local_mission_disk(
+    config: &Config,
+    mission_store: &Arc<dyn MissionStore>,
+    workspace: &workspace::Workspace,
+    estimate_gib: u64,
+) -> Result<(DurableDiskAdmissionLockGuard, String), String> {
+    let guard = acquire_durable_disk_admission_lock(config).await?;
+    let root = workspace::mission_workspace_root_for_workspace(workspace, Uuid::nil());
+    if let Some(reason) = disk_admission_refusal(&root) {
+        return Err(reason);
+    }
+    let usage = crate::api::monitoring::disk_usage_for_path(&root).map_err(|error| {
+        format!(
+            "mission creation refused: cannot measure workspace filesystem at {}: {error}",
+            root.display()
+        )
+    })?;
+    let reserved = reserved_disk_bytes_for_filesystem(mission_store, &usage.filesystem).await?;
+    let estimate = estimate_gib.saturating_mul(1 << 30);
+    let emergency = mission_disk_reserve_gib().saturating_mul(1 << 30);
+    let required = disk_admission_required_bytes(emergency, reserved, estimate);
+    if usage.available < required {
+        return Err(format!(
+            "mission admission refused on filesystem {}: {} GiB free, {} GiB already reserved, {} GiB candidate estimate, {} GiB emergency reserve ({} GiB required)",
+            usage.filesystem,
+            usage.available / (1 << 30),
+            reserved / (1 << 30),
+            estimate_gib,
+            mission_disk_reserve_gib(),
+            required / (1 << 30),
+        ));
+    }
+    tracing::info!(
+        filesystem = %usage.filesystem,
+        free_bytes = usage.available,
+        reserved_bytes = reserved,
+        candidate_bytes = estimate,
+        required_bytes = required,
+        "local mission disk admission reserved"
+    );
+    Ok((guard, disk_reservation_tag(&usage.filesystem, estimate)))
+}
+
 struct DurablePrWriterLockGuard {
     _process_guard: tokio::sync::MutexGuard<'static, ()>,
     file: std::fs::File,
@@ -8848,6 +8977,7 @@ pub async fn create_mission(
             },
             requires_local_disk: local_mission,
             estimated_disk_gib: effective_estimated_disk_gib,
+            admission_tags: Vec::new(),
             respond: tx,
         })
         .await
@@ -8974,6 +9104,23 @@ pub async fn create_mission(
             tags.retain(|tag| tag != "pr-writer" && tag != "pr-readonly");
             if !tags.iter().any(|tag| tag == capability) {
                 tags.push(capability.to_string());
+            }
+        }
+    }
+    // Creation persisted the admission lease before replying. This later
+    // metadata patch must retain it, otherwise user tags could release it.
+    let durable_reservation_tags: Vec<String> = mission
+        .project
+        .tags
+        .iter()
+        .filter(|tag| tag.starts_with(DISK_RESERVATION_TAG_PREFIX))
+        .cloned()
+        .collect();
+    if !durable_reservation_tags.is_empty() {
+        let requested = tags.get_or_insert_with(Vec::new);
+        for reservation in durable_reservation_tags {
+            if !requested.iter().any(|tag| tag == &reservation) {
+                requested.push(reservation);
             }
         }
     }
@@ -18159,39 +18306,33 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, fast_mode, backend, config_profile, parent_mission_id, working_directory, scheduling, requires_local_disk, estimated_disk_gib, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, fast_mode, backend, config_profile, parent_mission_id, working_directory, scheduling, requires_local_disk, estimated_disk_gib, admission_tags, respond } => {
                         // Disk preflight: refuse new missions when the root
                         // filesystem is critically full instead of letting
                         // workers die mid-flight on ENOSPC. Actor-level so
                         // the HTTP, Ask and Telegram entrypoints are all
                         // covered by this single gate.
+                        let mut reservation_guard = None;
+                        let mut reservation_tag = None;
                         if requires_local_disk {
                             let workspace = workspaces
                                 .get(workspace_id.unwrap_or(workspace::DEFAULT_WORKSPACE_ID))
                                 .await
                                 .unwrap_or_else(|| workspace::Workspace::default_host(config.working_dir.clone()));
-                            let root = workspace::mission_workspace_root_for_workspace(
+                            match reserve_local_mission_disk(
+                                &config,
+                                &mission_store,
                                 &workspace,
-                                Uuid::nil(),
-                            );
-                            if let Some(refusal) = disk_admission_refusal(&root) {
-                                let _ = respond.send(Err(refusal));
-                                continue;
-                            }
-                            let usage = match crate::api::monitoring::disk_usage_for_path(&root) {
-                                Ok(usage) => usage,
+                                estimated_disk_gib.unwrap_or_else(mission_disk_default_estimate_gib),
+                            ).await {
+                                Ok((guard, tag)) => {
+                                    reservation_guard = Some(guard);
+                                    reservation_tag = Some(tag);
+                                }
                                 Err(error) => {
-                                    let _ = respond.send(Err(format!("mission creation refused: cannot measure workspace filesystem at {}: {error}", root.display())));
+                                    let _ = respond.send(Err(error));
                                     continue;
                                 }
-                            };
-                            if let Some(refusal) = disk_estimate_refusal(
-                                &usage,
-                                estimated_disk_gib.unwrap_or_else(mission_disk_default_estimate_gib),
-                                mission_disk_reserve_gib(),
-                            ) {
-                                let _ = respond.send(Err(refusal));
-                                continue;
                             }
                         }
                         // First persist current mission history
@@ -18219,7 +18360,49 @@ async fn control_actor_loop(
                             scheduling,
                         )
                         .await {
-                            Ok(mission) => {
+                            Ok(mut mission) => {
+                                // The durable file lock remains held until this tag is
+                                // persisted.  A second process reconstructs the sum from
+                                // these tags, so a restart has no in-memory lease to lose.
+                                let mut tags = admission_tags;
+                                if let Some(tag) = reservation_tag {
+                                    tags.push(tag);
+                                }
+                                if !tags.is_empty() {
+                                    if let Err(error) = mission_store.update_mission_project(
+                                        mission.id,
+                                        crate::api::mission_store::MissionProjectPatch {
+                                            tags: Some(tags),
+                                            ..Default::default()
+                                        },
+                                    ).await {
+                                        // Never return a runnable mission that was admitted
+                                        // without its durable reservation.  Marking it terminal
+                                        // also releases any partially-visible reservation.
+                                        let _ = mission_store.update_mission_status(
+                                            mission.id,
+                                            MissionStatus::Failed,
+                                        ).await;
+                                        let _ = respond.send(Err(format!(
+                                            "mission creation rolled back: persist disk admission reservation: {error}"
+                                        )));
+                                        continue;
+                                    }
+                                    match mission_store.get_mission(mission.id).await {
+                                        Ok(Some(updated)) => mission = updated,
+                                        Ok(None) => {
+                                            let _ = respond.send(Err("mission creation rolled back: mission disappeared while persisting disk admission reservation".to_string()));
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            let _ = respond.send(Err(format!("mission creation rolled back: reload disk admission reservation: {error}")));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                // Explicitly drop after durable write, rather than relying on
+                                // scope order if this branch grows a later await.
+                                drop(reservation_guard.take());
                                 history.clear();
                                 *current_mission.write().await = Some(mission.id);
 
@@ -31816,5 +31999,39 @@ Investigate <service/> failures.
             (slow_count as u64) + slow_lagged >= PRODUCER_EVENTS as u64,
             "slow subscriber's got+lost should still account for the producer (got={slow_count} lagged={slow_lagged})"
         );
+    }
+
+    #[test]
+    fn disk_admission_reservations_are_filesystem_scoped_and_exact_at_boundary() {
+        let a = disk_reservation_tag("statvfs:filesystem-a", 20 << 30);
+        let b = disk_reservation_tag("statvfs:filesystem-b", 20 << 30);
+        assert_eq!(
+            parse_disk_reservation_tag(&a),
+            Some(("statvfs:filesystem-a", 20 << 30))
+        );
+        assert_eq!(
+            parse_disk_reservation_tag(&b),
+            Some(("statvfs:filesystem-b", 20 << 30))
+        );
+
+        let emergency = 64 << 30;
+        let first = 20 << 30;
+        // Exact equality leaves the emergency floor intact; a second
+        // same-filesystem admission must include the first reservation.
+        assert_eq!(disk_admission_required_bytes(emergency, 0, first), 84 << 30);
+        assert_eq!(
+            disk_admission_required_bytes(emergency, first, first),
+            104 << 30
+        );
+    }
+
+    #[test]
+    fn terminal_missions_release_disk_admission_reservations() {
+        assert!(mission_holds_disk_reservation(MissionStatus::Pending));
+        assert!(mission_holds_disk_reservation(MissionStatus::Active));
+        assert!(mission_holds_disk_reservation(MissionStatus::AwaitingUser));
+        assert!(!mission_holds_disk_reservation(MissionStatus::Completed));
+        assert!(!mission_holds_disk_reservation(MissionStatus::Failed));
+        assert!(!mission_holds_disk_reservation(MissionStatus::Acknowledged));
     }
 }

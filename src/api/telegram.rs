@@ -3716,6 +3716,7 @@ async fn resolve_or_create_mission(
             scheduling: Default::default(),
             requires_local_disk: true,
             estimated_disk_gib: None,
+            admission_tags: Vec::new(),
             respond: tx,
         })
         .await;

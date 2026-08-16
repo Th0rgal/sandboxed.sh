@@ -432,6 +432,9 @@ pub enum ControlCommand {
         requires_local_disk: bool,
         /// Expected local scratch peak; absent values use the safe default.
         estimated_disk_gib: Option<u64>,
+        /// Tags written atomically with creation.  The control actor uses this
+        /// for durable local-disk admission reservations.
+        admission_tags: Vec<String>,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Update mission status

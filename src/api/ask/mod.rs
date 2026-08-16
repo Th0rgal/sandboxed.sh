@@ -1111,6 +1111,7 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                     scheduling: Default::default(),
                     requires_local_disk: true,
                     estimated_disk_gib: None,
+                    admission_tags: Vec::new(),
                     respond: tx,
                 })
                 .await
