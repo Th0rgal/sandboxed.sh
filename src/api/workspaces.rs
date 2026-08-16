@@ -732,16 +732,18 @@ async fn update_workspace(
         }
     }
 
-    // Merge freeform config (shallow merge of top-level keys)
+    // Merge freeform config (shallow merge of top-level keys). The control
+    // registry path is server-owned and must not move with a client edit.
     if let Some(config) = req.config {
         if let Some(new_obj) = config.as_object() {
             let mut existing = workspace.config.as_object().cloned().unwrap_or_default();
             for (k, v) in new_obj {
+                if k == "mission_workspace_registry_control_root" {
+                    continue;
+                }
                 existing.insert(k.clone(), v.clone());
             }
             workspace.config = serde_json::Value::Object(existing);
-        } else {
-            workspace.config = config;
         }
     }
 

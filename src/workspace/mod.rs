@@ -801,12 +801,13 @@ impl WorkspaceStore {
     }
 
     /// Update a workspace.
-    pub async fn update(&self, workspace: Workspace) -> bool {
+    pub async fn update(&self, mut workspace: Workspace) -> bool {
         let updated = {
             let mut guard = self.workspaces.write().await;
             if let std::collections::hash_map::Entry::Occupied(mut entry) =
                 guard.entry(workspace.id)
             {
+                preserve_control_registry_authority(entry.get(), &mut workspace, &self.working_dir);
                 entry.insert(workspace);
                 true
             } else {
@@ -919,6 +920,9 @@ pub fn mission_workspace_dir_for_root(root: &Path, mission_id: Uuid) -> PathBuf 
 }
 
 const MISSION_WORKSPACE_ROOTS_FILE: &str = "mission-workspace-roots.json";
+const CONTROL_REGISTRY_CONFIG_KEY: &str = "mission_workspace_registry_control_root";
+/// Reserved registry key for the custom workspace volume itself, not a mission.
+const WORKSPACE_ROOT_REGISTRY_KEY: &str = "__workspace_root__";
 static MISSION_WORKSPACE_ROOTS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// The filesystem that owned a mission root when it was selected.  A path is
@@ -956,7 +960,7 @@ pub fn require_verified_mission_workspace(
 /// Accept the path-only format written by releases before filesystem identity
 /// was recorded.  The first successful use upgrades it under the registry
 /// lock; an unavailable legacy root is never replaced by the configured root.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(untagged)]
 enum MissionWorkspaceRootRecordOnDisk {
     Legacy(String),
@@ -988,7 +992,7 @@ fn mission_workspace_roots_path(workspace: &Workspace) -> PathBuf {
     if workspace.id != DEFAULT_WORKSPACE_ID {
         if let Some(root) = workspace
             .config
-            .get("mission_workspace_registry_control_root")
+            .get(CONTROL_REGISTRY_CONFIG_KEY)
             .and_then(serde_json::Value::as_str)
         {
             return PathBuf::from(root)
@@ -1007,19 +1011,21 @@ fn stamp_custom_workspace_control_registry(workspace: &mut Workspace, working_di
     if workspace.id == DEFAULT_WORKSPACE_ID {
         return;
     }
-    if workspace
+    if !workspace
         .config
-        .get("mission_workspace_registry_control_root")
-        .is_none()
+        .get(CONTROL_REGISTRY_CONFIG_KEY)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|root| !root.is_empty())
     {
         if !workspace.config.is_object() {
             workspace.config = serde_json::json!({});
         }
-        workspace.config["mission_workspace_registry_control_root"] =
+        workspace.config[CONTROL_REGISTRY_CONFIG_KEY] =
             serde_json::Value::String(working_dir.to_string_lossy().into_owned());
     }
     let destination = mission_workspace_roots_path(workspace);
     if destination.exists() {
+        ensure_workspace_root_identity_recorded(workspace);
         return;
     }
     if let Some(parent) = destination.parent() {
@@ -1044,12 +1050,156 @@ fn stamp_custom_workspace_control_registry(workspace: &mut Workspace, working_di
             return;
         }
     }
-    if let Err(error) = atomic_write_mission_workspace_roots(&destination, &HashMap::new()) {
+    let mut roots = HashMap::new();
+    if let Some(record) = workspace_root_registry_record(workspace) {
+        roots.insert(WORKSPACE_ROOT_REGISTRY_KEY.to_string(), record);
+    }
+    if let Err(error) = atomic_write_mission_workspace_roots(&destination, &roots) {
         tracing::error!(
             workspace = %workspace.id,
             error = %error,
             "failed to initialize empty control mission-root registry"
         );
+    }
+}
+
+fn preserve_control_registry_authority(
+    existing: &Workspace,
+    incoming: &mut Workspace,
+    working_dir: &Path,
+) {
+    if incoming.id == DEFAULT_WORKSPACE_ID {
+        return;
+    }
+    let existing_root = existing
+        .config
+        .get(CONTROL_REGISTRY_CONFIG_KEY)
+        .cloned()
+        .filter(|value| value.as_str().is_some_and(|root| !root.is_empty()));
+    if !incoming.config.is_object() {
+        incoming.config = existing.config.clone();
+        if incoming.config.is_object() {
+            if let Some(root) = existing_root {
+                incoming.config[CONTROL_REGISTRY_CONFIG_KEY] = root;
+            }
+            return;
+        }
+        incoming.config = serde_json::json!({});
+    }
+    if let Some(root) = existing_root {
+        incoming.config[CONTROL_REGISTRY_CONFIG_KEY] = root;
+    } else {
+        stamp_custom_workspace_control_registry(incoming, working_dir);
+    }
+}
+
+fn workspace_root_registry_record(workspace: &Workspace) -> Option<MissionWorkspaceRootRecord> {
+    let canonical = workspace.path.canonicalize().ok()?;
+    let identity = filesystem_identity(&canonical).ok()?;
+    Some(MissionWorkspaceRootRecord {
+        path: canonical.to_string_lossy().into_owned(),
+        filesystem_identity: Some(identity),
+    })
+}
+
+fn persist_workspace_root_identity(
+    workspace: &Workspace,
+    record: MissionWorkspaceRootRecord,
+) -> std::io::Result<()> {
+    let path = mission_workspace_roots_path(workspace);
+    std::fs::create_dir_all(
+        path.parent()
+            .expect("mission workspace root registry has a parent"),
+    )?;
+    let _guard = MISSION_WORKSPACE_ROOTS_LOCK
+        .lock()
+        .expect("registry lock poisoned");
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock_file)?;
+    let mut roots: HashMap<String, MissionWorkspaceRootRecord> =
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                serde_json::from_str::<HashMap<String, MissionWorkspaceRootRecordOnDisk>>(&contents)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+                    .into_iter()
+                    .map(|(id, value)| (id, value.into()))
+                    .collect()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(error) => return Err(error),
+        };
+    roots.insert(WORKSPACE_ROOT_REGISTRY_KEY.to_string(), record);
+    atomic_write_mission_workspace_roots(&path, &roots)?;
+    fs2::FileExt::unlock(&lock_file)?;
+    Ok(())
+}
+
+fn ensure_workspace_root_identity_recorded(workspace: &Workspace) {
+    if workspace.id == DEFAULT_WORKSPACE_ID {
+        return;
+    }
+    let Ok(roots) = read_mission_workspace_roots(workspace) else {
+        return;
+    };
+    if roots.contains_key(WORKSPACE_ROOT_REGISTRY_KEY) {
+        return;
+    }
+    if let Some(record) = workspace_root_registry_record(workspace) {
+        if let Err(error) = persist_workspace_root_identity(workspace, record) {
+            tracing::error!(
+                workspace = %workspace.id,
+                error = %error,
+                "failed to record custom workspace volume identity"
+            );
+        }
+    }
+}
+
+fn ensure_custom_workspace_volume_identity(workspace: &Workspace) -> std::io::Result<()> {
+    if workspace.id == DEFAULT_WORKSPACE_ID {
+        return Ok(());
+    }
+    let path = mission_workspace_roots_path(workspace);
+    let contents = match std::fs::read_to_string(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "persisted control registry for custom workspace {} is unavailable",
+                    workspace.id
+                ),
+            ));
+        }
+        Err(error) => return Err(error),
+        Ok(contents) => contents,
+    };
+    let roots: HashMap<String, MissionWorkspaceRootRecordOnDisk> = serde_json::from_str(&contents)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    match roots.get(WORKSPACE_ROOT_REGISTRY_KEY) {
+        Some(on_disk) => {
+            let record: MissionWorkspaceRootRecord = on_disk.clone().into();
+            validate_mission_workspace_root(&record)?;
+            Ok(())
+        }
+        None => {
+            if let Some(record) = workspace_root_registry_record(workspace) {
+                persist_workspace_root_identity(workspace, record)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "custom workspace {} volume identity is missing and the mount is unavailable",
+                        workspace.id
+                    ),
+                ))
+            }
+        }
     }
 }
 
@@ -1239,15 +1389,13 @@ pub fn ensure_persisted_mission_root_is_available(
     workspace: &Workspace,
     mission_id: Uuid,
 ) -> std::io::Result<()> {
+    ensure_custom_workspace_volume_identity(workspace)?;
     let path = mission_workspace_roots_path(workspace);
     let contents = match std::fs::read_to_string(&path) {
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
                 && workspace.id != DEFAULT_WORKSPACE_ID
-                && workspace
-                    .config
-                    .get("mission_workspace_registry_control_root")
-                    .is_some() =>
+                && workspace.config.get(CONTROL_REGISTRY_CONFIG_KEY).is_some() =>
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -6117,17 +6265,78 @@ WORKING_DIR = "/workspaces/mission-old"
         let mut workspace = Workspace::new_container("custom".into(), temp.path().join("mount"));
         std::fs::create_dir_all(&workspace.path).unwrap();
         stamp_custom_workspace_control_registry(&mut workspace, temp.path());
-        assert!(workspace.config["mission_workspace_registry_control_root"].is_string());
+        assert!(workspace.config[CONTROL_REGISTRY_CONFIG_KEY].is_string());
         let registry = mission_workspace_roots_path(&workspace);
         assert!(
             registry.exists(),
-            "first-use custom workspace needs an empty control registry"
+            "first-use custom workspace needs a control registry"
         );
         let contents = std::fs::read_to_string(&registry).unwrap();
         let parsed: HashMap<String, MissionWorkspaceRootRecordOnDisk> =
             serde_json::from_str(&contents).unwrap();
-        assert!(parsed.is_empty());
-        assert!(ensure_persisted_mission_root_is_available(&workspace, Uuid::new_v4()).is_ok());
+        if cfg!(target_os = "linux") {
+            assert!(parsed.contains_key(WORKSPACE_ROOT_REGISTRY_KEY));
+        } else {
+            assert!(!parsed.keys().any(|key| key != WORKSPACE_ROOT_REGISTRY_KEY));
+        }
+        if filesystem_identity(&workspace.path).is_ok() {
+            assert!(ensure_persisted_mission_root_is_available(&workspace, Uuid::new_v4()).is_ok());
+        }
+    }
+
+    #[test]
+    fn custom_workspace_volume_identity_mismatch_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = Workspace::new_container("custom".into(), temp.path().join("mount"));
+        std::fs::create_dir_all(&workspace.path).unwrap();
+        stamp_custom_workspace_control_registry(&mut workspace, temp.path());
+        let registry = mission_workspace_roots_path(&workspace);
+        let mut roots: HashMap<String, MissionWorkspaceRootRecord> = HashMap::new();
+        roots.insert(
+            WORKSPACE_ROOT_REGISTRY_KEY.to_string(),
+            MissionWorkspaceRootRecord {
+                path: workspace.path.to_string_lossy().into_owned(),
+                filesystem_identity: Some("linux-v2:replaced-volume:root-ino:1".into()),
+            },
+        );
+        atomic_write_mission_workspace_roots(&registry, &roots).unwrap();
+        assert!(ensure_persisted_mission_root_is_available(&workspace, Uuid::new_v4()).is_err());
+    }
+
+    #[tokio::test]
+    async fn update_preserves_control_registry_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::new(temp.path().to_path_buf()).await;
+        let workspace = Workspace::new_container("custom".into(), temp.path().join("mount"));
+        std::fs::create_dir_all(&workspace.path).unwrap();
+        let id = store.add(workspace).await;
+        let original = store.get(id).await.unwrap();
+        let original_root = original.config[CONTROL_REGISTRY_CONFIG_KEY]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut overwritten = original.clone();
+        overwritten.config = serde_json::json!({
+            "mission_workspace_registry_control_root": "/tmp/attacker-control-root",
+            "unrelated": true
+        });
+        assert!(store.update(overwritten).await);
+        let after = store.get(id).await.unwrap();
+        assert_eq!(
+            after.config[CONTROL_REGISTRY_CONFIG_KEY].as_str(),
+            Some(original_root.as_str())
+        );
+        assert_eq!(after.config["unrelated"], true);
+
+        let mut replaced = after.clone();
+        replaced.config = serde_json::Value::String("not-an-object".into());
+        assert!(store.update(replaced).await);
+        let restored = store.get(id).await.unwrap();
+        assert_eq!(
+            restored.config[CONTROL_REGISTRY_CONFIG_KEY].as_str(),
+            Some(original_root.as_str())
+        );
     }
 
     #[tokio::test]
