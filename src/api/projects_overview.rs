@@ -2823,9 +2823,10 @@ pub async fn project_action(
             match request.delete_mode.as_deref().unwrap_or("delete_missions") {
                 "keep_missions" => {}
                 "delete_missions" => {
+                    let tags = project_tag_keys(&slug);
                     deleted_mission_ids = state
                         .control
-                        .delete_project_missions(&slug)
+                        .delete_project_missions(&tags)
                         .await
                         .map_err(|error| (StatusCode::CONFLICT, error))?;
                 }

@@ -4175,11 +4175,18 @@ impl ControlHub {
         Ok(collected)
     }
 
-    /// Delete every mission tagged with this exact project across live and
-    /// offline stores. This is intentionally fail-closed: a project-wide data
-    /// delete cannot race a running, queued, paused, or otherwise resumable
-    /// mission. The operator must finish or cancel those missions first.
-    pub(crate) async fn delete_project_missions(&self, project: &str) -> Result<Vec<Uuid>, String> {
+    /// Delete every mission tagged with any of these project keys across live
+    /// and offline stores. Callers must pass every alias the board folds onto
+    /// the project (`project_tag_keys`), not only the canonical slug. This is
+    /// intentionally fail-closed: a project-wide data delete cannot race a
+    /// running, queued, paused, or otherwise resumable mission. The operator
+    /// must finish or cancel those missions first. All tags are scanned before
+    /// any delete so a live mission on an alias cannot be discovered after a
+    /// partial wipe.
+    pub(crate) async fn delete_project_missions(
+        &self,
+        projects: &[String],
+    ) -> Result<Vec<Uuid>, String> {
         const PAGE_SIZE: usize = 200;
         let inventory = self.mission_store_inventory().await?;
         let mut stores: Vec<Arc<dyn MissionStore>> = inventory.live;
@@ -4202,24 +4209,40 @@ impl ControlHub {
             ));
         }
 
-        let filter = mission_store::MissionFilter {
-            project: Some(project.to_string()),
-            ..Default::default()
+        let tags: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            projects
+                .iter()
+                .map(|tag| tag.trim())
+                .filter(|tag| !tag.is_empty() && seen.insert((*tag).to_string()))
+                .map(str::to_string)
+                .collect()
         };
         let mut plans: Vec<(Arc<dyn MissionStore>, Vec<Mission>)> = Vec::new();
         for store in stores {
             let mut matched = Vec::new();
-            let mut offset = 0;
-            loop {
-                let page = store
-                    .list_missions_filtered(&filter, PAGE_SIZE, offset)
-                    .await?;
-                let page_len = page.len();
-                matched.extend(page);
-                if page_len < PAGE_SIZE {
-                    break;
+            let mut seen_ids = std::collections::HashSet::new();
+            for tag in &tags {
+                let filter = mission_store::MissionFilter {
+                    project: Some(tag.clone()),
+                    ..Default::default()
+                };
+                let mut offset = 0;
+                loop {
+                    let page = store
+                        .list_missions_filtered(&filter, PAGE_SIZE, offset)
+                        .await?;
+                    let page_len = page.len();
+                    for mission in page {
+                        if seen_ids.insert(mission.id) {
+                            matched.push(mission);
+                        }
+                    }
+                    if page_len < PAGE_SIZE {
+                        break;
+                    }
+                    offset += page_len;
                 }
-                offset += page_len;
             }
             for mission in &matched {
                 if !mission.status.is_terminal() && mission.status != MissionStatus::Acknowledged {
