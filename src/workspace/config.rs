@@ -239,6 +239,22 @@ pub(crate) async fn write_opencode_config(
         base_config = serde_json::json!({});
     }
 
+    // MCP synchronization rewrites the generated settings file.  A custom
+    // workspace can carry provider definitions that do not exist in the
+    // server-wide OpenCode base config, so retain its local `provider` map
+    // before replacing MCP settings.  Server-managed Custom/Kimi definitions
+    // below override only matching keys with their authoritative values.
+    let local_provider_map = tokio::fs::read_to_string(workspace_dir.join("opencode.json"))
+        .await
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .and_then(|config| {
+            config
+                .get("provider")
+                .and_then(|value| value.as_object())
+                .cloned()
+        });
+
     {
         let base_obj = base_config.as_object_mut().expect("opencode base config");
         base_obj.insert(
@@ -251,6 +267,17 @@ pub(crate) async fn write_opencode_config(
             serde_json::Value::Object(permission),
         );
         base_obj.insert("tools".to_string(), serde_json::Value::Object(tools));
+
+        if let Some(provider_map) = local_provider_map {
+            let providers = base_obj
+                .entry("provider".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(providers) = providers.as_object_mut() {
+                for (key, provider) in provider_map {
+                    providers.entry(key).or_insert(provider);
+                }
+            }
+        }
 
         // Add custom providers if any. Kimi is handled here too: like Custom
         // providers it is not an OpenCode built-in, so it needs an explicit
@@ -270,7 +297,11 @@ pub(crate) async fn write_opencode_config(
                 .collect();
 
             if !provider_blocks.is_empty() {
-                let mut provider_map = serde_json::Map::new();
+                let mut provider_map = base_obj
+                    .get("provider")
+                    .and_then(|value| value.as_object())
+                    .cloned()
+                    .unwrap_or_default();
 
                 for provider in provider_blocks {
                     // Kimi: OpenAI-compatible block with the OAuth access token as
@@ -1364,6 +1395,39 @@ pub async fn write_backend_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mcp_rewrite_retains_workspace_local_custom_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        std::fs::write(
+            workspace.join("opencode.json"),
+            r#"{"provider":{"local-relay":{"name":"Local Relay","options":{"baseURL":"https://relay.invalid/v1"}}}}"#,
+        )
+        .unwrap();
+
+        write_opencode_config(
+            workspace,
+            Vec::new(),
+            workspace,
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(workspace.join("opencode.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            rewritten["provider"]["local-relay"]["options"]["baseURL"],
+            "https://relay.invalid/v1"
+        );
+    }
 
     #[tokio::test]
     async fn kimi_opencode_config_discovers_future_models_from_live_catalog() {

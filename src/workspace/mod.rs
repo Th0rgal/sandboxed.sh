@@ -3759,6 +3759,11 @@ pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::
             workspace.mcps_replace_defaults,
         );
         let skill_allowlist = (!workspace.skills.is_empty()).then_some(workspace.skills.as_slice());
+        // This is a rewrite, not a fresh config.  Preserve the workspace's
+        // own Custom and Kimi provider definitions just as mission
+        // preparation does; otherwise an MCP mutation on a relocated/custom
+        // workspace silently removes the only provider OpenCode can use.
+        let custom_providers = read_custom_providers_from_file(&workspace.path);
         if write_opencode_config(
             &path,
             mcp_configs,
@@ -3768,7 +3773,7 @@ pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::
             skill_allowlist,
             None,
             workspace.shared_network,
-            None,
+            (!custom_providers.is_empty()).then_some(custom_providers.as_slice()),
         )
         .await
         .is_ok()
@@ -5772,5 +5777,31 @@ WORKING_DIR = "/workspaces/mission-old"
             resolve_mission_workspace_root(None, temp.path()),
             temp.path()
         );
+    }
+
+    #[test]
+    fn global_mcp_sync_provider_source_includes_workspace_custom_and_kimi() {
+        let temp = tempfile::tempdir().unwrap();
+        let providers_dir = temp.path().join(".sandboxed-sh");
+        std::fs::create_dir_all(&providers_dir).unwrap();
+
+        let mut custom = AIProvider::new(ProviderType::Custom, "Local Relay".into());
+        custom.base_url = Some("https://relay.invalid/v1".into());
+        let mut kimi = AIProvider::new(ProviderType::Kimi, "Kimi".into());
+        kimi.base_url = Some("https://kimi.invalid/v1".into());
+        std::fs::write(
+            providers_dir.join("ai_providers.json"),
+            serde_json::to_vec(&vec![custom, kimi]).unwrap(),
+        )
+        .unwrap();
+
+        let providers = read_custom_providers_from_file(temp.path());
+        assert_eq!(providers.len(), 2);
+        assert!(providers
+            .iter()
+            .any(|p| p.provider_type == ProviderType::Custom));
+        assert!(providers
+            .iter()
+            .any(|p| p.provider_type == ProviderType::Kimi));
     }
 }

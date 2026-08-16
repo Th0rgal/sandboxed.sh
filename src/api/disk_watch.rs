@@ -12,7 +12,6 @@
 //! always fires; the webhook only when `PALOMA_WEBHOOK_FORWARD_URL` is set.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,21 +68,27 @@ enum AlertAction {
     None,
 }
 
-/// Prefer an OS filesystem identity so two persisted roots on the same mount
-/// share one alert cadence. The canonical path remains the portable fallback
-/// (and also identifies mounts on platforms without a device number).
-fn filesystem_identity(root: &Path) -> String {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Ok(metadata) = std::fs::metadata(root) {
-            return format!("device:{}", metadata.dev());
-        }
+/// Collect every operational root from the workspace inventory.  The same
+/// `mission_workspace_roots_for_workspace` helper is used by GC and
+/// admission; it validates persisted identities and excludes an unavailable
+/// or replaced mount rather than accidentally sampling its bare mountpoint.
+fn watched_roots_for_workspaces<'a>(
+    workspaces: impl IntoIterator<Item = &'a crate::workspace::Workspace>,
+) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    for workspace in workspaces {
+        roots.extend(crate::workspace::mission_workspace_roots_for_workspace(
+            &workspace,
+        ));
     }
-    root.canonicalize()
-        .unwrap_or_else(|_| root.to_path_buf())
-        .display()
-        .to_string()
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+async fn watched_roots(state: &Arc<AppState>) -> Vec<std::path::PathBuf> {
+    let workspaces = state.workspaces.list().await;
+    watched_roots_for_workspaces(workspaces.iter())
 }
 
 fn alert_action(
@@ -133,17 +138,24 @@ async fn run_loop(state: Arc<AppState>) {
         // Roots persisted for active missions can outlive a configuration
         // change, so sample every filesystem that can still host one rather
         // than only today's MISSION_WORKSPACE_ROOT.
-        let workspace = crate::workspace::Workspace::default_host(state.config.working_dir.clone());
-        let usages = crate::workspace::mission_workspace_roots_for_workspace(&workspace)
-            .into_iter()
-            .filter_map(|root| match monitoring::disk_usage_for_path(&root) {
-                Ok(usage) => Some((root.canonicalize().unwrap_or(root), usage)),
-                Err(error) => {
-                    tracing::warn!(path = %root.display(), %error, "disk watcher: cannot measure mission workspace filesystem");
-                    None
+        // `DiskUsage.filesystem` is the placement subsystem's stable mounted
+        // filesystem identity.  Deduplicate before alerting or sweeping: two
+        // workspace roots on one filesystem receive one cadence, while equal
+        // pressure on distinct filesystems is independently actionable.
+        let mut usages = HashMap::new();
+        for root in watched_roots(&state).await {
+            match monitoring::disk_usage_for_path(&root) {
+                Ok(usage) => {
+                    usages
+                        .entry(usage.filesystem.clone())
+                        .or_insert_with(|| (root.canonicalize().unwrap_or(root), usage));
                 }
-            });
-        for (mission_root, usage) in usages {
+                Err(error) => {
+                    tracing::warn!(path = %root.display(), %error, "disk watcher: cannot measure verified mission workspace filesystem")
+                }
+            }
+        }
+        for (filesystem, (mission_root, usage)) in usages {
             let used = usage.used;
             let total = usage.total;
             let percent = if total == 0 {
@@ -159,9 +171,7 @@ async fn run_loop(state: Arc<AppState>) {
                 });
             }
             match alert_action(
-                alerts
-                    .entry(filesystem_identity(&mission_root))
-                    .or_default(),
+                alerts.entry(filesystem).or_default(),
                 level,
                 percent,
                 tokio::time::Instant::now(),
@@ -245,6 +255,45 @@ mod tests {
                 now
             ),
             AlertAction::None
+        );
+    }
+
+    #[test]
+    fn custom_workspace_root_is_included_and_keeps_its_own_alert_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_root = temp.path().join("host");
+        let custom_root = temp.path().join("custom-separate-filesystem");
+        std::fs::create_dir_all(&host_root).unwrap();
+        std::fs::create_dir_all(&custom_root).unwrap();
+        let host = crate::workspace::Workspace::default_host(host_root.clone());
+        let mut custom = crate::workspace::Workspace::default_host(custom_root.clone());
+        custom.id = uuid::Uuid::new_v4();
+        custom.name = "custom".into();
+        let roots = watched_roots_for_workspaces([&host, &custom]);
+        assert!(roots.contains(&host_root));
+        assert!(roots.contains(&custom_root));
+
+        // Distinct mounted-filesystem identities must each receive their
+        // initial notification even when pressure level is identical.
+        let now = tokio::time::Instant::now();
+        let mut states = HashMap::<String, AlertState>::new();
+        assert_eq!(
+            alert_action(
+                states.entry("fs-host".into()).or_default(),
+                DiskHealthLevel::Warn,
+                91.0,
+                now
+            ),
+            AlertAction::Notify(DiskHealthLevel::Warn)
+        );
+        assert_eq!(
+            alert_action(
+                states.entry("fs-custom".into()).or_default(),
+                DiskHealthLevel::Warn,
+                91.0,
+                now
+            ),
+            AlertAction::Notify(DiskHealthLevel::Warn)
         );
     }
 }
