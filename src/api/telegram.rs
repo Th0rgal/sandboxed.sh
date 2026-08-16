@@ -1005,6 +1005,19 @@ fn paloma_alert_event_kind_at(
     )
 }
 
+/// Unique alert key for a live AskUserQuestion. Status stays `active`, so
+/// the usual status-event suffix would collapse every wait on the same
+/// mission onto one telegram_alerts row.
+fn paloma_alert_event_kind_for_live_wait(wait_started_at: Option<&str>) -> String {
+    match wait_started_at {
+        Some(started) => format!(
+            "mission_awaiting_user:{}",
+            started.replace([':', '.', '+'], "-")
+        ),
+        None => "mission_awaiting_user:live".to_string(),
+    }
+}
+
 #[cfg(test)]
 fn paloma_should_alert_long_running_mission_at(
     mission: &Mission,
@@ -1480,7 +1493,11 @@ async fn plan_paloma_alert_for_mission(
     )
     .await;
     let now = now_string();
-    let event_kind = paloma_alert_event_kind_at(&mission, base_kind, &events, alert_now);
+    let event_kind = if waiting_for_user_tool && needs_operator {
+        paloma_alert_event_kind_for_live_wait(wait_started_at.as_deref())
+    } else {
+        paloma_alert_event_kind_at(&mission, base_kind, &events, alert_now)
+    };
     let importance = paloma_alert_importance_for_mission(
         &mission,
         interest,
@@ -6837,14 +6854,14 @@ mod tests {
         is_paloma_shared_summary_allowed, markdown_to_telegram_html, merge_telegram_chat_metadata,
         mission_card_should_reanchor, mission_label, normalize_paloma_natural_command,
         paloma_alert_body, paloma_alert_class_from_event_kind, paloma_alert_digest_text,
-        paloma_alert_event_kind_at, paloma_alert_importance_for_mission,
-        paloma_alert_kind_for_status, paloma_channel_job_name, paloma_chat_is_allowed,
-        paloma_command_error_response, paloma_mission_has_failure_only_preference,
-        paloma_role_for_user, paloma_shared_summary_body,
-        paloma_should_alert_long_running_mission_at, paloma_should_alert_mission_at,
-        paloma_status_event_is_new, paloma_status_seen_sequences, paloma_timestamp_is_recent,
-        parse_paloma_selector_and_payload, redact_for_telegram, render_telegram_chunk,
-        sanitize_telegram_visible_text, scope_for_extracted_memory,
+        paloma_alert_event_kind_at, paloma_alert_event_kind_for_live_wait,
+        paloma_alert_importance_for_mission, paloma_alert_kind_for_status, paloma_channel_job_name,
+        paloma_chat_is_allowed, paloma_command_error_response,
+        paloma_mission_has_failure_only_preference, paloma_role_for_user,
+        paloma_shared_summary_body, paloma_should_alert_long_running_mission_at,
+        paloma_should_alert_mission_at, paloma_status_event_is_new, paloma_status_seen_sequences,
+        paloma_timestamp_is_recent, parse_paloma_selector_and_payload, redact_for_telegram,
+        render_telegram_chunk, sanitize_telegram_visible_text, scope_for_extracted_memory,
         select_latest_awaiting_user_mission, should_silence_paloma_shared_command,
         telegram_action_target_matches, telegram_chat_display_title, telegram_shared_file_caption,
         truncate_for_telegram, verify_internal_telegram_action_token, workflow_reply_text,
@@ -7866,6 +7883,23 @@ mod tests {
                 Utc.with_ymd_and_hms(2026, 5, 20, 1, 0, 0).unwrap()
             ),
             "mission_awaiting_user:2026-05-20T00-05-00Z"
+        );
+    }
+
+    #[test]
+    fn live_wait_alert_kind_uses_the_tool_start_not_the_active_status() {
+        assert_eq!(
+            paloma_alert_event_kind_for_live_wait(Some("2026-05-20T01:10:00Z")),
+            "mission_awaiting_user:2026-05-20T01-10-00Z"
+        );
+        assert_ne!(
+            paloma_alert_event_kind_for_live_wait(Some("2026-05-20T01:10:00Z")),
+            paloma_alert_event_kind_for_live_wait(Some("2026-05-20T01:40:00Z")),
+            "a second AskUserQuestion on the same active mission must not collide"
+        );
+        assert_eq!(
+            paloma_alert_event_kind_for_live_wait(None),
+            "mission_awaiting_user:live"
         );
     }
 
