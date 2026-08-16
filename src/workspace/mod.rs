@@ -1993,6 +1993,25 @@ fn mcp_launcher_shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Relative path of `child` inside `workspace_root`.
+///
+/// Prod workspaces are often stored as `/root/.sandboxed-sh/containers/<name>`
+/// while `MISSION_WORKSPACE_ROOT` resolves the same directory through the
+/// `/srv/sandboxed-storage/...` target of that symlink. `Path::strip_prefix`
+/// is lexical and treats those as unrelated, which made every container
+/// resume fail with "MCP launcher is outside the container workspace".
+fn strip_workspace_prefix(child: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = child.strip_prefix(workspace_root) {
+        return Some(relative.to_path_buf());
+    }
+    let canonical_child = std::fs::canonicalize(child).ok()?;
+    let canonical_root = std::fs::canonicalize(workspace_root).ok()?;
+    canonical_child
+        .strip_prefix(canonical_root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_mcp_env_launcher(
     config: &McpServerConfig,
@@ -2075,9 +2094,8 @@ fn write_mcp_env_launcher(
     write_result?;
 
     if workspace_type == WorkspaceType::Container && !container_fallback {
-        let relative = launcher_host_path
-            .strip_prefix(workspace_root)
-            .map_err(|_| anyhow::anyhow!("MCP launcher is outside the container workspace"))?;
+        let relative = strip_workspace_prefix(&launcher_host_path, workspace_root)
+            .ok_or_else(|| anyhow::anyhow!("MCP launcher is outside the container workspace"))?;
         Ok(format!("/{}", relative.to_string_lossy()))
     } else {
         Ok(launcher_host_path.to_string_lossy().to_string())
@@ -2282,9 +2300,8 @@ fn opencode_entry_from_mcp(
                 && nspawn::nspawn_available();
 
             if workspace_type == WorkspaceType::Container && !container_fallback {
-                let relative = workspace_dir
-                    .strip_prefix(workspace_root)
-                    .unwrap_or_else(|_| Path::new(""));
+                let relative =
+                    strip_workspace_prefix(workspace_dir, workspace_root).unwrap_or_default();
                 let guest_dir = if relative.as_os_str().is_empty() {
                     "/".to_string()
                 } else {
@@ -2317,9 +2334,7 @@ fn opencode_entry_from_mcp(
             )?;
 
             if use_nspawn {
-                let rel = workspace_dir
-                    .strip_prefix(workspace_root)
-                    .unwrap_or_else(|_| Path::new(""));
+                let rel = strip_workspace_prefix(workspace_dir, workspace_root).unwrap_or_default();
                 let rel_str = if rel.as_os_str().is_empty() {
                     "/".to_string()
                 } else {
@@ -6380,5 +6395,31 @@ WORKING_DIR = "/workspaces/mission-old"
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_workspace_prefix_follows_a_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("srv/containers/dumbcontracts");
+        std::fs::create_dir_all(
+            real.join("workspaces/mission-bf2b79ee/.sandboxed-sh/mcp-launchers"),
+        )
+        .unwrap();
+        let link_parent = temp.path().join("root/.sandboxed-sh/containers");
+        std::fs::create_dir_all(&link_parent).unwrap();
+        let link = link_parent.join("dumbcontracts");
+        symlink(&real, &link).unwrap();
+
+        let child = real.join("workspaces/mission-bf2b79ee/.sandboxed-sh/mcp-launchers/x.sh");
+        std::fs::write(&child, "#!/bin/bash\n").unwrap();
+
+        let relative = strip_workspace_prefix(&child, &link).expect("same directory via symlink");
+        assert_eq!(
+            relative,
+            PathBuf::from("workspaces/mission-bf2b79ee/.sandboxed-sh/mcp-launchers/x.sh")
+        );
     }
 }

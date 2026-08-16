@@ -2175,13 +2175,12 @@ pub async fn project_updates(
         .as_deref()
         .map(read_alias_map)
         .unwrap_or_default();
-    // Accept either the routing key or a tracker slug that aliases route TO.
-    let mut keys: Vec<String> = vec![slug.clone()];
-    for (from, to) in &aliases {
-        if to == &slug {
-            keys.push(from.clone());
-        }
-    }
+    // Accept the requested slug, its canonical, and every alias that folds
+    // onto the same card. `verity` must see `verity-core` deliveries — the
+    // board folds that way, but this endpoint used to only expand aliases
+    // that *point at* the raw slug, so `GET /verity/updates` stayed frozen
+    // on August-7 `project:verity` rows.
+    let keys = project_tag_keys_with(&aliases, &slug);
     let limit = query.limit.unwrap_or(50).min(200);
     let updates =
         tokio::task::spawn_blocking(move || read_deliveries(&db, DELIVERY_SCAN_LIMIT, Some(&keys)))
