@@ -190,13 +190,22 @@ export type ProjectAction =
   | "delete"
   | "restore";
 
+export type ProjectDeleteMode = "keep_missions" | "delete_missions";
+
 export async function postProjectAction(
   slug: string,
   action: ProjectAction,
+  options?: { deleteMode?: ProjectDeleteMode },
 ): Promise<void> {
+  const body: { action: ProjectAction; delete_mode?: ProjectDeleteMode } = {
+    action,
+  };
+  if (action === "delete") {
+    body.delete_mode = options?.deleteMode ?? "delete_missions";
+  }
   await apiPost(
     `/api/projects/${encodeURIComponent(slug)}/action`,
-    { action },
+    body,
     "Failed to apply project action",
   );
 }

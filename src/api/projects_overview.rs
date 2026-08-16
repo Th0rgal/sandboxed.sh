@@ -2799,16 +2799,16 @@ fn read_overrides(dir: &Path) -> HashMap<String, String> {
 #[derive(Debug, Deserialize)]
 pub struct ProjectActionRequest {
     action: String,
-    /// Only used by `delete`: `keep_missions` removes project-owned state but
-    /// preserves mission history; `delete_missions` also deletes every mission
-    /// tagged with the exact project slug.
+    /// Only used by `delete`. Default is `delete_missions` (wipe tagged
+    /// missions). Pass `keep_missions` to drop the roster row and keep
+    /// mission history — archive is the usual way to keep a project.
     #[serde(default)]
     delete_mode: Option<String>,
 }
 
-/// Apply a board action to a project. Delete is a real project deletion, with
-/// an explicit mission-retention policy; its board override remains as a
-/// tombstone so surviving missions or tracker markdown cannot recreate it.
+/// Apply a board action to a project. Delete wipes the roster row and, by
+/// default, every mission tagged with the slug. The board override stays as a
+/// tombstone so tracker markdown cannot recreate the row.
 #[derive(Debug, serde::Deserialize)]
 pub struct BindConversationRequest {
     pub session_id: String,
@@ -2892,12 +2892,13 @@ pub async fn project_action(
             overrides.insert(slug.clone(), "archived".to_string());
         }
         "delete" => {
-            match request.delete_mode.as_deref().unwrap_or("keep_missions") {
+            match request.delete_mode.as_deref().unwrap_or("delete_missions") {
                 "keep_missions" => {}
                 "delete_missions" => {
+                    let tags = project_tag_keys(&slug);
                     deleted_mission_ids = state
                         .control
-                        .delete_project_missions(&slug)
+                        .delete_project_missions(&tags)
                         .await
                         .map_err(|error| (StatusCode::CONFLICT, error))?;
                 }
