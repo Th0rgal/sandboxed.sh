@@ -20,8 +20,12 @@ pub struct OperatorAttentionInput<'a> {
     pub status: MissionStatus,
     pub awaiting_kind: Option<&'a str>,
     pub has_origin_session: bool,
+    /// Clock for persisted `awaiting_user`+`decision` (`last_status_change_at`).
     pub updated_at: &'a str,
     pub waiting_for_user_tool: bool,
+    /// Live AskUserQuestion clock: the user-wait tool's `started_at`.
+    /// Never `missions.updated_at` — that is the Active flip.
+    pub wait_started_at: Option<&'a str>,
 }
 
 /// Whether this mission is a qualified operator page right now.
@@ -34,34 +38,27 @@ pub fn needs_operator(input: &OperatorAttentionInput<'_>, now: DateTime<Utc>) ->
     if !is_qualified_operator_page(input) {
         return false;
     }
-    !held_for_controller_triage(input.has_origin_session, age_secs(input.updated_at, now))
+    !held_for_controller_triage(input.has_origin_session, page_age_secs(input, now))
 }
 
 /// [`needs_operator`] from a stored mission plus optional live AskUserQuestion.
 pub fn mission_needs_operator(
     mission: &Mission,
     waiting_for_user_tool: bool,
+    wait_started_at: Option<&str>,
     now: DateTime<Utc>,
 ) -> bool {
-    needs_operator(&attention_input(mission, waiting_for_user_tool), now)
+    needs_operator(
+        &attention_input(mission, waiting_for_user_tool, wait_started_at),
+        now,
+    )
 }
 
-pub fn attention_input(
-    mission: &Mission,
+pub fn attention_input<'a>(
+    mission: &'a Mission,
     waiting_for_user_tool: bool,
-) -> OperatorAttentionInput<'_> {
-    // Live AskUserQuestion leaves status Active, so last_status_change_at is
-    // the Active flip — often hours old. Clock that wait from updated_at
-    // (last row touch / tool activity), not the status transition.
-    let updated_at = if waiting_for_user_tool {
-        mission.updated_at.as_str()
-    } else {
-        mission
-            .activity
-            .last_status_change_at
-            .as_deref()
-            .unwrap_or(mission.updated_at.as_str())
-    };
+    wait_started_at: Option<&'a str>,
+) -> OperatorAttentionInput<'a> {
     OperatorAttentionInput {
         status: mission.status,
         awaiting_kind: mission.awaiting_kind.map(|kind| kind.as_str()),
@@ -69,8 +66,13 @@ pub fn attention_input(
             .origin_session_id
             .as_deref()
             .is_some_and(|id| !id.is_empty()),
-        updated_at,
+        updated_at: mission
+            .activity
+            .last_status_change_at
+            .as_deref()
+            .unwrap_or(mission.updated_at.as_str()),
         waiting_for_user_tool,
+        wait_started_at: wait_started_at.filter(|ts| !ts.is_empty()),
     }
 }
 
@@ -100,6 +102,18 @@ fn is_qualified_operator_page(input: &OperatorAttentionInput<'_>) -> bool {
 
 fn held_for_controller_triage(has_origin_session: bool, awaiting_secs: i64) -> bool {
     has_origin_session && awaiting_secs < CONTROLLER_TRIAGE_GRACE_SECS
+}
+
+fn page_age_secs(input: &OperatorAttentionInput<'_>, now: DateTime<Utc>) -> i64 {
+    if input.waiting_for_user_tool {
+        // Missing tool start: treat as now so a long-lived Active row does
+        // not page the instant AskUserQuestion fires. Never use updated_at.
+        return input
+            .wait_started_at
+            .map(|ts| age_secs(ts, now))
+            .unwrap_or(0);
+    }
+    age_secs(input.updated_at, now)
 }
 
 fn age_secs(timestamp: &str, now: DateTime<Utc>) -> i64 {
@@ -136,6 +150,7 @@ mod tests {
             has_origin_session: has_origin,
             updated_at,
             waiting_for_user_tool,
+            wait_started_at: waiting_for_user_tool.then_some(updated_at),
         }
     }
 
@@ -303,21 +318,25 @@ mod tests {
         assert!(mission_needs_operator(
             &sample_mission(Some(AwaitingKind::Decision), None, &fresh),
             false,
+            None,
             now()
         ));
         assert!(!mission_needs_operator(
             &sample_mission(Some(AwaitingKind::Decision), Some("sess-1"), &fresh),
             false,
+            None,
             now()
         ));
         assert!(mission_needs_operator(
             &sample_mission(Some(AwaitingKind::Decision), Some("sess-1"), &expired),
             false,
+            None,
             now()
         ));
         assert!(!mission_needs_operator(
             &sample_mission(Some(AwaitingKind::Ack), Some("sess-1"), &expired),
             false,
+            None,
             now()
         ));
     }
@@ -334,9 +353,37 @@ mod tests {
             &status_flip,
         );
         assert!(
-            !mission_needs_operator(&mission, true, now()),
+            !mission_needs_operator(&mission, true, Some(&tool_start), now()),
             "controller-owned AskUserQuestion inside grace must not page just because Active is old"
         );
+    }
+
+    #[test]
+    fn live_ask_user_question_clocks_grace_from_tool_started_at_not_updated_at() {
+        let too_old = ts_ago(CONTROLLER_TRIAGE_GRACE_SECS + 600);
+        let tool_start = ts_ago(30);
+        let mission = sample_mission_with_status(
+            MissionStatus::Active,
+            None,
+            Some("sess-1"),
+            &too_old,
+            &too_old,
+        );
+        assert!(
+            !mission_needs_operator(&mission, true, Some(&tool_start), now()),
+            "grace must start at the user-wait tool started_at, not missions.updated_at"
+        );
+        assert!(
+            !mission_needs_operator(&mission, true, None, now()),
+            "missing tool start must not fall back to updated_at and page immediately"
+        );
+        let expired_tool = ts_ago(CONTROLLER_TRIAGE_GRACE_SECS + 1);
+        assert!(mission_needs_operator(
+            &mission,
+            true,
+            Some(&expired_tool),
+            now()
+        ));
     }
 
     #[test]
