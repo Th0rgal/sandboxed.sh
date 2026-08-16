@@ -101,6 +101,12 @@ export interface Mission {
    * decision (a real question) or is just waiting to be acked/merged.
    */
   awaiting_kind?: AwaitingKind | null;
+  /**
+   * Qualified operator page. True only for an unanswered decision /
+   * AskUserQuestion with no owning controller, or after triage grace.
+   * The dashboard must not reimplement grace from origin + timestamps.
+   */
+  needs_operator?: boolean;
   /** Activity (P#5): when the status last changed (persisted). */
   last_status_change_at?: string | null;
   /** Activity: timestamp of the most recent mission event (computed). */

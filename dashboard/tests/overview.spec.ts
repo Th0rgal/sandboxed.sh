@@ -276,46 +276,51 @@ test.describe('Overview Page', () => {
     expect(hasLive || !hasLive).toBeTruthy();
   });
 
-  test('shows a needs you inbox for blocked and interrupted missions', async ({ page }) => {
+  test('Needs You only lists qualified operator pages', async ({ page }) => {
     const now = new Date().toISOString();
-    const blockedMission = {
+    const decisionMission = {
       id: '11111111-1111-4111-8111-111111111111',
-      title: 'Review deployment plan',
-      status: 'blocked',
+      title: 'Pick a merge strategy',
+      status: 'awaiting_user',
+      awaiting_kind: 'decision',
+      needs_operator: true,
       workspace_name: 'dev-workspace',
       history: [],
-      resumable: true,
       created_at: now,
       updated_at: now,
     };
-    const interruptedMission = {
+    const ackMission = {
       id: '22222222-2222-4222-8222-222222222222',
-      title: 'Answer product question',
-      status: 'interrupted',
+      title: 'PR ready for review',
+      status: 'awaiting_user',
+      awaiting_kind: 'ack',
+      needs_operator: false,
       workspace_name: 'app-workspace',
       history: [],
-      resumable: false,
       created_at: now,
       updated_at: now,
     };
-    const runningInterruptedMission = {
+    const inGraceMission = {
       id: '33333333-3333-4333-8333-333333333333',
-      title: 'Running resumed mission',
-      status: 'interrupted',
+      title: 'Controller is triaging',
+      status: 'awaiting_user',
+      awaiting_kind: 'decision',
+      needs_operator: false,
+      origin_session_id: 'sess-1',
       history: [],
-      resumable: true,
       created_at: now,
       updated_at: now,
     };
-    const extraBlockedMissions = Array.from({ length: 8 }, (_, index) => ({
-      id: `44444444-4444-4444-8444-44444444444${index}`,
-      title: `Waiting mission ${index + 1}`,
-      status: 'blocked',
+    const waitingToolMission = {
+      id: '44444444-4444-4444-8444-444444444444',
+      title: 'Ask parked inside grace',
+      status: 'active',
+      needs_operator: false,
+      origin_session_id: 'sess-1',
       history: [],
-      resumable: false,
       created_at: now,
       updated_at: now,
-    }));
+    };
 
     await page.route('**/api/**', async (route) => {
       const path = new URL(route.request().url()).pathname;
@@ -340,7 +345,7 @@ test.describe('Overview Page', () => {
 
       if (path === '/api/stats') {
         await json({
-          total_tasks: 3,
+          total_tasks: 4,
           active_tasks: 1,
           completed_tasks: 0,
           failed_tasks: 0,
@@ -357,16 +362,11 @@ test.describe('Overview Page', () => {
         return;
       }
       if (path === '/api/control/missions') {
-        await json([
-          blockedMission,
-          interruptedMission,
-          ...extraBlockedMissions,
-          runningInterruptedMission,
-        ]);
+        await json([decisionMission, ackMission, inGraceMission, waitingToolMission]);
         return;
       }
       if (path === '/api/control/running') {
-        await json([{ mission_id: runningInterruptedMission.id, state: 'running', queue_len: 0 }]);
+        await json([{ mission_id: waitingToolMission.id, state: 'waiting_for_tool', queue_len: 0 }]);
         return;
       }
       if (path === '/api/control/automations') {
@@ -398,11 +398,82 @@ test.describe('Overview Page', () => {
 
     await page.goto('/');
 
-    const inbox = page.getByRole('heading', { name: 'Needs You' }).locator('xpath=ancestor::section');
-    await expect(inbox).toBeVisible();
-    await expect(inbox.locator('.tabular-nums')).toHaveText('10');
-    await expect(inbox.getByText('Review deployment plan')).toBeVisible();
-    await expect(inbox.getByText('Answer product question')).toBeVisible();
-    await expect(inbox.getByText('Running resumed mission')).not.toBeVisible();
+    const needsYou = page.locator('div').filter({ hasText: /^Needs You/ }).first();
+    await expect(needsYou.getByText('Pick a merge strategy')).toBeVisible();
+    await expect(needsYou.getByText('PR ready for review')).toHaveCount(0);
+    await expect(needsYou.getByText('Controller is triaging')).toHaveCount(0);
+    await expect(needsYou.getByText('Ask parked inside grace')).toHaveCount(0);
+
+    await expect(page.getByText('PR ready for review')).toBeVisible();
+    await expect(page.getByText('Ask parked inside grace')).toBeVisible();
+    await expect(page.getByText('Controller is triaging')).toBeVisible();
+  });
+
+  test('Needs You is empty when nothing qualifies', async ({ page }) => {
+    const now = new Date().toISOString();
+    const ackMission = {
+      id: '22222222-2222-4222-8222-222222222222',
+      title: 'PR ready for review',
+      status: 'awaiting_user',
+      awaiting_kind: 'ack',
+      needs_operator: false,
+      history: [],
+      created_at: now,
+      updated_at: now,
+    };
+
+    await page.route('**/api/**', async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (route.request().method() === 'OPTIONS') {
+        await route.fulfill({
+          status: 204,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': '*',
+            'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+          },
+        });
+        return;
+      }
+      const json = (body: unknown) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify(body),
+        });
+
+      if (path === '/api/stats') {
+        await json({
+          total_tasks: 1,
+          active_tasks: 0,
+          completed_tasks: 0,
+          failed_tasks: 0,
+          total_cost_cents: 0,
+          actual_cost_cents: 0,
+          estimated_cost_cents: 0,
+          unknown_cost_cents: 0,
+          success_rate: 1,
+        });
+        return;
+      }
+      if (path === '/api/workspaces' || path === '/api/control/automations') {
+        await json([]);
+        return;
+      }
+      if (path === '/api/control/missions') {
+        await json([ackMission]);
+        return;
+      }
+      if (path === '/api/control/running') {
+        await json([]);
+        return;
+      }
+      await json({});
+    });
+
+    await page.goto('/');
+    await expect(page.getByText('All good!')).toBeVisible();
+    await expect(page.getByText('PR ready for review')).toBeVisible();
   });
 });

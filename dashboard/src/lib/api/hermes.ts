@@ -270,6 +270,7 @@ export interface AlertMissionSummary {
   status: string;
   workspace_name?: string | null;
   awaiting_kind?: string | null;
+  needs_operator?: boolean;
 }
 
 export interface AlertFeedEntry {
@@ -288,11 +289,13 @@ export interface AlertsFeedResponse {
 
 export async function listAlerts(opts?: {
   statuses?: string[];
+  needs_operator?: boolean;
   before?: string;
   limit?: number;
 }): Promise<AlertsFeedResponse> {
   const params = new URLSearchParams();
   if (opts?.statuses?.length) params.set("statuses", opts.statuses.join(","));
+  if (opts?.needs_operator) params.set("needs_operator", "true");
   if (opts?.before) params.set("before", opts.before);
   if (opts?.limit) params.set("limit", String(opts.limit));
   const qs = params.toString();

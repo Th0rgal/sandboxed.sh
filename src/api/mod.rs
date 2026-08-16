@@ -50,6 +50,7 @@ mod monitoring;
 mod native_loop_observer;
 pub mod oauth_reconcile;
 pub mod opencode;
+pub(crate) mod operator_attention;
 pub mod paloma;
 pub mod project_health;
 pub mod projects_overview;

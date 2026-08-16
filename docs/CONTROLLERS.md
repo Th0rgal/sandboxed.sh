@@ -89,8 +89,17 @@ Chaque livraison, **y compris les `[SILENT]`**, se termine par :
 ```
 
 - `mode=active` — il travaille. Un tick sain et muet, c'est `[SILENT]` + ce trailer.
-- `mode=blocked` — il bute sur quelque chose d'externe. `wait=` dit depuis combien
-  de ticks.
+- `mode=blocked` **sans suffixe** — **aucune lane ne peut avancer**. `wait=`
+  dit depuis combien de ticks. `blocked:<cause>` est le seul suffixe autorisé
+  et nomme la cause (`blocked:disk` est un vrai no-lane ; `blocked:harness`
+  n'en est pas un).
+- `blocked:harness` — suffixe de **trailer** temporaire (≤ 3 ticks) pour un
+  CLI manquant, un binaire mauvaise arch, ou un `nsenter` cassé, puis
+  contournement (autre backend, workspace host). Ce n'est **pas** un projet
+  bloqué. L'appel structuré `update_project_status` n'accepte que
+  `active`/`blocked`/`paused` : écrire `mode=blocked` + `blocker=harness`.
+  Préférer `mode=active` + `next=` changer de backend / réparer le harness.
+  Ne jamais poser un `blocked` nu pour un échec de harness.
 - `mode=paused` — dormant volontairement.
 
 Avant, ces trois régimes te parvenaient tous sous la forme d'un `[SILENT]`
@@ -101,6 +110,18 @@ ticks ». Maintenant `grep 'mode=blocked'` suffit, et le board les affiche.
 il doit vérifier que la dépendance est encore vivante, tenter un contournement
 borné, et livrer un rapport non silencieux. À 6 ticks, il escalade avec une
 question précise.
+
+Un callback d'inspect (`awaiting_user`, mission parkée) ne pose pas
+`mode=blocked` : ces statuts omettent le `[CTRL:]`. Recopier l'ancien
+trailer est une dérive de prompt.
+
+Si le dispatch est refusé (disque, auth, capacité), le projet **garde son
+objectif** avec un blocker infra nommé (`blocked:disk`, …). Le travail
+plateforme s'ouvre sous `sandboxed-sh`. On ne retitre pas, on ne réutilise
+pas la session de campagne (Lido « Corriger et merger les PRs » devenue un
+P0 disque). Un ordre explicite dans le chat (« merge these PRs ») met à jour
+`merge_authority` — `material_bar` seulement si l'ordre change aussi ce qui
+mérite une livraison. Un « never merge to main » périmé ne le surclasse pas.
 
 ## Le board
 

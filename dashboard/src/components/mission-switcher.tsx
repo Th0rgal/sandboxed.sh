@@ -168,7 +168,11 @@ function getMissionBackendLabel(mission: Mission): string {
 function getMissionStatusLabel(mission: Mission): string {
   // Distinguish "Needs Decision" vs "Awaiting Review" for awaiting_user using
   // awaiting_kind, matching the control workbench/header.
-  return statusLabel(mission.status, mission.awaiting_kind) ?? mission.status ?? 'Unknown';
+  return statusLabel(
+    mission.status,
+    mission.awaiting_kind,
+    mission.needs_operator === true,
+  ) ?? mission.status ?? 'Unknown';
 }
 
 function getMissionStatusToneClass(
@@ -215,7 +219,13 @@ function getMissionStatusDisplay(
     return {
       Icon: getStatusIcon(statusKey),
       tone: getMissionStatusToneClass(runningState, true),
-      label: waiting ? 'Needs You' : (runningState || 'running').replace(/_/g, ' '),
+      label: waiting
+        ? mission?.needs_operator
+          ? 'Needs You'
+          : mission?.awaiting_kind === 'ack'
+            ? 'Awaiting Review'
+            : 'Needs Decision'
+        : (runningState || 'running').replace(/_/g, ' '),
       spin: !waiting,
     };
   }

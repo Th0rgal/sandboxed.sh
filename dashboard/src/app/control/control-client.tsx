@@ -9045,6 +9045,7 @@ export default function ControlClient() {
         activeMission.status,
         viewingMissionIsRunning,
         activeMission.awaiting_kind,
+        activeMission.needs_operator === true,
       )
     : null;
   const faviconStatus = useMemo<MissionStatus | null>(() => {

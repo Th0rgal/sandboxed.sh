@@ -80,7 +80,10 @@ CREATE TABLE IF NOT EXISTS projects (
     controller_cron_id TEXT,                             -- the controller<->project link
     repository         TEXT,
     created_at         TEXT NOT NULL,
-    updated_at         TEXT NOT NULL
+    updated_at         TEXT NOT NULL,
+    -- Watermark for the last mode write. HTTP set_mode stamps now; ingest
+    -- only overwrites when the delivery is at least this new.
+    mode_signal_at     TEXT
 );
 
 -- The autonomy grant, structured so it survives a controller rewriting its own
@@ -233,6 +236,19 @@ impl ProjectsStore {
             "project_grant",
             "autonomy_level",
             "autonomy_level TEXT",
+        )?;
+        Self::ensure_column(
+            connection,
+            "projects",
+            "mode_signal_at",
+            "mode_signal_at TEXT",
+        )?;
+        // Rows that already had a mode before this column existed must not
+        // look unstamped: the first ingest would otherwise overwrite them.
+        connection.execute(
+            "UPDATE projects SET mode_signal_at = updated_at \
+             WHERE mode_signal_at IS NULL AND mode IS NOT NULL",
+            [],
         )?;
         connection.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_project_decisions_status \
@@ -396,7 +412,9 @@ impl ProjectsStore {
     ///
     /// Idempotent on `at`: the ingestor re-reads an overlapping window every
     /// cycle, so replaying a delivery it has already seen must not inflate the
-    /// count. Returns the resulting observation count for this state.
+    /// count. Returns the resulting observation count, or `0` when this `at`
+    /// was already counted (or is older than the open event) so ingest can
+    /// skip mode.
     pub fn record_state(
         &self,
         slug: &str,
@@ -421,7 +439,7 @@ impl ProjectsStore {
             if open_signature == signature {
                 // Already counted, or older than what we have: nothing to do.
                 if at <= last_seen_at.as_str() {
-                    return Ok(observations);
+                    return Ok(0);
                 }
                 connection
                     .execute(
@@ -467,7 +485,7 @@ impl ProjectsStore {
     /// exists at all is one created, with `descriptor` and no headline.
     ///
     /// Idempotent on `at`, same as [`Self::record_state`]. Returns the
-    /// resulting observation count.
+    /// resulting observation count, or `0` when this `at` was already counted.
     pub fn record_silent_observation(
         &self,
         slug: &str,
@@ -490,7 +508,7 @@ impl ProjectsStore {
         if let Some((first_seen_at, last_seen_at, observations)) = current {
             // Already counted, or older than what we have: nothing to do.
             if at <= last_seen_at.as_str() {
-                return Ok(observations);
+                return Ok(0);
             }
             connection
                 .execute(
@@ -710,7 +728,8 @@ impl ProjectsStore {
             .prepare(
                 "SELECT slug, title, objective, status, mode, wait_ticks, \
                  next_action, blocker, controller_cron_id, repository, \
-                 created_at, updated_at FROM projects ORDER BY updated_at DESC, slug",
+                 created_at, updated_at, mode_signal_at FROM projects \
+                 ORDER BY updated_at DESC, slug",
             )
             .map_err(|e| e.to_string())?;
         let rows = statement
@@ -727,7 +746,7 @@ impl ProjectsStore {
             .query_row(
                 "SELECT slug, title, objective, status, mode, wait_ticks, \
                  next_action, blocker, controller_cron_id, repository, \
-                 created_at, updated_at FROM projects WHERE slug = ?1",
+                 created_at, updated_at, mode_signal_at FROM projects WHERE slug = ?1",
                 params![slug],
                 Self::project_from_row,
             )
@@ -873,6 +892,7 @@ impl ProjectsStore {
             repository: row.get(9)?,
             created_at: row.get(10)?,
             updated_at: row.get(11)?,
+            mode_signal_at: row.get(12)?,
         })
     }
 
@@ -937,7 +957,7 @@ impl ProjectsStore {
             .execute(
                 "UPDATE projects SET mode = ?2, next_action = ?3, blocker = ?4, \
                  wait_ticks = CASE WHEN ?5 THEN wait_ticks + 1 ELSE 0 END, \
-                 updated_at = ?6 WHERE slug = ?1",
+                 updated_at = ?6, mode_signal_at = ?6 WHERE slug = ?1",
                 params![slug, mode, next_action, blocker, unchanged, now],
             )
             .map_err(|e| e.to_string())?;
@@ -960,16 +980,46 @@ impl ProjectsStore {
         wait: i64,
         next_action: Option<&str>,
         blocker: Option<&str>,
+        at: Option<&str>,
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
-        connection
-            .execute(
-                "UPDATE projects SET mode = ?2, wait_ticks = ?3, next_action = ?4, \
-                 blocker = ?5, updated_at = ?6 WHERE slug = ?1",
-                params![slug, mode, wait, next_action, blocker, now],
-            )
-            .map_err(|e| e.to_string())?;
+        match at {
+            Some(at) => {
+                let watermark: Option<String> = connection
+                    .query_row(
+                        "SELECT mode_signal_at FROM projects WHERE slug = ?1",
+                        params![slug],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .flatten();
+                if watermark
+                    .as_deref()
+                    .is_some_and(|watermark| !rfc3339_at_least(at, watermark))
+                {
+                    return Ok(());
+                }
+                connection
+                    .execute(
+                        "UPDATE projects SET mode = ?2, wait_ticks = ?3, next_action = ?4, \
+                         blocker = ?5, updated_at = ?6, mode_signal_at = ?7 \
+                         WHERE slug = ?1",
+                        params![slug, mode, wait, next_action, blocker, now, at],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            None => {
+                connection
+                    .execute(
+                        "UPDATE projects SET mode = ?2, wait_ticks = ?3, next_action = ?4, \
+                         blocker = ?5, updated_at = ?6 WHERE slug = ?1",
+                        params![slug, mode, wait, next_action, blocker, now],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(())
     }
 
@@ -1502,6 +1552,32 @@ pub struct UnroutedDelivery {
     pub blocker: Option<String>,
 }
 
+/// Parsed RFC3339 compare so `Z` and `+00:00` (and other offsets) order by
+/// instant, not by the serialized suffix.
+pub(crate) fn rfc3339_at_least(candidate: &str, watermark: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(candidate),
+        chrono::DateTime::parse_from_rfc3339(watermark),
+    ) {
+        (Ok(candidate), Ok(watermark)) => candidate >= watermark,
+        // Unparseable candidate must not clobber a known watermark.
+        (Err(_), Ok(_)) => false,
+        _ => true,
+    }
+}
+
+/// Strict instant compare for newest-in-batch selection. Unparseable
+/// values fall back to string order.
+pub(crate) fn rfc3339_after(candidate: &str, existing: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(candidate),
+        chrono::DateTime::parse_from_rfc3339(existing),
+    ) {
+        (Ok(candidate), Ok(existing)) => candidate > existing,
+        _ => candidate > existing,
+    }
+}
+
 /// A project as an object in its own right, not a union reconstructed per read.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProjectRecord {
@@ -1524,6 +1600,8 @@ pub struct ProjectRecord {
     pub repository: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_signal_at: Option<String>,
 }
 
 /// A chat-planned roadmap item: the project-scoped precursor of a board task.
@@ -1909,12 +1987,34 @@ mod tests {
             .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z", None)
             .expect("record");
         for _ in 0..5 {
-            store
-                .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z", None)
-                .expect("replay");
+            assert_eq!(
+                store
+                    .record_state("verity", "blocked", None, "2026-08-04T10:15:00Z", None)
+                    .expect("replay"),
+                0
+            );
         }
         let timeline = store.state_timeline("verity", 10).expect("timeline");
         assert_eq!(timeline[0].observations, 2);
+    }
+
+    #[test]
+    fn silent_replay_returns_zero_and_does_not_extend() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        assert_eq!(
+            store
+                .record_silent_observation("verity", "ctrl:active", "2026-08-04T10:00:00Z", None)
+                .expect("first"),
+            1
+        );
+        assert_eq!(
+            store
+                .record_silent_observation("verity", "ctrl:blocked", "2026-08-04T10:00:00Z", None)
+                .expect("replay"),
+            0
+        );
+        let timeline = store.state_timeline("verity", 10).expect("timeline");
+        assert_eq!(timeline[0].observations, 1);
     }
 
     /// An out-of-order delivery from the overlap window must not be recorded
@@ -2030,7 +2130,12 @@ mod tests {
         store
             .set_mode("bench", "active", Some("run"), None)
             .expect("m1");
-        assert_eq!(store.get_project("bench").unwrap().unwrap().wait_ticks, 0);
+        let after_http = store.get_project("bench").unwrap().unwrap();
+        assert_eq!(after_http.wait_ticks, 0);
+        assert!(
+            after_http.mode_signal_at.is_some(),
+            "HTTP set_mode must stamp mode_signal_at so explicit blockers stay fresh"
+        );
 
         // Same mode+blocker two more ticks: the counter is how long it's been here.
         store
@@ -2059,7 +2164,7 @@ mod tests {
         let store = ProjectsStore::open_in_memory().expect("store");
         // No project row: the ingestor must not create one from a trailer.
         store
-            .project_mode_from_signal("ghost", "active", 0, None, None)
+            .project_mode_from_signal("ghost", "active", 0, None, None, None)
             .expect("no-op, not an error");
         assert!(store.get_project("ghost").expect("read").is_none());
 
@@ -2069,15 +2174,112 @@ mod tests {
         // Replaying the same signal twice does not inflate wait — it is passed
         // in, not incremented, so overlapping ingest cycles are harmless.
         store
-            .project_mode_from_signal("bench", "blocked", 2, None, Some("transport-cap"))
+            .project_mode_from_signal("bench", "blocked", 2, None, Some("transport-cap"), None)
             .expect("m1");
         store
-            .project_mode_from_signal("bench", "blocked", 2, None, Some("transport-cap"))
+            .project_mode_from_signal("bench", "blocked", 2, None, Some("transport-cap"), None)
             .expect("m2 replay");
         let p = store.get_project("bench").expect("read").expect("present");
         assert_eq!(p.mode.as_deref(), Some("blocked"));
         assert_eq!(p.wait_ticks, 2);
         assert_eq!(p.blocker.as_deref(), Some("transport-cap"));
+    }
+
+    #[test]
+    fn mode_signal_watermark_refuses_older_deliveries() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("bench", None, None, None, None)
+            .expect("seed");
+        store
+            .set_mode("bench", "active", None, None)
+            .expect("http set_mode");
+        store.set_mode("bench", "active", None, None).expect("tick");
+        let before = store.get_project("bench").expect("read").expect("present");
+        assert_eq!(before.mode.as_deref(), Some("active"));
+        assert_eq!(before.wait_ticks, 1);
+
+        store
+            .project_mode_from_signal(
+                "bench",
+                "blocked",
+                0,
+                None,
+                Some("stale-callback"),
+                Some("2020-01-01T00:00:00Z"),
+            )
+            .expect("older signal");
+        let after = store.get_project("bench").expect("read").expect("present");
+        assert_eq!(after.mode.as_deref(), Some("active"));
+        assert_eq!(after.wait_ticks, 1);
+        assert_eq!(after.blocker, None);
+    }
+
+    #[test]
+    fn rfc3339_watermark_compares_instants_not_suffixes() {
+        assert!(rfc3339_at_least(
+            "2026-08-16T12:00:00Z",
+            "2026-08-16T12:00:00+00:00"
+        ));
+        assert!(rfc3339_at_least(
+            "2026-08-16T12:00:00+00:00",
+            "2026-08-16T12:00:00Z"
+        ));
+        assert!(!rfc3339_at_least(
+            "2026-08-16T11:00:00Z",
+            "2026-08-16T12:00:00+00:00"
+        ));
+        assert!(rfc3339_after(
+            "2026-08-16T13:00:00Z",
+            "2026-08-16T12:00:00+00:00"
+        ));
+        assert!(!rfc3339_after(
+            "2026-08-16T12:00:00Z",
+            "2026-08-16T12:00:00+00:00"
+        ));
+    }
+
+    #[test]
+    fn mode_signal_at_backfills_from_updated_at_on_existing_modes() {
+        let connection = Connection::open_in_memory().expect("conn");
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (
+                    slug TEXT PRIMARY KEY NOT NULL,
+                    title TEXT, objective TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    mode TEXT,
+                    wait_ticks INTEGER NOT NULL DEFAULT 0,
+                    next_action TEXT, blocker TEXT,
+                    controller_cron_id TEXT, repository TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                INSERT INTO projects
+                    (slug, status, mode, wait_ticks, created_at, updated_at)
+                VALUES
+                    ('bench', 'active', 'active', 0,
+                     '2026-08-01T00:00:00Z', '2026-08-10T12:00:00Z'),
+                    ('idle', 'active', NULL, 0,
+                     '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z');",
+            )
+            .expect("old schema");
+        ProjectsStore::initialize(&connection).expect("migrate");
+        let stamped: String = connection
+            .query_row(
+                "SELECT mode_signal_at FROM projects WHERE slug = 'bench'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stamped");
+        assert_eq!(stamped, "2026-08-10T12:00:00Z");
+        let idle: Option<String> = connection
+            .query_row(
+                "SELECT mode_signal_at FROM projects WHERE slug = 'idle'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("idle");
+        assert_eq!(idle, None);
     }
 
     #[test]

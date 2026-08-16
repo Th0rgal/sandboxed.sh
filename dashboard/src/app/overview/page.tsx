@@ -108,7 +108,11 @@ const CompactMissionCard = memo(function CompactMissionCard({
   onDelete: (id: string) => void;
   onToggleWorkers?: (id: string) => void;
 }) {
-  const color = getMissionTextColor(mission.status, isRunningForDisplay);
+  const color = getMissionTextColor(
+    mission.status,
+    isRunningForDisplay,
+    mission.awaiting_kind,
+  );
   const title = getMissionTitle(mission);
   const groupedWorkers = workers ?? [];
   const hasWorkers = groupedWorkers.length > 0;
@@ -366,10 +370,9 @@ function OverviewPageContent() {
     }
   );
 
-  // Missions parked on a frontend tool (e.g. AskUserQuestion). The backend
-  // reports them in the running list with run state `waiting_for_tool`, but
-  // they are blocked on the user, so they belong in "Needs You" — not
-  // "Running". Track them separately and keep them out of the running set.
+  // Missions parked on a frontend tool (e.g. AskUserQuestion). They stay in
+  // Running unless the API marked them `needs_operator` — controller-owned
+  // questions inside triage grace are not a human page.
   const waitingForToolMissionIds = useMemo(() => {
     return new Set(
       runningMissions
@@ -378,14 +381,11 @@ function OverviewPageContent() {
     );
   }, [runningMissions]);
 
-  // Build a set of actually-executing mission IDs from the runtime state
-  // (excluding those merely waiting on a frontend tool).
+  // Build a set of actually-executing mission IDs from the runtime state.
+  // waiting_for_tool stays here so unqualified AskUserQuestion rows remain
+  // Running; categorizeMissions promotes only `needs_operator` to Needs You.
   const runningMissionIds = useMemo(() => {
-    return new Set(
-      runningMissions
-        .filter((rm) => rm.state !== 'waiting_for_tool')
-        .map((rm) => rm.mission_id)
-    );
+    return new Set(runningMissions.map((rm) => rm.mission_id));
   }, [runningMissions]);
 
   // Build a set of missions with active automations
@@ -634,9 +634,8 @@ function OverviewPageContent() {
                         isActuallyRunning={
                           // Offer Cancel (not Delete) whenever the harness is
                           // still alive — including a mission parked on a
-                          // frontend tool (waiting_for_tool). It shows as
-                          // "Needs You", but its process is live and should be
-                          // cancellable, not deleted outright.
+                          // frontend tool (waiting_for_tool). The process is
+                          // live even when the card sits in Needs You.
                           runningMissionIds.has(mission.id) ||
                           waitingForToolMissionIds.has(mission.id)
                         }

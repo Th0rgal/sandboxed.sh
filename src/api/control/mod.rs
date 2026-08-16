@@ -4052,6 +4052,24 @@ impl ControlHub {
         Ok(collected)
     }
 
+    /// Live AskUserQuestion waits: mission id → user-wait tool `started_at`.
+    /// Presence means `WaitingUser`; the value is the grace clock (None if the
+    /// tool row is not registered yet — treated as just started).
+    pub(crate) async fn collect_waiting_user_waits(&self) -> HashMap<Uuid, Option<String>> {
+        let mut waits = HashMap::new();
+        let Ok(inventory) = self.mission_store_inventory().await else {
+            return waits;
+        };
+        for store in inventory.live {
+            let Ok(runs) = store.list_active_mission_runs().await else {
+                continue;
+            };
+            let store_waits = user_wait_starts_for_runs(store.as_ref(), &runs).await;
+            waits.extend(store_waits);
+        }
+        waits
+    }
+
     /// Board tasks across every store whose boss mission belongs to this
     /// project family. Live stores answer through the trait; persisted SQLite
     /// databases with no live control session (fresh restart, other users) are
@@ -4203,11 +4221,18 @@ impl ControlHub {
         Ok(collected)
     }
 
-    /// Delete every mission tagged with this exact project across live and
-    /// offline stores. This is intentionally fail-closed: a project-wide data
-    /// delete cannot race a running, queued, paused, or otherwise resumable
-    /// mission. The operator must finish or cancel those missions first.
-    pub(crate) async fn delete_project_missions(&self, project: &str) -> Result<Vec<Uuid>, String> {
+    /// Delete every mission tagged with any of these project keys across live
+    /// and offline stores. Callers must pass every alias the board folds onto
+    /// the project (`project_tag_keys`), not only the canonical slug. This is
+    /// intentionally fail-closed: a project-wide data delete cannot race a
+    /// running, queued, paused, or otherwise resumable mission. The operator
+    /// must finish or cancel those missions first. All tags are scanned before
+    /// any delete so a live mission on an alias cannot be discovered after a
+    /// partial wipe.
+    pub(crate) async fn delete_project_missions(
+        &self,
+        projects: &[String],
+    ) -> Result<Vec<Uuid>, String> {
         const PAGE_SIZE: usize = 200;
         let inventory = self.mission_store_inventory().await?;
         let mut stores: Vec<Arc<dyn MissionStore>> = inventory.live;
@@ -4230,24 +4255,40 @@ impl ControlHub {
             ));
         }
 
-        let filter = mission_store::MissionFilter {
-            project: Some(project.to_string()),
-            ..Default::default()
+        let tags: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            projects
+                .iter()
+                .map(|tag| tag.trim())
+                .filter(|tag| !tag.is_empty() && seen.insert((*tag).to_string()))
+                .map(str::to_string)
+                .collect()
         };
         let mut plans: Vec<(Arc<dyn MissionStore>, Vec<Mission>)> = Vec::new();
         for store in stores {
             let mut matched = Vec::new();
-            let mut offset = 0;
-            loop {
-                let page = store
-                    .list_missions_filtered(&filter, PAGE_SIZE, offset)
-                    .await?;
-                let page_len = page.len();
-                matched.extend(page);
-                if page_len < PAGE_SIZE {
-                    break;
+            let mut seen_ids = std::collections::HashSet::new();
+            for tag in &tags {
+                let filter = mission_store::MissionFilter {
+                    project: Some(tag.clone()),
+                    ..Default::default()
+                };
+                let mut offset = 0;
+                loop {
+                    let page = store
+                        .list_missions_filtered(&filter, PAGE_SIZE, offset)
+                        .await?;
+                    let page_len = page.len();
+                    for mission in page {
+                        if seen_ids.insert(mission.id) {
+                            matched.push(mission);
+                        }
+                    }
+                    if page_len < PAGE_SIZE {
+                        break;
+                    }
+                    offset += page_len;
                 }
-                offset += page_len;
             }
             for mission in &matched {
                 if !mission.status.is_terminal() && mission.status != MissionStatus::Acknowledged {
@@ -4261,6 +4302,17 @@ impl ControlHub {
                         "Cannot delete project data while mission {} still has an active run.",
                         mission.id
                     ));
+                }
+                let children = collect_child_mission_ids(&store, mission.id)
+                    .await
+                    .map_err(|(_, error)| error)?;
+                for child_id in children {
+                    if !seen_ids.contains(&child_id) {
+                        return Err(format!(
+                            "Cannot delete project data while mission {} has descendant {} tagged outside this project. Re-tag or delete that child first.",
+                            mission.id, child_id
+                        ));
+                    }
                 }
             }
             plans.push((store, matched));
@@ -5159,6 +5211,7 @@ fn attach_execution_to_mission_value(
     mut value: serde_json::Value,
     mission: &Mission,
     run: Option<&MissionRun>,
+    wait_started_at: Option<&str>,
 ) -> serde_json::Value {
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -5174,12 +5227,52 @@ fn attach_execution_to_mission_value(
                 serde_json::Value::Null
             },
         );
+        let waiting_for_user_tool =
+            run.is_some_and(|run| run.execution_state == MissionExecutionState::WaitingUser);
+        object.insert(
+            "needs_operator".to_string(),
+            serde_json::Value::Bool(super::operator_attention::mission_needs_operator(
+                mission,
+                waiting_for_user_tool,
+                wait_started_at,
+                chrono::Utc::now(),
+            )),
+        );
     }
     value
 }
 
 fn is_user_wait_tool(tool_kind: &str) -> bool {
     matches!(tool_kind, "request_user_input" | "frontend_tool") || is_interactive_ui_tool(tool_kind)
+}
+
+pub(crate) async fn user_wait_tool_started_at(
+    store: &dyn MissionStore,
+    run: &MissionRun,
+) -> Option<String> {
+    if run.execution_state != MissionExecutionState::WaitingUser {
+        return None;
+    }
+    let tools = store.list_active_tool_executions(run.run_id).await.ok()?;
+    tools
+        .into_iter()
+        .filter(|tool| is_user_wait_tool(&tool.tool_kind))
+        .map(|tool| tool.started_at)
+        .min()
+}
+
+pub(crate) async fn user_wait_starts_for_runs(
+    store: &dyn MissionStore,
+    runs: impl IntoIterator<Item = &MissionRun>,
+) -> HashMap<Uuid, Option<String>> {
+    let mut waits = HashMap::new();
+    for run in runs {
+        if run.execution_state != MissionExecutionState::WaitingUser {
+            continue;
+        }
+        waits.insert(run.mission_id, user_wait_tool_started_at(store, run).await);
+    }
+    waits
 }
 
 const PROVISIONAL_TOOL_DEADLINE_SECS: i64 = 120;
@@ -5566,11 +5659,20 @@ pub async fn list_missions(
         .into_iter()
         .map(|run| (run.mission_id, run))
         .collect();
+    let wait_starts =
+        user_wait_starts_for_runs(control.mission_store.as_ref(), active_runs.values()).await;
     let values = missions
         .into_iter()
         .map(|mission| {
             let value = serde_json::to_value(&mission).unwrap_or(serde_json::Value::Null);
-            attach_execution_to_mission_value(value, &mission, active_runs.get(&mission.id))
+            attach_execution_to_mission_value(
+                value,
+                &mission,
+                active_runs.get(&mission.id),
+                wait_starts
+                    .get(&mission.id)
+                    .and_then(|started| started.as_deref()),
+            )
         })
         .collect();
     Ok(Json(values))
@@ -6515,10 +6617,15 @@ pub async fn get_mission(
                 .get_active_mission_run(mission.id)
                 .await
                 .map_err(internal_error)?;
+            let wait_started_at = match active_run.as_ref() {
+                Some(run) => user_wait_tool_started_at(control.mission_store.as_ref(), run).await,
+                None => None,
+            };
             let mut value = attach_execution_to_mission_value(
                 serde_json::to_value(&mission).map_err(internal_error)?,
                 &mission,
                 active_run.as_ref(),
+                wait_started_at.as_deref(),
             );
             let host_configured =
                 state.config.spark_arbiter_url.is_some() || state.config.spark_ssh_target.is_some();
@@ -6935,11 +7042,19 @@ pub async fn get_mission_digest(
             }
         }
     }
-    let execution = control
+    let active_run = control
         .mission_store
         .get_active_mission_run(mission.id)
         .await
-        .map_err(internal_error)?
+        .map_err(internal_error)?;
+    let waiting_for_user_tool = active_run
+        .as_ref()
+        .is_some_and(|run| run.execution_state == MissionExecutionState::WaitingUser);
+    let wait_started_at = match active_run.as_ref() {
+        Some(run) => user_wait_tool_started_at(control.mission_store.as_ref(), run).await,
+        None => None,
+    };
+    let execution = active_run
         .as_ref()
         .map(|run| mission_execution_projection(run, mission.status));
 
@@ -6948,6 +7063,12 @@ pub async fn get_mission_digest(
         "title": mission.title,
         "status": mission.status,
         "awaiting_kind": mission.awaiting_kind.map(|k| k.as_str()),
+        "needs_operator": super::operator_attention::mission_needs_operator(
+            &mission,
+            waiting_for_user_tool,
+            wait_started_at.as_deref(),
+            chrono::Utc::now(),
+        ),
         "terminal_reason": mission.terminal_reason,
         "terminal_evidence": mission.terminal_evidence,
         "short_description": mission.short_description,
@@ -12225,6 +12346,11 @@ pub async fn get_mission_events(
 pub struct AlertsFeedQuery {
     /// Comma-separated mission statuses to keep (e.g. `awaiting_user,failed`).
     pub statuses: Option<String>,
+    /// When true, keep only alerts that are themselves a current operator
+    /// page (`awaiting_user` or live AskUserQuestion). Current-state: the
+    /// mission must still `needs_operator` now. The handler walks the raw
+    /// status-event feed until `limit` matches so a sparse page is not empty.
+    pub needs_operator: Option<bool>,
     /// Timestamp cursor: return alerts strictly older than this.
     pub before: Option<String>,
     pub limit: Option<usize>,
@@ -12257,6 +12383,79 @@ pub struct AlertsFeedResponse {
     pub next_cursor: Option<String>,
 }
 
+fn telegram_delivery_for_status(
+    telegram_alerts: &[crate::api::mission_store::TelegramAlert],
+    mission_id: Uuid,
+    status: &str,
+) -> Option<AlertFeedDelivery> {
+    let class = format!("mission_{status}");
+    telegram_alerts
+        .iter()
+        .find(|alert| {
+            alert.mission_id == Some(mission_id)
+                && alert
+                    .event_kind
+                    .split(':')
+                    .next()
+                    .unwrap_or(&alert.event_kind)
+                    == class
+        })
+        .map(|alert| AlertFeedDelivery {
+            channel: "telegram",
+            status: alert.status.clone(),
+            sent_at: alert.sent_at.clone(),
+            acknowledged_at: alert.acknowledged_at.clone(),
+            last_error: alert.last_error.clone(),
+        })
+}
+
+/// Synthesize a current-state alert for a live AskUserQuestion so Needs You
+/// does not depend on the mission's (possibly ancient) `active` status event
+/// still sitting inside the historical scan window.
+fn live_wait_alert_entry(
+    mission_id: Uuid,
+    summary: mission_store::MissionSummary,
+    wait_started_at: Option<&str>,
+    now: &str,
+    delivery: Option<AlertFeedDelivery>,
+) -> AlertFeedEntry {
+    AlertFeedEntry {
+        mission_id,
+        status: "active".to_string(),
+        summary: "Waiting for user input".to_string(),
+        timestamp: wait_started_at.unwrap_or(now).to_string(),
+        mission: Some(summary),
+        delivery,
+    }
+}
+
+fn refresh_summary_for_waiting_user(
+    summary: &mut mission_store::MissionSummary,
+    waiting_for_user_tool: bool,
+    wait_started_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    if !waiting_for_user_tool {
+        return;
+    }
+    let parsed_status = serde_json::from_value(serde_json::Value::String(summary.status.clone()))
+        .unwrap_or(MissionStatus::Active);
+    summary.needs_operator = super::operator_attention::needs_operator(
+        &super::operator_attention::OperatorAttentionInput {
+            status: parsed_status,
+            awaiting_kind: summary.awaiting_kind.as_deref(),
+            has_origin_session: summary
+                .origin_session_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty()),
+            updated_at: &summary.updated_at,
+            waiting_for_user_tool: true,
+            wait_started_at,
+        },
+        now,
+    );
+}
+
 /// Cross-mission feed of status-change alerts, newest first. Source of truth
 /// is `mission_events` (`mission_status_changed`), decorated best-effort with
 /// mission summaries and Telegram delivery state.
@@ -12267,85 +12466,192 @@ pub async fn get_alerts_feed(
 ) -> Result<Json<AlertsFeedResponse>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-
-    let events = control
-        .mission_store
-        .get_status_events_global(query.before.as_deref(), limit)
-        .await
-        .map_err(internal_error)?;
-
-    // Cursor comes from the raw (unfiltered) page so pagination never stalls
-    // even when a status filter empties a page.
-    let next_cursor = if events.len() == limit {
-        events.last().map(|e| e.timestamp.clone())
-    } else {
-        None
-    };
-
+    let needs_operator_only = query.needs_operator == Some(true);
     let wanted: Option<Vec<String>> = query.statuses.as_deref().map(|s| {
         s.split(',')
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty())
             .collect()
     });
-
-    let mut entries: Vec<AlertFeedEntry> = events
-        .into_iter()
-        .filter_map(|e| {
-            let status = e.metadata.get("status")?.as_str()?.to_string();
-            if let Some(wanted) = &wanted {
-                if !wanted.contains(&status) {
-                    return None;
-                }
-            }
-            Some(AlertFeedEntry {
-                mission_id: e.mission_id,
-                status,
-                summary: e.content,
-                timestamp: e.timestamp,
-                mission: None,
-                delivery: None,
-            })
-        })
-        .collect();
-
-    let mission_ids: Vec<Uuid> = {
-        let mut ids: Vec<Uuid> = entries.iter().map(|e| e.mission_id).collect();
-        ids.sort();
-        ids.dedup();
-        ids
-    };
-
-    let summaries = control
+    let active_runs = control
         .mission_store
-        .get_mission_summaries(&mission_ids)
-        .await
-        .map_err(internal_error)?;
-    let telegram_alerts = control
-        .mission_store
-        .list_telegram_alerts_for_missions(&mission_ids)
+        .list_active_mission_runs()
         .await
         .unwrap_or_default();
+    let waiting_user_waits =
+        user_wait_starts_for_runs(control.mission_store.as_ref(), &active_runs).await;
+    let now = chrono::Utc::now();
 
-    for entry in &mut entries {
-        entry.mission = summaries.get(&entry.mission_id).cloned();
-        // Loose join: telegram_alerts has no FK to the event row; match the
-        // alert class (`mission_<status>` before any `:` suffix). The list is
-        // ordered created_at DESC, so the first match is the most recent.
-        let class = format!("mission_{}", entry.status);
-        entry.delivery = telegram_alerts
-            .iter()
-            .find(|a| {
-                a.mission_id == Some(entry.mission_id)
-                    && a.event_kind.split(':').next().unwrap_or(&a.event_kind) == class
+    // `needs_operator` is sparse, so walk raw pages until we fill `limit`
+    // (or exhaust) instead of returning an empty 30-row window.
+    const MAX_OPERATOR_PAGES: usize = 10;
+    let max_pages = if needs_operator_only {
+        MAX_OPERATOR_PAGES
+    } else {
+        1
+    };
+    let mut before = query.before.clone();
+    let mut entries: Vec<AlertFeedEntry> = Vec::new();
+    let mut next_cursor = None;
+    let mut seen_ids: HashSet<Uuid> = HashSet::new();
+    let mut seeded_live: HashSet<Uuid> = HashSet::new();
+    let mut summaries: HashMap<Uuid, mission_store::MissionSummary> = HashMap::new();
+    let mut telegram_alerts = Vec::new();
+
+    // Current live waits belong on the first Needs You page even when the
+    // mission's last status event is older than the historical window.
+    if needs_operator_only && query.before.is_none() && !waiting_user_waits.is_empty() {
+        let live_ids: Vec<Uuid> = waiting_user_waits.keys().copied().collect();
+        let fetched = control
+            .mission_store
+            .get_mission_summaries(&live_ids)
+            .await
+            .map_err(internal_error)?;
+        summaries.extend(fetched);
+        telegram_alerts.extend(
+            control
+                .mission_store
+                .list_telegram_alerts_for_missions(&live_ids)
+                .await
+                .unwrap_or_default(),
+        );
+        let now_rfc = now.to_rfc3339();
+        for (mission_id, started_at) in &waiting_user_waits {
+            if let Some(wanted) = &wanted {
+                if !wanted.iter().any(|status| status == "active") {
+                    continue;
+                }
+            }
+            let Some(summary) = summaries.get_mut(mission_id) else {
+                continue;
+            };
+            refresh_summary_for_waiting_user(summary, true, started_at.as_deref(), now);
+            if !summary.needs_operator {
+                continue;
+            }
+            entries.push(live_wait_alert_entry(
+                *mission_id,
+                summary.clone(),
+                started_at.as_deref(),
+                &now_rfc,
+                telegram_delivery_for_status(&telegram_alerts, *mission_id, "awaiting_user")
+                    .or_else(|| {
+                        telegram_delivery_for_status(&telegram_alerts, *mission_id, "active")
+                    }),
+            ));
+            seeded_live.insert(*mission_id);
+            seen_ids.insert(*mission_id);
+        }
+        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    }
+
+    for _ in 0..max_pages {
+        let events = control
+            .mission_store
+            .get_status_events_global(before.as_deref(), limit)
+            .await
+            .map_err(internal_error)?;
+        let page_len = events.len();
+        next_cursor = if page_len == limit {
+            events.last().map(|e| e.timestamp.clone())
+        } else {
+            None
+        };
+
+        let mut page: Vec<AlertFeedEntry> = events
+            .into_iter()
+            .filter_map(|e| {
+                let status = e.metadata.get("status")?.as_str()?.to_string();
+                if let Some(wanted) = &wanted {
+                    if !wanted.contains(&status) {
+                        return None;
+                    }
+                }
+                Some(AlertFeedEntry {
+                    mission_id: e.mission_id,
+                    status,
+                    summary: e.content,
+                    timestamp: e.timestamp,
+                    mission: None,
+                    delivery: None,
+                })
             })
-            .map(|a| AlertFeedDelivery {
-                channel: "telegram",
-                status: a.status.clone(),
-                sent_at: a.sent_at.clone(),
-                acknowledged_at: a.acknowledged_at.clone(),
-                last_error: a.last_error.clone(),
+            .collect();
+
+        let new_ids: Vec<Uuid> = {
+            let mut ids: Vec<Uuid> = page
+                .iter()
+                .map(|e| e.mission_id)
+                .filter(|id| seen_ids.insert(*id))
+                .collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        };
+        if !new_ids.is_empty() {
+            let fetched = control
+                .mission_store
+                .get_mission_summaries(&new_ids)
+                .await
+                .map_err(internal_error)?;
+            summaries.extend(fetched);
+            telegram_alerts.extend(
+                control
+                    .mission_store
+                    .list_telegram_alerts_for_missions(&new_ids)
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+
+        for entry in &mut page {
+            if let Some(summary) = summaries.get_mut(&entry.mission_id) {
+                let waiting = waiting_user_waits.contains_key(&entry.mission_id);
+                refresh_summary_for_waiting_user(
+                    summary,
+                    waiting,
+                    waiting_user_waits
+                        .get(&entry.mission_id)
+                        .and_then(|started| started.as_deref()),
+                    now,
+                );
+                entry.mission = Some(summary.clone());
+            }
+            entry.delivery =
+                telegram_delivery_for_status(&telegram_alerts, entry.mission_id, &entry.status);
+        }
+
+        if needs_operator_only {
+            page.retain(|entry| {
+                if seeded_live.contains(&entry.mission_id) {
+                    return false;
+                }
+                super::operator_attention::alert_event_is_operator_page(
+                    &entry.status,
+                    entry
+                        .mission
+                        .as_ref()
+                        .is_some_and(|summary| summary.needs_operator),
+                    waiting_user_waits.contains_key(&entry.mission_id),
+                )
             });
+        }
+        entries.extend(page);
+        if entries.len() >= limit || next_cursor.is_none() {
+            break;
+        }
+        before = next_cursor.clone();
+    }
+    let truncated = entries.len() > limit;
+    let had_more_raw = next_cursor.is_some();
+    entries.truncate(limit);
+    // After a filter walk, leftover matches sit on the truncated tail of
+    // this page. Point the cursor at the last *kept* event so Load older
+    // does not skip them (the raw-page cursor would).
+    if needs_operator_only && (truncated || (entries.len() == limit && had_more_raw)) {
+        if let Some(last) = entries.last() {
+            next_cursor = Some(last.timestamp.clone());
+        }
     }
 
     Ok(Json(AlertsFeedResponse {
@@ -32483,5 +32789,46 @@ Investigate <service/> failures.
 
         let rows = nonterminal_missions_in_sqlite(&path).unwrap();
         assert_eq!(rows.get(&mission_id), Some(&Some(workspace_id)));
+    }
+
+    fn test_summary(needs_operator: bool) -> super::mission_store::MissionSummary {
+        super::mission_store::MissionSummary {
+            title: Some("ask".into()),
+            status: "active".into(),
+            workspace_name: None,
+            awaiting_kind: None,
+            needs_operator,
+            origin_session_id: None,
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn live_wait_alert_uses_the_tool_start_not_the_ancient_active_event() {
+        let mission_id = uuid::Uuid::new_v4();
+        let entry = super::live_wait_alert_entry(
+            mission_id,
+            test_summary(true),
+            Some("2026-08-16T12:00:00Z"),
+            "2026-08-16T12:05:00Z",
+            None,
+        );
+        assert_eq!(entry.mission_id, mission_id);
+        assert_eq!(entry.status, "active");
+        assert_eq!(entry.timestamp, "2026-08-16T12:00:00Z");
+        assert_eq!(entry.summary, "Waiting for user input");
+        assert!(entry.mission.is_some_and(|m| m.needs_operator));
+    }
+
+    #[test]
+    fn live_wait_alert_falls_back_to_now_when_tool_start_is_missing() {
+        let entry = super::live_wait_alert_entry(
+            uuid::Uuid::new_v4(),
+            test_summary(true),
+            None,
+            "2026-08-16T12:05:00Z",
+            None,
+        );
+        assert_eq!(entry.timestamp, "2026-08-16T12:05:00Z");
     }
 }
