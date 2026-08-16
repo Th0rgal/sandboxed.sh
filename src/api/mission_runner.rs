@@ -3686,19 +3686,31 @@ async fn run_mission_turn(
     let mission_work_dir = if let Some(ref wd) = mission_working_directory {
         match resolve_mission_working_directory(&workspace.path, workspace.workspace_type, wd) {
             Ok(wd_path) => {
-                if let Err(error) =
-                    workspace::verify_explicit_mission_working_directory_owner(&workspace, &wd_path)
-                {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        requested_working_directory = %wd,
-                        error = %error,
-                        "refusing explicit working_directory without a verified persisted owner"
-                    );
-                    return AgentResult::failure(
-                        format!("explicit working_directory owner is unavailable or unverified: {error}"),
-                        0,
-                    );
+                if let Err(error) = workspace::verify_or_adopt_explicit_mission_working_directory(
+                    &workspace,
+                    &wd_path,
+                    &[mission_id],
+                ) {
+                    if workspace::is_generated_mission_directory_under_known_root(
+                        &workspace, &wd_path,
+                    ) {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            requested_working_directory = %wd,
+                            "adopting pre-registry generated working_directory"
+                        );
+                    } else {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            requested_working_directory = %wd,
+                            error = %error,
+                            "refusing explicit working_directory without a verified persisted owner"
+                        );
+                        return AgentResult::failure(
+                            format!("explicit working_directory owner is unavailable or unverified: {error}"),
+                            0,
+                        );
+                    }
                 }
                 tracing::info!(
                     mission_id = %mission_id,

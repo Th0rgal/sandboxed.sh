@@ -319,9 +319,10 @@ async fn offload_build(
         )
             .into_response();
     }
-    match crate::workspace::verify_explicit_mission_working_directory_owner(
+    match crate::workspace::verify_or_adopt_explicit_mission_working_directory(
         &workspace,
         std::path::Path::new(&host_dir),
+        &[host_owner.id],
     ) {
         Ok(owner_id) if owner_id == host_owner.id => {}
         Ok(_) => {
@@ -332,11 +333,24 @@ async fn offload_build(
                 .into_response();
         }
         Err(error) => {
-            return (
-                StatusCode::CONFLICT,
-                format!("host_dir persisted mission owner is unavailable or unverified: {error}"),
-            )
-                .into_response();
+            if crate::workspace::is_generated_mission_directory_under_known_root(
+                &workspace,
+                std::path::Path::new(&host_dir),
+            ) {
+                tracing::warn!(
+                    host_owner = %host_owner.id,
+                    host_dir = %host_dir,
+                    "adopting pre-registry spark host_dir"
+                );
+            } else {
+                return (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "host_dir persisted mission owner is unavailable or unverified: {error}"
+                    ),
+                )
+                    .into_response();
+            }
         }
     }
     if let Err(error) = host_dir_matches_mission_owner(&host_dir, &workspace, host_owner.id) {

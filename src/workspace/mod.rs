@@ -9,7 +9,7 @@
 //! - **Host**: Execute directly on the remote host environment
 //! - **Container**: Execute inside an isolated container environment (systemd-nspawn)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -604,49 +604,21 @@ impl WorkspaceStore {
         // A custom workspace may be a removable/mounted filesystem.  Persist
         // its mission-root registry in this store's control directory before
         // any mission code can consult it.  Copy the old colocated registry
-        // while it is still reachable; if it is not, the stamped control-path
-        // makes later placement resolution fail closed rather than treating a
-        // bare mountpoint as a fresh workspace.
+        // while it is still reachable; if it is not, write an empty control
+        // registry so first-use is distinguishable from a lost file.
         for workspace in workspaces.values_mut() {
-            if workspace.id == DEFAULT_WORKSPACE_ID
-                || workspace
-                    .config
-                    .get("mission_workspace_registry_control_root")
-                    .is_some()
-            {
-                continue;
-            }
-            let legacy = legacy_mission_workspace_roots_path(workspace);
-            let control_root = working_dir.to_string_lossy().into_owned();
-            if !workspace.config.is_object() {
-                workspace.config = serde_json::json!({});
-            }
-            workspace.config["mission_workspace_registry_control_root"] =
-                serde_json::Value::String(control_root);
-            let destination = mission_workspace_roots_path(workspace);
-            if !destination.exists() && legacy.exists() {
-                if let Some(parent) = destination.parent() {
-                    if let Err(error) = std::fs::create_dir_all(parent)
-                        .and_then(|_| std::fs::copy(&legacy, &destination).map(|_| ()))
-                    {
-                        tracing::error!(
-                            workspace = %workspace.id,
-                            error = %error,
-                            "failed to migrate custom mission-root registry to control storage"
-                        );
-                    }
-                }
-            }
+            stamp_custom_workspace_control_registry(workspace, &working_dir);
         }
 
         // Scan for orphaned containers and restore them
         let orphaned = store.scan_orphaned_containers(&workspaces).await;
-        for workspace in orphaned {
+        for mut workspace in orphaned {
             tracing::info!(
                 "Restored orphaned container workspace: {} at {}",
                 workspace.name,
                 workspace.path.display()
             );
+            stamp_custom_workspace_control_registry(&mut workspace, &working_dir);
             workspaces.insert(workspace.id, workspace);
         }
 
@@ -813,7 +785,8 @@ impl WorkspaceStore {
     }
 
     /// Add a new workspace.
-    pub async fn add(&self, workspace: Workspace) -> Uuid {
+    pub async fn add(&self, mut workspace: Workspace) -> Uuid {
+        stamp_custom_workspace_control_registry(&mut workspace, &self.working_dir);
         let id = workspace.id;
         {
             let mut guard = self.workspaces.write().await;
@@ -1013,6 +986,59 @@ fn mission_workspace_roots_path(workspace: &Workspace) -> PathBuf {
         }
     }
     legacy_mission_workspace_roots_path(workspace)
+}
+
+/// Stamp control-storage authority onto a custom workspace and ensure an
+/// empty registry exists.  A missing destination after this stamp is a lost
+/// file, not a first-use workspace.
+fn stamp_custom_workspace_control_registry(workspace: &mut Workspace, working_dir: &Path) {
+    if workspace.id == DEFAULT_WORKSPACE_ID {
+        return;
+    }
+    if workspace
+        .config
+        .get("mission_workspace_registry_control_root")
+        .is_none()
+    {
+        if !workspace.config.is_object() {
+            workspace.config = serde_json::json!({});
+        }
+        workspace.config["mission_workspace_registry_control_root"] =
+            serde_json::Value::String(working_dir.to_string_lossy().into_owned());
+    }
+    let destination = mission_workspace_roots_path(workspace);
+    if destination.exists() {
+        return;
+    }
+    if let Some(parent) = destination.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::error!(
+                workspace = %workspace.id,
+                error = %error,
+                "failed to create control mission-root registry directory"
+            );
+            return;
+        }
+    }
+    let legacy = legacy_mission_workspace_roots_path(workspace);
+    if legacy.exists() {
+        if let Err(error) = std::fs::copy(&legacy, &destination) {
+            tracing::error!(
+                workspace = %workspace.id,
+                error = %error,
+                "failed to migrate custom mission-root registry to control storage"
+            );
+        } else {
+            return;
+        }
+    }
+    if let Err(error) = atomic_write_mission_workspace_roots(&destination, &HashMap::new()) {
+        tracing::error!(
+            workspace = %workspace.id,
+            error = %error,
+            "failed to initialize empty control mission-root registry"
+        );
+    }
 }
 
 pub(crate) fn filesystem_identity(path: &Path) -> std::io::Result<String> {
@@ -1294,7 +1320,13 @@ pub fn verify_explicit_mission_working_directory_owner(
         .and_then(|name| name.strip_prefix("mission-"))
         .expect("checked mission directory name");
 
-    let roots = read_mission_workspace_roots(workspace)?;
+    let roots = match read_mission_workspace_roots(workspace) {
+        Ok(roots) => roots,
+        // A missing registry is the pre-feature state, not a corrupt one.
+        // Callers that know candidate owners can adopt the generated path.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) => return Err(error),
+    };
     let mut matches = Vec::new();
     for (id, record) in roots {
         if !id.starts_with(short) {
@@ -1322,6 +1354,118 @@ pub fn verify_explicit_mission_working_directory_owner(
             "explicit working directory {} has ambiguous mission ownership",
             requested.display()
         ))),
+    }
+}
+
+/// Whether `requested` lives under a generated `workspaces/mission-<short>`
+/// directory owned by one of this workspace's known roots.  Used to adopt
+/// pre-registry placements without treating an arbitrary path as a mission.
+pub fn is_generated_mission_directory_under_known_root(
+    workspace: &Workspace,
+    requested: &Path,
+) -> bool {
+    let Ok(requested) = requested.canonicalize() else {
+        return false;
+    };
+    let Some(mission_dir) = requested.ancestors().find(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("mission-"))
+            .is_some_and(|short| short.len() == 8 && short.chars().all(|c| c.is_ascii_hexdigit()))
+            && ancestor
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                == Some("workspaces")
+    }) else {
+        return false;
+    };
+    mission_workspace_roots_for_workspace(workspace)
+        .into_iter()
+        .any(|root| {
+            workspaces_root_for(&root)
+                .canonicalize()
+                .ok()
+                .is_some_and(|expected| Some(expected.as_path()) == mission_dir.parent())
+        })
+}
+
+/// Register a pre-registry generated directory for a candidate owner whose
+/// short id matches the physical `mission-<short>` ancestor.
+pub fn adopt_legacy_explicit_working_directory(
+    workspace: &Workspace,
+    requested: &Path,
+    candidates: &[Uuid],
+) -> std::io::Result<Option<Uuid>> {
+    let requested = match requested.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(mission_dir) = requested.ancestors().find(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("mission-"))
+            .is_some_and(|short| short.len() == 8 && short.chars().all(|c| c.is_ascii_hexdigit()))
+            && ancestor
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                == Some("workspaces")
+    }) else {
+        return Ok(None);
+    };
+    let Some(short) = mission_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("mission-"))
+    else {
+        return Ok(None);
+    };
+    let Some(root) = mission_dir.parent().and_then(|parent| parent.parent()) else {
+        return Ok(None);
+    };
+    if !mission_workspace_roots_for_workspace(workspace)
+        .into_iter()
+        .any(|known| known.canonicalize().ok().is_some_and(|known| known == root) || known == root)
+    {
+        return Ok(None);
+    }
+    for candidate in candidates {
+        if !candidate.to_string().starts_with(short) {
+            continue;
+        }
+        let expected = mission_workspace_dir_for_root(root, *candidate);
+        if expected.canonicalize().ok().as_deref() != Some(mission_dir) && expected != mission_dir {
+            continue;
+        }
+        persist_mission_workspace_root(workspace, *candidate, root)?;
+        return Ok(Some(*candidate));
+    }
+    Ok(None)
+}
+
+/// Verify a persisted owner, or adopt a pre-registry generated directory
+/// belonging to one of `candidates`.  A generated directory under a known
+/// root with no matching candidate is accepted only as a compatibility
+/// signal via [`is_generated_mission_directory_under_known_root`].
+pub fn verify_or_adopt_explicit_mission_working_directory(
+    workspace: &Workspace,
+    requested: &Path,
+    candidates: &[Uuid],
+) -> std::io::Result<Uuid> {
+    match verify_explicit_mission_working_directory_owner(workspace, requested) {
+        Ok(owner) => Ok(owner),
+        Err(error) => {
+            if let Some(owner) =
+                adopt_legacy_explicit_working_directory(workspace, requested, candidates)?
+            {
+                return Ok(owner);
+            }
+            Err(error)
+        }
     }
 }
 
@@ -3217,6 +3361,35 @@ fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
     }
 
     Vec::new()
+}
+
+fn read_managed_opencode_provider_keys(workspace_root: &Path) -> HashSet<String> {
+    let mut keys = HashSet::from(["kimi".to_string()]);
+    let candidates = [
+        workspace_root.join(AI_PROVIDERS_PATH),
+        std::path::PathBuf::from(home_dir()).join(AI_PROVIDERS_PATH),
+    ];
+    for path in &candidates {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(providers) = serde_json::from_str::<Vec<AIProvider>>(&contents) else {
+            continue;
+        };
+        for provider in providers {
+            if matches!(
+                provider.provider_type,
+                ProviderType::Custom | ProviderType::Kimi
+            ) {
+                keys.insert(sanitize_key(&provider.name));
+                if provider.provider_type == ProviderType::Kimi {
+                    keys.insert("kimi".to_string());
+                }
+            }
+        }
+        break;
+    }
+    keys
 }
 
 /// Prepare a workspace directory for a mission with skill and tool syncing for a specific backend.
@@ -5924,5 +6097,53 @@ WORKING_DIR = "/workspaces/mission-old"
         assert!(providers
             .iter()
             .any(|p| p.provider_type == ProviderType::Kimi));
+    }
+
+    #[test]
+    fn adding_a_custom_workspace_initializes_an_empty_control_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = Workspace::new_container("custom".into(), temp.path().join("mount"));
+        std::fs::create_dir_all(&workspace.path).unwrap();
+        stamp_custom_workspace_control_registry(&mut workspace, temp.path());
+        assert!(workspace.config["mission_workspace_registry_control_root"].is_string());
+        let registry = mission_workspace_roots_path(&workspace);
+        assert!(
+            registry.exists(),
+            "first-use custom workspace needs an empty control registry"
+        );
+        let contents = std::fs::read_to_string(&registry).unwrap();
+        let parsed: HashMap<String, MissionWorkspaceRootRecordOnDisk> =
+            serde_json::from_str(&contents).unwrap();
+        assert!(parsed.is_empty());
+        assert!(ensure_persisted_mission_root_is_available(&workspace, Uuid::new_v4()).is_ok());
+    }
+
+    #[test]
+    fn legacy_explicit_generated_directory_can_be_adopted() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::default_host(temp.path().to_path_buf());
+        let mission = Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap();
+        let worktree = mission_workspace_dir_for_root(temp.path(), mission).join("wk");
+        std::fs::create_dir_all(&worktree).unwrap();
+        assert!(verify_explicit_mission_working_directory_owner(&workspace, &worktree).is_err());
+        assert!(is_generated_mission_directory_under_known_root(
+            &workspace, &worktree
+        ));
+        match adopt_legacy_explicit_working_directory(&workspace, &worktree, &[mission]) {
+            Ok(Some(id)) => {
+                assert_eq!(id, mission);
+                assert_eq!(
+                    verify_explicit_mission_working_directory_owner(&workspace, &worktree).unwrap(),
+                    mission
+                );
+            }
+            Ok(None) | Err(_) => {
+                // Persisting a registry identity requires Linux mountinfo.
+                assert!(
+                    !cfg!(target_os = "linux"),
+                    "legacy adoption must persist on Linux"
+                );
+            }
+        }
     }
 }

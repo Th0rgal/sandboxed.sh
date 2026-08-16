@@ -82,6 +82,7 @@ fn resolve_base_work_dir(
     workspace: &crate::workspace::Workspace,
     nspawn_container: bool,
     mission_id: Uuid,
+    parent_mission_id: Option<Uuid>,
 ) -> Result<std::path::PathBuf, String> {
     let workspace_path = &workspace.path;
     // Validate before accepting an explicit working directory: it can be a
@@ -89,6 +90,10 @@ fn resolve_base_work_dir(
     // replacement tree left at the same path after an unmount.
     crate::workspace::ensure_persisted_mission_root_is_available(workspace, mission_id)
         .map_err(|error| format!("persisted mission workspace root is unavailable: {error}"))?;
+    let mut owner_candidates = vec![mission_id];
+    if let Some(parent) = parent_mission_id {
+        owner_candidates.push(parent);
+    }
     if let Some(dir) = working_directory.map(std::path::PathBuf::from) {
         // Mission metadata records the path as the harness saw it. In an
         // nspawn workspace that is a guest path such as
@@ -98,9 +103,20 @@ fn resolve_base_work_dir(
         if nspawn_container && dir.is_absolute() && !dir.starts_with(workspace_path) {
             let host_dir = workspace_path.join(dir.strip_prefix("/").unwrap_or(&dir));
             if host_dir.exists() {
-                crate::workspace::verify_explicit_mission_working_directory_owner(
-                    workspace, &host_dir,
+                crate::workspace::verify_or_adopt_explicit_mission_working_directory(
+                    workspace,
+                    &host_dir,
+                    &owner_candidates,
                 )
+                .or_else(|error| {
+                    if crate::workspace::is_generated_mission_directory_under_known_root(
+                        workspace, &host_dir,
+                    ) {
+                        Ok(mission_id)
+                    } else {
+                        Err(error)
+                    }
+                })
                 .map_err(|error| {
                     format!(
                         "explicit working_directory owner is unavailable or unverified: {error}"
@@ -109,12 +125,23 @@ fn resolve_base_work_dir(
                 return Ok(host_dir);
             }
         } else if dir.exists() {
-            crate::workspace::verify_explicit_mission_working_directory_owner(workspace, &dir)
-                .map_err(|error| {
-                    format!(
-                        "explicit working_directory owner is unavailable or unverified: {error}"
-                    )
-                })?;
+            crate::workspace::verify_or_adopt_explicit_mission_working_directory(
+                workspace,
+                &dir,
+                &owner_candidates,
+            )
+            .or_else(|error| {
+                if crate::workspace::is_generated_mission_directory_under_known_root(
+                    workspace, &dir,
+                ) {
+                    Ok(mission_id)
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(|error| {
+                format!("explicit working_directory owner is unavailable or unverified: {error}")
+            })?;
             return Ok(dir);
         }
     }
@@ -205,6 +232,7 @@ pub async fn ask_send(
         &workspace,
         nspawn_container,
         mission_id,
+        mission.parent_mission_id,
     )
     .map_err(internal)?;
 
@@ -334,6 +362,7 @@ pub async fn ask_send_stream(
         &workspace,
         nspawn_container,
         mission_id,
+        mission.parent_mission_id,
     )
     .map_err(internal)?;
 
@@ -493,7 +522,7 @@ mod tests {
         let workspace = crate::workspace::Workspace::default_host(root.path().to_path_buf());
         let mission = Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap();
         crate::workspace::persist_mission_workspace_root(&workspace, mission, root.path()).unwrap();
-        let resolved = resolve_base_work_dir(Some(guest), &workspace, true, mission);
+        let resolved = resolve_base_work_dir(Some(guest), &workspace, true, mission, None);
         assert_eq!(resolved.unwrap(), host);
     }
 
@@ -508,6 +537,7 @@ mod tests {
             &workspace,
             false,
             Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap(),
+            None,
         );
         assert!(resolved.is_err());
     }
@@ -542,7 +572,7 @@ mod tests {
             .join("worker-worktree");
         std::fs::create_dir_all(&explicit).unwrap();
         let error =
-            resolve_base_work_dir(explicit.to_str(), &workspace, false, mission).unwrap_err();
+            resolve_base_work_dir(explicit.to_str(), &workspace, false, mission, None).unwrap_err();
         assert!(error.contains("persisted mission workspace root is unavailable"));
         assert_ne!(error, workspace.path.display().to_string());
 
@@ -559,7 +589,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let error = resolve_base_work_dir(None, &workspace, false, mission).unwrap_err();
+        let error = resolve_base_work_dir(None, &workspace, false, mission, None).unwrap_err();
         assert!(error.contains("persisted mission workspace root is unavailable"));
         assert!(!workspace
             .path
@@ -572,7 +602,25 @@ mod tests {
     fn missing_selected_mission_directory_rejects_ask_fallback() {
         let root = tempdir().unwrap();
         let workspace = crate::workspace::Workspace::default_host(root.path().to_path_buf());
-        let error = resolve_base_work_dir(None, &workspace, false, Uuid::new_v4()).unwrap_err();
+        let error =
+            resolve_base_work_dir(None, &workspace, false, Uuid::new_v4(), None).unwrap_err();
         assert!(error.contains("not prepared"));
+    }
+
+    #[test]
+    fn legacy_explicit_generated_directory_is_adopted_without_a_registry() {
+        let root = tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::default_host(root.path().to_path_buf());
+        let mission = Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap();
+        let worktree = crate::workspace::mission_workspace_dir_for_root(root.path(), mission)
+            .join("worker-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let resolved =
+            resolve_base_work_dir(worktree.to_str(), &workspace, false, mission, None).unwrap();
+        assert_eq!(resolved, worktree);
+        assert!(
+            crate::workspace::mission_workspace_dir_for_workspace(&workspace, mission).exists()
+        );
     }
 }
