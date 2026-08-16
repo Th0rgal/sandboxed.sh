@@ -89,13 +89,15 @@ Chaque livraison, **y compris les `[SILENT]`**, se termine par :
 ```
 
 - `mode=active` — il travaille. Un tick sain et muet, c'est `[SILENT]` + ce trailer.
-- `mode=blocked` — **aucune lane ne peut avancer**. `wait=` dit depuis combien
-  de ticks. Un suffixe `blocked:<cause>` nomme la cause ; c'est le seul suffixe
-  autorisé. `blocked` nu n'est pas un fourre-tout.
-- `blocked:harness` — CLI manquant, binaire mauvaise arch, `nsenter` cassé.
-  Au plus 3 ticks, puis contournement (autre backend, workspace host). Un
-  échec de harness n'est **pas** un projet bloqué : rester `mode=active` avec
-  `next=` changer de backend / réparer le harness, plutôt que `blocked` nu.
+- `mode=blocked` **sans suffixe** — **aucune lane ne peut avancer**. `wait=`
+  dit depuis combien de ticks. `blocked:<cause>` est le seul suffixe autorisé
+  et nomme la cause (`blocked:disk` est un vrai no-lane ; `blocked:harness`
+  n'en est pas un).
+- `blocked:harness` — suffixe temporaire (≤ 3 ticks) pour un CLI manquant, un
+  binaire mauvaise arch, ou un `nsenter` cassé, puis contournement (autre
+  backend, workspace host). Ce n'est **pas** un projet bloqué. Préférer
+  `mode=active` + `next=` changer de backend / réparer le harness. Ne jamais
+  poser un `blocked` nu pour un échec de harness.
 - `mode=paused` — dormant volontairement.
 
 Avant, ces trois régimes te parvenaient tous sous la forme d'un `[SILENT]`
@@ -116,8 +118,8 @@ objectif** avec un blocker infra nommé (`blocked:disk`, …). Le travail
 plateforme s'ouvre sous `sandboxed-sh`. On ne retitre pas, on ne réutilise
 pas la session de campagne (Lido « Corriger et merger les PRs » devenue un
 P0 disque). Un ordre explicite dans le chat (« merge these PRs ») met à jour
-le grant (`merge_authority` / `material_bar`) ; un « never merge to main »
-périmé ne le surclasse pas.
+`merge_authority` — `material_bar` seulement si l'ordre change aussi ce qui
+mérite une livraison. Un « never merge to main » périmé ne le surclasse pas.
 
 ## Le board
 
