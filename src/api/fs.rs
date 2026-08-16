@@ -315,6 +315,14 @@ fn canonicalize_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn is_within_workspace_or_mission(
+    path: &Path,
+    workspace_root: &Path,
+    mission_root: Option<&Path>,
+) -> bool {
+    path.starts_with(workspace_root) || mission_root.is_some_and(|root| path.starts_with(root))
+}
+
 /// Search one level deep inside the mission workspace for a file whose tail
 /// matches `resolved`. Used when the agent worked inside a cloned-repo
 /// subdirectory and the dashboard's path resolution doesn't account for it.
@@ -326,7 +334,8 @@ async fn find_in_mission_subdirs(
     mission_id: uuid::Uuid,
     resolved: &Path,
 ) -> Option<PathBuf> {
-    let mission_dir = crate::workspace::mission_workspace_dir_for_root(workspace_root, mission_id);
+    let workspace = crate::workspace::Workspace::default_host(workspace_root.to_path_buf());
+    let mission_dir = crate::workspace::mission_workspace_dir_for_workspace(&workspace, mission_id);
     let tail = resolved.strip_prefix(&mission_dir).ok()?;
     if tail.as_os_str().is_empty() {
         return None;
@@ -768,7 +777,10 @@ pub async fn resolve_path_for_workspace(
     // Validate that the resolved path is within an allowed location
     // This can be either the workspace root or the global context directory for missions
     let context_root = canonicalize_or_original(&api_context_root(state));
-    let in_workspace = canonical.starts_with(&workspace_root);
+    let mission_root = mission_id
+        .map(|mid| crate::workspace::mission_workspace_dir_for_workspace(&workspace, mid));
+    let in_workspace =
+        is_within_workspace_or_mission(&canonical, &workspace_root, mission_root.as_deref());
     let in_context = mission_id.is_some() && canonical.starts_with(&context_root);
 
     if !in_workspace && !in_context {
@@ -1608,5 +1620,26 @@ mod tests {
                 .join(mission_id.to_string())
                 .join("keel-compressed.jpg")
         );
+    }
+
+    #[test]
+    fn relocated_mission_root_is_allowed_without_widening_containment() {
+        let workspace = Path::new("/workspace");
+        let mission = Path::new("/separate-volume/workspaces/mission-deadbeef");
+        assert!(is_within_workspace_or_mission(
+            &mission.join("scratch.txt"),
+            workspace,
+            Some(mission)
+        ));
+        assert!(!is_within_workspace_or_mission(
+            Path::new("/separate-volume/workspaces/mission-other/scratch.txt"),
+            workspace,
+            Some(mission)
+        ));
+        assert!(!is_within_workspace_or_mission(
+            Path::new("/separate-volume/unrelated.txt"),
+            workspace,
+            Some(mission)
+        ));
     }
 }

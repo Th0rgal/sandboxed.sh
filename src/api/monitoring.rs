@@ -202,7 +202,7 @@ pub fn disk_usage_for_path(path: &Path) -> std::io::Result<DiskUsage> {
         if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let block_size = u64::from(stat.f_frsize.max(stat.f_bsize));
+        let block_size = statvfs_accounting_block_size(stat.f_frsize, stat.f_bsize);
         let total = stat.f_blocks.saturating_mul(block_size);
         let available = stat.f_bavail.saturating_mul(block_size);
         return Ok(DiskUsage {
@@ -224,6 +224,14 @@ pub fn disk_usage_for_path(path: &Path) -> std::io::Result<DiskUsage> {
             available: total.saturating_sub(used),
         })
     }
+}
+
+fn statvfs_accounting_block_size(fragment_size: libc::c_ulong, block_size: libc::c_ulong) -> u64 {
+    u64::from(if fragment_size == 0 {
+        block_size
+    } else {
+        fragment_size
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -933,5 +941,11 @@ mod tests {
             let shm_usage = disk_usage_for_path(shm).unwrap();
             assert_ne!(shm_usage.filesystem, root.filesystem);
         }
+    }
+
+    #[test]
+    fn statvfs_accounting_uses_fragment_size_with_zero_fallback() {
+        assert_eq!(statvfs_accounting_block_size(1024, 4096), 1024);
+        assert_eq!(statvfs_accounting_block_size(0, 4096), 4096);
     }
 }

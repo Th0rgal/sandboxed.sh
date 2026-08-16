@@ -368,7 +368,7 @@ impl Workspace {
         let port = std::env::var("PORT")
             .ok()
             .filter(|s| !s.trim().is_empty())?;
-        let host_dir = mission_workspace_dir_for_root(&self.path, mission_id);
+        let host_dir = mission_workspace_dir_for_workspace(self, mission_id);
         let short = &mission_id.to_string()[..8];
         let guest_dir = if self.workspace_type == WorkspaceType::Container {
             format!("/workspaces/mission-{}", short)
@@ -894,6 +894,49 @@ pub fn mission_workspace_dir_for_root(root: &Path, mission_id: Uuid) -> PathBuf 
     workspaces_root_for(root).join(format!("mission-{}", short_id))
 }
 
+const MISSION_WORKSPACE_ROOTS_FILE: &str = "mission-workspace-roots.json";
+
+fn mission_workspace_roots_path(workspace: &Workspace) -> PathBuf {
+    config_root(&workspace.path).join(MISSION_WORKSPACE_ROOTS_FILE)
+}
+
+fn persisted_mission_workspace_root(workspace: &Workspace, mission_id: Uuid) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(mission_workspace_roots_path(workspace)).ok()?;
+    let roots: HashMap<String, String> = serde_json::from_str(&contents).ok()?;
+    let root = PathBuf::from(roots.get(&mission_id.to_string())?);
+    // This is persisted local state, but it is still untrusted after a manual
+    // edit.  Do not turn a corrupt registry into an API path escape.
+    let root = root.canonicalize().ok()?;
+    root.is_dir().then_some(root)
+}
+
+/// Persist the selected root before creating a mission directory.  The
+/// registry lives with the workspace configuration rather than the generated
+/// directory, so it survives restarts and a later environment/config drift.
+fn persist_mission_workspace_root(workspace: &Workspace, mission_id: Uuid, root: &Path) {
+    if workspace.id != DEFAULT_WORKSPACE_ID {
+        return;
+    }
+    let path = mission_workspace_roots_path(workspace);
+    let mut roots: HashMap<String, String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default();
+    if roots.contains_key(&mission_id.to_string()) {
+        return;
+    }
+    roots.insert(mission_id.to_string(), root.to_string_lossy().into_owned());
+    if let Err(error) = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(config_root(&workspace.path))?;
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&roots).expect("root map serializes"),
+        )
+    })() {
+        tracing::warn!(mission_id = %mission_id, path = %path.display(), %error, "Failed to persist mission workspace root");
+    }
+}
+
 /// Resolve the root used for newly-created default-host mission directories.
 ///
 /// `MISSION_WORKSPACE_ROOT` is deliberately only a placement override for the
@@ -961,6 +1004,9 @@ fn mission_workspace_root_is_writable(root: &Path) -> bool {
 /// Existing generated directories always win, which keeps active missions and
 /// historic workspace records compatible after an operator enables a new root.
 pub fn mission_workspace_root_for_workspace(workspace: &Workspace, mission_id: Uuid) -> PathBuf {
+    if let Some(root) = persisted_mission_workspace_root(workspace, mission_id) {
+        return root;
+    }
     let legacy = mission_workspace_dir_for_root(&workspace.path, mission_id);
     if legacy.exists() || workspace.id != DEFAULT_WORKSPACE_ID {
         return workspace.path.clone();
@@ -974,6 +1020,27 @@ pub fn mission_workspace_dir_for_workspace(workspace: &Workspace, mission_id: Uu
         &mission_workspace_root_for_workspace(workspace, mission_id),
         mission_id,
     )
+}
+
+/// Roots that can contain generated mission directories for this workspace.
+/// Used by maintenance scans; registered roots preserve discoverability after
+/// an operator changes `MISSION_WORKSPACE_ROOT`.
+pub fn mission_workspace_roots_for_workspace(workspace: &Workspace) -> Vec<PathBuf> {
+    let mut roots = vec![workspace.path.clone()];
+    if workspace.id == DEFAULT_WORKSPACE_ID {
+        roots.push(configured_mission_workspace_root(&workspace.path));
+        if let Ok(contents) = std::fs::read_to_string(mission_workspace_roots_path(workspace)) {
+            if let Ok(saved) = serde_json::from_str::<HashMap<String, String>>(&contents) {
+                roots.extend(saved.into_values().filter_map(|root| {
+                    let root = PathBuf::from(root).canonicalize().ok()?;
+                    root.is_dir().then_some(root)
+                }));
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 /// Resolve a configured project directory to its host-visible path.
@@ -2416,7 +2483,9 @@ pub async fn prepare_mission_workspace_in(
 ) -> anyhow::Result<PathBuf> {
     // Use a mission-specific directory under the workspace root so multiple missions
     // can run concurrently without clobbering per-workspace config files.
-    let dir = mission_workspace_dir_for_workspace(workspace, mission_id);
+    let root = mission_workspace_root_for_workspace(workspace, mission_id);
+    persist_mission_workspace_root(workspace, mission_id, &root);
+    let dir = mission_workspace_dir_for_root(&root, mission_id);
     prepare_workspace_dir(&dir).await?;
     install_remote_build_wrapper(workspace, mission_id).await?;
     let mcp_configs = filter_mcp_configs_for_workspace(
@@ -2614,7 +2683,9 @@ pub async fn prepare_mission_workspace_with_skills_backend(
 ) -> anyhow::Result<PathBuf> {
     // Mission workspace directory lives under the selected workspace root.
     // This keeps filesystem and config effects scoped to the mission.
-    let dir = mission_workspace_dir_for_workspace(workspace, mission_id);
+    let root = mission_workspace_root_for_workspace(workspace, mission_id);
+    persist_mission_workspace_root(workspace, mission_id, &root);
+    let dir = mission_workspace_dir_for_root(&root, mission_id);
     prepare_workspace_dir(&dir).await?;
     install_remote_build_wrapper(workspace, mission_id).await?;
     // Reviewers still need authenticated read access to private repositories.
@@ -4828,6 +4899,27 @@ WORKING_DIR = "/workspaces/mission-old"
             mission_workspace_dir_for_workspace(&workspace, mission),
             legacy
         );
+    }
+
+    #[test]
+    fn persisted_mission_root_survives_restart_and_config_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("separate-filesystem");
+        std::fs::create_dir_all(&storage).unwrap();
+        let mission = Uuid::new_v4();
+        let workspace = Workspace::default_host(temp.path().to_path_buf());
+
+        persist_mission_workspace_root(&workspace, mission, &storage);
+
+        // A fresh workspace value models a process restart; the resolver must
+        // use the recorded selection rather than today's configuration.
+        let after_restart = Workspace::default_host(temp.path().to_path_buf());
+        assert_eq!(
+            mission_workspace_dir_for_workspace(&after_restart, mission),
+            mission_workspace_dir_for_root(&storage.canonicalize().unwrap(), mission)
+        );
+        assert!(mission_workspace_roots_for_workspace(&after_restart)
+            .contains(&storage.canonicalize().unwrap()));
     }
 
     #[test]

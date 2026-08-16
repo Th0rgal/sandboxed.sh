@@ -19915,7 +19915,7 @@ async fn control_actor_loop(
                                     workspaces
                                         .get(wsid)
                                         .await
-                                        .map(|w| crate::workspace::mission_workspace_dir_for_root(&w.path, mid))
+                                        .map(|w| crate::workspace::mission_workspace_dir_for_workspace(&w, mid))
                                         .unwrap_or_else(|| config.working_dir.clone())
                                 } else {
                                     config.working_dir.clone()
@@ -20541,7 +20541,7 @@ async fn control_actor_loop(
                                     workspaces
                                         .get(wsid)
                                         .await
-                                        .map(|w| crate::workspace::mission_workspace_dir_for_root(&w.path, *mission_id))
+                                        .map(|w| crate::workspace::mission_workspace_dir_for_workspace(&w, *mission_id))
                                         .unwrap_or_else(|| config.working_dir.clone())
                                 } else {
                                     config.working_dir.clone()

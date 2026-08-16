@@ -818,136 +818,143 @@ async fn orphan_sweep(
     let index = &index_full.by_short;
 
     for ws in state.workspaces.list().await {
-        let root = workspace::workspaces_root_for(&ws.path);
-        let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
-            continue;
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(short) = name.strip_prefix("mission-") else {
+        for workspace_root in workspace::mission_workspace_roots_for_workspace(&ws) {
+            let root = workspace::workspaces_root_for(&workspace_root);
+            let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
                 continue;
             };
-            if short.len() != 8 || !short.chars().all(|c| c.is_ascii_hexdigit()) {
-                continue;
-            }
-            let dir = entry.path();
-            if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let workspace_token = crate::workspace_exec::machine_name_for_path(&ws.path);
-            if workspace_token
-                .as_ref()
-                .is_some_and(|token| scope_protected.contains(&(token.clone(), short.to_string())))
-            {
-                tracing::debug!(path = %dir.display(), "mission GC: kept (live exec scope)");
-                continue;
-            }
-            enum Verdict {
-                Keep(&'static str),
-                Delete(&'static str, bool /*orphan*/, bool /*stopped*/),
-            }
-            let indexed_entry = index
-                .get(short)
-                .and_then(|entries| entry_for_workspace(entries, ws.id));
-            let verdict = match indexed_entry {
-                Some(e) => match e.status {
-                    MissionStatus::Active
-                    | MissionStatus::Pending
-                    | MissionStatus::WaitingBackground => Verdict::Keep("mission running"),
-                    MissionStatus::AwaitingUser | MissionStatus::Paused => {
-                        if e.updated_at < params.stopped_cutoff {
-                            Verdict::Delete("stopped mission past long-stop retention", false, true)
-                        } else {
-                            Verdict::Keep("awaiting user / paused within retention")
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(short) = name.strip_prefix("mission-") else {
+                    continue;
+                };
+                if short.len() != 8 || !short.chars().all(|c| c.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let dir = entry.path();
+                if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let workspace_token = crate::workspace_exec::machine_name_for_path(&ws.path);
+                if workspace_token.as_ref().is_some_and(|token| {
+                    scope_protected.contains(&(token.clone(), short.to_string()))
+                }) {
+                    tracing::debug!(path = %dir.display(), "mission GC: kept (live exec scope)");
+                    continue;
+                }
+                enum Verdict {
+                    Keep(&'static str),
+                    Delete(&'static str, bool /*orphan*/, bool /*stopped*/),
+                }
+                let indexed_entry = index
+                    .get(short)
+                    .and_then(|entries| entry_for_workspace(entries, ws.id));
+                let verdict = match indexed_entry {
+                    Some(e) => match e.status {
+                        MissionStatus::Active
+                        | MissionStatus::Pending
+                        | MissionStatus::WaitingBackground => Verdict::Keep("mission running"),
+                        MissionStatus::AwaitingUser | MissionStatus::Paused => {
+                            if e.updated_at < params.stopped_cutoff {
+                                Verdict::Delete(
+                                    "stopped mission past long-stop retention",
+                                    false,
+                                    true,
+                                )
+                            } else {
+                                Verdict::Keep("awaiting user / paused within retention")
+                            }
                         }
-                    }
-                    _ => {
-                        if e.updated_at < params.cutoff {
-                            Verdict::Delete("terminal mission past retention", false, false)
-                        } else {
-                            Verdict::Keep("terminal mission within retention")
+                        _ => {
+                            if e.updated_at < params.cutoff {
+                                Verdict::Delete("terminal mission past retention", false, false)
+                            } else {
+                                Verdict::Keep("terminal mission within retention")
+                            }
                         }
-                    }
-                },
-                None => {
-                    if !params.orphans_enabled {
-                        Verdict::Keep("orphan collection disabled")
-                    } else if !index_full.complete {
-                        Verdict::Keep("mission index incomplete; not trusting orphan verdicts")
-                    } else {
-                        // No mission anywhere claims this dir. Use the dir
-                        // mtime as the age signal, with the normal retention
-                        // as a grace period for freshly-created dirs whose
-                        // mission row hasn't landed yet.
-                        let old_enough = match tokio::fs::metadata(&dir).await {
-                            Ok(meta) => match meta.modified() {
-                                Ok(mtime) => chrono::DateTime::<Utc>::from(mtime) < params.cutoff,
+                    },
+                    None => {
+                        if !params.orphans_enabled {
+                            Verdict::Keep("orphan collection disabled")
+                        } else if !index_full.complete {
+                            Verdict::Keep("mission index incomplete; not trusting orphan verdicts")
+                        } else {
+                            // No mission anywhere claims this dir. Use the dir
+                            // mtime as the age signal, with the normal retention
+                            // as a grace period for freshly-created dirs whose
+                            // mission row hasn't landed yet.
+                            let old_enough = match tokio::fs::metadata(&dir).await {
+                                Ok(meta) => match meta.modified() {
+                                    Ok(mtime) => {
+                                        chrono::DateTime::<Utc>::from(mtime) < params.cutoff
+                                    }
+                                    Err(_) => false,
+                                },
                                 Err(_) => false,
-                            },
-                            Err(_) => false,
-                        };
-                        if old_enough {
-                            Verdict::Delete("no mission in any store", true, false)
-                        } else {
-                            Verdict::Keep("unmatched but too recent")
+                            };
+                            if old_enough {
+                                Verdict::Delete("no mission in any store", true, false)
+                            } else {
+                                Verdict::Keep("unmatched but too recent")
+                            }
                         }
                     }
-                }
-            };
-            match verdict {
-                Verdict::Keep(reason) => {
-                    tracing::debug!(path = %dir.display(), reason, "mission GC: kept");
-                }
-                Verdict::Delete(reason, orphan, stopped) => {
-                    if params.dry_run && dry_run_candidates.contains(&dir) {
-                        tracing::debug!(
-                            path = %dir.display(),
-                            reason,
-                            "mission GC: skipped duplicate dry-run candidate",
-                        );
-                        continue;
+                };
+                match verdict {
+                    Verdict::Keep(reason) => {
+                        tracing::debug!(path = %dir.display(), reason, "mission GC: kept");
                     }
-                    let size = directory_size_bytes(&dir).await;
-                    if params.dry_run {
-                        report.proposed += 1;
-                        tracing::info!(
-                            action = "would_remove",
-                            path = %dir.display(),
-                            workspace = %ws.name,
-                            workspace_id = %ws.id,
-                            bytes = size,
-                            reason,
-                            orphan,
-                            stopped,
-                            "mission GC audit",
-                        );
-                        continue;
-                    }
-                    match tokio::fs::remove_dir_all(&dir).await {
-                        Ok(()) => {
-                            report.removed += 1;
-                            if orphan {
-                                report.orphans_removed += 1;
-                            }
-                            if stopped {
-                                report.stopped_removed += 1;
-                            }
-                            report.bytes_freed = report.bytes_freed.saturating_add(size);
+                    Verdict::Delete(reason, orphan, stopped) => {
+                        if params.dry_run && dry_run_candidates.contains(&dir) {
+                            tracing::debug!(
+                                path = %dir.display(),
+                                reason,
+                                "mission GC: skipped duplicate dry-run candidate",
+                            );
+                            continue;
+                        }
+                        let size = directory_size_bytes(&dir).await;
+                        if params.dry_run {
+                            report.proposed += 1;
                             tracing::info!(
+                                action = "would_remove",
                                 path = %dir.display(),
                                 workspace = %ws.name,
+                                workspace_id = %ws.id,
                                 bytes = size,
                                 reason,
-                                "mission GC: removed workspace directory (orphan sweep)",
+                                orphan,
+                                stopped,
+                                "mission GC audit",
                             );
+                            continue;
                         }
-                        Err(err) => {
-                            report.errors += 1;
-                            tracing::warn!(
-                                path = %dir.display(),
-                                ?err,
-                                "mission GC: failed to remove directory (orphan sweep)",
-                            );
+                        match tokio::fs::remove_dir_all(&dir).await {
+                            Ok(()) => {
+                                report.removed += 1;
+                                if orphan {
+                                    report.orphans_removed += 1;
+                                }
+                                if stopped {
+                                    report.stopped_removed += 1;
+                                }
+                                report.bytes_freed = report.bytes_freed.saturating_add(size);
+                                tracing::info!(
+                                    path = %dir.display(),
+                                    workspace = %ws.name,
+                                    bytes = size,
+                                    reason,
+                                    "mission GC: removed workspace directory (orphan sweep)",
+                                );
+                            }
+                            Err(err) => {
+                                report.errors += 1;
+                                tracing::warn!(
+                                    path = %dir.display(),
+                                    ?err,
+                                    "mission GC: failed to remove directory (orphan sweep)",
+                                );
+                            }
                         }
                     }
                 }
