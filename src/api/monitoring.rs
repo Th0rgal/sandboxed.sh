@@ -203,8 +203,9 @@ pub fn disk_usage_for_path(path: &Path) -> std::io::Result<DiskUsage> {
             Err(std::io::Error::last_os_error())
         } else {
             let block_size = statvfs_accounting_block_size(stat.f_frsize, stat.f_bsize);
-            let total = stat.f_blocks.saturating_mul(block_size);
-            let available = stat.f_bavail.saturating_mul(block_size);
+            // Linux `fsblkcnt_t` is 64-bit; macOS still uses 32-bit counts.
+            let total = u64::from(stat.f_blocks).saturating_mul(block_size);
+            let available = u64::from(stat.f_bavail).saturating_mul(block_size);
             Ok(DiskUsage {
                 measured_path,
                 filesystem: format!("statvfs:{}", stat.f_fsid),
