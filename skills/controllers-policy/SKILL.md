@@ -62,9 +62,12 @@ posture that must escalate.
 
 **Owner chat updates the grant.** An explicit order in the project session —
 "Merge these PRs" — is not a comment: `set_project_grant` and update
-`merge_authority` / `material_bar`. If the order is ambiguous, record
-`pending_user` and act once answered. A stale "never merge to main" in the
-prompt or an old GRANT block does not outrank a later owner order.
+`merge_authority`. Touch `material_bar` only when the owner actually changes
+what is worth a delivery. If the order is ambiguous, record `pending_user`,
+proceed with the conservative in-grant default, and apply `set_project_grant`
+when answered (or on 24h expiry). Do not stall the tick. A stale "never merge
+to main" in the prompt or an old GRANT block does not outrank a later owner
+order.
 
 Precedence, highest wins:
 
