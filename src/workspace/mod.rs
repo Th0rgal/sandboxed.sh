@@ -925,16 +925,18 @@ fn ensure_persisted_mission_root_is_available(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    let roots: HashMap<String, String> = serde_json::from_str(&contents).map_err(|error| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-    })?;
+    let roots: HashMap<String, String> = serde_json::from_str(&contents)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     if let Some(root) = roots.get(&mission_id.to_string()) {
         let root = PathBuf::from(root);
         let canonical = root.canonicalize()?;
         if !canonical.is_dir() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("persisted mission workspace root {} is not a directory", root.display()),
+                format!(
+                    "persisted mission workspace root {} is not a directory",
+                    root.display()
+                ),
             ));
         }
     }
@@ -1000,9 +1002,8 @@ fn persist_mission_workspace_root(
             .open(lock_path)?;
         fs2::FileExt::lock_exclusive(&lock_file)?;
         let mut roots: HashMap<String, String> = match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents).map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-            })?,
+            Ok(contents) => serde_json::from_str(&contents)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(error) => return Err(error),
         };
