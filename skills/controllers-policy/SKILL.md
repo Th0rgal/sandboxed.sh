@@ -60,6 +60,12 @@ merge.** Do not open a `[DECISION:]` asking Thomas to bless a green in-scope mer
 record the merge as a granted act and do it. `review-first` is the only merge
 posture that must escalate.
 
+**Owner chat updates the grant.** An explicit order in the project session —
+"Merge these PRs" — is not a comment: `set_project_grant` and update
+`merge_authority` / `material_bar`. If the order is ambiguous, record
+`pending_user` and act once answered. A stale "never merge to main" in the
+prompt or an old GRANT block does not outrank a later owner order.
+
 Precedence, highest wins:
 
 1. **Structured pause** — a `resume_condition` in the project grant (preferred), or a
@@ -92,7 +98,17 @@ End EVERY delivery, including `[SILENT]`, with exactly one line:
 
 `[CTRL: <project> | mode=active|blocked|paused | wait=<consecutive ticks in this mode> | next=<next action, or resume/unblock condition>]`
 
-Machine-parsed — keep the format. **`mode` is EXACTLY one of `active`, `blocked`, or `paused`** — never a version, host, suite, or free text. A value like `v0.2-local-host` is rejected and your mode silently stops reaching the board. Put version/host/suite detail in `next=` or the report body, not in `mode`. `blocked` may carry a cause as `blocked:<cause>`; that is the only suffix allowed. `[SILENT]` means "nothing material for Thomas", never
+Machine-parsed — keep the format. **`mode` is EXACTLY one of `active`, `blocked`, or `paused`** — never a version, host, suite, or free text. A value like `v0.2-local-host` is rejected and your mode silently stops reaching the board. Put version/host/suite detail in `next=` or the report body, not in `mode`. `blocked` may carry a cause as `blocked:<cause>`; that is the only suffix allowed.
+
+**`mode=blocked` with no suffix means no lane can progress.** A missing CLI, a
+wrong-arch binary, or a container `nsenter` failure is not that. Stay
+`mode=active` with `next=` switch-backend / repair-harness, or use
+`blocked:harness` for at most 3 ticks, then work around (other backend, host
+workspace). Bare `blocked` for a harness failure is a lie about the project.
+Coldcard `acfb03d2` (2026-08-13) finished `Codex CLI not found` and the
+callback painted the campaign blocked.
+
+`[SILENT]` means "nothing material for Thomas", never
 "I did nothing": a healthy quiet tick is `[SILENT]` followed by
 `[CTRL: ... mode=active | wait=0 | ...]`.
 
@@ -232,6 +248,9 @@ repeated failure `repeat-loop-guard` · tool-call limits `context-budget`.
 - **A mission asking a question gets an answer or an escalation, never silence.** Use `answer_mission_question` to respond to a mission blocked on AskUserQuestion — plain messages queue behind the blocked turn and will not unblock it.
 - **The store refuses two classes of lie.** A headline that only restates an auto-resume (`RELANCÉE`, `relaunch`) is ingested as `[SILENT]`. A writer-lease claim while a writer is live is coerced to `mode=active` and also silenced. Do not fight this: if the campaign actually changed heads or gates, change the `STATE_SIGNATURE` fields.
 - **Owner questions are unique and expire.** The same `pending_user` question is recorded once. After 24h unanswered it becomes `expired`; act on the conservative in-grant default, do not re-ask.
+- **Do not stamp `mode=blocked` from an inspect callback.** Inspect callbacks omit `[CTRL:]` on `awaiting_user`. A controller that copies the old trailer onto a callback is prompt drift: ingest already refuses inspect for mode, and re-emitting `mode=blocked` from a parked turn is how the board stays red after the writer moved on. Inspect, then write your own trailer from live state.
+- **Do not abandon the objective.** If dispatch is refused (disk, auth, capacity): keep the original project on its objective with a named infra blocker (`blocked:disk`, `blocked:auth`, `blocked:capacity`); open or fix the platform work under its own project (`sandboxed-sh`). Do not retitle or reuse the campaign session. Lido “Corriger et merger les PRs” becoming a P0 disk ticket is the incident — a platform outage is not a new campaign.
+- **Harness ≠ project blocked.** Missing CLI, wrong-arch binary, container `nsenter` failure: `mode=active` + `next=` switch backend / repair harness, or `blocked:harness` ≤ 3 ticks then workaround. See the trailer rule above.
 
 ## Optimisations d exécution (2026-08-10, leçons terrain)
 
