@@ -1804,7 +1804,7 @@ pub async fn projects_overview(
         .collect_project_missions(chrono::Duration::hours(TERMINAL_MISSION_HORIZON_HOURS))
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let waiting_user_ids = state.control.collect_waiting_user_mission_ids().await;
+    let waiting_user_waits = state.control.collect_waiting_user_waits().await;
 
     // Delivery-derived facts come from the projects store, which the
     // background ingestor keeps current — the overview never scans the Hermes
@@ -1878,7 +1878,10 @@ pub async fn projects_overview(
             .or_insert_with(|| ProjectRowBuilder::new(key));
         builder.missions.push(mission_chip(
             mission,
-            waiting_user_ids.contains(&mission.id),
+            waiting_user_waits.contains_key(&mission.id),
+            waiting_user_waits
+                .get(&mission.id)
+                .and_then(|started| started.as_deref()),
         ));
         builder.health_inputs.push(OwnedHealthInput {
             track: mission.project.track.clone(),
@@ -2555,7 +2558,11 @@ fn bucket_rank(bucket: &str) -> u8 {
     }
 }
 
-fn mission_chip(mission: &Mission, waiting_for_user_tool: bool) -> MissionChip {
+fn mission_chip(
+    mission: &Mission,
+    waiting_for_user_tool: bool,
+    wait_started_at: Option<&str>,
+) -> MissionChip {
     MissionChip {
         id: mission.id.to_string(),
         status: mission.status,
@@ -2565,6 +2572,7 @@ fn mission_chip(mission: &Mission, waiting_for_user_tool: bool) -> MissionChip {
         needs_operator: super::operator_attention::mission_needs_operator(
             mission,
             waiting_for_user_tool,
+            wait_started_at,
             chrono::Utc::now(),
         ),
     }

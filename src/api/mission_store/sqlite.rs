@@ -4445,6 +4445,7 @@ impl MissionStore for SqliteMissionStore {
                                 .is_some_and(|id| !id.is_empty()),
                             updated_at: persisted_clock,
                             waiting_for_user_tool: false,
+                            wait_started_at: None,
                         },
                         now,
                     );
