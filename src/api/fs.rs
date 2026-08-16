@@ -812,9 +812,20 @@ pub async fn resolve_path_for_workspace(
         .map(|mid| crate::workspace::mission_workspace_dir_for_workspace(&workspace, mid));
     let in_workspace =
         is_within_workspace_or_mission(&canonical, &workspace_root, mission_root.as_deref());
+    // An orchestrated worker can deliberately use a worktree under its
+    // ancestor's mission directory.  Do not turn that into a broad allowance
+    // for every relocated root: accept it only when the directory's actual
+    // `workspaces/mission-<short>` ancestor resolves to one unambiguous,
+    // identity-verified persisted owner.
+    let in_verified_ancestor_mission = !in_workspace
+        && mission_id.is_some()
+        && crate::workspace::verify_explicit_mission_working_directory_owner(
+            &workspace, &canonical,
+        )
+        .is_ok();
     let in_context = mission_id.is_some() && canonical.starts_with(&context_root);
 
-    if !in_workspace && !in_context {
+    if !in_workspace && !in_verified_ancestor_mission && !in_context {
         return Err((
             StatusCode::FORBIDDEN,
             format!(

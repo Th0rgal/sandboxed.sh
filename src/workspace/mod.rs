@@ -1128,7 +1128,11 @@ fn legacy_device_identity_matches(identity: &str, actual_identity: &str) -> bool
 }
 
 fn is_legacy_mount_identity(identity: &str) -> bool {
-    identity.starts_with("mount:") && identity.contains(":dev:") && identity.contains(":ino:")
+    // Both the original dev/inode form and the immediately preceding v2 form
+    // used a namespace-local `mount:<id>:` prefix.  The prefix is not stable
+    // across restart, but validation above has already compared its stable
+    // suffix before this permits the one-time rewrite.
+    identity.starts_with("mount:")
 }
 
 /// Refuse to create a replacement directory when an existing mission's
@@ -1340,7 +1344,10 @@ fn persist_mission_workspace_root_record(
                     .get()
                     .filesystem_identity
                     .as_deref()
-                    .is_none_or(is_legacy_mount_identity) =>
+                    .is_none_or(|identity| {
+                        is_legacy_mount_identity(identity)
+                            || (identity.starts_with("dev:") && identity.contains(":ino:"))
+                    }) =>
             {
                 entry.insert(record);
                 true
@@ -3696,21 +3703,57 @@ pub fn runtime_workspace_file_path(working_dir_root: &Path, mission_id: Option<U
 
 /// Regenerate `opencode.json` for all workspace directories.
 pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::Result<usize> {
-    let root = workspaces_root(&config.working_dir);
-    if !root.exists() {
-        return Ok(0);
-    }
-
     let mut count = 0;
     let mcp_configs = mcp.list_configs().await;
     let workspace_env = HashMap::new();
 
-    let mut entries = tokio::fs::read_dir(&root).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
+    // This entry point is also used by MCP mutations, where only Config is
+    // available.  Load the persisted workspace inventory so custom workspaces
+    // and every verified historic relocated root participate, rather than
+    // scanning only today's default working_dir.
+    let workspace_path = config.working_dir.join(".sandboxed-sh/workspaces.json");
+    let mut workspaces = match std::fs::read_to_string(&workspace_path) {
+        Ok(contents) => serde_json::from_str::<Vec<Workspace>>(&contents)
+            .map_err(|error| anyhow::anyhow!("parse {}: {error}", workspace_path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read {}: {error}",
+                workspace_path.display()
+            ))
         }
+    };
+    if !workspaces
+        .iter()
+        .any(|workspace| workspace.id == DEFAULT_WORKSPACE_ID)
+    {
+        workspaces.push(Workspace::default_host(config.working_dir.clone()));
+    }
+    let mut dirs = std::collections::BTreeSet::new();
+    for workspace in workspaces {
+        // `mission_workspace_roots_for_workspace` validates persisted identity
+        // before returning it. An unavailable/replaced root is therefore not
+        // written through during a global MCP update.
+        for root in mission_workspace_roots_for_workspace(&workspace) {
+            let root = root.canonicalize().map_err(|error| {
+                anyhow::anyhow!(
+                    "canonicalize mission workspace root {}: {error}",
+                    root.display()
+                )
+            })?;
+            let scan_root = workspaces_root_for(&root);
+            if !scan_root.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(&scan_root)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    dirs.insert(path);
+                }
+            }
+        }
+    }
+    for path in dirs {
         if write_opencode_config(
             &path,
             mcp_configs.clone(),
@@ -3718,9 +3761,9 @@ pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::
             WorkspaceType::Host,
             &workspace_env,
             None,
-            None, // No command_contents for migration
-            None, // shared_network: not relevant for host workspaces
-            None, // custom_providers: none for migration
+            None,
+            None,
+            None,
         )
         .await
         .is_ok()
@@ -5387,6 +5430,8 @@ WORKING_DIR = "/workspaces/mission-old"
         let workspace = Workspace::default_host(temp.path().to_path_buf());
         let boss = Uuid::new_v4();
         let worker = Uuid::new_v4();
+        persist_mission_workspace_root(&workspace, boss, &old_root).unwrap();
+        persist_mission_workspace_root(&workspace, worker, &new_root).unwrap();
         // This test changes the simulated mount authority itself.  Production
         // writes deliberately refuse to replace a mismatched record, so write
         // the restored fixture directly before verifying the recovered mount.
@@ -5400,7 +5445,6 @@ WORKING_DIR = "/workspaces/mission-old"
         );
         atomic_write_mission_workspace_roots(&mission_workspace_roots_path(&workspace), &restored)
             .unwrap();
-        persist_mission_workspace_root(&workspace, worker, &new_root).unwrap();
         let boss_worktree = mission_workspace_dir_for_root(&old_root, boss).join("wk-1");
         std::fs::create_dir_all(&boss_worktree).unwrap();
 
@@ -5425,15 +5469,16 @@ WORKING_DIR = "/workspaces/mission-old"
 
         // Restoring the selected filesystem identity makes the same worktree
         // usable again; no fallback to the worker's selected root occurred.
-        persist_mission_workspace_root_record(
-            &workspace,
-            boss,
+        let mut restored = read_mission_workspace_roots(&workspace).unwrap();
+        restored.insert(
+            boss.to_string(),
             MissionWorkspaceRootRecord {
                 path: old_root.canonicalize().unwrap().display().to_string(),
                 filesystem_identity: Some(filesystem_identity(&old_root).unwrap()),
             },
-        )
-        .unwrap();
+        );
+        atomic_write_mission_workspace_roots(&mission_workspace_roots_path(&workspace), &restored)
+            .unwrap();
         assert_eq!(
             verify_explicit_mission_working_directory_owner(&workspace, &boss_worktree).unwrap(),
             boss

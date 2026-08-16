@@ -7513,30 +7513,42 @@ fn disk_reservation_outstanding_bytes(reservation: &DiskReservation) -> u64 {
     reservation.estimated_bytes.saturating_sub(usage)
 }
 
-fn nonterminal_mission_ids_in_sqlite(path: &std::path::Path) -> Result<HashSet<Uuid>, String> {
+fn nonterminal_missions_in_sqlite(
+    path: &std::path::Path,
+) -> Result<HashMap<Uuid, Option<Uuid>>, String> {
     let connection =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
     let mut statement = connection
-        .prepare("SELECT id, status FROM missions")
+        .prepare("SELECT id, status, workspace_id FROM missions")
+        .or_else(|_| connection.prepare("SELECT id, status, NULL AS workspace_id FROM missions"))
         .map_err(|error| format!("query {}: {error}", path.display()))?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })
         .map_err(|error| error.to_string())?;
-    let mut ids = HashSet::new();
+    let mut missions = HashMap::new();
     for row in rows {
-        let (id, status) = row.map_err(|error| error.to_string())?;
+        let (id, status, workspace_id) = row.map_err(|error| error.to_string())?;
         let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
             .unwrap_or(MissionStatus::Active);
         if mission_holds_disk_reservation(status) {
             let id = Uuid::parse_str(&id)
                 .map_err(|error| format!("parse mission id {id} in {}: {error}", path.display()))?;
-            ids.insert(id);
+            let workspace_id = workspace_id
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .map_err(|error| format!("parse workspace id in {}: {error}", path.display()))?;
+            missions.insert(id, workspace_id);
         }
     }
-    Ok(ids)
+    Ok(missions)
 }
 
 /// Reconstruct the live lease set from authoritative mission state while the
@@ -7549,11 +7561,17 @@ async fn reconcile_disk_reservation_ledger_under_lock(
     config: &Config,
 ) -> Result<(), String> {
     let inventory = control_hub.mission_store_inventory().await?;
-    let mut live_ids = HashSet::new();
+    // Mission rows are the lifecycle authority.  A process can crash after a
+    // row commits but before the separate, atomically-published ledger file is
+    // renamed.  Reconstructing a conservative lease for every such live row
+    // closes that crash window; the lock is retained from admission through
+    // row creation and ledger publication, so no concurrent admission can
+    // observe the intermediate state either.
+    let mut live_missions: HashMap<Uuid, Option<Uuid>> = HashMap::new();
     for store in inventory.live {
         for mission in store.list_missions(usize::MAX, 0).await? {
             if mission_holds_disk_reservation(mission.status) {
-                live_ids.insert(mission.id);
+                live_missions.insert(mission.id, Some(mission.workspace_id));
             }
         }
     }
@@ -7563,19 +7581,58 @@ async fn reconcile_disk_reservation_ledger_under_lock(
         );
         for mission in store.list_missions(usize::MAX, 0).await? {
             if mission_holds_disk_reservation(mission.status) {
-                live_ids.insert(mission.id);
+                live_missions.insert(mission.id, Some(mission.workspace_id));
             }
         }
     }
     for path in inventory.offline_sqlite {
-        let ids = tokio::task::spawn_blocking(move || nonterminal_mission_ids_in_sqlite(&path))
+        let missions = tokio::task::spawn_blocking(move || nonterminal_missions_in_sqlite(&path))
             .await
             .map_err(|error| error.to_string())??;
-        live_ids.extend(ids);
+        for (id, workspace_id) in missions {
+            live_missions.entry(id).or_insert(workspace_id);
+        }
     }
     let mut ledger = read_disk_reservation_ledger(config)?;
     let before = ledger.reservations.len();
-    ledger.reservations.retain(|id, _| live_ids.contains(id));
+    ledger
+        .reservations
+        .retain(|id, _| live_missions.contains_key(id));
+    for (&mission_id, workspace_id) in &live_missions {
+        if ledger.reservations.contains_key(&mission_id) {
+            continue;
+        }
+        // A very old SQLite schema may not carry workspace_id. Charge the
+        // default host conservatively rather than allowing a crash-created
+        // Pending mission to escape admission accounting.
+        let workspace_id = workspace_id.unwrap_or(workspace::DEFAULT_WORKSPACE_ID);
+        let workspace = control_hub
+            .workspaces
+            .get(workspace_id)
+            .await
+            .unwrap_or_else(|| workspace::Workspace::default_host(config.working_dir.clone()));
+        workspace::ensure_persisted_mission_root_is_available(&workspace, mission_id)
+            .map_err(|error| format!("verify persisted placement for {mission_id}: {error}"))?;
+        let root = workspace::mission_workspace_root_for_workspace(&workspace, mission_id);
+        let usage = crate::api::monitoring::disk_usage_for_path(&root).map_err(|error| {
+            format!(
+                "measure reconstructed mission filesystem {}: {error}",
+                root.display()
+            )
+        })?;
+        ledger.reservations.insert(
+            mission_id,
+            DiskReservation {
+                mission_id,
+                filesystem: usage.filesystem,
+                estimated_bytes: mission_disk_default_estimate_gib().saturating_mul(1 << 30),
+                free_bytes_at_grant: usage.available,
+                workspace_dir: Some(workspace::mission_workspace_dir_for_workspace(
+                    &workspace, mission_id,
+                )),
+            },
+        );
+    }
     if ledger.reservations.len() != before {
         write_disk_reservation_ledger(config, &ledger)?;
     }
@@ -32329,5 +32386,29 @@ Investigate <service/> failures.
         assert!(!mission_holds_disk_reservation(MissionStatus::Completed));
         assert!(!mission_holds_disk_reservation(MissionStatus::Failed));
         assert!(!mission_holds_disk_reservation(MissionStatus::Acknowledged));
+    }
+
+    #[test]
+    fn restart_reconciliation_reads_workspace_identity_from_offline_mission_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missions.db");
+        let mission_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE missions (id TEXT PRIMARY KEY, status TEXT, workspace_id TEXT)",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO missions (id, status, workspace_id) VALUES (?1, 'pending', ?2)",
+                rusqlite::params![mission_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let rows = nonterminal_missions_in_sqlite(&path).unwrap();
+        assert_eq!(rows.get(&mission_id), Some(&Some(workspace_id)));
     }
 }
