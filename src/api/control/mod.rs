@@ -7525,6 +7525,13 @@ struct DiskReservationLedger {
     version: u8,
     #[serde(default)]
     reservations: HashMap<Uuid, DiskReservation>,
+    /// Compatibility input for the immediately preceding ledger format.  The
+    /// placement decision has moved to the mission row, but an upgrade must
+    /// first transfer any remote (`false`) decisions rather than treating
+    /// those missions as conservative local work.  Do not serialize this
+    /// field again: once transferred, the row is the sole authority.
+    #[serde(default, skip_serializing)]
+    legacy_requires_local_disk: HashMap<Uuid, bool>,
 }
 
 const fn disk_reservation_ledger_version() -> u8 {
@@ -7547,6 +7554,7 @@ fn read_disk_reservation_ledger(config: &Config) -> Result<DiskReservationLedger
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DiskReservationLedger {
             version: disk_reservation_ledger_version(),
             reservations: HashMap::new(),
+            legacy_requires_local_disk: HashMap::new(),
         }),
         Err(error) => Err(format!("read {}: {error}", path.display())),
     }
@@ -7675,6 +7683,55 @@ fn nonterminal_missions_in_sqlite(
     Ok(missions)
 }
 
+/// Transfer placement from the short-lived v2 lease-ledger authority into an
+/// offline SQLite mission store.  This runs under the global admission lock;
+/// the transaction means a crash leaves either the old ledger classification
+/// or the fully-updated mission rows, never a partially applied set.
+fn migrate_legacy_ledger_placement_in_sqlite(
+    path: &std::path::Path,
+    placement: &HashMap<Uuid, bool>,
+) -> Result<(), String> {
+    if placement.is_empty() {
+        return Ok(());
+    }
+    let mut connection = rusqlite::Connection::open(path)
+        .map_err(|error| format!("open {} for placement migration: {error}", path.display()))?;
+    let has_column = connection
+        .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'requires_local_disk'")
+        .and_then(|statement| statement.exists([]))
+        .map_err(|error| format!("inspect {} placement schema: {error}", path.display()))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("start {} placement migration: {error}", path.display()))?;
+    if !has_column {
+        transaction
+            .execute(
+                "ALTER TABLE missions ADD COLUMN requires_local_disk INTEGER NOT NULL DEFAULT 1",
+                [],
+            )
+            .map_err(|error| format!("add {} placement column: {error}", path.display()))?;
+    }
+    for (&mission_id, &requires_local_disk) in placement {
+        transaction
+            .execute(
+                "UPDATE missions SET requires_local_disk = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    if requires_local_disk { 1i64 } else { 0i64 },
+                    mission_id.to_string()
+                ],
+            )
+            .map_err(|error| {
+                format!(
+                    "migrate placement for {mission_id} in {}: {error}",
+                    path.display()
+                )
+            })?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("commit {} placement migration: {error}", path.display()))
+}
+
 /// Reconstruct the live lease set from authoritative mission state while the
 /// global admission lock is held.  The ledger supplies bytes; mission stores
 /// supply lifecycle truth.  Project tags are deliberately excluded: they are
@@ -7685,6 +7742,8 @@ async fn reconcile_disk_reservation_ledger_under_lock(
     config: &Config,
 ) -> Result<(), String> {
     let inventory = control_hub.mission_store_inventory().await?;
+    let mut ledger = read_disk_reservation_ledger(config)?;
+    let legacy_placement = std::mem::take(&mut ledger.legacy_requires_local_disk);
     // Mission rows are the lifecycle authority.  A process can crash after a
     // row commits but before the separate, atomically-published ledger file is
     // renamed.  Reconstructing a conservative lease for every such live row
@@ -7694,10 +7753,23 @@ async fn reconcile_disk_reservation_ledger_under_lock(
     let mut live_missions: HashMap<Uuid, (Option<Uuid>, bool)> = HashMap::new();
     for store in inventory.live {
         for mission in store.list_missions(usize::MAX, 0).await? {
+            if let Some(&requires_local_disk) = legacy_placement.get(&mission.id) {
+                if mission.requires_local_disk != requires_local_disk {
+                    store
+                        .set_mission_requires_local_disk(mission.id, requires_local_disk)
+                        .await?;
+                }
+            }
             if mission_holds_disk_reservation(mission.status) {
                 live_missions.insert(
                     mission.id,
-                    (Some(mission.workspace_id), mission.requires_local_disk),
+                    (
+                        Some(mission.workspace_id),
+                        legacy_placement
+                            .get(&mission.id)
+                            .copied()
+                            .unwrap_or(mission.requires_local_disk),
+                    ),
                 );
             }
         }
@@ -7707,24 +7779,40 @@ async fn reconcile_disk_reservation_ledger_under_lock(
             mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await?,
         );
         for mission in store.list_missions(usize::MAX, 0).await? {
+            if let Some(&requires_local_disk) = legacy_placement.get(&mission.id) {
+                if mission.requires_local_disk != requires_local_disk {
+                    store
+                        .set_mission_requires_local_disk(mission.id, requires_local_disk)
+                        .await?;
+                }
+            }
             if mission_holds_disk_reservation(mission.status) {
                 live_missions.insert(
                     mission.id,
-                    (Some(mission.workspace_id), mission.requires_local_disk),
+                    (
+                        Some(mission.workspace_id),
+                        legacy_placement
+                            .get(&mission.id)
+                            .copied()
+                            .unwrap_or(mission.requires_local_disk),
+                    ),
                 );
             }
         }
     }
     for path in inventory.offline_sqlite {
-        let missions = tokio::task::spawn_blocking(move || nonterminal_missions_in_sqlite(&path))
-            .await
-            .map_err(|error| error.to_string())??;
+        let placement = legacy_placement.clone();
+        let missions = tokio::task::spawn_blocking(move || {
+            migrate_legacy_ledger_placement_in_sqlite(&path, &placement)?;
+            nonterminal_missions_in_sqlite(&path)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
         for (id, placement) in missions {
             live_missions.entry(id).or_insert(placement);
         }
     }
-    let mut ledger = read_disk_reservation_ledger(config)?;
-    let mut changed = false;
+    let mut changed = !legacy_placement.is_empty();
     let before = ledger.reservations.len();
     ledger
         .reservations
@@ -32803,6 +32891,39 @@ Investigate <service/> failures.
         let rows = nonterminal_missions_in_sqlite(&path).unwrap();
         // Placement comes from authoritative mission rows, never from the
         // lease ledger. A mixed restart rebuilds only local missions.
+        assert_eq!(rows.get(&local), Some(&(None, true)));
+        assert_eq!(rows.get(&remote), Some(&(None, false)));
+    }
+
+    #[test]
+    fn legacy_ledger_remote_placement_is_migrated_to_sqlite_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missions.db");
+        let local = Uuid::new_v4();
+        let remote = Uuid::new_v4();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        // This is the schema just before placement moved out of the ledger.
+        connection
+            .execute_batch(
+                "CREATE TABLE missions (id TEXT PRIMARY KEY, status TEXT, workspace_id TEXT)",
+            )
+            .unwrap();
+        for id in [local, remote] {
+            connection
+                .execute(
+                    "INSERT INTO missions VALUES (?1, 'pending', NULL)",
+                    rusqlite::params![id.to_string()],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        migrate_legacy_ledger_placement_in_sqlite(
+            &path,
+            &HashMap::from([(local, true), (remote, false)]),
+        )
+        .unwrap();
+        let rows = nonterminal_missions_in_sqlite(&path).unwrap();
         assert_eq!(rows.get(&local), Some(&(None, true)));
         assert_eq!(rows.get(&remote), Some(&(None, false)));
     }
