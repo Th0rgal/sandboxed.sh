@@ -7,6 +7,7 @@ import {
   finishedTone,
   getMissionDotColor,
   getMissionTextColor,
+  statusLabel,
   FINISHED_STATUSES,
   NEEDS_ATTENTION_STATUSES,
 } from './mission-status';
@@ -33,8 +34,10 @@ describe('mission-status', () => {
   });
 
   describe('needsAttentionStatus', () => {
-    it('returns true only for awaiting_user', () => {
-      expect(needsAttentionStatus('awaiting_user')).toBe(true);
+    it('returns true only when the API marked needs_operator', () => {
+      expect(needsAttentionStatus('awaiting_user', true)).toBe(true);
+      expect(needsAttentionStatus('awaiting_user')).toBe(false);
+      expect(needsAttentionStatus('awaiting_user', false)).toBe(false);
     });
 
     it('returns false for failure statuses (now in Finished/red)', () => {
@@ -79,8 +82,17 @@ describe('mission-status', () => {
     });
 
     describe('needs-you when not running', () => {
-      it('categorizes awaiting_user missions as needs-you when not running', () => {
-        expect(categorizeMission('awaiting_user', false)).toBe('needs-you');
+      it('categorizes only needs_operator missions as needs-you', () => {
+        expect(categorizeMission('awaiting_user', false, false, true, 'decision')).toBe('needs-you');
+        expect(categorizeMission('awaiting_user', false)).toBe('finished');
+      });
+
+      it('ack leaves the inbox for Finished / Awaiting Review', () => {
+        expect(categorizeMission('awaiting_user', false, false, false, 'ack')).toBe('finished');
+      });
+
+      it('in-grace controller decisions stay on the board in Running', () => {
+        expect(categorizeMission('awaiting_user', false, false, false, 'decision')).toBe('running');
       });
 
       it('failure statuses no longer land in needs-you (they go to finished/red)', () => {
@@ -112,23 +124,30 @@ describe('mission-status', () => {
       });
     });
 
-    describe('waiting for tool takes priority over running', () => {
-      it('categorizes a mission parked on a frontend tool as needs-you', () => {
-        // Backend still reports the mission as running (run state
-        // waiting_for_tool), but it is blocked on the user.
-        expect(categorizeMission('active', true, true)).toBe('needs-you');
-        expect(categorizeMission('active', false, true)).toBe('needs-you');
+    describe('waiting for tool is Needs You only when needs_operator', () => {
+      it('keeps controller-owned waiting_for_tool inside grace in Running', () => {
+        expect(categorizeMission('active', true, true, false)).toBe('running');
+        expect(categorizeMission('active', false, true, false)).toBe('running');
+      });
+
+      it('promotes waiting_for_tool to Needs You when the API says so', () => {
+        expect(categorizeMission('active', true, true, true)).toBe('needs-you');
       });
     });
   });
 
   describe('categorizeMissions', () => {
-    type TestMission = { id: string; status: MissionStatus };
+    type TestMission = {
+      id: string;
+      status: MissionStatus;
+      needs_operator?: boolean;
+      awaiting_kind?: 'decision' | 'ack' | null;
+    };
 
     it('groups missions into correct categories', () => {
       const missions: TestMission[] = [
         { id: '1', status: 'active' },
-        { id: '2', status: 'awaiting_user' },
+        { id: '2', status: 'awaiting_user', needs_operator: true, awaiting_kind: 'decision' },
         { id: '3', status: 'completed' },
         { id: '4', status: 'failed' },
         { id: '5', status: 'acknowledged' },
@@ -144,13 +163,44 @@ describe('mission-status', () => {
       expect(result.other).toEqual([]);
     });
 
-    it('puts missions waiting on a frontend tool in needs-you, not running', () => {
+    it('keeps in-grace parked decisions in Running', () => {
       const missions: TestMission[] = [
-        { id: 'asking', status: 'active' }, // parked on AskUserQuestion
-        { id: 'executing', status: 'active' }, // genuinely running a turn
+        { id: 'triage', status: 'awaiting_user', awaiting_kind: 'decision', needs_operator: false },
       ];
-      // Backend reports both in the running list, but `asking` is waiting_for_tool.
-      const runningIds = new Set(['executing']);
+      const result = categorizeMissions(missions, new Set());
+      expect(result['needs-you']).toEqual([]);
+      expect(result.running.map(m => m.id)).toEqual(['triage']);
+    });
+
+    it('ack is Finished, not Needs You', () => {
+      const missions: TestMission[] = [
+        { id: 'ack', status: 'awaiting_user', awaiting_kind: 'ack', needs_operator: false },
+      ];
+      const result = categorizeMissions(missions, new Set());
+      expect(result['needs-you']).toEqual([]);
+      expect(result.finished.map(m => m.id)).toEqual(['ack']);
+    });
+
+    it('puts controller-owned waiting_for_tool inside grace in running', () => {
+      const missions: TestMission[] = [
+        { id: 'asking', status: 'active', needs_operator: false },
+        { id: 'executing', status: 'active' },
+      ];
+      const runningIds = new Set(['asking', 'executing']);
+      const waitingForToolIds = new Set(['asking']);
+
+      const result = categorizeMissions(missions, runningIds, waitingForToolIds);
+
+      expect(result.running.map(m => m.id)).toEqual(['asking', 'executing']);
+      expect(result['needs-you']).toEqual([]);
+    });
+
+    it('promotes waiting_for_tool to Needs You only when needs_operator', () => {
+      const missions: TestMission[] = [
+        { id: 'asking', status: 'active', needs_operator: true },
+        { id: 'executing', status: 'active' },
+      ];
+      const runningIds = new Set(['asking', 'executing']);
       const waitingForToolIds = new Set(['asking']);
 
       const result = categorizeMissions(missions, runningIds, waitingForToolIds);
@@ -161,9 +211,9 @@ describe('mission-status', () => {
 
     it('handles resumed mission correctly (awaiting_user but running)', () => {
       const missions: TestMission[] = [
-        { id: 'resumed', status: 'awaiting_user' }, // DB still says awaiting_user
+        { id: 'resumed', status: 'awaiting_user', needs_operator: true, awaiting_kind: 'decision' },
         { id: 'new', status: 'active' },
-        { id: 'waiting', status: 'awaiting_user' },
+        { id: 'waiting', status: 'awaiting_user', needs_operator: true, awaiting_kind: 'decision' },
       ];
       const runningIds = new Set(['resumed', 'new']);
 
@@ -269,8 +319,21 @@ describe('mission-status', () => {
       expect(FINISHED_STATUSES).toHaveLength(6);
     });
 
-    it('NEEDS_ATTENTION_STATUSES contains only awaiting_user', () => {
-      expect(NEEDS_ATTENTION_STATUSES).toEqual(['awaiting_user']);
+    it('NEEDS_ATTENTION_STATUSES is empty — Needs You is needs_operator, not a status list', () => {
+      expect(NEEDS_ATTENTION_STATUSES).toEqual([]);
+    });
+  });
+
+  describe('statusLabel', () => {
+    it('prefers Awaiting Review when kind is missing unless needs_operator', () => {
+      expect(statusLabel('awaiting_user')).toBe('Awaiting Review');
+      expect(statusLabel('awaiting_user', null, false)).toBe('Awaiting Review');
+      expect(statusLabel('awaiting_user', null, true)).toBe('Needs You');
+    });
+
+    it('uses awaiting_kind labels when present', () => {
+      expect(statusLabel('awaiting_user', 'ack')).toBe('Awaiting Review');
+      expect(statusLabel('awaiting_user', 'decision')).toBe('Needs Decision');
     });
   });
 });

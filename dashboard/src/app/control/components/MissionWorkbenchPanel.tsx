@@ -78,7 +78,12 @@ export function MissionWorkbenchPanel({
     mission?.title?.trim() ||
     (mission ? getMissionShortName(mission.id) : "No mission selected");
   const status = mission
-    ? missionStatusLabel(mission.status, isRunning, mission.awaiting_kind)
+    ? missionStatusLabel(
+        mission.status,
+        isRunning,
+        mission.awaiting_kind,
+        mission.needs_operator === true,
+      )
     : null;
   const canResume =
     mission &&
