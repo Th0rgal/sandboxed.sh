@@ -1659,6 +1659,26 @@ async fn spawn_task_worker(
     } else {
         None
     };
+    let assigned_id = Uuid::new_v4();
+    if let Some((admission_guard, mut reservation, workspace)) = admission {
+        reservation.mission_id = assigned_id;
+        reservation.workspace_dir = Some(crate::workspace::mission_workspace_dir_for_workspace(
+            &workspace,
+            assigned_id,
+        ));
+        let mut ledger =
+            super::read_disk_reservation_ledger(&control_hub.expect("admission hub").config)?;
+        ledger.reservations.insert(assigned_id, reservation);
+        if let Err(error) = super::write_disk_reservation_ledger(
+            &control_hub.expect("admission hub").config,
+            &ledger,
+        ) {
+            return Err(format!(
+                "board worker creation rolled back: persist disk admission ledger: {error}"
+            ));
+        }
+        drop(admission_guard);
+    }
     let mission = mission_store
         .create_mission_with_parent_and_placement(
             Some(&format!("[{}] {}", task.task_key, task.title)),
@@ -1672,29 +1692,9 @@ async fn spawn_task_worker(
             Some(task.boss_mission_id),
             task.working_directory.as_deref(),
             true,
+            Some(assigned_id),
         )
         .await?;
-    if let Some((admission_guard, mut reservation, workspace)) = admission {
-        reservation.mission_id = mission.id;
-        reservation.workspace_dir = Some(crate::workspace::mission_workspace_dir_for_workspace(
-            &workspace, mission.id,
-        ));
-        let mut ledger =
-            super::read_disk_reservation_ledger(&control_hub.expect("admission hub").config)?;
-        ledger.reservations.insert(mission.id, reservation);
-        if let Err(error) = super::write_disk_reservation_ledger(
-            &control_hub.expect("admission hub").config,
-            &ledger,
-        ) {
-            let _ = mission_store
-                .update_mission_status(mission.id, MissionStatus::Failed)
-                .await;
-            return Err(format!(
-                "board worker creation rolled back: persist disk admission ledger: {error}"
-            ));
-        }
-        drop(admission_guard);
-    }
     // Inherit the boss's project tagging. Board tasks bypass the public
     // create-mission handler, and `create_mission_with_parent` carries no
     // project metadata — so workers were landing untagged. The parent link

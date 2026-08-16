@@ -3631,10 +3631,11 @@ impl MissionStore for SqliteMissionStore {
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
         requires_local_disk: bool,
+        assigned_id: Option<Uuid>,
     ) -> Result<Mission, String> {
         let conn = self.conn.clone();
         let now = now_string();
-        let id = Uuid::new_v4();
+        let id = assigned_id.unwrap_or_else(Uuid::new_v4);
         // Inherit workspace from parent mission when not explicitly provided.
         let workspace_id = if let Some(ws) = workspace_id {
             ws
@@ -3774,6 +3775,7 @@ impl MissionStore for SqliteMissionStore {
             parent_mission_id,
             working_directory,
             true,
+            None,
         )
         .await
     }

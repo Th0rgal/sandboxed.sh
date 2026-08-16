@@ -2113,7 +2113,9 @@ pub trait MissionStore: Send + Sync {
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
         requires_local_disk: bool,
+        assigned_id: Option<Uuid>,
     ) -> Result<Mission, String> {
+        let _ = assigned_id;
         let mut mission = self
             .create_mission_with_parent(
                 title,

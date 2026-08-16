@@ -7530,7 +7530,15 @@ struct DiskReservationLedger {
     /// first transfer any remote (`false`) decisions rather than treating
     /// those missions as conservative local work.  Do not serialize this
     /// field again: once transferred, the row is the sole authority.
-    #[serde(default, skip_serializing)]
+    ///
+    /// The on-disk key was `requires_local_disk`.  The Rust field was renamed
+    /// during the migration, so deserialize both names.
+    #[serde(
+        default,
+        rename = "requires_local_disk",
+        alias = "legacy_requires_local_disk",
+        skip_serializing
+    )]
     legacy_requires_local_disk: HashMap<Uuid, bool>,
 }
 
@@ -7629,6 +7637,20 @@ async fn reserved_disk_bytes_for_filesystem(
 /// the same consumption twice.  A lease therefore retains only its estimated
 /// *remaining* peak after measuring its own workspace.  Measurement failure
 /// is conservative: keep the complete estimate.
+fn allocated_file_bytes(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // POSIX `st_blocks` is in 512-byte units and counts allocated
+        // storage, so sparse/reflinked files do not appear fully consumed.
+        metadata.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
+
 fn disk_reservation_outstanding_bytes(reservation: &DiskReservation) -> u64 {
     let Some(path) = reservation.workspace_dir.as_deref() else {
         return reservation.estimated_bytes;
@@ -7638,7 +7660,9 @@ fn disk_reservation_outstanding_bytes(reservation: &DiskReservation) -> u64 {
         .filter_map(Result::ok)
         .filter_map(|entry| entry.metadata().ok())
         .filter(|metadata| metadata.is_file())
-        .fold(0u64, |total, metadata| total.saturating_add(metadata.len()));
+        .fold(0u64, |total, metadata| {
+            total.saturating_add(allocated_file_bytes(&metadata))
+        });
     reservation.estimated_bytes.saturating_sub(usage)
 }
 
@@ -7935,6 +7959,32 @@ async fn release_local_mission_disk(config: &Config, mission_id: Uuid) -> Result
         write_disk_reservation_ledger(config, &ledger)?;
     }
     Ok(())
+}
+
+async fn release_local_mission_disk_if_not_holding(
+    mission_store: &Arc<dyn crate::api::mission_store::MissionStore>,
+    config: &Config,
+    mission_id: Uuid,
+) {
+    match mission_store.get_mission(mission_id).await {
+        Ok(Some(mission)) if mission_holds_disk_reservation(mission.status) => {}
+        Ok(_) => {
+            if let Err(error) = release_local_mission_disk(config, mission_id).await {
+                tracing::error!(
+                    mission = %mission_id,
+                    %error,
+                    "terminal mission lease cleanup failed after runner stop"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                mission = %mission_id,
+                %error,
+                "could not load mission to decide disk lease release"
+            );
+        }
+    }
 }
 
 struct DurablePrWriterLockGuard {
@@ -17522,6 +17572,7 @@ async fn control_actor_loop(
             working_directory,
             true,
             scheduling,
+            None,
         )
         .await
     }
@@ -17544,6 +17595,7 @@ async fn control_actor_loop(
         working_directory: Option<&str>,
         requires_local_disk: bool,
         scheduling: crate::api::mission_store::MissionScheduling,
+        assigned_id: Option<Uuid>,
     ) -> Result<Mission, String> {
         let mut mission = mission_store
             .create_mission_with_parent_and_placement(
@@ -17558,6 +17610,7 @@ async fn control_actor_loop(
                 parent_mission_id,
                 working_directory,
                 requires_local_disk,
+                assigned_id,
             )
             .await?;
         // FLEET-001: persist scheduling metadata as a focused follow-up write so
@@ -19113,6 +19166,43 @@ async fn control_actor_loop(
                         )
                         .await;
 
+                        // Publish the lease before the mission row so a crash
+                        // cannot reconstruct a custom estimate as the default.
+                        let assigned_id = Uuid::new_v4();
+                        if reservation_guard.is_none() {
+                            match acquire_durable_disk_admission_lock(&config).await {
+                                Ok(guard) => reservation_guard = Some(guard),
+                                Err(error) => {
+                                    let _ = respond.send(Err(format!(
+                                        "mission creation rolled back: acquire placement ledger lock: {error}"
+                                    )));
+                                    continue;
+                                }
+                            }
+                        }
+                        let mut ledger = match read_disk_reservation_ledger(&config) {
+                            Ok(ledger) => ledger,
+                            Err(error) => {
+                                let _ = respond.send(Err(format!(
+                                    "mission creation rolled back: read disk admission ledger: {error}"
+                                )));
+                                continue;
+                            }
+                        };
+                        if let Some(mut candidate) = reservation.take() {
+                            candidate.mission_id = assigned_id;
+                            candidate.workspace_dir = Some(
+                                workspace::mission_workspace_dir_for_workspace(&workspace, assigned_id),
+                            );
+                            ledger.reservations.insert(assigned_id, candidate);
+                            if let Err(error) = write_disk_reservation_ledger(&config, &ledger) {
+                                let _ = respond.send(Err(format!(
+                                    "mission creation rolled back: persist disk placement ledger: {error}"
+                                )));
+                                continue;
+                            }
+                        }
+
                         // Create a new mission with optional title, workspace, agent, and backend
                         match create_new_mission_with_title_and_placement(
                             &mission_store,
@@ -19128,13 +19218,12 @@ async fn control_actor_loop(
                             working_directory.as_deref(),
                             requires_local_disk,
                             scheduling,
+                            Some(assigned_id),
                         )
                         .await {
                             Ok(mut mission) => {
                                 // Project tags are user-editable and are not admission
-                                // state.  Persist any ordinary tags independently, then
-                                // write the server-owned v2 ledger before releasing the
-                                // cross-process lock.
+                                // state.  Persist any ordinary tags independently.
                                 let tags = admission_tags;
                                 if !tags.is_empty() {
                                     if let Err(error) = mission_store.update_mission_project(
@@ -19144,9 +19233,6 @@ async fn control_actor_loop(
                                             ..Default::default()
                                         },
                                     ).await {
-                                        // Never return a runnable mission that was admitted
-                                        // without its durable reservation.  Marking it terminal
-                                        // also releases any partially-visible reservation.
                                         let _ = mission_store.update_mission_status(
                                             mission.id,
                                             MissionStatus::Failed,
@@ -19167,47 +19253,6 @@ async fn control_actor_loop(
                                             continue;
                                         }
                                     }
-                                }
-                                // Placement was persisted in the same store operation as the
-                                // Pending row.  The lease ledger supplies only byte amounts.
-                                // Keep the same global lock through the server-owned
-                                // lease publication so a restart cannot observe a
-                                // partially admitted local mission.
-                                if reservation_guard.is_none() {
-                                    match acquire_durable_disk_admission_lock(&config).await {
-                                        Ok(guard) => reservation_guard = Some(guard),
-                                        Err(error) => {
-                                            let _ = mission_store.update_mission_status(mission.id, MissionStatus::Failed).await;
-                                            let _ = respond.send(Err(format!(
-                                                "mission creation rolled back: acquire placement ledger lock: {error}"
-                                            )));
-                                            continue;
-                                        }
-                                    }
-                                }
-                                let mut ledger = match read_disk_reservation_ledger(&config) {
-                                    Ok(ledger) => ledger,
-                                    Err(error) => {
-                                        let _ = mission_store.update_mission_status(mission.id, MissionStatus::Failed).await;
-                                        let _ = respond.send(Err(format!(
-                                            "mission creation rolled back: read disk admission ledger: {error}"
-                                        )));
-                                        continue;
-                                    }
-                                };
-                                if let Some(mut candidate) = reservation.take() {
-                                    candidate.mission_id = mission.id;
-                                    candidate.workspace_dir = Some(
-                                        workspace::mission_workspace_dir_for_workspace(&workspace, mission.id),
-                                    );
-                                    ledger.reservations.insert(mission.id, candidate);
-                                }
-                                if let Err(error) = write_disk_reservation_ledger(&config, &ledger) {
-                                    let _ = mission_store.update_mission_status(mission.id, MissionStatus::Failed).await;
-                                    let _ = respond.send(Err(format!(
-                                        "mission creation rolled back: persist disk placement ledger: {error}"
-                                    )));
-                                    continue;
                                 }
                                 // Explicitly drop after durable write, rather than relying on
                                 // scope order if this branch grows a later await.
@@ -19253,7 +19298,11 @@ async fn control_actor_loop(
                             .update_mission_status(id, new_status)
                             .await;
                         if result.is_ok() {
-                            if !mission_holds_disk_reservation(new_status) {
+                            let runner_active = running_mission_id == Some(id)
+                                || parallel_runners
+                                    .get(&id)
+                                    .is_some_and(|runner| runner.is_running());
+                            if !mission_holds_disk_reservation(new_status) && !runner_active {
                                 if let Err(error) = release_local_mission_disk(&config, id).await {
                                     tracing::error!(mission = %id, %error,
                                         "terminal mission lease cleanup failed; retaining conservative admission state");
@@ -20756,6 +20805,10 @@ async fn control_actor_loop(
                     let completed_mission_id = running_mission_id;
                     running = None;
                     running_cancel = None;
+                    if let Some(mid) = running_mission_id {
+                        release_local_mission_disk_if_not_holding(&mission_store, &config, mid)
+                            .await;
+                    }
                     running_mission_id = None;
                     running_backend_id = None;
                     main_runner_activity = None;
@@ -21840,6 +21893,7 @@ async fn control_actor_loop(
                 // Remove completed runners and clean up their desktop sessions
                 for mid in completed_missions {
                     parallel_runners.remove(&mid);
+                    release_local_mission_disk_if_not_holding(&mission_store, &config, mid).await;
                     close_mission_desktop_sessions(
                         &mission_store,
                         mid,
@@ -32893,6 +32947,51 @@ Investigate <service/> failures.
         // lease ledger. A mixed restart rebuilds only local missions.
         assert_eq!(rows.get(&local), Some(&(None, true)));
         assert_eq!(rows.get(&remote), Some(&(None, false)));
+    }
+
+    #[test]
+    fn legacy_ledger_deserializes_requires_local_disk_key() {
+        let remote = Uuid::new_v4();
+        let json = format!(
+            r#"{{"version":2,"reservations":{{}},"requires_local_disk":{{"{remote}":false}}}}"#
+        );
+        let ledger: DiskReservationLedger = serde_json::from_str(&json).unwrap();
+        assert_eq!(ledger.legacy_requires_local_disk.get(&remote), Some(&false));
+        let serialized = serde_json::to_value(&ledger).unwrap();
+        assert!(serialized.get("requires_local_disk").is_none());
+        assert!(serialized.get("legacy_requires_local_disk").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outstanding_reservation_uses_allocated_bytes_not_logical_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(64 << 30).unwrap();
+        drop(file);
+        let reservation = DiskReservation {
+            mission_id: Uuid::new_v4(),
+            filesystem: "fs".into(),
+            estimated_bytes: 64 << 30,
+            free_bytes_at_grant: 0,
+            workspace_dir: Some(dir.path().to_path_buf()),
+        };
+        let outstanding = disk_reservation_outstanding_bytes(&reservation);
+        assert!(
+            outstanding > 32 << 30,
+            "a sparse 64 GiB file must not consume the full reservation; outstanding={outstanding}"
+        );
+    }
+
+    #[test]
+    fn running_missions_keep_disk_reservations_after_terminal_status() {
+        assert!(mission_holds_disk_reservation(MissionStatus::Active));
+        // Presentation status is not enough to release: SetMissionStatus must
+        // also observe that no runner is active. The helper below is the
+        // status half of that conjunction.
+        assert!(!mission_holds_disk_reservation(MissionStatus::Completed));
+        assert!(!mission_holds_disk_reservation(MissionStatus::Failed));
     }
 
     #[test]

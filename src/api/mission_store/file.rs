@@ -278,6 +278,7 @@ impl MissionStore for FileMissionStore {
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
         requires_local_disk: bool,
+        assigned_id: Option<Uuid>,
     ) -> Result<Mission, String> {
         let now = now_string();
         let metadata_source = title.and_then(|value| {
@@ -290,7 +291,7 @@ impl MissionStore for FileMissionStore {
         });
         let metadata_updated_at = metadata_source.as_ref().map(|_| now.clone());
         let mission = Mission {
-            id: Uuid::new_v4(),
+            id: assigned_id.unwrap_or_else(Uuid::new_v4),
             status: MissionStatus::Pending,
             title: title.map(|s| s.to_string()),
             short_description: None,
@@ -366,6 +367,7 @@ impl MissionStore for FileMissionStore {
             parent_mission_id,
             working_directory,
             true,
+            None,
         )
         .await
     }
