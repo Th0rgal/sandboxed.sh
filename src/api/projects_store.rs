@@ -80,7 +80,10 @@ CREATE TABLE IF NOT EXISTS projects (
     controller_cron_id TEXT,                             -- the controller<->project link
     repository         TEXT,
     created_at         TEXT NOT NULL,
-    updated_at         TEXT NOT NULL
+    updated_at         TEXT NOT NULL,
+    -- Watermark for the last mode write. HTTP set_mode stamps now; ingest
+    -- only overwrites when the delivery is at least this new.
+    mode_signal_at     TEXT
 );
 
 -- The autonomy grant, structured so it survives a controller rewriting its own
@@ -233,6 +236,12 @@ impl ProjectsStore {
             "project_grant",
             "autonomy_level",
             "autonomy_level TEXT",
+        )?;
+        Self::ensure_column(
+            connection,
+            "projects",
+            "mode_signal_at",
+            "mode_signal_at TEXT",
         )?;
         connection.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_project_decisions_status \
@@ -937,7 +946,7 @@ impl ProjectsStore {
             .execute(
                 "UPDATE projects SET mode = ?2, next_action = ?3, blocker = ?4, \
                  wait_ticks = CASE WHEN ?5 THEN wait_ticks + 1 ELSE 0 END, \
-                 updated_at = ?6 WHERE slug = ?1",
+                 updated_at = ?6, mode_signal_at = ?6 WHERE slug = ?1",
                 params![slug, mode, next_action, blocker, unchanged, now],
             )
             .map_err(|e| e.to_string())?;
@@ -960,16 +969,33 @@ impl ProjectsStore {
         wait: i64,
         next_action: Option<&str>,
         blocker: Option<&str>,
+        at: Option<&str>,
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
-        connection
-            .execute(
-                "UPDATE projects SET mode = ?2, wait_ticks = ?3, next_action = ?4, \
-                 blocker = ?5, updated_at = ?6 WHERE slug = ?1",
-                params![slug, mode, wait, next_action, blocker, now],
-            )
-            .map_err(|e| e.to_string())?;
+        match at {
+            Some(at) => {
+                // HTTP set_mode stamps mode_signal_at; refuse an older delivery
+                // so a finished-turn callback cannot undo a newer controller write.
+                connection
+                    .execute(
+                        "UPDATE projects SET mode = ?2, wait_ticks = ?3, next_action = ?4, \
+                         blocker = ?5, updated_at = ?6, mode_signal_at = ?7 \
+                         WHERE slug = ?1 AND (mode_signal_at IS NULL OR ?7 >= mode_signal_at)",
+                        params![slug, mode, wait, next_action, blocker, now, at],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            None => {
+                connection
+                    .execute(
+                        "UPDATE projects SET mode = ?2, wait_ticks = ?3, next_action = ?4, \
+                         blocker = ?5, updated_at = ?6 WHERE slug = ?1",
+                        params![slug, mode, wait, next_action, blocker, now],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(())
     }
 
@@ -2059,7 +2085,7 @@ mod tests {
         let store = ProjectsStore::open_in_memory().expect("store");
         // No project row: the ingestor must not create one from a trailer.
         store
-            .project_mode_from_signal("ghost", "active", 0, None, None)
+            .project_mode_from_signal("ghost", "active", 0, None, None, None)
             .expect("no-op, not an error");
         assert!(store.get_project("ghost").expect("read").is_none());
 
@@ -2069,15 +2095,45 @@ mod tests {
         // Replaying the same signal twice does not inflate wait — it is passed
         // in, not incremented, so overlapping ingest cycles are harmless.
         store
-            .project_mode_from_signal("bench", "blocked", 2, None, Some("transport-cap"))
+            .project_mode_from_signal("bench", "blocked", 2, None, Some("transport-cap"), None)
             .expect("m1");
         store
-            .project_mode_from_signal("bench", "blocked", 2, None, Some("transport-cap"))
+            .project_mode_from_signal("bench", "blocked", 2, None, Some("transport-cap"), None)
             .expect("m2 replay");
         let p = store.get_project("bench").expect("read").expect("present");
         assert_eq!(p.mode.as_deref(), Some("blocked"));
         assert_eq!(p.wait_ticks, 2);
         assert_eq!(p.blocker.as_deref(), Some("transport-cap"));
+    }
+
+    #[test]
+    fn mode_signal_watermark_refuses_older_deliveries() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("bench", None, None, None, None)
+            .expect("seed");
+        store
+            .set_mode("bench", "active", None, None)
+            .expect("http set_mode");
+        store.set_mode("bench", "active", None, None).expect("tick");
+        let before = store.get_project("bench").expect("read").expect("present");
+        assert_eq!(before.mode.as_deref(), Some("active"));
+        assert_eq!(before.wait_ticks, 1);
+
+        store
+            .project_mode_from_signal(
+                "bench",
+                "blocked",
+                0,
+                None,
+                Some("stale-callback"),
+                Some("2020-01-01T00:00:00Z"),
+            )
+            .expect("older signal");
+        let after = store.get_project("bench").expect("read").expect("present");
+        assert_eq!(after.mode.as_deref(), Some("active"));
+        assert_eq!(after.wait_ticks, 1);
+        assert_eq!(after.blocker, None);
     }
 
     #[test]

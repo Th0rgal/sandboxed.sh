@@ -142,6 +142,27 @@ async fn live_writer_project_slugs(state: &super::routes::AppState) -> HashSet<S
 /// prefix lets readers keep rendering `state` as absent for those.
 const CTRL_DESCRIPTOR_PREFIX: &str = "ctrl:";
 
+/// Mission-complete callbacks always carry `next=inspect`. They wake the
+/// controller but must not project a mode or a "blocker reported" chip.
+fn is_mission_inspect_callback(headline: &str, state: Option<&str>) -> bool {
+    if headline.starts_with("[Mission callback:") {
+        return true;
+    }
+    state.is_some_and(|descriptor| {
+        let mut parts = descriptor.split('|');
+        parts.next() == Some("mission-callback") && parts.next_back() == Some("inspect")
+    })
+}
+
+/// Newest pending `[CTRL:]` mode per slug, applied after the oldest-first
+/// timeline replay so a mixed batch cannot let an older blocked trailer win.
+struct PendingModeWrite {
+    at: String,
+    mode: String,
+    wait: i64,
+    blocker: Option<String>,
+}
+
 /// Fold one batch of deliveries into the projects store.
 ///
 /// This is THE delivery router: alias resolution, roster auto-upsert, state
@@ -163,6 +184,7 @@ fn ingest_deliveries_with_live(
     deliveries: Vec<DeliveryUpdate>,
     live_projects: &HashSet<String>,
 ) {
+    let mut pending_modes: HashMap<String, PendingModeWrite> = HashMap::new();
     // read_deliveries returns newest-first; replay oldest-first so a
     // run of the same state lands as one extended row rather than
     // being rejected as out-of-order.
@@ -234,22 +256,28 @@ fn ingest_deliveries_with_live(
                 1
             }
         };
-        // Project the controller's `[CTRL: … mode=… ]` mode onto the
-        // project record — independent of the descriptor, so a
-        // CTRL-only delivery still updates the mode column. Idempotent
-        // on replay: `wait` comes from the observation count, not a
-        // per-call increment.
-        if let Some(mode) = gated_mode {
-            let base = mode.split_once(':').map_or(mode, |(base, _)| base);
-            let blocker = mode.split_once(':').map(|(_, cause)| cause);
-            if let Err(error) = projects.project_mode_from_signal(
-                slug,
-                base,
-                observations.saturating_sub(1) as i64,
-                None,
-                blocker,
-            ) {
-                tracing::warn!("state ingest mode: {slug}: {error}");
+        // Replay of an older state returns 0 and must not touch mode/wait.
+        // Inspect callbacks wake the controller but never project a mode.
+        // A batch applies at most the newest delivery per slug so an older
+        // blocked trailer cannot overwrite a newer active one.
+        if observations > 0
+            && !is_mission_inspect_callback(&delivery.headline, delivery.state.as_deref())
+        {
+            if let Some(mode) = gated_mode {
+                let base = mode.split_once(':').map_or(mode, |(base, _)| base);
+                let blocker = mode.split_once(':').map(|(_, cause)| cause);
+                let write = PendingModeWrite {
+                    at: delivery.at.clone(),
+                    mode: base.to_string(),
+                    wait: observations.saturating_sub(1) as i64,
+                    blocker: blocker.map(str::to_string),
+                };
+                match pending_modes.get(slug) {
+                    Some(existing) if existing.at > write.at => {}
+                    _ => {
+                        pending_modes.insert(slug.to_string(), write);
+                    }
+                }
             }
         }
         // A `[DECISION: …]` trailer reaches the ledger through the same
@@ -305,6 +333,18 @@ fn ingest_deliveries_with_live(
             ) {
                 tracing::warn!("state ingest close merged decisions: {slug}: {error}");
             }
+        }
+    }
+    for (slug, write) in pending_modes {
+        if let Err(error) = projects.project_mode_from_signal(
+            &slug,
+            &write.mode,
+            write.wait,
+            None,
+            write.blocker.as_deref(),
+            Some(write.at.as_str()),
+        ) {
+            tracing::warn!("state ingest mode: {slug}: {error}");
         }
     }
 }
@@ -2162,7 +2202,17 @@ impl ProjectRowBuilder {
 
         if let Some(latest) = &self.latest_update {
             if let Some(blocker) = latest.blocker.as_deref() {
-                attention.push(format!("blocker reported: {blocker}"));
+                let inspect =
+                    is_mission_inspect_callback(&latest.headline, latest.state.as_deref());
+                let stale_mode = chrono::DateTime::parse_from_rfc3339(&latest.at)
+                    .ok()
+                    .zip(chrono::DateTime::parse_from_rfc3339(now).ok())
+                    .is_some_and(|(at, now)| {
+                        now.signed_duration_since(at) > chrono::Duration::hours(STALE_ACTIVE_HOURS)
+                    });
+                if !inspect && !stale_mode {
+                    attention.push(format!("blocker reported: {blocker}"));
+                }
             }
             // Same non-silent state three ticks in a row: the controller
             // keeps reporting an unchanged world — the phantom-lease shape.
@@ -3926,7 +3976,9 @@ mod tests {
         let mut builder = ProjectRowBuilder::new("verity".to_string());
         // Three deliveries of SAMPLE collapse in the store into one state
         // event with observations=3; the builder sees that count.
-        builder.attach_store_update(parse_delivery("s", 3.0, SAMPLE), 3, 3);
+        let mut update = parse_delivery("s", 1_754_000_000.0, SAMPLE);
+        update.at = "2026-08-04T11:00:00Z".into();
+        builder.attach_store_update(update, 3, 3);
         let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
         assert_eq!(row.bucket, "attention");
         assert!(row.attention_reasons.iter().any(|r| r.contains("blocker")));
@@ -4685,5 +4737,161 @@ mod tests {
         assert_eq!(record.blocker.as_deref(), Some("transport-cap"));
         assert_eq!(record.wait_ticks, 2);
         assert_eq!(store.state_event_totals().expect("totals")["lido"], 3);
+    }
+
+    #[test]
+    fn older_blocked_replay_does_not_paint_mode_or_reset_wait() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity", None, None, None, None)
+            .expect("seed");
+        let newer = "[Cron delivery: Verity]\nCertify merged\n\
+                     [CTRL: verity | mode=active | wait=2 | next=x]\n\
+                     [STATE_SIGNATURE: verity|phase|head|clean]\n";
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            vec![parse_delivery("sess-new", 1_754_003_600.0, newer)],
+        );
+        store
+            .project_mode_from_signal("verity", "active", 2, None, None, None)
+            .expect("seed wait");
+        let before = store.get_project("verity").expect("read").expect("present");
+        assert_eq!(before.mode.as_deref(), Some("active"));
+        assert_eq!(before.wait_ticks, 2);
+
+        let older = "[Cron delivery: Verity]\nBLOQUÉE\n**Blocked by:** stale lease\n\
+                     [CTRL: verity | mode=blocked:lease | wait=0 | next=inspect x]\n\
+                     [STATE_SIGNATURE: verity|phase-old|head|blocked]\n";
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            vec![parse_delivery("sess-old", 1_754_000_000.0, older)],
+        );
+        let after = store.get_project("verity").expect("read").expect("present");
+        assert_eq!(after.mode.as_deref(), Some("active"));
+        assert_eq!(after.wait_ticks, 2);
+    }
+
+    #[test]
+    fn http_set_mode_survives_older_ingest_callback() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity", None, None, None, None)
+            .expect("seed");
+        store
+            .set_mode("verity", "active", Some("continue"), None)
+            .expect("http");
+        // A regular (non-inspect) older blocked CTRL must still lose to the
+        // HTTP watermark — inspect callbacks are skipped earlier.
+        let older = "[Cron delivery: Verity]\nOld block\n\
+                     [CTRL: verity | mode=blocked:lease | wait=0 | next=wait]\n\
+                     [STATE_SIGNATURE: verity|old|head|blocked]\n";
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            vec![parse_delivery("sess-old", 1_754_000_000.0, older)],
+        );
+        let record = store.get_project("verity").expect("read").expect("present");
+        assert_eq!(record.mode.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn inspect_callback_does_not_write_mode() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity", None, None, None, None)
+            .expect("seed");
+        store
+            .set_mode("verity", "active", Some("continue"), None)
+            .expect("http");
+        let callback = "[Mission callback: coldcard skip kernel]\n\
+                        status=failed mission=acfb03d2\n\
+                        Codex CLI not found\n\
+                        [CTRL: verity | mode=blocked | wait=0 | next=inspect acfb03d2]\n\
+                        [STATE_SIGNATURE: verity|mission-callback|acfb03d2|failed|inspect]\n";
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            vec![parse_delivery("sess-cb", 1_754_003_600.0, callback)],
+        );
+        let record = store.get_project("verity").expect("read").expect("present");
+        assert_eq!(record.mode.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn newest_delivery_in_a_mixed_batch_wins_mode() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        let older = "[Cron delivery: Verity]\nOld block\n\
+                     [CTRL: verity | mode=blocked:lease | wait=0 | next=wait]\n\
+                     [STATE_SIGNATURE: verity|old|head|blocked]\n";
+        let newer = "[Cron delivery: Verity]\nMoved on\n\
+                     [CTRL: verity | mode=active | wait=0 | next=x]\n\
+                     [STATE_SIGNATURE: verity|new|head|clean]\n";
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            // Newest-first, as read_deliveries returns them.
+            vec![
+                parse_delivery("sess-new", 1_754_003_600.0, newer),
+                parse_delivery("sess-old", 1_754_000_000.0, older),
+            ],
+        );
+        let record = store.get_project("verity").expect("read").expect("present");
+        assert_eq!(record.mode.as_deref(), Some("active"));
+        assert_eq!(record.blocker, None);
+    }
+
+    #[test]
+    fn inspect_callback_does_not_add_blocker_reported() {
+        let mut builder = ProjectRowBuilder::new("verity".into());
+        builder.attach_store_update(
+            DeliveryUpdate {
+                headline: "[Mission callback: coldcard skip kernel]".into(),
+                body: None,
+                session_id: "s".into(),
+                at: "2026-08-04T11:50:00Z".into(),
+                signature: Some("verity".into()),
+                state: Some("mission-callback|acfb03d2|failed|inspect".into()),
+                mode: Some("blocked".into()),
+                blocker: Some("Codex CLI not found".into()),
+                decision: None,
+            },
+            1,
+            1,
+        );
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert!(
+            !row.attention_reasons
+                .iter()
+                .any(|r| r.contains("blocker reported")),
+            "inspect callbacks must not raise blocker attention: {:?}",
+            row.attention_reasons
+        );
+    }
+
+    #[test]
+    fn stale_blocker_signal_does_not_raise_blocker_reported() {
+        let mut builder = ProjectRowBuilder::new("verity".into());
+        builder.controller_cron_id = Some("cron-1".into());
+        builder.attach_store_update(
+            active_update("2026-08-02T11:00:00Z", Some("waiting on CI")),
+            1,
+            5,
+        );
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert!(
+            !row.attention_reasons
+                .iter()
+                .any(|r| r.contains("blocker reported")),
+            "a 24h-stale mode signal must not paint a fresh BLOCKED: {:?}",
+            row.attention_reasons
+        );
+        assert_eq!(row.controller_health, Some("stale"));
     }
 }

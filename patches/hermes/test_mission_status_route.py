@@ -134,6 +134,27 @@ def test_callback_text_carries_ctrl_and_signature():
     assert "[DECISION:]" in text
 
 
+def test_awaiting_user_callback_omits_ctrl():
+    text = format_mission_callback(
+        {
+            "mission_id": "acfb03d2",
+            "status": "awaiting_user",
+            "title": "need a secret",
+            "project": "verity-core",
+            "short_description": "Waiting on an API key",
+        }
+    )
+    assert "[Mission callback: need a secret]" in text
+    assert "status=awaiting_user mission=acfb03d2" in text
+    assert "Waiting on an API key" in text
+    assert "[CTRL:" not in text
+    assert "mode=blocked" not in text
+    assert (
+        "[STATE_SIGNATURE: verity-core|mission-callback|acfb03d2|awaiting_user|inspect]"
+        in text
+    )
+
+
 def test_origin_must_reference_the_mission_when_inspectable():
     from gateway.platforms.mission_status_route import append_mission_callback
 
