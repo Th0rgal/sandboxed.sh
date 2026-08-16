@@ -5146,6 +5146,16 @@ fn attach_execution_to_mission_value(
                 serde_json::Value::Null
             },
         );
+        let waiting_for_user_tool =
+            run.is_some_and(|run| run.execution_state == MissionExecutionState::WaitingUser);
+        object.insert(
+            "needs_operator".to_string(),
+            serde_json::Value::Bool(super::operator_attention::mission_needs_operator(
+                mission,
+                waiting_for_user_tool,
+                chrono::Utc::now(),
+            )),
+        );
     }
     value
 }
@@ -6868,6 +6878,16 @@ pub async fn get_mission_digest(
         "title": mission.title,
         "status": mission.status,
         "awaiting_kind": mission.awaiting_kind.map(|k| k.as_str()),
+        "needs_operator": super::operator_attention::mission_needs_operator(
+            &mission,
+            execution.as_ref().is_some_and(|value| {
+                value
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("waiting_user")
+            }),
+            chrono::Utc::now(),
+        ),
         "terminal_reason": mission.terminal_reason,
         "terminal_evidence": mission.terminal_evidence,
         "short_description": mission.short_description,
@@ -11671,6 +11691,9 @@ pub async fn get_mission_events(
 pub struct AlertsFeedQuery {
     /// Comma-separated mission statuses to keep (e.g. `awaiting_user,failed`).
     pub statuses: Option<String>,
+    /// When true, keep only alerts whose current mission is a qualified
+    /// operator page (`needs_operator`). Used by the Needs You feed filter.
+    pub needs_operator: Option<bool>,
     /// Timestamp cursor: return alerts strictly older than this.
     pub before: Option<String>,
     pub limit: Option<usize>,
@@ -11792,6 +11815,15 @@ pub async fn get_alerts_feed(
                 acknowledged_at: a.acknowledged_at.clone(),
                 last_error: a.last_error.clone(),
             });
+    }
+
+    if query.needs_operator == Some(true) {
+        entries.retain(|entry| {
+            entry
+                .mission
+                .as_ref()
+                .is_some_and(|summary| summary.needs_operator)
+        });
     }
 
     Ok(Json(AlertsFeedResponse {

@@ -617,6 +617,8 @@ pub struct MissionSummary {
     pub status: String,
     pub workspace_name: Option<String>,
     pub awaiting_kind: Option<String>,
+    /// Qualified operator page — computed at read time from kind/origin/grace.
+    pub needs_operator: bool,
 }
 
 /// Persisted summary for one tool call across all of its stored events.
