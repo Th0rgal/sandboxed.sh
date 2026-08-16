@@ -926,14 +926,12 @@ mod tests {
         assert!(root.total >= root.available);
         assert!(!root.measured_path.as_os_str().is_empty());
 
-        // Linux normally mounts tmpfs at /dev/shm. When it is present on a
-        // distinct filesystem, this proves we do not silently report `/`.
+        // Linux normally mounts tmpfs at /dev/shm. This proves we do not
+        // silently report `/` when asked to measure a distinct filesystem.
         let shm = Path::new("/dev/shm");
         if shm.is_dir() {
             let shm_usage = disk_usage_for_path(shm).unwrap();
-            if shm_usage.filesystem != root.filesystem {
-                assert_ne!(shm_usage.filesystem, root.filesystem);
-            }
+            assert_ne!(shm_usage.filesystem, root.filesystem);
         }
     }
 }
