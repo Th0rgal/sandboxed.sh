@@ -200,18 +200,19 @@ pub fn disk_usage_for_path(path: &Path) -> std::io::Result<DiskUsage> {
         })?;
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
-            return Err(std::io::Error::last_os_error());
+            Err(std::io::Error::last_os_error())
+        } else {
+            let block_size = statvfs_accounting_block_size(stat.f_frsize, stat.f_bsize);
+            let total = stat.f_blocks.saturating_mul(block_size);
+            let available = stat.f_bavail.saturating_mul(block_size);
+            Ok(DiskUsage {
+                measured_path,
+                filesystem: format!("statvfs:{}", stat.f_fsid),
+                used: total.saturating_sub(available),
+                total,
+                available,
+            })
         }
-        let block_size = statvfs_accounting_block_size(stat.f_frsize, stat.f_bsize);
-        let total = stat.f_blocks.saturating_mul(block_size);
-        let available = stat.f_bavail.saturating_mul(block_size);
-        return Ok(DiskUsage {
-            measured_path,
-            filesystem: format!("statvfs:{}", stat.f_fsid),
-            used: total.saturating_sub(available),
-            total,
-            available,
-        });
     }
     #[cfg(not(unix))]
     {
@@ -226,12 +227,12 @@ pub fn disk_usage_for_path(path: &Path) -> std::io::Result<DiskUsage> {
     }
 }
 
-fn statvfs_accounting_block_size(fragment_size: libc::c_ulong, block_size: libc::c_ulong) -> u64 {
-    u64::from(if fragment_size == 0 {
+fn statvfs_accounting_block_size(fragment_size: u64, block_size: u64) -> u64 {
+    if fragment_size == 0 {
         block_size
     } else {
         fragment_size
-    })
+    }
 }
 
 #[derive(Debug, Clone)]

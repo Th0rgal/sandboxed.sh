@@ -207,6 +207,54 @@ pub(crate) fn entry_for_workspace(
         })
 }
 
+/// Select the known owner of this *physical* mission directory across every
+/// workspace. A configured default-host root can overlap a separately
+/// registered workspace, so the workspace that happens to scan first is not
+/// authoritative. Only entries whose workspace can actually resolve to `dir`
+/// are considered; unrelated short-id collisions remain isolated.
+fn entry_for_directory<'a>(
+    entries: &'a [MissionIndexEntry],
+    short: &str,
+    dir: &std::path::Path,
+    workspace_roots: &std::collections::HashMap<uuid::Uuid, Vec<std::path::PathBuf>>,
+) -> Option<&'a MissionIndexEntry> {
+    entries
+        .iter()
+        .filter(|entry| {
+            workspace_roots
+                .get(&entry.workspace_id)
+                .is_some_and(|roots| {
+                    roots.iter().any(|root| {
+                        workspace::workspaces_root_for(root).join(format!("mission-{short}")) == dir
+                    })
+                })
+        })
+        .max_by_key(|entry| {
+            (
+                protection_rank(&entry.status),
+                entry.updated_at.timestamp_micros(),
+            )
+        })
+}
+
+fn workspace_ids_for_directory(
+    short: &str,
+    dir: &std::path::Path,
+    workspace_roots: &std::collections::HashMap<uuid::Uuid, Vec<std::path::PathBuf>>,
+) -> Vec<uuid::Uuid> {
+    workspace_roots
+        .iter()
+        .filter_map(|(id, roots)| {
+            roots
+                .iter()
+                .any(|root| {
+                    workspace::workspaces_root_for(root).join(format!("mission-{short}")) == dir
+                })
+                .then_some(*id)
+        })
+        .collect()
+}
+
 /// Whether the most protective known owner of a shared short-id directory is
 /// terminal and past retention. Phase 1 must use the same collision policy as
 /// the disk-driven sweep before proposing or removing the shared path.
@@ -816,9 +864,26 @@ async fn orphan_sweep(
     report: &mut SweepReport,
 ) {
     let index = &index_full.by_short;
+    let workspaces = state.workspaces.list().await;
+    let workspace_roots: std::collections::HashMap<_, _> = workspaces
+        .iter()
+        .map(|ws| (ws.id, workspace::mission_workspace_roots_for_workspace(ws)))
+        .collect();
+    let workspaces_by_id: std::collections::HashMap<_, _> =
+        workspaces.iter().map(|ws| (ws.id, ws)).collect();
+    let mut scanned_roots = std::collections::HashSet::new();
 
-    for ws in state.workspaces.list().await {
-        for workspace_root in workspace::mission_workspace_roots_for_workspace(&ws) {
+    for ws in &workspaces {
+        for workspace_root in &workspace_roots[&ws.id] {
+            // Multiple registered workspaces may intentionally share a root.
+            // Scan its physical directory once, then resolve ownership below
+            // from every workspace rather than from this loop's `ws`.
+            let physical_root = workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_root.clone());
+            if !scanned_roots.insert(physical_root) {
+                continue;
+            }
             let root = workspace::workspaces_root_for(&workspace_root);
             let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
                 continue;
@@ -835,9 +900,13 @@ async fn orphan_sweep(
                 if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
                     continue;
                 }
-                let workspace_token = crate::workspace_exec::machine_name_for_path(&ws.path);
-                if workspace_token.as_ref().is_some_and(|token| {
-                    scope_protected.contains(&(token.clone(), short.to_string()))
+                let owner_workspace_ids =
+                    workspace_ids_for_directory(short, &dir, &workspace_roots);
+                if owner_workspace_ids.iter().any(|workspace_id| {
+                    workspaces_by_id
+                        .get(workspace_id)
+                        .and_then(|owner| crate::workspace_exec::machine_name_for_path(&owner.path))
+                        .is_some_and(|token| scope_protected.contains(&(token, short.to_string())))
                 }) {
                     tracing::debug!(path = %dir.display(), "mission GC: kept (live exec scope)");
                     continue;
@@ -846,9 +915,9 @@ async fn orphan_sweep(
                     Keep(&'static str),
                     Delete(&'static str, bool /*orphan*/, bool /*stopped*/),
                 }
-                let indexed_entry = index
-                    .get(short)
-                    .and_then(|entries| entry_for_workspace(entries, ws.id));
+                let indexed_entry = index.get(short).and_then(|entries| {
+                    entry_for_directory(entries, short, &dir, &workspace_roots)
+                });
                 let verdict = match indexed_entry {
                     Some(e) => match e.status {
                         MissionStatus::Active
@@ -1092,6 +1161,52 @@ mod tests {
             workspace_id,
             now - chrono::Duration::days(7),
         ));
+    }
+
+    #[test]
+    fn overlapping_roots_use_global_active_owner_before_orphan_classification() {
+        let root = tempfile::tempdir().unwrap();
+        let default_workspace = uuid::Uuid::nil();
+        let custom_workspace = uuid::Uuid::new_v4();
+        let short = "deadbeef";
+        let dir = workspace::workspaces_root_for(root.path()).join(format!("mission-{short}"));
+        let now = Utc::now();
+        let entries = vec![
+            // The default workspace has a terminal collision, but the custom
+            // workspace owns this same physical root and is still running.
+            MissionIndexEntry {
+                status: MissionStatus::Completed,
+                updated_at: now - chrono::Duration::days(40),
+                workspace_id: default_workspace,
+            },
+            MissionIndexEntry {
+                status: MissionStatus::Active,
+                updated_at: now - chrono::Duration::days(40),
+                workspace_id: custom_workspace,
+            },
+        ];
+        let roots = std::collections::HashMap::from([
+            (default_workspace, vec![root.path().to_path_buf()]),
+            (custom_workspace, vec![root.path().to_path_buf()]),
+        ]);
+
+        let owner = entry_for_directory(&entries, short, &dir, &roots)
+            .expect("the overlapping root has a global owner");
+        assert_eq!(owner.workspace_id, custom_workspace);
+        assert_eq!(owner.status, MissionStatus::Active);
+        assert_eq!(workspace_ids_for_directory(short, &dir, &roots).len(), 2);
+
+        let terminal_only = vec![MissionIndexEntry {
+            status: MissionStatus::Completed,
+            updated_at: now - chrono::Duration::days(40),
+            workspace_id: custom_workspace,
+        }];
+        assert_eq!(
+            entry_for_directory(&terminal_only, short, &dir, &roots)
+                .expect("terminal owner still owns the directory")
+                .status,
+            MissionStatus::Completed
+        );
     }
 
     #[test]

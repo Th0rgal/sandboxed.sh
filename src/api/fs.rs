@@ -1447,8 +1447,9 @@ pub async fn upload_finalize(
 mod tests {
     use super::{
         api_context_root_for_config, context_mirror_suffix, context_upload_suffix_for_dir,
-        is_context_upload_path_for_dir, path_is_under_allowed_roots, sanitize_path_component,
-        upload_display_path, validate_chunk_upload_shape, MAX_CHUNK_UPLOAD_CHUNKS,
+        is_context_upload_path_for_dir, is_within_workspace_or_mission,
+        path_is_under_allowed_roots, sanitize_path_component, upload_display_path,
+        validate_chunk_upload_shape, MAX_CHUNK_UPLOAD_CHUNKS,
     };
     use crate::config::Config;
     use crate::workspace::Workspace;

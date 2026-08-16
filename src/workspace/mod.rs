@@ -10,8 +10,9 @@
 //! - **Container**: Execute inside an isolated container environment (systemd-nspawn)
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 // Per-backend config generation (Phase 4 of the decomposition).
 pub mod config;
@@ -895,6 +896,7 @@ pub fn mission_workspace_dir_for_root(root: &Path, mission_id: Uuid) -> PathBuf 
 }
 
 const MISSION_WORKSPACE_ROOTS_FILE: &str = "mission-workspace-roots.json";
+static MISSION_WORKSPACE_ROOTS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn mission_workspace_roots_path(workspace: &Workspace) -> PathBuf {
     config_root(&workspace.path).join(MISSION_WORKSPACE_ROOTS_FILE)
@@ -910,6 +912,36 @@ fn persisted_mission_workspace_root(workspace: &Workspace, mission_id: Uuid) -> 
     root.is_dir().then_some(root)
 }
 
+/// Atomically replace a registry file and make both the file and the rename
+/// durable before releasing the registry lock. Readers therefore see either a
+/// complete old JSON document or a complete new one, never a truncation.
+fn atomic_write_mission_workspace_roots(
+    path: &Path,
+    roots: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let parent = path.parent().expect("mission root registry has parent");
+    let temp = parent.join(format!(
+        ".{MISSION_WORKSPACE_ROOTS_FILE}.{}.tmp",
+        Uuid::new_v4()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(roots).expect("root map serializes");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 /// Persist the selected root before creating a mission directory.  The
 /// registry lives with the workspace configuration rather than the generated
 /// directory, so it survives restarts and a later environment/config drift.
@@ -917,22 +949,34 @@ fn persist_mission_workspace_root(workspace: &Workspace, mission_id: Uuid, root:
     if workspace.id != DEFAULT_WORKSPACE_ID {
         return;
     }
-    let path = mission_workspace_roots_path(workspace);
-    let mut roots: HashMap<String, String> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-        .unwrap_or_default();
-    if roots.contains_key(&mission_id.to_string()) {
-        return;
-    }
-    roots.insert(mission_id.to_string(), root.to_string_lossy().into_owned());
     if let Err(error) = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(config_root(&workspace.path))?;
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&roots).expect("root map serializes"),
-        )
+        // The process-local lock avoids blocking an async executor on an
+        // advisory file lock when many preparations race. The file lock also
+        // serializes independent server processes sharing this workspace.
+        let _guard = MISSION_WORKSPACE_ROOTS_LOCK
+            .lock()
+            .expect("registry lock poisoned");
+        let path = mission_workspace_roots_path(workspace);
+        let lock_path = path.with_extension("json.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(lock_path)?;
+        fs2::FileExt::lock_exclusive(&lock_file)?;
+        let mut roots: HashMap<String, String> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|contents| serde_json::from_str(&contents).ok())
+            .unwrap_or_default();
+        if !roots.contains_key(&mission_id.to_string()) {
+            roots.insert(mission_id.to_string(), root.to_string_lossy().into_owned());
+            atomic_write_mission_workspace_roots(&path, &roots)?;
+        }
+        fs2::FileExt::unlock(&lock_file)?;
+        Ok(())
     })() {
+        let path = mission_workspace_roots_path(workspace);
         tracing::warn!(mission_id = %mission_id, path = %path.display(), %error, "Failed to persist mission workspace root");
     }
 }
@@ -4920,6 +4964,72 @@ WORKING_DIR = "/workspaces/mission-old"
         );
         assert!(mission_workspace_roots_for_workspace(&after_restart)
             .contains(&storage.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn mission_root_registry_serializes_concurrent_writers_and_readers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("separate-filesystem");
+        std::fs::create_dir_all(&storage).unwrap();
+        let workspace = Workspace::default_host(temp.path().to_path_buf());
+        let missions: Vec<_> = (0..24).map(|_| Uuid::new_v4()).collect();
+        let start = Arc::new(Barrier::new(missions.len() + 2));
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let reader_workspace = workspace.clone();
+        let reader_start = Arc::clone(&start);
+        let reader_finished = Arc::clone(&finished);
+        let reader = std::thread::spawn(move || {
+            reader_start.wait();
+            while !reader_finished.load(Ordering::Acquire) {
+                let path = mission_workspace_roots_path(&reader_workspace);
+                if let Ok(contents) = std::fs::read_to_string(path) {
+                    let _: HashMap<String, String> = serde_json::from_str(&contents)
+                        .expect("readers must never observe partial registry JSON");
+                }
+            }
+        });
+
+        let writers: Vec<_> = missions
+            .iter()
+            .copied()
+            .map(|mission| {
+                let workspace = workspace.clone();
+                let storage = storage.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    persist_mission_workspace_root(&workspace, mission, &storage);
+                })
+            })
+            .collect();
+        start.wait();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        finished.store(true, Ordering::Release);
+        reader.join().unwrap();
+
+        let after_restart = Workspace::default_host(temp.path().to_path_buf());
+        let contents =
+            std::fs::read_to_string(mission_workspace_roots_path(&after_restart)).unwrap();
+        let roots: HashMap<String, String> = serde_json::from_str(&contents).unwrap();
+        assert_eq!(
+            roots.len(),
+            missions.len(),
+            "no concurrent update may be lost"
+        );
+        for mission in missions {
+            // A new workspace value models restart/config drift: every entry
+            // remains independently recoverable from the durable registry.
+            assert_eq!(
+                mission_workspace_root_for_workspace(&after_restart, mission),
+                storage.canonicalize().unwrap()
+            );
+        }
     }
 
     #[test]
