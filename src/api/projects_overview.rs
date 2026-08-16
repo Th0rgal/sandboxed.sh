@@ -1182,8 +1182,8 @@ fn merge_announcement_needles(delivery: &DeliveryUpdate, recorded_decided: bool)
 
 /// `GET /api/projects/:slug/tasks` — the project's roadmap.
 ///
-/// The list **is** the item inventory (`project_tracks` + leftover proposals
-/// + attention-horizon attempts). Boss `board_tasks` stay private to the
+/// The list **is** the item inventory: `project_tracks`, leftover proposals,
+/// and attention-horizon attempts. Boss `board_tasks` stay private to the
 /// mission that owns them; they are not a second plan. Aliases fold onto the
 /// canonical roster slug — hyphen prefix matching is deliberately not used,
 /// so `verity` never swallows `verity-lido`.
