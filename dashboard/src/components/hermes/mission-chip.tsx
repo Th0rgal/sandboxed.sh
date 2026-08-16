@@ -71,7 +71,11 @@ export function MissionChip({ missionId }: { missionId: string }) {
             </span>
             <span className="mt-1 flex items-center gap-1.5 text-xs text-white/55">
               <span className={cn("h-1.5 w-1.5 rounded-full", dot)} />
-              {statusLabel(mission.status, mission.awaiting_kind ?? null)}
+              {statusLabel(
+                mission.status,
+                mission.awaiting_kind ?? null,
+                mission.needs_operator === true,
+              )}
               {mission.workspace_name && (
                 <span className="truncate text-white/35">
                   · {mission.workspace_name}

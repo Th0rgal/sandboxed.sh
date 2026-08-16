@@ -1564,6 +1564,9 @@ struct MissionChip {
     title: Option<String>,
     updated_at: String,
     github_pr: Option<String>,
+    /// Qualified operator page — ack / in-grace controller waits stay false.
+    #[serde(default)]
+    needs_operator: bool,
 }
 
 /// Owned copy of what the health rollup reads.
@@ -2122,10 +2125,12 @@ pub(crate) fn humanize_slug(slug: &str) -> String {
 
 /// Roster/CTRL mode is the default; live work and parked decisions win.
 /// `paused` is never overridden — the operator (or controller) parked it.
+/// Raw `awaiting_user` is not a decision block; only a qualified
+/// `needs_operator` page or a pending_user ledger row is.
 pub(crate) fn honest_controller_mode(
     store_mode: Option<&str>,
     has_live_mission: bool,
-    awaiting_user: bool,
+    needs_operator: bool,
     pending_decisions: u32,
 ) -> Option<String> {
     let base = store_mode
@@ -2134,10 +2139,10 @@ pub(crate) fn honest_controller_mode(
     if base.eq_ignore_ascii_case("paused") {
         return store_mode.map(str::to_string);
     }
-    if has_live_mission && !awaiting_user {
+    if has_live_mission && !needs_operator {
         return Some("active".to_string());
     }
-    if pending_decisions > 0 {
+    if pending_decisions > 0 || needs_operator {
         return Some("blocked:decision".to_string());
     }
     store_mode.map(str::to_string)
@@ -2246,12 +2251,12 @@ impl ProjectRowBuilder {
                 attention.push("same state on 3 consecutive updates".to_string());
             }
         }
-        // A parked question always needs the operator: no freshness or mode
-        // signal from the controller can answer on the human's behalf.
+        // Only qualified operator pages count as "awaiting user". Ack and
+        // in-grace controller-owned questions stay off the attention shelf.
         let awaiting_user = self
             .missions
             .iter()
-            .filter(|chip| chip.status == MissionStatus::AwaitingUser)
+            .filter(|chip| chip.needs_operator)
             .count();
         let has_live_mission = self
             .missions
@@ -2552,6 +2557,11 @@ fn mission_chip(mission: &Mission) -> MissionChip {
         title: mission.title.clone(),
         updated_at: mission.updated_at.clone(),
         github_pr: mission.project.github_pr.clone(),
+        needs_operator: super::operator_attention::mission_needs_operator(
+            mission,
+            false,
+            chrono::Utc::now(),
+        ),
     }
 }
 
@@ -3843,6 +3853,14 @@ mod tests {
             honest_controller_mode(Some("blocked:transport-cap"), false, false, 0).as_deref(),
             Some("blocked:transport-cap")
         );
+        assert_eq!(
+            honest_controller_mode(Some("active"), true, true, 0).as_deref(),
+            Some("blocked:decision")
+        );
+        assert_eq!(
+            honest_controller_mode(Some("active"), true, false, 0).as_deref(),
+            Some("active")
+        );
     }
 
     #[test]
@@ -3856,6 +3874,7 @@ mod tests {
             title: Some("rebase #2332".into()),
             updated_at: "2026-08-14T06:00:00Z".into(),
             github_pr: None,
+            needs_operator: false,
         });
         let row = builder.finish(&[], None, None, "2026-08-14T06:05:00Z");
         assert_eq!(row.mode.as_deref(), Some("active"));
@@ -4041,6 +4060,7 @@ mod tests {
                 title: None,
                 updated_at: "2026-08-01T00:00:00Z".to_string(),
                 github_pr: None,
+                needs_operator: false,
             });
         }
         let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
@@ -4062,6 +4082,7 @@ mod tests {
             title: None,
             updated_at: "2026-08-02T00:00:00Z".to_string(),
             github_pr: None,
+            needs_operator: false,
         }
     }
 
@@ -4284,6 +4305,7 @@ mod tests {
             title: None,
             updated_at: "2026-08-04T11:00:00Z".to_string(),
             github_pr: None,
+            needs_operator: true,
         });
         builder
             .missions
@@ -4296,6 +4318,63 @@ mod tests {
             .iter()
             .any(|r| r.contains("awaiting user input")));
         assert!(row.attention_reasons.iter().any(|r| r.contains("Failed")));
+    }
+
+    fn awaiting_chip(id: &str, needs_operator: bool) -> MissionChip {
+        MissionChip {
+            id: id.to_string(),
+            status: MissionStatus::AwaitingUser,
+            title: None,
+            updated_at: "2026-08-04T11:00:00Z".to_string(),
+            github_pr: None,
+            needs_operator,
+        }
+    }
+
+    #[test]
+    fn ack_with_controller_origin_is_not_project_attention() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder
+            .missions
+            .push(awaiting_chip("00000002-aaaa-bbbb-cccc-dddddddddddd", false));
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert!(!row
+            .attention_reasons
+            .iter()
+            .any(|r| r.contains("awaiting user input")));
+        assert_ne!(row.mode.as_deref(), Some("blocked:decision"));
+    }
+
+    #[test]
+    fn decision_without_origin_is_project_attention() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder
+            .missions
+            .push(awaiting_chip("00000002-aaaa-bbbb-cccc-dddddddddddd", true));
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert!(row
+            .attention_reasons
+            .iter()
+            .any(|r| r.contains("awaiting user input")));
+        assert_eq!(row.mode.as_deref(), Some("blocked:decision"));
+    }
+
+    #[test]
+    fn pending_user_is_attention_regardless_of_missions() {
+        let mut builder = ProjectRowBuilder::new("verity".to_string());
+        builder.pending_decisions = 1;
+        builder
+            .missions
+            .push(awaiting_chip("00000002-aaaa-bbbb-cccc-dddddddddddd", false));
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert!(row
+            .attention_reasons
+            .iter()
+            .any(|r| r.contains("decision awaiting you")));
+        assert!(!row
+            .attention_reasons
+            .iter()
+            .any(|r| r.contains("awaiting user input")));
     }
 
     /// Freshness alone is not enough: without an active mode the controller

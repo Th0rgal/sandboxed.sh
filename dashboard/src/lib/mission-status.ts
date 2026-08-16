@@ -8,11 +8,10 @@ import type { AwaitingKind, MissionStatus } from './api/missions';
 export type MissionCategory = 'running' | 'needs-you' | 'finished' | 'other';
 export type FinishedTone = 'green' | 'red';
 
-// "Needs You" is reserved for missions where the agent finished its turn
-// cleanly (`awaiting_user`) and is waiting on the user. Failure paths
-// (interrupted, blocked, not_feasible, failed) live in Finished with a red
-// tone instead.
-export const NEEDS_ATTENTION_STATUSES: MissionStatus[] = ['awaiting_user'];
+// "Needs You" is a qualified operator page (`needs_operator` from the API).
+// A bare `awaiting_user` list is not enough — ack and in-grace controller
+// waits stay out of that column. Failure paths live in Finished (red).
+export const NEEDS_ATTENTION_STATUSES: MissionStatus[] = [];
 export const FINISHED_STATUSES: MissionStatus[] = [
   'completed',
   'acknowledged',
@@ -32,10 +31,14 @@ export function isFinishedStatus(status: MissionStatus): boolean {
 }
 
 /**
- * Check if a mission needs user attention based on its stored status.
+ * Check if a mission needs the operator. Trust the API `needs_operator`
+ * flag so the dashboard does not reimplement controller-triage grace.
  */
-export function needsAttentionStatus(status: MissionStatus): boolean {
-  return NEEDS_ATTENTION_STATUSES.includes(status);
+export function needsAttentionStatus(
+  _status: MissionStatus,
+  needsOperator = false
+): boolean {
+  return needsOperator;
 }
 
 /**
@@ -50,25 +53,29 @@ export function finishedTone(status: MissionStatus): FinishedTone {
  * Categorize a mission based on runtime state and stored status.
  *
  * Priority order:
- * 1. Needs You (waiting for tool) - the agent is parked on a frontend tool
- *    (e.g. AskUserQuestion). The backend still reports this mission as
- *    "running" (run state `waiting_for_tool`) because its harness is alive,
- *    but it is blocked on the user, so it belongs in Needs You — not Running.
- * 2. Running - mission is actually executing a turn
- * 3. Needs You - awaiting_user AND not running
- * 4. Finished - completed/acknowledged/failed/interrupted/blocked/not_feasible AND not running
- * 5. Other - anything else (active-but-not-running, pending)
+ * 1. Needs You — only when the API says `needs_operator` (decision /
+ *    AskUserQuestion after grace / no origin).
+ * 2. Running — actually executing, or waiting_for_tool that is not an
+ *    operator page (controller still has first triage).
+ * 3. Finished — completed/acked/failed/blocked, plus awaiting_user ack
+ *    (sky Awaiting Review).
+ * 4. Other — anything else (active-but-not-running, in-grace decisions).
  */
 export function categorizeMission(
   status: MissionStatus,
   isActuallyRunning: boolean,
-  isWaitingForTool = false
+  isWaitingForTool = false,
+  needsOperator = false,
+  awaitingKind?: AwaitingKind | null
 ): MissionCategory {
-  if (isWaitingForTool) {
+  // A live turn beats a stale awaiting_user/needs_operator flag (resume).
+  // waiting_for_tool is the exception: the harness is alive but parked on
+  // the user, so a qualified page still belongs in Needs You.
+  if (needsAttentionStatus(status, needsOperator) && (!isActuallyRunning || isWaitingForTool)) {
     return 'needs-you';
   }
 
-  if (isActuallyRunning) {
+  if (isActuallyRunning || isWaitingForTool) {
     return 'running';
   }
 
@@ -79,11 +86,7 @@ export function categorizeMission(
     return 'running';
   }
 
-  if (needsAttentionStatus(status)) {
-    return 'needs-you';
-  }
-
-  if (isFinishedStatus(status)) {
+  if (isFinishedStatus(status) || (status === 'awaiting_user' && awaitingKind !== 'decision')) {
     return 'finished';
   }
 
@@ -95,10 +98,17 @@ export function categorizeMission(
  * Returns missions grouped by category with each mission only in one category.
  *
  * `waitingForToolMissionIds` is the subset of running missions parked on a
- * frontend tool (run state `waiting_for_tool`); they are surfaced as Needs You
- * rather than Running even though the backend still reports them as running.
+ * frontend tool (run state `waiting_for_tool`). They stay in Running unless
+ * the API marked them `needs_operator`.
  */
-export function categorizeMissions<T extends { id: string; status: MissionStatus }>(
+export function categorizeMissions<
+  T extends {
+    id: string;
+    status: MissionStatus;
+    needs_operator?: boolean;
+    awaiting_kind?: AwaitingKind | null;
+  },
+>(
   missions: T[],
   runningMissionIds: Set<string>,
   waitingForToolMissionIds: Set<string> = new Set()
@@ -113,7 +123,13 @@ export function categorizeMissions<T extends { id: string; status: MissionStatus
   for (const mission of missions) {
     const isWaitingForTool = waitingForToolMissionIds.has(mission.id);
     const isActuallyRunning = runningMissionIds.has(mission.id);
-    const category = categorizeMission(mission.status, isActuallyRunning, isWaitingForTool);
+    const category = categorizeMission(
+      mission.status,
+      isActuallyRunning,
+      isWaitingForTool,
+      mission.needs_operator === true,
+      mission.awaiting_kind
+    );
     result[category].push(mission);
   }
 
@@ -152,7 +168,7 @@ export const STATUS_TEXT_COLORS: Record<MissionStatus, string> = {
 export const STATUS_LABELS: Record<MissionStatus, string> = {
   pending: 'Pending',
   active: 'Active',
-  awaiting_user: 'Needs You',
+  awaiting_user: 'Awaiting Review',
   acknowledged: 'Acknowledged',
   completed: 'Completed',
   failed: 'Failed',
@@ -175,14 +191,19 @@ export const AWAITING_KIND_LABELS: Record<AwaitingKind, string> = {
 
 /**
  * Display label for a mission status, refined by `awaiting_kind` when the
- * mission is parked in `awaiting_user`. Falls back to the generic status label.
+ * mission is parked in `awaiting_user`. Missing kind is Awaiting Review
+ * unless the API marked the mission `needs_operator`.
  */
 export function statusLabel(
   status: MissionStatus,
   awaitingKind?: AwaitingKind | null,
+  needsOperator = false,
 ): string {
-  if (status === 'awaiting_user' && awaitingKind) {
-    return AWAITING_KIND_LABELS[awaitingKind];
+  if (status === 'awaiting_user') {
+    if (awaitingKind) {
+      return AWAITING_KIND_LABELS[awaitingKind];
+    }
+    return needsOperator ? 'Needs You' : AWAITING_KIND_LABELS.ack;
   }
   return STATUS_LABELS[status] ?? status;
 }
@@ -191,9 +212,16 @@ export function statusLabel(
  * Get the display dot color for a mission, considering runtime state.
  * Running missions always show indigo regardless of stored status.
  */
-export function getMissionDotColor(status: MissionStatus, isActuallyRunning: boolean): string {
+export function getMissionDotColor(
+  status: MissionStatus,
+  isActuallyRunning: boolean,
+  awaitingKind?: AwaitingKind | null,
+): string {
   if (isActuallyRunning) {
     return 'bg-indigo-400';
+  }
+  if (status === 'awaiting_user' && awaitingKind === 'ack') {
+    return 'bg-sky-400';
   }
   return STATUS_DOT_COLORS[status] || 'bg-gray-400';
 }
@@ -201,9 +229,16 @@ export function getMissionDotColor(status: MissionStatus, isActuallyRunning: boo
 /**
  * Get the display text color for a mission, considering runtime state.
  */
-export function getMissionTextColor(status: MissionStatus, isActuallyRunning: boolean): string {
+export function getMissionTextColor(
+  status: MissionStatus,
+  isActuallyRunning: boolean,
+  awaitingKind?: AwaitingKind | null,
+): string {
   if (isActuallyRunning) {
     return 'text-indigo-400';
+  }
+  if (status === 'awaiting_user' && awaitingKind === 'ack') {
+    return 'text-sky-400';
   }
   return STATUS_TEXT_COLORS[status] || 'text-white/40';
 }
