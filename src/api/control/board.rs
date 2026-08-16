@@ -1660,7 +1660,8 @@ async fn spawn_task_worker(
         None
     };
     let assigned_id = Uuid::new_v4();
-    if let Some((admission_guard, mut reservation, workspace)) = admission {
+    let mut admission_guard = None;
+    if let Some((guard, mut reservation, workspace)) = admission {
         reservation.mission_id = assigned_id;
         reservation.workspace_dir = Some(crate::workspace::mission_workspace_dir_for_workspace(
             &workspace,
@@ -1677,7 +1678,7 @@ async fn spawn_task_worker(
                 "board worker creation rolled back: persist disk admission ledger: {error}"
             ));
         }
-        drop(admission_guard);
+        admission_guard = Some(guard);
     }
     let mission = mission_store
         .create_mission_with_parent_and_placement(
@@ -1695,6 +1696,7 @@ async fn spawn_task_worker(
             Some(assigned_id),
         )
         .await?;
+    drop(admission_guard);
     // Inherit the boss's project tagging. Board tasks bypass the public
     // create-mission handler, and `create_mission_with_parent` carries no
     // project metadata — so workers were landing untagged. The parent link
