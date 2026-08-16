@@ -1263,11 +1263,26 @@ pub async fn plan_project_tasks(
             format!("unknown project '{requested}'"),
         ));
     };
-    if req.tasks.is_empty() {
+    let planned = planned_tracks_from_request(&req.tasks)?;
+    state
+        .projects
+        .upsert_planned_tracks(&slug, &planned)
+        .map_err(store_err)?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "proposed": planned.len() }),
+    ))
+}
+
+/// Validate the whole batch before any write so a later 400 cannot leave a
+/// prefix of tracks persisted.
+fn planned_tracks_from_request(
+    tasks: &[ProposalInput],
+) -> Result<Vec<super::projects_store::PlannedTrack>, (StatusCode, String)> {
+    if tasks.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "tasks is required".to_string()));
     }
-    let mut planned = 0usize;
-    for task in &req.tasks {
+    let mut planned = Vec::with_capacity(tasks.len());
+    for task in tasks {
         let task_key = task.task_key.trim();
         if !is_plain_key(task_key) {
             return Err((
@@ -1275,7 +1290,8 @@ pub async fn plan_project_tasks(
                 format!("invalid task_key '{}'", task.task_key),
             ));
         }
-        if task.title.trim().is_empty() {
+        let title = task.title.trim();
+        if title.is_empty() {
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!("task '{task_key}' needs a title"),
@@ -1286,14 +1302,16 @@ pub async fn plan_project_tasks(
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or(task.title.trim());
-        state
-            .projects
-            .set_track(&slug, task_key, Some(desired), Some("open"))
-            .map_err(store_err)?;
-        planned += 1;
+            .unwrap_or(title);
+        planned.push(super::projects_store::PlannedTrack {
+            track: task_key.to_string(),
+            title: title.to_string(),
+            desired_state: desired.to_string(),
+            acceptance_criteria: task.acceptance_criteria.clone(),
+            depends_on: task.depends_on.clone(),
+        });
     }
-    Ok(Json(serde_json::json!({ "ok": true, "proposed": planned })))
+    Ok(planned)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1335,23 +1353,47 @@ pub async fn update_project_task(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         });
-    let tracks = collect_family_tracks(&state.projects, &slug).map_err(store_err)?;
-    if tracks.iter().any(|track| track.track == task_key) {
+    let title = req
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let family = project_tag_keys(&slug);
+    if let Some(stored) = state
+        .projects
+        .find_track_slug(&family, &task_key)
+        .map_err(store_err)?
+    {
         state
             .projects
-            .set_track(&slug, &task_key, desired, None)
+            .patch_track(
+                &stored,
+                &task_key,
+                desired,
+                None,
+                title,
+                req.acceptance_criteria.as_deref(),
+                req.depends_on.as_deref(),
+            )
             .map_err(store_err)?;
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
+    let Some(stored) = state
+        .projects
+        .find_open_proposal_slug(&family, &task_key)
+        .map_err(store_err)?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no open item '{task_key}' for '{slug}'"),
+        ));
+    };
     let updated = state
         .projects
         .update_proposal(
-            &slug,
+            &stored,
             &task_key,
-            req.title
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty()),
+            title,
             req.prompt.as_deref(),
             req.acceptance_criteria.as_deref(),
             req.depends_on.as_deref(),
@@ -1380,17 +1422,31 @@ pub async fn cancel_project_task(
             format!("unknown project '{requested}'"),
         ));
     };
-    let tracks = collect_family_tracks(&state.projects, &slug).map_err(store_err)?;
-    if tracks.iter().any(|track| track.track == task_key) {
+    let family = project_tag_keys(&slug);
+    if let Some(stored) = state
+        .projects
+        .find_track_slug(&family, &task_key)
+        .map_err(store_err)?
+    {
         state
             .projects
-            .set_track(&slug, &task_key, None, Some("cancelled"))
+            .set_track(&stored, &task_key, None, Some("cancelled"))
             .map_err(store_err)?;
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
+    let Some(stored) = state
+        .projects
+        .find_open_proposal_slug(&family, &task_key)
+        .map_err(store_err)?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no open item '{task_key}' for '{slug}'"),
+        ));
+    };
     let cancelled = state
         .projects
-        .cancel_proposal(&slug, &task_key)
+        .cancel_proposal(&stored, &task_key)
         .map_err(store_err)?;
     if !cancelled {
         return Err((
@@ -2934,9 +2990,18 @@ fn item_belongs_on_roadmap(item: &super::mission_horizon::ProjectItem) -> bool {
     if item.kind == "task" {
         return item.open;
     }
-    matches!(
-        item.status.as_deref(),
-        Some("open") | Some("active") | Some("proposed") | Some("done")
+    if !item.declared {
+        return false;
+    }
+    // Declared tracks stay on the checklist unless cancelled/closed.
+    // `done` remains (as accepted). Missing, empty, running, in-progress
+    // match `project_items`: they are open.
+    !matches!(
+        item.status
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        Some("cancelled") | Some("closed")
     )
 }
 
@@ -2970,11 +3035,18 @@ fn item_roadmap_status(item: &super::mission_horizon::ProjectItem) -> &'static s
 
 fn item_as_roadmap_task(item: &super::mission_horizon::ProjectItem) -> serde_json::Value {
     let title = item
-        .desired_state
+        .title
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+        .or_else(|| {
+            item.desired_state
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
         .or_else(|| {
             item.attempts
                 .iter()
@@ -2990,6 +3062,8 @@ fn item_as_roadmap_task(item: &super::mission_horizon::ProjectItem) -> serde_jso
         "kind": item.kind,
         "open": item.open,
         "desired_state": item.desired_state,
+        "acceptance_criteria": item.acceptance_criteria,
+        "depends_on": item.depends_on,
         "worker_mission_id": latest.map(|attempt| attempt.id.to_string()),
         "attempts": item.attempts.len(),
         "updated_at": latest.map(|attempt| attempt.updated_at.clone()),
@@ -3676,7 +3750,11 @@ mod tests {
             kind: "track",
             desired_state: Some("land #2332".into()),
             status: Some("open".into()),
+            title: Some("Land #2332".into()),
+            acceptance_criteria: vec!["CI green".into()],
+            depends_on: vec!["freeze".into()],
             open: true,
+            declared: true,
             attempts: vec![ProjectItemAttempt {
                 id: Uuid::nil(),
                 status: "active".into(),
@@ -3688,8 +3766,10 @@ mod tests {
         assert_eq!(item_roadmap_status(&open_live), "running");
         let row = item_as_roadmap_task(&open_live);
         assert_eq!(row["task_key"], "c5");
-        assert_eq!(row["title"], "land #2332");
+        assert_eq!(row["title"], "Land #2332");
         assert_eq!(row["status"], "running");
+        assert_eq!(row["acceptance_criteria"][0], "CI green");
+        assert_eq!(row["depends_on"][0], "freeze");
 
         let done = ProjectItem {
             open: false,
@@ -3704,6 +3784,8 @@ mod tests {
             open: true,
             status: None,
             desired_state: None,
+            title: None,
+            declared: false,
             attempts: vec![ProjectItemAttempt {
                 id: Uuid::nil(),
                 status: "failed".into(),
@@ -3716,6 +3798,116 @@ mod tests {
         assert!(
             !item_belongs_on_roadmap(&zombie),
             "unacknowledged failed attempts are not the roadmap"
+        );
+    }
+
+    #[test]
+    fn declared_open_tracks_stay_on_the_roadmap() {
+        use crate::api::mission_horizon::{track_status_is_open, ProjectItem};
+
+        let declared = |status: Option<&str>| ProjectItem {
+            key: "pr-48".into(),
+            kind: "track",
+            desired_state: None,
+            status: status.map(str::to_string),
+            title: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+            open: track_status_is_open(status),
+            declared: true,
+            attempts: Vec::new(),
+        };
+        for status in [
+            None,
+            Some(""),
+            Some("open"),
+            Some("running"),
+            Some("in-progress"),
+        ] {
+            assert!(
+                item_belongs_on_roadmap(&declared(status)),
+                "declared track status {status:?} belongs on the roadmap"
+            );
+        }
+        assert!(item_belongs_on_roadmap(&declared(Some("done"))));
+        assert!(!item_belongs_on_roadmap(&declared(Some("cancelled"))));
+        assert!(!item_belongs_on_roadmap(&declared(Some("closed"))));
+    }
+
+    #[test]
+    fn plan_request_validates_the_whole_batch_before_any_write() {
+        let ok = ProposalInput {
+            task_key: "land-2332".into(),
+            title: "Land #2332".into(),
+            prompt: Some("merge after certify".into()),
+            acceptance_criteria: vec!["CI green".into()],
+            depends_on: vec!["freeze-head".into()],
+        };
+        let planned = planned_tracks_from_request(&[ok]).expect("valid");
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].title, "Land #2332");
+        assert_eq!(planned[0].desired_state, "merge after certify");
+        assert_eq!(planned[0].acceptance_criteria, vec!["CI green"]);
+        assert_eq!(planned[0].depends_on, vec!["freeze-head"]);
+
+        let first = ProposalInput {
+            task_key: "ok-item".into(),
+            title: "Fine".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let bad_key = ProposalInput {
+            task_key: "not a key".into(),
+            title: "Bad".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let err = planned_tracks_from_request(&[first, bad_key]).expect_err("invalid key");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let empty_title = ProposalInput {
+            task_key: "second".into(),
+            title: "   ".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let first = ProposalInput {
+            task_key: "ok-item".into(),
+            title: "Fine".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let err = planned_tracks_from_request(&[first, empty_title]).expect_err("empty title");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("needs a title"));
+
+        // The handler only writes after the whole batch validates.
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity-core", None, None, None, None)
+            .expect("seed");
+        let valid = ProposalInput {
+            task_key: "first".into(),
+            title: "First".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let invalid = ProposalInput {
+            task_key: "".into(),
+            title: "Second".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        assert!(planned_tracks_from_request(&[valid, invalid]).is_err());
+        assert!(
+            store.tracks("verity-core").expect("tracks").is_empty(),
+            "a rejected batch must not persist earlier entries"
         );
     }
 

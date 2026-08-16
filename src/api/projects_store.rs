@@ -105,11 +105,14 @@ CREATE TABLE IF NOT EXISTS project_grant (
 -- One row per workstream. `desired_state` is what the track should reach;
 -- `status` is where it is. The controller sets these instead of editing prose.
 CREATE TABLE IF NOT EXISTS project_tracks (
-    slug          TEXT NOT NULL,
-    track         TEXT NOT NULL,
-    desired_state TEXT,
-    status        TEXT,
-    updated_at    TEXT NOT NULL,
+    slug                 TEXT NOT NULL,
+    track                TEXT NOT NULL,
+    desired_state        TEXT,
+    status               TEXT,
+    title                TEXT,
+    acceptance_criteria  TEXT,                             -- JSON array of strings
+    depends_on           TEXT,                             -- JSON array of task keys
+    updated_at           TEXT NOT NULL,
     PRIMARY KEY (slug, track)
 );
 
@@ -265,6 +268,21 @@ impl ProjectsStore {
              CASE WHEN answered = 1 THEN 'answered' ELSE 'pending_user' END \
              WHERE status IS NULL",
             [],
+        )?;
+        // 2026-08: planned items persist the submitted title/contract on the
+        // track itself so `plan_project_tasks` is not a silent title-only write.
+        Self::ensure_column(connection, "project_tracks", "title", "title TEXT")?;
+        Self::ensure_column(
+            connection,
+            "project_tracks",
+            "acceptance_criteria",
+            "acceptance_criteria TEXT",
+        )?;
+        Self::ensure_column(
+            connection,
+            "project_tracks",
+            "depends_on",
+            "depends_on TEXT",
         )?;
         Ok(())
     }
@@ -1045,22 +1063,46 @@ impl ProjectsStore {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT track, desired_state, status, updated_at \
+                "SELECT track, desired_state, status, title, acceptance_criteria, depends_on, updated_at \
                  FROM project_tracks WHERE slug = ?1 ORDER BY track",
             )
             .map_err(|e| e.to_string())?;
         let rows = statement
             .query_map(params![slug], |row| {
+                let criteria: Option<String> = row.get(4)?;
+                let depends: Option<String> = row.get(5)?;
                 Ok(ProjectTrack {
                     track: row.get(0)?,
                     desired_state: row.get(1)?,
                     status: row.get(2)?,
-                    updated_at: row.get(3)?,
+                    title: row.get(3)?,
+                    acceptance_criteria: parse_string_list(criteria),
+                    depends_on: parse_string_list(depends),
+                    updated_at: row.get(6)?,
                 })
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
+    }
+
+    /// Slug that actually owns this track among `slugs` (canonical + aliases).
+    pub fn find_track_slug(&self, slugs: &[String], track: &str) -> Result<Option<String>, String> {
+        let connection = self.lock()?;
+        for slug in slugs {
+            let found: Option<String> = connection
+                .query_row(
+                    "SELECT slug FROM project_tracks WHERE slug = ?1 AND track = ?2",
+                    params![slug, track],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
     }
 
     pub fn set_track(
@@ -1070,20 +1112,93 @@ impl ProjectsStore {
         desired_state: Option<&str>,
         status: Option<&str>,
     ) -> Result<(), String> {
+        self.patch_track(slug, track, desired_state, status, None, None, None)
+    }
+
+    /// Partial update: NULL / omitted contract fields leave the stored values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn patch_track(
+        &self,
+        slug: &str,
+        track: &str,
+        desired_state: Option<&str>,
+        status: Option<&str>,
+        title: Option<&str>,
+        acceptance_criteria: Option<&[String]>,
+        depends_on: Option<&[String]>,
+    ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
+        let criteria = acceptance_criteria
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let depends = depends_on
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let connection = self.lock()?;
         connection
             .execute(
-                "INSERT INTO project_tracks (slug, track, desired_state, status, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                "INSERT INTO project_tracks \
+                   (slug, track, desired_state, status, title, acceptance_criteria, depends_on, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(slug, track) DO UPDATE SET \
                    desired_state = COALESCE(excluded.desired_state, project_tracks.desired_state), \
                    status = COALESCE(excluded.status, project_tracks.status), \
+                   title = COALESCE(excluded.title, project_tracks.title), \
+                   acceptance_criteria = COALESCE(excluded.acceptance_criteria, project_tracks.acceptance_criteria), \
+                   depends_on = COALESCE(excluded.depends_on, project_tracks.depends_on), \
                    updated_at = excluded.updated_at",
-                params![slug, track, desired_state, status, now],
+                params![
+                    slug,
+                    track,
+                    desired_state,
+                    status,
+                    title,
+                    criteria,
+                    depends,
+                    now
+                ],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Plan items from chat: latest title + contract win, status stays `open`
+    /// unless a later `set_track` moved it. One transaction so a later invalid
+    /// caller never leaves a prefix of the batch persisted.
+    pub fn upsert_planned_tracks(&self, slug: &str, items: &[PlannedTrack]) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.lock()?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        for item in items {
+            let criteria =
+                serde_json::to_string(&item.acceptance_criteria).map_err(|e| e.to_string())?;
+            let depends = serde_json::to_string(&item.depends_on).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO project_tracks \
+                   (slug, track, desired_state, status, title, acceptance_criteria, depends_on, updated_at) \
+                 VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(slug, track) DO UPDATE SET \
+                   desired_state = excluded.desired_state, \
+                   status = 'open', \
+                   title = excluded.title, \
+                   acceptance_criteria = excluded.acceptance_criteria, \
+                   depends_on = excluded.depends_on, \
+                   updated_at = excluded.updated_at",
+                params![
+                    slug,
+                    item.track,
+                    item.desired_state,
+                    item.title,
+                    criteria,
+                    depends,
+                    now
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn get_grant(&self, slug: &str) -> Result<Option<ProjectGrant>, String> {
@@ -1272,6 +1387,30 @@ impl ProjectsStore {
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
+    }
+
+    /// Slug that actually owns this leftover proposal among `slugs`.
+    pub fn find_open_proposal_slug(
+        &self,
+        slugs: &[String],
+        task_key: &str,
+    ) -> Result<Option<String>, String> {
+        let connection = self.lock()?;
+        for slug in slugs {
+            let found: Option<String> = connection
+                .query_row(
+                    "SELECT slug FROM project_roadmap_proposals \
+                     WHERE slug = ?1 AND task_key = ?2 AND status = 'proposed'",
+                    params![slug, task_key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
     }
 
     /// Record a decision and return its `at` key. The legacy `answered` flag is
@@ -1672,6 +1811,16 @@ pub struct NewProposal {
     pub depends_on: Vec<String>,
 }
 
+/// Input for `upsert_planned_tracks` — the chat-submitted item contract.
+#[derive(Debug, Clone)]
+pub struct PlannedTrack {
+    pub track: String,
+    pub title: String,
+    pub desired_state: String,
+    pub acceptance_criteria: Vec<String>,
+    pub depends_on: Vec<String>,
+}
+
 /// JSON-array column → Vec, treating NULL/garbage as empty rather than erroring
 /// the whole roadmap read.
 fn parse_string_list(raw: Option<String>) -> Vec<String> {
@@ -1709,6 +1858,12 @@ pub struct ProjectTrack {
     pub desired_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     pub updated_at: String,
 }
 
@@ -2886,5 +3041,120 @@ mod tests {
         // Newest first, and the oldest batch (including s1) was evicted.
         assert_eq!(rows[0].at, "2026-08-05T10:59:00Z");
         assert!(rows.iter().all(|row| row.session_id == "s2"));
+    }
+
+    #[test]
+    fn planned_tracks_persist_the_submitted_contract() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity-core", None, None, None, None)
+            .expect("seed");
+        store
+            .upsert_planned_tracks(
+                "verity-core",
+                &[PlannedTrack {
+                    track: "land-2332".into(),
+                    title: "Land #2332".into(),
+                    desired_state: "merge after certify".into(),
+                    acceptance_criteria: vec!["CI green".into(), "review resolved".into()],
+                    depends_on: vec!["freeze-head".into()],
+                }],
+            )
+            .expect("plan");
+        let tracks = store.tracks("verity-core").expect("tracks");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title.as_deref(), Some("Land #2332"));
+        assert_eq!(
+            tracks[0].desired_state.as_deref(),
+            Some("merge after certify")
+        );
+        assert_eq!(tracks[0].status.as_deref(), Some("open"));
+        assert_eq!(
+            tracks[0].acceptance_criteria,
+            vec!["CI green", "review resolved"]
+        );
+        assert_eq!(tracks[0].depends_on, vec!["freeze-head"]);
+
+        store
+            .upsert_planned_tracks(
+                "verity-core",
+                &[PlannedTrack {
+                    track: "land-2332".into(),
+                    title: "Land #2332 (retry)".into(),
+                    desired_state: "merge after certify".into(),
+                    acceptance_criteria: vec!["exact-head clean".into()],
+                    depends_on: vec![],
+                }],
+            )
+            .expect("replan");
+        let tracks = store.tracks("verity-core").expect("re-read");
+        assert_eq!(tracks[0].title.as_deref(), Some("Land #2332 (retry)"));
+        assert_eq!(tracks[0].acceptance_criteria, vec!["exact-head clean"]);
+        assert!(tracks[0].depends_on.is_empty());
+    }
+
+    #[test]
+    fn find_open_proposal_slug_uses_the_stored_alias() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_proposals(
+                "verity",
+                &[NewProposal {
+                    task_key: "docs".into(),
+                    title: "Write the guide".into(),
+                    prompt: None,
+                    acceptance_criteria: vec!["published".into()],
+                    depends_on: vec![],
+                }],
+            )
+            .expect("seed alias proposal");
+        let keys = vec!["verity-core".into(), "verity".into()];
+        assert_eq!(
+            store
+                .find_open_proposal_slug(&keys, "docs")
+                .expect("lookup")
+                .as_deref(),
+            Some("verity")
+        );
+        assert!(store
+            .update_proposal(
+                "verity",
+                "docs",
+                Some("Write the core guide"),
+                None,
+                None,
+                None
+            )
+            .expect("update under alias"));
+        let open = store.list_open_proposals("verity").expect("list");
+        assert_eq!(open[0].title, "Write the core guide");
+        assert!(!store
+            .update_proposal("verity-core", "docs", Some("miss"), None, None, None)
+            .expect("canonical miss"));
+    }
+
+    #[test]
+    fn an_old_tracks_table_gains_the_plan_contract_columns() {
+        let connection = Connection::open_in_memory().expect("conn");
+        connection
+            .execute_batch(
+                "CREATE TABLE project_tracks (
+                    slug TEXT NOT NULL, track TEXT NOT NULL,
+                    desired_state TEXT, status TEXT, updated_at TEXT NOT NULL,
+                    PRIMARY KEY (slug, track));
+                 INSERT INTO project_tracks VALUES
+                    ('lido', 'P-ETH-1', 'proved', 'in-progress', '2026-08-01T00:00:00Z');",
+            )
+            .expect("old schema");
+        ProjectsStore::initialize(&connection).expect("migrate");
+        let store = ProjectsStore {
+            connection: Mutex::new(connection),
+        };
+        let tracks = store.tracks("lido").expect("read");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].track, "P-ETH-1");
+        assert_eq!(tracks[0].status.as_deref(), Some("in-progress"));
+        assert!(tracks[0].title.is_none());
+        assert!(tracks[0].acceptance_criteria.is_empty());
     }
 }
