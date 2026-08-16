@@ -533,7 +533,7 @@ pub async fn get_project(
         .map_err(store_err)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown project '{slug}'")))?;
     let grant = state.projects.get_grant(&slug).map_err(store_err)?;
-    let tracks = state.projects.tracks(&slug).map_err(store_err)?;
+    let tracks = collect_family_tracks(&state.projects, &slug).map_err(store_err)?;
     let decisions = state.projects.open_decisions(&slug).map_err(store_err)?;
     let recent = state
         .projects
@@ -544,10 +544,7 @@ pub async fn get_project(
         .binding(&slug)
         .map_err(store_err)?
         .map(follow_live_conversation);
-    let proposals = state
-        .projects
-        .list_open_proposals(&slug)
-        .map_err(store_err)?;
+    let items = load_project_items(&state, &slug).await?;
     let missions = match state
         .control
         .collect_attention_missions_for_project(&slug)
@@ -559,7 +556,6 @@ pub async fn get_project(
             Vec::new()
         }
     };
-    let items = super::mission_horizon::project_items(&tracks, &proposals, &missions);
     let mut project = project;
     if let Some(derived) = next_action_from_live_titles(
         missions
@@ -806,6 +802,9 @@ pub async fn set_project_track(
     if !is_plain_key(&slug) {
         return Err(bad_slug());
     }
+    let slug = resolve_roster_slug(&state.projects, &slug)
+        .map_err(store_err)?
+        .unwrap_or(slug);
     if req.track.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "track is required".to_string()));
     }
@@ -818,7 +817,7 @@ pub async fn set_project_track(
             req.status.as_deref(),
         )
         .map_err(store_err)?;
-    let tracks = state.projects.tracks(&slug).map_err(store_err)?;
+    let tracks = collect_family_tracks(&state.projects, &slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({ "tracks": tracks })))
 }
 
@@ -1181,83 +1180,41 @@ fn merge_announcement_needles(delivery: &DeliveryUpdate, recorded_decided: bool)
     needles
 }
 
-/// `GET /api/projects/:slug/tasks` — the project's roadmap: every board task
-/// planned under a boss mission of this project family, in planning order,
-/// with the per-item detail (digest, PR link, worker mission) the drawer's
-/// checklist expands into.
+/// `GET /api/projects/:slug/tasks` — the project's roadmap.
+///
+/// The list **is** the item inventory: `project_tracks`, leftover proposals,
+/// and attention-horizon attempts. Boss `board_tasks` stay private to the
+/// mission that owns them; they are not a second plan. Aliases fold onto the
+/// canonical roster slug — hyphen prefix matching is deliberately not used,
+/// so `verity` never swallows `verity-lido`.
 pub async fn project_tasks(
     State(state): State<Arc<AppState>>,
-    AxumPath(slug): AxumPath<String>,
+    AxumPath(requested): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if !is_plain_key(&slug) {
+    if !is_plain_key(&requested) {
         return Err(bad_slug());
     }
-    let tasks = state
-        .control
-        .collect_project_board_tasks(&slug)
-        .await
-        .map_err(store_err)?;
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .unwrap_or(requested);
+    let items = load_project_items(&state, &slug).await?;
     let mut done = 0usize;
     let mut running = 0usize;
     let mut failed = 0usize;
-    let mut rows: Vec<serde_json::Value> = tasks
+    let rows: Vec<serde_json::Value> = items
         .iter()
-        .map(|task| {
-            let status = task.status.to_string();
-            match status.as_str() {
+        .filter(|item| item_belongs_on_roadmap(item))
+        .map(|item| {
+            let status = item_roadmap_status(item);
+            match status {
                 "accepted" => done += 1,
                 "running" | "settled" => running += 1,
                 "failed" => failed += 1,
                 _ => {}
             }
-            let pr_url = task
-                .result_digest
-                .as_deref()
-                .and_then(extract_pr_url)
-                .or_else(|| task.notes.as_deref().and_then(extract_pr_url));
-            serde_json::json!({
-                "id": task.id,
-                "task_key": task.task_key,
-                "title": task.title,
-                "status": status,
-                "outcome": task.outcome,
-                "depends_on": task.depends_on,
-                "acceptance_criteria": task.acceptance_criteria,
-                "result_digest": task.result_digest,
-                "pr_url": pr_url,
-                "worker_mission_id": task.worker_mission_id,
-                "boss_mission_id": task.boss_mission_id,
-                "attempts": task.attempts,
-                "updated_at": task.updated_at,
-            })
+            item_as_roadmap_task(item)
         })
         .collect();
-    // Chat-planned proposals ride the same list as `status: "proposed"`. A
-    // board task under the same key supersedes its proposal — the plan became
-    // real work, so the proposal row disappears from the read.
-    let planned: std::collections::HashSet<&str> =
-        tasks.iter().map(|task| task.task_key.as_str()).collect();
-    let proposals = state
-        .projects
-        .list_open_proposals(&slug)
-        .map_err(store_err)?;
-    rows.extend(
-        proposals
-            .iter()
-            .filter(|proposal| !planned.contains(proposal.task_key.as_str()))
-            .map(|proposal| {
-                serde_json::json!({
-                    "id": null,
-                    "task_key": proposal.task_key,
-                    "title": proposal.title,
-                    "prompt": proposal.prompt,
-                    "status": "proposed",
-                    "depends_on": proposal.depends_on,
-                    "acceptance_criteria": proposal.acceptance_criteria,
-                    "updated_at": proposal.updated_at,
-                })
-            }),
-    );
     Ok(Json(serde_json::json!({
         "slug": slug,
         "tasks": rows,
@@ -1287,30 +1244,45 @@ pub struct PlanTasksRequest {
     pub tasks: Vec<ProposalInput>,
 }
 
-/// `POST /api/projects/:slug/tasks` — plan roadmap items from chat. Proposals
-/// only: real board tasks stay writable solely by their boss mission, so a
-/// conversation can shape the plan without reaching into a running board.
+/// `POST /api/projects/:slug/tasks` — plan roadmap items from chat.
+///
+/// Writes the project's **item** table (`project_tracks`). This used to insert
+/// a third ledger (`project_roadmap_proposals`); that table is read only to
+/// surface leftover rows until they are absorbed into a track.
 pub async fn plan_project_tasks(
     State(state): State<Arc<AppState>>,
-    AxumPath(slug): AxumPath<String>,
+    AxumPath(requested): AxumPath<String>,
     Json(req): Json<PlanTasksRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if !is_plain_key(&slug) {
+    if !is_plain_key(&requested) {
         return Err(bad_slug());
     }
-    if state
+    let Some(slug) = resolve_roster_slug(&state.projects, &requested).map_err(store_err)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("unknown project '{requested}'"),
+        ));
+    };
+    let planned = planned_tracks_from_request(&req.tasks)?;
+    state
         .projects
-        .get_project(&slug)
-        .map_err(store_err)?
-        .is_none()
-    {
-        return Err((StatusCode::NOT_FOUND, format!("unknown project '{slug}'")));
-    }
-    if req.tasks.is_empty() {
+        .upsert_planned_tracks(&slug, &planned)
+        .map_err(store_err)?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "proposed": planned.len() }),
+    ))
+}
+
+/// Validate the whole batch before any write so a later 400 cannot leave a
+/// prefix of tracks persisted.
+fn planned_tracks_from_request(
+    tasks: &[ProposalInput],
+) -> Result<Vec<super::projects_store::PlannedTrack>, (StatusCode, String)> {
+    if tasks.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "tasks is required".to_string()));
     }
-    let mut proposals = Vec::with_capacity(req.tasks.len());
-    for task in &req.tasks {
+    let mut planned = Vec::with_capacity(tasks.len());
+    for task in tasks {
         let task_key = task.task_key.trim();
         if !is_plain_key(task_key) {
             return Err((
@@ -1318,27 +1290,28 @@ pub async fn plan_project_tasks(
                 format!("invalid task_key '{}'", task.task_key),
             ));
         }
-        if task.title.trim().is_empty() {
+        let title = task.title.trim();
+        if title.is_empty() {
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!("task '{task_key}' needs a title"),
             ));
         }
-        proposals.push(crate::api::projects_store::NewProposal {
-            task_key: task_key.to_string(),
-            title: task.title.trim().to_string(),
-            prompt: task.prompt.clone(),
+        let desired = task
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(title);
+        planned.push(super::projects_store::PlannedTrack {
+            track: task_key.to_string(),
+            title: title.to_string(),
+            desired_state: desired.to_string(),
             acceptance_criteria: task.acceptance_criteria.clone(),
             depends_on: task.depends_on.clone(),
         });
     }
-    state
-        .projects
-        .upsert_proposals(&slug, &proposals)
-        .map_err(store_err)?;
-    Ok(Json(
-        serde_json::json!({ "ok": true, "proposed": proposals.len() }),
-    ))
+    Ok(planned)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1353,52 +1326,74 @@ pub struct UpdateProposalRequest {
     pub depends_on: Option<Vec<String>>,
 }
 
-/// A proposal whose key a boss mission has planned as a real board task is
-/// *adopted*: the roadmap read hides it, and editing/cancelling the hidden row
-/// would silently succeed while changing nothing the caller can see. Surface
-/// that as a conflict instead.
-async fn assert_not_adopted(
-    state: &Arc<AppState>,
-    slug: &str,
-    task_key: &str,
-) -> Result<(), (StatusCode, String)> {
-    let tasks = state
-        .control
-        .collect_project_board_tasks(slug)
-        .await
-        .map_err(store_err)?;
-    if tasks.iter().any(|task| task.task_key == task_key) {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "proposal '{task_key}' was adopted as a board task — steer the boss mission instead"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// `PATCH /api/projects/:slug/tasks/:task_key` — edit an open proposal.
-/// 404 covers "never proposed" and "cancelled"; an adopted key is 409 — once a
-/// board task owns the key, edits belong to the boss mission's flow.
+/// `PATCH /api/projects/:slug/tasks/:task_key` — edit an item (track).
+/// Leftover proposal rows are updated as a compatibility fallback.
 pub async fn update_project_task(
     State(state): State<Arc<AppState>>,
-    AxumPath((slug, task_key)): AxumPath<(String, String)>,
+    AxumPath((requested, task_key)): AxumPath<(String, String)>,
     Json(req): Json<UpdateProposalRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if !is_plain_key(&slug) || !is_plain_key(&task_key) {
+    if !is_plain_key(&requested) || !is_plain_key(&task_key) {
         return Err(bad_slug());
     }
-    assert_not_adopted(&state, &slug, &task_key).await?;
-    let updated = state
-        .projects
-        .update_proposal(
-            &slug,
-            &task_key,
+    let Some(slug) = resolve_roster_slug(&state.projects, &requested).map_err(store_err)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("unknown project '{requested}'"),
+        ));
+    };
+    let desired = req
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
             req.title
                 .as_deref()
                 .map(str::trim)
-                .filter(|t| !t.is_empty()),
+                .filter(|value| !value.is_empty())
+        });
+    let title = req
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let family = project_tag_keys(&slug);
+    if let Some(stored) = state
+        .projects
+        .find_track_slug(&family, &task_key)
+        .map_err(store_err)?
+    {
+        state
+            .projects
+            .patch_track(
+                &stored,
+                &task_key,
+                desired,
+                None,
+                title,
+                req.acceptance_criteria.as_deref(),
+                req.depends_on.as_deref(),
+            )
+            .map_err(store_err)?;
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
+    let Some(stored) = state
+        .projects
+        .find_open_proposal_slug(&family, &task_key)
+        .map_err(store_err)?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no open item '{task_key}' for '{slug}'"),
+        ));
+    };
+    let updated = state
+        .projects
+        .update_proposal(
+            &stored,
+            &task_key,
+            title,
             req.prompt.as_deref(),
             req.acceptance_criteria.as_deref(),
             req.depends_on.as_deref(),
@@ -1407,29 +1402,56 @@ pub async fn update_project_task(
     if !updated {
         return Err((
             StatusCode::NOT_FOUND,
-            format!("no open proposal '{task_key}' for '{slug}'"),
+            format!("no open item '{task_key}' for '{slug}'"),
         ));
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// `DELETE /api/projects/:slug/tasks/:task_key` — cancel an open proposal.
+/// `DELETE /api/projects/:slug/tasks/:task_key` — cancel an item.
 pub async fn cancel_project_task(
     State(state): State<Arc<AppState>>,
-    AxumPath((slug, task_key)): AxumPath<(String, String)>,
+    AxumPath((requested, task_key)): AxumPath<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if !is_plain_key(&slug) || !is_plain_key(&task_key) {
+    if !is_plain_key(&requested) || !is_plain_key(&task_key) {
         return Err(bad_slug());
     }
-    assert_not_adopted(&state, &slug, &task_key).await?;
+    let Some(slug) = resolve_roster_slug(&state.projects, &requested).map_err(store_err)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("unknown project '{requested}'"),
+        ));
+    };
+    let family = project_tag_keys(&slug);
+    if let Some(stored) = state
+        .projects
+        .find_track_slug(&family, &task_key)
+        .map_err(store_err)?
+    {
+        state
+            .projects
+            .set_track(&stored, &task_key, None, Some("cancelled"))
+            .map_err(store_err)?;
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
+    let Some(stored) = state
+        .projects
+        .find_open_proposal_slug(&family, &task_key)
+        .map_err(store_err)?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no open item '{task_key}' for '{slug}'"),
+        ));
+    };
     let cancelled = state
         .projects
-        .cancel_proposal(&slug, &task_key)
+        .cancel_proposal(&stored, &task_key)
         .map_err(store_err)?;
     if !cancelled {
         return Err((
             StatusCode::NOT_FOUND,
-            format!("no open proposal '{task_key}' for '{slug}'"),
+            format!("no open item '{task_key}' for '{slug}'"),
         ));
     }
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -2897,6 +2919,157 @@ pub fn project_tag_keys_with(aliases: &HashMap<String, String>, slug: &str) -> V
     keys
 }
 
+fn collect_family_tracks(
+    store: &super::projects_store::ProjectsStore,
+    slug: &str,
+) -> Result<Vec<super::projects_store::ProjectTrack>, String> {
+    let mut collected = Vec::new();
+    let mut seen = HashSet::new();
+    for key in project_tag_keys(slug) {
+        for track in store.tracks(&key)? {
+            if seen.insert(track.track.clone()) {
+                collected.push(track);
+            }
+        }
+    }
+    Ok(collected)
+}
+
+fn collect_family_proposals(
+    store: &super::projects_store::ProjectsStore,
+    slug: &str,
+) -> Result<Vec<super::projects_store::RoadmapProposal>, String> {
+    let mut collected = Vec::new();
+    let mut seen = HashSet::new();
+    for key in project_tag_keys(slug) {
+        for proposal in store.list_open_proposals(&key)? {
+            if seen.insert(proposal.task_key.clone()) {
+                collected.push(proposal);
+            }
+        }
+    }
+    Ok(collected)
+}
+
+async fn load_project_items(
+    state: &Arc<AppState>,
+    slug: &str,
+) -> Result<Vec<super::mission_horizon::ProjectItem>, (StatusCode, String)> {
+    let tracks = collect_family_tracks(&state.projects, slug).map_err(store_err)?;
+    let proposals = collect_family_proposals(&state.projects, slug).map_err(store_err)?;
+    let missions = match state
+        .control
+        .collect_attention_missions_for_project(slug)
+        .await
+    {
+        Ok(missions) => missions,
+        Err(error) => {
+            tracing::warn!(project = %slug, %error, "project items: attention collect failed");
+            Vec::new()
+        }
+    };
+    Ok(super::mission_horizon::project_items(
+        &tracks, &proposals, &missions,
+    ))
+}
+
+fn item_attempt_is_live(status: &str) -> bool {
+    matches!(status, "active" | "pending" | "running" | "awaiting_user")
+}
+
+/// The public roadmap is the plan, not the unacknowledged graveyard.
+/// Controllers still see every attention item on `get_project`.
+fn item_belongs_on_roadmap(item: &super::mission_horizon::ProjectItem) -> bool {
+    if item
+        .attempts
+        .iter()
+        .any(|attempt| item_attempt_is_live(&attempt.status))
+    {
+        return true;
+    }
+    if item.kind == "task" {
+        return item.open;
+    }
+    if !item.declared {
+        return false;
+    }
+    // Declared tracks stay on the checklist unless cancelled/closed.
+    // `done` remains (as accepted). Missing, empty, running, in-progress
+    // match `project_items`: they are open.
+    !matches!(
+        item.status
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        Some("cancelled") | Some("closed")
+    )
+}
+
+/// Map an item onto the existing `/tasks` row shape the desktop already
+/// renders. Status vocabulary stays the checklist's: accepted / running /
+/// failed / proposed / pending.
+fn item_roadmap_status(item: &super::mission_horizon::ProjectItem) -> &'static str {
+    if !item.open {
+        return "accepted";
+    }
+    if item
+        .attempts
+        .iter()
+        .any(|attempt| item_attempt_is_live(&attempt.status))
+    {
+        return "running";
+    }
+    if item.status.as_deref() == Some("proposed") {
+        return "proposed";
+    }
+    if !item.attempts.is_empty()
+        && item
+            .attempts
+            .iter()
+            .all(|attempt| matches!(attempt.status.as_str(), "failed" | "interrupted"))
+    {
+        return "failed";
+    }
+    "pending"
+}
+
+fn item_as_roadmap_task(item: &super::mission_horizon::ProjectItem) -> serde_json::Value {
+    let title = item
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            item.desired_state
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            item.attempts
+                .iter()
+                .find_map(|attempt| attempt.title.clone().filter(|title| !title.is_empty()))
+        })
+        .unwrap_or_else(|| item.key.clone());
+    let latest = item.attempts.first();
+    serde_json::json!({
+        "id": null,
+        "task_key": item.key,
+        "title": title,
+        "status": item_roadmap_status(item),
+        "kind": item.kind,
+        "open": item.open,
+        "desired_state": item.desired_state,
+        "acceptance_criteria": item.acceptance_criteria,
+        "depends_on": item.depends_on,
+        "worker_mission_id": latest.map(|attempt| attempt.id.to_string()),
+        "attempts": item.attempts.len(),
+        "updated_at": latest.map(|attempt| attempt.updated_at.clone()),
+    })
+}
+
 /// True when every field of a state descriptor is an unfilled `<placeholder>`.
 ///
 /// Deliberately narrow: a descriptor is rejected only when it carries no real
@@ -3544,6 +3717,197 @@ mod tests {
         assert_eq!(
             project_tag_keys_with(&aliases, "verity"),
             vec!["verity".to_string()]
+        );
+    }
+
+    #[test]
+    fn sibling_verity_projects_do_not_share_a_hyphen_family() {
+        let mut aliases = HashMap::new();
+        aliases.insert("verity".to_string(), "verity-core".to_string());
+        aliases.insert("lido".to_string(), "verity-lido".to_string());
+        aliases.insert("lido-audit".to_string(), "verity-lido".to_string());
+        aliases.insert("lido-pdeposit1-tx".to_string(), "verity-lido".to_string());
+
+        let core = project_tag_keys_with(&aliases, "verity-core");
+        assert!(core.contains(&"verity-core".to_string()));
+        assert!(core.contains(&"verity".to_string()));
+        assert!(!core.iter().any(|key| key.contains("lido")));
+
+        let lido = project_tag_keys_with(&aliases, "lido-audit");
+        assert!(lido.contains(&"verity-lido".to_string()));
+        assert!(lido.contains(&"lido-pdeposit1-tx".to_string()));
+        assert!(!lido.contains(&"verity-core".to_string()));
+        assert!(!lido.contains(&"verity".to_string()));
+    }
+
+    #[test]
+    fn item_roadmap_status_follows_open_and_live_attempts() {
+        use crate::api::mission_horizon::{ProjectItem, ProjectItemAttempt};
+        use uuid::Uuid;
+
+        let open_live = ProjectItem {
+            key: "c5".into(),
+            kind: "track",
+            desired_state: Some("land #2332".into()),
+            status: Some("open".into()),
+            title: Some("Land #2332".into()),
+            acceptance_criteria: vec!["CI green".into()],
+            depends_on: vec!["freeze".into()],
+            open: true,
+            declared: true,
+            attempts: vec![ProjectItemAttempt {
+                id: Uuid::nil(),
+                status: "active".into(),
+                title: Some("repair #2332".into()),
+                updated_at: "2026-08-15T00:00:00Z".into(),
+                role: None,
+            }],
+        };
+        assert_eq!(item_roadmap_status(&open_live), "running");
+        let row = item_as_roadmap_task(&open_live);
+        assert_eq!(row["task_key"], "c5");
+        assert_eq!(row["title"], "Land #2332");
+        assert_eq!(row["status"], "running");
+        assert_eq!(row["acceptance_criteria"][0], "CI green");
+        assert_eq!(row["depends_on"][0], "freeze");
+
+        let done = ProjectItem {
+            open: false,
+            status: Some("done".into()),
+            attempts: Vec::new(),
+            ..open_live.clone()
+        };
+        assert_eq!(item_roadmap_status(&done), "accepted");
+        assert!(item_belongs_on_roadmap(&open_live));
+        assert!(item_belongs_on_roadmap(&done));
+        let zombie = ProjectItem {
+            open: true,
+            status: None,
+            desired_state: None,
+            title: None,
+            declared: false,
+            attempts: vec![ProjectItemAttempt {
+                id: Uuid::nil(),
+                status: "failed".into(),
+                title: Some("old cert".into()),
+                updated_at: "2026-08-01T00:00:00Z".into(),
+                role: None,
+            }],
+            ..open_live.clone()
+        };
+        assert!(
+            !item_belongs_on_roadmap(&zombie),
+            "unacknowledged failed attempts are not the roadmap"
+        );
+    }
+
+    #[test]
+    fn declared_open_tracks_stay_on_the_roadmap() {
+        use crate::api::mission_horizon::{track_status_is_open, ProjectItem};
+
+        let declared = |status: Option<&str>| ProjectItem {
+            key: "pr-48".into(),
+            kind: "track",
+            desired_state: None,
+            status: status.map(str::to_string),
+            title: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+            open: track_status_is_open(status),
+            declared: true,
+            attempts: Vec::new(),
+        };
+        for status in [
+            None,
+            Some(""),
+            Some("open"),
+            Some("running"),
+            Some("in-progress"),
+        ] {
+            assert!(
+                item_belongs_on_roadmap(&declared(status)),
+                "declared track status {status:?} belongs on the roadmap"
+            );
+        }
+        assert!(item_belongs_on_roadmap(&declared(Some("done"))));
+        assert!(!item_belongs_on_roadmap(&declared(Some("cancelled"))));
+        assert!(!item_belongs_on_roadmap(&declared(Some("closed"))));
+    }
+
+    #[test]
+    fn plan_request_validates_the_whole_batch_before_any_write() {
+        let ok = ProposalInput {
+            task_key: "land-2332".into(),
+            title: "Land #2332".into(),
+            prompt: Some("merge after certify".into()),
+            acceptance_criteria: vec!["CI green".into()],
+            depends_on: vec!["freeze-head".into()],
+        };
+        let planned = planned_tracks_from_request(&[ok]).expect("valid");
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].title, "Land #2332");
+        assert_eq!(planned[0].desired_state, "merge after certify");
+        assert_eq!(planned[0].acceptance_criteria, vec!["CI green"]);
+        assert_eq!(planned[0].depends_on, vec!["freeze-head"]);
+
+        let first = ProposalInput {
+            task_key: "ok-item".into(),
+            title: "Fine".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let bad_key = ProposalInput {
+            task_key: "not a key".into(),
+            title: "Bad".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let err = planned_tracks_from_request(&[first, bad_key]).expect_err("invalid key");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let empty_title = ProposalInput {
+            task_key: "second".into(),
+            title: "   ".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let first = ProposalInput {
+            task_key: "ok-item".into(),
+            title: "Fine".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let err = planned_tracks_from_request(&[first, empty_title]).expect_err("empty title");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("needs a title"));
+
+        // The handler only writes after the whole batch validates.
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity-core", None, None, None, None)
+            .expect("seed");
+        let valid = ProposalInput {
+            task_key: "first".into(),
+            title: "First".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let invalid = ProposalInput {
+            task_key: "".into(),
+            title: "Second".into(),
+            prompt: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        assert!(planned_tracks_from_request(&[valid, invalid]).is_err());
+        assert!(
+            store.tracks("verity-core").expect("tracks").is_empty(),
+            "a rejected batch must not persist earlier entries"
         );
     }
 

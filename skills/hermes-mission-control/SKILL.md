@@ -9,7 +9,7 @@ description: >
 metadata:
   policy: chatgpt-ui-pool
   policy_version: 1.3.0
-version: 1.10.0
+version: 1.11.0
 ---
 
 # Hermes Mission Control
@@ -115,10 +115,16 @@ mission is `pending`/`active`, then stop. The result comes back here.
 
 ### Controller launch
 
-A cron tick with `deliver: project:<slug>`. Pass `project` (and track /
-intent as usual). Do **not** enroll a worker wakeup and do not wait.
-Report on the next tick or via the project route. A `cron_*` session
-dies with the tick; never stamp one as origin.
+A cron tick with `deliver: project:<canonical-slug>`. Pass `project` as
+the roster slug (`verity-core`, `verity-lido`, …) and `track` as the
+**item** this mission is an attempt on. Do **not** enroll a worker
+wakeup and do not wait. Report on the next tick or via the project
+route. A `cron_*` session dies with the tick; never stamp one as origin.
+
+The project's items **are** the roadmap (`get_project` / `get_project_tasks`
+are the same list). `plan_project_tasks` upserts an item. Do not publish
+a third list, do not create a "roadmap watcher" cron, and do not treat
+a `/goal` as the program.
 
 ### On callback
 

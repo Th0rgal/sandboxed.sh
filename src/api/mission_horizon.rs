@@ -130,8 +130,28 @@ pub struct ProjectItem {
     pub desired_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     pub open: bool,
+    /// True when a `project_tracks` or leftover proposal row declared this
+    /// item. Mission-only attention rows stay off the public roadmap.
+    #[serde(skip)]
+    pub declared: bool,
     pub attempts: Vec<ProjectItemAttempt>,
+}
+
+/// A declared track is open unless it is done, closed, or cancelled.
+/// Missing, empty, `running`, and `in-progress` all count as open — that is
+/// how `set_project_track` and existing store rows already behave.
+pub fn track_status_is_open(status: Option<&str>) -> bool {
+    !matches!(
+        status.map(str::trim).filter(|value| !value.is_empty()),
+        Some("done") | Some("closed") | Some("cancelled")
+    )
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -161,7 +181,11 @@ pub fn project_items(
                 kind: "track",
                 desired_state: track.desired_state.clone(),
                 status: track.status.clone(),
-                open: track.status.as_deref() != Some("done"),
+                title: track.title.clone(),
+                acceptance_criteria: track.acceptance_criteria.clone(),
+                depends_on: track.depends_on.clone(),
+                open: track_status_is_open(track.status.as_deref()),
+                declared: true,
                 attempts: Vec::new(),
             },
         );
@@ -172,9 +196,13 @@ pub fn project_items(
             .or_insert_with(|| ProjectItem {
                 key: proposal.task_key.clone(),
                 kind: "task",
-                desired_state: None,
+                desired_state: proposal.prompt.clone(),
                 status: Some("proposed".to_string()),
+                title: Some(proposal.title.clone()),
+                acceptance_criteria: proposal.acceptance_criteria.clone(),
+                depends_on: proposal.depends_on.clone(),
                 open: true,
+                declared: true,
                 attempts: Vec::new(),
             });
     }
@@ -195,7 +223,11 @@ pub fn project_items(
             kind: "track",
             desired_state: mission.project.desired_state.clone(),
             status: None,
+            title: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
             open: true,
+            declared: false,
             attempts: Vec::new(),
         });
         item.attempts.push(ProjectItemAttempt {
@@ -526,6 +558,9 @@ mod tests {
             track: "core".to_string(),
             desired_state: Some("landed".to_string()),
             status: Some("active".to_string()),
+            title: Some("Core".to_string()),
+            acceptance_criteria: vec!["merged".to_string()],
+            depends_on: Vec::new(),
             updated_at: "2026-08-14T00:00:00Z".to_string(),
         }];
         let proposals = vec![RoadmapProposal {
@@ -562,6 +597,42 @@ mod tests {
             .attempts
             .iter()
             .all(|attempt| attempt.id != live.id || item.key == "core")));
+
+        let cancelled = vec![ProjectTrack {
+            track: "old-pr46".to_string(),
+            desired_state: Some("certify PR 46".to_string()),
+            status: Some("cancelled".to_string()),
+            title: None,
+            acceptance_criteria: Vec::new(),
+            depends_on: Vec::new(),
+            updated_at: "2026-08-01T00:00:00Z".to_string(),
+        }];
+        let closed = project_items(&cancelled, &[], &[]);
+        assert_eq!(closed.len(), 1);
+        assert!(!closed[0].open, "cancelled tracks are not open items");
+        assert!(core.declared);
+        assert_eq!(core.title.as_deref(), Some("Core"));
+        assert_eq!(core.acceptance_criteria, vec!["merged"]);
+        assert!(docs.declared);
+        assert!(!review.declared, "mission-only items are not declared");
+        let missing = project_items(
+            &[ProjectTrack {
+                track: "running-pr".to_string(),
+                desired_state: None,
+                status: Some("running".to_string()),
+                title: None,
+                acceptance_criteria: Vec::new(),
+                depends_on: Vec::new(),
+                updated_at: "2026-08-14T00:00:00Z".to_string(),
+            }],
+            &[],
+            &[],
+        );
+        assert!(missing[0].open, "running is an open track status");
+        assert!(track_status_is_open(None));
+        assert!(track_status_is_open(Some("")));
+        assert!(track_status_is_open(Some("in-progress")));
+        assert!(!track_status_is_open(Some("closed")));
         let historical = missions
             .iter()
             .filter(|mission| {
