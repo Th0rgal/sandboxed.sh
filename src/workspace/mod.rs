@@ -945,11 +945,15 @@ fn atomic_write_mission_workspace_roots(
 /// Persist the selected root before creating a mission directory.  The
 /// registry lives with the workspace configuration rather than the generated
 /// directory, so it survives restarts and a later environment/config drift.
-fn persist_mission_workspace_root(workspace: &Workspace, mission_id: Uuid, root: &Path) {
+fn persist_mission_workspace_root(
+    workspace: &Workspace,
+    mission_id: Uuid,
+    root: &Path,
+) -> std::io::Result<()> {
     if workspace.id != DEFAULT_WORKSPACE_ID {
-        return;
+        return Ok(());
     }
-    if let Err(error) = (|| -> std::io::Result<()> {
+    (|| -> std::io::Result<()> {
         std::fs::create_dir_all(config_root(&workspace.path))?;
         // The process-local lock avoids blocking an async executor on an
         // advisory file lock when many preparations race. The file lock also
@@ -978,10 +982,7 @@ fn persist_mission_workspace_root(workspace: &Workspace, mission_id: Uuid, root:
         }
         fs2::FileExt::unlock(&lock_file)?;
         Ok(())
-    })() {
-        let path = mission_workspace_roots_path(workspace);
-        tracing::warn!(mission_id = %mission_id, path = %path.display(), %error, "Failed to persist mission workspace root");
-    }
+    })()
 }
 
 /// Resolve the root used for newly-created default-host mission directories.
@@ -1111,8 +1112,9 @@ fn configured_project_dir_with_nspawn(
     // orchestrator-owned git worktree) is authoritative. Only replace the
     // generated per-mission state directory; otherwise every worker would be
     // redirected back to the shared LEAN_PROJECT_PATH checkout.
-    let generated_workspaces = workspaces_root_for(&workspace.path);
-    let is_generated_mission_dir = fallback.parent() == Some(generated_workspaces.as_path())
+    let is_generated_mission_dir = mission_workspace_roots_for_workspace(workspace)
+        .iter()
+        .any(|root| fallback.parent() == Some(workspaces_root_for(root).as_path()))
         && fallback
             .file_name()
             .and_then(|name| name.to_str())
@@ -2531,7 +2533,7 @@ pub async fn prepare_mission_workspace_in(
     // Use a mission-specific directory under the workspace root so multiple missions
     // can run concurrently without clobbering per-workspace config files.
     let root = mission_workspace_root_for_workspace(workspace, mission_id);
-    persist_mission_workspace_root(workspace, mission_id, &root);
+    persist_mission_workspace_root(workspace, mission_id, &root)?;
     let dir = mission_workspace_dir_for_root(&root, mission_id);
     prepare_workspace_dir(&dir).await?;
     install_remote_build_wrapper(workspace, mission_id).await?;
@@ -2731,7 +2733,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     // Mission workspace directory lives under the selected workspace root.
     // This keeps filesystem and config effects scoped to the mission.
     let root = mission_workspace_root_for_workspace(workspace, mission_id);
-    persist_mission_workspace_root(workspace, mission_id, &root);
+    persist_mission_workspace_root(workspace, mission_id, &root)?;
     let dir = mission_workspace_dir_for_root(&root, mission_id);
     prepare_workspace_dir(&dir).await?;
     install_remote_build_wrapper(workspace, mission_id).await?;
@@ -4520,6 +4522,24 @@ sandboxed-harness-version:grok=\n";
     }
 
     #[test]
+    fn configured_project_path_recognizes_relocated_mission_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut workspace = Workspace::default_host(root.path().to_path_buf());
+        workspace.env_vars.insert(
+            "LEAN_PROJECT_PATH".to_string(),
+            project.to_string_lossy().into_owned(),
+        );
+        let mission = Uuid::new_v4();
+        persist_mission_workspace_root(&workspace, mission, storage.path()).unwrap();
+        let mission_dir = mission_workspace_dir_for_workspace(&workspace, mission);
+
+        assert_eq!(configured_project_dir(&workspace, &mission_dir), project);
+    }
+
+    #[test]
     fn configured_project_path_rejects_parent_traversal() {
         let root = tempfile::tempdir().unwrap();
         let mut workspace =
@@ -4956,7 +4976,7 @@ WORKING_DIR = "/workspaces/mission-old"
         let mission = Uuid::new_v4();
         let workspace = Workspace::default_host(temp.path().to_path_buf());
 
-        persist_mission_workspace_root(&workspace, mission, &storage);
+        persist_mission_workspace_root(&workspace, mission, &storage).unwrap();
 
         // A fresh workspace value models a process restart; the resolver must
         // use the recorded selection rather than today's configuration.
@@ -5005,7 +5025,7 @@ WORKING_DIR = "/workspaces/mission-old"
                 let start = Arc::clone(&start);
                 std::thread::spawn(move || {
                     start.wait();
-                    persist_mission_workspace_root(&workspace, mission, &storage);
+                    persist_mission_workspace_root(&workspace, mission, &storage).unwrap();
                 })
             })
             .collect();
@@ -5033,6 +5053,15 @@ WORKING_DIR = "/workspaces/mission-old"
                 storage.canonicalize().unwrap()
             );
         }
+    }
+
+    #[test]
+    fn mission_root_registry_persistence_failure_is_returned() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::default_host(temp.path().to_path_buf());
+        std::fs::write(config_root(&workspace.path), "not a directory").unwrap();
+
+        assert!(persist_mission_workspace_root(&workspace, Uuid::new_v4(), temp.path()).is_err());
     }
 
     #[test]

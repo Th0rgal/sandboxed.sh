@@ -58,14 +58,35 @@ async fn run_loop(state: Arc<AppState>) {
     let mut last_alert_at: Option<tokio::time::Instant> = None;
     loop {
         interval.tick().await;
-        let mission_root =
-            crate::workspace::configured_mission_workspace_root(&state.config.working_dir);
-        let usage = match monitoring::disk_usage_for_path(&mission_root) {
-            Ok(usage) => usage,
-            Err(error) => {
-                tracing::warn!(path = %mission_root.display(), %error, "disk watcher: cannot measure mission workspace filesystem");
-                continue;
-            }
+        // Roots persisted for active missions can outlive a configuration
+        // change, so sample every filesystem that can still host one rather
+        // than only today's MISSION_WORKSPACE_ROOT.
+        let workspace =
+            crate::workspace::Workspace::default_host(state.config.working_dir.clone());
+        let usage = crate::workspace::mission_workspace_roots_for_workspace(&workspace)
+            .into_iter()
+            .filter_map(|root| match monitoring::disk_usage_for_path(&root) {
+                Ok(usage) => Some((root, usage)),
+                Err(error) => {
+                    tracing::warn!(path = %root.display(), %error, "disk watcher: cannot measure mission workspace filesystem");
+                    None
+                }
+            })
+            .max_by(|(_, left), (_, right)| {
+                let left = if left.total == 0 {
+                    f32::INFINITY
+                } else {
+                    left.used as f32 / left.total as f32
+                };
+                let right = if right.total == 0 {
+                    f32::INFINITY
+                } else {
+                    right.used as f32 / right.total as f32
+                };
+                left.total_cmp(&right)
+            });
+        let Some((mission_root, usage)) = usage else {
+            continue;
         };
         let used = usage.used;
         let total = usage.total;
@@ -93,8 +114,9 @@ async fn run_loop(state: Arc<AppState>) {
         if level != DiskHealthLevel::Ok && (escalated || repeat_due) {
             let free_gb = total.saturating_sub(used) / (1024 * 1024 * 1024);
             let message = format!(
-                "Disk {level:?}: root filesystem at {percent:.1}% ({free_gb} GB free). \
-                 Mission admission is refused at critical level."
+                "Disk {level:?}: mission filesystem {} at {percent:.1}% ({free_gb} GB free). \
+                 Mission admission is refused at critical level.",
+                mission_root.display()
             );
             match level {
                 DiskHealthLevel::Critical => tracing::error!(percent, free_gb, "{message}"),
@@ -105,7 +127,7 @@ async fn run_loop(state: Arc<AppState>) {
             last_alert_at = Some(tokio::time::Instant::now());
         } else if recovered {
             let message = format!(
-                "Disk recovered: root filesystem back to {percent:.1}% used; \
+                "Disk recovered: mission filesystem back to {percent:.1}% used; \
                  mission admission restored."
             );
             tracing::info!(percent, "{message}");
