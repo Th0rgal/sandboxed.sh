@@ -281,7 +281,7 @@ impl MissionStore for InMemoryMissionStore {
             .collect())
     }
 
-    async fn create_mission_with_parent(
+    async fn create_mission_with_parent_and_placement(
         &self,
         title: Option<&str>,
         workspace_id: Option<Uuid>,
@@ -293,6 +293,7 @@ impl MissionStore for InMemoryMissionStore {
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
+        requires_local_disk: bool,
     ) -> Result<Mission, String> {
         let now = now_string();
         let metadata_source = title.and_then(|value| {
@@ -333,6 +334,7 @@ impl MissionStore for InMemoryMissionStore {
             terminal_evidence: None,
             parent_mission_id,
             working_directory: working_directory.map(|s| s.to_string()),
+            requires_local_disk,
             mission_mode: super::MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
@@ -354,6 +356,35 @@ impl MissionStore for InMemoryMissionStore {
         Ok(mission)
     }
 
+    async fn create_mission_with_parent(
+        &self,
+        title: Option<&str>,
+        workspace_id: Option<Uuid>,
+        agent: Option<&str>,
+        model_override: Option<&str>,
+        model_effort: Option<&str>,
+        fast_mode: bool,
+        backend: Option<&str>,
+        config_profile: Option<&str>,
+        parent_mission_id: Option<Uuid>,
+        working_directory: Option<&str>,
+    ) -> Result<Mission, String> {
+        self.create_mission_with_parent_and_placement(
+            title,
+            workspace_id,
+            agent,
+            model_override,
+            model_effort,
+            fast_mode,
+            backend,
+            config_profile,
+            parent_mission_id,
+            working_directory,
+            true,
+        )
+        .await
+    }
+
     async fn get_child_missions(&self, parent_id: Uuid) -> Result<Vec<Mission>, String> {
         let missions = self.missions.read().await;
         Ok(missions
@@ -361,6 +392,20 @@ impl MissionStore for InMemoryMissionStore {
             .filter(|m| m.parent_mission_id == Some(parent_id))
             .cloned()
             .collect())
+    }
+
+    async fn set_mission_requires_local_disk(
+        &self,
+        id: Uuid,
+        requires_local_disk: bool,
+    ) -> Result<(), String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {id} not found"))?;
+        mission.requires_local_disk = requires_local_disk;
+        mission.updated_at = now_string();
+        Ok(())
     }
 
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String> {

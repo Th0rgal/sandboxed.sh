@@ -1660,7 +1660,7 @@ async fn spawn_task_worker(
         None
     };
     let mission = mission_store
-        .create_mission_with_parent(
+        .create_mission_with_parent_and_placement(
             Some(&format!("[{}] {}", task.task_key, task.title)),
             Some(workspace_id),
             None,
@@ -1671,6 +1671,7 @@ async fn spawn_task_worker(
             None,
             Some(task.boss_mission_id),
             task.working_directory.as_deref(),
+            true,
         )
         .await?;
     if let Some((admission_guard, mut reservation, workspace)) = admission {
