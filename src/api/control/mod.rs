@@ -4024,6 +4024,26 @@ impl ControlHub {
         Ok(collected)
     }
 
+    /// Mission IDs whose live run is parked on AskUserQuestion (`WaitingUser`).
+    /// Used so project chips share the same `needs_operator` clock as list/detail.
+    pub(crate) async fn collect_waiting_user_mission_ids(&self) -> HashSet<Uuid> {
+        let mut ids = HashSet::new();
+        let Ok(inventory) = self.mission_store_inventory().await else {
+            return ids;
+        };
+        for store in inventory.live {
+            let Ok(runs) = store.list_active_mission_runs().await else {
+                continue;
+            };
+            for run in runs {
+                if run.execution_state == MissionExecutionState::WaitingUser {
+                    ids.insert(run.mission_id);
+                }
+            }
+        }
+        ids
+    }
+
     /// Board tasks across every store whose boss mission belongs to this
     /// project family. Live stores answer through the trait; persisted SQLite
     /// databases with no live control session (fresh restart, other users) are
@@ -11691,8 +11711,10 @@ pub async fn get_mission_events(
 pub struct AlertsFeedQuery {
     /// Comma-separated mission statuses to keep (e.g. `awaiting_user,failed`).
     pub statuses: Option<String>,
-    /// When true, keep only alerts whose current mission is a qualified
-    /// operator page (`needs_operator`). Used by the Needs You feed filter.
+    /// When true, keep only alerts that are themselves a current operator
+    /// page (`awaiting_user` or live AskUserQuestion). Current-state: the
+    /// mission must still `needs_operator` now. The handler walks the raw
+    /// status-event feed until `limit` matches so a sparse page is not empty.
     pub needs_operator: Option<bool>,
     /// Timestamp cursor: return alerts strictly older than this.
     pub before: Option<String>,
@@ -11726,6 +11748,31 @@ pub struct AlertsFeedResponse {
     pub next_cursor: Option<String>,
 }
 
+fn refresh_summary_for_waiting_user(
+    summary: &mut mission_store::MissionSummary,
+    waiting_for_user_tool: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    if !waiting_for_user_tool {
+        return;
+    }
+    let parsed_status = serde_json::from_value(serde_json::Value::String(summary.status.clone()))
+        .unwrap_or(MissionStatus::Active);
+    summary.needs_operator = super::operator_attention::needs_operator(
+        &super::operator_attention::OperatorAttentionInput {
+            status: parsed_status,
+            awaiting_kind: summary.awaiting_kind.as_deref(),
+            has_origin_session: summary
+                .origin_session_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty()),
+            updated_at: &summary.updated_at,
+            waiting_for_user_tool: true,
+        },
+        now,
+    );
+}
+
 /// Cross-mission feed of status-change alerts, newest first. Source of truth
 /// is `mission_events` (`mission_status_changed`), decorated best-effort with
 /// mission summaries and Telegram delivery state.
@@ -11736,95 +11783,139 @@ pub async fn get_alerts_feed(
 ) -> Result<Json<AlertsFeedResponse>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-
-    let events = control
-        .mission_store
-        .get_status_events_global(query.before.as_deref(), limit)
-        .await
-        .map_err(internal_error)?;
-
-    // Cursor comes from the raw (unfiltered) page so pagination never stalls
-    // even when a status filter empties a page.
-    let next_cursor = if events.len() == limit {
-        events.last().map(|e| e.timestamp.clone())
-    } else {
-        None
-    };
-
+    let needs_operator_only = query.needs_operator == Some(true);
     let wanted: Option<Vec<String>> = query.statuses.as_deref().map(|s| {
         s.split(',')
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty())
             .collect()
     });
-
-    let mut entries: Vec<AlertFeedEntry> = events
+    let waiting_user_ids: HashSet<Uuid> = control
+        .mission_store
+        .list_active_mission_runs()
+        .await
+        .unwrap_or_default()
         .into_iter()
-        .filter_map(|e| {
-            let status = e.metadata.get("status")?.as_str()?.to_string();
-            if let Some(wanted) = &wanted {
-                if !wanted.contains(&status) {
-                    return None;
-                }
-            }
-            Some(AlertFeedEntry {
-                mission_id: e.mission_id,
-                status,
-                summary: e.content,
-                timestamp: e.timestamp,
-                mission: None,
-                delivery: None,
-            })
-        })
+        .filter(|run| run.execution_state == MissionExecutionState::WaitingUser)
+        .map(|run| run.mission_id)
         .collect();
+    let now = chrono::Utc::now();
 
-    let mission_ids: Vec<Uuid> = {
-        let mut ids: Vec<Uuid> = entries.iter().map(|e| e.mission_id).collect();
-        ids.sort();
-        ids.dedup();
-        ids
+    // `needs_operator` is sparse, so walk raw pages until we fill `limit`
+    // (or exhaust) instead of returning an empty 30-row window.
+    const MAX_OPERATOR_PAGES: usize = 10;
+    let max_pages = if needs_operator_only {
+        MAX_OPERATOR_PAGES
+    } else {
+        1
     };
+    let mut before = query.before.clone();
+    let mut entries: Vec<AlertFeedEntry> = Vec::new();
+    let mut next_cursor = None;
+    let mut seen_ids: HashSet<Uuid> = HashSet::new();
+    let mut summaries: HashMap<Uuid, mission_store::MissionSummary> = HashMap::new();
+    let mut telegram_alerts = Vec::new();
 
-    let summaries = control
-        .mission_store
-        .get_mission_summaries(&mission_ids)
-        .await
-        .map_err(internal_error)?;
-    let telegram_alerts = control
-        .mission_store
-        .list_telegram_alerts_for_missions(&mission_ids)
-        .await
-        .unwrap_or_default();
+    for _ in 0..max_pages {
+        let events = control
+            .mission_store
+            .get_status_events_global(before.as_deref(), limit)
+            .await
+            .map_err(internal_error)?;
+        let page_len = events.len();
+        next_cursor = if page_len == limit {
+            events.last().map(|e| e.timestamp.clone())
+        } else {
+            None
+        };
 
-    for entry in &mut entries {
-        entry.mission = summaries.get(&entry.mission_id).cloned();
-        // Loose join: telegram_alerts has no FK to the event row; match the
-        // alert class (`mission_<status>` before any `:` suffix). The list is
-        // ordered created_at DESC, so the first match is the most recent.
-        let class = format!("mission_{}", entry.status);
-        entry.delivery = telegram_alerts
-            .iter()
-            .find(|a| {
-                a.mission_id == Some(entry.mission_id)
-                    && a.event_kind.split(':').next().unwrap_or(&a.event_kind) == class
+        let mut page: Vec<AlertFeedEntry> = events
+            .into_iter()
+            .filter_map(|e| {
+                let status = e.metadata.get("status")?.as_str()?.to_string();
+                if let Some(wanted) = &wanted {
+                    if !wanted.contains(&status) {
+                        return None;
+                    }
+                }
+                Some(AlertFeedEntry {
+                    mission_id: e.mission_id,
+                    status,
+                    summary: e.content,
+                    timestamp: e.timestamp,
+                    mission: None,
+                    delivery: None,
+                })
             })
-            .map(|a| AlertFeedDelivery {
-                channel: "telegram",
-                status: a.status.clone(),
-                sent_at: a.sent_at.clone(),
-                acknowledged_at: a.acknowledged_at.clone(),
-                last_error: a.last_error.clone(),
-            });
-    }
+            .collect();
 
-    if query.needs_operator == Some(true) {
-        entries.retain(|entry| {
-            entry
-                .mission
-                .as_ref()
-                .is_some_and(|summary| summary.needs_operator)
-        });
+        let new_ids: Vec<Uuid> = {
+            let mut ids: Vec<Uuid> = page
+                .iter()
+                .map(|e| e.mission_id)
+                .filter(|id| seen_ids.insert(*id))
+                .collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        };
+        if !new_ids.is_empty() {
+            let fetched = control
+                .mission_store
+                .get_mission_summaries(&new_ids)
+                .await
+                .map_err(internal_error)?;
+            summaries.extend(fetched);
+            telegram_alerts.extend(
+                control
+                    .mission_store
+                    .list_telegram_alerts_for_missions(&new_ids)
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+
+        for entry in &mut page {
+            if let Some(summary) = summaries.get_mut(&entry.mission_id) {
+                let waiting = waiting_user_ids.contains(&entry.mission_id);
+                refresh_summary_for_waiting_user(summary, waiting, now);
+                entry.mission = Some(summary.clone());
+            }
+            let class = format!("mission_{}", entry.status);
+            entry.delivery = telegram_alerts
+                .iter()
+                .find(|a| {
+                    a.mission_id == Some(entry.mission_id)
+                        && a.event_kind.split(':').next().unwrap_or(&a.event_kind) == class
+                })
+                .map(|a| AlertFeedDelivery {
+                    channel: "telegram",
+                    status: a.status.clone(),
+                    sent_at: a.sent_at.clone(),
+                    acknowledged_at: a.acknowledged_at.clone(),
+                    last_error: a.last_error.clone(),
+                });
+        }
+
+        if needs_operator_only {
+            page.retain(|entry| {
+                super::operator_attention::alert_event_is_operator_page(
+                    &entry.status,
+                    entry
+                        .mission
+                        .as_ref()
+                        .is_some_and(|summary| summary.needs_operator),
+                    waiting_user_ids.contains(&entry.mission_id),
+                )
+            });
+        }
+        entries.extend(page);
+        if entries.len() >= limit || next_cursor.is_none() {
+            break;
+        }
+        before = next_cursor.clone();
     }
+    entries.truncate(limit);
 
     Ok(Json(AlertsFeedResponse {
         alerts: entries,

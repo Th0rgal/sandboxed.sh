@@ -24,21 +24,20 @@ pub fn alert_kind_for_status(status: MissionStatus) -> Option<&'static str> {
 pub fn alert_importance_for_mission(
     mission: &Mission,
     interest: TelegramMissionInterestLevel,
+    waiting_for_user_tool: bool,
 ) -> &'static str {
     if interest == TelegramMissionInterestLevel::High {
         return "high";
     }
+    if crate::api::operator_attention::mission_needs_operator(
+        mission,
+        waiting_for_user_tool,
+        Utc::now(),
+    ) {
+        return "high";
+    }
     match mission.status {
         MissionStatus::Failed | MissionStatus::Blocked => "high",
-        MissionStatus::AwaitingUser
-            if crate::api::operator_attention::mission_needs_operator(
-                mission,
-                false,
-                Utc::now(),
-            ) =>
-        {
-            "high"
-        }
         MissionStatus::Active => "normal",
         _ => "low",
     }
