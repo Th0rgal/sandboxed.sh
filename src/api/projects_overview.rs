@@ -256,18 +256,30 @@ fn ingest_deliveries_with_live(
                 1
             }
         };
-        // record_state / record_silent_observation return 0 for an already-
-        // counted or older delivery; do not project mode from that `at`.
-        if observations > 0
-            && !is_mission_inspect_callback(&delivery.headline, delivery.state.as_deref())
-        {
+        // Queue the newest gated_mode even when this delivery was already
+        // counted: a crash between record_state and project_mode_from_signal
+        // must retry. The mode watermark rejects older-than-watermark signals,
+        // so a replay stays idempotent. Inspect callbacks still never write.
+        if !is_mission_inspect_callback(&delivery.headline, delivery.state.as_deref()) {
             if let Some(mode) = gated_mode {
                 let base = mode.split_once(':').map_or(mode, |(base, _)| base);
                 let blocker = mode.split_once(':').map(|(_, cause)| cause);
+                let wait = if observations > 0 {
+                    observations.saturating_sub(1) as i64
+                } else {
+                    // Already counted: reuse the stored observation count so
+                    // a retry does not reset wait_ticks to 0.
+                    projects
+                        .state_timeline(slug, 1)
+                        .ok()
+                        .and_then(|events| events.into_iter().next())
+                        .map(|event| event.observations.saturating_sub(1) as i64)
+                        .unwrap_or(0)
+                };
                 let write = PendingModeWrite {
                     at: delivery.at.clone(),
                     mode: base.to_string(),
-                    wait: observations.saturating_sub(1) as i64,
+                    wait,
                     blocker: blocker.map(str::to_string),
                 };
                 if pending_modes.get(slug).is_none_or(|existing| {
@@ -1899,11 +1911,13 @@ pub async fn projects_overview(
         let builder = rows
             .entry(key.clone())
             .or_insert_with(|| ProjectRowBuilder::new(key.clone()));
+        let mode_signal_at = record.mode_signal_at.or(Some(record.updated_at));
         if is_canonical {
             builder.title = record.title;
             builder.next_action = record.next_action;
             builder.mode = record.mode;
             builder.controller_cron_id = record.controller_cron_id;
+            builder.mode_signal_at = mode_signal_at;
         } else {
             builder.title = builder.title.take().or(record.title);
             builder.next_action = builder.next_action.take().or(record.next_action);
@@ -1912,6 +1926,7 @@ pub async fn projects_overview(
                 .controller_cron_id
                 .take()
                 .or(record.controller_cron_id);
+            builder.mode_signal_at = builder.mode_signal_at.take().or(mode_signal_at);
         }
     }
     // The latest ingested state per project becomes the row's latest_update —
@@ -2142,6 +2157,9 @@ struct ProjectRowBuilder {
     /// Health inputs, accumulated alongside the display chips.
     health_inputs: Vec<OwnedHealthInput>,
     latest_update: Option<DeliveryUpdate>,
+    /// When the roster mode/blocker was last written. Ages "blocker reported"
+    /// independently of the newest state-event timestamp.
+    mode_signal_at: Option<String>,
     /// How many consecutive deliveries reported the latest state — the stall
     /// signal's input, read from the store's observation count.
     latest_observations: u32,
@@ -2163,6 +2181,7 @@ impl ProjectRowBuilder {
             missions: Vec::new(),
             health_inputs: Vec::new(),
             latest_update: None,
+            mode_signal_at: None,
             latest_observations: 0,
             updates_count: 0,
             autonomy_level: None,
@@ -2199,7 +2218,13 @@ impl ProjectRowBuilder {
 
         if let Some(latest) = &self.latest_update {
             if let Some(blocker) = latest.blocker.as_deref() {
-                let stale_mode = chrono::DateTime::parse_from_rfc3339(&latest.at)
+                // Age from the mode write, not the newest state event. A
+                // fresh mission callback refreshes `latest.at` without
+                // touching a stale roster blocker; a fresh HTTP set_mode
+                // stamps `mode_signal_at` even when the last state event is
+                // old.
+                let signal_at = self.mode_signal_at.as_deref().unwrap_or(&latest.at);
+                let stale_mode = chrono::DateTime::parse_from_rfc3339(signal_at)
                     .ok()
                     .zip(chrono::DateTime::parse_from_rfc3339(now).ok())
                     .is_some_and(|(at, now)| {
@@ -4904,6 +4929,7 @@ mod tests {
     fn stale_blocker_signal_does_not_raise_blocker_reported() {
         let mut builder = ProjectRowBuilder::new("verity".into());
         builder.controller_cron_id = Some("cron-1".into());
+        builder.mode_signal_at = Some("2026-08-02T11:00:00Z".into());
         builder.attach_store_update(
             active_update("2026-08-02T11:00:00Z", Some("waiting on CI")),
             1,
@@ -4918,5 +4944,115 @@ mod tests {
             row.attention_reasons
         );
         assert_eq!(row.controller_health, Some("stale"));
+    }
+
+    #[test]
+    fn stale_roster_blocker_does_not_chip_when_state_event_is_fresh() {
+        let mut builder = ProjectRowBuilder::new("verity".into());
+        builder.mode_signal_at = Some("2026-08-02T11:00:00Z".into());
+        builder.attach_store_update(
+            active_update("2026-08-04T11:50:00Z", Some("waiting on CI")),
+            1,
+            5,
+        );
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert!(
+            !row.attention_reasons
+                .iter()
+                .any(|r| r.contains("blocker reported")),
+            "a stale roster blocker must not look new just because a callback refreshed latest.at: {:?}",
+            row.attention_reasons
+        );
+    }
+
+    #[test]
+    fn fresh_mode_signal_chips_even_when_state_event_is_old() {
+        let mut builder = ProjectRowBuilder::new("verity".into());
+        builder.mode_signal_at = Some("2026-08-04T11:50:00Z".into());
+        builder.attach_store_update(
+            active_update("2026-08-02T11:00:00Z", Some("waiting on CI")),
+            1,
+            5,
+        );
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert!(
+            row.attention_reasons
+                .iter()
+                .any(|r| r.contains("blocker reported")),
+            "a fresh HTTP/mode signal must chip even when the last state event is old: {:?}",
+            row.attention_reasons
+        );
+    }
+
+    #[test]
+    fn already_counted_delivery_retries_deferred_mode_write() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity", None, None, None, None)
+            .expect("seed");
+        let content = "[Cron delivery: Verity]\nBlocked\n\
+                       [CTRL: verity | mode=blocked:lease | wait=0 | next=wait]\n\
+                       [STATE_SIGNATURE: verity|phase|head|blocked]\n";
+        let delivery = parse_delivery("sess", 1_754_003_600.0, content);
+        // State committed, mode write lost — the crash window the next scan
+        // must retry instead of treating observations==0 as completion.
+        let descriptor = delivery.state.clone().expect("descriptor");
+        assert_eq!(
+            store
+                .record_state(
+                    "verity",
+                    &descriptor,
+                    Some(delivery.headline.as_str()),
+                    &delivery.at,
+                    Some("sess"),
+                )
+                .expect("pre-record"),
+            1
+        );
+        assert_eq!(
+            store
+                .get_project("verity")
+                .expect("read")
+                .expect("present")
+                .mode,
+            None
+        );
+        ingest_deliveries(&store, &HashMap::new(), &HashMap::new(), vec![delivery]);
+        let record = store.get_project("verity").expect("read").expect("present");
+        assert_eq!(record.mode.as_deref(), Some("blocked"));
+        assert_eq!(record.blocker.as_deref(), Some("lease"));
+        assert_eq!(record.wait_ticks, 0);
+        assert!(record.mode_signal_at.is_some());
+    }
+
+    #[test]
+    fn replaying_an_already_applied_mode_does_not_reset_wait() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        for i in 0..3 {
+            let tick = "[Cron delivery: Lido]\n[SILENT]\n[CTRL: lido | mode=blocked:transport-cap | wait=0 | next=x]";
+            ingest_deliveries(
+                &store,
+                &HashMap::new(),
+                &HashMap::new(),
+                vec![parse_delivery(
+                    &format!("sess-{i}"),
+                    1_754_000_000.0 + (i as f64) * 60.0,
+                    tick,
+                )],
+            );
+        }
+        let before = store.get_project("lido").expect("read").expect("present");
+        assert_eq!(before.wait_ticks, 2);
+        let last = "[Cron delivery: Lido]\n[SILENT]\n[CTRL: lido | mode=blocked:transport-cap | wait=0 | next=x]";
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            vec![parse_delivery("sess-2", 1_754_000_000.0 + 120.0, last)],
+        );
+        let after = store.get_project("lido").expect("read").expect("present");
+        assert_eq!(after.mode.as_deref(), Some("blocked"));
+        assert_eq!(after.blocker.as_deref(), Some("transport-cap"));
+        assert_eq!(after.wait_ticks, 2);
     }
 }

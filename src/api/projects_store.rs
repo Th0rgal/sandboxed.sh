@@ -728,7 +728,8 @@ impl ProjectsStore {
             .prepare(
                 "SELECT slug, title, objective, status, mode, wait_ticks, \
                  next_action, blocker, controller_cron_id, repository, \
-                 created_at, updated_at FROM projects ORDER BY updated_at DESC, slug",
+                 created_at, updated_at, mode_signal_at FROM projects \
+                 ORDER BY updated_at DESC, slug",
             )
             .map_err(|e| e.to_string())?;
         let rows = statement
@@ -745,7 +746,7 @@ impl ProjectsStore {
             .query_row(
                 "SELECT slug, title, objective, status, mode, wait_ticks, \
                  next_action, blocker, controller_cron_id, repository, \
-                 created_at, updated_at FROM projects WHERE slug = ?1",
+                 created_at, updated_at, mode_signal_at FROM projects WHERE slug = ?1",
                 params![slug],
                 Self::project_from_row,
             )
@@ -891,6 +892,7 @@ impl ProjectsStore {
             repository: row.get(9)?,
             created_at: row.get(10)?,
             updated_at: row.get(11)?,
+            mode_signal_at: row.get(12)?,
         })
     }
 
@@ -1598,6 +1600,8 @@ pub struct ProjectRecord {
     pub repository: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_signal_at: Option<String>,
 }
 
 /// A chat-planned roadmap item: the project-scoped precursor of a board task.
@@ -2126,7 +2130,12 @@ mod tests {
         store
             .set_mode("bench", "active", Some("run"), None)
             .expect("m1");
-        assert_eq!(store.get_project("bench").unwrap().unwrap().wait_ticks, 0);
+        let after_http = store.get_project("bench").unwrap().unwrap();
+        assert_eq!(after_http.wait_ticks, 0);
+        assert!(
+            after_http.mode_signal_at.is_some(),
+            "HTTP set_mode must stamp mode_signal_at so explicit blockers stay fresh"
+        );
 
         // Same mode+blocker two more ticks: the counter is how long it's been here.
         store
