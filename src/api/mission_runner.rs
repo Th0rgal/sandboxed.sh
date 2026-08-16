@@ -7694,24 +7694,11 @@ fn elf_machine_name(machine: u16) -> &'static str {
     }
 }
 
-/// Resolve an overlay probe without following a symlink out of the rootfs.
-/// `File::open` would chase an absolute `/usr/bin/dash` link onto the host.
-fn overlay_trusted_path(
-    workspace: &crate::workspace::Workspace,
-    path: &std::path::Path,
+/// Keep every hop under the overlay root. `..` that walks out is refused.
+fn normalize_overlay_path(
+    root: &std::path::Path,
+    joined: std::path::PathBuf,
 ) -> Option<std::path::PathBuf> {
-    let meta = path.symlink_metadata().ok()?;
-    if !meta.file_type().is_symlink() {
-        return Some(path.to_path_buf());
-    }
-    let target = std::fs::read_link(path).ok()?;
-    let joined = if target.is_absolute() {
-        workspace
-            .path
-            .join(target.strip_prefix("/").unwrap_or(target.as_path()))
-    } else {
-        path.parent()?.join(target)
-    };
     let mut normalized = std::path::PathBuf::new();
     for component in joined.components() {
         match component {
@@ -7726,9 +7713,36 @@ fn overlay_trusted_path(
             std::path::Component::Normal(_) => normalized.push(component),
         }
     }
-    normalized
-        .starts_with(&workspace.path)
-        .then_some(normalized)
+    normalized.starts_with(root).then_some(normalized)
+}
+
+/// Resolve an overlay probe without following a symlink out of the rootfs.
+/// `File::open` would chase an absolute `/usr/bin/dash` link onto the host.
+/// A chain such as `sh -> /etc/alternatives/sh -> /usr/bin/dash` must be
+/// rewritten hop-by-hop; stopping after the first link still leaves a
+/// host-absolute target.
+fn overlay_trusted_path(
+    workspace: &crate::workspace::Workspace,
+    path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    const MAX_SYMLINK_HOPS: usize = 32;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let meta = current.symlink_metadata().ok()?;
+        if !meta.file_type().is_symlink() {
+            return Some(current);
+        }
+        let target = std::fs::read_link(&current).ok()?;
+        let joined = if target.is_absolute() {
+            workspace
+                .path
+                .join(target.strip_prefix("/").unwrap_or(target.as_path()))
+        } else {
+            current.parent()?.join(target)
+        };
+        current = normalize_overlay_path(&workspace.path, joined)?;
+    }
+    None
 }
 
 fn overlay_elf_e_machine(
@@ -9333,6 +9347,47 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_elf_follows_a_two_level_symlink_chain_inside_the_rootfs() {
+        let container = tempfile::tempdir().unwrap();
+        write_fake_elf(
+            &container.path().join("usr/bin/dash"),
+            super::ELF_EM_AARCH64,
+        );
+        fs::create_dir_all(container.path().join("etc/alternatives")).unwrap();
+        fs::create_dir_all(container.path().join("bin")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(
+                "/usr/bin/dash",
+                container.path().join("etc/alternatives/sh"),
+            )
+            .unwrap();
+            symlink("/etc/alternatives/sh", container.path().join("bin/sh")).unwrap();
+        }
+        let workspace = container_workspace_at(container.path());
+        assert_eq!(
+            super::overlay_elf_e_machine(&workspace, &container.path().join("bin/sh")),
+            Some(super::ELF_EM_AARCH64),
+            "must read the overlay dash ELF, not follow the second link onto the host"
+        );
+
+        let host = tempfile::tempdir().unwrap();
+        write_fake_elf(&host.path().join("grok"), super::ELF_EM_X86_64);
+        let err = super::copy_host_executable_into_container(&workspace, &host.path().join("grok"))
+            .expect_err("cross-arch copy must be refused after resolving the symlink chain");
+        assert!(
+            err.contains("does not match container arch"),
+            "expected arch-mismatch error, got: {err}"
+        );
+        assert!(
+            !container.path().join("usr/local/bin/grok").exists(),
+            "refused copy must not leave a guest binary"
+        );
     }
 
     #[test]

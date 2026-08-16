@@ -24,11 +24,18 @@ use crate::workspace_exec::WorkspaceExec;
 /// `opt/grok-cli` would otherwise become the exec path, and nsenter without
 /// `--root` would resolve it on the host.
 fn grok_overlay_guest_path(workspace: &Workspace, program: &str) -> Option<String> {
-    let relative = (!program.starts_with('/')).then_some(program);
-    let overlay = container_overlay_command_path(workspace, "/usr/local/bin/grok")
-        .or_else(|| container_overlay_command_path(workspace, "grok"))
-        .or_else(|| relative.and_then(|name| container_overlay_command_path(workspace, name)))?;
-    Some(container_overlay_guest_path(workspace, &overlay, "grok"))
+    // Relative cli_path overrides (e.g. `custom-grok`) must win over the
+    // ordinary overlay binary. Absolute configured programs are host paths
+    // and are never overlay-looked-up.
+    let overlay = if program.starts_with('/') {
+        container_overlay_command_path(workspace, "/usr/local/bin/grok")
+            .or_else(|| container_overlay_command_path(workspace, "grok"))?
+    } else {
+        container_overlay_command_path(workspace, program)
+            .or_else(|| container_overlay_command_path(workspace, "/usr/local/bin/grok"))
+            .or_else(|| container_overlay_command_path(workspace, "grok"))?
+    };
+    Some(container_overlay_guest_path(workspace, &overlay, program))
 }
 
 /// Whether nsenter `Present` may be used as the exec path. Absolute container
@@ -1757,6 +1764,25 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[test]
+    fn grok_overlay_prefers_configured_relative_program() {
+        let root = tempfile::tempdir().unwrap();
+        write_executable(
+            &root.path().join("usr/local/bin/grok"),
+            b"#!/bin/sh\necho ordinary\n",
+        );
+        write_executable(
+            &root.path().join("usr/local/bin/custom-grok"),
+            b"#!/bin/sh\necho custom\n",
+        );
+        let workspace = container_workspace_at(root.path());
+        assert_eq!(
+            grok_overlay_guest_path(&workspace, "custom-grok").as_deref(),
+            Some("/usr/local/bin/custom-grok"),
+            "relative cli_path must win over ordinary /usr/local/bin/grok"
+        );
     }
 
     #[test]
