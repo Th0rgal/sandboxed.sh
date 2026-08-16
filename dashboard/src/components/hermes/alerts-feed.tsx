@@ -15,10 +15,15 @@ import { cn } from "@/lib/utils";
 
 type FeedFilter = "all" | "needs-you" | "finished";
 
-const FILTER_STATUSES: Record<FeedFilter, string[] | undefined> = {
-  all: undefined,
-  "needs-you": ["awaiting_user"],
-  finished: ["completed", "failed", "interrupted", "blocked", "not_feasible"],
+const FILTER_QUERY: Record<
+  FeedFilter,
+  { statuses?: string[]; needs_operator?: boolean }
+> = {
+  all: {},
+  "needs-you": { needs_operator: true },
+  finished: {
+    statuses: ["completed", "failed", "interrupted", "blocked", "not_feasible"],
+  },
 };
 
 const FILTER_LABELS: Record<FeedFilter, string> = {
@@ -50,7 +55,7 @@ export function AlertsFeed() {
 
   const { data, isLoading } = useSWR(
     ["hermes-alerts", filter],
-    () => listAlerts({ statuses: FILTER_STATUSES[filter], limit: 30 }),
+    () => listAlerts({ ...FILTER_QUERY[filter], limit: 30 }),
     {
       refreshInterval: 15000,
       revalidateOnFocus: false,
@@ -95,7 +100,7 @@ export function AlertsFeed() {
     setLoadingMore(true);
     try {
       const page = await listAlerts({
-        statuses: FILTER_STATUSES[filter],
+        ...FILTER_QUERY[filter],
         before: cursor,
         limit: 30,
       });
@@ -170,6 +175,7 @@ function AlertRow({ alert }: { alert: AlertFeedEntry }) {
   const awaitingKind = (alert.mission?.awaiting_kind ?? null) as
     | AwaitingKind
     | null;
+  const needsOperator = alert.mission?.needs_operator === true;
   const title =
     alert.mission?.title?.trim() || getMissionShortName(alert.mission_id);
   const ts = new Date(alert.timestamp);
@@ -195,7 +201,7 @@ function AlertRow({ alert }: { alert: AlertFeedEntry }) {
       </div>
       <div className="mt-0.5 flex items-center gap-2 pl-3.5">
         <span className="shrink-0 text-[10px] font-medium text-white/50">
-          {statusLabel(status, awaitingKind)}
+          {statusLabel(status, awaitingKind, needsOperator)}
         </span>
         {alert.summary && (
           <span className="min-w-0 truncate text-[11px] text-white/40">

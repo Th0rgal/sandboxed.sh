@@ -4414,20 +4414,44 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let placeholders = vec!["?"; id_strings.len()].join(",");
             let sql = format!(
-                "SELECT id, title, status, workspace_name, awaiting_kind \
+                "SELECT id, title, status, workspace_name, awaiting_kind, \
+                 origin_session_id, COALESCE(last_status_change_at, updated_at) \
                  FROM missions WHERE id IN ({placeholders})"
             );
+            let now = chrono::Utc::now();
             let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map(rusqlite::params_from_iter(id_strings.iter()), |row| {
                     let mid: String = row.get(0)?;
+                    let status: String = row.get(2)?;
+                    let awaiting_kind: Option<String> = row.get(4)?;
+                    let origin_session_id: Option<String> = row.get(5)?;
+                    let updated_at: String = row.get(6)?;
+                    let parsed_status =
+                        serde_json::from_value::<crate::api::control::events::MissionStatus>(
+                            serde_json::Value::String(status.clone()),
+                        )
+                        .unwrap_or(crate::api::control::events::MissionStatus::Active);
+                    let needs_operator = crate::api::operator_attention::needs_operator(
+                        &crate::api::operator_attention::OperatorAttentionInput {
+                            status: parsed_status,
+                            awaiting_kind: awaiting_kind.as_deref(),
+                            has_origin_session: origin_session_id
+                                .as_deref()
+                                .is_some_and(|id| !id.is_empty()),
+                            updated_at: &updated_at,
+                            waiting_for_user_tool: false,
+                        },
+                        now,
+                    );
                     Ok((
                         mid,
                         MissionSummary {
                             title: row.get(1)?,
-                            status: row.get(2)?,
+                            status,
                             workspace_name: row.get(3)?,
-                            awaiting_kind: row.get(4)?,
+                            awaiting_kind,
+                            needs_operator,
                         },
                     ))
                 })

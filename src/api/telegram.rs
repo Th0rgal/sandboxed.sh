@@ -120,28 +120,6 @@ struct TelegramReplyRecord {
     created_at: Instant,
 }
 
-/// How long an operator/controller-launched mission may sit in `awaiting_user`
-/// before its question escalates to the human. Within this window the owning
-/// controller is expected to triage it (answer via `answer_mission_question`)
-/// on its own tick, so the human only ever sees questions the controller
-/// couldn't resolve. Overridable via `CONTROLLER_TRIAGE_GRACE_SECS`.
-const CONTROLLER_TRIAGE_GRACE_SECS: i64 = 20 * 60;
-
-/// Whether to HOLD an `awaiting_user` human alert so the owning controller can
-/// triage first. True only for a mission an operator/controller launched
-/// (`has_origin_session`) that has been awaiting for less than the triage
-/// grace. After the grace (controller didn't resolve it) or for a mission with
-/// no owning controller, the human is alerted as before.
-fn holds_for_controller_triage(
-    status: MissionStatus,
-    has_origin_session: bool,
-    awaiting_secs: i64,
-) -> bool {
-    status == MissionStatus::AwaitingUser
-        && has_origin_session
-        && awaiting_secs < CONTROLLER_TRIAGE_GRACE_SECS
-}
-
 const TELEGRAM_UPDATE_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
 const TELEGRAM_REPLY_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
 const TELEGRAM_SCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -1368,30 +1346,16 @@ async fn plan_paloma_alert_for_mission(
         .await
         .unwrap_or_default();
     let alert_now = Utc::now();
-    // Controller-first triage: a mission an operator/controller launched
-    // (origin_session_id present) that is only awaiting_user should be triaged
-    // by its OWNING controller — which reads the question and answers it via
-    // `answer_mission_question` on its tick — not bubbled straight to the human.
-    // Hold the human alert for a grace window; escalate to the human only if the
-    // question is still unanswered after `CONTROLLER_TRIAGE_GRACE_SECS` (the
-    // controller couldn't resolve it), so "needs you" stays rare and qualified.
+    // Needs You is a qualified page. Ack, inspect, and in-grace
+    // controller-owned questions stay out of the human inbox.
+    if mission.status == MissionStatus::AwaitingUser
+        && !crate::api::operator_attention::mission_needs_operator(&mission, false, alert_now)
     {
-        let awaiting_secs = chrono::DateTime::parse_from_rfc3339(&mission.updated_at)
-            .ok()
-            .map(|t| (alert_now - t.with_timezone(&Utc)).num_seconds())
-            .unwrap_or(i64::MAX);
-        if holds_for_controller_triage(
-            mission.status,
-            mission.origin_session_id.is_some(),
-            awaiting_secs,
-        ) {
-            tracing::debug!(
-                mission_id = %mission.id,
-                awaiting_secs,
-                "Paloma alert: holding awaiting_user alert — owning controller gets first triage"
-            );
-            return;
-        }
+        tracing::debug!(
+            mission_id = %mission.id,
+            "Paloma alert: holding awaiting_user — not a qualified operator page"
+        );
+        return;
     }
     let policy_snapshot = paloma_policy_snapshot_json(&mission, interest, alert_now);
     if interest == TelegramMissionInterestLevel::Muted {
@@ -7630,32 +7594,41 @@ mod tests {
     }
 
     #[test]
-    fn controller_first_triage_holds_fresh_awaiting_for_controller_owned_missions() {
-        use super::{holds_for_controller_triage, CONTROLLER_TRIAGE_GRACE_SECS};
-        // Owned by a controller + freshly awaiting → hold (controller triages).
-        assert!(holds_for_controller_triage(
-            MissionStatus::AwaitingUser,
-            true,
-            60
-        ));
-        // Past the grace → escalate to the human (controller didn't resolve it).
-        assert!(!holds_for_controller_triage(
-            MissionStatus::AwaitingUser,
-            true,
-            CONTROLLER_TRIAGE_GRACE_SECS + 1
-        ));
-        // No owning controller → alert the human as before.
-        assert!(!holds_for_controller_triage(
-            MissionStatus::AwaitingUser,
-            false,
-            60
-        ));
-        // Not an awaiting-user question → unaffected.
-        assert!(!holds_for_controller_triage(
-            MissionStatus::Failed,
-            true,
-            60
-        ));
+    fn controller_first_triage_holds_unqualified_awaiting_user() {
+        use crate::api::mission_store::AwaitingKind;
+        use crate::api::operator_attention::{
+            mission_needs_operator, CONTROLLER_TRIAGE_GRACE_SECS,
+        };
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
+        let mut owned = test_mission("triage me", MissionStatus::AwaitingUser);
+        owned.awaiting_kind = Some(AwaitingKind::Decision);
+        owned.origin_session_id = Some("sess-1".into());
+        owned.updated_at = (now - chrono::Duration::seconds(60)).to_rfc3339();
+        assert!(
+            !mission_needs_operator(&owned, false, now),
+            "fresh controller-owned decision stays with the controller"
+        );
+
+        owned.updated_at =
+            (now - chrono::Duration::seconds(CONTROLLER_TRIAGE_GRACE_SECS + 1)).to_rfc3339();
+        assert!(
+            mission_needs_operator(&owned, false, now),
+            "expired grace pages the human"
+        );
+
+        let mut unowned = test_mission("ask the human", MissionStatus::AwaitingUser);
+        unowned.awaiting_kind = Some(AwaitingKind::Decision);
+        unowned.origin_session_id = None;
+        unowned.updated_at = (now - chrono::Duration::seconds(5)).to_rfc3339();
+        assert!(mission_needs_operator(&unowned, false, now));
+
+        let mut ack = test_mission("review me", MissionStatus::AwaitingUser);
+        ack.awaiting_kind = Some(AwaitingKind::Ack);
+        ack.origin_session_id = Some("sess-1".into());
+        ack.updated_at =
+            (now - chrono::Duration::seconds(CONTROLLER_TRIAGE_GRACE_SECS + 1)).to_rfc3339();
+        assert!(!mission_needs_operator(&ack, false, now));
     }
 
     #[test]
@@ -7777,6 +7750,19 @@ mod tests {
         );
         assert_eq!(
             paloma_alert_importance_for_mission(&mission, TelegramMissionInterestLevel::High),
+            "high"
+        );
+
+        let mut ack = test_mission("review me", MissionStatus::AwaitingUser);
+        ack.awaiting_kind = Some(crate::api::mission_store::AwaitingKind::Ack);
+        assert_eq!(
+            paloma_alert_importance_for_mission(&ack, TelegramMissionInterestLevel::Normal),
+            "low"
+        );
+        let mut decision = test_mission("pick one", MissionStatus::AwaitingUser);
+        decision.awaiting_kind = Some(crate::api::mission_store::AwaitingKind::Decision);
+        assert_eq!(
+            paloma_alert_importance_for_mission(&decision, TelegramMissionInterestLevel::Normal),
             "high"
         );
     }

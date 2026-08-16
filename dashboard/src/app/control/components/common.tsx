@@ -55,6 +55,7 @@ export function missionStatusLabel(
   status: MissionStatus,
   isRunning = false,
   awaitingKind?: AwaitingKind | null,
+  needsOperator = false,
 ): {
   label: string;
   className: string;
@@ -75,15 +76,15 @@ export function missionStatusLabel(
       };
     case "awaiting_user":
       // Distinguish "agent asked a question" (decision) from "agent finished,
-      // waiting to be acked/merged" (ack). The old single "Needs You" label
-      // was ambiguous.
+      // waiting to be acked/merged" (ack). Missing kind is Awaiting Review
+      // unless the API marked this a qualified operator page.
       if (awaitingKind === "decision") {
         return {
           label: "Needs Decision",
           className: "bg-amber-500/20 text-amber-400",
         };
       }
-      if (awaitingKind === "ack") {
+      if (awaitingKind === "ack" || !needsOperator) {
         return {
           label: "Awaiting Review",
           className: "bg-sky-500/20 text-sky-400",
