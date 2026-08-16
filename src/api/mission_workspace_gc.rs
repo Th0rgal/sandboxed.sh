@@ -884,7 +884,7 @@ async fn orphan_sweep(
             if !scanned_roots.insert(physical_root) {
                 continue;
             }
-            let root = workspace::workspaces_root_for(&workspace_root);
+            let root = workspace::workspaces_root_for(workspace_root);
             let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
                 continue;
             };

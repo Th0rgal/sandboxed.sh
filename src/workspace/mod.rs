@@ -963,14 +963,17 @@ fn persist_mission_workspace_root(workspace: &Workspace, mission_id: Uuid, root:
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)?;
         fs2::FileExt::lock_exclusive(&lock_file)?;
         let mut roots: HashMap<String, String> = std::fs::read_to_string(&path)
             .ok()
             .and_then(|contents| serde_json::from_str(&contents).ok())
             .unwrap_or_default();
-        if !roots.contains_key(&mission_id.to_string()) {
-            roots.insert(mission_id.to_string(), root.to_string_lossy().into_owned());
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            roots.entry(mission_id.to_string())
+        {
+            entry.insert(root.to_string_lossy().into_owned());
             atomic_write_mission_workspace_roots(&path, &roots)?;
         }
         fs2::FileExt::unlock(&lock_file)?;
