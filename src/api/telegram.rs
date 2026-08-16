@@ -3766,6 +3766,8 @@ async fn resolve_or_create_mission(
             working_directory: None,
             scheduling: Default::default(),
             requires_local_disk: true,
+            estimated_disk_gib: None,
+            admission_tags: Vec::new(),
             respond: tx,
         })
         .await;
@@ -6938,6 +6940,7 @@ mod tests {
             terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
+            requires_local_disk: true,
             mission_mode: MissionMode::Task,
             goal_mode: false,
             goal_objective: None,

@@ -315,6 +315,14 @@ fn canonicalize_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn is_within_workspace_or_mission(
+    path: &Path,
+    workspace_root: &Path,
+    mission_root: Option<&Path>,
+) -> bool {
+    path.starts_with(workspace_root) || mission_root.is_some_and(|root| path.starts_with(root))
+}
+
 /// Search one level deep inside the mission workspace for a file whose tail
 /// matches `resolved`. Used when the agent worked inside a cloned-repo
 /// subdirectory and the dashboard's path resolution doesn't account for it.
@@ -322,11 +330,15 @@ fn canonicalize_or_original(path: &Path) -> PathBuf {
 /// (ambiguous matches stay an error so the caller's existing 4xx handling
 /// surfaces the issue).
 async fn find_in_mission_subdirs(
-    workspace_root: &Path,
+    workspace: &crate::workspace::Workspace,
     mission_id: uuid::Uuid,
     resolved: &Path,
 ) -> Option<PathBuf> {
-    let mission_dir = crate::workspace::mission_workspace_dir_for_root(workspace_root, mission_id);
+    // Do not synthesize a default host workspace here.  Besides losing
+    // container/custom workspace identity, that made the shallow dashboard
+    // lookup consult the default-host root registry for a mission belonging
+    // to a different workspace.
+    let mission_dir = crate::workspace::mission_workspace_dir_for_workspace(workspace, mission_id);
     let tail = resolved.strip_prefix(&mission_dir).ok()?;
     if tail.as_os_str().is_empty() {
         return None;
@@ -602,6 +614,21 @@ pub async fn resolve_path_for_workspace(
         )
     })?;
 
+    // A persisted placement is a capability, not a hint.  In particular, a
+    // vanished mount can leave an identically named directory on the parent
+    // disk.  Validate it before any path rewriting or create-on-upload path
+    // can reach that directory.
+    if let Some(mid) = mission_id {
+        crate::workspace::ensure_persisted_mission_root_is_available(&workspace, mid).map_err(
+            |error| {
+                (
+                    StatusCode::CONFLICT,
+                    format!("persisted mission workspace root is unavailable: {error}"),
+                )
+            },
+        )?;
+    }
+
     let workspace_root = workspace.path.canonicalize().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -611,8 +638,21 @@ pub async fn resolve_path_for_workspace(
 
     let input = Path::new(path);
 
+    // Older dashboard clients derive an absolute mission path from the
+    // workspace's legacy root. Preserve that request shape after a mission
+    // has been placed under MISSION_WORKSPACE_ROOT by translating only the
+    // exact legacy mission prefix to its persisted workspace-aware location.
+    let relocated_input = mission_id.and_then(|mid| {
+        let legacy = crate::workspace::mission_workspace_dir_for_root(&workspace.path, mid);
+        input.strip_prefix(&legacy).ok().map(|tail| {
+            crate::workspace::mission_workspace_dir_for_workspace(&workspace, mid).join(tail)
+        })
+    });
+
     // Resolve the final path based on input type
-    let mut resolved = if input.is_absolute() {
+    let mut resolved = if let Some(relocated) = relocated_input {
+        relocated
+    } else if input.is_absolute() {
         if workspace.workspace_type == WorkspaceType::Container {
             if input.starts_with(&workspace_root) {
                 input.to_path_buf()
@@ -657,7 +697,7 @@ pub async fn resolve_path_for_workspace(
     // contains the same tail, transparently use that match.
     if let Some(mid) = mission_id {
         if !resolved.exists() {
-            if let Some(rerooted) = find_in_mission_subdirs(&workspace_root, mid, &resolved).await {
+            if let Some(rerooted) = find_in_mission_subdirs(&workspace, mid, &resolved).await {
                 resolved = rerooted;
             }
         }
@@ -768,10 +808,39 @@ pub async fn resolve_path_for_workspace(
     // Validate that the resolved path is within an allowed location
     // This can be either the workspace root or the global context directory for missions
     let context_root = canonicalize_or_original(&api_context_root(state));
-    let in_workspace = canonical.starts_with(&workspace_root);
+    let mission_root = mission_id
+        .map(|mid| crate::workspace::mission_workspace_dir_for_workspace(&workspace, mid));
+    let in_workspace =
+        is_within_workspace_or_mission(&canonical, &workspace_root, mission_root.as_deref());
+    // An orchestrated worker can deliberately use a worktree under its
+    // ancestor's mission directory.  Do not turn that into a broad allowance
+    // for every relocated root: accept it only when the directory's actual
+    // `workspaces/mission-<short>` ancestor resolves to one unambiguous,
+    // identity-verified persisted owner.
+    let verified_ancestor_owner = (!in_workspace && mission_id.is_some())
+        .then(|| {
+            crate::workspace::verify_explicit_mission_working_directory_owner(
+                &workspace, &canonical,
+            )
+        })
+        .transpose()
+        .map_err(|_| ())
+        .ok()
+        .flatten();
+    let in_verified_ancestor_mission = match (mission_id, verified_ancestor_owner) {
+        (Some(requester), Some(owner)) => {
+            // The placement check proves the path's filesystem owner; the
+            // control-plane ancestry check prevents a sibling mission in a
+            // shared workspace from borrowing that capability.
+            requester_descends_from(&state.control, requester, owner)
+                .await
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
     let in_context = mission_id.is_some() && canonical.starts_with(&context_root);
 
-    if !in_workspace && !in_context {
+    if !in_workspace && !in_verified_ancestor_mission && !in_context {
         return Err((
             StatusCode::FORBIDDEN,
             format!(
@@ -782,6 +851,40 @@ pub async fn resolve_path_for_workspace(
     }
 
     Ok(canonical)
+}
+
+async fn requester_descends_from(
+    control: &crate::api::control::ControlHub,
+    requester: uuid::Uuid,
+    owner: uuid::Uuid,
+) -> Result<bool, String> {
+    let (store, mission) = control
+        .find_mission_store_owner(requester)
+        .await?
+        .ok_or_else(|| "requesting mission is unavailable".to_string())?;
+    mission_descends_from_in_store(store.as_ref(), mission, owner).await
+}
+
+async fn mission_descends_from_in_store(
+    store: &dyn crate::api::mission_store::MissionStore,
+    mut mission: crate::api::mission_store::Mission,
+    owner: uuid::Uuid,
+) -> Result<bool, String> {
+    for _ in 0..64 {
+        if mission.id == owner {
+            return Ok(true);
+        }
+        let Some(parent_id) = mission.parent_mission_id else {
+            return Ok(false);
+        };
+        // Stay inside the requester's store. A parent id that only exists in
+        // another user's store is not an ancestor for path authorization.
+        let Some(parent) = store.get_mission(parent_id).await? else {
+            return Ok(false);
+        };
+        mission = parent;
+    }
+    Err("mission ancestry exceeds safe depth".to_string())
 }
 
 fn resolve_upload_base(path: &str) -> Result<PathBuf, (StatusCode, String)> {
@@ -1435,9 +1538,11 @@ pub async fn upload_finalize(
 mod tests {
     use super::{
         api_context_root_for_config, context_mirror_suffix, context_upload_suffix_for_dir,
-        is_context_upload_path_for_dir, path_is_under_allowed_roots, sanitize_path_component,
-        upload_display_path, validate_chunk_upload_shape, MAX_CHUNK_UPLOAD_CHUNKS,
+        is_context_upload_path_for_dir, is_within_workspace_or_mission,
+        path_is_under_allowed_roots, sanitize_path_component, upload_display_path,
+        validate_chunk_upload_shape, MAX_CHUNK_UPLOAD_CHUNKS,
     };
+    use crate::api::mission_store::MissionStore;
     use crate::config::Config;
     use crate::workspace::Workspace;
     use std::path::{Path, PathBuf};
@@ -1607,6 +1712,58 @@ mod tests {
             PathBuf::from("/root/context")
                 .join(mission_id.to_string())
                 .join("keel-compressed.jpg")
+        );
+    }
+
+    #[test]
+    fn relocated_mission_root_is_allowed_without_widening_containment() {
+        let workspace = Path::new("/workspace");
+        let mission = Path::new("/separate-volume/workspaces/mission-deadbeef");
+        assert!(is_within_workspace_or_mission(
+            &mission.join("scratch.txt"),
+            workspace,
+            Some(mission)
+        ));
+        assert!(!is_within_workspace_or_mission(
+            Path::new("/separate-volume/workspaces/mission-other/scratch.txt"),
+            workspace,
+            Some(mission)
+        ));
+        assert!(!is_within_workspace_or_mission(
+            Path::new("/separate-volume/unrelated.txt"),
+            workspace,
+            Some(mission)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ancestry_does_not_follow_parent_ids_from_another_store() {
+        let victim_store = crate::api::mission_store::InMemoryMissionStore::new();
+        let attacker_store = crate::api::mission_store::InMemoryMissionStore::new();
+        let victim = victim_store
+            .create_mission(Some("victim"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let attacker = attacker_store
+            .create_mission_with_parent(
+                Some("attacker"),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                Some(victim.id),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !super::mission_descends_from_in_store(&attacker_store, attacker, victim.id)
+                .await
+                .unwrap()
         );
     }
 }

@@ -473,6 +473,12 @@ pub struct Mission {
     /// Working directory override (for git worktrees etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+    /// Whether this mission's placement consumes host-local disk.  This is
+    /// server-owned placement authority, deliberately persisted with the
+    /// mission rather than inferred from mutable project metadata or a lease
+    /// ledger.  Missing legacy records are conservatively local.
+    #[serde(default = "default_requires_local_disk")]
+    pub requires_local_disk: bool,
     /// Mission operating mode (task or assistant)
     #[serde(default)]
     pub mission_mode: MissionMode,
@@ -536,6 +542,10 @@ fn default_backend() -> String {
 
 fn default_workspace_id() -> Uuid {
     crate::workspace::DEFAULT_WORKSPACE_ID
+}
+
+fn default_requires_local_disk() -> bool {
+    true
 }
 
 impl Mission {
@@ -2086,8 +2096,59 @@ pub trait MissionStore: Send + Sync {
         working_directory: Option<&str>,
     ) -> Result<Mission, String>;
 
+    /// Create a mission while atomically recording the server-decided
+    /// placement authority. Persistent stores must override this together
+    /// with their row insert; the compatibility implementation is only for
+    /// stores which cannot provide a transaction.
+    async fn create_mission_with_parent_and_placement(
+        &self,
+        title: Option<&str>,
+        workspace_id: Option<Uuid>,
+        agent: Option<&str>,
+        model_override: Option<&str>,
+        model_effort: Option<&str>,
+        fast_mode: bool,
+        backend: Option<&str>,
+        config_profile: Option<&str>,
+        parent_mission_id: Option<Uuid>,
+        working_directory: Option<&str>,
+        requires_local_disk: bool,
+        assigned_id: Option<Uuid>,
+    ) -> Result<Mission, String> {
+        let _ = assigned_id;
+        let mut mission = self
+            .create_mission_with_parent(
+                title,
+                workspace_id,
+                agent,
+                model_override,
+                model_effort,
+                fast_mode,
+                backend,
+                config_profile,
+                parent_mission_id,
+                working_directory,
+            )
+            .await?;
+        self.set_mission_requires_local_disk(mission.id, requires_local_disk)
+            .await?;
+        mission.requires_local_disk = requires_local_disk;
+        Ok(mission)
+    }
+
     /// Update mission status.
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String>;
+
+    /// Persist server-decided placement authority.  Project metadata is
+    /// intentionally excluded: it is editable by users and cannot decide
+    /// whether a mission consumes local disk after restart.
+    async fn set_mission_requires_local_disk(
+        &self,
+        _id: Uuid,
+        _requires_local_disk: bool,
+    ) -> Result<(), String> {
+        Err("mission store does not support persisted placement authority".to_string())
+    }
 
     /// Persist FLEET-001 scheduling metadata (priority, not_before, deadline)
     /// for a mission. Default is a no-op so non-persistent stores can ignore it;
@@ -4118,6 +4179,7 @@ mod tests {
             terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
+            requires_local_disk: true,
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,

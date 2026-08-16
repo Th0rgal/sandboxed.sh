@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -3962,6 +3963,33 @@ impl ControlHub {
         self.sessions.read().await.values().cloned().collect()
     }
 
+    /// Resolve a mission capability against the store that owns it.  Never use
+    /// `get_mission_store` for this: that convenience method intentionally
+    /// chooses an arbitrary desktop/default session and is not an authority
+    /// lookup in a multi-user deployment.
+    pub(crate) async fn find_mission_store_owner(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Option<(Arc<dyn MissionStore>, Mission)>, String> {
+        // A Spark token can only have been minted by a running session, so a
+        // live owner is required.  Do not open offline SQLite files here: a
+        // capability check must not create a competing writer just to find a
+        // row that cannot currently execute.
+        let stores: Vec<_> = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .map(|state| Arc::clone(&state.mission_store))
+            .collect();
+        for store in stores {
+            if let Some(mission) = store.get_mission(mission_id).await? {
+                return Ok(Some((store, mission)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Collect every mission that carries a `project` tag across all mission
     /// stores (live, offline file, offline sqlite). Read-only; used by the
     /// projects-overview board. Terminal missions older than `terminal_horizon`
@@ -5671,24 +5699,45 @@ pub struct FleetHealth {
     pub disk_total: u64,
     pub disk_percent: f32,
     pub disk_level: crate::api::monitoring::DiskHealthLevel,
+    /// Canonical path whose backing filesystem is measured for local missions.
+    pub disk_path: String,
+    /// Non-secret filesystem identifier returned by statvfs.
+    pub disk_filesystem: String,
+    pub disk_free_gib: u64,
+    pub disk_required_gib: u64,
 }
 
 /// Admission preflight: `Some(reason)` when new missions must be refused
-/// because the root filesystem is critically full, or is at warn level while
+/// because the selected mission-workspace filesystem is critically full, or is at warn level while
 /// `DISK_ADMISSION_AT_WARN=1`. `DISK_ADMISSION_ENABLED=0` is the escape hatch.
-fn disk_admission_refusal() -> Option<String> {
+fn disk_admission_refusal(path: &std::path::Path) -> Option<String> {
     let enabled = std::env::var("DISK_ADMISSION_ENABLED")
         .map(|v| v.trim() != "0" && !v.trim().eq_ignore_ascii_case("false"))
         .unwrap_or(true);
     if !enabled {
         return None;
     }
-    let (used, total, percent) = crate::api::monitoring::current_disk_usage();
+    let usage = match crate::api::monitoring::disk_usage_for_path(path) {
+        Ok(usage) => usage,
+        Err(error) => {
+            return Some(format!(
+                "mission creation refused: cannot measure workspace filesystem at {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let used = usage.used;
+    let total = usage.total;
+    let percent = if total == 0 {
+        100.0
+    } else {
+        used as f32 / total as f32 * 100.0
+    };
     match crate::api::monitoring::DiskHealthLevel::from_percent(percent) {
         crate::api::monitoring::DiskHealthLevel::Critical => Some(format!(
-            "mission creation refused: disk critically full ({percent:.1}% used, {} GB free). \
-             Free space or raise DISK_CRITICAL_PCT, then retry.",
-            total.saturating_sub(used) / (1024 * 1024 * 1024)
+            "mission creation refused: disk critically full at {} (filesystem {}, \
+             {percent:.1}% used, {} GiB free). Free space or raise DISK_CRITICAL_PCT, then retry.",
+            usage.measured_path.display(), usage.filesystem, usage.available / (1 << 30)
         )),
         crate::api::monitoring::DiskHealthLevel::Warn
             if std::env::var("DISK_ADMISSION_AT_WARN")
@@ -5697,9 +5746,9 @@ fn disk_admission_refusal() -> Option<String> {
         {
             Some(format!(
                 "mission creation refused: disk above the admission warning threshold \
-                 ({percent:.1}% used, {} GB free). Wait for workspace GC, select a remote \
+                 at {} (filesystem {}, {percent:.1}% used, {} GiB free). Wait for workspace GC, select a remote \
                  node, or free space.",
-                total.saturating_sub(used) / (1024 * 1024 * 1024)
+                usage.measured_path.display(), usage.filesystem, usage.available / (1 << 30)
             ))
         }
         crate::api::monitoring::DiskHealthLevel::Warn => {
@@ -5713,17 +5762,35 @@ fn disk_admission_refusal() -> Option<String> {
     }
 }
 
+fn mission_disk_reserve_gib() -> u64 {
+    std::env::var("MISSION_DISK_EMERGENCY_RESERVE_GB")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(150)
+}
+
+fn mission_disk_default_estimate_gib() -> u64 {
+    std::env::var("MISSION_DISK_DEFAULT_ESTIMATE_GIB")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|estimate| (1..=512).contains(estimate))
+        .unwrap_or(64)
+}
+
 fn disk_estimate_refusal(
-    available_bytes: u64,
+    usage: &crate::api::monitoring::DiskUsage,
     estimated_gib: u64,
     reserve_gib: u64,
 ) -> Option<String> {
     let required_gib = estimated_gib.saturating_add(reserve_gib);
-    (available_bytes < required_gib.saturating_mul(1 << 30)).then(|| {
+    (usage.available < required_gib.saturating_mul(1 << 30)).then(|| {
         format!(
             "mission needs an estimated {estimated_gib} GiB scratch plus a {reserve_gib} GiB \
-             emergency floor, but only {} GiB is free; select a remote node or free space",
-            available_bytes / (1 << 30)
+             emergency floor ({required_gib} GiB required), but only {} GiB is free at {} \
+             (filesystem {}); select a remote node or free space",
+            usage.available / (1 << 30),
+            usage.measured_path.display(),
+            usage.filesystem
         )
     })
 }
@@ -5756,7 +5823,16 @@ pub async fn fleet_health(
         .map_err(internal_error)?;
 
     let cfg = &state.config;
-    let (disk_used, disk_total, disk_percent) = crate::api::monitoring::current_disk_usage();
+    let workspace_root = crate::workspace::configured_mission_workspace_root(&cfg.working_dir);
+    let disk =
+        crate::api::monitoring::disk_usage_for_path(&workspace_root).map_err(internal_error)?;
+    let disk_percent = if disk.total == 0 {
+        100.0
+    } else {
+        disk.used as f32 / disk.total as f32 * 100.0
+    };
+    let reserve_gib = mission_disk_reserve_gib();
+    let required_gib = mission_disk_default_estimate_gib().saturating_add(reserve_gib);
     Ok(Json(FleetHealth {
         status: if control_responsive { "ok" } else { "degraded" },
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -5766,10 +5842,14 @@ pub async fn fleet_health(
         missions,
         webhook_forwarder_configured: cfg.paloma_webhook_forward_url.is_some(),
         offload_configured: cfg.spark_arbiter_url.is_some() || cfg.spark_ssh_target.is_some(),
-        disk_used,
-        disk_total,
+        disk_used: disk.used,
+        disk_total: disk.total,
         disk_percent,
         disk_level: crate::api::monitoring::DiskHealthLevel::from_percent(disk_percent),
+        disk_path: disk.measured_path.to_string_lossy().to_string(),
+        disk_filesystem: disk.filesystem,
+        disk_free_gib: disk.available / (1 << 30),
+        disk_required_gib: required_gib,
     }))
 }
 
@@ -7370,6 +7450,542 @@ fn apply_native_backend_agent_selector(
 static PR_WRITER_CREATE_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
 
+// Admission is deliberately a durable, filesystem-scoped lease rather than an
+// in-memory counter.  More than one control process can use the same mission
+// store and a restart must not forget work that is already consuming scratch.
+static DISK_ADMISSION_LOCK: std::sync::LazyLock<Mutex<()>> =
+    std::sync::LazyLock::new(|| Mutex::new(()));
+
+struct DurableDiskAdmissionLockGuard {
+    _process_guard: tokio::sync::MutexGuard<'static, ()>,
+    file: std::fs::File,
+}
+
+impl Drop for DurableDiskAdmissionLockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+async fn acquire_durable_disk_admission_lock(
+    config: &Config,
+) -> Result<DurableDiskAdmissionLockGuard, String> {
+    let process_guard = DISK_ADMISSION_LOCK.lock().await;
+    let lock_dir = config.working_dir.join(".sandboxed-sh").join("missions");
+    tokio::fs::create_dir_all(&lock_dir)
+        .await
+        .map_err(|error| format!("create disk admission lock directory: {error}"))?;
+    let lock_path = lock_dir.join(".disk-admission.lock");
+    let file = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("open {}: {error}", lock_path.display()))?;
+        fs2::FileExt::lock_exclusive(&file)
+            .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
+        Ok::<_, String>(file)
+    })
+    .await
+    .map_err(|error| format!("join disk admission lock task: {error}"))??;
+    Ok(DurableDiskAdmissionLockGuard {
+        _process_guard: process_guard,
+        file,
+    })
+}
+
+const DISK_RESERVATION_TAG_PREFIX: &str = "disk-reservation-v1:";
+
+/// Server-owned admission state.  This is intentionally separate from
+/// `MissionProject`: project metadata is user editable and consequently can
+/// never be an authority for resource accounting.  The file is written while
+/// holding the global admission lock and atomically replaced, so independent
+/// control processes observe a complete old or complete new ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiskReservation {
+    mission_id: Uuid,
+    filesystem: String,
+    estimated_bytes: u64,
+    /// Free bytes observed when the lease was granted.  This is a diagnostic
+    /// baseline, not an additional reservation; counting both consumed disk
+    /// and the full estimate would double-count the same work.
+    free_bytes_at_grant: u64,
+    /// Canonical mission directory whose actual usage consumes this lease.
+    /// Older records omit it and conservatively retain their full estimate.
+    #[serde(default)]
+    workspace_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DiskReservationLedger {
+    #[serde(default = "disk_reservation_ledger_version")]
+    version: u8,
+    #[serde(default)]
+    reservations: HashMap<Uuid, DiskReservation>,
+    /// Compatibility input for the immediately preceding ledger format.  The
+    /// placement decision has moved to the mission row, but an upgrade must
+    /// first transfer any remote (`false`) decisions rather than treating
+    /// those missions as conservative local work.  Do not serialize this
+    /// field again: once transferred, the row is the sole authority.
+    ///
+    /// The on-disk key was `requires_local_disk`.  The Rust field was renamed
+    /// during the migration, so deserialize both names.
+    #[serde(
+        default,
+        rename = "requires_local_disk",
+        alias = "legacy_requires_local_disk",
+        skip_serializing
+    )]
+    legacy_requires_local_disk: HashMap<Uuid, bool>,
+}
+
+const fn disk_reservation_ledger_version() -> u8 {
+    2
+}
+
+fn disk_reservation_ledger_path(config: &Config) -> PathBuf {
+    config
+        .working_dir
+        .join(".sandboxed-sh")
+        .join("missions")
+        .join("disk-reservations-v2.json")
+}
+
+fn read_disk_reservation_ledger(config: &Config) -> Result<DiskReservationLedger, String> {
+    let path = disk_reservation_ledger_path(config);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DiskReservationLedger {
+            version: disk_reservation_ledger_version(),
+            reservations: HashMap::new(),
+            legacy_requires_local_disk: HashMap::new(),
+        }),
+        Err(error) => Err(format!("read {}: {error}", path.display())),
+    }
+}
+
+fn write_disk_reservation_ledger(
+    config: &Config,
+    ledger: &DiskReservationLedger,
+) -> Result<(), String> {
+    let path = disk_reservation_ledger_path(config);
+    let parent = path.parent().expect("ledger path has parent");
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    let temp = parent.join(format!(".disk-reservations-v2.{}.tmp", Uuid::new_v4()));
+    let outcome = (|| -> Result<(), String> {
+        let bytes = serde_json::to_vec(ledger).map_err(|error| error.to_string())?;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|error| format!("open {}: {error}", temp.display()))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("write {}: {error}", temp.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {error}", temp.display()))?;
+        std::fs::rename(&temp, &path)
+            .map_err(|error| format!("rename {}: {error}", path.display()))?;
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| format!("sync {}: {error}", parent.display()))?;
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    outcome
+}
+
+/// Admission leases are server-owned durable state.  They used to share the
+/// free-form project-tag namespace, which let a project edit forge, erase, or
+/// transplant a lease.  Keep the compatibility reader below for records made
+/// by older servers, but never accept this reserved namespace from an API
+/// request.
+fn contains_internal_disk_reservation_tag(tags: &[String]) -> bool {
+    tags.iter()
+        .any(|tag| tag.trim().starts_with(DISK_RESERVATION_TAG_PREFIX))
+}
+
+fn mission_holds_disk_reservation(status: MissionStatus) -> bool {
+    !status.is_terminal() && status != MissionStatus::Acknowledged
+}
+
+fn disk_admission_required_bytes(emergency: u64, reserved: u64, candidate: u64) -> u64 {
+    emergency.saturating_add(reserved).saturating_add(candidate)
+}
+
+async fn reserved_disk_bytes_for_filesystem(
+    config: &Config,
+    filesystem: &str,
+) -> Result<u64, String> {
+    let ledger = read_disk_reservation_ledger(config)?;
+    Ok(ledger
+        .reservations
+        .values()
+        .filter(|reservation| reservation.filesystem == filesystem)
+        .map(disk_reservation_outstanding_bytes)
+        .fold(0u64, |sum, bytes| sum.saturating_add(bytes)))
+}
+
+/// The filesystem's free counter already includes bytes written by a running
+/// mission. Subtracting both those bytes and its full estimate would charge
+/// the same consumption twice.  A lease therefore retains only its estimated
+/// *remaining* peak after measuring its own workspace.  Measurement failure
+/// is conservative: keep the complete estimate.
+fn allocated_file_bytes(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // POSIX `st_blocks` is in 512-byte units and counts allocated
+        // storage, so sparse/reflinked files do not appear fully consumed.
+        metadata.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
+
+fn disk_reservation_outstanding_bytes(reservation: &DiskReservation) -> u64 {
+    let Some(path) = reservation.workspace_dir.as_deref() else {
+        return reservation.estimated_bytes;
+    };
+    let usage = walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .fold(0u64, |total, metadata| {
+            total.saturating_add(allocated_file_bytes(&metadata))
+        });
+    reservation.estimated_bytes.saturating_sub(usage)
+}
+
+fn nonterminal_missions_in_sqlite(
+    path: &std::path::Path,
+) -> Result<HashMap<Uuid, (Option<Uuid>, bool)>, String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
+    let mut statement = connection
+        .prepare("SELECT id, status, workspace_id, COALESCE(requires_local_disk, 1) FROM missions")
+        .or_else(|_| connection.prepare("SELECT id, status, workspace_id, 1 FROM missions"))
+        .or_else(|_| connection.prepare("SELECT id, status, NULL AS workspace_id, 1 FROM missions"))
+        .map_err(|error| format!("query {}: {error}", path.display()))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut missions = HashMap::new();
+    for row in rows {
+        let (id, status, workspace_id, requires_local_disk) =
+            row.map_err(|error| error.to_string())?;
+        let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
+            .unwrap_or(MissionStatus::Active);
+        if mission_holds_disk_reservation(status) {
+            let id = Uuid::parse_str(&id)
+                .map_err(|error| format!("parse mission id {id} in {}: {error}", path.display()))?;
+            let workspace_id = workspace_id
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .map_err(|error| format!("parse workspace id in {}: {error}", path.display()))?;
+            missions.insert(id, (workspace_id, requires_local_disk != 0));
+        }
+    }
+    Ok(missions)
+}
+
+/// Transfer placement from the short-lived v2 lease-ledger authority into an
+/// offline SQLite mission store.  This runs under the global admission lock;
+/// the transaction means a crash leaves either the old ledger classification
+/// or the fully-updated mission rows, never a partially applied set.
+fn migrate_legacy_ledger_placement_in_sqlite(
+    path: &std::path::Path,
+    placement: &HashMap<Uuid, bool>,
+) -> Result<(), String> {
+    if placement.is_empty() {
+        return Ok(());
+    }
+    let mut connection = rusqlite::Connection::open(path)
+        .map_err(|error| format!("open {} for placement migration: {error}", path.display()))?;
+    let has_column = connection
+        .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'requires_local_disk'")
+        .and_then(|mut statement| statement.exists([]))
+        .map_err(|error| format!("inspect {} placement schema: {error}", path.display()))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("start {} placement migration: {error}", path.display()))?;
+    if !has_column {
+        transaction
+            .execute(
+                "ALTER TABLE missions ADD COLUMN requires_local_disk INTEGER NOT NULL DEFAULT 1",
+                [],
+            )
+            .map_err(|error| format!("add {} placement column: {error}", path.display()))?;
+    }
+    for (&mission_id, &requires_local_disk) in placement {
+        transaction
+            .execute(
+                "UPDATE missions SET requires_local_disk = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    if requires_local_disk { 1i64 } else { 0i64 },
+                    mission_id.to_string()
+                ],
+            )
+            .map_err(|error| {
+                format!(
+                    "migrate placement for {mission_id} in {}: {error}",
+                    path.display()
+                )
+            })?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("commit {} placement migration: {error}", path.display()))
+}
+
+/// Reconstruct the live lease set from authoritative mission state while the
+/// global admission lock is held.  The ledger supplies bytes; mission stores
+/// supply lifecycle truth.  Project tags are deliberately excluded: they are
+/// user-editable presentation metadata and can neither grant nor retain a
+/// lease after a project edit.
+async fn reconcile_disk_reservation_ledger_under_lock(
+    control_hub: &ControlHub,
+    config: &Config,
+) -> Result<(), String> {
+    let inventory = control_hub.mission_store_inventory().await?;
+    let mut ledger = read_disk_reservation_ledger(config)?;
+    let legacy_placement = std::mem::take(&mut ledger.legacy_requires_local_disk);
+    // Mission rows are the lifecycle authority.  A process can crash after a
+    // row commits but before the separate, atomically-published ledger file is
+    // renamed.  Reconstructing a conservative lease for every such live row
+    // closes that crash window; the lock is retained from admission through
+    // row creation and ledger publication, so no concurrent admission can
+    // observe the intermediate state either.
+    let mut live_missions: HashMap<Uuid, (Option<Uuid>, bool)> = HashMap::new();
+    for store in inventory.live {
+        for mission in store.list_missions(usize::MAX, 0).await? {
+            if let Some(&requires_local_disk) = legacy_placement.get(&mission.id) {
+                if mission.requires_local_disk != requires_local_disk {
+                    store
+                        .set_mission_requires_local_disk(mission.id, requires_local_disk)
+                        .await?;
+                }
+            }
+            if mission_holds_disk_reservation(mission.status) {
+                live_missions.insert(
+                    mission.id,
+                    (
+                        Some(mission.workspace_id),
+                        legacy_placement
+                            .get(&mission.id)
+                            .copied()
+                            .unwrap_or(mission.requires_local_disk),
+                    ),
+                );
+            }
+        }
+    }
+    for user in inventory.offline_file_users {
+        let store: Arc<dyn MissionStore> = Arc::new(
+            mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await?,
+        );
+        for mission in store.list_missions(usize::MAX, 0).await? {
+            if let Some(&requires_local_disk) = legacy_placement.get(&mission.id) {
+                if mission.requires_local_disk != requires_local_disk {
+                    store
+                        .set_mission_requires_local_disk(mission.id, requires_local_disk)
+                        .await?;
+                }
+            }
+            if mission_holds_disk_reservation(mission.status) {
+                live_missions.insert(
+                    mission.id,
+                    (
+                        Some(mission.workspace_id),
+                        legacy_placement
+                            .get(&mission.id)
+                            .copied()
+                            .unwrap_or(mission.requires_local_disk),
+                    ),
+                );
+            }
+        }
+    }
+    for path in inventory.offline_sqlite {
+        let placement = legacy_placement.clone();
+        let missions = tokio::task::spawn_blocking(move || {
+            migrate_legacy_ledger_placement_in_sqlite(&path, &placement)?;
+            nonterminal_missions_in_sqlite(&path)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        for (id, placement) in missions {
+            live_missions.entry(id).or_insert(placement);
+        }
+    }
+    let mut changed = !legacy_placement.is_empty();
+    let before = ledger.reservations.len();
+    ledger
+        .reservations
+        .retain(|id, _| live_missions.contains_key(id));
+    changed |= ledger.reservations.len() != before;
+    for (&mission_id, &(workspace_id, requires_local_disk)) in &live_missions {
+        // Remote-node missions have an authoritative persisted placement
+        // record but no host-disk lease.  Never manufacture one on restart.
+        // An absent record predates placement persistence and is charged
+        // locally as the safe compatibility policy.
+        if !requires_local_disk {
+            continue;
+        }
+        if ledger.reservations.contains_key(&mission_id) {
+            continue;
+        }
+        // A very old SQLite schema may not carry workspace_id. Charge the
+        // default host conservatively rather than allowing a crash-created
+        // Pending mission to escape admission accounting.
+        let workspace_id = workspace_id.unwrap_or(workspace::DEFAULT_WORKSPACE_ID);
+        let workspace = control_hub
+            .workspaces
+            .get(workspace_id)
+            .await
+            .unwrap_or_else(|| workspace::Workspace::default_host(config.working_dir.clone()));
+        workspace::ensure_persisted_mission_root_is_available(&workspace, mission_id)
+            .map_err(|error| format!("verify persisted placement for {mission_id}: {error}"))?;
+        let root = workspace::mission_workspace_root_for_workspace(&workspace, mission_id);
+        let usage = crate::api::monitoring::disk_usage_for_path(&root).map_err(|error| {
+            format!(
+                "measure reconstructed mission filesystem {}: {error}",
+                root.display()
+            )
+        })?;
+        ledger.reservations.insert(
+            mission_id,
+            DiskReservation {
+                mission_id,
+                filesystem: usage.filesystem,
+                estimated_bytes: mission_disk_default_estimate_gib().saturating_mul(1 << 30),
+                free_bytes_at_grant: usage.available,
+                workspace_dir: Some(workspace::mission_workspace_dir_for_workspace(
+                    &workspace, mission_id,
+                )),
+            },
+        );
+        changed = true;
+    }
+    if changed {
+        write_disk_reservation_ledger(config, &ledger)?;
+    }
+    Ok(())
+}
+
+/// The caller must retain the returned lock through mission persistence and
+/// its reservation-tag write.  That makes admission, creation and durable
+/// reconstruction one atomic protocol across local control processes.
+async fn reserve_local_mission_disk(
+    control_hub: &ControlHub,
+    config: &Config,
+    workspace: &workspace::Workspace,
+    estimate_gib: u64,
+) -> Result<(DurableDiskAdmissionLockGuard, DiskReservation), String> {
+    let guard = acquire_durable_disk_admission_lock(config).await?;
+    reconcile_disk_reservation_ledger_under_lock(control_hub, config).await?;
+    let root = workspace::mission_workspace_root_for_workspace(workspace, Uuid::nil());
+    if let Some(reason) = disk_admission_refusal(&root) {
+        return Err(reason);
+    }
+    let usage = crate::api::monitoring::disk_usage_for_path(&root).map_err(|error| {
+        format!(
+            "mission creation refused: cannot measure workspace filesystem at {}: {error}",
+            root.display()
+        )
+    })?;
+    let reserved = reserved_disk_bytes_for_filesystem(config, &usage.filesystem).await?;
+    let estimate = estimate_gib.saturating_mul(1 << 30);
+    let emergency = mission_disk_reserve_gib().saturating_mul(1 << 30);
+    let required = disk_admission_required_bytes(emergency, reserved, estimate);
+    if usage.available < required {
+        return Err(format!(
+            "mission admission refused on filesystem {}: {} GiB free, {} GiB already reserved, {} GiB candidate estimate, {} GiB emergency reserve ({} GiB required)",
+            usage.filesystem,
+            usage.available / (1 << 30),
+            reserved / (1 << 30),
+            estimate_gib,
+            mission_disk_reserve_gib(),
+            required / (1 << 30),
+        ));
+    }
+    tracing::info!(
+        filesystem = %usage.filesystem,
+        free_bytes = usage.available,
+        reserved_bytes = reserved,
+        candidate_bytes = estimate,
+        required_bytes = required,
+        "local mission disk admission reserved"
+    );
+    Ok((
+        guard,
+        DiskReservation {
+            mission_id: Uuid::nil(),
+            filesystem: usage.filesystem,
+            estimated_bytes: estimate,
+            free_bytes_at_grant: usage.available,
+            workspace_dir: None,
+        },
+    ))
+}
+
+/// Release a server-owned lease when a mission reaches a terminal state.  The
+/// lock is the same one used for admission, making a terminal transition and
+/// a concurrent create serialize across control processes.  A failed ledger
+/// write is deliberately surfaced to the caller rather than silently making
+/// capacity appear free.
+async fn release_local_mission_disk(config: &Config, mission_id: Uuid) -> Result<(), String> {
+    let _guard = acquire_durable_disk_admission_lock(config).await?;
+    let mut ledger = read_disk_reservation_ledger(config)?;
+    if ledger.reservations.remove(&mission_id).is_some() {
+        write_disk_reservation_ledger(config, &ledger)?;
+    }
+    Ok(())
+}
+
+async fn release_local_mission_disk_if_not_holding(
+    mission_store: &Arc<dyn crate::api::mission_store::MissionStore>,
+    config: &Config,
+    mission_id: Uuid,
+) {
+    match mission_store.get_mission(mission_id).await {
+        Ok(Some(mission)) if mission_holds_disk_reservation(mission.status) => {}
+        Ok(_) => {
+            if let Err(error) = release_local_mission_disk(config, mission_id).await {
+                tracing::error!(
+                    mission = %mission_id,
+                    %error,
+                    "terminal mission lease cleanup failed after runner stop"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                mission = %mission_id,
+                %error,
+                "could not load mission to decide disk lease release"
+            );
+        }
+    }
+}
+
 struct DurablePrWriterLockGuard {
     _process_guard: tokio::sync::MutexGuard<'static, ()>,
     file: std::fs::File,
@@ -8730,16 +9346,9 @@ pub async fn create_mission(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty);
-    let effective_estimated_disk_gib = req.estimated_disk_gib.or_else(|| {
-        local_mission
-            .then(|| {
-                std::env::var("MISSION_DISK_DEFAULT_ESTIMATE_GIB")
-                    .ok()
-                    .and_then(|raw| raw.trim().parse::<u64>().ok())
-                    .filter(|estimate| (1..=512).contains(estimate))
-            })
-            .flatten()
-    });
+    let effective_estimated_disk_gib = req
+        .estimated_disk_gib
+        .or_else(|| local_mission.then(mission_disk_default_estimate_gib));
     if let Some(estimated_gib) = effective_estimated_disk_gib {
         if estimated_gib == 0 || estimated_gib > 512 {
             return Err((
@@ -8748,19 +9357,37 @@ pub async fn create_mission(
             ));
         }
         if local_mission {
-            let (used, total, _) = crate::api::monitoring::current_disk_usage();
-            let reserve_gib = std::env::var("MISSION_DISK_EMERGENCY_RESERVE_GB")
-                .ok()
-                .and_then(|raw| raw.trim().parse::<u64>().ok())
-                .unwrap_or(64);
+            let workspace = state
+                .workspaces
+                .get(workspace_id.unwrap_or(workspace::DEFAULT_WORKSPACE_ID))
+                .await
+                .unwrap_or_else(|| {
+                    workspace::Workspace::default_host(state.config.working_dir.clone())
+                });
+            let root = workspace::mission_workspace_root_for_workspace(&workspace, Uuid::nil());
+            let usage = crate::api::monitoring::disk_usage_for_path(&root).map_err(|error| {
+                (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    format!("mission creation refused: cannot measure workspace filesystem at {}: {error}", root.display()),
+                )
+            })?;
             if let Some(reason) =
-                disk_estimate_refusal(total.saturating_sub(used), estimated_gib, reserve_gib)
+                disk_estimate_refusal(&usage, estimated_gib, mission_disk_reserve_gib())
             {
                 return Err((StatusCode::INSUFFICIENT_STORAGE, reason));
             }
         }
     }
     let mut normalized_request_tags = normalize_mission_tags(req.tags.as_deref());
+    if normalized_request_tags
+        .as_deref()
+        .is_some_and(contains_internal_disk_reservation_tag)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "disk-reservation-v1 tags are reserved internal admission state".to_string(),
+        ));
+    }
     if let Some(estimated_gib) = effective_estimated_disk_gib {
         let tag = format!("disk-estimate-gib:{estimated_gib}");
         let tags = normalized_request_tags.get_or_insert_with(Vec::new);
@@ -8913,6 +9540,8 @@ pub async fn create_mission(
                 deadline: req.deadline.map(|t| t.to_rfc3339()),
             },
             requires_local_disk: local_mission,
+            estimated_disk_gib: effective_estimated_disk_gib,
+            admission_tags: Vec::new(),
             respond: tx,
         })
         .await
@@ -9039,6 +9668,23 @@ pub async fn create_mission(
             tags.retain(|tag| tag != "pr-writer" && tag != "pr-readonly");
             if !tags.iter().any(|tag| tag == capability) {
                 tags.push(capability.to_string());
+            }
+        }
+    }
+    // Creation persisted the admission lease before replying. This later
+    // metadata patch must retain it, otherwise user tags could release it.
+    let durable_reservation_tags: Vec<String> = mission
+        .project
+        .tags
+        .iter()
+        .filter(|tag| tag.starts_with(DISK_RESERVATION_TAG_PREFIX))
+        .cloned()
+        .collect();
+    if !durable_reservation_tags.is_empty() {
+        let requested = tags.get_or_insert_with(Vec::new);
+        for reservation in durable_reservation_tags {
+            if !requested.iter().any(|tag| tag == &reservation) {
+                requested.push(reservation);
             }
         }
     }
@@ -10875,6 +11521,15 @@ pub async fn update_mission_project(
             .filter(|t| !t.is_empty())
             .collect()
     });
+    if tags
+        .as_deref()
+        .is_some_and(contains_internal_disk_reservation_tag)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "disk-reservation-v1 tags are reserved internal admission state".to_string(),
+        ));
+    }
 
     let effective_string = |patch: &Option<Option<String>>, current: &Option<String>| {
         patch.clone().unwrap_or_else(|| current.clone())
@@ -10882,6 +11537,24 @@ pub async fn update_mission_project(
     let effective_github_pr = effective_string(&github_pr, &current.project.github_pr);
     let effective_intent = effective_string(&intent, &current.project.intent);
     let mut effective_tags = tags.clone().unwrap_or_else(|| current.project.tags.clone());
+    // Compatibility: old releases persisted leases in project tags.  A
+    // project edit may not drop or replace one of those records while the
+    // migration reader still reconstructs it.
+    let durable_reservation_tags: Vec<String> = current
+        .project
+        .tags
+        .iter()
+        .filter(|tag| tag.starts_with(DISK_RESERVATION_TAG_PREFIX))
+        .cloned()
+        .collect();
+    for reservation in &durable_reservation_tags {
+        if !effective_tags.iter().any(|tag| tag == reservation) {
+            effective_tags.push(reservation.clone());
+        }
+    }
+    if tags.is_some() {
+        tags = Some(effective_tags.clone());
+    }
     let deferred_goal = control
         .mission_store
         .get_deferred_goal(id)
@@ -12977,9 +13650,32 @@ async fn cleanup_mission_workspace_dirs_for_delete(
     let mut deleted_dirs = Vec::new();
     for mission in missions {
         let Some(ws) = workspaces.get(mission.workspace_id).await else {
-            continue;
+            // Do not finalize the database deletion when the workspace that
+            // owns a mission's persisted placement cannot be consulted.  A
+            // relocated directory may still exist on a temporarily missing
+            // volume, and treating that as an already-clean workspace would
+            // orphan it permanently.
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "Cannot verify workspace placement for mission {} because workspace {} is unavailable",
+                    mission.id, mission.workspace_id
+                ),
+            ));
         };
-        let dir = workspace::mission_workspace_dir_for_root(&ws.path, mission.id);
+        workspace::ensure_persisted_mission_root_is_available(&ws, mission.id).map_err(
+            |error| {
+                tracing::warn!(mission_id = %mission.id, %error, "refusing to delete workspace with unavailable persisted root");
+                (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Cannot delete mission {}: persisted mission workspace root is unavailable: {}",
+                        mission.id, error
+                    ),
+                )
+            },
+        )?;
+        let dir = workspace::mission_workspace_dir_for_workspace(&ws, mission.id);
         if !dir.exists() {
             continue;
         }
@@ -16873,8 +17569,47 @@ async fn control_actor_loop(
         working_directory: Option<&str>,
         scheduling: crate::api::mission_store::MissionScheduling,
     ) -> Result<Mission, String> {
+        create_new_mission_with_title_and_placement(
+            mission_store,
+            title,
+            workspace_id,
+            agent,
+            model_override,
+            model_effort,
+            fast_mode,
+            backend,
+            config_profile,
+            parent_mission_id,
+            working_directory,
+            true,
+            scheduling,
+            None,
+        )
+        .await
+    }
+
+    /// Persist placement authority with the Pending mission row.  The
+    /// admission ledger is only a byte lease and must never decide whether a
+    /// restarted mission is local or remote.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_new_mission_with_title_and_placement(
+        mission_store: &Arc<dyn MissionStore>,
+        title: Option<&str>,
+        workspace_id: Option<Uuid>,
+        agent: Option<&str>,
+        model_override: Option<&str>,
+        model_effort: Option<&str>,
+        fast_mode: bool,
+        backend: Option<&str>,
+        config_profile: Option<&str>,
+        parent_mission_id: Option<Uuid>,
+        working_directory: Option<&str>,
+        requires_local_disk: bool,
+        scheduling: crate::api::mission_store::MissionScheduling,
+        assigned_id: Option<Uuid>,
+    ) -> Result<Mission, String> {
         let mut mission = mission_store
-            .create_mission_with_parent(
+            .create_mission_with_parent_and_placement(
                 title,
                 workspace_id,
                 agent,
@@ -16885,6 +17620,8 @@ async fn control_actor_loop(
                 config_profile,
                 parent_mission_id,
                 working_directory,
+                requires_local_disk,
+                assigned_id,
             )
             .await?;
         // FLEET-001: persist scheduling metadata as a focused follow-up write so
@@ -18398,16 +19135,37 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, fast_mode, backend, config_profile, parent_mission_id, working_directory, scheduling, requires_local_disk, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, fast_mode, backend, config_profile, parent_mission_id, working_directory, scheduling, requires_local_disk, estimated_disk_gib, admission_tags, respond } => {
+                        // Resolve once for both admission and the durable lease record.
+                        // Keeping this value outside the conditional is important: the
+                        // lease must name the exact workspace that was admitted, rather
+                        // than reconstructing a possibly different default later.
+                        let workspace = workspaces
+                            .get(workspace_id.unwrap_or(workspace::DEFAULT_WORKSPACE_ID))
+                            .await
+                            .unwrap_or_else(|| workspace::Workspace::default_host(config.working_dir.clone()));
                         // Disk preflight: refuse new missions when the root
                         // filesystem is critically full instead of letting
                         // workers die mid-flight on ENOSPC. Actor-level so
                         // the HTTP, Ask and Telegram entrypoints are all
                         // covered by this single gate.
+                        let mut reservation_guard = None;
+                        let mut reservation = None;
                         if requires_local_disk {
-                            if let Some(refusal) = disk_admission_refusal() {
-                                let _ = respond.send(Err(refusal));
-                                continue;
+                            match reserve_local_mission_disk(
+                                &control_hub,
+                                &config,
+                                &workspace,
+                                estimated_disk_gib.unwrap_or_else(mission_disk_default_estimate_gib),
+                            ).await {
+                                Ok((guard, candidate)) => {
+                                    reservation_guard = Some(guard);
+                                    reservation = Some(candidate);
+                                }
+                                Err(error) => {
+                                    let _ = respond.send(Err(error));
+                                    continue;
+                                }
                             }
                         }
                         // First persist current mission history
@@ -18419,8 +19177,45 @@ async fn control_actor_loop(
                         )
                         .await;
 
+                        // Publish the lease before the mission row so a crash
+                        // cannot reconstruct a custom estimate as the default.
+                        let assigned_id = Uuid::new_v4();
+                        if reservation_guard.is_none() {
+                            match acquire_durable_disk_admission_lock(&config).await {
+                                Ok(guard) => reservation_guard = Some(guard),
+                                Err(error) => {
+                                    let _ = respond.send(Err(format!(
+                                        "mission creation rolled back: acquire placement ledger lock: {error}"
+                                    )));
+                                    continue;
+                                }
+                            }
+                        }
+                        let mut ledger = match read_disk_reservation_ledger(&config) {
+                            Ok(ledger) => ledger,
+                            Err(error) => {
+                                let _ = respond.send(Err(format!(
+                                    "mission creation rolled back: read disk admission ledger: {error}"
+                                )));
+                                continue;
+                            }
+                        };
+                        if let Some(mut candidate) = reservation.take() {
+                            candidate.mission_id = assigned_id;
+                            candidate.workspace_dir = Some(
+                                workspace::mission_workspace_dir_for_workspace(&workspace, assigned_id),
+                            );
+                            ledger.reservations.insert(assigned_id, candidate);
+                            if let Err(error) = write_disk_reservation_ledger(&config, &ledger) {
+                                let _ = respond.send(Err(format!(
+                                    "mission creation rolled back: persist disk placement ledger: {error}"
+                                )));
+                                continue;
+                            }
+                        }
+
                         // Create a new mission with optional title, workspace, agent, and backend
-                        match create_new_mission_with_title(
+                        match create_new_mission_with_title_and_placement(
                             &mission_store,
                             title.as_deref(),
                             workspace_id,
@@ -18432,10 +19227,47 @@ async fn control_actor_loop(
                             config_profile.as_deref(),
                             parent_mission_id,
                             working_directory.as_deref(),
+                            requires_local_disk,
                             scheduling,
+                            Some(assigned_id),
                         )
                         .await {
-                            Ok(mission) => {
+                            Ok(mut mission) => {
+                                // Project tags are user-editable and are not admission
+                                // state.  Persist any ordinary tags independently.
+                                let tags = admission_tags;
+                                if !tags.is_empty() {
+                                    if let Err(error) = mission_store.update_mission_project(
+                                        mission.id,
+                                        crate::api::mission_store::MissionProjectPatch {
+                                            tags: Some(tags),
+                                            ..Default::default()
+                                        },
+                                    ).await {
+                                        let _ = mission_store.update_mission_status(
+                                            mission.id,
+                                            MissionStatus::Failed,
+                                        ).await;
+                                        let _ = respond.send(Err(format!(
+                                            "mission creation rolled back: persist mission project metadata: {error}"
+                                        )));
+                                        continue;
+                                    }
+                                    match mission_store.get_mission(mission.id).await {
+                                        Ok(Some(updated)) => mission = updated,
+                                        Ok(None) => {
+                                            let _ = respond.send(Err("mission creation rolled back: mission disappeared while persisting disk admission reservation".to_string()));
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            let _ = respond.send(Err(format!("mission creation rolled back: reload mission metadata: {error}")));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                // Explicitly drop after durable write, rather than relying on
+                                // scope order if this branch grows a later await.
+                                drop(reservation_guard.take());
                                 history.clear();
                                 *current_mission.write().await = Some(mission.id);
 
@@ -18477,6 +19309,16 @@ async fn control_actor_loop(
                             .update_mission_status(id, new_status)
                             .await;
                         if result.is_ok() {
+                            let runner_active = running_mission_id == Some(id)
+                                || parallel_runners
+                                    .get(&id)
+                                    .is_some_and(|runner| runner.is_running());
+                            if !mission_holds_disk_reservation(new_status) && !runner_active {
+                                if let Err(error) = release_local_mission_disk(&config, id).await {
+                                    tracing::error!(mission = %id, %error,
+                                        "terminal mission lease cleanup failed; retaining conservative admission state");
+                                }
+                            }
                             maybe_schedule_mission_metadata_refresh_for_status(
                                 &mission_store,
                                 &events_tx,
@@ -19974,6 +20816,10 @@ async fn control_actor_loop(
                     let completed_mission_id = running_mission_id;
                     running = None;
                     running_cancel = None;
+                    if let Some(mid) = running_mission_id {
+                        release_local_mission_disk_if_not_holding(&mission_store, &config, mid)
+                            .await;
+                    }
                     running_mission_id = None;
                     running_backend_id = None;
                     main_runner_activity = None;
@@ -20154,7 +21000,7 @@ async fn control_actor_loop(
                                     workspaces
                                         .get(wsid)
                                         .await
-                                        .map(|w| crate::workspace::mission_workspace_dir_for_root(&w.path, mid))
+                                        .map(|w| crate::workspace::mission_workspace_dir_for_workspace(&w, mid))
                                         .unwrap_or_else(|| config.working_dir.clone())
                                 } else {
                                     config.working_dir.clone()
@@ -20780,7 +21626,7 @@ async fn control_actor_loop(
                                     workspaces
                                         .get(wsid)
                                         .await
-                                        .map(|w| crate::workspace::mission_workspace_dir_for_root(&w.path, *mission_id))
+                                        .map(|w| crate::workspace::mission_workspace_dir_for_workspace(&w, *mission_id))
                                         .unwrap_or_else(|| config.working_dir.clone())
                                 } else {
                                     config.working_dir.clone()
@@ -21058,6 +21904,7 @@ async fn control_actor_loop(
                 // Remove completed runners and clean up their desktop sessions
                 for mid in completed_missions {
                     parallel_runners.remove(&mid);
+                    release_local_mission_disk_if_not_holding(&mission_store, &config, mid).await;
                     close_mission_desktop_sessions(
                         &mission_store,
                         mid,
@@ -21097,6 +21944,7 @@ async fn control_actor_loop(
                         config.max_parallel_missions,
                     );
                     board::scheduler_pass(
+                        Some(&control_hub),
                         &mission_store,
                         &self_cmd_tx,
                         &snapshot,
@@ -22083,7 +22931,7 @@ async fn run_single_control_turn(
         // Get library for skill syncing
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
-        let dir = match Box::pin(workspace::prepare_mission_workspace_with_skills_backend(
+        let prepared = Box::pin(workspace::prepare_mission_workspace_with_skills_backend(
             &mut ws,
             &mcp,
             lib_ref,
@@ -22095,12 +22943,15 @@ async fn run_single_control_turn(
             Some(&config.working_dir),
             !pr_readonly,
         ))
-        .await
-        {
+        .await;
+        let dir = match workspace::require_verified_mission_workspace(prepared) {
             Ok(dir) => dir,
             Err(e) => {
-                tracing::warn!("Failed to prepare mission workspace: {}", e);
-                ws.path.clone()
+                // The persisted mission root is a placement capability, not
+                // a hint. Do not run an Ask/control turn in the workspace
+                // root if its selected filesystem cannot be verified.
+                tracing::warn!(mission_id = %mid, error = %e, "refusing control turn without its verified mission workspace");
+                return crate::agents::AgentResult::failure(e.to_string(), 0);
             }
         };
         (dir, Some(ws))
@@ -25584,11 +26435,31 @@ mod tests {
 
     #[test]
     fn disk_estimate_preserves_emergency_free_space() {
-        assert!(disk_estimate_refusal(100 << 30, 20, 64).is_none());
-        let refusal = disk_estimate_refusal(80 << 30, 20, 64).unwrap();
+        let usage = crate::api::monitoring::DiskUsage {
+            measured_path: "/srv/sandboxed-storage".into(),
+            filesystem: "statvfs:test".to_string(),
+            used: 0,
+            total: 100 << 30,
+            available: 100 << 30,
+        };
+        assert!(disk_estimate_refusal(&usage, 20, 64).is_none());
+        // Equality is admitted: the emergency reserve remains exactly intact.
+        let exact = crate::api::monitoring::DiskUsage {
+            available: 84 << 30,
+            total: 84 << 30,
+            ..usage.clone()
+        };
+        assert!(disk_estimate_refusal(&exact, 20, 64).is_none());
+        let low = crate::api::monitoring::DiskUsage {
+            available: 80 << 30,
+            total: 80 << 30,
+            ..usage
+        };
+        let refusal = disk_estimate_refusal(&low, 20, 64).unwrap();
         assert!(refusal.contains("20 GiB scratch"));
         assert!(refusal.contains("64 GiB"));
         assert!(refusal.contains("80 GiB is free"));
+        assert!(refusal.contains("/srv/sandboxed-storage"));
     }
 
     #[test]
@@ -27213,6 +28084,96 @@ mod tests {
         assert!(!worker_dir.exists());
         assert!(store.get_mission(boss.id).await.unwrap().is_some());
         assert!(store.get_mission(worker.id).await.unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_refuses_changed_persisted_filesystem_until_identity_is_restored() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let storage = temp.path().join("relocated-storage");
+        std::fs::create_dir_all(&storage).expect("storage should be created");
+        let workspaces = Arc::new(workspace::WorkspaceStore::new(temp.path().to_path_buf()).await);
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(
+                Some("relocated mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission should be created");
+        let mission_dir = workspace::mission_workspace_dir_for_root(&storage, mission.id);
+        std::fs::create_dir_all(&mission_dir).expect("mission directory should be created");
+
+        let registry_dir = temp.path().join(".sandboxed-sh");
+        std::fs::create_dir_all(&registry_dir).expect("registry directory should be created");
+        let registry_path = registry_dir.join("mission-workspace-roots.json");
+        let actual_identity = workspace::filesystem_identity(&storage).unwrap();
+        std::fs::write(
+            &registry_path,
+            serde_json::json!({ mission.id.to_string(): {
+                "path": storage,
+                "filesystem_identity": actual_identity
+            }})
+            .to_string(),
+        )
+        .expect("registry should be written");
+
+        // A completely unavailable persisted root must leave both the
+        // checkout and its database record intact.
+        let unavailable_storage = temp.path().join("temporarily-unmounted-storage");
+        std::fs::rename(&storage, &unavailable_storage).expect("storage should disappear");
+        let error = cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, mission.id, &[])
+            .await
+            .expect_err("deletion must fail closed for an unavailable filesystem");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(store.get_mission(mission.id).await.unwrap().is_some());
+        assert!(unavailable_storage
+            .join("workspaces")
+            .join(mission_dir.file_name().unwrap())
+            .exists());
+        std::fs::rename(&unavailable_storage, &storage).expect("storage should be restored");
+
+        // An unmount can also leave the mountpoint path behind on a different
+        // filesystem. That identity mismatch is equally unsafe to delete.
+        std::fs::write(
+            &registry_path,
+            serde_json::json!({ mission.id.to_string(): {
+                "path": storage,
+                "filesystem_identity": "dev:changed-after-unmount"
+            }})
+            .to_string(),
+        )
+        .expect("mismatched registry should be written");
+        let error = cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, mission.id, &[])
+            .await
+            .expect_err("deletion must fail closed for a replaced filesystem");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(store.get_mission(mission.id).await.unwrap().is_some());
+        assert!(mission_dir.exists());
+
+        std::fs::write(
+            &registry_path,
+            serde_json::json!({ mission.id.to_string(): {
+                "path": storage,
+                "filesystem_identity": actual_identity
+            }})
+            .to_string(),
+        )
+        .expect("restored registry should be written");
+
+        cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, mission.id, &[])
+            .await
+            .expect("deletion should proceed after the original filesystem is restored");
+        delete_mission_with_children(&store, mission.id, &[])
+            .await
+            .expect("database record should delete only after verified cleanup");
+        assert!(!mission_dir.exists());
+        assert!(store.get_mission(mission.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -29866,6 +30827,7 @@ And the report:
             terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
+            requires_local_disk: true,
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
@@ -29906,6 +30868,7 @@ And the report:
             terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
+            requires_local_disk: true,
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
@@ -29961,6 +30924,7 @@ And the report:
             terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
+            requires_local_disk: true,
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
@@ -30013,6 +30977,7 @@ And the report:
             terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
+            requires_local_disk: true,
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
@@ -30065,6 +31030,7 @@ And the report:
             terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
+            requires_local_disk: true,
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
@@ -30117,6 +31083,7 @@ And the report:
             terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
+            requires_local_disk: true,
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
@@ -30253,6 +31220,7 @@ And the report:
             terminal_evidence: None,
             parent_mission_id: None,
             working_directory: None,
+            requires_local_disk: true,
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
@@ -31919,6 +32887,181 @@ Investigate <service/> failures.
             (slow_count as u64) + slow_lagged >= PRODUCER_EVENTS as u64,
             "slow subscriber's got+lost should still account for the producer (got={slow_count} lagged={slow_lagged})"
         );
+    }
+
+    #[test]
+    fn disk_admission_reservations_are_filesystem_scoped_and_exact_at_boundary() {
+        let a = DiskReservation {
+            mission_id: Uuid::new_v4(),
+            filesystem: "filesystem-a".into(),
+            estimated_bytes: 20 << 30,
+            free_bytes_at_grant: 0,
+            workspace_dir: None,
+        };
+        let b = DiskReservation {
+            mission_id: Uuid::new_v4(),
+            filesystem: "filesystem-b".into(),
+            estimated_bytes: 20 << 30,
+            free_bytes_at_grant: 0,
+            workspace_dir: None,
+        };
+        assert_eq!(disk_reservation_outstanding_bytes(&a), 20 << 30);
+        assert_eq!(disk_reservation_outstanding_bytes(&b), 20 << 30);
+
+        let emergency = 64 << 30;
+        let first = 20 << 30;
+        // Exact equality leaves the emergency floor intact; a second
+        // same-filesystem admission must include the first reservation.
+        assert_eq!(disk_admission_required_bytes(emergency, 0, first), 84 << 30);
+        assert_eq!(
+            disk_admission_required_bytes(emergency, first, first),
+            104 << 30
+        );
+    }
+
+    #[test]
+    fn terminal_missions_release_disk_admission_reservations() {
+        assert!(mission_holds_disk_reservation(MissionStatus::Pending));
+        assert!(mission_holds_disk_reservation(MissionStatus::Active));
+        assert!(mission_holds_disk_reservation(MissionStatus::AwaitingUser));
+        assert!(!mission_holds_disk_reservation(MissionStatus::Completed));
+        assert!(!mission_holds_disk_reservation(MissionStatus::Failed));
+        assert!(!mission_holds_disk_reservation(MissionStatus::Acknowledged));
+    }
+
+    #[test]
+    fn restart_reconstruction_excludes_persisted_remote_missions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missions.db");
+        let local = Uuid::new_v4();
+        let remote = Uuid::new_v4();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE missions (id TEXT PRIMARY KEY, status TEXT, workspace_id TEXT, requires_local_disk INTEGER)",
+        ).unwrap();
+        connection
+            .execute(
+                "INSERT INTO missions VALUES (?1, 'pending', NULL, 1)",
+                rusqlite::params![local.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO missions VALUES (?1, 'active', NULL, 0)",
+                rusqlite::params![remote.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let rows = nonterminal_missions_in_sqlite(&path).unwrap();
+        // Placement comes from authoritative mission rows, never from the
+        // lease ledger. A mixed restart rebuilds only local missions.
+        assert_eq!(rows.get(&local), Some(&(None, true)));
+        assert_eq!(rows.get(&remote), Some(&(None, false)));
+    }
+
+    #[test]
+    fn legacy_ledger_deserializes_requires_local_disk_key() {
+        let remote = Uuid::new_v4();
+        let json = format!(
+            r#"{{"version":2,"reservations":{{}},"requires_local_disk":{{"{remote}":false}}}}"#
+        );
+        let ledger: DiskReservationLedger = serde_json::from_str(&json).unwrap();
+        assert_eq!(ledger.legacy_requires_local_disk.get(&remote), Some(&false));
+        let serialized = serde_json::to_value(&ledger).unwrap();
+        assert!(serialized.get("requires_local_disk").is_none());
+        assert!(serialized.get("legacy_requires_local_disk").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outstanding_reservation_uses_allocated_bytes_not_logical_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(64 << 30).unwrap();
+        drop(file);
+        let reservation = DiskReservation {
+            mission_id: Uuid::new_v4(),
+            filesystem: "fs".into(),
+            estimated_bytes: 64 << 30,
+            free_bytes_at_grant: 0,
+            workspace_dir: Some(dir.path().to_path_buf()),
+        };
+        let outstanding = disk_reservation_outstanding_bytes(&reservation);
+        assert!(
+            outstanding > 32 << 30,
+            "a sparse 64 GiB file must not consume the full reservation; outstanding={outstanding}"
+        );
+    }
+
+    #[test]
+    fn running_missions_keep_disk_reservations_after_terminal_status() {
+        assert!(mission_holds_disk_reservation(MissionStatus::Active));
+        // Presentation status is not enough to release: SetMissionStatus must
+        // also observe that no runner is active. The helper below is the
+        // status half of that conjunction.
+        assert!(!mission_holds_disk_reservation(MissionStatus::Completed));
+        assert!(!mission_holds_disk_reservation(MissionStatus::Failed));
+    }
+
+    #[test]
+    fn legacy_ledger_remote_placement_is_migrated_to_sqlite_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missions.db");
+        let local = Uuid::new_v4();
+        let remote = Uuid::new_v4();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        // This is the schema just before placement moved out of the ledger.
+        connection
+            .execute_batch(
+                "CREATE TABLE missions (id TEXT PRIMARY KEY, status TEXT, workspace_id TEXT)",
+            )
+            .unwrap();
+        for id in [local, remote] {
+            connection
+                .execute(
+                    "INSERT INTO missions VALUES (?1, 'pending', NULL)",
+                    rusqlite::params![id.to_string()],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        migrate_legacy_ledger_placement_in_sqlite(
+            &path,
+            &HashMap::from([(local, true), (remote, false)]),
+        )
+        .unwrap();
+        let rows = nonterminal_missions_in_sqlite(&path).unwrap();
+        assert_eq!(rows.get(&local), Some(&(None, true)));
+        assert_eq!(rows.get(&remote), Some(&(None, false)));
+    }
+
+    #[test]
+    fn restart_reconciliation_reads_workspace_identity_from_offline_mission_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missions.db");
+        let mission_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE missions (id TEXT PRIMARY KEY, status TEXT, workspace_id TEXT)",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO missions (id, status, workspace_id) VALUES (?1, 'pending', ?2)",
+                rusqlite::params![mission_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let rows = nonterminal_missions_in_sqlite(&path).unwrap();
+        // Legacy schemas do not have placement authority, so migration is
+        // deliberately conservative: they are local until explicitly moved.
+        assert_eq!(rows.get(&mission_id), Some(&(Some(workspace_id), true)));
     }
 
     fn test_summary(needs_operator: bool) -> super::mission_store::MissionSummary {

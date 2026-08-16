@@ -207,6 +207,59 @@ pub(crate) fn entry_for_workspace(
         })
 }
 
+/// Select the known owner of this *physical* mission directory across every
+/// workspace. A configured default-host root can overlap a separately
+/// registered workspace, so the workspace that happens to scan first is not
+/// authoritative. Only entries whose workspace can actually resolve to `dir`
+/// are considered; unrelated short-id collisions remain isolated.
+fn physical_mission_directory(root: &std::path::Path, short: &str) -> std::path::PathBuf {
+    let candidate = workspace::workspaces_root_for(root).join(format!("mission-{short}"));
+    candidate.canonicalize().unwrap_or(candidate)
+}
+
+fn entry_for_directory<'a>(
+    entries: &'a [MissionIndexEntry],
+    short: &str,
+    dir: &std::path::Path,
+    workspace_roots: &std::collections::HashMap<uuid::Uuid, Vec<std::path::PathBuf>>,
+) -> Option<&'a MissionIndexEntry> {
+    let physical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    entries
+        .iter()
+        .filter(|entry| {
+            workspace_roots
+                .get(&entry.workspace_id)
+                .is_some_and(|roots| {
+                    roots
+                        .iter()
+                        .any(|root| physical_mission_directory(root, short) == physical_dir)
+                })
+        })
+        .max_by_key(|entry| {
+            (
+                protection_rank(&entry.status),
+                entry.updated_at.timestamp_micros(),
+            )
+        })
+}
+
+fn workspace_ids_for_directory(
+    short: &str,
+    dir: &std::path::Path,
+    workspace_roots: &std::collections::HashMap<uuid::Uuid, Vec<std::path::PathBuf>>,
+) -> Vec<uuid::Uuid> {
+    let physical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    workspace_roots
+        .iter()
+        .filter_map(|(id, roots)| {
+            roots
+                .iter()
+                .any(|root| physical_mission_directory(root, short) == physical_dir)
+                .then_some(*id)
+        })
+        .collect()
+}
+
 /// Whether the most protective known owner of a shared short-id directory is
 /// terminal and past retention. Phase 1 must use the same collision policy as
 /// the disk-driven sweep before proposing or removing the shared path.
@@ -224,12 +277,15 @@ fn indexed_mission_directory_is_collectible(
 fn phase_one_index_allows_collection(
     index: &MissionIndex,
     mission_short: &str,
-    workspace_id: uuid::Uuid,
+    dir: &std::path::Path,
+    workspace_roots: &std::collections::HashMap<uuid::Uuid, Vec<std::path::PathBuf>>,
     cutoff: DateTime<Utc>,
 ) -> bool {
     index.complete
         && index.by_short.get(mission_short).is_some_and(|entries| {
-            indexed_mission_directory_is_collectible(entries, workspace_id, cutoff, true)
+            entry_for_directory(entries, mission_short, dir, workspace_roots).is_some_and(|entry| {
+                is_gc_eligible_status(&entry.status) && entry.updated_at < cutoff
+            })
         })
 }
 
@@ -678,6 +734,20 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
             }
         };
     let mission_index = build_mission_index(state).await;
+    let all_workspaces = state.workspaces.list().await;
+    let workspace_roots: std::collections::HashMap<_, _> = all_workspaces
+        .iter()
+        .map(|workspace| {
+            (
+                workspace.id,
+                workspace::mission_workspace_roots_for_workspace(workspace),
+            )
+        })
+        .collect();
+    let workspace_paths: std::collections::HashMap<_, _> = all_workspaces
+        .iter()
+        .map(|workspace| (workspace.id, workspace.path.clone()))
+        .collect();
     let sessions = state.control.all_sessions().await;
     for session in sessions {
         let store = session.mission_store.clone();
@@ -720,18 +790,50 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
                         continue;
                     }
                 };
-                let dir = workspace::mission_workspace_dir_for_root(&ws.path, mission.id);
+                // A recorded root which now names a different filesystem is
+                // not an orphan on the parent disk.  Never inspect or remove
+                // its look-alike mission path until the original filesystem
+                // is back and its persisted identity verifies.
+                if let Err(error) =
+                    workspace::ensure_persisted_mission_root_is_available(&ws, mission.id)
+                {
+                    tracing::warn!(mission_id = %mission.id, %error, "mission GC: persisted root is unavailable; skipping collection");
+                    continue;
+                }
+                let dir = workspace::mission_workspace_dir_for_workspace(&ws, mission.id);
                 if !dir.exists() {
                     continue;
                 }
                 let short = mission.id.simple().to_string()[..8].to_string();
-                if !phase_one_index_allows_collection(&mission_index, &short, workspace_id, cutoff)
-                {
+                if !phase_one_index_allows_collection(
+                    &mission_index,
+                    &short,
+                    &dir,
+                    &workspace_roots,
+                    cutoff,
+                ) {
                     tracing::debug!(
                         mission_id = %mission.id,
                         workspace_id = %workspace_id,
                         path = %dir.display(),
                         "mission GC: kept (short-id collision owner protected)",
+                    );
+                    continue;
+                }
+                if workspace_ids_for_directory(&short, &dir, &workspace_roots)
+                    .iter()
+                    .any(|workspace_id| {
+                        workspace_paths
+                            .get(workspace_id)
+                            .and_then(|path| crate::workspace_exec::machine_name_for_path(path))
+                            .is_some_and(|token| scope_protected.contains(&(token, short.clone())))
+                    })
+                {
+                    tracing::debug!(
+                        mission_id = %mission.id,
+                        workspace_id = %workspace_id,
+                        path = %dir.display(),
+                        "mission GC: kept (live exec scope from global directory owner)",
                     );
                     continue;
                 }
@@ -816,138 +918,166 @@ async fn orphan_sweep(
     report: &mut SweepReport,
 ) {
     let index = &index_full.by_short;
+    let workspaces = state.workspaces.list().await;
+    let workspace_roots: std::collections::HashMap<_, _> = workspaces
+        .iter()
+        .map(|ws| (ws.id, workspace::mission_workspace_roots_for_workspace(ws)))
+        .collect();
+    let workspaces_by_id: std::collections::HashMap<_, _> =
+        workspaces.iter().map(|ws| (ws.id, ws)).collect();
+    let mut scanned_roots = std::collections::HashSet::new();
 
-    for ws in state.workspaces.list().await {
-        let root = workspace::workspaces_root_for(&ws.path);
-        let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
-            continue;
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(short) = name.strip_prefix("mission-") else {
+    for ws in &workspaces {
+        for workspace_root in &workspace_roots[&ws.id] {
+            // Multiple registered workspaces may intentionally share a root.
+            // Scan its physical directory once, then resolve ownership below
+            // from every workspace rather than from this loop's `ws`.
+            let physical_root = workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_root.clone());
+            if !scanned_roots.insert(physical_root) {
+                continue;
+            }
+            let root = workspace::workspaces_root_for(workspace_root);
+            let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
                 continue;
             };
-            if short.len() != 8 || !short.chars().all(|c| c.is_ascii_hexdigit()) {
-                continue;
-            }
-            let dir = entry.path();
-            if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let workspace_token = crate::workspace_exec::machine_name_for_path(&ws.path);
-            if workspace_token
-                .as_ref()
-                .is_some_and(|token| scope_protected.contains(&(token.clone(), short.to_string())))
-            {
-                tracing::debug!(path = %dir.display(), "mission GC: kept (live exec scope)");
-                continue;
-            }
-            enum Verdict {
-                Keep(&'static str),
-                Delete(&'static str, bool /*orphan*/, bool /*stopped*/),
-            }
-            let indexed_entry = index
-                .get(short)
-                .and_then(|entries| entry_for_workspace(entries, ws.id));
-            let verdict = match indexed_entry {
-                Some(e) => match e.status {
-                    MissionStatus::Active
-                    | MissionStatus::Pending
-                    | MissionStatus::WaitingBackground => Verdict::Keep("mission running"),
-                    MissionStatus::AwaitingUser | MissionStatus::Paused => {
-                        if e.updated_at < params.stopped_cutoff {
-                            Verdict::Delete("stopped mission past long-stop retention", false, true)
-                        } else {
-                            Verdict::Keep("awaiting user / paused within retention")
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(short) = name.strip_prefix("mission-") else {
+                    continue;
+                };
+                if short.len() != 8 || !short.chars().all(|c| c.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let dir = entry.path();
+                if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let owner_workspace_ids =
+                    workspace_ids_for_directory(short, &dir, &workspace_roots);
+                if owner_workspace_ids.iter().any(|workspace_id| {
+                    workspaces_by_id
+                        .get(workspace_id)
+                        .and_then(|owner| crate::workspace_exec::machine_name_for_path(&owner.path))
+                        .is_some_and(|token| scope_protected.contains(&(token, short.to_string())))
+                }) {
+                    tracing::debug!(path = %dir.display(), "mission GC: kept (live exec scope)");
+                    continue;
+                }
+                enum Verdict {
+                    Keep(&'static str),
+                    Delete(&'static str, bool /*orphan*/, bool /*stopped*/),
+                }
+                let indexed_entry = index.get(short).and_then(|entries| {
+                    entry_for_directory(entries, short, &dir, &workspace_roots)
+                });
+                let verdict = match indexed_entry {
+                    Some(e) => match e.status {
+                        MissionStatus::Active
+                        | MissionStatus::Pending
+                        | MissionStatus::WaitingBackground => Verdict::Keep("mission running"),
+                        MissionStatus::AwaitingUser | MissionStatus::Paused => {
+                            if e.updated_at < params.stopped_cutoff {
+                                Verdict::Delete(
+                                    "stopped mission past long-stop retention",
+                                    false,
+                                    true,
+                                )
+                            } else {
+                                Verdict::Keep("awaiting user / paused within retention")
+                            }
                         }
-                    }
-                    _ => {
-                        if e.updated_at < params.cutoff {
-                            Verdict::Delete("terminal mission past retention", false, false)
-                        } else {
-                            Verdict::Keep("terminal mission within retention")
+                        _ => {
+                            if e.updated_at < params.cutoff {
+                                Verdict::Delete("terminal mission past retention", false, false)
+                            } else {
+                                Verdict::Keep("terminal mission within retention")
+                            }
                         }
-                    }
-                },
-                None => {
-                    if !params.orphans_enabled {
-                        Verdict::Keep("orphan collection disabled")
-                    } else if !index_full.complete {
-                        Verdict::Keep("mission index incomplete; not trusting orphan verdicts")
-                    } else {
-                        // No mission anywhere claims this dir. Use the dir
-                        // mtime as the age signal, with the normal retention
-                        // as a grace period for freshly-created dirs whose
-                        // mission row hasn't landed yet.
-                        let old_enough = match tokio::fs::metadata(&dir).await {
-                            Ok(meta) => match meta.modified() {
-                                Ok(mtime) => chrono::DateTime::<Utc>::from(mtime) < params.cutoff,
+                    },
+                    None => {
+                        if !params.orphans_enabled {
+                            Verdict::Keep("orphan collection disabled")
+                        } else if !index_full.complete {
+                            Verdict::Keep("mission index incomplete; not trusting orphan verdicts")
+                        } else {
+                            // No mission anywhere claims this dir. Use the dir
+                            // mtime as the age signal, with the normal retention
+                            // as a grace period for freshly-created dirs whose
+                            // mission row hasn't landed yet.
+                            let old_enough = match tokio::fs::metadata(&dir).await {
+                                Ok(meta) => match meta.modified() {
+                                    Ok(mtime) => {
+                                        chrono::DateTime::<Utc>::from(mtime) < params.cutoff
+                                    }
+                                    Err(_) => false,
+                                },
                                 Err(_) => false,
-                            },
-                            Err(_) => false,
-                        };
-                        if old_enough {
-                            Verdict::Delete("no mission in any store", true, false)
-                        } else {
-                            Verdict::Keep("unmatched but too recent")
+                            };
+                            if old_enough {
+                                Verdict::Delete("no mission in any store", true, false)
+                            } else {
+                                Verdict::Keep("unmatched but too recent")
+                            }
                         }
                     }
-                }
-            };
-            match verdict {
-                Verdict::Keep(reason) => {
-                    tracing::debug!(path = %dir.display(), reason, "mission GC: kept");
-                }
-                Verdict::Delete(reason, orphan, stopped) => {
-                    if params.dry_run && dry_run_candidates.contains(&dir) {
-                        tracing::debug!(
-                            path = %dir.display(),
-                            reason,
-                            "mission GC: skipped duplicate dry-run candidate",
-                        );
-                        continue;
+                };
+                match verdict {
+                    Verdict::Keep(reason) => {
+                        tracing::debug!(path = %dir.display(), reason, "mission GC: kept");
                     }
-                    let size = directory_size_bytes(&dir).await;
-                    if params.dry_run {
-                        report.proposed += 1;
-                        tracing::info!(
-                            action = "would_remove",
-                            path = %dir.display(),
-                            workspace = %ws.name,
-                            workspace_id = %ws.id,
-                            bytes = size,
-                            reason,
-                            orphan,
-                            stopped,
-                            "mission GC audit",
-                        );
-                        continue;
-                    }
-                    match tokio::fs::remove_dir_all(&dir).await {
-                        Ok(()) => {
-                            report.removed += 1;
-                            if orphan {
-                                report.orphans_removed += 1;
-                            }
-                            if stopped {
-                                report.stopped_removed += 1;
-                            }
-                            report.bytes_freed = report.bytes_freed.saturating_add(size);
+                    Verdict::Delete(reason, orphan, stopped) => {
+                        if params.dry_run && dry_run_candidates.contains(&dir) {
+                            tracing::debug!(
+                                path = %dir.display(),
+                                reason,
+                                "mission GC: skipped duplicate dry-run candidate",
+                            );
+                            continue;
+                        }
+                        let size = directory_size_bytes(&dir).await;
+                        if params.dry_run {
+                            report.proposed += 1;
                             tracing::info!(
+                                action = "would_remove",
                                 path = %dir.display(),
                                 workspace = %ws.name,
+                                workspace_id = %ws.id,
                                 bytes = size,
                                 reason,
-                                "mission GC: removed workspace directory (orphan sweep)",
+                                orphan,
+                                stopped,
+                                "mission GC audit",
                             );
+                            continue;
                         }
-                        Err(err) => {
-                            report.errors += 1;
-                            tracing::warn!(
-                                path = %dir.display(),
-                                ?err,
-                                "mission GC: failed to remove directory (orphan sweep)",
-                            );
+                        match tokio::fs::remove_dir_all(&dir).await {
+                            Ok(()) => {
+                                report.removed += 1;
+                                if orphan {
+                                    report.orphans_removed += 1;
+                                }
+                                if stopped {
+                                    report.stopped_removed += 1;
+                                }
+                                report.bytes_freed = report.bytes_freed.saturating_add(size);
+                                tracing::info!(
+                                    path = %dir.display(),
+                                    workspace = %ws.name,
+                                    bytes = size,
+                                    reason,
+                                    "mission GC: removed workspace directory (orphan sweep)",
+                                );
+                            }
+                            Err(err) => {
+                                report.errors += 1;
+                                tracing::warn!(
+                                    path = %dir.display(),
+                                    ?err,
+                                    "mission GC: failed to remove directory (orphan sweep)",
+                                );
+                            }
                         }
                     }
                 }
@@ -1079,12 +1209,75 @@ mod tests {
             by_short: std::collections::HashMap::new(),
             complete: false,
         };
+        let roots = std::collections::HashMap::new();
         assert!(!phase_one_index_allows_collection(
             &incomplete_empty,
             "deadbeef",
-            workspace_id,
+            std::path::Path::new("mission-deadbeef"),
+            &roots,
             now - chrono::Duration::days(7),
         ));
+    }
+
+    #[test]
+    fn overlapping_roots_use_global_active_owner_before_orphan_classification() {
+        let root = tempfile::tempdir().unwrap();
+        let default_workspace = uuid::Uuid::nil();
+        let custom_workspace = uuid::Uuid::new_v4();
+        let short = "deadbeef";
+        let dir = workspace::workspaces_root_for(root.path()).join(format!("mission-{short}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = Utc::now();
+        let entries = vec![
+            // The default workspace has a terminal collision, but the custom
+            // workspace owns this same physical root and is still running.
+            MissionIndexEntry {
+                status: MissionStatus::Completed,
+                updated_at: now - chrono::Duration::days(40),
+                workspace_id: default_workspace,
+            },
+            MissionIndexEntry {
+                status: MissionStatus::Active,
+                updated_at: now - chrono::Duration::days(40),
+                workspace_id: custom_workspace,
+            },
+        ];
+        let roots = std::collections::HashMap::from([
+            (default_workspace, vec![root.path().to_path_buf()]),
+            (custom_workspace, vec![root.path().to_path_buf()]),
+        ]);
+
+        let owner = entry_for_directory(&entries, short, &dir, &roots)
+            .expect("the overlapping root has a global owner");
+        assert_eq!(owner.workspace_id, custom_workspace);
+        assert_eq!(owner.status, MissionStatus::Active);
+        assert_eq!(workspace_ids_for_directory(short, &dir, &roots).len(), 2);
+        let index = MissionIndex {
+            by_short: std::collections::HashMap::from([(short.to_string(), entries.clone())]),
+            complete: true,
+        };
+        assert!(
+            !phase_one_index_allows_collection(
+                &index,
+                short,
+                &dir,
+                &roots,
+                now - chrono::Duration::days(7),
+            ),
+            "phase one must retain a path with an active owner in an overlapping root"
+        );
+
+        let terminal_only = vec![MissionIndexEntry {
+            status: MissionStatus::Completed,
+            updated_at: now - chrono::Duration::days(40),
+            workspace_id: custom_workspace,
+        }];
+        assert_eq!(
+            entry_for_directory(&terminal_only, short, &dir, &roots)
+                .expect("terminal owner still owns the directory")
+                .status,
+            MissionStatus::Completed
+        );
     }
 
     #[test]

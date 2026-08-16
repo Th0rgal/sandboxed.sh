@@ -49,13 +49,25 @@ matching live scopes before changing a workspace shared by concurrent missions.
 
 ## Admission and continuity
 
-By default, disk warning is not a portfolio-wide stop. Set
+By default, disk warning is not a portfolio-wide stop. Local mission placement
+uses `MISSION_WORKSPACE_ROOT` when it names an existing writable absolute
+directory (for example `/srv/sandboxed-storage`). The service canonicalizes the
+directory, including a deliberate symlink, and falls back safely to the
+workspace's recorded root if it is missing, unwritable, relative, or contains
+path traversal. It never moves or deletes existing workspace records or active
+mission directories; an already-existing legacy mission directory continues to
+be used.
+
+Admission and fleet health measure the `statvfs` filesystem that backs this
+selected path, not `/`. Their non-secret output includes the canonical path,
+filesystem identifier, free GiB, and required GiB. Set
 `DISK_ADMISSION_AT_WARN=1` on build-heavy hosts to refuse all new missions at
 Warn instead of waiting for Critical. A local disk-heavy mission should set
 `estimated_disk_gib`; the API rejects it when its estimate would cross
-`MISSION_DISK_EMERGENCY_RESERVE_GB` (default 64 GiB).
-`MISSION_DISK_DEFAULT_ESTIMATE_GIB` supplies a fail-safe estimate when a local
-request omits one. Critical level always rejects all new local missions.
+`MISSION_DISK_EMERGENCY_RESERVE_GB` (default 150 GiB).
+`MISSION_DISK_DEFAULT_ESTIMATE_GIB` defaults to 64 GiB, so a local request
+without an explicit estimate remains fail-closed. Critical level always rejects
+all new local missions.
 
 For a high-churn Lean/build host, a deliberately aggressive profile is:
 
@@ -84,3 +96,12 @@ oversized overlays fail closed. Remote placement reserves the declared scratch
 estimate, while runners reuse content-addressed checkouts and dependency-only
 Lake cache slots. This lets a dirty proof lane continue on a roomy node without
 duplicating a fresh Mathlib tree on the production host.
+
+## Future placement scoring (design only)
+
+After the P0 filesystem admission work, placement can consume one unified
+scorecard: hard constraints first (workspace isolation, reachable runner,
+filesystem capacity after estimate plus reserve), then soft penalties for a
+GitHub runner being busy or highly loaded. Busy/load must only rank otherwise
+admissible candidates lower; it must never become an admission rejection or
+weaken the local filesystem fail-closed checks.

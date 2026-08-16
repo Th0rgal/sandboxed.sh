@@ -8,6 +8,34 @@
 //! reader never observes a half-written config.
 
 use super::*;
+use std::collections::{HashMap, HashSet};
+
+const SANDBOXED_MANAGED_PROVIDER_KEY: &str = "x-sandboxed-managed";
+
+fn managed_opencode_provider_keys(custom_providers: Option<&[AIProvider]>) -> HashSet<String> {
+    let mut keys = HashSet::from(["kimi".to_string()]);
+    if let Some(providers) = custom_providers {
+        for provider in providers {
+            keys.insert(sanitize_key(&provider.name));
+            if provider.provider_type == ProviderType::Kimi {
+                keys.insert("kimi".to_string());
+            }
+        }
+    }
+    keys
+}
+
+fn is_sandboxed_managed_provider(
+    key: &str,
+    provider: &serde_json::Value,
+    managed_keys: &HashSet<String>,
+) -> bool {
+    provider
+        .get(SANDBOXED_MANAGED_PROVIDER_KEY)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || managed_keys.contains(key)
+}
 
 /// Write `contents` to `path` atomically: write to a sibling `.tmp` file,
 /// then rename over the target. Renames within one directory are atomic on
@@ -239,6 +267,22 @@ pub(crate) async fn write_opencode_config(
         base_config = serde_json::json!({});
     }
 
+    // MCP synchronization rewrites the generated settings file.  A custom
+    // workspace can carry provider definitions that do not exist in the
+    // server-wide OpenCode base config, so retain its local `provider` map
+    // before replacing MCP settings.  Server-managed Custom/Kimi definitions
+    // below override only matching keys with their authoritative values.
+    let local_provider_map = tokio::fs::read_to_string(workspace_dir.join("opencode.json"))
+        .await
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .and_then(|config| {
+            config
+                .get("provider")
+                .and_then(|value| value.as_object())
+                .cloned()
+        });
+
     {
         let base_obj = base_config.as_object_mut().expect("opencode base config");
         base_obj.insert(
@@ -251,6 +295,22 @@ pub(crate) async fn write_opencode_config(
             serde_json::Value::Object(permission),
         );
         base_obj.insert("tools".to_string(), serde_json::Value::Object(tools));
+
+        if let Some(provider_map) = local_provider_map {
+            let providers = base_obj
+                .entry("provider".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(providers) = providers.as_object_mut() {
+                let mut managed_keys = managed_opencode_provider_keys(custom_providers);
+                managed_keys.extend(read_managed_opencode_provider_keys(workspace_root));
+                for (key, provider) in provider_map {
+                    if is_sandboxed_managed_provider(&key, &provider, &managed_keys) {
+                        continue;
+                    }
+                    providers.entry(key).or_insert(provider);
+                }
+            }
+        }
 
         // Add custom providers if any. Kimi is handled here too: like Custom
         // providers it is not an OpenCode built-in, so it needs an explicit
@@ -270,7 +330,11 @@ pub(crate) async fn write_opencode_config(
                 .collect();
 
             if !provider_blocks.is_empty() {
-                let mut provider_map = serde_json::Map::new();
+                let mut provider_map = base_obj
+                    .get("provider")
+                    .and_then(|value| value.as_object())
+                    .cloned()
+                    .unwrap_or_default();
 
                 for provider in provider_blocks {
                     // Kimi: OpenAI-compatible block with the OAuth access token as
@@ -346,6 +410,8 @@ pub(crate) async fn write_opencode_config(
                         provider_config
                             .insert("models".to_string(), serde_json::Value::Object(models_map));
 
+                        provider_config
+                            .insert(SANDBOXED_MANAGED_PROVIDER_KEY.to_string(), json!(true));
                         provider_map.insert(
                             "kimi".to_string(),
                             serde_json::Value::Object(provider_config),
@@ -419,6 +485,7 @@ pub(crate) async fn write_opencode_config(
                         }
                     }
 
+                    provider_config.insert(SANDBOXED_MANAGED_PROVIDER_KEY.to_string(), json!(true));
                     provider_map.insert(provider_id, serde_json::Value::Object(provider_config));
                 }
 
@@ -1364,6 +1431,73 @@ pub async fn write_backend_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mcp_rewrite_retains_workspace_local_custom_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        std::fs::write(
+            workspace.join("opencode.json"),
+            r#"{"provider":{"local-relay":{"name":"Local Relay","options":{"baseURL":"https://relay.invalid/v1"}}}}"#,
+        )
+        .unwrap();
+
+        write_opencode_config(
+            workspace,
+            Vec::new(),
+            workspace,
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(workspace.join("opencode.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            rewritten["provider"]["local-relay"]["options"]["baseURL"],
+            "https://relay.invalid/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_rewrite_drops_disabled_server_managed_providers() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        std::fs::write(
+            workspace.join("opencode.json"),
+            r#"{"provider":{"kimi":{"name":"Kimi","x-sandboxed-managed":true,"options":{"apiKey":"stale"}},"local-relay":{"name":"Local Relay","options":{"baseURL":"https://relay.invalid/v1"}}}}"#,
+        )
+        .unwrap();
+
+        write_opencode_config(
+            workspace,
+            Vec::new(),
+            workspace,
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(workspace.join("opencode.json")).unwrap())
+                .unwrap();
+        assert!(rewritten["provider"].get("kimi").is_none());
+        assert_eq!(
+            rewritten["provider"]["local-relay"]["options"]["baseURL"],
+            "https://relay.invalid/v1"
+        );
+    }
 
     #[tokio::test]
     async fn kimi_opencode_config_discovers_future_models_from_live_catalog() {

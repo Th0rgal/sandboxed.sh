@@ -3645,7 +3645,6 @@ async fn run_mission_turn(
             "Failed to sync MCP binaries into workspace"
         );
     }
-    let workspace_root = workspace.path.clone();
     let mission_work_dir_result = {
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
@@ -3663,7 +3662,9 @@ async fn run_mission_turn(
         )
         .await
     };
-    let mission_work_dir = match mission_work_dir_result {
+    let mission_work_dir = match workspace::require_verified_mission_workspace(
+        mission_work_dir_result,
+    ) {
         Ok(dir) => {
             tracing::info!(
                 "Mission {} workspace directory: {}",
@@ -3673,8 +3674,11 @@ async fn run_mission_turn(
             dir
         }
         Err(e) => {
-            tracing::warn!("Failed to prepare mission workspace, using default: {}", e);
-            workspace_root
+            // A persisted placement error means the original filesystem is
+            // unavailable or has changed identity. Running against the raw
+            // workspace root would silently write a different tree.
+            tracing::warn!(mission_id = %mission_id, error = %e, "refusing to run mission without its verified workspace");
+            return AgentResult::failure(e.to_string(), 0);
         }
     };
 
@@ -3682,6 +3686,32 @@ async fn run_mission_turn(
     let mission_work_dir = if let Some(ref wd) = mission_working_directory {
         match resolve_mission_working_directory(&workspace.path, workspace.workspace_type, wd) {
             Ok(wd_path) => {
+                if let Err(error) = workspace::verify_or_adopt_explicit_mission_working_directory(
+                    &workspace,
+                    &wd_path,
+                    &[mission_id],
+                ) {
+                    if workspace::is_generated_mission_directory_under_known_root(
+                        &workspace, &wd_path,
+                    ) {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            requested_working_directory = %wd,
+                            "adopting pre-registry generated working_directory"
+                        );
+                    } else {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            requested_working_directory = %wd,
+                            error = %error,
+                            "refusing explicit working_directory without a verified persisted owner"
+                        );
+                        return AgentResult::failure(
+                            format!("explicit working_directory owner is unavailable or unverified: {error}"),
+                            0,
+                        );
+                    }
+                }
                 tracing::info!(
                     mission_id = %mission_id,
                     requested_working_directory = %wd,
@@ -3695,9 +3725,12 @@ async fn run_mission_turn(
                     mission_id = %mission_id,
                     requested_working_directory = %wd,
                     error = %error,
-                    "Mission working_directory is invalid; using prepared mission directory"
+                    "refusing invalid explicit mission working_directory"
                 );
-                mission_work_dir
+                return AgentResult::failure(
+                    format!("explicit working_directory is invalid: {error}"),
+                    0,
+                );
             }
         }
     } else {

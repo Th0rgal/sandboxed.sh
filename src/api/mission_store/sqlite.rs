@@ -511,7 +511,8 @@ CREATE TABLE IF NOT EXISTS missions (
     awaiting_kind TEXT,
     last_status_change_at TEXT,
     origin TEXT,
-    origin_session_id TEXT
+    origin_session_id TEXT,
+    requires_local_disk INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
@@ -2276,6 +2277,27 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add paused_at column: {}", e))?;
         }
 
+        // Placement is authority for local-disk admission after a restart.
+        // Existing rows predate this field and are deliberately migrated as
+        // local, the fail-closed compatibility policy.
+        let has_requires_local_disk_column: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('missions') WHERE name = 'requires_local_disk'",
+            )
+            .map_err(|e| format!("Failed to check for requires_local_disk column: {e}"))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {e}"))?;
+        if !has_requires_local_disk_column {
+            tracing::info!(
+                "Running migration: adding 'requires_local_disk' column to missions table"
+            );
+            conn.execute(
+                "ALTER TABLE missions ADD COLUMN requires_local_disk INTEGER NOT NULL DEFAULT 1",
+                [],
+            )
+            .map_err(|e| format!("Failed to add requires_local_disk column: {e}"))?;
+        }
+
         // Project tagging + awaiting_kind classification + activity timestamps +
         // track state. Lets external consumers (Paloma) group/filter/route
         // missions, tell "needs a decision" apart from "finished, please ack",
@@ -2729,6 +2751,7 @@ fn row_to_mission(row: &rusqlite::Row<'_>) -> rusqlite::Result<Mission> {
         awaiting_kind,
         origin: row.get(42).ok().flatten(),
         origin_session_id: row.get(43).ok().flatten(),
+        requires_local_disk: row.get::<_, i32>(44).unwrap_or(1) != 0,
     })
 }
 
@@ -2745,7 +2768,7 @@ const MISSION_LIST_COLUMNS: &str = "id, status, title, short_description, metada
      COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at, \
      COALESCE(priority, 0) as priority, not_before, deadline, paused_at, \
      project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at, \
-     COALESCE(fast_mode, 0) as fast_mode, origin, origin_session_id";
+     COALESCE(fast_mode, 0) as fast_mode, origin, origin_session_id, COALESCE(requires_local_disk, 1) as requires_local_disk";
 
 fn parse_status(s: &str) -> MissionStatus {
     match s {
@@ -3158,7 +3181,7 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
                             COALESCE(priority, 0) as priority, not_before, deadline, paused_at,
                             project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at,
-                            COALESCE(fast_mode, 0) as fast_mode, origin, origin_session_id FROM missions WHERE id = ?1",
+                            COALESCE(fast_mode, 0) as fast_mode, origin, origin_session_id, COALESCE(requires_local_disk, 1) as requires_local_disk FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -3226,6 +3249,7 @@ impl MissionStore for SqliteMissionStore {
                             awaiting_kind,
                             origin: row.get(42).ok().flatten(),
                             origin_session_id: row.get(43).ok().flatten(),
+                            requires_local_disk: row.get::<_, i32>(44).unwrap_or(1) != 0,
                     })
                 })
                 .optional()
@@ -3594,7 +3618,7 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|error| error.to_string())?
     }
 
-    async fn create_mission_with_parent(
+    async fn create_mission_with_parent_and_placement(
         &self,
         title: Option<&str>,
         workspace_id: Option<Uuid>,
@@ -3606,10 +3630,12 @@ impl MissionStore for SqliteMissionStore {
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
+        requires_local_disk: bool,
+        assigned_id: Option<Uuid>,
     ) -> Result<Mission, String> {
         let conn = self.conn.clone();
         let now = now_string();
-        let id = Uuid::new_v4();
+        let id = assigned_id.unwrap_or_else(Uuid::new_v4);
         // Inherit workspace from parent mission when not explicitly provided.
         let workspace_id = if let Some(ws) = workspace_id {
             ws
@@ -3663,6 +3689,7 @@ impl MissionStore for SqliteMissionStore {
             terminal_evidence: None,
             parent_mission_id,
             working_directory: working_directory.map(|s| s.to_string()),
+            requires_local_disk,
             mission_mode: MissionMode::default(),
             goal_mode: false,
             goal_objective: None,
@@ -3683,8 +3710,8 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective, last_status_change_at, fast_mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective, last_status_change_at, fast_mode, requires_local_disk)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
                 params![
                     m.id.to_string(),
                     status_to_string(m.status),
@@ -3711,6 +3738,7 @@ impl MissionStore for SqliteMissionStore {
                     m.goal_objective,
                     m.created_at,
                     if m.fast_mode { 1i64 } else { 0i64 },
+                    if m.requires_local_disk { 1i64 } else { 0i64 },
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -3722,13 +3750,43 @@ impl MissionStore for SqliteMissionStore {
         Ok(mission)
     }
 
+    async fn create_mission_with_parent(
+        &self,
+        title: Option<&str>,
+        workspace_id: Option<Uuid>,
+        agent: Option<&str>,
+        model_override: Option<&str>,
+        model_effort: Option<&str>,
+        fast_mode: bool,
+        backend: Option<&str>,
+        config_profile: Option<&str>,
+        parent_mission_id: Option<Uuid>,
+        working_directory: Option<&str>,
+    ) -> Result<Mission, String> {
+        self.create_mission_with_parent_and_placement(
+            title,
+            workspace_id,
+            agent,
+            model_override,
+            model_effort,
+            fast_mode,
+            backend,
+            config_profile,
+            parent_mission_id,
+            working_directory,
+            true,
+            None,
+        )
+        .await
+    }
+
     async fn get_child_missions(&self, parent_id: Uuid) -> Result<Vec<Mission>, String> {
         let conn = self.conn.clone();
         let parent_id_str = parent_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn
-                .prepare("SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, session_id, terminal_reason, parent_mission_id, working_directory, COALESCE(mission_mode, 'task') as mission_mode, COALESCE(fast_mode, 0) as fast_mode FROM missions WHERE parent_mission_id = ?1")
+                .prepare("SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, session_id, terminal_reason, parent_mission_id, working_directory, COALESCE(mission_mode, 'task') as mission_mode, COALESCE(fast_mode, 0) as fast_mode, COALESCE(requires_local_disk, 1) as requires_local_disk FROM missions WHERE parent_mission_id = ?1")
                 .map_err(|e| e.to_string())?;
             let missions = stmt
                 .query_map(params![parent_id_str], |row| {
@@ -3761,6 +3819,7 @@ impl MissionStore for SqliteMissionStore {
                         terminal_evidence: None,
                         parent_mission_id: row.get::<_, Option<String>>(20)?.and_then(|s| Uuid::parse_str(&s).ok()),
                         working_directory: row.get(21)?,
+                        requires_local_disk: row.get::<_, i32>(24)? != 0,
                         mission_mode: row.get::<_, Option<String>>(22)?
                             .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
                             .unwrap_or_default(),
@@ -3782,6 +3841,33 @@ impl MissionStore for SqliteMissionStore {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+
+    async fn set_mission_requires_local_disk(
+        &self,
+        id: Uuid,
+        requires_local_disk: bool,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET requires_local_disk = ?1, updated_at = ?2 WHERE id = ?3",
+                params![
+                    if requires_local_disk { 1i64 } else { 0i64 },
+                    now_string(),
+                    id.to_string()
+                ],
+            )
+            .map_err(|error| error.to_string())
+            .and_then(|updated| {
+                (updated == 1)
+                    .then_some(())
+                    .ok_or_else(|| format!("mission {id} not found while persisting placement"))
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
 
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String> {
@@ -4763,6 +4849,7 @@ impl MissionStore for SqliteMissionStore {
                         terminal_evidence: None,
                         parent_mission_id: None,
                         working_directory: None,
+                        requires_local_disk: true,
                         mission_mode: row
                             .get::<_, Option<String>>(13)?
                             .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
@@ -4903,6 +4990,7 @@ impl MissionStore for SqliteMissionStore {
                         terminal_evidence: None,
                         parent_mission_id: None,
                         working_directory: None,
+                        requires_local_disk: true,
                         mission_mode: row
                             .get::<_, Option<String>>(13)?
                             .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
@@ -7458,6 +7546,7 @@ impl MissionStore for SqliteMissionStore {
                         terminal_evidence: None,
                         parent_mission_id: None,
                         working_directory: None,
+                        requires_local_disk: true,
                         mission_mode: serde_json::from_value(serde_json::Value::String(mode_str))
                             .unwrap_or_default(),
                         goal_mode: false,
