@@ -277,15 +277,21 @@ async fn offload_build(
     // rsync below WRITES into host_dir.
     let host_short = name.strip_prefix("mission-").unwrap_or("");
     let req_short = &req.mission_id.to_string()[..8];
-    let mission_store = state.control.get_mission_store().await;
+    let Some((mission_store, requesting_mission)) = state
+        .control
+        .find_mission_store_owner(req.mission_id)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(mission_id = %req.mission_id, %error, "spark owner lookup failed closed");
+            None
+        })
+    else {
+        return (StatusCode::FORBIDDEN, "mission capability owner not found").into_response();
+    };
     let host_owner = if host_short.is_empty() {
         None
     } else if host_short == req_short {
-        mission_store
-            .get_mission(req.mission_id)
-            .await
-            .ok()
-            .flatten()
+        Some(requesting_mission)
     } else {
         mission_ancestor_by_short(&mission_store, req.mission_id, host_short).await
     };

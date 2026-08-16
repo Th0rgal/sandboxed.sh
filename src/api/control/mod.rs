@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -3962,6 +3963,33 @@ impl ControlHub {
         self.sessions.read().await.values().cloned().collect()
     }
 
+    /// Resolve a mission capability against the store that owns it.  Never use
+    /// `get_mission_store` for this: that convenience method intentionally
+    /// chooses an arbitrary desktop/default session and is not an authority
+    /// lookup in a multi-user deployment.
+    pub(crate) async fn find_mission_store_owner(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Option<(Arc<dyn MissionStore>, Mission)>, String> {
+        // A Spark token can only have been minted by a running session, so a
+        // live owner is required.  Do not open offline SQLite files here: a
+        // capability check must not create a competing writer just to find a
+        // row that cannot currently execute.
+        let stores: Vec<_> = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .map(|state| Arc::clone(&state.mission_store))
+            .collect();
+        for store in stores {
+            if let Some(mission) = store.get_mission(mission_id).await? {
+                return Ok(Some((store, mission)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Collect every mission that carries a `project` tag across all mission
     /// stores (live, offline file, offline sqlite). Read-only; used by the
     /// projects-overview board. Terminal missions older than `terminal_horizon`
@@ -7350,17 +7378,100 @@ async fn acquire_durable_disk_admission_lock(
 
 const DISK_RESERVATION_TAG_PREFIX: &str = "disk-reservation-v1:";
 
-fn disk_reservation_tag(filesystem: &str, bytes: u64) -> String {
-    // `filesystem` is a local statvfs identifier, not a path or secret.  The
-    // trailing byte count makes parsing unambiguous even though the identity
-    // itself contains colons.
-    format!("{DISK_RESERVATION_TAG_PREFIX}{filesystem}:{bytes}")
+/// Server-owned admission state.  This is intentionally separate from
+/// `MissionProject`: project metadata is user editable and consequently can
+/// never be an authority for resource accounting.  The file is written while
+/// holding the global admission lock and atomically replaced, so independent
+/// control processes observe a complete old or complete new ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiskReservation {
+    mission_id: Uuid,
+    filesystem: String,
+    estimated_bytes: u64,
+    /// Free bytes observed when the lease was granted.  This is a diagnostic
+    /// baseline, not an additional reservation; counting both consumed disk
+    /// and the full estimate would double-count the same work.
+    free_bytes_at_grant: u64,
+    /// Canonical mission directory whose actual usage consumes this lease.
+    /// Older records omit it and conservatively retain their full estimate.
+    #[serde(default)]
+    workspace_dir: Option<PathBuf>,
 }
 
-fn parse_disk_reservation_tag(tag: &str) -> Option<(&str, u64)> {
-    let value = tag.strip_prefix(DISK_RESERVATION_TAG_PREFIX)?;
-    let (filesystem, bytes) = value.rsplit_once(':')?;
-    Some((filesystem, bytes.parse().ok()?))
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DiskReservationLedger {
+    #[serde(default = "disk_reservation_ledger_version")]
+    version: u8,
+    #[serde(default)]
+    reservations: HashMap<Uuid, DiskReservation>,
+}
+
+const fn disk_reservation_ledger_version() -> u8 {
+    2
+}
+
+fn disk_reservation_ledger_path(config: &Config) -> PathBuf {
+    config
+        .working_dir
+        .join(".sandboxed-sh")
+        .join("missions")
+        .join("disk-reservations-v2.json")
+}
+
+fn read_disk_reservation_ledger(config: &Config) -> Result<DiskReservationLedger, String> {
+    let path = disk_reservation_ledger_path(config);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DiskReservationLedger {
+            version: disk_reservation_ledger_version(),
+            reservations: HashMap::new(),
+        }),
+        Err(error) => Err(format!("read {}: {error}", path.display())),
+    }
+}
+
+fn write_disk_reservation_ledger(
+    config: &Config,
+    ledger: &DiskReservationLedger,
+) -> Result<(), String> {
+    let path = disk_reservation_ledger_path(config);
+    let parent = path.parent().expect("ledger path has parent");
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    let temp = parent.join(format!(".disk-reservations-v2.{}.tmp", Uuid::new_v4()));
+    let outcome = (|| -> Result<(), String> {
+        let bytes = serde_json::to_vec(ledger).map_err(|error| error.to_string())?;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|error| format!("open {}: {error}", temp.display()))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("write {}: {error}", temp.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {error}", temp.display()))?;
+        std::fs::rename(&temp, &path)
+            .map_err(|error| format!("rename {}: {error}", path.display()))?;
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| format!("sync {}: {error}", parent.display()))?;
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    outcome
+}
+
+/// Admission leases are server-owned durable state.  They used to share the
+/// free-form project-tag namespace, which let a project edit forge, erase, or
+/// transplant a lease.  Keep the compatibility reader below for records made
+/// by older servers, but never accept this reserved namespace from an API
+/// request.
+fn contains_internal_disk_reservation_tag(tags: &[String]) -> bool {
+    tags.iter()
+        .any(|tag| tag.trim().starts_with(DISK_RESERVATION_TAG_PREFIX))
 }
 
 fn mission_holds_disk_reservation(status: MissionStatus) -> bool {
@@ -7372,29 +7483,116 @@ fn disk_admission_required_bytes(emergency: u64, reserved: u64, candidate: u64) 
 }
 
 async fn reserved_disk_bytes_for_filesystem(
-    mission_store: &Arc<dyn MissionStore>,
+    config: &Config,
     filesystem: &str,
 ) -> Result<u64, String> {
-    let missions = mission_store.list_missions(usize::MAX, 0).await?;
-    Ok(missions
-        .iter()
-        .filter(|mission| mission_holds_disk_reservation(mission.status))
-        .flat_map(|mission| mission.project.tags.iter())
-        .filter_map(|tag| parse_disk_reservation_tag(tag))
-        .filter(|(reserved_filesystem, _)| *reserved_filesystem == filesystem)
-        .fold(0u64, |total, (_, bytes)| total.saturating_add(bytes)))
+    let ledger = read_disk_reservation_ledger(config)?;
+    Ok(ledger
+        .reservations
+        .values()
+        .filter(|reservation| reservation.filesystem == filesystem)
+        .map(disk_reservation_outstanding_bytes)
+        .fold(0u64, |sum, bytes| sum.saturating_add(bytes)))
+}
+
+/// The filesystem's free counter already includes bytes written by a running
+/// mission. Subtracting both those bytes and its full estimate would charge
+/// the same consumption twice.  A lease therefore retains only its estimated
+/// *remaining* peak after measuring its own workspace.  Measurement failure
+/// is conservative: keep the complete estimate.
+fn disk_reservation_outstanding_bytes(reservation: &DiskReservation) -> u64 {
+    let Some(path) = reservation.workspace_dir.as_deref() else {
+        return reservation.estimated_bytes;
+    };
+    let usage = walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .fold(0u64, |total, metadata| total.saturating_add(metadata.len()));
+    reservation.estimated_bytes.saturating_sub(usage)
+}
+
+fn nonterminal_mission_ids_in_sqlite(path: &std::path::Path) -> Result<HashSet<Uuid>, String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
+    let mut statement = connection
+        .prepare("SELECT id, status FROM missions")
+        .map_err(|error| format!("query {}: {error}", path.display()))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut ids = HashSet::new();
+    for row in rows {
+        let (id, status) = row.map_err(|error| error.to_string())?;
+        let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
+            .unwrap_or(MissionStatus::Active);
+        if mission_holds_disk_reservation(status) {
+            let id = Uuid::parse_str(&id)
+                .map_err(|error| format!("parse mission id {id} in {}: {error}", path.display()))?;
+            ids.insert(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Reconstruct the live lease set from authoritative mission state while the
+/// global admission lock is held.  The ledger supplies bytes; mission stores
+/// supply lifecycle truth.  Project tags are deliberately excluded: they are
+/// user-editable presentation metadata and can neither grant nor retain a
+/// lease after a project edit.
+async fn reconcile_disk_reservation_ledger_under_lock(
+    control_hub: &ControlHub,
+    config: &Config,
+) -> Result<(), String> {
+    let inventory = control_hub.mission_store_inventory().await?;
+    let mut live_ids = HashSet::new();
+    for store in inventory.live {
+        for mission in store.list_missions(usize::MAX, 0).await? {
+            if mission_holds_disk_reservation(mission.status) {
+                live_ids.insert(mission.id);
+            }
+        }
+    }
+    for user in inventory.offline_file_users {
+        let store: Arc<dyn MissionStore> = Arc::new(
+            mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await?,
+        );
+        for mission in store.list_missions(usize::MAX, 0).await? {
+            if mission_holds_disk_reservation(mission.status) {
+                live_ids.insert(mission.id);
+            }
+        }
+    }
+    for path in inventory.offline_sqlite {
+        let ids = tokio::task::spawn_blocking(move || nonterminal_mission_ids_in_sqlite(&path))
+            .await
+            .map_err(|error| error.to_string())??;
+        live_ids.extend(ids);
+    }
+    let mut ledger = read_disk_reservation_ledger(config)?;
+    let before = ledger.reservations.len();
+    ledger.reservations.retain(|id, _| live_ids.contains(id));
+    if ledger.reservations.len() != before {
+        write_disk_reservation_ledger(config, &ledger)?;
+    }
+    Ok(())
 }
 
 /// The caller must retain the returned lock through mission persistence and
 /// its reservation-tag write.  That makes admission, creation and durable
 /// reconstruction one atomic protocol across local control processes.
 async fn reserve_local_mission_disk(
+    control_hub: &ControlHub,
     config: &Config,
-    mission_store: &Arc<dyn MissionStore>,
     workspace: &workspace::Workspace,
     estimate_gib: u64,
-) -> Result<(DurableDiskAdmissionLockGuard, String), String> {
+) -> Result<(DurableDiskAdmissionLockGuard, DiskReservation), String> {
     let guard = acquire_durable_disk_admission_lock(config).await?;
+    reconcile_disk_reservation_ledger_under_lock(control_hub, config).await?;
     let root = workspace::mission_workspace_root_for_workspace(workspace, Uuid::nil());
     if let Some(reason) = disk_admission_refusal(&root) {
         return Err(reason);
@@ -7405,7 +7603,7 @@ async fn reserve_local_mission_disk(
             root.display()
         )
     })?;
-    let reserved = reserved_disk_bytes_for_filesystem(mission_store, &usage.filesystem).await?;
+    let reserved = reserved_disk_bytes_for_filesystem(config, &usage.filesystem).await?;
     let estimate = estimate_gib.saturating_mul(1 << 30);
     let emergency = mission_disk_reserve_gib().saturating_mul(1 << 30);
     let required = disk_admission_required_bytes(emergency, reserved, estimate);
@@ -7428,7 +7626,30 @@ async fn reserve_local_mission_disk(
         required_bytes = required,
         "local mission disk admission reserved"
     );
-    Ok((guard, disk_reservation_tag(&usage.filesystem, estimate)))
+    Ok((
+        guard,
+        DiskReservation {
+            mission_id: Uuid::nil(),
+            filesystem: usage.filesystem,
+            estimated_bytes: estimate,
+            free_bytes_at_grant: usage.available,
+            workspace_dir: None,
+        },
+    ))
+}
+
+/// Release a server-owned lease when a mission reaches a terminal state.  The
+/// lock is the same one used for admission, making a terminal transition and
+/// a concurrent create serialize across control processes.  A failed ledger
+/// write is deliberately surfaced to the caller rather than silently making
+/// capacity appear free.
+async fn release_local_mission_disk(config: &Config, mission_id: Uuid) -> Result<(), String> {
+    let _guard = acquire_durable_disk_admission_lock(config).await?;
+    let mut ledger = read_disk_reservation_ledger(config)?;
+    if ledger.reservations.remove(&mission_id).is_some() {
+        write_disk_reservation_ledger(config, &ledger)?;
+    }
+    Ok(())
 }
 
 struct DurablePrWriterLockGuard {
@@ -8824,6 +9045,15 @@ pub async fn create_mission(
         }
     }
     let mut normalized_request_tags = normalize_mission_tags(req.tags.as_deref());
+    if normalized_request_tags
+        .as_deref()
+        .is_some_and(contains_internal_disk_reservation_tag)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "disk-reservation-v1 tags are reserved internal admission state".to_string(),
+        ));
+    }
     if let Some(estimated_gib) = effective_estimated_disk_gib {
         let tag = format!("disk-estimate-gib:{estimated_gib}");
         let tags = normalized_request_tags.get_or_insert_with(Vec::new);
@@ -10945,6 +11175,15 @@ pub async fn update_mission_project(
             .filter(|t| !t.is_empty())
             .collect()
     });
+    if tags
+        .as_deref()
+        .is_some_and(contains_internal_disk_reservation_tag)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "disk-reservation-v1 tags are reserved internal admission state".to_string(),
+        ));
+    }
 
     let effective_string = |patch: &Option<Option<String>>, current: &Option<String>| {
         patch.clone().unwrap_or_else(|| current.clone())
@@ -10952,6 +11191,24 @@ pub async fn update_mission_project(
     let effective_github_pr = effective_string(&github_pr, &current.project.github_pr);
     let effective_intent = effective_string(&intent, &current.project.intent);
     let mut effective_tags = tags.clone().unwrap_or_else(|| current.project.tags.clone());
+    // Compatibility: old releases persisted leases in project tags.  A
+    // project edit may not drop or replace one of those records while the
+    // migration reader still reconstructs it.
+    let durable_reservation_tags: Vec<String> = current
+        .project
+        .tags
+        .iter()
+        .filter(|tag| tag.starts_with(DISK_RESERVATION_TAG_PREFIX))
+        .cloned()
+        .collect();
+    for reservation in &durable_reservation_tags {
+        if !effective_tags.iter().any(|tag| tag == reservation) {
+            effective_tags.push(reservation.clone());
+        }
+    }
+    if tags.is_some() {
+        tags = Some(effective_tags.clone());
+    }
     let deferred_goal = control
         .mission_store
         .get_deferred_goal(id)
@@ -18307,27 +18564,31 @@ async fn control_actor_loop(
                         }
                     }
                     ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, fast_mode, backend, config_profile, parent_mission_id, working_directory, scheduling, requires_local_disk, estimated_disk_gib, admission_tags, respond } => {
+                        // Resolve once for both admission and the durable lease record.
+                        // Keeping this value outside the conditional is important: the
+                        // lease must name the exact workspace that was admitted, rather
+                        // than reconstructing a possibly different default later.
+                        let workspace = workspaces
+                            .get(workspace_id.unwrap_or(workspace::DEFAULT_WORKSPACE_ID))
+                            .await
+                            .unwrap_or_else(|| workspace::Workspace::default_host(config.working_dir.clone()));
                         // Disk preflight: refuse new missions when the root
                         // filesystem is critically full instead of letting
                         // workers die mid-flight on ENOSPC. Actor-level so
                         // the HTTP, Ask and Telegram entrypoints are all
                         // covered by this single gate.
                         let mut reservation_guard = None;
-                        let mut reservation_tag = None;
+                        let mut reservation = None;
                         if requires_local_disk {
-                            let workspace = workspaces
-                                .get(workspace_id.unwrap_or(workspace::DEFAULT_WORKSPACE_ID))
-                                .await
-                                .unwrap_or_else(|| workspace::Workspace::default_host(config.working_dir.clone()));
                             match reserve_local_mission_disk(
+                                &control_hub,
                                 &config,
-                                &mission_store,
                                 &workspace,
                                 estimated_disk_gib.unwrap_or_else(mission_disk_default_estimate_gib),
                             ).await {
-                                Ok((guard, tag)) => {
+                                Ok((guard, candidate)) => {
                                     reservation_guard = Some(guard);
-                                    reservation_tag = Some(tag);
+                                    reservation = Some(candidate);
                                 }
                                 Err(error) => {
                                     let _ = respond.send(Err(error));
@@ -18361,13 +18622,11 @@ async fn control_actor_loop(
                         )
                         .await {
                             Ok(mut mission) => {
-                                // The durable file lock remains held until this tag is
-                                // persisted.  A second process reconstructs the sum from
-                                // these tags, so a restart has no in-memory lease to lose.
-                                let mut tags = admission_tags;
-                                if let Some(tag) = reservation_tag {
-                                    tags.push(tag);
-                                }
+                                // Project tags are user-editable and are not admission
+                                // state.  Persist any ordinary tags independently, then
+                                // write the server-owned v2 ledger before releasing the
+                                // cross-process lock.
+                                let tags = admission_tags;
                                 if !tags.is_empty() {
                                     if let Err(error) = mission_store.update_mission_project(
                                         mission.id,
@@ -18384,7 +18643,7 @@ async fn control_actor_loop(
                                             MissionStatus::Failed,
                                         ).await;
                                         let _ = respond.send(Err(format!(
-                                            "mission creation rolled back: persist disk admission reservation: {error}"
+                                            "mission creation rolled back: persist mission project metadata: {error}"
                                         )));
                                         continue;
                                     }
@@ -18395,9 +18654,33 @@ async fn control_actor_loop(
                                             continue;
                                         }
                                         Err(error) => {
-                                            let _ = respond.send(Err(format!("mission creation rolled back: reload disk admission reservation: {error}")));
+                                            let _ = respond.send(Err(format!("mission creation rolled back: reload mission metadata: {error}")));
                                             continue;
                                         }
+                                    }
+                                }
+                                if let Some(mut candidate) = reservation.take() {
+                                    candidate.mission_id = mission.id;
+                                    candidate.workspace_dir = Some(
+                                        workspace::mission_workspace_dir_for_workspace(&workspace, mission.id),
+                                    );
+                                    let mut ledger = match read_disk_reservation_ledger(&config) {
+                                        Ok(ledger) => ledger,
+                                        Err(error) => {
+                                            let _ = mission_store.update_mission_status(mission.id, MissionStatus::Failed).await;
+                                            let _ = respond.send(Err(format!(
+                                                "mission creation rolled back: read disk admission ledger: {error}"
+                                            )));
+                                            continue;
+                                        }
+                                    };
+                                    ledger.reservations.insert(mission.id, candidate);
+                                    if let Err(error) = write_disk_reservation_ledger(&config, &ledger) {
+                                        let _ = mission_store.update_mission_status(mission.id, MissionStatus::Failed).await;
+                                        let _ = respond.send(Err(format!(
+                                            "mission creation rolled back: persist disk admission ledger: {error}"
+                                        )));
+                                        continue;
                                     }
                                 }
                                 // Explicitly drop after durable write, rather than relying on
@@ -18444,6 +18727,12 @@ async fn control_actor_loop(
                             .update_mission_status(id, new_status)
                             .await;
                         if result.is_ok() {
+                            if !mission_holds_disk_reservation(new_status) {
+                                if let Err(error) = release_local_mission_disk(&config, id).await {
+                                    tracing::error!(mission = %id, %error,
+                                        "terminal mission lease cleanup failed; retaining conservative admission state");
+                                }
+                            }
                             maybe_schedule_mission_metadata_refresh_for_status(
                                 &mission_store,
                                 &events_tx,
@@ -21064,6 +21353,7 @@ async fn control_actor_loop(
                         config.max_parallel_missions,
                     );
                     board::scheduler_pass(
+                        Some(&control_hub),
                         &mission_store,
                         &self_cmd_tx,
                         &snapshot,
@@ -32003,16 +32293,22 @@ Investigate <service/> failures.
 
     #[test]
     fn disk_admission_reservations_are_filesystem_scoped_and_exact_at_boundary() {
-        let a = disk_reservation_tag("statvfs:filesystem-a", 20 << 30);
-        let b = disk_reservation_tag("statvfs:filesystem-b", 20 << 30);
-        assert_eq!(
-            parse_disk_reservation_tag(&a),
-            Some(("statvfs:filesystem-a", 20 << 30))
-        );
-        assert_eq!(
-            parse_disk_reservation_tag(&b),
-            Some(("statvfs:filesystem-b", 20 << 30))
-        );
+        let a = DiskReservation {
+            mission_id: Uuid::new_v4(),
+            filesystem: "filesystem-a".into(),
+            estimated_bytes: 20 << 30,
+            free_bytes_at_grant: 0,
+            workspace_dir: None,
+        };
+        let b = DiskReservation {
+            mission_id: Uuid::new_v4(),
+            filesystem: "filesystem-b".into(),
+            estimated_bytes: 20 << 30,
+            free_bytes_at_grant: 0,
+            workspace_dir: None,
+        };
+        assert_eq!(disk_reservation_outstanding_bytes(&a), 20 << 30);
+        assert_eq!(disk_reservation_outstanding_bytes(&b), 20 << 30);
 
         let emergency = 64 << 30;
         let first = 20 << 30;

@@ -957,16 +957,27 @@ fn mission_workspace_roots_path(workspace: &Workspace) -> PathBuf {
 }
 
 pub(crate) fn filesystem_identity(path: &Path) -> std::io::Result<String> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
         let canonical = path.canonicalize()?;
         let metadata = std::fs::metadata(&canonical)?;
-        // `st_dev` alone does not distinguish a bind mount from the
-        // underlying directory exposed at its mountpoint after unmount. The
-        // inode of the selected root does, and unlike a Linux mount-instance
-        // ID it remains stable across a normal reboot/remount.
-        Ok(format!("dev:{}:ino:{}", metadata.dev(), metadata.ino()))
+        let mount = linux_mount_identity(&canonical)?;
+        // Do not persist `st_dev`: Linux may renumber block devices across a
+        // reboot, and a bind mount shares it with the directory revealed when
+        // that mount disappears.  The mount source/root plus statvfs fsid is
+        // the filesystem authority; the selected root inode additionally
+        // binds the placement to the directory on that filesystem.
+        Ok(format!("linux-v2:{mount}:root-ino:{}", metadata.ino()))
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // There is no portable mount-source API. Refuse to pretend a path is
+        // a filesystem identity; callers fail closed instead.
+        let _ = path;
+        Err(std::io::Error::other(
+            "stable filesystem identity requires Linux mountinfo",
+        ))
     }
     #[cfg(not(unix))]
     {
@@ -975,6 +986,70 @@ pub(crate) fn filesystem_identity(path: &Path) -> std::io::Result<String> {
         // pretending that an unverified path is a stable filesystem identity.
         Ok(format!("path:{}", path.canonicalize()?.display()))
     }
+}
+
+/// Linux mount identity deliberately excludes mount ID and `st_dev`, both of
+/// which are namespace/boot volatile.  `/proc/self/mountinfo` supplies the
+/// backing source and filesystem root while `statvfs.f_fsid` distinguishes
+/// otherwise identical overlay sources.  Failure to read either is a
+/// verification failure, never a path-only fallback.
+#[cfg(target_os = "linux")]
+fn linux_mount_identity(path: &Path) -> std::io::Result<String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let contents = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let mut selected: Option<(PathBuf, String, String, String)> = None;
+    for line in contents.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<_> = left.split_whitespace().collect();
+        let right: Vec<_> = right.split_whitespace().collect();
+        if fields.len() < 5 || right.len() < 2 {
+            continue;
+        }
+        let mountpoint = PathBuf::from(unescape_mountinfo(fields[4]));
+        if !path.starts_with(&mountpoint) {
+            continue;
+        }
+        let candidate = (
+            mountpoint,
+            unescape_mountinfo(fields[3]),
+            right[0].to_string(),
+            unescape_mountinfo(right[1]),
+        );
+        if selected
+            .as_ref()
+            .is_none_or(|current| candidate.0.as_os_str().len() > current.0.as_os_str().len())
+        {
+            selected = Some(candidate);
+        }
+    }
+    let Some((_mountpoint, root, fstype, source)) = selected else {
+        return Err(std::io::Error::other(
+            "no mountinfo entry for persisted root",
+        ));
+    };
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(format!(
+        "fsid:{}:type:{}:source:{}:mount-root:{}",
+        stat.f_fsid, fstype, source, root
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 fn read_mission_workspace_roots(
@@ -1010,7 +1085,12 @@ fn validate_mission_workspace_root(
         // unmounted to reveal a same-device directory at the same path.
         let legacy_mount_identity =
             legacy_mount_identity_matches(expected_identity, &actual_identity);
-        if expected_identity != &actual_identity && !legacy_mount_identity {
+        let legacy_device_identity =
+            legacy_device_identity_matches(expected_identity, &actual_identity);
+        if expected_identity != &actual_identity
+            && !legacy_mount_identity
+            && !legacy_device_identity
+        {
             return Err(std::io::Error::other(format!(
                     "persisted mission workspace root {} changed filesystem identity (expected {}, got {})",
                     root.display(), expected_identity, actual_identity
@@ -1023,8 +1103,28 @@ fn validate_mission_workspace_root(
 fn legacy_mount_identity_matches(identity: &str, actual_identity: &str) -> bool {
     identity
         .strip_prefix("mount:")
-        .and_then(|value| value.find(":dev:").map(|offset| &value[offset + 1..]))
+        // Legacy records were `mount:<namespace-local-id>:<stable-id>`.
+        // The stable suffix changed from dev/inode to linux-v2, but the
+        // mount ID itself was never an authority and is discarded here.
+        .and_then(|value| value.split_once(':').map(|(_, stable)| stable))
         .is_some_and(|stable_suffix| stable_suffix == actual_identity)
+}
+
+/// `dev:…:ino:…` was emitted before v2. Device numbers are not stable across
+/// reboot, so migrate it only when the selected-root inode still agrees. This
+/// is a one-time compatibility bridge; the rewritten v2 record thereafter
+/// verifies mount source/fsid and fails closed on a replacement mount.
+fn legacy_device_identity_matches(identity: &str, actual_identity: &str) -> bool {
+    let old_inode = identity
+        .strip_prefix("dev:")
+        .and_then(|v| v.rsplit_once(":ino:"))
+        .map(|(_, inode)| inode);
+    let new_inode = actual_identity
+        .rsplit_once(":root-ino:")
+        .map(|(_, inode)| inode);
+    old_inode
+        .zip(new_inode)
+        .is_some_and(|(old, new)| old == new)
 }
 
 fn is_legacy_mount_identity(identity: &str) -> bool {
@@ -1055,7 +1155,7 @@ pub fn ensure_persisted_mission_root_is_available(
     if record
         .filesystem_identity
         .as_deref()
-        .is_none_or(is_legacy_mount_identity)
+        .is_none_or(|identity| is_legacy_mount_identity(identity) || identity.starts_with("dev:"))
     {
         // Compatibility migration: bind the identity only after the legacy
         // path was successfully reached.  This closes the mountpoint hole for
@@ -1201,9 +1301,6 @@ fn persist_mission_workspace_root_record(
     mission_id: Uuid,
     record: MissionWorkspaceRootRecord,
 ) -> std::io::Result<()> {
-    if workspace.id != DEFAULT_WORKSPACE_ID {
-        return Ok(());
-    }
     (|| -> std::io::Result<()> {
         std::fs::create_dir_all(config_root(&workspace.path))?;
         // The process-local lock avoids blocking an async executor on an
@@ -1354,8 +1451,14 @@ pub fn mission_workspace_dir_for_workspace(workspace: &Workspace, mission_id: Uu
 /// an operator changes `MISSION_WORKSPACE_ROOT`.
 pub fn mission_workspace_roots_for_workspace(workspace: &Workspace) -> Vec<PathBuf> {
     let mut roots = vec![workspace.path.clone()];
-    if workspace.id == DEFAULT_WORKSPACE_ID {
-        roots.push(configured_mission_workspace_root(&workspace.path));
+    {
+        // Every workspace owns a registry.  A custom workspace is just as
+        // capable of hosting a relocated mission as the default host; making
+        // it registry-less forced explicit-directory checks to accidentally
+        // consult the default host's placement authority.
+        if workspace.id == DEFAULT_WORKSPACE_ID {
+            roots.push(configured_mission_workspace_root(&workspace.path));
+        }
         if let Ok(contents) = std::fs::read_to_string(mission_workspace_roots_path(workspace)) {
             if let Ok(saved) =
                 serde_json::from_str::<HashMap<String, MissionWorkspaceRootRecordOnDisk>>(&contents)
@@ -5284,15 +5387,19 @@ WORKING_DIR = "/workspaces/mission-old"
         let workspace = Workspace::default_host(temp.path().to_path_buf());
         let boss = Uuid::new_v4();
         let worker = Uuid::new_v4();
-        persist_mission_workspace_root_record(
-            &workspace,
-            boss,
+        // This test changes the simulated mount authority itself.  Production
+        // writes deliberately refuse to replace a mismatched record, so write
+        // the restored fixture directly before verifying the recovered mount.
+        let mut restored = read_mission_workspace_roots(&workspace).unwrap();
+        restored.insert(
+            boss.to_string(),
             MissionWorkspaceRootRecord {
                 path: old_root.canonicalize().unwrap().display().to_string(),
                 filesystem_identity: Some(filesystem_identity(&old_root).unwrap()),
             },
-        )
-        .unwrap();
+        );
+        atomic_write_mission_workspace_roots(&mission_workspace_roots_path(&workspace), &restored)
+            .unwrap();
         persist_mission_workspace_root(&workspace, worker, &new_root).unwrap();
         let boss_worktree = mission_workspace_dir_for_root(&old_root, boss).join("wk-1");
         std::fs::create_dir_all(&boss_worktree).unwrap();
@@ -5480,12 +5587,9 @@ WORKING_DIR = "/workspaces/mission-old"
         let mission = Uuid::new_v4();
         let workspace = Workspace::default_host(temp.path().to_path_buf());
         std::fs::create_dir_all(config_root(&workspace.path)).unwrap();
-        let device_only = filesystem_identity(&storage)
-            .unwrap()
-            .split(":ino:")
-            .next()
-            .unwrap()
-            .to_owned();
+        // A device-only predecessor record has no directory binding and must
+        // never be promoted on a bind-mount/unmount look-alike.
+        let device_only = "dev:legacy-device-only".to_string();
         std::fs::write(
             mission_workspace_roots_path(&workspace),
             serde_json::json!({mission.to_string(): {
@@ -5497,6 +5601,41 @@ WORKING_DIR = "/workspaces/mission-old"
         .unwrap();
 
         assert!(ensure_persisted_mission_root_is_available(&workspace, mission).is_err());
+    }
+
+    #[test]
+    fn legacy_device_inode_identity_migrates_to_reboot_stable_mount_identity() {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let temp = tempfile::tempdir().unwrap();
+            let storage = temp.path().join("legacy-device-inode-storage");
+            std::fs::create_dir_all(&storage).unwrap();
+            let mission = Uuid::new_v4();
+            let workspace = Workspace::default_host(temp.path().to_path_buf());
+            std::fs::create_dir_all(config_root(&workspace.path)).unwrap();
+            let inode = std::fs::metadata(&storage).unwrap().ino();
+            std::fs::write(
+                mission_workspace_roots_path(&workspace),
+                serde_json::json!({mission.to_string(): {
+                    "path": storage,
+                    "filesystem_identity": format!("dev:renumbered-after-reboot:ino:{inode}")
+                }})
+                .to_string(),
+            )
+            .unwrap();
+
+            ensure_persisted_mission_root_is_available(&workspace, mission).unwrap();
+            let saved: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(mission_workspace_roots_path(&workspace)).unwrap(),
+            )
+            .unwrap();
+            let identity = saved[mission.to_string()]["filesystem_identity"]
+                .as_str()
+                .unwrap();
+            assert!(identity.starts_with("linux-v2:"));
+            assert!(!identity.contains("dev:renumbered-after-reboot"));
+        }
     }
 
     #[test]

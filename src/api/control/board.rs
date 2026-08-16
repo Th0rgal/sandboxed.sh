@@ -1325,6 +1325,7 @@ fn seconds_since(rfc3339: &str) -> i64 {
 /// Spawn workers for ready tasks while capacity allows, and sweep zombies.
 /// Called from the control actor's tick, throttled by the caller (~2s).
 pub async fn scheduler_pass(
+    control_hub: Option<&super::ControlHub>,
     mission_store: &Arc<dyn MissionStore>,
     cmd_tx: &mpsc::Sender<ControlCommand>,
     snapshot: &RunnerSnapshot,
@@ -1536,6 +1537,7 @@ pub async fn scheduler_pass(
                         continue;
                     }
                     match spawn_task_worker(
+                        control_hub,
                         mission_store,
                         cmd_tx,
                         outbox_inflight,
@@ -1614,6 +1616,7 @@ fn append_note(notes: &Option<String>, line: &str) -> Option<String> {
 }
 
 async fn spawn_task_worker(
+    control_hub: Option<&super::ControlHub>,
     mission_store: &Arc<dyn MissionStore>,
     cmd_tx: &mpsc::Sender<ControlCommand>,
     outbox_inflight: &BoardOutboxInflight,
@@ -1630,6 +1633,32 @@ async fn spawn_task_worker(
         .or_else(|| role_default_model(task));
     let model_override = requested_model
         .and_then(|model| super::normalize_model_override_for_backend(Some(&task.backend), model));
+    // Board workers are local missions just like REST/Ask-created workers.
+    // Keep the admission lock over both mission persistence and the trusted
+    // ledger write: otherwise two schedulers can each observe the same free
+    // bytes and overcommit before either worker is visible to reconstruction.
+    // Production callers always supply the hub. `None` exists solely for
+    // focused in-memory unit tests that exercise board metadata without a
+    // filesystem-backed control server; it is private to this module and
+    // cannot be reached by an API caller.
+    let admission = if let Some(control_hub) = control_hub {
+        let workspace = crate::workspace::resolve_workspace(
+            &control_hub.workspaces,
+            &control_hub.config,
+            Some(workspace_id),
+        )
+        .await;
+        let (guard, reservation) = super::reserve_local_mission_disk(
+            control_hub,
+            &control_hub.config,
+            &workspace,
+            super::mission_disk_default_estimate_gib(),
+        )
+        .await?;
+        Some((guard, reservation, workspace))
+    } else {
+        None
+    };
     let mission = mission_store
         .create_mission_with_parent(
             Some(&format!("[{}] {}", task.task_key, task.title)),
@@ -1644,6 +1673,23 @@ async fn spawn_task_worker(
             task.working_directory.as_deref(),
         )
         .await?;
+    if let Some((admission_guard, mut reservation, workspace)) = admission {
+        reservation.mission_id = mission.id;
+        reservation.workspace_dir = Some(crate::workspace::mission_workspace_dir_for_workspace(
+            &workspace, mission.id,
+        ));
+        let mut ledger = super::read_disk_reservation_ledger(&control_hub.expect("admission hub").config)?;
+        ledger.reservations.insert(mission.id, reservation);
+        if let Err(error) = super::write_disk_reservation_ledger(&control_hub.expect("admission hub").config, &ledger) {
+            let _ = mission_store
+                .update_mission_status(mission.id, MissionStatus::Failed)
+                .await;
+            return Err(format!(
+                "board worker creation rolled back: persist disk admission ledger: {error}"
+            ));
+        }
+        drop(admission_guard);
+    }
     // Inherit the boss's project tagging. Board tasks bypass the public
     // create-mission handler, and `create_mission_with_parent` carries no
     // project metadata — so workers were landing untagged. The parent link
@@ -1993,6 +2039,7 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::channel(8);
         let inflight: BoardOutboxInflight = Default::default();
         let worker_id = spawn_task_worker(
+            None,
             &store,
             &cmd_tx,
             &inflight,
@@ -3364,6 +3411,7 @@ mod tests {
         let outbox_inflight: BoardOutboxInflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
 
         scheduler_pass(
+            None,
             &store,
             &cmd_tx,
             &snapshot,

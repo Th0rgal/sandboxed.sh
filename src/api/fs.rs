@@ -330,12 +330,15 @@ fn is_within_workspace_or_mission(
 /// (ambiguous matches stay an error so the caller's existing 4xx handling
 /// surfaces the issue).
 async fn find_in_mission_subdirs(
-    workspace_root: &Path,
+    workspace: &crate::workspace::Workspace,
     mission_id: uuid::Uuid,
     resolved: &Path,
 ) -> Option<PathBuf> {
-    let workspace = crate::workspace::Workspace::default_host(workspace_root.to_path_buf());
-    let mission_dir = crate::workspace::mission_workspace_dir_for_workspace(&workspace, mission_id);
+    // Do not synthesize a default host workspace here.  Besides losing
+    // container/custom workspace identity, that made the shallow dashboard
+    // lookup consult the default-host root registry for a mission belonging
+    // to a different workspace.
+    let mission_dir = crate::workspace::mission_workspace_dir_for_workspace(workspace, mission_id);
     let tail = resolved.strip_prefix(&mission_dir).ok()?;
     if tail.as_os_str().is_empty() {
         return None;
@@ -694,7 +697,7 @@ pub async fn resolve_path_for_workspace(
     // contains the same tail, transparently use that match.
     if let Some(mid) = mission_id {
         if !resolved.exists() {
-            if let Some(rerooted) = find_in_mission_subdirs(&workspace_root, mid, &resolved).await {
+            if let Some(rerooted) = find_in_mission_subdirs(&workspace, mid, &resolved).await {
                 resolved = rerooted;
             }
         }
