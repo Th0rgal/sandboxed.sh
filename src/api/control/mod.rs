@@ -7594,10 +7594,12 @@ async fn reconcile_disk_reservation_ledger_under_lock(
         }
     }
     let mut ledger = read_disk_reservation_ledger(config)?;
+    let mut changed = false;
     let before = ledger.reservations.len();
     ledger
         .reservations
         .retain(|id, _| live_missions.contains_key(id));
+    changed |= ledger.reservations.len() != before;
     for (&mission_id, workspace_id) in &live_missions {
         if ledger.reservations.contains_key(&mission_id) {
             continue;
@@ -7632,8 +7634,9 @@ async fn reconcile_disk_reservation_ledger_under_lock(
                 )),
             },
         );
+        changed = true;
     }
-    if ledger.reservations.len() != before {
+    if changed {
         write_disk_reservation_ledger(config, &ledger)?;
     }
     Ok(())

@@ -817,12 +817,27 @@ pub async fn resolve_path_for_workspace(
     // for every relocated root: accept it only when the directory's actual
     // `workspaces/mission-<short>` ancestor resolves to one unambiguous,
     // identity-verified persisted owner.
-    let in_verified_ancestor_mission = !in_workspace
-        && mission_id.is_some()
-        && crate::workspace::verify_explicit_mission_working_directory_owner(
-            &workspace, &canonical,
-        )
-        .is_ok();
+    let verified_ancestor_owner = (!in_workspace && mission_id.is_some())
+        .then(|| {
+            crate::workspace::verify_explicit_mission_working_directory_owner(
+                &workspace, &canonical,
+            )
+        })
+        .transpose()
+        .map_err(|_| ())
+        .ok()
+        .flatten();
+    let in_verified_ancestor_mission = match (mission_id, verified_ancestor_owner) {
+        (Some(requester), Some(owner)) => {
+            // The placement check proves the path's filesystem owner; the
+            // control-plane ancestry check prevents a sibling mission in a
+            // shared workspace from borrowing that capability.
+            requester_descends_from(&state.control, requester, owner)
+                .await
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
     let in_context = mission_id.is_some() && canonical.starts_with(&context_root);
 
     if !in_workspace && !in_verified_ancestor_mission && !in_context {
@@ -836,6 +851,35 @@ pub async fn resolve_path_for_workspace(
     }
 
     Ok(canonical)
+}
+
+async fn requester_descends_from(
+    control: &crate::api::control::ControlHub,
+    requester: uuid::Uuid,
+    owner: uuid::Uuid,
+) -> Result<bool, String> {
+    let (_, mut mission) = control
+        .find_mission_store_owner(requester)
+        .await?
+        .ok_or_else(|| "requesting mission is unavailable".to_string())?;
+    for _ in 0..64 {
+        if mission.id == owner {
+            return Ok(true);
+        }
+        let Some(parent) = mission.parent_mission_id else {
+            return Ok(false);
+        };
+        let (store, parent) = control
+            .find_mission_store_owner(parent)
+            .await?
+            .ok_or_else(|| "mission ancestor is unavailable".to_string())?;
+        // Parent links must stay within their owning store; accepting a
+        // cross-store coincidence would recreate the same confused-deputy
+        // problem this bound prevents.
+        let _ = store;
+        mission = parent;
+    }
+    Err("mission ancestry exceeds safe depth".to_string())
 }
 
 fn resolve_upload_base(path: &str) -> Result<PathBuf, (StatusCode, String)> {

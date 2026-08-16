@@ -3705,7 +3705,6 @@ pub fn runtime_workspace_file_path(working_dir_root: &Path, mission_id: Option<U
 pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::Result<usize> {
     let mut count = 0;
     let mcp_configs = mcp.list_configs().await;
-    let workspace_env = HashMap::new();
 
     // This entry point is also used by MCP mutations, where only Config is
     // available.  Load the persisted workspace inventory so custom workspaces
@@ -3729,7 +3728,7 @@ pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::
     {
         workspaces.push(Workspace::default_host(config.working_dir.clone()));
     }
-    let mut dirs = std::collections::BTreeSet::new();
+    let mut dirs = std::collections::BTreeMap::new();
     for workspace in workspaces {
         // `mission_workspace_roots_for_workspace` validates persisted identity
         // before returning it. An unavailable/replaced root is therefore not
@@ -3748,21 +3747,27 @@ pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::
             for entry in std::fs::read_dir(&scan_root)? {
                 let path = entry?.path();
                 if path.is_dir() {
-                    dirs.insert(path);
+                    dirs.entry(path).or_insert_with(|| workspace.clone());
                 }
             }
         }
     }
-    for path in dirs {
+    for (path, workspace) in dirs {
+        let mcp_configs = filter_mcp_configs_for_workspace(
+            mcp_configs.clone(),
+            &workspace.mcps,
+            workspace.mcps_replace_defaults,
+        );
+        let skill_allowlist = (!workspace.skills.is_empty()).then_some(workspace.skills.as_slice());
         if write_opencode_config(
             &path,
-            mcp_configs.clone(),
-            &config.working_dir,
-            WorkspaceType::Host,
-            &workspace_env,
+            mcp_configs,
+            &workspace.path,
+            workspace.workspace_type,
+            &workspace.env_vars,
+            skill_allowlist,
             None,
-            None,
-            None,
+            workspace.shared_network,
             None,
         )
         .await
