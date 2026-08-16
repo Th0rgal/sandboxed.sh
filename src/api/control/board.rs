@@ -1678,9 +1678,13 @@ async fn spawn_task_worker(
         reservation.workspace_dir = Some(crate::workspace::mission_workspace_dir_for_workspace(
             &workspace, mission.id,
         ));
-        let mut ledger = super::read_disk_reservation_ledger(&control_hub.expect("admission hub").config)?;
+        let mut ledger =
+            super::read_disk_reservation_ledger(&control_hub.expect("admission hub").config)?;
         ledger.reservations.insert(mission.id, reservation);
-        if let Err(error) = super::write_disk_reservation_ledger(&control_hub.expect("admission hub").config, &ledger) {
+        if let Err(error) = super::write_disk_reservation_ledger(
+            &control_hub.expect("admission hub").config,
+            &ledger,
+        ) {
             let _ = mission_store
                 .update_mission_status(mission.id, MissionStatus::Failed)
                 .await;
