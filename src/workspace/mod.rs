@@ -912,6 +912,35 @@ fn persisted_mission_workspace_root(workspace: &Workspace, mission_id: Uuid) -> 
     root.is_dir().then_some(root)
 }
 
+/// Refuse to create a replacement directory when an existing mission's
+/// recorded root cannot be reached.  Falling back here would abandon its
+/// checkout during a transient unmount.
+fn ensure_persisted_mission_root_is_available(
+    workspace: &Workspace,
+    mission_id: Uuid,
+) -> std::io::Result<()> {
+    let path = mission_workspace_roots_path(workspace);
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let roots: HashMap<String, String> = serde_json::from_str(&contents).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+    })?;
+    if let Some(root) = roots.get(&mission_id.to_string()) {
+        let root = PathBuf::from(root);
+        let canonical = root.canonicalize()?;
+        if !canonical.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("persisted mission workspace root {} is not a directory", root.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Atomically replace a registry file and make both the file and the rename
 /// durable before releasing the registry lock. Readers therefore see either a
 /// complete old JSON document or a complete new one, never a truncation.
@@ -970,10 +999,13 @@ fn persist_mission_workspace_root(
             .truncate(false)
             .open(lock_path)?;
         fs2::FileExt::lock_exclusive(&lock_file)?;
-        let mut roots: HashMap<String, String> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|contents| serde_json::from_str(&contents).ok())
-            .unwrap_or_default();
+        let mut roots: HashMap<String, String> = match std::fs::read_to_string(&path) {
+            Ok(contents) => serde_json::from_str(&contents).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(error) => return Err(error),
+        };
         if let std::collections::hash_map::Entry::Vacant(entry) =
             roots.entry(mission_id.to_string())
         {
@@ -2532,6 +2564,7 @@ pub async fn prepare_mission_workspace_in(
 ) -> anyhow::Result<PathBuf> {
     // Use a mission-specific directory under the workspace root so multiple missions
     // can run concurrently without clobbering per-workspace config files.
+    ensure_persisted_mission_root_is_available(workspace, mission_id)?;
     let root = mission_workspace_root_for_workspace(workspace, mission_id);
     persist_mission_workspace_root(workspace, mission_id, &root)?;
     let dir = mission_workspace_dir_for_root(&root, mission_id);
@@ -2732,6 +2765,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
 ) -> anyhow::Result<PathBuf> {
     // Mission workspace directory lives under the selected workspace root.
     // This keeps filesystem and config effects scoped to the mission.
+    ensure_persisted_mission_root_is_available(workspace, mission_id)?;
     let root = mission_workspace_root_for_workspace(workspace, mission_id);
     persist_mission_workspace_root(workspace, mission_id, &root)?;
     let dir = mission_workspace_dir_for_root(&root, mission_id);
