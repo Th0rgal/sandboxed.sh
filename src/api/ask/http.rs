@@ -487,8 +487,8 @@ mod tests {
     #[test]
     fn nspawn_working_directory_is_resolved_inside_container_root() {
         let root = tempdir().unwrap();
-        let guest = "/workspaces/mission-abcd/repo";
-        let host = root.path().join("workspaces/mission-abcd/repo");
+        let guest = "/workspaces/mission-abcd0000/repo";
+        let host = root.path().join("workspaces/mission-abcd0000/repo");
         std::fs::create_dir_all(&host).unwrap();
         let workspace = crate::workspace::Workspace::default_host(root.path().to_path_buf());
         let mission = Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap();

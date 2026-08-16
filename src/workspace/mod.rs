@@ -5284,7 +5284,15 @@ WORKING_DIR = "/workspaces/mission-old"
         let workspace = Workspace::default_host(temp.path().to_path_buf());
         let boss = Uuid::new_v4();
         let worker = Uuid::new_v4();
-        persist_mission_workspace_root(&workspace, boss, &old_root).unwrap();
+        persist_mission_workspace_root_record(
+            &workspace,
+            boss,
+            MissionWorkspaceRootRecord {
+                path: old_root.canonicalize().unwrap().display().to_string(),
+                filesystem_identity: Some(filesystem_identity(&old_root).unwrap()),
+            },
+        )
+        .unwrap();
         persist_mission_workspace_root(&workspace, worker, &new_root).unwrap();
         let boss_worktree = mission_workspace_dir_for_root(&old_root, boss).join("wk-1");
         std::fs::create_dir_all(&boss_worktree).unwrap();
