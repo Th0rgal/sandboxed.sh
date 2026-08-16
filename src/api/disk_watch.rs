@@ -78,7 +78,7 @@ fn watched_roots_for_workspaces<'a>(
     let mut roots = Vec::new();
     for workspace in workspaces {
         roots.extend(crate::workspace::mission_workspace_roots_for_workspace(
-            &workspace,
+            workspace,
         ));
     }
     roots.sort();
