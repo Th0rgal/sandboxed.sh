@@ -18,66 +18,19 @@ use crate::util::env_var_bool;
 use crate::workspace::Workspace;
 use crate::workspace_exec::WorkspaceExec;
 
-async fn ensure_grok_cli_available(
+/// Overlay / guest path for a Grok CLI, never a host path like `/opt/grok-cli`.
+fn grok_overlay_guest_path(workspace: &Workspace, program: &str) -> Option<String> {
+    let overlay = container_overlay_command_path(workspace, program)
+        .or_else(|| container_overlay_command_path(workspace, "/usr/local/bin/grok"))
+        .or_else(|| container_overlay_command_path(workspace, "grok"))?;
+    Some(container_overlay_guest_path(workspace, &overlay, "grok"))
+}
+
+async fn install_grok_cli_in_workspace(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     cli_path: &str,
 ) -> Result<String, String> {
-    let program = cli_path.split(' ').next().unwrap_or(cli_path);
-    if let Some(overlay) = container_overlay_command_path(&workspace_exec.workspace, program)
-        .or_else(|| {
-            container_overlay_command_path(&workspace_exec.workspace, "/usr/local/bin/grok")
-        })
-    {
-        return Ok(container_overlay_guest_path(
-            &workspace_exec.workspace,
-            &overlay,
-            program,
-        ));
-    }
-    match command_presence(workspace_exec, cwd, program).await {
-        CommandPresence::Present => return Ok(cli_path.to_string()),
-        CommandPresence::Inconclusive => {
-            tracing::warn!(
-                program,
-                "Grok CLI nsenter probe timed out; not treating as absent"
-            );
-        }
-        CommandPresence::Absent => {}
-    }
-
-    // Host-copy first, same as Codex/OpenCode. The assistant container had a
-    // dangling symlink at /usr/local/bin/grok → /root/.grok/downloads/... so
-    // `ls` on the overlay looked fine and `command -v grok` inside nspawn
-    // failed (Verity #2332 writer 08306fdb, 2026-08-13).
-    if workspace_exec.workspace.workspace_type == crate::workspace::WorkspaceType::Container {
-        if let Some(host) = resolve_host_executable(program)
-            .or_else(|| resolve_host_executable("/usr/local/bin/grok"))
-        {
-            if let Ok(dest) = copy_host_executable_into_container(&workspace_exec.workspace, &host)
-            {
-                if container_overlay_command_path(&workspace_exec.workspace, &dest).is_some()
-                    || command_available(workspace_exec, cwd, &dest).await
-                {
-                    tracing::info!(
-                        host = %host.display(),
-                        dest,
-                        "Copied host Grok CLI into container workspace"
-                    );
-                    return Ok(dest);
-                }
-            }
-        }
-    }
-
-    let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_GROK", true);
-    if !auto_install {
-        return Err(format!(
-            "Grok Build CLI '{}' not found in workspace. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash",
-            cli_path
-        ));
-    }
-
     match command_presence(workspace_exec, cwd, "curl").await {
         CommandPresence::Present => {}
         CommandPresence::Inconclusive => {
@@ -133,16 +86,110 @@ async fn ensure_grok_cli_available(
         return Err(format!("Grok Build install failed: {}", message));
     }
 
-    if command_available(workspace_exec, cwd, cli_path).await {
-        Ok(cli_path.to_string())
-    } else if command_available(workspace_exec, cwd, "/usr/local/bin/grok").await {
+    if let Some(guest) = grok_overlay_guest_path(&workspace_exec.workspace, "grok") {
+        return Ok(guest);
+    }
+    if command_available(workspace_exec, cwd, "/usr/local/bin/grok").await {
         Ok("/usr/local/bin/grok".to_string())
+    } else if !cli_path.starts_with('/') && command_available(workspace_exec, cwd, cli_path).await {
+        Ok(cli_path.to_string())
     } else {
         Err(
             "Grok Build install completed but 'grok' is still not available in workspace PATH."
                 .to_string(),
         )
     }
+}
+
+async fn copy_host_grok_cli_into_container(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    program: &str,
+) -> Result<Option<String>, String> {
+    let Some(host) = resolve_host_executable(program)
+        .or_else(|| resolve_host_executable("/usr/local/bin/grok"))
+        .or_else(|| resolve_host_executable("grok"))
+    else {
+        return Ok(None);
+    };
+    let dest = copy_host_executable_into_container(&workspace_exec.workspace, &host)?;
+    if container_overlay_command_path(&workspace_exec.workspace, &dest).is_some()
+        || command_available(workspace_exec, cwd, &dest).await
+    {
+        tracing::info!(
+            host = %host.display(),
+            dest,
+            "Copied host Grok CLI into container workspace"
+        );
+        return Ok(Some(dest));
+    }
+    Ok(None)
+}
+
+async fn ensure_grok_cli_available(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> Result<String, String> {
+    let program = cli_path.split(' ').next().unwrap_or(cli_path);
+    let is_container =
+        workspace_exec.workspace.workspace_type == crate::workspace::WorkspaceType::Container;
+
+    if let Some(guest) = grok_overlay_guest_path(&workspace_exec.workspace, program) {
+        return Ok(guest);
+    }
+    match command_presence(workspace_exec, cwd, program).await {
+        // An absolute configured path that missed the overlay is a host
+        // path (`/opt/grok-cli`). nsenter --root cannot exec it.
+        CommandPresence::Present if !(is_container && program.starts_with('/')) => {
+            return Ok(cli_path.to_string());
+        }
+        CommandPresence::Present => {
+            tracing::warn!(
+                program,
+                "Ignoring host-absolute Grok CLI path for container workspace"
+            );
+        }
+        CommandPresence::Inconclusive => {
+            tracing::warn!(
+                program,
+                "Grok CLI nsenter probe timed out; not treating as absent"
+            );
+        }
+        CommandPresence::Absent => {}
+    }
+
+    let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_GROK", true);
+    let mut install_error = None;
+    if auto_install {
+        match install_grok_cli_in_workspace(workspace_exec, cwd, cli_path).await {
+            Ok(path) => return Ok(path),
+            Err(err) => install_error = Some(err),
+        }
+    }
+
+    // Host copy is last resort and only after the ELF arch check inside
+    // copy_host_executable_into_container.
+    if is_container {
+        match copy_host_grok_cli_into_container(workspace_exec, cwd, program).await {
+            Ok(Some(dest)) => return Ok(dest),
+            Ok(None) => {}
+            Err(err) => {
+                return Err(format!(
+                    "Grok Build CLI not found in workspace and the host CLI cannot be copied: {err}"
+                ));
+            }
+        }
+    }
+
+    if let Some(err) = install_error {
+        return Err(err);
+    }
+
+    Err(format!(
+        "Grok Build CLI '{}' not found in workspace. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash",
+        cli_path
+    ))
 }
 
 fn grok_event_is_reasoning_type(value: &serde_json::Value) -> bool {
@@ -1649,6 +1696,72 @@ async fn run_grok_acp_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::WorkspaceType;
+    use std::fs;
+
+    fn container_workspace_at(path: &std::path::Path) -> Workspace {
+        Workspace {
+            id: Uuid::new_v4(),
+            name: "verity".into(),
+            workspace_type: WorkspaceType::Container,
+            path: path.to_path_buf(),
+            status: crate::workspace::WorkspaceStatus::Ready,
+            error_message: None,
+            config: serde_json::json!({}),
+            template: None,
+            distro: None,
+            env_vars: Default::default(),
+            init_scripts: Vec::new(),
+            init_script: None,
+            created_at: chrono::Utc::now(),
+            skills: Vec::new(),
+            plugins: Vec::new(),
+            shared_network: None,
+            tailscale_mode: None,
+            mcps: Vec::new(),
+            mcps_replace_defaults: true,
+            config_profile: None,
+            resolved_git_credentials: None,
+            read_only_command_guard_dir: None,
+            harness_versions: None,
+        }
+    }
+
+    #[test]
+    fn grok_overlay_prefers_guest_path_over_host_opt_cli() {
+        let root = tempfile::tempdir().unwrap();
+        let grok = root.path().join("usr/local/bin/grok");
+        fs::create_dir_all(grok.parent().unwrap()).unwrap();
+        fs::write(&grok, b"#!/bin/sh\necho grok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&grok, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let workspace = container_workspace_at(root.path());
+        assert_eq!(
+            grok_overlay_guest_path(&workspace, "/opt/grok-cli").as_deref(),
+            Some("/usr/local/bin/grok")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_grok_cli_prefers_guest_overlay_over_host_opt_path() {
+        let root = tempfile::tempdir().unwrap();
+        let grok = root.path().join("usr/local/bin/grok");
+        fs::create_dir_all(grok.parent().unwrap()).unwrap();
+        fs::write(&grok, b"#!/bin/sh\necho grok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&grok, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let exec = WorkspaceExec::new(container_workspace_at(root.path()));
+        let path = ensure_grok_cli_available(&exec, root.path(), "/opt/grok-cli")
+            .await
+            .expect("overlay grok must be used");
+        assert_eq!(path, "/usr/local/bin/grok");
+    }
 
     #[test]
     fn grok_event_reasoning_handles_streaming_json_thought_events() {

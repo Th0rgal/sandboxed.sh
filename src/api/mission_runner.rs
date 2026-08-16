@@ -6243,20 +6243,27 @@ pub(crate) fn container_overlay_command_path(
 }
 
 /// Guest-absolute path for an overlay hit, e.g. `/usr/local/bin/grok`.
+///
+/// The overlay file wins over `program`. A configured host path such as
+/// `/opt/grok-cli` must not be returned once we have found the in-guest
+/// binary — `nsenter --root` can only exec a container path.
 pub(crate) fn container_overlay_guest_path(
     workspace: &Workspace,
     overlay_path: &Path,
     program: &str,
 ) -> String {
-    if program.contains('/') {
-        return program.to_string();
-    }
     overlay_path
         .strip_prefix(&workspace.path)
         .ok()
         .map(|rel| format!("/{}", rel.to_string_lossy()))
         .filter(|guest| guest != "/")
-        .unwrap_or_else(|| format!("/usr/local/bin/{program}"))
+        .unwrap_or_else(|| {
+            if program.contains('/') {
+                program.to_string()
+            } else {
+                format!("/usr/local/bin/{program}")
+            }
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7659,6 +7666,99 @@ fn host_executable_available(program: &str) -> bool {
     }
 }
 
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+pub(crate) const ELF_EM_X86_64: u16 = 62;
+pub(crate) const ELF_EM_AARCH64: u16 = 183;
+
+/// ELF `e_machine` from the first 20 bytes, or `None` for scripts / non-ELF.
+pub(crate) fn elf_e_machine(path: &std::path::Path) -> Option<u16> {
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    let mut file = std::fs::File::open(path).ok()?;
+    file.read_exact(&mut header).ok()?;
+    if header[0..4] != ELF_MAGIC {
+        return None;
+    }
+    match header[5] {
+        1 => Some(u16::from_le_bytes([header[18], header[19]])),
+        2 => Some(u16::from_be_bytes([header[18], header[19]])),
+        _ => None,
+    }
+}
+
+fn elf_machine_name(machine: u16) -> &'static str {
+    match machine {
+        ELF_EM_X86_64 => "x86_64",
+        ELF_EM_AARCH64 => "aarch64",
+        _ => "unknown",
+    }
+}
+
+fn host_elf_machine() -> Option<u16> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some(ELF_EM_X86_64),
+        "aarch64" => Some(ELF_EM_AARCH64),
+        _ => None,
+    }
+}
+
+/// Container ISA from the nspawn overlay (`/bin/sh` etc.), else the host
+/// arch — nspawn images are debootstrapped for the machine that created them.
+pub(crate) fn container_overlay_elf_machine(
+    workspace: &crate::workspace::Workspace,
+) -> Option<u16> {
+    const PROBES: &[&str] = &[
+        "sh",
+        "bash",
+        "/bin/sh",
+        "/usr/bin/sh",
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/lib64/ld-linux-x86-64.so.2",
+        "/lib/ld-linux-x86-64.so.2",
+        "/lib/ld-linux-aarch64.so.1",
+        "/usr/lib/ld-linux-aarch64.so.1",
+        "/lib64/ld-linux-aarch64.so.1",
+    ];
+    for probe in PROBES {
+        if let Some(path) = container_overlay_command_path(workspace, probe) {
+            if let Some(machine) = elf_e_machine(&path) {
+                return Some(machine);
+            }
+        }
+        if probe.contains('/') {
+            let path = workspace.path.join(probe.trim_start_matches('/'));
+            if let Some(machine) = elf_e_machine(&path) {
+                return Some(machine);
+            }
+        }
+    }
+    host_elf_machine()
+}
+
+fn refuse_cross_arch_host_copy(
+    workspace: &crate::workspace::Workspace,
+    host_executable: &std::path::Path,
+) -> Result<(), String> {
+    let Some(host_machine) = elf_e_machine(host_executable) else {
+        return Ok(());
+    };
+    let Some(container_machine) = container_overlay_elf_machine(workspace) else {
+        return Ok(());
+    };
+    if host_machine == container_machine {
+        return Ok(());
+    }
+    Err(format!(
+        "Refusing to copy {} into the container: host ELF machine {} ({}) does not match container arch {} ({}) (x86_64=62, aarch64=183)",
+        host_executable.display(),
+        host_machine,
+        elf_machine_name(host_machine),
+        container_machine,
+        elf_machine_name(container_machine),
+    ))
+}
+
 pub(crate) fn copy_host_executable_into_container(
     workspace: &crate::workspace::Workspace,
     host_executable: &std::path::Path,
@@ -7667,6 +7767,11 @@ pub(crate) fn copy_host_executable_into_container(
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| "Host executable has invalid filename".to_string())?;
+
+    // A host-native CLI exec-format-fails inside a foreign-arch nspawn
+    // rootfs. Refuse so the mission reports a missing CLI instead of
+    // dying later with Exec format error.
+    refuse_cross_arch_host_copy(workspace, host_executable)?;
 
     let dest_dir = workspace.path.join("usr").join("local").join("bin");
     std::fs::create_dir_all(&dest_dir)
@@ -9173,6 +9278,64 @@ mod tests {
         assert_eq!(fs::read(&copied).unwrap(), fs::read(&real).unwrap());
     }
 
+    fn write_fake_elf(path: &std::path::Path, e_machine: u16) {
+        let mut header = vec![0u8; 64];
+        header[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        header[4] = 2; // ELFCLASS64
+        header[5] = 1; // ELFDATA2LSB
+        header[6] = 1; // EV_CURRENT
+        header[18..20].copy_from_slice(&e_machine.to_le_bytes());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, header).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn copy_host_executable_refuses_elf_arch_mismatch() {
+        let host = tempfile::tempdir().unwrap();
+        let container = tempfile::tempdir().unwrap();
+        let host_bin = host.path().join("grok");
+        write_fake_elf(&host_bin, super::ELF_EM_X86_64);
+        write_fake_elf(&container.path().join("bin/sh"), super::ELF_EM_AARCH64);
+
+        let workspace = container_workspace_at(container.path());
+        let err = super::copy_host_executable_into_container(&workspace, &host_bin)
+            .expect_err("cross-arch copy must be refused");
+        assert!(
+            err.contains("does not match container arch"),
+            "expected arch-mismatch error, got: {err}"
+        );
+        assert!(
+            err.contains("62") && err.contains("183"),
+            "error should name ELF e_machine values, got: {err}"
+        );
+        assert!(
+            !container.path().join("usr/local/bin/grok").exists(),
+            "refused copy must not leave a guest binary"
+        );
+    }
+
+    #[test]
+    fn copy_host_executable_allows_matching_elf_arch() {
+        let host = tempfile::tempdir().unwrap();
+        let container = tempfile::tempdir().unwrap();
+        let host_bin = host.path().join("grok");
+        write_fake_elf(&host_bin, super::ELF_EM_AARCH64);
+        write_fake_elf(&container.path().join("bin/sh"), super::ELF_EM_AARCH64);
+
+        let workspace = container_workspace_at(container.path());
+        let dest = super::copy_host_executable_into_container(&workspace, &host_bin)
+            .expect("matching arch must copy");
+        assert_eq!(dest, "/usr/local/bin/grok");
+        assert!(container.path().join("usr/local/bin/grok").is_file());
+    }
+
     fn container_workspace_at(path: &std::path::Path) -> crate::workspace::Workspace {
         crate::workspace::Workspace {
             id: Uuid::new_v4(),
@@ -9223,6 +9386,11 @@ mod tests {
         assert_eq!(
             super::container_overlay_guest_path(&workspace, &grok_hit, "grok"),
             "/usr/local/bin/grok"
+        );
+        assert_eq!(
+            super::container_overlay_guest_path(&workspace, &grok_hit, "/opt/grok-cli"),
+            "/usr/local/bin/grok",
+            "configured host path must not replace the overlay guest path"
         );
         assert_eq!(
             super::container_overlay_command_path(&workspace, "/usr/bin/curl").as_deref(),
