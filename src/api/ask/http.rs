@@ -514,7 +514,11 @@ mod tests {
             registry_dir.join("mission-workspace-roots.json"),
             serde_json::json!({ mission.to_string(): {
                 "path": storage,
-                "filesystem_identity": crate::workspace::filesystem_identity(&storage).unwrap(),
+                // Model the identity that was captured from the volume before
+                // it was unmounted.  The test filesystem can immediately
+                // reuse a deleted directory's inode, so an actual mount
+                // replacement needs a deterministic recorded identity here.
+                "filesystem_identity": "dev:before-unmount",
             }})
             .to_string(),
         )
