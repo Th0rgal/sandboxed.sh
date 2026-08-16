@@ -406,6 +406,7 @@ test.describe('Overview Page', () => {
 
     await expect(page.getByText('PR ready for review')).toBeVisible();
     await expect(page.getByText('Ask parked inside grace')).toBeVisible();
+    await expect(page.getByText('Controller is triaging')).toBeVisible();
   });
 
   test('Needs You is empty when nothing qualifies', async ({ page }) => {

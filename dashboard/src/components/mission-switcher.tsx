@@ -220,7 +220,11 @@ function getMissionStatusDisplay(
       Icon: getStatusIcon(statusKey),
       tone: getMissionStatusToneClass(runningState, true),
       label: waiting
-        ? (mission?.needs_operator ? 'Needs You' : 'Awaiting Review')
+        ? mission?.needs_operator
+          ? 'Needs You'
+          : mission?.awaiting_kind === 'ack'
+            ? 'Awaiting Review'
+            : 'Needs Decision'
         : (runningState || 'running').replace(/_/g, ' '),
       spin: !waiting,
     };

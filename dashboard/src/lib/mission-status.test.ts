@@ -91,8 +91,8 @@ describe('mission-status', () => {
         expect(categorizeMission('awaiting_user', false, false, false, 'ack')).toBe('finished');
       });
 
-      it('in-grace controller decisions stay out of Needs You', () => {
-        expect(categorizeMission('awaiting_user', false, false, false, 'decision')).toBe('other');
+      it('in-grace controller decisions stay on the board in Running', () => {
+        expect(categorizeMission('awaiting_user', false, false, false, 'decision')).toBe('running');
       });
 
       it('failure statuses no longer land in needs-you (they go to finished/red)', () => {
@@ -161,6 +161,15 @@ describe('mission-status', () => {
       expect(result['needs-you'].map(m => m.id)).toEqual(['2']);
       expect(result.finished.map(m => m.id)).toEqual(['3', '4', '5', '6']);
       expect(result.other).toEqual([]);
+    });
+
+    it('keeps in-grace parked decisions in Running', () => {
+      const missions: TestMission[] = [
+        { id: 'triage', status: 'awaiting_user', awaiting_kind: 'decision', needs_operator: false },
+      ];
+      const result = categorizeMissions(missions, new Set());
+      expect(result['needs-you']).toEqual([]);
+      expect(result.running.map(m => m.id)).toEqual(['triage']);
     });
 
     it('ack is Finished, not Needs You', () => {

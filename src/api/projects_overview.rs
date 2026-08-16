@@ -1804,6 +1804,7 @@ pub async fn projects_overview(
         .collect_project_missions(chrono::Duration::hours(TERMINAL_MISSION_HORIZON_HOURS))
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let waiting_user_ids = state.control.collect_waiting_user_mission_ids().await;
 
     // Delivery-derived facts come from the projects store, which the
     // background ingestor keeps current — the overview never scans the Hermes
@@ -1875,7 +1876,10 @@ pub async fn projects_overview(
         let builder = rows
             .entry(key.clone())
             .or_insert_with(|| ProjectRowBuilder::new(key));
-        builder.missions.push(mission_chip(mission));
+        builder.missions.push(mission_chip(
+            mission,
+            waiting_user_ids.contains(&mission.id),
+        ));
         builder.health_inputs.push(OwnedHealthInput {
             track: mission.project.track.clone(),
             status: mission.status,
@@ -2125,8 +2129,9 @@ pub(crate) fn humanize_slug(slug: &str) -> String {
 
 /// Roster/CTRL mode is the default; live work and parked decisions win.
 /// `paused` is never overridden — the operator (or controller) parked it.
-/// Raw `awaiting_user` is not a decision block; only a qualified
-/// `needs_operator` page or a pending_user ledger row is.
+/// Raw `awaiting_user` is not a decision block. A `pending_user` ledger row
+/// becomes `blocked:decision` only when there is no live work (and no
+/// qualified `needs_operator` page). Live work still wins.
 pub(crate) fn honest_controller_mode(
     store_mode: Option<&str>,
     has_live_mission: bool,
@@ -2550,7 +2555,7 @@ fn bucket_rank(bucket: &str) -> u8 {
     }
 }
 
-fn mission_chip(mission: &Mission) -> MissionChip {
+fn mission_chip(mission: &Mission, waiting_for_user_tool: bool) -> MissionChip {
     MissionChip {
         id: mission.id.to_string(),
         status: mission.status,
@@ -2559,7 +2564,7 @@ fn mission_chip(mission: &Mission) -> MissionChip {
         github_pr: mission.project.github_pr.clone(),
         needs_operator: super::operator_attention::mission_needs_operator(
             mission,
-            false,
+            waiting_for_user_tool,
             chrono::Utc::now(),
         ),
     }
@@ -4363,9 +4368,6 @@ mod tests {
     fn pending_user_is_attention_regardless_of_missions() {
         let mut builder = ProjectRowBuilder::new("verity".to_string());
         builder.pending_decisions = 1;
-        builder
-            .missions
-            .push(awaiting_chip("00000002-aaaa-bbbb-cccc-dddddddddddd", false));
         let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
         assert!(row
             .attention_reasons
@@ -4375,6 +4377,8 @@ mod tests {
             .attention_reasons
             .iter()
             .any(|r| r.contains("awaiting user input")));
+        assert_eq!(row.mode.as_deref(), Some("blocked:decision"));
+        assert_eq!(row.bucket, "attention");
     }
 
     /// Freshness alone is not enough: without an active mode the controller

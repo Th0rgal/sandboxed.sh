@@ -50,6 +50,18 @@ pub fn attention_input(
     mission: &Mission,
     waiting_for_user_tool: bool,
 ) -> OperatorAttentionInput<'_> {
+    // Live AskUserQuestion leaves status Active, so last_status_change_at is
+    // the Active flip — often hours old. Clock that wait from updated_at
+    // (last row touch / tool activity), not the status transition.
+    let updated_at = if waiting_for_user_tool {
+        mission.updated_at.as_str()
+    } else {
+        mission
+            .activity
+            .last_status_change_at
+            .as_deref()
+            .unwrap_or(mission.updated_at.as_str())
+    };
     OperatorAttentionInput {
         status: mission.status,
         awaiting_kind: mission.awaiting_kind.map(|kind| kind.as_str()),
@@ -57,13 +69,26 @@ pub fn attention_input(
             .origin_session_id
             .as_deref()
             .is_some_and(|id| !id.is_empty()),
-        updated_at: mission
-            .activity
-            .last_status_change_at
-            .as_deref()
-            .unwrap_or(mission.updated_at.as_str()),
+        updated_at,
         waiting_for_user_tool,
     }
+}
+
+/// Whether a status-change alert row is itself an operator page.
+///
+/// `needs_operator=true` on the alerts feed is **current-state**: the mission
+/// must qualify now. The event is kept only when it is the page itself
+/// (`awaiting_user`) or a live AskUserQuestion (`active` + WaitingUser), so
+/// older failed/completed rows on the same mission do not fill Needs You.
+pub fn alert_event_is_operator_page(
+    event_status: &str,
+    current_needs_operator: bool,
+    waiting_for_user_tool: bool,
+) -> bool {
+    if !current_needs_operator {
+        return false;
+    }
+    event_status == "awaiting_user" || (waiting_for_user_tool && event_status == "active")
 }
 
 fn is_qualified_operator_page(input: &OperatorAttentionInput<'_>) -> bool {
@@ -210,9 +235,25 @@ mod tests {
         origin: Option<&str>,
         updated_at: &str,
     ) -> Mission {
+        sample_mission_with_status(
+            MissionStatus::AwaitingUser,
+            kind,
+            origin,
+            updated_at,
+            updated_at,
+        )
+    }
+
+    fn sample_mission_with_status(
+        status: MissionStatus,
+        kind: Option<AwaitingKind>,
+        origin: Option<&str>,
+        updated_at: &str,
+        last_status_change_at: &str,
+    ) -> Mission {
         Mission {
             id: Uuid::new_v4(),
-            status: MissionStatus::AwaitingUser,
+            status,
             title: Some("q".into()),
             short_description: None,
             metadata_updated_at: None,
@@ -246,7 +287,7 @@ mod tests {
             scheduling: Default::default(),
             project: Default::default(),
             activity: MissionActivity {
-                last_status_change_at: Some(updated_at.to_string()),
+                last_status_change_at: Some(last_status_change_at.to_string()),
                 ..Default::default()
             },
             awaiting_kind: kind,
@@ -279,5 +320,35 @@ mod tests {
             false,
             now()
         ));
+    }
+
+    #[test]
+    fn live_ask_user_question_clocks_grace_from_updated_at_not_active_flip() {
+        let status_flip = ts_ago(CONTROLLER_TRIAGE_GRACE_SECS + 600);
+        let tool_start = ts_ago(30);
+        let mission = sample_mission_with_status(
+            MissionStatus::Active,
+            None,
+            Some("sess-1"),
+            &tool_start,
+            &status_flip,
+        );
+        assert!(
+            !mission_needs_operator(&mission, true, now()),
+            "controller-owned AskUserQuestion inside grace must not page just because Active is old"
+        );
+    }
+
+    #[test]
+    fn alert_event_filter_keeps_pages_not_historical_noise() {
+        // ack / in-grace decision: current needs_operator is false.
+        assert!(!alert_event_is_operator_page("awaiting_user", false, false));
+        // no-origin decision that still qualifies.
+        assert!(alert_event_is_operator_page("awaiting_user", true, false));
+        // live AskUserQuestion qualifies only with WaitingUser + current page.
+        assert!(alert_event_is_operator_page("active", true, true));
+        assert!(!alert_event_is_operator_page("active", true, false));
+        assert!(!alert_event_is_operator_page("failed", true, true));
+        assert!(!alert_event_is_operator_page("completed", true, false));
     }
 }
