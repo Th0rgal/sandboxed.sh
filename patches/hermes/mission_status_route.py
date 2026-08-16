@@ -185,7 +185,6 @@ def format_mission_callback(payload: dict) -> str:
         payload.get("terminal_evidence") if status != "completed" else None,
     ]
     body = "\n".join(str(b).strip() for b in bits if b and str(b).strip())
-    mode = "active" if status == "completed" else "blocked"
     event_id = extract_event_id(payload)
     lines = [
         f"[Mission callback: {title}]",
@@ -195,14 +194,23 @@ def format_mission_callback(payload: dict) -> str:
     ]
     if body:
         lines.append(body)
+    # No [CTRL:] — ingest would project mode=blocked from a parked turn.
+    emit_ctrl = status not in {
+        "awaiting_user",
+        "awaitinguser",
+        "acknowledged",
+        "interrupted",
+    }
     if status != "completed":
         lines.append(
             "If this is infra (missing CLI, auth, workspace), fix or "
             "[DECISION:] — do not stay silent in another session."
         )
-    lines.append(
-        f"[CTRL: {project} | mode={mode} | wait=0 | next=inspect {mission_id}]"
-    )
+    if emit_ctrl:
+        mode = "active" if status == "completed" else "blocked"
+        lines.append(
+            f"[CTRL: {project} | mode={mode} | wait=0 | next=inspect {mission_id}]"
+        )
     lines.append(
         f"[STATE_SIGNATURE: {project}|mission-callback|{mission_id}|{status}|inspect]"
     )
