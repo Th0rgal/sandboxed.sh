@@ -194,8 +194,7 @@ def format_mission_callback(payload: dict) -> str:
     ]
     if body:
         lines.append(body)
-    # Parked / interrupted turns still wake the controller, but must not
-    # project mode=blocked onto the board (wait_ticks=0 stale chip).
+    # No [CTRL:] — ingest would project mode=blocked from a parked turn.
     emit_ctrl = status not in {
         "awaiting_user",
         "awaitinguser",

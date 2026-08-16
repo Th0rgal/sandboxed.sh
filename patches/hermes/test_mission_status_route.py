@@ -155,6 +155,23 @@ def test_awaiting_user_callback_omits_ctrl():
     )
 
 
+def test_interrupted_callback_omits_ctrl():
+    text = format_mission_callback(
+        {
+            "mission_id": "acfb03d2",
+            "status": "interrupted",
+            "title": "killed mid-run",
+            "project": "verity-core",
+        }
+    )
+    assert "[CTRL:" not in text
+    assert "mode=blocked" not in text
+    assert (
+        "[STATE_SIGNATURE: verity-core|mission-callback|acfb03d2|interrupted|inspect]"
+        in text
+    )
+
+
 def test_origin_must_reference_the_mission_when_inspectable():
     from gateway.platforms.mission_status_route import append_mission_callback
 

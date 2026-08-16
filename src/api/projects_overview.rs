@@ -142,8 +142,8 @@ async fn live_writer_project_slugs(state: &super::routes::AppState) -> HashSet<S
 /// prefix lets readers keep rendering `state` as absent for those.
 const CTRL_DESCRIPTOR_PREFIX: &str = "ctrl:";
 
-/// Mission-complete callbacks always carry `next=inspect`. They wake the
-/// controller but must not project a mode or a "blocker reported" chip.
+/// Headline `[Mission callback:` or descriptor `mission-callback|…|inspect`
+/// (routing key already stripped).
 fn is_mission_inspect_callback(headline: &str, state: Option<&str>) -> bool {
     if headline.starts_with("[Mission callback:") {
         return true;
@@ -256,10 +256,8 @@ fn ingest_deliveries_with_live(
                 1
             }
         };
-        // Replay of an older state returns 0 and must not touch mode/wait.
-        // Inspect callbacks wake the controller but never project a mode.
-        // A batch applies at most the newest delivery per slug so an older
-        // blocked trailer cannot overwrite a newer active one.
+        // record_state / record_silent_observation return 0 for an already-
+        // counted or older delivery; do not project mode from that `at`.
         if observations > 0
             && !is_mission_inspect_callback(&delivery.headline, delivery.state.as_deref())
         {
@@ -272,11 +270,10 @@ fn ingest_deliveries_with_live(
                     wait: observations.saturating_sub(1) as i64,
                     blocker: blocker.map(str::to_string),
                 };
-                match pending_modes.get(slug) {
-                    Some(existing) if existing.at > write.at => {}
-                    _ => {
-                        pending_modes.insert(slug.to_string(), write);
-                    }
+                if pending_modes.get(slug).is_none_or(|existing| {
+                    !super::projects_store::rfc3339_after(&existing.at, &write.at)
+                }) {
+                    pending_modes.insert(slug.to_string(), write);
                 }
             }
         }
@@ -2202,15 +2199,13 @@ impl ProjectRowBuilder {
 
         if let Some(latest) = &self.latest_update {
             if let Some(blocker) = latest.blocker.as_deref() {
-                let inspect =
-                    is_mission_inspect_callback(&latest.headline, latest.state.as_deref());
                 let stale_mode = chrono::DateTime::parse_from_rfc3339(&latest.at)
                     .ok()
                     .zip(chrono::DateTime::parse_from_rfc3339(now).ok())
                     .is_some_and(|(at, now)| {
                         now.signed_duration_since(at) > chrono::Duration::hours(STALE_ACTIVE_HOURS)
                     });
-                if !inspect && !stale_mode {
+                if !stale_mode {
                     attention.push(format!("blocker reported: {blocker}"));
                 }
             }
@@ -4849,6 +4844,8 @@ mod tests {
 
     #[test]
     fn inspect_callback_does_not_add_blocker_reported() {
+        // Ingest never copies inspect onto the roster, so latest_update has
+        // no blocker to chip — even when the newest headline is a callback.
         let mut builder = ProjectRowBuilder::new("verity".into());
         builder.attach_store_update(
             DeliveryUpdate {
@@ -4858,8 +4855,8 @@ mod tests {
                 at: "2026-08-04T11:50:00Z".into(),
                 signature: Some("verity".into()),
                 state: Some("mission-callback|acfb03d2|failed|inspect".into()),
-                mode: Some("blocked".into()),
-                blocker: Some("Codex CLI not found".into()),
+                mode: None,
+                blocker: None,
                 decision: None,
             },
             1,
@@ -4871,6 +4868,34 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("blocker reported")),
             "inspect callbacks must not raise blocker attention: {:?}",
+            row.attention_reasons
+        );
+    }
+
+    #[test]
+    fn inspect_headline_does_not_hide_a_fresh_roster_blocker() {
+        let mut builder = ProjectRowBuilder::new("verity".into());
+        builder.attach_store_update(
+            DeliveryUpdate {
+                headline: "[Mission callback: coldcard skip kernel]".into(),
+                body: None,
+                session_id: "s".into(),
+                at: "2026-08-04T11:50:00Z".into(),
+                signature: Some("verity".into()),
+                state: Some("mission-callback|acfb03d2|failed|inspect".into()),
+                mode: Some("blocked".into()),
+                blocker: Some("transport-cap".into()),
+                decision: None,
+            },
+            1,
+            1,
+        );
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert!(
+            row.attention_reasons
+                .iter()
+                .any(|r| r.contains("blocker reported")),
+            "a genuine roster blocker must still chip: {:?}",
             row.attention_reasons
         );
     }
