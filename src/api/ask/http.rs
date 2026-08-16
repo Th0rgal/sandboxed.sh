@@ -84,6 +84,11 @@ fn resolve_base_work_dir(
     mission_id: Uuid,
 ) -> Result<std::path::PathBuf, String> {
     let workspace_path = &workspace.path;
+    // Validate before accepting an explicit working directory: it can be a
+    // child of a mounted persisted root, and `exists()` alone would accept a
+    // replacement tree left at the same path after an unmount.
+    crate::workspace::ensure_persisted_mission_root_is_available(workspace, mission_id)
+        .map_err(|error| format!("persisted mission workspace root is unavailable: {error}"))?;
     if let Some(dir) = working_directory.map(std::path::PathBuf::from) {
         // Mission metadata records the path as the harness saw it. In an
         // nspawn workspace that is a guest path such as
@@ -103,8 +108,6 @@ fn resolve_base_work_dir(
     // mission preparation.  Ask is a sidecar, but running its shell in a
     // newly selected workspace after a mounted persisted root disappears is
     // still a write/read against the wrong mission tree.
-    crate::workspace::ensure_persisted_mission_root_is_available(workspace, mission_id)
-        .map_err(|error| format!("persisted mission workspace root is unavailable: {error}"))?;
     let per_mission_dir =
         crate::workspace::mission_workspace_dir_for_workspace(workspace, mission_id);
     if per_mission_dir.exists() {

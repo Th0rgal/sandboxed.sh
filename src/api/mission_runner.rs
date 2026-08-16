@@ -3662,7 +3662,9 @@ async fn run_mission_turn(
         )
         .await
     };
-    let mission_work_dir = match mission_work_dir_result {
+    let mission_work_dir = match workspace::require_verified_mission_workspace(
+        mission_work_dir_result,
+    ) {
         Ok(dir) => {
             tracing::info!(
                 "Mission {} workspace directory: {}",
@@ -3676,10 +3678,7 @@ async fn run_mission_turn(
             // unavailable or has changed identity. Running against the raw
             // workspace root would silently write a different tree.
             tracing::warn!(mission_id = %mission_id, error = %e, "refusing to run mission without its verified workspace");
-            return AgentResult::failure(
-                format!("Failed to prepare verified mission workspace: {e}"),
-                0,
-            );
+            return AgentResult::failure(e.to_string(), 0);
         }
     };
 

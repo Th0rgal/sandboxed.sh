@@ -21867,7 +21867,7 @@ async fn run_single_control_turn(
         // Get library for skill syncing
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
-        let dir = match Box::pin(workspace::prepare_mission_workspace_with_skills_backend(
+        let prepared = Box::pin(workspace::prepare_mission_workspace_with_skills_backend(
             &mut ws,
             &mcp,
             lib_ref,
@@ -21879,18 +21879,15 @@ async fn run_single_control_turn(
             Some(&config.working_dir),
             !pr_readonly,
         ))
-        .await
-        {
+        .await;
+        let dir = match workspace::require_verified_mission_workspace(prepared) {
             Ok(dir) => dir,
             Err(e) => {
                 // The persisted mission root is a placement capability, not
                 // a hint. Do not run an Ask/control turn in the workspace
                 // root if its selected filesystem cannot be verified.
                 tracing::warn!(mission_id = %mid, error = %e, "refusing control turn without its verified mission workspace");
-                return crate::agents::AgentResult::failure(
-                    format!("Failed to prepare verified mission workspace: {e}"),
-                    0,
-                );
+                return crate::agents::AgentResult::failure(e.to_string(), 0);
             }
         };
         (dir, Some(ws))
@@ -27028,8 +27025,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn delete_refuses_changed_persisted_filesystem_until_identity_is_restored() {
-        use std::os::unix::fs::MetadataExt;
-
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let storage = temp.path().join("relocated-storage");
         std::fs::create_dir_all(&storage).expect("storage should be created");
@@ -27053,7 +27048,7 @@ mod tests {
         let registry_dir = temp.path().join(".sandboxed-sh");
         std::fs::create_dir_all(&registry_dir).expect("registry directory should be created");
         let registry_path = registry_dir.join("mission-workspace-roots.json");
-        let actual_identity = format!("dev:{}", std::fs::metadata(&storage).unwrap().dev());
+        let actual_identity = workspace::filesystem_identity(&storage).unwrap();
         std::fs::write(
             &registry_path,
             serde_json::json!({ mission.id.to_string(): {

@@ -178,18 +178,18 @@ fn rel_path_is_safe(rel_clean: &str) -> bool {
         })
 }
 
-/// Walk a mission's `parent_mission_id` chain and return true if any ANCESTOR's
-/// id begins with `short` — the 8-char prefix encoded in a `mission-<short>`
+/// Walk a mission's `parent_mission_id` chain and return the matching
+/// ANCESTOR — the 8-char prefix encoded in a `mission-<short>`
 /// workspace dir name. Lets an orchestrator worker offload a build that lives in
 /// its parent/boss mission's shared workspace dir (per-PR worktrees). The walk
 /// is bounded; a missing record or cyclic chain just yields `false` (→ 403).
-async fn mission_has_ancestor_short(
+async fn mission_ancestor_by_short(
     store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
     short: &str,
-) -> bool {
+) -> Option<super::mission_store::Mission> {
     if short.is_empty() {
-        return false;
+        return None;
     }
     let mut cur = match store.get_mission(mission_id).await {
         Ok(Some(m)) => m.parent_mission_id,
@@ -199,7 +199,7 @@ async fn mission_has_ancestor_short(
     while let Some(id) = cur {
         let id_str = id.to_string();
         if id_str.len() >= 8 && id_str[..8] == *short {
-            return true;
+            return store.get_mission(id).await.ok().flatten();
         }
         cur = match store.get_mission(id).await {
             Ok(Some(m)) => m.parent_mission_id,
@@ -210,7 +210,7 @@ async fn mission_has_ancestor_short(
             break;
         }
     }
-    false
+    None
 }
 
 async fn offload_build(
@@ -260,36 +260,35 @@ async fn offload_build(
     // rsync below WRITES into host_dir.
     let host_short = name.strip_prefix("mission-").unwrap_or("");
     let req_short = &req.mission_id.to_string()[..8];
-    let host_dir_authorized = if host_short.is_empty() {
-        false
+    let mission_store = state.control.get_mission_store().await;
+    let host_owner = if host_short.is_empty() {
+        None
     } else if host_short == req_short {
-        true
+        mission_store
+            .get_mission(req.mission_id)
+            .await
+            .ok()
+            .flatten()
     } else {
-        let store = state.control.get_mission_store().await;
-        mission_has_ancestor_short(&store, req.mission_id, host_short).await
+        mission_ancestor_by_short(&mission_store, req.mission_id, host_short).await
     };
-    if !host_dir_authorized {
+    let Some(host_owner) = host_owner else {
         return (
             StatusCode::FORBIDDEN,
             "host_dir does not belong to this mission or an ancestor",
         )
             .into_response();
-    }
+    };
 
     // The capability belongs to a persisted mission placement.  Do this after
     // authorization (so it is not a mount-probing oracle), but before rsync
     // can read from or write to a stale mountpoint on the root filesystem.
-    let mission_store = state.control.get_mission_store().await;
-    let mission = match mission_store.get_mission(req.mission_id).await {
-        Ok(Some(mission)) => mission,
-        _ => return (StatusCode::NOT_FOUND, "mission not found").into_response(),
-    };
-    let workspace = match state.workspaces.get(mission.workspace_id).await {
+    let workspace = match state.workspaces.get(host_owner.workspace_id).await {
         Some(workspace) => workspace,
         None => return (StatusCode::NOT_FOUND, "mission workspace not found").into_response(),
     };
     if let Err(error) =
-        crate::workspace::ensure_persisted_mission_root_is_available(&workspace, req.mission_id)
+        crate::workspace::ensure_persisted_mission_root_is_available(&workspace, host_owner.id)
     {
         return (
             StatusCode::CONFLICT,
@@ -460,7 +459,7 @@ async fn offload_build(
 
 #[cfg(test)]
 mod tests {
-    use super::mission_has_ancestor_short;
+    use super::mission_ancestor_by_short;
     use super::rel_path_is_safe;
     use crate::api::mission_store::{InMemoryMissionStore, MissionStore};
     use std::sync::Arc;
@@ -501,19 +500,37 @@ mod tests {
         let stranger = mk(&store, "stranger", None).await;
 
         // A worker's token may offload into its boss (parent) dir.
-        assert!(mission_has_ancestor_short(&store, worker, &short(boss)).await);
+        assert!(mission_ancestor_by_short(&store, worker, &short(boss))
+            .await
+            .is_some());
         // …and a grandchild reaches the boss two hops up.
-        assert!(mission_has_ancestor_short(&store, grandchild, &short(boss)).await);
-        assert!(mission_has_ancestor_short(&store, grandchild, &short(worker)).await);
+        assert!(mission_ancestor_by_short(&store, grandchild, &short(boss))
+            .await
+            .is_some());
+        assert!(
+            mission_ancestor_by_short(&store, grandchild, &short(worker))
+                .await
+                .is_some()
+        );
         // An unrelated mission's dir is never authorized.
-        assert!(!mission_has_ancestor_short(&store, worker, &short(stranger)).await);
+        assert!(mission_ancestor_by_short(&store, worker, &short(stranger))
+            .await
+            .is_none());
         // The own-dir case is handled by the caller (host_short == req_short),
         // so the ancestor walk (parents only) must NOT self-match.
-        assert!(!mission_has_ancestor_short(&store, worker, &short(worker)).await);
+        assert!(mission_ancestor_by_short(&store, worker, &short(worker))
+            .await
+            .is_none());
         // Empty short never authorizes.
-        assert!(!mission_has_ancestor_short(&store, worker, "").await);
+        assert!(mission_ancestor_by_short(&store, worker, "")
+            .await
+            .is_none());
         // Unknown mission id → no ancestors → false.
-        assert!(!mission_has_ancestor_short(&store, uuid::Uuid::new_v4(), &short(boss)).await);
+        assert!(
+            mission_ancestor_by_short(&store, uuid::Uuid::new_v4(), &short(boss))
+                .await
+                .is_none()
+        );
     }
 
     #[test]

@@ -909,6 +909,26 @@ struct MissionWorkspaceRootRecord {
     filesystem_identity: Option<String>,
 }
 
+/// A mission turn must not continue when its prepared directory cannot be
+/// verified.  In particular, callers must not substitute the workspace root:
+/// a persisted placement can refer to a temporarily unavailable or replaced
+/// filesystem at the same path.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to prepare verified mission workspace: {source}")]
+pub struct MissionWorkspacePreparationError {
+    #[source]
+    source: anyhow::Error,
+}
+
+/// Convert preparation failures into the typed, fail-closed boundary used by
+/// every execution entry point.  Keeping this conversion centralized makes a
+/// raw-workspace fallback impossible to reintroduce accidentally.
+pub fn require_verified_mission_workspace(
+    prepared: anyhow::Result<PathBuf>,
+) -> Result<PathBuf, MissionWorkspacePreparationError> {
+    prepared.map_err(|source| MissionWorkspacePreparationError { source })
+}
+
 /// Accept the path-only format written by releases before filesystem identity
 /// was recorded.  The first successful use upgrades it under the registry
 /// lock; an unavailable legacy root is never replaced by the configured root.
@@ -935,11 +955,22 @@ fn mission_workspace_roots_path(workspace: &Workspace) -> PathBuf {
     config_root(&workspace.path).join(MISSION_WORKSPACE_ROOTS_FILE)
 }
 
-fn filesystem_identity(path: &Path) -> std::io::Result<String> {
+pub(crate) fn filesystem_identity(path: &Path) -> std::io::Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Ok(format!("dev:{}", std::fs::metadata(path)?.dev()))
+        let canonical = path.canonicalize()?;
+        let metadata = std::fs::metadata(&canonical)?;
+        // `st_dev` alone does not distinguish a bind mount from the
+        // underlying filesystem it exposes after unmount.  Linux mount IDs do
+        // distinguish those mounts; include the directory inode as a further
+        // guard against a replacement at the same path.
+        let mount_id = linux_mount_id_for_path(&canonical)?;
+        Ok(format!(
+            "mount:{mount_id}:dev:{}:ino:{}",
+            metadata.dev(),
+            metadata.ino()
+        ))
     }
     #[cfg(not(unix))]
     {
@@ -948,6 +979,45 @@ fn filesystem_identity(path: &Path) -> std::io::Result<String> {
         // pretending that an unverified path is a stable filesystem identity.
         Ok(format!("path:{}", path.canonicalize()?.display()))
     }
+}
+
+#[cfg(unix)]
+fn linux_mount_id_for_path(path: &Path) -> std::io::Result<u64> {
+    let path = path.canonicalize()?;
+    let mut best_match: Option<(PathBuf, u64)> = None;
+    for line in std::fs::read_to_string("/proc/self/mountinfo")?.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(id) = fields.next().and_then(|value| value.parse::<u64>().ok()) else {
+            continue;
+        };
+        // mountinfo fields 3 and 4 are major:minor and root; field 5 is the
+        // mount point. Escapes are octal, as documented by proc(5).
+        let _parent = fields.next();
+        let _device = fields.next();
+        let _root = fields.next();
+        let Some(mount_point) = fields.next() else {
+            continue;
+        };
+        let mount_point = PathBuf::from(
+            mount_point
+                .replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\134", "\\"),
+        );
+        if path.starts_with(&mount_point)
+            && best_match
+                .as_ref()
+                .is_none_or(|(best, _)| mount_point.as_os_str().len() > best.as_os_str().len())
+        {
+            best_match = Some((mount_point, id));
+        }
+    }
+    best_match.map(|(_, id)| id).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no Linux mount identity found for {}", path.display()),
+        )
+    })
 }
 
 fn read_mission_workspace_roots(
@@ -5163,10 +5233,38 @@ WORKING_DIR = "/workspaces/mission-old"
         // under today's configured root.
         std::fs::remove_dir(&storage).unwrap();
         let mcp = McpRegistry::new(temp.path()).await;
-        let result = prepare_mission_workspace_in(&workspace, &mcp, mission).await;
+        let result = require_verified_mission_workspace(
+            prepare_mission_workspace_in(&workspace, &mcp, mission).await,
+        );
 
         assert!(result.is_err());
         assert!(!mission_workspace_dir_for_root(temp.path(), mission).exists());
+
+        // Model the execution boundary with a launch sentinel. A failed
+        // persisted-placement preparation must return before a harness or a
+        // continuation process receives a working directory.
+        let mut launches = 0;
+        if let Ok(dir) = result {
+            launches += 1;
+            std::fs::write(dir.join("launch-sentinel"), "launched").unwrap();
+        }
+        assert_eq!(launches, 0, "no process may launch on an unverified root");
+
+        // Once the exact selected root is available again, normal preparation
+        // and execution may resume in that root, never in the workspace root.
+        std::fs::create_dir(&storage).unwrap();
+        let dir = require_verified_mission_workspace(
+            prepare_mission_workspace_in(&workspace, &mcp, mission).await,
+        )
+        .expect("restored persisted root should prepare normally");
+        launches += 1;
+        std::fs::write(dir.join("launch-sentinel"), "launched").unwrap();
+        assert_eq!(launches, 1);
+        assert!(dir.starts_with(&storage));
+        assert!(dir.join("launch-sentinel").exists());
+        assert!(!mission_workspace_dir_for_root(temp.path(), mission)
+            .join("launch-sentinel")
+            .exists());
     }
 
     #[tokio::test]
