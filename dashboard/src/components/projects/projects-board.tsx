@@ -705,7 +705,11 @@ function ProjectActions({ project }: { project: ProjectRow }) {
       setBusy(action);
       setActionError(null);
       try {
-        await postProjectAction(project.slug, action);
+        await postProjectAction(
+          project.slug,
+          action,
+          action === "delete" ? { deleteMode: "delete_missions" } : undefined,
+        );
         await mutate("projects-overview");
       } catch (err) {
         setActionError(String(err instanceof Error ? err.message : err));
@@ -842,13 +846,19 @@ function ProjectActions({ project }: { project: ProjectRow }) {
         <ActionButton
           icon={Archive}
           label="Archive"
+          title="Hide this project from the board. Missions and history stay."
           busy={busy === "archive"}
           onClick={() => run("archive")}
         />
       )}
       <ActionButton
         icon={Trash2}
-        label={confirmDelete ? "Confirm?" : "Delete"}
+        label={confirmDelete ? "Delete all?" : "Delete"}
+        title={
+          confirmDelete
+            ? "Permanently delete this project, its missions, and its history. Cancel live missions first. Archive if you only want it off the board."
+            : "Permanently delete this project, its missions, and its history. Archive to keep them."
+        }
         danger={confirmDelete}
         busy={busy === "delete"}
         onClick={() => {

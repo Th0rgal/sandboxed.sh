@@ -382,7 +382,7 @@ describe("ProjectsBoard", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: /^Pause$/ }));
     await waitFor(() =>
-      expect(mockedAction).toHaveBeenCalledWith("verity", "pause"),
+      expect(mockedAction).toHaveBeenCalledWith("verity", "pause", undefined),
     );
   });
 
@@ -392,11 +392,13 @@ describe("ProjectsBoard", () => {
 
     renderBoard();
 
-    fireEvent.click(await screen.findByRole("button", { name: /Delete/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Delete$/ }));
     expect(mockedAction).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: /Confirm/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Delete all/ }));
     await waitFor(() =>
-      expect(mockedAction).toHaveBeenCalledWith("verity", "delete"),
+      expect(mockedAction).toHaveBeenCalledWith("verity", "delete", {
+        deleteMode: "delete_missions",
+      }),
     );
   });
 
@@ -413,12 +415,14 @@ describe("ProjectsBoard", () => {
     renderBoard();
 
     fireEvent.click(await screen.findByRole("button", { name: /verity/ }));
-    fireEvent.click(await screen.findByRole("button", { name: /Delete/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Delete$/ }));
     expect(mockedAction).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: /Confirm/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Delete all/ }));
 
     await waitFor(() =>
-      expect(mockedAction).toHaveBeenCalledWith("verity", "delete"),
+      expect(mockedAction).toHaveBeenCalledWith("verity", "delete", {
+        deleteMode: "delete_missions",
+      }),
     );
     await waitFor(() =>
       expect(
