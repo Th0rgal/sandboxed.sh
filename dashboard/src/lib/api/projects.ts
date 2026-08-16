@@ -17,6 +17,8 @@ export interface ProjectMissionChip {
   title: string | null;
   updated_at: string;
   github_pr: string | null;
+  /** When the mission entered its current status. Heartbeats only bump updated_at. */
+  last_status_change_at?: string | null;
 }
 
 export interface ProjectDeliveryUpdate {

@@ -118,7 +118,7 @@ describe("cardSummary", () => {
       "landed-old",
     );
     expect(summary.lastSignalAt).toBe("2026-08-14T05:50:00Z");
-    expect(summary.lastWorkAt).toBe("2026-08-14T05:52:00Z");
+    expect(summary.lastWorkAt).toBeNull();
     expect(summary.idleNextAction).toBe(false);
     expect(summary.controllerBehind).toBe(false);
   });
@@ -172,6 +172,56 @@ describe("cardSummary", () => {
     expect(summary.lastWorkAt).toBe("2026-08-14T15:35:08Z");
     expect(summary.controllerBehind).toBe(true);
     expect(summary.idleNextAction).toBe(false);
+  });
+
+  test("does not flag a long-running writer the controller already acknowledged", () => {
+    const summary = cardSummary(
+      row({
+        pending_decisions: 0,
+        latest_update: {
+          headline: "Verity PR #2335 — RÉPARATION ACTIVE",
+          body: null,
+          session_id: "s",
+          at: "2026-08-16T22:25:00Z",
+          signature: "verity",
+          mode: "active",
+          blocker: null,
+        },
+        missions: [
+          {
+            id: "bf2b79ee",
+            status: "active",
+            title: "Repair Verity PR #2335",
+            updated_at: "2026-08-16T22:50:00Z",
+            last_status_change_at: "2026-08-16T20:30:00Z",
+            github_pr: null,
+          },
+        ],
+        health: {
+          missions: 2,
+          active: 1,
+          failed: 0,
+          overdue: 0,
+          tracks_needing_attention: 0,
+          tracks: [
+            {
+              track: "pr-2335",
+              verdict: "active",
+              missions: 1,
+              active: 1,
+              failed: 0,
+              completed: 0,
+              overdue: 0,
+              desired_states: {},
+              last_activity_at: "2026-08-16T22:50:00Z",
+            },
+          ],
+        },
+      }),
+    );
+    expect(summary.liveAttempts).toBe(1);
+    expect(summary.lastWorkAt).toBe("2026-08-16T20:30:00Z");
+    expect(summary.controllerBehind).toBe(false);
   });
 
   test("flags next_action with zero live attempts when the owner is not asked", () => {
