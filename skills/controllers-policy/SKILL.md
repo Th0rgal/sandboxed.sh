@@ -60,14 +60,19 @@ merge.** Do not open a `[DECISION:]` asking Thomas to bless a green in-scope mer
 record the merge as a granted act and do it. `review-first` is the only merge
 posture that must escalate.
 
-**Owner chat updates the grant.** An explicit order in the project session —
-"Merge these PRs" — is not a comment: `set_project_grant` and update
-`merge_authority`. Touch `material_bar` only when the owner actually changes
-what is worth a delivery. If the order is ambiguous, record `pending_user`,
-proceed with the conservative in-grant default, and apply `set_project_grant`
-when answered (or on 24h expiry). Do not stall the tick. A stale "never merge
-to main" in the prompt or an old GRANT block does not outrank a later owner
-order.
+**Owner chat updates the grant only when the order is durable.** An explicit
+standing grant — "you may merge in this repo", "review-first from now on" —
+is not a comment: `set_project_grant` and update `merge_authority`. A one-off
+"Merge these PRs" is a scoped decision for the named PRs only; record it as
+`pending_user`/`decided` with the PR list, do **not** widen `merge_authority`
+to `full`. The grant schema cannot represent a PR-limited authorization.
+Touch `material_bar` only when the owner actually changes what is worth a
+delivery. If the order is ambiguous, record `pending_user`, proceed with the
+conservative **existing** in-grant default, and apply `set_project_grant`
+only when the owner answers with a durable grant. On 24h expiry, keep the
+current grant — never guess a `merge_authority` value. Do not stall the tick.
+A stale "never merge to main" in the prompt or an old GRANT block does not
+outrank a later owner standing order.
 
 Precedence, highest wins:
 
@@ -106,8 +111,12 @@ Machine-parsed — keep the format. **`mode` is EXACTLY one of `active`, `blocke
 **`mode=blocked` with no suffix means no lane can progress.** A missing CLI, a
 wrong-arch binary, or a container `nsenter` failure is not that. Stay
 `mode=active` with `next=` switch-backend / repair-harness, or use
-`blocked:harness` for at most 3 ticks, then work around (other backend, host
-workspace). Bare `blocked` for a harness failure is a lie about the project.
+trailer `blocked:harness` for at most 3 ticks, then work around (other
+backend, host workspace). The structured `update_project_status` call
+accepts only `active` / `blocked` / `paused`: write `mode=blocked` with
+`blocker=harness`. Reserve `blocked:harness` for the CTRL trailer.
+Bare `blocked` with no harness blocker for a CLI/`nsenter` failure is a
+lie about the project.
 Coldcard `acfb03d2` (2026-08-13) finished `Codex CLI not found` and the
 callback painted the campaign blocked.
 
@@ -250,10 +259,10 @@ repeated failure `repeat-loop-guard` · tool-call limits `context-budget`.
 - **Acknowledge what you have absorbed.** When a failed/interrupted mission has been superseded (retry dispatched, work re-planned, or intentionally dropped), immediately mark it `acknowledged` — an unacknowledged terminal mission is an open operator alert. The attention surface only counts UNacknowledged failures; leaving absorbed failures unacknowledged cries wolf on every board.
 - **A mission asking a question gets an answer or an escalation, never silence.** Use `answer_mission_question` to respond to a mission blocked on AskUserQuestion — plain messages queue behind the blocked turn and will not unblock it.
 - **The store refuses two classes of lie.** A headline that only restates an auto-resume (`RELANCÉE`, `relaunch`) is ingested as `[SILENT]`. A writer-lease claim while a writer is live is coerced to `mode=active` and also silenced. Do not fight this: if the campaign actually changed heads or gates, change the `STATE_SIGNATURE` fields.
-- **Owner questions are unique and expire.** The same `pending_user` question is recorded once. After 24h unanswered it becomes `expired`; act on the conservative in-grant default, do not re-ask.
+- **Owner questions are unique and expire.** The same `pending_user` question is recorded once. After 24h unanswered it becomes `expired`; act on the conservative existing grant, do not re-ask, and do not call `set_project_grant` to invent a value.
 - **Do not stamp `mode=blocked` from an inspect callback.** Inspect callbacks omit `[CTRL:]` on `awaiting_user`. A controller that copies the old trailer onto a callback is prompt drift: ingest already refuses inspect for mode, and re-emitting `mode=blocked` from a parked turn is how the board stays red after the writer moved on. Inspect, then write your own trailer from live state.
 - **Do not abandon the objective.** If dispatch is refused (disk, auth, capacity): keep the original project on its objective with a named infra blocker (`blocked:disk`, `blocked:auth`, `blocked:capacity`); open or fix the platform work under its own project (`sandboxed-sh`). Do not retitle or reuse the campaign session. Lido “Corriger et merger les PRs” becoming a P0 disk ticket is the incident — a platform outage is not a new campaign.
-- **Harness ≠ project blocked.** Missing CLI, wrong-arch binary, container `nsenter` failure: `mode=active` + `next=` switch backend / repair harness, or `blocked:harness` ≤ 3 ticks then workaround. See the trailer rule above.
+- **Harness ≠ project blocked.** Missing CLI, wrong-arch binary, container `nsenter` failure: `mode=active` + `next=` switch backend / repair harness, or trailer `blocked:harness` ≤ 3 ticks then workaround. Structured write: `update_project_status(..., mode=blocked, blocker=harness)`. See the trailer rule above.
 
 ## Optimisations d exécution (2026-08-10, leçons terrain)
 
