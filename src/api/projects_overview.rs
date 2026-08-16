@@ -267,13 +267,15 @@ fn ingest_deliveries_with_live(
                 let wait = if observations > 0 {
                     observations.saturating_sub(1) as i64
                 } else {
-                    // Already counted: reuse the stored observation count so
-                    // a retry does not reset wait_ticks to 0.
+                    // Already counted: keep the roster wait, not the newest
+                    // state event's observations. A later callback can open a
+                    // new 1-observation row; reading that would reset
+                    // wait_ticks to 0 on every overlapping scan.
                     projects
-                        .state_timeline(slug, 1)
+                        .get_project(slug)
                         .ok()
-                        .and_then(|events| events.into_iter().next())
-                        .map(|event| event.observations.saturating_sub(1) as i64)
+                        .flatten()
+                        .map(|record| record.wait_ticks)
                         .unwrap_or(0)
                 };
                 let write = PendingModeWrite {
