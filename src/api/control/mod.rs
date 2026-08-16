@@ -7698,7 +7698,7 @@ fn migrate_legacy_ledger_placement_in_sqlite(
         .map_err(|error| format!("open {} for placement migration: {error}", path.display()))?;
     let has_column = connection
         .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'requires_local_disk'")
-        .and_then(|statement| statement.exists([]))
+        .and_then(|mut statement| statement.exists([]))
         .map_err(|error| format!("inspect {} placement schema: {error}", path.display()))?;
     let transaction = connection
         .transaction()
