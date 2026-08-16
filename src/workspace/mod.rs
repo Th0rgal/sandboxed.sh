@@ -5318,7 +5318,15 @@ WORKING_DIR = "/workspaces/mission-old"
 
         // Restoring the selected filesystem identity makes the same worktree
         // usable again; no fallback to the worker's selected root occurred.
-        persist_mission_workspace_root(&workspace, boss, &old_root).unwrap();
+        persist_mission_workspace_root_record(
+            &workspace,
+            boss,
+            MissionWorkspaceRootRecord {
+                path: old_root.canonicalize().unwrap().display().to_string(),
+                filesystem_identity: Some(filesystem_identity(&old_root).unwrap()),
+            },
+        )
+        .unwrap();
         assert_eq!(
             verify_explicit_mission_working_directory_owner(&workspace, &boss_worktree).unwrap(),
             boss
