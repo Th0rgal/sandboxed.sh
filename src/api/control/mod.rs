@@ -11829,6 +11829,52 @@ pub struct AlertsFeedResponse {
     pub next_cursor: Option<String>,
 }
 
+fn telegram_delivery_for_status(
+    telegram_alerts: &[crate::api::mission_store::TelegramAlert],
+    mission_id: Uuid,
+    status: &str,
+) -> Option<AlertFeedDelivery> {
+    let class = format!("mission_{status}");
+    telegram_alerts
+        .iter()
+        .find(|alert| {
+            alert.mission_id == Some(mission_id)
+                && alert
+                    .event_kind
+                    .split(':')
+                    .next()
+                    .unwrap_or(&alert.event_kind)
+                    == class
+        })
+        .map(|alert| AlertFeedDelivery {
+            channel: "telegram",
+            status: alert.status.clone(),
+            sent_at: alert.sent_at.clone(),
+            acknowledged_at: alert.acknowledged_at.clone(),
+            last_error: alert.last_error.clone(),
+        })
+}
+
+/// Synthesize a current-state alert for a live AskUserQuestion so Needs You
+/// does not depend on the mission's (possibly ancient) `active` status event
+/// still sitting inside the historical scan window.
+fn live_wait_alert_entry(
+    mission_id: Uuid,
+    summary: mission_store::MissionSummary,
+    wait_started_at: Option<&str>,
+    now: &str,
+    delivery: Option<AlertFeedDelivery>,
+) -> AlertFeedEntry {
+    AlertFeedEntry {
+        mission_id,
+        status: "active".to_string(),
+        summary: "Waiting for user input".to_string(),
+        timestamp: wait_started_at.unwrap_or(now).to_string(),
+        mission: Some(summary),
+        delivery,
+    }
+}
+
 fn refresh_summary_for_waiting_user(
     summary: &mut mission_store::MissionSummary,
     waiting_for_user_tool: bool,
@@ -11894,8 +11940,56 @@ pub async fn get_alerts_feed(
     let mut entries: Vec<AlertFeedEntry> = Vec::new();
     let mut next_cursor = None;
     let mut seen_ids: HashSet<Uuid> = HashSet::new();
+    let mut seeded_live: HashSet<Uuid> = HashSet::new();
     let mut summaries: HashMap<Uuid, mission_store::MissionSummary> = HashMap::new();
     let mut telegram_alerts = Vec::new();
+
+    // Current live waits belong on the first Needs You page even when the
+    // mission's last status event is older than the historical window.
+    if needs_operator_only && query.before.is_none() && !waiting_user_waits.is_empty() {
+        let live_ids: Vec<Uuid> = waiting_user_waits.keys().copied().collect();
+        let fetched = control
+            .mission_store
+            .get_mission_summaries(&live_ids)
+            .await
+            .map_err(internal_error)?;
+        summaries.extend(fetched);
+        telegram_alerts.extend(
+            control
+                .mission_store
+                .list_telegram_alerts_for_missions(&live_ids)
+                .await
+                .unwrap_or_default(),
+        );
+        let now_rfc = now.to_rfc3339();
+        for (mission_id, started_at) in &waiting_user_waits {
+            if let Some(wanted) = &wanted {
+                if !wanted.iter().any(|status| status == "active") {
+                    continue;
+                }
+            }
+            let Some(summary) = summaries.get_mut(mission_id) else {
+                continue;
+            };
+            refresh_summary_for_waiting_user(summary, true, started_at.as_deref(), now);
+            if !summary.needs_operator {
+                continue;
+            }
+            entries.push(live_wait_alert_entry(
+                *mission_id,
+                summary.clone(),
+                started_at.as_deref(),
+                &now_rfc,
+                telegram_delivery_for_status(&telegram_alerts, *mission_id, "awaiting_user")
+                    .or_else(|| {
+                        telegram_delivery_for_status(&telegram_alerts, *mission_id, "active")
+                    }),
+            ));
+            seeded_live.insert(*mission_id);
+            seen_ids.insert(*mission_id);
+        }
+        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    }
 
     for _ in 0..max_pages {
         let events = control
@@ -11969,24 +12063,15 @@ pub async fn get_alerts_feed(
                 );
                 entry.mission = Some(summary.clone());
             }
-            let class = format!("mission_{}", entry.status);
-            entry.delivery = telegram_alerts
-                .iter()
-                .find(|a| {
-                    a.mission_id == Some(entry.mission_id)
-                        && a.event_kind.split(':').next().unwrap_or(&a.event_kind) == class
-                })
-                .map(|a| AlertFeedDelivery {
-                    channel: "telegram",
-                    status: a.status.clone(),
-                    sent_at: a.sent_at.clone(),
-                    acknowledged_at: a.acknowledged_at.clone(),
-                    last_error: a.last_error.clone(),
-                });
+            entry.delivery =
+                telegram_delivery_for_status(&telegram_alerts, entry.mission_id, &entry.status);
         }
 
         if needs_operator_only {
             page.retain(|entry| {
+                if seeded_live.contains(&entry.mission_id) {
+                    return false;
+                }
                 super::operator_attention::alert_event_is_operator_page(
                     &entry.status,
                     entry
@@ -31823,5 +31908,46 @@ Investigate <service/> failures.
             (slow_count as u64) + slow_lagged >= PRODUCER_EVENTS as u64,
             "slow subscriber's got+lost should still account for the producer (got={slow_count} lagged={slow_lagged})"
         );
+    }
+
+    fn test_summary(needs_operator: bool) -> super::mission_store::MissionSummary {
+        super::mission_store::MissionSummary {
+            title: Some("ask".into()),
+            status: "active".into(),
+            workspace_name: None,
+            awaiting_kind: None,
+            needs_operator,
+            origin_session_id: None,
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn live_wait_alert_uses_the_tool_start_not_the_ancient_active_event() {
+        let mission_id = uuid::Uuid::new_v4();
+        let entry = super::live_wait_alert_entry(
+            mission_id,
+            test_summary(true),
+            Some("2026-08-16T12:00:00Z"),
+            "2026-08-16T12:05:00Z",
+            None,
+        );
+        assert_eq!(entry.mission_id, mission_id);
+        assert_eq!(entry.status, "active");
+        assert_eq!(entry.timestamp, "2026-08-16T12:00:00Z");
+        assert_eq!(entry.summary, "Waiting for user input");
+        assert!(entry.mission.is_some_and(|m| m.needs_operator));
+    }
+
+    #[test]
+    fn live_wait_alert_falls_back_to_now_when_tool_start_is_missing() {
+        let entry = super::live_wait_alert_entry(
+            uuid::Uuid::new_v4(),
+            test_summary(true),
+            None,
+            "2026-08-16T12:05:00Z",
+            None,
+        );
+        assert_eq!(entry.timestamp, "2026-08-16T12:05:00Z");
     }
 }
