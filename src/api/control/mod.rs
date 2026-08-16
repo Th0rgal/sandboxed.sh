@@ -27074,6 +27074,7 @@ mod tests {
         assert_eq!(error.0, StatusCode::CONFLICT);
         assert!(store.get_mission(mission.id).await.unwrap().is_some());
         assert!(unavailable_storage
+            .join("workspaces")
             .join(mission_dir.file_name().unwrap())
             .exists());
         std::fs::rename(&unavailable_storage, &storage).expect("storage should be restored");
