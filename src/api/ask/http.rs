@@ -79,10 +79,11 @@ pub struct AskThreadDetail {
 /// model to burn its whole iteration budget just locating the project.
 fn resolve_base_work_dir(
     working_directory: Option<&str>,
-    workspace_path: &std::path::Path,
+    workspace: &crate::workspace::Workspace,
     nspawn_container: bool,
     mission_id: Uuid,
 ) -> std::path::PathBuf {
+    let workspace_path = &workspace.path;
     if let Some(dir) = working_directory.map(std::path::PathBuf::from) {
         // Mission metadata records the path as the harness saw it. In an
         // nspawn workspace that is a guest path such as
@@ -99,7 +100,7 @@ fn resolve_base_work_dir(
         }
     }
     let per_mission_dir =
-        crate::workspace::mission_workspace_dir_for_root(workspace_path, mission_id);
+        crate::workspace::mission_workspace_dir_for_workspace(workspace, mission_id);
     if per_mission_dir.exists() {
         per_mission_dir
     } else {
@@ -175,7 +176,7 @@ pub async fn ask_send(
         && crate::workspace::use_nspawn_for_workspace(&workspace);
     let base_work_dir = resolve_base_work_dir(
         mission.working_directory.as_deref(),
-        &workspace.path,
+        &workspace,
         nspawn_container,
         mission_id,
     );
@@ -303,7 +304,7 @@ pub async fn ask_send_stream(
         && crate::workspace::use_nspawn_for_workspace(&workspace);
     let base_work_dir = resolve_base_work_dir(
         mission.working_directory.as_deref(),
-        &workspace.path,
+        &workspace,
         nspawn_container,
         mission_id,
     );
@@ -461,9 +462,10 @@ mod tests {
         let guest = "/workspaces/mission-abcd/repo";
         let host = root.path().join("workspaces/mission-abcd/repo");
         std::fs::create_dir_all(&host).unwrap();
+        let workspace = crate::workspace::Workspace::default_host(root.path().to_path_buf());
         let resolved = resolve_base_work_dir(
             Some(guest),
-            root.path(),
+            &workspace,
             true,
             Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap(),
         );
@@ -475,9 +477,10 @@ mod tests {
         let root = tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
+        let workspace = crate::workspace::Workspace::default_host(root.path().to_path_buf());
         let resolved = resolve_base_work_dir(
             repo.to_str(),
-            root.path(),
+            &workspace,
             false,
             Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap(),
         );

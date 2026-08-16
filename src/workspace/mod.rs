@@ -894,6 +894,88 @@ pub fn mission_workspace_dir_for_root(root: &Path, mission_id: Uuid) -> PathBuf 
     workspaces_root_for(root).join(format!("mission-{}", short_id))
 }
 
+/// Resolve the root used for newly-created default-host mission directories.
+///
+/// `MISSION_WORKSPACE_ROOT` is deliberately only a placement override for the
+/// generated per-mission scratch tree.  Workspace records continue to own
+/// their configured paths, so enabling it never rewrites or moves an existing
+/// workspace.  A bad override fails safely back to the established root.
+pub fn configured_mission_workspace_root(fallback: &Path) -> PathBuf {
+    resolve_mission_workspace_root(
+        std::env::var_os("MISSION_WORKSPACE_ROOT")
+            .map(PathBuf::from)
+            .as_deref(),
+        fallback,
+    )
+}
+
+fn resolve_mission_workspace_root(candidate: Option<&Path>, fallback: &Path) -> PathBuf {
+    resolve_mission_workspace_root_with(candidate, fallback, mission_workspace_root_is_writable)
+}
+
+fn resolve_mission_workspace_root_with(
+    candidate: Option<&Path>,
+    fallback: &Path,
+    is_writable: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    let Some(candidate) = candidate else {
+        return fallback.to_path_buf();
+    };
+    let candidate = candidate.to_path_buf();
+    if !candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        tracing::warn!(path = %candidate.display(), "Ignoring unsafe MISSION_WORKSPACE_ROOT; using workspace root");
+        return fallback.to_path_buf();
+    }
+    match std::fs::canonicalize(&candidate) {
+        Ok(path) if path.is_dir() && is_writable(&path) => path,
+        Ok(path) => {
+            tracing::warn!(path = %path.display(), "MISSION_WORKSPACE_ROOT is not a writable directory; using workspace root");
+            fallback.to_path_buf()
+        }
+        Err(error) => {
+            tracing::warn!(path = %candidate.display(), %error, "Cannot resolve MISSION_WORKSPACE_ROOT; using workspace root");
+            fallback.to_path_buf()
+        }
+    }
+}
+
+fn mission_workspace_root_is_writable(root: &Path) -> bool {
+    // Metadata permissions are not enough (ACLs and read-only mounts can
+    // disagree), so make and remove only an unpredictable, empty probe we own.
+    let probe = root.join(format!(".sandboxed-sh-write-probe-{}", Uuid::new_v4()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => std::fs::remove_file(probe).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// The root that will hold this mission's generated workspace directory.
+/// Existing generated directories always win, which keeps active missions and
+/// historic workspace records compatible after an operator enables a new root.
+pub fn mission_workspace_root_for_workspace(workspace: &Workspace, mission_id: Uuid) -> PathBuf {
+    let legacy = mission_workspace_dir_for_root(&workspace.path, mission_id);
+    if legacy.exists() || workspace.id != DEFAULT_WORKSPACE_ID {
+        return workspace.path.clone();
+    }
+    configured_mission_workspace_root(&workspace.path)
+}
+
+/// Generated directory for a mission, preserving an existing legacy location.
+pub fn mission_workspace_dir_for_workspace(workspace: &Workspace, mission_id: Uuid) -> PathBuf {
+    mission_workspace_dir_for_root(
+        &mission_workspace_root_for_workspace(workspace, mission_id),
+        mission_id,
+    )
+}
+
 /// Resolve a configured project directory to its host-visible path.
 ///
 /// Mission state (harness config, HOME and XDG data) deliberately lives in a
@@ -2183,7 +2265,7 @@ fn remote_build_wrapper_path(workspace: &Workspace, mission_id: Uuid) -> PathBuf
     if workspace.workspace_type == WorkspaceType::Container && !is_container_fallback(workspace) {
         PathBuf::from("/usr/local/lib/sandboxed-sh/bin/remote-lean-build")
     } else {
-        mission_workspace_dir_for_root(&workspace.path, mission_id)
+        mission_workspace_dir_for_workspace(workspace, mission_id)
             .join(".sandboxed-sh/bin/remote-lean-build")
     }
 }
@@ -2334,7 +2416,7 @@ pub async fn prepare_mission_workspace_in(
 ) -> anyhow::Result<PathBuf> {
     // Use a mission-specific directory under the workspace root so multiple missions
     // can run concurrently without clobbering per-workspace config files.
-    let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
+    let dir = mission_workspace_dir_for_workspace(workspace, mission_id);
     prepare_workspace_dir(&dir).await?;
     install_remote_build_wrapper(workspace, mission_id).await?;
     let mcp_configs = filter_mcp_configs_for_workspace(
@@ -2532,7 +2614,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
 ) -> anyhow::Result<PathBuf> {
     // Mission workspace directory lives under the selected workspace root.
     // This keeps filesystem and config effects scoped to the mission.
-    let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
+    let dir = mission_workspace_dir_for_workspace(workspace, mission_id);
     prepare_workspace_dir(&dir).await?;
     install_remote_build_wrapper(workspace, mission_id).await?;
     // Reviewers still need authenticated read access to private repositories.
@@ -4703,5 +4785,57 @@ WORKING_DIR = "/workspaces/mission-old"
     fn test_codex_reasoning_summary_on_empty_config() {
         let result = ensure_codex_reasoning_summary("");
         assert!(result.starts_with("model_reasoning_summary = \"detailed\"\n"));
+    }
+
+    #[test]
+    fn mission_workspace_root_canonicalizes_symlink_and_rejects_unsafe_fallbacks() {
+        let temp = tempfile::tempdir().unwrap();
+        let fallback = temp.path().join("legacy");
+        let target = temp.path().join("storage");
+        std::fs::create_dir_all(&fallback).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, temp.path().join("storage-link")).unwrap();
+
+        #[cfg(unix)]
+        assert_eq!(
+            resolve_mission_workspace_root(Some(&temp.path().join("storage-link")), &fallback),
+            target.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_mission_workspace_root(Some(&temp.path().join("missing")), &fallback),
+            fallback
+        );
+        assert_eq!(
+            resolve_mission_workspace_root(Some(std::path::Path::new("/tmp/../unsafe")), &fallback),
+            fallback
+        );
+        assert_eq!(
+            resolve_mission_workspace_root_with(Some(&target), &fallback, |_| false),
+            fallback,
+            "an unwritable configured root must fail back even when tests run as root"
+        );
+    }
+
+    #[test]
+    fn existing_mission_directory_keeps_legacy_placement() {
+        let temp = tempfile::tempdir().unwrap();
+        let mission = Uuid::new_v4();
+        let workspace = Workspace::default_host(temp.path().to_path_buf());
+        let legacy = mission_workspace_dir_for_root(&workspace.path, mission);
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(
+            mission_workspace_dir_for_workspace(&workspace, mission),
+            legacy
+        );
+    }
+
+    #[test]
+    fn mission_workspace_root_defaults_to_workspace_root() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_mission_workspace_root(None, temp.path()),
+            temp.path()
+        );
     }
 }

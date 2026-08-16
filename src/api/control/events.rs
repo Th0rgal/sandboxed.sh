@@ -430,6 +430,8 @@ pub enum ControlCommand {
         /// Whether creation consumes the API host's local scratch space.
         /// Remote-node missions bypass the host disk-pressure gate.
         requires_local_disk: bool,
+        /// Expected local scratch peak; absent values use the safe default.
+        estimated_disk_gib: Option<u64>,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Update mission status

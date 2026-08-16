@@ -3715,6 +3715,7 @@ async fn resolve_or_create_mission(
             working_directory: None,
             scheduling: Default::default(),
             requires_local_disk: true,
+            estimated_disk_gib: None,
             respond: tx,
         })
         .await;

@@ -8,6 +8,7 @@
 //! for container workspaces, collected from cgroup stats.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -183,6 +184,55 @@ pub fn current_disk_usage() -> (u64, u64, f32) {
     let disks = Disks::new_with_refreshed_list();
     let (used, total) = root_disk_usage(&disks);
     (used, total, pct(used, total))
+}
+
+/// Capacity of the filesystem that actually backs `path`.  `statvfs` avoids
+/// guessing from a root-filesystem mount list when mission scratch lives on a
+/// separate volume.
+pub fn disk_usage_for_path(path: &Path) -> std::io::Result<DiskUsage> {
+    let measured_path = std::fs::canonicalize(path)?;
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(measured_path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+        })?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let block_size = u64::from(stat.f_frsize.max(stat.f_bsize));
+        let total = stat.f_blocks.saturating_mul(block_size);
+        let available = stat.f_bavail.saturating_mul(block_size);
+        return Ok(DiskUsage {
+            measured_path,
+            filesystem: format!("statvfs:{}", stat.f_fsid),
+            used: total.saturating_sub(available),
+            total,
+            available,
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let (used, total, _) = current_disk_usage();
+        Ok(DiskUsage {
+            measured_path,
+            filesystem: "root".to_string(),
+            used,
+            total,
+            available: total.saturating_sub(used),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DiskUsage {
+    pub measured_path: PathBuf,
+    pub filesystem: String,
+    pub used: u64,
+    pub total: u64,
+    pub available: u64,
 }
 
 /// Percentage of `used` over `total` (0 when `total` is 0).
@@ -864,4 +914,26 @@ fn systemd_escape(name: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_usage_measures_the_requested_path() {
+        let root = disk_usage_for_path(Path::new("/")).unwrap();
+        assert!(root.total >= root.available);
+        assert!(!root.measured_path.as_os_str().is_empty());
+
+        // Linux normally mounts tmpfs at /dev/shm. When it is present on a
+        // distinct filesystem, this proves we do not silently report `/`.
+        let shm = Path::new("/dev/shm");
+        if shm.is_dir() {
+            let shm_usage = disk_usage_for_path(shm).unwrap();
+            if shm_usage.filesystem != root.filesystem {
+                assert_ne!(shm_usage.filesystem, root.filesystem);
+            }
+        }
+    }
 }

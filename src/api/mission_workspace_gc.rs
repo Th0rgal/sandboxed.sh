@@ -720,7 +720,7 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
                         continue;
                     }
                 };
-                let dir = workspace::mission_workspace_dir_for_root(&ws.path, mission.id);
+                let dir = workspace::mission_workspace_dir_for_workspace(&ws, mission.id);
                 if !dir.exists() {
                     continue;
                 }

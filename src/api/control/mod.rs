@@ -5570,24 +5570,45 @@ pub struct FleetHealth {
     pub disk_total: u64,
     pub disk_percent: f32,
     pub disk_level: crate::api::monitoring::DiskHealthLevel,
+    /// Canonical path whose backing filesystem is measured for local missions.
+    pub disk_path: String,
+    /// Non-secret filesystem identifier returned by statvfs.
+    pub disk_filesystem: String,
+    pub disk_free_gib: u64,
+    pub disk_required_gib: u64,
 }
 
 /// Admission preflight: `Some(reason)` when new missions must be refused
-/// because the root filesystem is critically full, or is at warn level while
+/// because the selected mission-workspace filesystem is critically full, or is at warn level while
 /// `DISK_ADMISSION_AT_WARN=1`. `DISK_ADMISSION_ENABLED=0` is the escape hatch.
-fn disk_admission_refusal() -> Option<String> {
+fn disk_admission_refusal(path: &std::path::Path) -> Option<String> {
     let enabled = std::env::var("DISK_ADMISSION_ENABLED")
         .map(|v| v.trim() != "0" && !v.trim().eq_ignore_ascii_case("false"))
         .unwrap_or(true);
     if !enabled {
         return None;
     }
-    let (used, total, percent) = crate::api::monitoring::current_disk_usage();
+    let usage = match crate::api::monitoring::disk_usage_for_path(path) {
+        Ok(usage) => usage,
+        Err(error) => {
+            return Some(format!(
+                "mission creation refused: cannot measure workspace filesystem at {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let used = usage.used;
+    let total = usage.total;
+    let percent = if total == 0 {
+        100.0
+    } else {
+        used as f32 / total as f32 * 100.0
+    };
     match crate::api::monitoring::DiskHealthLevel::from_percent(percent) {
         crate::api::monitoring::DiskHealthLevel::Critical => Some(format!(
-            "mission creation refused: disk critically full ({percent:.1}% used, {} GB free). \
-             Free space or raise DISK_CRITICAL_PCT, then retry.",
-            total.saturating_sub(used) / (1024 * 1024 * 1024)
+            "mission creation refused: disk critically full at {} (filesystem {}, \
+             {percent:.1}% used, {} GiB free). Free space or raise DISK_CRITICAL_PCT, then retry.",
+            usage.measured_path.display(), usage.filesystem, usage.available / (1 << 30)
         )),
         crate::api::monitoring::DiskHealthLevel::Warn
             if std::env::var("DISK_ADMISSION_AT_WARN")
@@ -5596,9 +5617,9 @@ fn disk_admission_refusal() -> Option<String> {
         {
             Some(format!(
                 "mission creation refused: disk above the admission warning threshold \
-                 ({percent:.1}% used, {} GB free). Wait for workspace GC, select a remote \
+                 at {} (filesystem {}, {percent:.1}% used, {} GiB free). Wait for workspace GC, select a remote \
                  node, or free space.",
-                total.saturating_sub(used) / (1024 * 1024 * 1024)
+                usage.measured_path.display(), usage.filesystem, usage.available / (1 << 30)
             ))
         }
         crate::api::monitoring::DiskHealthLevel::Warn => {
@@ -5612,17 +5633,35 @@ fn disk_admission_refusal() -> Option<String> {
     }
 }
 
+fn mission_disk_reserve_gib() -> u64 {
+    std::env::var("MISSION_DISK_EMERGENCY_RESERVE_GB")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(150)
+}
+
+fn mission_disk_default_estimate_gib() -> u64 {
+    std::env::var("MISSION_DISK_DEFAULT_ESTIMATE_GIB")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|estimate| (1..=512).contains(estimate))
+        .unwrap_or(64)
+}
+
 fn disk_estimate_refusal(
-    available_bytes: u64,
+    usage: &crate::api::monitoring::DiskUsage,
     estimated_gib: u64,
     reserve_gib: u64,
 ) -> Option<String> {
     let required_gib = estimated_gib.saturating_add(reserve_gib);
-    (available_bytes < required_gib.saturating_mul(1 << 30)).then(|| {
+    (usage.available < required_gib.saturating_mul(1 << 30)).then(|| {
         format!(
             "mission needs an estimated {estimated_gib} GiB scratch plus a {reserve_gib} GiB \
-             emergency floor, but only {} GiB is free; select a remote node or free space",
-            available_bytes / (1 << 30)
+             emergency floor ({required_gib} GiB required), but only {} GiB is free at {} \
+             (filesystem {}); select a remote node or free space",
+            usage.available / (1 << 30),
+            usage.measured_path.display(),
+            usage.filesystem
         )
     })
 }
@@ -5655,7 +5694,16 @@ pub async fn fleet_health(
         .map_err(internal_error)?;
 
     let cfg = &state.config;
-    let (disk_used, disk_total, disk_percent) = crate::api::monitoring::current_disk_usage();
+    let workspace_root = crate::workspace::configured_mission_workspace_root(&cfg.working_dir);
+    let disk =
+        crate::api::monitoring::disk_usage_for_path(&workspace_root).map_err(internal_error)?;
+    let disk_percent = if disk.total == 0 {
+        100.0
+    } else {
+        disk.used as f32 / disk.total as f32 * 100.0
+    };
+    let reserve_gib = mission_disk_reserve_gib();
+    let required_gib = mission_disk_default_estimate_gib().saturating_add(reserve_gib);
     Ok(Json(FleetHealth {
         status: if control_responsive { "ok" } else { "degraded" },
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -5665,10 +5713,14 @@ pub async fn fleet_health(
         missions,
         webhook_forwarder_configured: cfg.paloma_webhook_forward_url.is_some(),
         offload_configured: cfg.spark_arbiter_url.is_some() || cfg.spark_ssh_target.is_some(),
-        disk_used,
-        disk_total,
+        disk_used: disk.used,
+        disk_total: disk.total,
         disk_percent,
         disk_level: crate::api::monitoring::DiskHealthLevel::from_percent(disk_percent),
+        disk_path: disk.measured_path.to_string_lossy().to_string(),
+        disk_filesystem: disk.filesystem,
+        disk_free_gib: disk.available / (1 << 30),
+        disk_required_gib: required_gib,
     }))
 }
 
@@ -8610,16 +8662,9 @@ pub async fn create_mission(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty);
-    let effective_estimated_disk_gib = req.estimated_disk_gib.or_else(|| {
-        local_mission
-            .then(|| {
-                std::env::var("MISSION_DISK_DEFAULT_ESTIMATE_GIB")
-                    .ok()
-                    .and_then(|raw| raw.trim().parse::<u64>().ok())
-                    .filter(|estimate| (1..=512).contains(estimate))
-            })
-            .flatten()
-    });
+    let effective_estimated_disk_gib = req
+        .estimated_disk_gib
+        .or_else(|| local_mission.then(mission_disk_default_estimate_gib));
     if let Some(estimated_gib) = effective_estimated_disk_gib {
         if estimated_gib == 0 || estimated_gib > 512 {
             return Err((
@@ -8628,13 +8673,22 @@ pub async fn create_mission(
             ));
         }
         if local_mission {
-            let (used, total, _) = crate::api::monitoring::current_disk_usage();
-            let reserve_gib = std::env::var("MISSION_DISK_EMERGENCY_RESERVE_GB")
-                .ok()
-                .and_then(|raw| raw.trim().parse::<u64>().ok())
-                .unwrap_or(64);
+            let workspace = state
+                .workspaces
+                .get(workspace_id.unwrap_or(workspace::DEFAULT_WORKSPACE_ID))
+                .await
+                .unwrap_or_else(|| {
+                    workspace::Workspace::default_host(state.config.working_dir.clone())
+                });
+            let root = workspace::mission_workspace_root_for_workspace(&workspace, Uuid::nil());
+            let usage = crate::api::monitoring::disk_usage_for_path(&root).map_err(|error| {
+                (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    format!("mission creation refused: cannot measure workspace filesystem at {}: {error}", root.display()),
+                )
+            })?;
             if let Some(reason) =
-                disk_estimate_refusal(total.saturating_sub(used), estimated_gib, reserve_gib)
+                disk_estimate_refusal(&usage, estimated_gib, mission_disk_reserve_gib())
             {
                 return Err((StatusCode::INSUFFICIENT_STORAGE, reason));
             }
@@ -8793,6 +8847,7 @@ pub async fn create_mission(
                 deadline: req.deadline.map(|t| t.to_rfc3339()),
             },
             requires_local_disk: local_mission,
+            estimated_disk_gib: effective_estimated_disk_gib,
             respond: tx,
         })
         .await
@@ -12662,7 +12717,7 @@ async fn cleanup_mission_workspace_dirs_for_delete(
         let Some(ws) = workspaces.get(mission.workspace_id).await else {
             continue;
         };
-        let dir = workspace::mission_workspace_dir_for_root(&ws.path, mission.id);
+        let dir = workspace::mission_workspace_dir_for_workspace(&ws, mission.id);
         if !dir.exists() {
             continue;
         }
@@ -18081,14 +18136,37 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, fast_mode, backend, config_profile, parent_mission_id, working_directory, scheduling, requires_local_disk, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, fast_mode, backend, config_profile, parent_mission_id, working_directory, scheduling, requires_local_disk, estimated_disk_gib, respond } => {
                         // Disk preflight: refuse new missions when the root
                         // filesystem is critically full instead of letting
                         // workers die mid-flight on ENOSPC. Actor-level so
                         // the HTTP, Ask and Telegram entrypoints are all
                         // covered by this single gate.
                         if requires_local_disk {
-                            if let Some(refusal) = disk_admission_refusal() {
+                            let workspace = workspaces
+                                .get(workspace_id.unwrap_or(workspace::DEFAULT_WORKSPACE_ID))
+                                .await
+                                .unwrap_or_else(|| workspace::Workspace::default_host(config.working_dir.clone()));
+                            let root = workspace::mission_workspace_root_for_workspace(
+                                &workspace,
+                                Uuid::nil(),
+                            );
+                            if let Some(refusal) = disk_admission_refusal(&root) {
+                                let _ = respond.send(Err(refusal));
+                                continue;
+                            }
+                            let usage = match crate::api::monitoring::disk_usage_for_path(&root) {
+                                Ok(usage) => usage,
+                                Err(error) => {
+                                    let _ = respond.send(Err(format!("mission creation refused: cannot measure workspace filesystem at {}: {error}", root.display())));
+                                    continue;
+                                }
+                            };
+                            if let Some(refusal) = disk_estimate_refusal(
+                                &usage,
+                                estimated_disk_gib.unwrap_or_else(mission_disk_default_estimate_gib),
+                                mission_disk_reserve_gib(),
+                            ) {
                                 let _ = respond.send(Err(refusal));
                                 continue;
                             }
@@ -25267,11 +25345,31 @@ mod tests {
 
     #[test]
     fn disk_estimate_preserves_emergency_free_space() {
-        assert!(disk_estimate_refusal(100 << 30, 20, 64).is_none());
-        let refusal = disk_estimate_refusal(80 << 30, 20, 64).unwrap();
+        let usage = crate::api::monitoring::DiskUsage {
+            measured_path: "/srv/sandboxed-storage".into(),
+            filesystem: "statvfs:test".to_string(),
+            used: 0,
+            total: 100 << 30,
+            available: 100 << 30,
+        };
+        assert!(disk_estimate_refusal(&usage, 20, 64).is_none());
+        // Equality is admitted: the emergency reserve remains exactly intact.
+        let exact = crate::api::monitoring::DiskUsage {
+            available: 84 << 30,
+            total: 84 << 30,
+            ..usage.clone()
+        };
+        assert!(disk_estimate_refusal(&exact, 20, 64).is_none());
+        let low = crate::api::monitoring::DiskUsage {
+            available: 80 << 30,
+            total: 80 << 30,
+            ..usage
+        };
+        let refusal = disk_estimate_refusal(&low, 20, 64).unwrap();
         assert!(refusal.contains("20 GiB scratch"));
         assert!(refusal.contains("64 GiB"));
         assert!(refusal.contains("80 GiB is free"));
+        assert!(refusal.contains("/srv/sandboxed-storage"));
     }
 
     #[test]
