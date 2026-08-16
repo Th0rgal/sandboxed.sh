@@ -3686,6 +3686,20 @@ async fn run_mission_turn(
     let mission_work_dir = if let Some(ref wd) = mission_working_directory {
         match resolve_mission_working_directory(&workspace.path, workspace.workspace_type, wd) {
             Ok(wd_path) => {
+                if let Err(error) =
+                    workspace::verify_explicit_mission_working_directory_owner(&workspace, &wd_path)
+                {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        requested_working_directory = %wd,
+                        error = %error,
+                        "refusing explicit working_directory without a verified persisted owner"
+                    );
+                    return AgentResult::failure(
+                        format!("explicit working_directory owner is unavailable or unverified: {error}"),
+                        0,
+                    );
+                }
                 tracing::info!(
                     mission_id = %mission_id,
                     requested_working_directory = %wd,
@@ -3699,9 +3713,12 @@ async fn run_mission_turn(
                     mission_id = %mission_id,
                     requested_working_directory = %wd,
                     error = %error,
-                    "Mission working_directory is invalid; using prepared mission directory"
+                    "refusing invalid explicit mission working_directory"
                 );
-                mission_work_dir
+                return AgentResult::failure(
+                    format!("explicit working_directory is invalid: {error}"),
+                    0,
+                );
             }
         }
     } else {

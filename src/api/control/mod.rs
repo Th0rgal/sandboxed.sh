@@ -7380,7 +7380,7 @@ async fn reserved_disk_bytes_for_filesystem(
         .iter()
         .filter(|mission| mission_holds_disk_reservation(mission.status))
         .flat_map(|mission| mission.project.tags.iter())
-        .filter_map(parse_disk_reservation_tag)
+        .filter_map(|tag| parse_disk_reservation_tag(tag))
         .filter(|(reserved_filesystem, _)| *reserved_filesystem == filesystem)
         .fold(0u64, |total, (_, bytes)| total.saturating_add(bytes)))
 }

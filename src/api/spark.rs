@@ -313,6 +313,26 @@ async fn offload_build(
         )
             .into_response();
     }
+    match crate::workspace::verify_explicit_mission_working_directory_owner(
+        &workspace,
+        std::path::Path::new(&host_dir),
+    ) {
+        Ok(owner_id) if owner_id == host_owner.id => {}
+        Ok(_) => {
+            return (
+                StatusCode::FORBIDDEN,
+                "host_dir resolved to a different persisted mission owner",
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("host_dir persisted mission owner is unavailable or unverified: {error}"),
+            )
+                .into_response();
+        }
+    }
     if let Err(error) = host_dir_matches_mission_owner(&host_dir, &workspace, host_owner.id) {
         return (StatusCode::FORBIDDEN, error).into_response();
     }

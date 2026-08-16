@@ -1072,6 +1072,80 @@ pub fn ensure_persisted_mission_root_is_available(
     Ok(())
 }
 
+/// Verify the persisted owner of an explicit directory below a mission
+/// workspace.  A worker can legitimately run in a boss's worktree, but the
+/// worker's own selected root says nothing about the filesystem that owns that
+/// worktree.  Resolve the physical `workspaces/mission-<short>` ancestor,
+/// require exactly one registry owner, and validate that owner's persisted
+/// root before accepting any descendant.
+///
+/// Callers intentionally receive an error for a directory outside a mission
+/// workspace: an explicit override is a capability, not a generic escape hatch
+/// from the selected mission placement.
+pub fn verify_explicit_mission_working_directory_owner(
+    workspace: &Workspace,
+    requested: &Path,
+) -> std::io::Result<Uuid> {
+    let requested = requested.canonicalize()?;
+    let mission_dir = requested
+        .ancestors()
+        .find(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("mission-"))
+                .is_some_and(|short| {
+                    short.len() == 8 && short.chars().all(|c| c.is_ascii_hexdigit())
+                })
+                && ancestor
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    == Some("workspaces")
+        })
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "explicit working directory {} has no mission workspace owner",
+                requested.display()
+            ))
+        })?;
+    let short = mission_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("mission-"))
+        .expect("checked mission directory name");
+
+    let roots = read_mission_workspace_roots(workspace)?;
+    let mut matches = Vec::new();
+    for (id, record) in roots {
+        if !id.starts_with(short) {
+            continue;
+        }
+        let mission_id = Uuid::parse_str(&id).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid mission root registry id",
+            )
+        })?;
+        let (root, _) = validate_mission_workspace_root(&record)?;
+        let expected = mission_workspace_dir_for_root(&root, mission_id).canonicalize()?;
+        if expected == mission_dir {
+            matches.push(mission_id);
+        }
+    }
+    match matches.as_slice() {
+        [mission_id] => Ok(*mission_id),
+        [] => Err(std::io::Error::other(format!(
+            "explicit working directory {} is not a verified persisted mission placement",
+            requested.display()
+        ))),
+        _ => Err(std::io::Error::other(format!(
+            "explicit working directory {} has ambiguous mission ownership",
+            requested.display()
+        ))),
+    }
+}
+
 /// Atomically replace a registry file and make both the file and the rename
 /// durable before releasing the registry lock. Readers therefore see either a
 /// complete old JSON document or a complete new one, never a truncation.
@@ -1105,7 +1179,7 @@ fn atomic_write_mission_workspace_roots(
 /// Persist the selected root before creating a mission directory.  The
 /// registry lives with the workspace configuration rather than the generated
 /// directory, so it survives restarts and a later environment/config drift.
-fn persist_mission_workspace_root(
+pub(crate) fn persist_mission_workspace_root(
     workspace: &Workspace,
     mission_id: Uuid,
     root: &Path,
@@ -5198,6 +5272,49 @@ WORKING_DIR = "/workspaces/mission-old"
         );
         assert!(mission_workspace_roots_for_workspace(&after_restart)
             .contains(&storage.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn explicit_ancestor_worktree_requires_the_ancestors_verified_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_root = temp.path().join("boss-old-filesystem");
+        let new_root = temp.path().join("worker-new-filesystem");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::create_dir_all(&new_root).unwrap();
+        let workspace = Workspace::default_host(temp.path().to_path_buf());
+        let boss = Uuid::new_v4();
+        let worker = Uuid::new_v4();
+        persist_mission_workspace_root(&workspace, boss, &old_root).unwrap();
+        persist_mission_workspace_root(&workspace, worker, &new_root).unwrap();
+        let boss_worktree = mission_workspace_dir_for_root(&old_root, boss).join("wk-1");
+        std::fs::create_dir_all(&boss_worktree).unwrap();
+
+        assert_eq!(
+            verify_explicit_mission_working_directory_owner(&workspace, &boss_worktree).unwrap(),
+            boss
+        );
+
+        // Model an unmount that leaves a different filesystem at the same
+        // path. The worker's new root remains valid, but it must not authorize
+        // a turn or offload in the boss's stale worktree.
+        let mut roots = read_mission_workspace_roots(&workspace).unwrap();
+        roots
+            .get_mut(&boss.to_string())
+            .unwrap()
+            .filesystem_identity = Some("dev:replaced:ino:root".to_string());
+        atomic_write_mission_workspace_roots(&mission_workspace_roots_path(&workspace), &roots)
+            .unwrap();
+        assert!(
+            verify_explicit_mission_working_directory_owner(&workspace, &boss_worktree).is_err()
+        );
+
+        // Restoring the selected filesystem identity makes the same worktree
+        // usable again; no fallback to the worker's selected root occurred.
+        persist_mission_workspace_root(&workspace, boss, &old_root).unwrap();
+        assert_eq!(
+            verify_explicit_mission_working_directory_owner(&workspace, &boss_worktree).unwrap(),
+            boss
+        );
     }
 
     #[tokio::test]

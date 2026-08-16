@@ -98,9 +98,23 @@ fn resolve_base_work_dir(
         if nspawn_container && dir.is_absolute() && !dir.starts_with(workspace_path) {
             let host_dir = workspace_path.join(dir.strip_prefix("/").unwrap_or(&dir));
             if host_dir.exists() {
+                crate::workspace::verify_explicit_mission_working_directory_owner(
+                    workspace, &host_dir,
+                )
+                .map_err(|error| {
+                    format!(
+                        "explicit working_directory owner is unavailable or unverified: {error}"
+                    )
+                })?;
                 return Ok(host_dir);
             }
         } else if dir.exists() {
+            crate::workspace::verify_explicit_mission_working_directory_owner(workspace, &dir)
+                .map_err(|error| {
+                    format!(
+                        "explicit working_directory owner is unavailable or unverified: {error}"
+                    )
+                })?;
             return Ok(dir);
         }
     }
@@ -477,17 +491,14 @@ mod tests {
         let host = root.path().join("workspaces/mission-abcd/repo");
         std::fs::create_dir_all(&host).unwrap();
         let workspace = crate::workspace::Workspace::default_host(root.path().to_path_buf());
-        let resolved = resolve_base_work_dir(
-            Some(guest),
-            &workspace,
-            true,
-            Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap(),
-        );
+        let mission = Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap();
+        crate::workspace::persist_mission_workspace_root(&workspace, mission, root.path()).unwrap();
+        let resolved = resolve_base_work_dir(Some(guest), &workspace, true, mission);
         assert_eq!(resolved.unwrap(), host);
     }
 
     #[test]
-    fn host_working_directory_is_left_unchanged() {
+    fn host_working_directory_without_a_persisted_mission_owner_is_rejected() {
         let root = tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -498,7 +509,7 @@ mod tests {
             false,
             Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap(),
         );
-        assert_eq!(resolved.unwrap(), repo);
+        assert!(resolved.is_err());
     }
 
     #[test]
