@@ -5024,6 +5024,27 @@ WORKING_DIR = "/workspaces/mission-old"
             .contains(&storage.canonicalize().unwrap()));
     }
 
+    #[tokio::test]
+    async fn unavailable_persisted_mission_root_fails_closed_before_configured_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("temporarily-unmounted-storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let mission = Uuid::new_v4();
+        let workspace = Workspace::default_host(temp.path().to_path_buf());
+
+        persist_mission_workspace_root(&workspace, mission, &storage).unwrap();
+        // Model an unavailable mount after a restart. Preparation checks this
+        // persisted selection before resolving MISSION_WORKSPACE_ROOT, so it
+        // must surface an error rather than creating a new mission directory
+        // under today's configured root.
+        std::fs::remove_dir(&storage).unwrap();
+        let mcp = McpRegistry::new(temp.path()).await;
+        let result = prepare_mission_workspace_in(&workspace, &mcp, mission).await;
+
+        assert!(result.is_err());
+        assert!(!mission_workspace_dir_for_root(temp.path(), mission).exists());
+    }
+
     #[test]
     fn mission_root_registry_serializes_concurrent_writers_and_readers() {
         use std::sync::atomic::{AtomicBool, Ordering};
