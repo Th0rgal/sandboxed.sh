@@ -601,6 +601,44 @@ impl WorkspaceStore {
             }
         }
 
+        // A custom workspace may be a removable/mounted filesystem.  Persist
+        // its mission-root registry in this store's control directory before
+        // any mission code can consult it.  Copy the old colocated registry
+        // while it is still reachable; if it is not, the stamped control-path
+        // makes later placement resolution fail closed rather than treating a
+        // bare mountpoint as a fresh workspace.
+        for workspace in workspaces.values_mut() {
+            if workspace.id == DEFAULT_WORKSPACE_ID
+                || workspace
+                    .config
+                    .get("mission_workspace_registry_control_root")
+                    .is_some()
+            {
+                continue;
+            }
+            let legacy = legacy_mission_workspace_roots_path(workspace);
+            let control_root = working_dir.to_string_lossy().into_owned();
+            if !workspace.config.is_object() {
+                workspace.config = serde_json::json!({});
+            }
+            workspace.config["mission_workspace_registry_control_root"] =
+                serde_json::Value::String(control_root);
+            let destination = mission_workspace_roots_path(workspace);
+            if !destination.exists() && legacy.exists() {
+                if let Some(parent) = destination.parent() {
+                    if let Err(error) = std::fs::create_dir_all(parent)
+                        .and_then(|_| std::fs::copy(&legacy, &destination).map(|_| ()))
+                    {
+                        tracing::error!(
+                            workspace = %workspace.id,
+                            error = %error,
+                            "failed to migrate custom mission-root registry to control storage"
+                        );
+                    }
+                }
+            }
+        }
+
         // Scan for orphaned containers and restore them
         let orphaned = store.scan_orphaned_containers(&workspaces).await;
         for workspace in orphaned {
@@ -952,8 +990,29 @@ impl From<MissionWorkspaceRootRecordOnDisk> for MissionWorkspaceRootRecord {
     }
 }
 
-fn mission_workspace_roots_path(workspace: &Workspace) -> PathBuf {
+fn legacy_mission_workspace_roots_path(workspace: &Workspace) -> PathBuf {
     config_root(&workspace.path).join(MISSION_WORKSPACE_ROOTS_FILE)
+}
+
+/// Custom workspaces can themselves be mounted filesystems.  Their placement
+/// authority must therefore live with the server control store, not on the
+/// volume it is meant to verify.  WorkspaceStore stamps this path into the
+/// persisted workspace definition during migration; the default workspace
+/// keeps its established location for compatibility.
+fn mission_workspace_roots_path(workspace: &Workspace) -> PathBuf {
+    if workspace.id != DEFAULT_WORKSPACE_ID {
+        if let Some(root) = workspace
+            .config
+            .get("mission_workspace_registry_control_root")
+            .and_then(serde_json::Value::as_str)
+        {
+            return PathBuf::from(root)
+                .join(".sandboxed-sh")
+                .join("mission-workspace-roots")
+                .join(format!("{}.json", workspace.id));
+        }
+    }
+    legacy_mission_workspace_roots_path(workspace)
 }
 
 pub(crate) fn filesystem_identity(path: &Path) -> std::io::Result<String> {
@@ -1144,6 +1203,22 @@ pub fn ensure_persisted_mission_root_is_available(
 ) -> std::io::Result<()> {
     let path = mission_workspace_roots_path(workspace);
     let contents = match std::fs::read_to_string(&path) {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && workspace.id != DEFAULT_WORKSPACE_ID
+                && workspace
+                    .config
+                    .get("mission_workspace_registry_control_root")
+                    .is_some() =>
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "persisted control registry for custom workspace {} is unavailable",
+                    workspace.id
+                ),
+            ));
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
         Ok(contents) => contents,
@@ -1306,14 +1381,17 @@ fn persist_mission_workspace_root_record(
     record: MissionWorkspaceRootRecord,
 ) -> std::io::Result<()> {
     (|| -> std::io::Result<()> {
-        std::fs::create_dir_all(config_root(&workspace.path))?;
+        let path = mission_workspace_roots_path(workspace);
+        std::fs::create_dir_all(
+            path.parent()
+                .expect("mission workspace root registry has a parent"),
+        )?;
         // The process-local lock avoids blocking an async executor on an
         // advisory file lock when many preparations race. The file lock also
         // serializes independent server processes sharing this workspace.
         let _guard = MISSION_WORKSPACE_ROOTS_LOCK
             .lock()
             .expect("registry lock poisoned");
-        let path = mission_workspace_roots_path(workspace);
         let lock_path = path.with_extension("json.lock");
         let lock_file = std::fs::OpenOptions::new()
             .read(true)
@@ -1482,6 +1560,43 @@ pub fn mission_workspace_roots_for_workspace(workspace: &Workspace) -> Vec<PathB
     roots.sort();
     roots.dedup();
     roots
+}
+
+/// Whether a generated directory is owned by this workspace's persisted
+/// placement authority.  This is deliberately stronger than membership in a
+/// scan root: configured roots may overlap a custom workspace, and scan order
+/// must never select the configuration used to rewrite a mission's MCP file.
+fn owns_persisted_mission_directory(workspace: &Workspace, directory: &Path) -> bool {
+    let Ok(directory) = directory.canonicalize() else {
+        return false;
+    };
+    let Some(short) = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("mission-"))
+    else {
+        return false;
+    };
+    if short.len() != 8 || !short.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    let Ok(roots) = read_mission_workspace_roots(workspace) else {
+        return false;
+    };
+    roots.into_iter().any(|(id, record)| {
+        let Ok(mission_id) = Uuid::parse_str(&id) else {
+            return false;
+        };
+        if !id.starts_with(short) {
+            return false;
+        }
+        let Ok((root, _)) = validate_mission_workspace_root(&record) else {
+            return false;
+        };
+        mission_workspace_dir_for_root(&root, mission_id)
+            .canonicalize()
+            .is_ok_and(|expected| expected == directory)
+    })
 }
 
 /// Resolve a configured project directory to its host-visible path.
@@ -3747,7 +3862,13 @@ pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::
             for entry in std::fs::read_dir(&scan_root)? {
                 let path = entry?.path();
                 if path.is_dir() {
-                    dirs.entry(path).or_insert_with(|| workspace.clone());
+                    if owns_persisted_mission_directory(&workspace, &path) {
+                        // A verified owner always wins over a provisional
+                        // scan-root match from an overlapping workspace.
+                        dirs.insert(path, workspace.clone());
+                    } else {
+                        dirs.entry(path).or_insert_with(|| workspace.clone());
+                    }
                 }
             }
         }
