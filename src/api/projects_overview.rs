@@ -1666,6 +1666,11 @@ struct MissionChip {
     title: Option<String>,
     updated_at: String,
     github_pr: Option<String>,
+    /// When this mission last entered its current status. Heartbeats bump
+    /// `updated_at` on every tool event; this stays put so "controller behind"
+    /// compares work *start*, not the last tick.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_status_change_at: Option<String>,
     /// Qualified operator page — ack / in-grace controller waits stay false.
     #[serde(default)]
     needs_operator: bool,
@@ -2714,6 +2719,11 @@ fn mission_chip(
         title: mission.title.clone(),
         updated_at: mission.updated_at.clone(),
         github_pr: mission.project.github_pr.clone(),
+        last_status_change_at: mission
+            .activity
+            .last_status_change_at
+            .clone()
+            .or_else(|| Some(mission.created_at.clone())),
         needs_operator: super::operator_attention::mission_needs_operator(
             mission,
             waiting_for_user_tool,
@@ -4436,6 +4446,7 @@ mod tests {
             title: Some("rebase #2332".into()),
             updated_at: "2026-08-14T06:00:00Z".into(),
             github_pr: None,
+            last_status_change_at: None,
             needs_operator: false,
         });
         let row = builder.finish(&[], None, None, "2026-08-14T06:05:00Z");
@@ -4622,6 +4633,7 @@ mod tests {
                 title: None,
                 updated_at: "2026-08-01T00:00:00Z".to_string(),
                 github_pr: None,
+                last_status_change_at: None,
                 needs_operator: false,
             });
         }
@@ -4644,6 +4656,7 @@ mod tests {
             title: None,
             updated_at: "2026-08-02T00:00:00Z".to_string(),
             github_pr: None,
+            last_status_change_at: None,
             needs_operator: false,
         }
     }
@@ -4868,6 +4881,7 @@ mod tests {
             title: None,
             updated_at: "2026-08-04T11:00:00Z".to_string(),
             github_pr: None,
+            last_status_change_at: None,
             needs_operator: true,
         });
         builder
@@ -4890,6 +4904,7 @@ mod tests {
             title: None,
             updated_at: "2026-08-04T11:00:00Z".to_string(),
             github_pr: None,
+            last_status_change_at: None,
             needs_operator,
         }
     }
@@ -5121,6 +5136,7 @@ mod tests {
             title: Some("Certify Lido PR #88 exact head".to_string()),
             updated_at: "2026-08-16T19:00:00Z".to_string(),
             github_pr: None,
+            last_status_change_at: None,
             needs_operator: false,
         });
         builder.missions.push(MissionChip {
@@ -5129,6 +5145,7 @@ mod tests {
             title: Some("Design P-RESERVE-RELATIONAL implementation packet".to_string()),
             updated_at: "2026-08-16T19:00:01Z".to_string(),
             github_pr: None,
+            last_status_change_at: None,
             needs_operator: false,
         });
         let row = builder.finish(&[], None, None, "2026-08-16T19:05:00Z");

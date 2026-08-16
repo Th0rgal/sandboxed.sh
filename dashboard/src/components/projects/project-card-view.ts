@@ -99,13 +99,17 @@ export function cardSummary(project: ProjectRow): CardSummary {
 const CONTROLLER_BEHIND_MS = 15 * 60 * 1000;
 
 function latestLiveWorkAt(project: ProjectRow): string | null {
-  const fromMissions = (project.missions ?? [])
-    .filter((mission) => LIVE_ATTEMPT.has(mission.status))
-    .map((mission) => mission.updated_at);
-  const fromTracks = (project.health?.tracks ?? [])
-    .filter((track) => track.active > 0)
-    .map((track) => track.last_activity_at);
-  return latestTimestamp([...fromMissions, ...fromTracks]);
+  // Use when the live attempt *started*, not the last tool heartbeat.
+  // A writer that has been running for 20 minutes is not new work the
+  // controller missed.
+  return latestTimestamp(
+    (project.missions ?? [])
+      .filter((mission) => LIVE_ATTEMPT.has(mission.status))
+      .map(
+        (mission) =>
+          nonblank(mission.last_status_change_at) ?? mission.updated_at,
+      ),
+  );
 }
 
 function isControllerBehind(
