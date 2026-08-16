@@ -7694,16 +7694,52 @@ fn elf_machine_name(machine: u16) -> &'static str {
     }
 }
 
-fn host_elf_machine() -> Option<u16> {
-    match std::env::consts::ARCH {
-        "x86_64" => Some(ELF_EM_X86_64),
-        "aarch64" => Some(ELF_EM_AARCH64),
-        _ => None,
+/// Resolve an overlay probe without following a symlink out of the rootfs.
+/// `File::open` would chase an absolute `/usr/bin/dash` link onto the host.
+fn overlay_trusted_path(
+    workspace: &crate::workspace::Workspace,
+    path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let meta = path.symlink_metadata().ok()?;
+    if !meta.file_type().is_symlink() {
+        return Some(path.to_path_buf());
     }
+    let target = std::fs::read_link(path).ok()?;
+    let joined = if target.is_absolute() {
+        workspace
+            .path
+            .join(target.strip_prefix("/").unwrap_or(target.as_path()))
+    } else {
+        path.parent()?.join(target)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(_) => normalized.push(component),
+        }
+    }
+    normalized
+        .starts_with(&workspace.path)
+        .then_some(normalized)
 }
 
-/// Container ISA from the nspawn overlay (`/bin/sh` etc.), else the host
-/// arch — nspawn images are debootstrapped for the machine that created them.
+fn overlay_elf_e_machine(
+    workspace: &crate::workspace::Workspace,
+    path: &std::path::Path,
+) -> Option<u16> {
+    elf_e_machine(&overlay_trusted_path(workspace, path)?)
+}
+
+/// Container ISA from the nspawn overlay only. Unknown ISA is `None` —
+/// callers must fail closed rather than assume the host arch.
 pub(crate) fn container_overlay_elf_machine(
     workspace: &crate::workspace::Workspace,
 ) -> Option<u16> {
@@ -7722,18 +7758,18 @@ pub(crate) fn container_overlay_elf_machine(
     ];
     for probe in PROBES {
         if let Some(path) = container_overlay_command_path(workspace, probe) {
-            if let Some(machine) = elf_e_machine(&path) {
+            if let Some(machine) = overlay_elf_e_machine(workspace, &path) {
                 return Some(machine);
             }
         }
         if probe.contains('/') {
             let path = workspace.path.join(probe.trim_start_matches('/'));
-            if let Some(machine) = elf_e_machine(&path) {
+            if let Some(machine) = overlay_elf_e_machine(workspace, &path) {
                 return Some(machine);
             }
         }
     }
-    host_elf_machine()
+    None
 }
 
 fn refuse_cross_arch_host_copy(
@@ -7744,7 +7780,10 @@ fn refuse_cross_arch_host_copy(
         return Ok(());
     };
     let Some(container_machine) = container_overlay_elf_machine(workspace) else {
-        return Ok(());
+        return Err(format!(
+            "Refusing to copy {} into the container: could not determine container arch from the nspawn overlay (x86_64=62, aarch64=183)",
+            host_executable.display(),
+        ));
     };
     if host_machine == container_machine {
         return Ok(());
@@ -9322,6 +9361,31 @@ mod tests {
     }
 
     #[test]
+    fn copy_host_executable_refuses_elf_arch_mismatch_aarch64_on_x86_64() {
+        let host = tempfile::tempdir().unwrap();
+        let container = tempfile::tempdir().unwrap();
+        let host_bin = host.path().join("grok");
+        write_fake_elf(&host_bin, super::ELF_EM_AARCH64);
+        write_fake_elf(&container.path().join("bin/sh"), super::ELF_EM_X86_64);
+
+        let workspace = container_workspace_at(container.path());
+        let err = super::copy_host_executable_into_container(&workspace, &host_bin)
+            .expect_err("cross-arch copy must be refused");
+        assert!(
+            err.contains("does not match container arch"),
+            "expected arch-mismatch error, got: {err}"
+        );
+        assert!(
+            err.contains("62") && err.contains("183"),
+            "error should name ELF e_machine values, got: {err}"
+        );
+        assert!(
+            !container.path().join("usr/local/bin/grok").exists(),
+            "refused copy must not leave a guest binary"
+        );
+    }
+
+    #[test]
     fn copy_host_executable_allows_matching_elf_arch() {
         let host = tempfile::tempdir().unwrap();
         let container = tempfile::tempdir().unwrap();
@@ -9334,6 +9398,23 @@ mod tests {
             .expect("matching arch must copy");
         assert_eq!(dest, "/usr/local/bin/grok");
         assert!(container.path().join("usr/local/bin/grok").is_file());
+    }
+
+    #[test]
+    fn copy_host_executable_refuses_when_container_isa_unknown() {
+        let host = tempfile::tempdir().unwrap();
+        let container = tempfile::tempdir().unwrap();
+        let host_bin = host.path().join("grok");
+        write_fake_elf(&host_bin, super::ELF_EM_X86_64);
+
+        let workspace = container_workspace_at(container.path());
+        let err = super::copy_host_executable_into_container(&workspace, &host_bin)
+            .expect_err("unknown container ISA must refuse an ELF copy");
+        assert!(
+            err.contains("could not determine container arch"),
+            "expected fail-closed unknown-ISA error, got: {err}"
+        );
+        assert!(!container.path().join("usr/local/bin/grok").exists());
     }
 
     fn container_workspace_at(path: &std::path::Path) -> crate::workspace::Workspace {

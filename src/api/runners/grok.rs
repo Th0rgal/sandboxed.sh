@@ -19,11 +19,32 @@ use crate::workspace::Workspace;
 use crate::workspace_exec::WorkspaceExec;
 
 /// Overlay / guest path for a Grok CLI, never a host path like `/opt/grok-cli`.
+///
+/// Absolute configured programs are not overlay-looked-up: an overlay file at
+/// `opt/grok-cli` would otherwise become the exec path, and nsenter without
+/// `--root` would resolve it on the host.
 fn grok_overlay_guest_path(workspace: &Workspace, program: &str) -> Option<String> {
-    let overlay = container_overlay_command_path(workspace, program)
-        .or_else(|| container_overlay_command_path(workspace, "/usr/local/bin/grok"))
-        .or_else(|| container_overlay_command_path(workspace, "grok"))?;
+    let relative = (!program.starts_with('/')).then_some(program);
+    let overlay = container_overlay_command_path(workspace, "/usr/local/bin/grok")
+        .or_else(|| container_overlay_command_path(workspace, "grok"))
+        .or_else(|| relative.and_then(|name| container_overlay_command_path(workspace, name)))?;
     Some(container_overlay_guest_path(workspace, &overlay, "grok"))
+}
+
+/// Whether nsenter `Present` may be used as the exec path. Absolute container
+/// paths that missed the guest overlay are host paths (`/opt/grok-cli`).
+fn grok_cli_path_from_presence(
+    is_container: bool,
+    program: &str,
+    cli_path: &str,
+    presence: CommandPresence,
+) -> Option<String> {
+    match presence {
+        CommandPresence::Present if !(is_container && program.starts_with('/')) => {
+            Some(cli_path.to_string())
+        }
+        _ => None,
+    }
 }
 
 async fn install_grok_cli_in_workspace(
@@ -138,12 +159,11 @@ async fn ensure_grok_cli_available(
     if let Some(guest) = grok_overlay_guest_path(&workspace_exec.workspace, program) {
         return Ok(guest);
     }
-    match command_presence(workspace_exec, cwd, program).await {
-        // An absolute configured path that missed the overlay is a host
-        // path (`/opt/grok-cli`). nsenter --root cannot exec it.
-        CommandPresence::Present if !(is_container && program.starts_with('/')) => {
-            return Ok(cli_path.to_string());
-        }
+    let presence = command_presence(workspace_exec, cwd, program).await;
+    if let Some(path) = grok_cli_path_from_presence(is_container, program, cli_path, presence) {
+        return Ok(path);
+    }
+    match presence {
         CommandPresence::Present => {
             tracing::warn!(
                 program,
@@ -1727,17 +1747,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn grok_overlay_prefers_guest_path_over_host_opt_cli() {
-        let root = tempfile::tempdir().unwrap();
-        let grok = root.path().join("usr/local/bin/grok");
-        fs::create_dir_all(grok.parent().unwrap()).unwrap();
-        fs::write(&grok, b"#!/bin/sh\necho grok\n").unwrap();
+    fn write_executable(path: &std::path::Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&grok, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[test]
+    fn grok_overlay_prefers_guest_path_over_host_opt_cli() {
+        let root = tempfile::tempdir().unwrap();
+        write_executable(
+            &root.path().join("usr/local/bin/grok"),
+            b"#!/bin/sh\necho grok\n",
+        );
         let workspace = container_workspace_at(root.path());
         assert_eq!(
             grok_overlay_guest_path(&workspace, "/opt/grok-cli").as_deref(),
@@ -1745,22 +1773,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn grok_overlay_ignores_absolute_opt_cli_even_when_present() {
+        let root = tempfile::tempdir().unwrap();
+        write_executable(
+            &root.path().join("opt/grok-cli"),
+            b"#!/bin/sh\necho host-grok\n",
+        );
+        let workspace = container_workspace_at(root.path());
+        assert_eq!(
+            grok_overlay_guest_path(&workspace, "/opt/grok-cli"),
+            None,
+            "overlay /opt/grok-cli must not become the guest exec path"
+        );
+    }
+
+    #[test]
+    fn grok_presence_never_returns_absolute_container_host_path() {
+        assert_eq!(
+            grok_cli_path_from_presence(
+                true,
+                "/opt/grok-cli",
+                "/opt/grok-cli",
+                CommandPresence::Present,
+            ),
+            None
+        );
+        assert_eq!(
+            grok_cli_path_from_presence(true, "grok", "grok", CommandPresence::Present).as_deref(),
+            Some("grok")
+        );
+        assert_eq!(
+            grok_cli_path_from_presence(
+                false,
+                "/opt/grok-cli",
+                "/opt/grok-cli",
+                CommandPresence::Present,
+            )
+            .as_deref(),
+            Some("/opt/grok-cli")
+        );
+    }
+
     #[tokio::test]
     async fn ensure_grok_cli_prefers_guest_overlay_over_host_opt_path() {
         let root = tempfile::tempdir().unwrap();
-        let grok = root.path().join("usr/local/bin/grok");
-        fs::create_dir_all(grok.parent().unwrap()).unwrap();
-        fs::write(&grok, b"#!/bin/sh\necho grok\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&grok, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_executable(
+            &root.path().join("usr/local/bin/grok"),
+            b"#!/bin/sh\necho grok\n",
+        );
         let exec = WorkspaceExec::new(container_workspace_at(root.path()));
         let path = ensure_grok_cli_available(&exec, root.path(), "/opt/grok-cli")
             .await
             .expect("overlay grok must be used");
         assert_eq!(path, "/usr/local/bin/grok");
+    }
+
+    #[tokio::test]
+    async fn ensure_grok_cli_never_returns_opt_path_when_overlay_has_no_grok() {
+        let root = tempfile::tempdir().unwrap();
+        write_executable(
+            &root.path().join("opt/grok-cli"),
+            b"#!/bin/sh\necho host-grok\n",
+        );
+        let prev = std::env::var("SANDBOXED_SH_AUTO_INSTALL_GROK").ok();
+        std::env::set_var("SANDBOXED_SH_AUTO_INSTALL_GROK", "0");
+        let exec = WorkspaceExec::new(container_workspace_at(root.path()));
+        let result = ensure_grok_cli_available(&exec, root.path(), "/opt/grok-cli").await;
+        match prev {
+            Some(value) => std::env::set_var("SANDBOXED_SH_AUTO_INSTALL_GROK", value),
+            None => std::env::remove_var("SANDBOXED_SH_AUTO_INSTALL_GROK"),
+        }
+        match result {
+            Ok(path) => assert_ne!(
+                path, "/opt/grok-cli",
+                "overlay-miss must not exec the host path"
+            ),
+            Err(_) => {}
+        }
     }
 
     #[test]
