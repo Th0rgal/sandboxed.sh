@@ -25,6 +25,7 @@ pub fn alert_importance_for_mission(
     mission: &Mission,
     interest: TelegramMissionInterestLevel,
     waiting_for_user_tool: bool,
+    wait_started_at: Option<&str>,
 ) -> &'static str {
     if interest == TelegramMissionInterestLevel::High {
         return "high";
@@ -32,6 +33,7 @@ pub fn alert_importance_for_mission(
     if crate::api::operator_attention::mission_needs_operator(
         mission,
         waiting_for_user_tool,
+        wait_started_at,
         Utc::now(),
     ) {
         return "high";

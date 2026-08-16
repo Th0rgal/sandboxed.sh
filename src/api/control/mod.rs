@@ -4024,24 +4024,22 @@ impl ControlHub {
         Ok(collected)
     }
 
-    /// Mission IDs whose live run is parked on AskUserQuestion (`WaitingUser`).
-    /// Used so project chips share the same `needs_operator` clock as list/detail.
-    pub(crate) async fn collect_waiting_user_mission_ids(&self) -> HashSet<Uuid> {
-        let mut ids = HashSet::new();
+    /// Live AskUserQuestion waits: mission id → user-wait tool `started_at`.
+    /// Presence means `WaitingUser`; the value is the grace clock (None if the
+    /// tool row is not registered yet — treated as just started).
+    pub(crate) async fn collect_waiting_user_waits(&self) -> HashMap<Uuid, Option<String>> {
+        let mut waits = HashMap::new();
         let Ok(inventory) = self.mission_store_inventory().await else {
-            return ids;
+            return waits;
         };
         for store in inventory.live {
             let Ok(runs) = store.list_active_mission_runs().await else {
                 continue;
             };
-            for run in runs {
-                if run.execution_state == MissionExecutionState::WaitingUser {
-                    ids.insert(run.mission_id);
-                }
-            }
+            let store_waits = user_wait_starts_for_runs(store.as_ref(), &runs).await;
+            waits.extend(store_waits);
         }
-        ids
+        waits
     }
 
     /// Board tasks across every store whose boss mission belongs to this
@@ -5151,6 +5149,7 @@ fn attach_execution_to_mission_value(
     mut value: serde_json::Value,
     mission: &Mission,
     run: Option<&MissionRun>,
+    wait_started_at: Option<&str>,
 ) -> serde_json::Value {
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -5173,6 +5172,7 @@ fn attach_execution_to_mission_value(
             serde_json::Value::Bool(super::operator_attention::mission_needs_operator(
                 mission,
                 waiting_for_user_tool,
+                wait_started_at,
                 chrono::Utc::now(),
             )),
         );
@@ -5182,6 +5182,35 @@ fn attach_execution_to_mission_value(
 
 fn is_user_wait_tool(tool_kind: &str) -> bool {
     matches!(tool_kind, "request_user_input" | "frontend_tool") || is_interactive_ui_tool(tool_kind)
+}
+
+pub(crate) async fn user_wait_tool_started_at(
+    store: &dyn MissionStore,
+    run: &MissionRun,
+) -> Option<String> {
+    if run.execution_state != MissionExecutionState::WaitingUser {
+        return None;
+    }
+    let tools = store.list_active_tool_executions(run.run_id).await.ok()?;
+    tools
+        .into_iter()
+        .filter(|tool| is_user_wait_tool(&tool.tool_kind))
+        .map(|tool| tool.started_at)
+        .min()
+}
+
+pub(crate) async fn user_wait_starts_for_runs(
+    store: &dyn MissionStore,
+    runs: impl IntoIterator<Item = &MissionRun>,
+) -> HashMap<Uuid, Option<String>> {
+    let mut waits = HashMap::new();
+    for run in runs {
+        if run.execution_state != MissionExecutionState::WaitingUser {
+            continue;
+        }
+        waits.insert(run.mission_id, user_wait_tool_started_at(store, run).await);
+    }
+    waits
 }
 
 const PROVISIONAL_TOOL_DEADLINE_SECS: i64 = 120;
@@ -5568,11 +5597,20 @@ pub async fn list_missions(
         .into_iter()
         .map(|run| (run.mission_id, run))
         .collect();
+    let wait_starts =
+        user_wait_starts_for_runs(control.mission_store.as_ref(), active_runs.values()).await;
     let values = missions
         .into_iter()
         .map(|mission| {
             let value = serde_json::to_value(&mission).unwrap_or(serde_json::Value::Null);
-            attach_execution_to_mission_value(value, &mission, active_runs.get(&mission.id))
+            attach_execution_to_mission_value(
+                value,
+                &mission,
+                active_runs.get(&mission.id),
+                wait_starts
+                    .get(&mission.id)
+                    .and_then(|started| started.as_deref()),
+            )
         })
         .collect();
     Ok(Json(values))
@@ -6465,10 +6503,15 @@ pub async fn get_mission(
                 .get_active_mission_run(mission.id)
                 .await
                 .map_err(internal_error)?;
+            let wait_started_at = match active_run.as_ref() {
+                Some(run) => user_wait_tool_started_at(control.mission_store.as_ref(), run).await,
+                None => None,
+            };
             let mut value = attach_execution_to_mission_value(
                 serde_json::to_value(&mission).map_err(internal_error)?,
                 &mission,
                 active_run.as_ref(),
+                wait_started_at.as_deref(),
             );
             let host_configured =
                 state.config.spark_arbiter_url.is_some() || state.config.spark_ssh_target.is_some();
@@ -6885,11 +6928,19 @@ pub async fn get_mission_digest(
             }
         }
     }
-    let execution = control
+    let active_run = control
         .mission_store
         .get_active_mission_run(mission.id)
         .await
-        .map_err(internal_error)?
+        .map_err(internal_error)?;
+    let waiting_for_user_tool = active_run
+        .as_ref()
+        .is_some_and(|run| run.execution_state == MissionExecutionState::WaitingUser);
+    let wait_started_at = match active_run.as_ref() {
+        Some(run) => user_wait_tool_started_at(control.mission_store.as_ref(), run).await,
+        None => None,
+    };
+    let execution = active_run
         .as_ref()
         .map(|run| mission_execution_projection(run, mission.status));
 
@@ -6900,12 +6951,8 @@ pub async fn get_mission_digest(
         "awaiting_kind": mission.awaiting_kind.map(|k| k.as_str()),
         "needs_operator": super::operator_attention::mission_needs_operator(
             &mission,
-            execution.as_ref().is_some_and(|value| {
-                value
-                    .get("state")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("waiting_user")
-            }),
+            waiting_for_user_tool,
+            wait_started_at.as_deref(),
             chrono::Utc::now(),
         ),
         "terminal_reason": mission.terminal_reason,
@@ -11751,6 +11798,7 @@ pub struct AlertsFeedResponse {
 fn refresh_summary_for_waiting_user(
     summary: &mut mission_store::MissionSummary,
     waiting_for_user_tool: bool,
+    wait_started_at: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) {
     if !waiting_for_user_tool {
@@ -11768,6 +11816,7 @@ fn refresh_summary_for_waiting_user(
                 .is_some_and(|id| !id.is_empty()),
             updated_at: &summary.updated_at,
             waiting_for_user_tool: true,
+            wait_started_at,
         },
         now,
     );
@@ -11790,15 +11839,13 @@ pub async fn get_alerts_feed(
             .filter(|p| !p.is_empty())
             .collect()
     });
-    let waiting_user_ids: HashSet<Uuid> = control
+    let active_runs = control
         .mission_store
         .list_active_mission_runs()
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|run| run.execution_state == MissionExecutionState::WaitingUser)
-        .map(|run| run.mission_id)
-        .collect();
+        .unwrap_or_default();
+    let waiting_user_waits =
+        user_wait_starts_for_runs(control.mission_store.as_ref(), &active_runs).await;
     let now = chrono::Utc::now();
 
     // `needs_operator` is sparse, so walk raw pages until we fill `limit`
@@ -11877,8 +11924,15 @@ pub async fn get_alerts_feed(
 
         for entry in &mut page {
             if let Some(summary) = summaries.get_mut(&entry.mission_id) {
-                let waiting = waiting_user_ids.contains(&entry.mission_id);
-                refresh_summary_for_waiting_user(summary, waiting, now);
+                let waiting = waiting_user_waits.contains_key(&entry.mission_id);
+                refresh_summary_for_waiting_user(
+                    summary,
+                    waiting,
+                    waiting_user_waits
+                        .get(&entry.mission_id)
+                        .and_then(|started| started.as_deref()),
+                    now,
+                );
                 entry.mission = Some(summary.clone());
             }
             let class = format!("mission_{}", entry.status);
@@ -11905,7 +11959,7 @@ pub async fn get_alerts_feed(
                         .mission
                         .as_ref()
                         .is_some_and(|summary| summary.needs_operator),
-                    waiting_user_ids.contains(&entry.mission_id),
+                    waiting_user_waits.contains_key(&entry.mission_id),
                 )
             });
         }
@@ -11915,7 +11969,17 @@ pub async fn get_alerts_feed(
         }
         before = next_cursor.clone();
     }
+    let truncated = entries.len() > limit;
+    let had_more_raw = next_cursor.is_some();
     entries.truncate(limit);
+    // After a filter walk, leftover matches sit on the truncated tail of
+    // this page. Point the cursor at the last *kept* event so Load older
+    // does not skip them (the raw-page cursor would).
+    if needs_operator_only && (truncated || (entries.len() == limit && had_more_raw)) {
+        if let Some(last) = entries.last() {
+            next_cursor = Some(last.timestamp.clone());
+        }
+    }
 
     Ok(Json(AlertsFeedResponse {
         alerts: entries,

@@ -985,8 +985,9 @@ fn paloma_alert_importance_for_mission(
     mission: &Mission,
     interest: TelegramMissionInterestLevel,
     waiting_for_user_tool: bool,
+    wait_started_at: Option<&str>,
 ) -> &'static str {
-    planner::alert_importance_for_mission(mission, interest, waiting_for_user_tool)
+    planner::alert_importance_for_mission(mission, interest, waiting_for_user_tool, wait_started_at)
 }
 
 fn paloma_alert_event_kind_at(
@@ -1344,18 +1345,25 @@ async fn plan_paloma_alert_for_mission(
         .await
         .unwrap_or_default();
     let alert_now = Utc::now();
-    let waiting_for_user_tool = ctx
+    let active_run = ctx
         .mission_store
         .get_active_mission_run(mission.id)
         .await
         .ok()
-        .flatten()
-        .is_some_and(|run| {
-            run.execution_state == crate::api::mission_store::MissionExecutionState::WaitingUser
-        });
+        .flatten();
+    let waiting_for_user_tool = active_run.as_ref().is_some_and(|run| {
+        run.execution_state == crate::api::mission_store::MissionExecutionState::WaitingUser
+    });
+    let wait_started_at = match active_run.as_ref() {
+        Some(run) => {
+            crate::api::control::user_wait_tool_started_at(ctx.mission_store.as_ref(), run).await
+        }
+        None => None,
+    };
     let needs_operator = crate::api::operator_attention::mission_needs_operator(
         &mission,
         waiting_for_user_tool,
+        wait_started_at.as_deref(),
         alert_now,
     );
     // Needs You is a qualified page. Ack, inspect, and in-grace
@@ -1374,7 +1382,13 @@ async fn plan_paloma_alert_for_mission(
     }) else {
         return;
     };
-    let policy_snapshot = paloma_policy_snapshot_json(&mission, interest, alert_now);
+    // Qualified live AskUserQuestion is a user page, not a long-running
+    // Active turn — skip the 30-minute gate and "is still running" copy.
+    let mut policy_mission = mission.clone();
+    if waiting_for_user_tool && needs_operator {
+        policy_mission.status = MissionStatus::AwaitingUser;
+    }
+    let policy_snapshot = paloma_policy_snapshot_json(&policy_mission, interest, alert_now);
     if interest == TelegramMissionInterestLevel::Muted {
         log_paloma_alert_decision(
             ctx,
@@ -1390,8 +1404,8 @@ async fn plan_paloma_alert_for_mission(
         .await;
         return;
     }
-    if paloma_mission_has_failure_only_preference(alert_preferences, mission.id)
-        && mission.status != MissionStatus::Failed
+    if paloma_mission_has_failure_only_preference(alert_preferences, policy_mission.id)
+        && policy_mission.status != MissionStatus::Failed
     {
         log_paloma_alert_decision(
             ctx,
@@ -1407,7 +1421,7 @@ async fn plan_paloma_alert_for_mission(
         .await;
         return;
     }
-    if !paloma_should_alert_mission_at(&mission, &events, interest, alert_now) {
+    if !paloma_should_alert_mission_at(&policy_mission, &events, interest, alert_now) {
         log_paloma_alert_decision(
             ctx,
             owner_id,
@@ -1416,7 +1430,10 @@ async fn plan_paloma_alert_for_mission(
             "create_alert",
             false,
             Some(paloma_alert_suppression_reason(
-                &mission, &events, interest, alert_now,
+                &policy_mission,
+                &events,
+                interest,
+                alert_now,
             )),
             policy_snapshot,
             None,
@@ -1449,7 +1466,7 @@ async fn plan_paloma_alert_for_mission(
         .await;
         return;
     }
-    let body = paloma_alert_body(&mission, &events);
+    let body = paloma_alert_body(&policy_mission, &events);
     log_paloma_alert_decision(
         ctx,
         owner_id,
@@ -1464,8 +1481,13 @@ async fn plan_paloma_alert_for_mission(
     .await;
     let now = now_string();
     let event_kind = paloma_alert_event_kind_at(&mission, base_kind, &events, alert_now);
-    let importance =
-        paloma_alert_importance_for_mission(&mission, interest, waiting_for_user_tool).to_string();
+    let importance = paloma_alert_importance_for_mission(
+        &mission,
+        interest,
+        waiting_for_user_tool,
+        wait_started_at.as_deref(),
+    )
+    .to_string();
     let _ = ctx
         .mission_store
         .create_telegram_alert_if_absent(TelegramAlert {
@@ -7624,14 +7646,14 @@ mod tests {
         owned.origin_session_id = Some("sess-1".into());
         owned.updated_at = (now - chrono::Duration::seconds(60)).to_rfc3339();
         assert!(
-            !mission_needs_operator(&owned, false, now),
+            !mission_needs_operator(&owned, false, None, now),
             "fresh controller-owned decision stays with the controller"
         );
 
         owned.updated_at =
             (now - chrono::Duration::seconds(CONTROLLER_TRIAGE_GRACE_SECS + 1)).to_rfc3339();
         assert!(
-            mission_needs_operator(&owned, false, now),
+            mission_needs_operator(&owned, false, None, now),
             "expired grace pages the human"
         );
 
@@ -7639,14 +7661,14 @@ mod tests {
         unowned.awaiting_kind = Some(AwaitingKind::Decision);
         unowned.origin_session_id = None;
         unowned.updated_at = (now - chrono::Duration::seconds(5)).to_rfc3339();
-        assert!(mission_needs_operator(&unowned, false, now));
+        assert!(mission_needs_operator(&unowned, false, None, now));
 
         let mut ack = test_mission("review me", MissionStatus::AwaitingUser);
         ack.awaiting_kind = Some(AwaitingKind::Ack);
         ack.origin_session_id = Some("sess-1".into());
         ack.updated_at =
             (now - chrono::Duration::seconds(CONTROLLER_TRIAGE_GRACE_SECS + 1)).to_rfc3339();
-        assert!(!mission_needs_operator(&ack, false, now));
+        assert!(!mission_needs_operator(&ack, false, None, now));
     }
 
     #[test]
@@ -7766,7 +7788,8 @@ mod tests {
             paloma_alert_importance_for_mission(
                 &mission,
                 TelegramMissionInterestLevel::Normal,
-                false
+                false,
+                None
             ),
             "normal"
         );
@@ -7774,7 +7797,8 @@ mod tests {
             paloma_alert_importance_for_mission(
                 &mission,
                 TelegramMissionInterestLevel::High,
-                false
+                false,
+                None
             ),
             "high"
         );
@@ -7782,7 +7806,12 @@ mod tests {
         let mut ack = test_mission("review me", MissionStatus::AwaitingUser);
         ack.awaiting_kind = Some(crate::api::mission_store::AwaitingKind::Ack);
         assert_eq!(
-            paloma_alert_importance_for_mission(&ack, TelegramMissionInterestLevel::Normal, false),
+            paloma_alert_importance_for_mission(
+                &ack,
+                TelegramMissionInterestLevel::Normal,
+                false,
+                None
+            ),
             "low"
         );
         let mut decision = test_mission("pick one", MissionStatus::AwaitingUser);
@@ -7791,7 +7820,8 @@ mod tests {
             paloma_alert_importance_for_mission(
                 &decision,
                 TelegramMissionInterestLevel::Normal,
-                false
+                false,
+                None
             ),
             "high"
         );
