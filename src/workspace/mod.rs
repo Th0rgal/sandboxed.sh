@@ -829,18 +829,30 @@ impl WorkspaceStore {
             return false; // Cannot delete default workspace
         }
 
-        let existed = {
+        let removed = {
             let mut guard = self.workspaces.write().await;
-            guard.remove(&id).is_some()
+            guard.remove(&id)
         };
 
-        if existed {
+        if let Some(workspace) = removed {
+            let registry = mission_workspace_roots_path(&workspace);
+            if registry.exists() {
+                if let Err(error) = std::fs::remove_file(&registry) {
+                    tracing::warn!(
+                        workspace = %id,
+                        path = %registry.display(),
+                        %error,
+                        "failed to remove mission-root registry after workspace delete"
+                    );
+                }
+            }
             if let Err(e) = self.save_to_disk().await {
                 tracing::error!("Failed to save workspaces to disk: {}", e);
             }
+            true
+        } else {
+            false
         }
-
-        existed
     }
 }
 
@@ -6116,6 +6128,20 @@ WORKING_DIR = "/workspaces/mission-old"
             serde_json::from_str(&contents).unwrap();
         assert!(parsed.is_empty());
         assert!(ensure_persisted_mission_root_is_available(&workspace, Uuid::new_v4()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_custom_workspace_removes_its_control_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::new(temp.path().to_path_buf()).await;
+        let mut workspace = Workspace::new_container("doomed".into(), temp.path().join("mount"));
+        std::fs::create_dir_all(&workspace.path).unwrap();
+        let id = store.add(workspace.clone()).await;
+        workspace = store.get(id).await.unwrap();
+        let registry = mission_workspace_roots_path(&workspace);
+        assert!(registry.exists());
+        assert!(store.delete(id).await);
+        assert!(!registry.exists());
     }
 
     #[test]
