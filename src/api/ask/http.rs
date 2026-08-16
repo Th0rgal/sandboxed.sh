@@ -512,7 +512,11 @@ mod tests {
         std::fs::create_dir_all(&registry_dir).unwrap();
         std::fs::write(
             registry_dir.join("mission-workspace-roots.json"),
-            serde_json::json!({ mission.to_string(): storage }).to_string(),
+            serde_json::json!({ mission.to_string(): {
+                "path": storage,
+                "filesystem_identity": crate::workspace::filesystem_identity(&storage).unwrap(),
+            }})
+            .to_string(),
         )
         .unwrap();
         std::fs::remove_dir(&storage).unwrap();

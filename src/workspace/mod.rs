@@ -5225,18 +5225,17 @@ WORKING_DIR = "/workspaces/mission-old"
         }
         assert_eq!(launches, 0, "no process may launch on an unverified root");
 
-        // Once the exact selected root is available again, normal preparation
-        // and execution may resume in that root, never in the workspace root.
+        // Recreating the mountpoint is *not* restoration of the selected
+        // filesystem: it has a different root inode and must remain blocked.
+        // A real remount retains the mounted filesystem's root identity; that
+        // normal restart path is covered by
+        // `persisted_mission_root_survives_restart_and_config_drift`.
         std::fs::create_dir(&storage).unwrap();
-        let dir = require_verified_mission_workspace(
+        assert!(require_verified_mission_workspace(
             prepare_mission_workspace_in(&workspace, &mcp, mission).await,
         )
-        .expect("restored persisted root should prepare normally");
-        launches += 1;
-        std::fs::write(dir.join("launch-sentinel"), "launched").unwrap();
-        assert_eq!(launches, 1);
-        assert!(dir.starts_with(&storage));
-        assert!(dir.join("launch-sentinel").exists());
+        .is_err());
+        assert_eq!(launches, 0);
         assert!(!mission_workspace_dir_for_root(temp.path(), mission)
             .join("launch-sentinel")
             .exists());
