@@ -212,21 +212,27 @@ pub(crate) fn entry_for_workspace(
 /// registered workspace, so the workspace that happens to scan first is not
 /// authoritative. Only entries whose workspace can actually resolve to `dir`
 /// are considered; unrelated short-id collisions remain isolated.
+fn physical_mission_directory(root: &std::path::Path, short: &str) -> std::path::PathBuf {
+    let candidate = workspace::workspaces_root_for(root).join(format!("mission-{short}"));
+    candidate.canonicalize().unwrap_or(candidate)
+}
+
 fn entry_for_directory<'a>(
     entries: &'a [MissionIndexEntry],
     short: &str,
     dir: &std::path::Path,
     workspace_roots: &std::collections::HashMap<uuid::Uuid, Vec<std::path::PathBuf>>,
 ) -> Option<&'a MissionIndexEntry> {
+    let physical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     entries
         .iter()
         .filter(|entry| {
             workspace_roots
                 .get(&entry.workspace_id)
                 .is_some_and(|roots| {
-                    roots.iter().any(|root| {
-                        workspace::workspaces_root_for(root).join(format!("mission-{short}")) == dir
-                    })
+                    roots
+                        .iter()
+                        .any(|root| physical_mission_directory(root, short) == physical_dir)
                 })
         })
         .max_by_key(|entry| {
@@ -242,14 +248,13 @@ fn workspace_ids_for_directory(
     dir: &std::path::Path,
     workspace_roots: &std::collections::HashMap<uuid::Uuid, Vec<std::path::PathBuf>>,
 ) -> Vec<uuid::Uuid> {
+    let physical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     workspace_roots
         .iter()
         .filter_map(|(id, roots)| {
             roots
                 .iter()
-                .any(|root| {
-                    workspace::workspaces_root_for(root).join(format!("mission-{short}")) == dir
-                })
+                .any(|root| physical_mission_directory(root, short) == physical_dir)
                 .then_some(*id)
         })
         .collect()
@@ -272,12 +277,15 @@ fn indexed_mission_directory_is_collectible(
 fn phase_one_index_allows_collection(
     index: &MissionIndex,
     mission_short: &str,
-    workspace_id: uuid::Uuid,
+    dir: &std::path::Path,
+    workspace_roots: &std::collections::HashMap<uuid::Uuid, Vec<std::path::PathBuf>>,
     cutoff: DateTime<Utc>,
 ) -> bool {
     index.complete
         && index.by_short.get(mission_short).is_some_and(|entries| {
-            indexed_mission_directory_is_collectible(entries, workspace_id, cutoff, true)
+            entry_for_directory(entries, mission_short, dir, workspace_roots).is_some_and(|entry| {
+                is_gc_eligible_status(&entry.status) && entry.updated_at < cutoff
+            })
         })
 }
 
@@ -726,6 +734,20 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
             }
         };
     let mission_index = build_mission_index(state).await;
+    let all_workspaces = state.workspaces.list().await;
+    let workspace_roots: std::collections::HashMap<_, _> = all_workspaces
+        .iter()
+        .map(|workspace| {
+            (
+                workspace.id,
+                workspace::mission_workspace_roots_for_workspace(workspace),
+            )
+        })
+        .collect();
+    let workspace_paths: std::collections::HashMap<_, _> = all_workspaces
+        .iter()
+        .map(|workspace| (workspace.id, workspace.path.clone()))
+        .collect();
     let sessions = state.control.all_sessions().await;
     for session in sessions {
         let store = session.mission_store.clone();
@@ -773,13 +795,35 @@ pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepRepor
                     continue;
                 }
                 let short = mission.id.simple().to_string()[..8].to_string();
-                if !phase_one_index_allows_collection(&mission_index, &short, workspace_id, cutoff)
-                {
+                if !phase_one_index_allows_collection(
+                    &mission_index,
+                    &short,
+                    &dir,
+                    &workspace_roots,
+                    cutoff,
+                ) {
                     tracing::debug!(
                         mission_id = %mission.id,
                         workspace_id = %workspace_id,
                         path = %dir.display(),
                         "mission GC: kept (short-id collision owner protected)",
+                    );
+                    continue;
+                }
+                if workspace_ids_for_directory(&short, &dir, &workspace_roots)
+                    .iter()
+                    .any(|workspace_id| {
+                        workspace_paths
+                            .get(workspace_id)
+                            .and_then(|path| crate::workspace_exec::machine_name_for_path(path))
+                            .is_some_and(|token| scope_protected.contains(&(token, short.clone())))
+                    })
+                {
+                    tracing::debug!(
+                        mission_id = %mission.id,
+                        workspace_id = %workspace_id,
+                        path = %dir.display(),
+                        "mission GC: kept (live exec scope from global directory owner)",
                     );
                     continue;
                 }
@@ -1155,10 +1199,12 @@ mod tests {
             by_short: std::collections::HashMap::new(),
             complete: false,
         };
+        let roots = std::collections::HashMap::new();
         assert!(!phase_one_index_allows_collection(
             &incomplete_empty,
             "deadbeef",
-            workspace_id,
+            std::path::Path::new("mission-deadbeef"),
+            &roots,
             now - chrono::Duration::days(7),
         ));
     }
@@ -1170,6 +1216,7 @@ mod tests {
         let custom_workspace = uuid::Uuid::new_v4();
         let short = "deadbeef";
         let dir = workspace::workspaces_root_for(root.path()).join(format!("mission-{short}"));
+        std::fs::create_dir_all(&dir).unwrap();
         let now = Utc::now();
         let entries = vec![
             // The default workspace has a terminal collision, but the custom
@@ -1195,6 +1242,20 @@ mod tests {
         assert_eq!(owner.workspace_id, custom_workspace);
         assert_eq!(owner.status, MissionStatus::Active);
         assert_eq!(workspace_ids_for_directory(short, &dir, &roots).len(), 2);
+        let index = MissionIndex {
+            by_short: std::collections::HashMap::from([(short.to_string(), entries.clone())]),
+            complete: true,
+        };
+        assert!(
+            !phase_one_index_allows_collection(
+                &index,
+                short,
+                &dir,
+                &roots,
+                now - chrono::Duration::days(7),
+            ),
+            "phase one must retain a path with an active owner in an overlapping root"
+        );
 
         let terminal_only = vec![MissionIndexEntry {
             status: MissionStatus::Completed,
