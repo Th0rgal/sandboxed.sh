@@ -82,7 +82,7 @@ fn resolve_base_work_dir(
     workspace: &crate::workspace::Workspace,
     nspawn_container: bool,
     mission_id: Uuid,
-) -> std::path::PathBuf {
+) -> Result<std::path::PathBuf, String> {
     let workspace_path = &workspace.path;
     if let Some(dir) = working_directory.map(std::path::PathBuf::from) {
         // Mission metadata records the path as the harness saw it. In an
@@ -93,18 +93,24 @@ fn resolve_base_work_dir(
         if nspawn_container && dir.is_absolute() && !dir.starts_with(workspace_path) {
             let host_dir = workspace_path.join(dir.strip_prefix("/").unwrap_or(&dir));
             if host_dir.exists() {
-                return host_dir;
+                return Ok(host_dir);
             }
         } else if dir.exists() {
-            return dir;
+            return Ok(dir);
         }
     }
+    // This has to use the same fail-closed persisted-placement check as
+    // mission preparation.  Ask is a sidecar, but running its shell in a
+    // newly selected workspace after a mounted persisted root disappears is
+    // still a write/read against the wrong mission tree.
+    crate::workspace::ensure_persisted_mission_root_is_available(workspace, mission_id)
+        .map_err(|error| format!("persisted mission workspace root is unavailable: {error}"))?;
     let per_mission_dir =
         crate::workspace::mission_workspace_dir_for_workspace(workspace, mission_id);
     if per_mission_dir.exists() {
-        per_mission_dir
+        Ok(per_mission_dir)
     } else {
-        workspace_path.to_path_buf()
+        Ok(workspace_path.to_path_buf())
     }
 }
 
@@ -179,7 +185,8 @@ pub async fn ask_send(
         &workspace,
         nspawn_container,
         mission_id,
-    );
+    )
+    .map_err(internal)?;
 
     // Optional sandbox-copy isolation: writes go to a throwaway worktree/copy.
     let setup_exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
@@ -307,7 +314,8 @@ pub async fn ask_send_stream(
         &workspace,
         nspawn_container,
         mission_id,
-    );
+    )
+    .map_err(internal)?;
 
     // Optional sandbox-copy isolation (same as the synchronous path): set up a
     // throwaway worktree, run the streamed turn in it, tear it down after.
@@ -469,7 +477,7 @@ mod tests {
             true,
             Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap(),
         );
-        assert_eq!(resolved, host);
+        assert_eq!(resolved.unwrap(), host);
     }
 
     #[test]
@@ -484,6 +492,27 @@ mod tests {
             false,
             Uuid::parse_str("abcd0000-0000-4000-8000-000000000000").unwrap(),
         );
-        assert_eq!(resolved, repo);
+        assert_eq!(resolved.unwrap(), repo);
+    }
+
+    #[test]
+    fn unavailable_persisted_root_rejects_ask_fallback() {
+        let root = tempdir().unwrap();
+        let storage = root.path().join("temporarily-unmounted-storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let workspace = crate::workspace::Workspace::default_host(root.path().to_path_buf());
+        let mission = Uuid::new_v4();
+        let registry_dir = workspace.path.join(".sandboxed-sh");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("mission-workspace-roots.json"),
+            serde_json::json!({ mission.to_string(): storage }).to_string(),
+        )
+        .unwrap();
+        std::fs::remove_dir(&storage).unwrap();
+
+        let error = resolve_base_work_dir(None, &workspace, false, mission).unwrap_err();
+        assert!(error.contains("persisted mission workspace root is unavailable"));
+        assert_ne!(error, workspace.path.display().to_string());
     }
 }

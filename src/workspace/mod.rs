@@ -915,7 +915,7 @@ fn persisted_mission_workspace_root(workspace: &Workspace, mission_id: Uuid) -> 
 /// Refuse to create a replacement directory when an existing mission's
 /// recorded root cannot be reached.  Falling back here would abandon its
 /// checkout during a transient unmount.
-fn ensure_persisted_mission_root_is_available(
+pub fn ensure_persisted_mission_root_is_available(
     workspace: &Workspace,
     mission_id: Uuid,
 ) -> std::io::Result<()> {
