@@ -69,6 +69,7 @@ async fn run_loop(state: Arc<AppState>) {
     interval.tick().await;
     loop {
         interval.tick().await;
+        sweep_disk_reservations(&state).await;
         run_configured_sweep(&state, "scheduled").await;
         // Container `/tmp` scratch shares this cadence but not this GC's
         // settings: it is disk hygiene for a path no mission record points at,
@@ -122,6 +123,16 @@ async fn run_configured_sweep(state: &Arc<AppState>, trigger: &'static str) {
         dry_run = params.dry_run,
         "mission workspace GC sweep finished",
     );
+}
+
+/// Drop scratch leases whose mission is not live. Runs even when workspace
+/// GC is dry-run/disabled — the reservation file is what blocks admission,
+/// not the mission directory.
+async fn sweep_disk_reservations(state: &Arc<AppState>) {
+    match crate::api::control::sweep_stale_disk_reservations(&state.control, &state.config).await {
+        Ok(()) => {}
+        Err(error) => tracing::warn!(%error, "disk reservation sweep failed"),
+    }
 }
 
 fn gc_execution_enabled() -> bool {

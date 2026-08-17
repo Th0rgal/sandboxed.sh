@@ -460,7 +460,8 @@ impl MissionStore for FileMissionStore {
             mission.awaiting_kind = None;
         }
         drop(missions);
-        self.persist().await
+        self.persist().await?;
+        Ok(())
     }
 
     async fn set_mission_first_viewed_at_if_unset(

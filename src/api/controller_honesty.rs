@@ -120,6 +120,84 @@ pub fn normalize_decision_question(question: &str) -> String {
         .join(" ")
 }
 
+/// A next-action that means "idle until a PR appears" rather than do the
+/// stored roadmap item. Controllers rephrase this every tick, which used
+/// to look like progress.
+pub fn is_watch_idle_next_action(next: Option<&str>) -> bool {
+    let Some(raw) = next.map(fold_headline) else {
+        return false;
+    };
+    if raw.is_empty() {
+        return false;
+    }
+    let watch = raw.contains("watch")
+        || raw.contains("surveill")
+        || raw.contains("monitor")
+        || raw.contains("veille");
+    let pr = raw.contains("pr") || raw.contains("pull request");
+    watch && pr
+}
+
+/// Track `desired_state` that still wants implementation (not merge/done).
+pub fn is_implement_ready_desired(desired: Option<&str>) -> bool {
+    let Some(raw) = desired.map(fold_headline) else {
+        return false;
+    };
+    raw == "implement"
+        || raw == "implementable"
+        || raw == "implement-ready"
+        || raw == "ready"
+        || raw.starts_with("implement")
+}
+
+fn track_is_open(status: Option<&str>) -> bool {
+    match status.map(fold_headline) {
+        None => true,
+        Some(s) if s.is_empty() => true,
+        Some(s) => !matches!(
+            s.as_str(),
+            "done" | "merged" | "closed" | "superseded" | "dropped"
+        ),
+    }
+}
+
+fn track_is_open_pr(track: &str, status: Option<&str>) -> bool {
+    let name = fold_headline(track);
+    track_is_open(status) && (name.starts_with("pr-") || name.starts_with("pr "))
+}
+
+/// When the drain is empty and a stored track is still implementable, that
+/// item wins over a "watch for a new PR" idle line.
+pub fn honest_next_action(
+    reported: Option<&str>,
+    tracks: &[(String, Option<String>, Option<String>)],
+) -> Option<String> {
+    let implement = tracks.iter().find_map(|(track, desired, status)| {
+        if !track_is_open(status.as_deref()) {
+            return None;
+        }
+        if is_implement_ready_desired(desired.as_deref()) {
+            return Some(format!("implement {track}"));
+        }
+        None
+    });
+    let has_open_pr = tracks
+        .iter()
+        .any(|(track, _, status)| track_is_open_pr(track, status.as_deref()));
+    if let Some(item) = implement {
+        if !has_open_pr && is_watch_idle_next_action(reported) {
+            return Some(item);
+        }
+        if reported.is_none() || reported.is_some_and(|s| s.trim().is_empty()) {
+            return Some(item);
+        }
+    }
+    reported
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn fold_headline(headline: &str) -> String {
     headline
         .chars()
@@ -216,5 +294,53 @@ mod tests {
             normalize_decision_question("Relancer  coldcard_skip depuis le checkpoint ?"),
             normalize_decision_question("relancer coldcard_skip depuis le checkpoint ?")
         );
+    }
+
+    #[test]
+    fn watch_idle_does_not_win_over_implement_ready_track() {
+        let tracks = vec![(
+            "p-reserve-relational".to_string(),
+            Some("implement".to_string()),
+            Some("open".to_string()),
+        )];
+        assert_eq!(
+            honest_next_action(
+                Some("watch for a new Lido PR or exact-head finding"),
+                &tracks
+            )
+            .as_deref(),
+            Some("implement p-reserve-relational")
+        );
+        assert_eq!(
+            honest_next_action(Some("surveiller toute nouvelle PR Lido vers main"), &tracks)
+                .as_deref(),
+            Some("implement p-reserve-relational")
+        );
+        // An open PR drain still reports the controller's line.
+        let with_pr = vec![
+            tracks[0].clone(),
+            (
+                "pr-84".to_string(),
+                Some("mergeable".to_string()),
+                Some("open".to_string()),
+            ),
+        ];
+        assert_eq!(
+            honest_next_action(Some("watch for a new Lido PR"), &with_pr).as_deref(),
+            Some("watch for a new Lido PR")
+        );
+    }
+
+    #[test]
+    fn watch_phrasing_is_detected() {
+        assert!(is_watch_idle_next_action(Some(
+            "watch for a new Lido PR or exact-head finding"
+        )));
+        assert!(is_watch_idle_next_action(Some(
+            "monitor-open-prs then merge"
+        )));
+        assert!(!is_watch_idle_next_action(Some(
+            "implement p-reserve-relational"
+        )));
     }
 }
