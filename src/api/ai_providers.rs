@@ -7959,6 +7959,107 @@ async fn get_provider_usage(
             }
             info
         }
+        ProviderType::Kimi => {
+            let mut token = oauth
+                .as_ref()
+                .map(|o| o.access_token.clone())
+                .or_else(|| api_key_opt.clone());
+            if token.is_none() {
+                return Ok(Json(serde_json::json!({
+                    "provider_type": "kimi",
+                    "provider_name": provider_name,
+                    "account_email": account_email,
+                    "error": "No credentials configured"
+                })));
+            }
+            if let (Some(o), Some(uuid)) = (oauth.as_ref(), provider_uuid) {
+                if oauth_token_expired(o.expires_at) && !o.refresh_token.trim().is_empty() {
+                    match refresh_oauth_token_internal(&ProviderType::Kimi, &o.refresh_token).await
+                    {
+                        Ok((access, refresh, expires_at)) => {
+                            let creds = crate::ai_providers::OAuthCredentials {
+                                access_token: access.clone(),
+                                refresh_token: refresh,
+                                expires_at,
+                            };
+                            let _ = state.ai_providers.set_oauth_credentials(uuid, creds).await;
+                            token = Some(access);
+                        }
+                        Err(e) => {
+                            tracing::debug!("Kimi usage token refresh failed: {e}");
+                        }
+                    }
+                }
+            }
+            let token = token.expect("checked above");
+            let mut info = serde_json::json!({
+                "provider_type": "kimi",
+                "provider_name": provider_name,
+                "account_email": account_email,
+            });
+
+            let usages = client
+                .get(crate::api::kimi_usage::CODING_USAGES_URL)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("User-Agent", crate::api::kimi_usage::KIMI_USAGE_USER_AGENT)
+                .header("Accept", "application/json")
+                .send()
+                .await;
+            let mut coding = crate::api::kimi_usage::KimiUsageSnapshot::default();
+            match usages {
+                Ok(r) if r.status().is_success() => {
+                    if let Ok(payload) = r.json::<serde_json::Value>().await {
+                        coding = crate::api::kimi_usage::parse_coding_usages(&payload);
+                    }
+                    info["status"] = serde_json::json!("connected");
+                }
+                Ok(r) => {
+                    let status = r.status().as_u16();
+                    if status == 401 || status == 403 {
+                        info["status"] = serde_json::json!("needs_reauth");
+                        info["error"] = serde_json::json!(format!(
+                            "Kimi Code usage endpoint returned HTTP {status}"
+                        ));
+                    } else {
+                        info["status"] = serde_json::json!("connected");
+                    }
+                }
+                Err(e) => {
+                    info["error"] =
+                        serde_json::json!(format!("Failed to reach Kimi usage API: {e}"));
+                }
+            }
+
+            let mut balance = crate::api::kimi_usage::KimiUsageSnapshot::default();
+            if let Some(key) = api_key_opt.as_ref() {
+                if let Ok(r) = client
+                    .get(crate::api::kimi_usage::OPEN_PLATFORM_BALANCE_URL)
+                    .header("Authorization", format!("Bearer {key}"))
+                    .header("Accept", "application/json")
+                    .send()
+                    .await
+                {
+                    if r.status().is_success() {
+                        if let Ok(payload) = r.json::<serde_json::Value>().await {
+                            balance = crate::api::kimi_usage::parse_open_platform_balance(&payload);
+                        }
+                    }
+                }
+            }
+
+            let snap = crate::api::kimi_usage::merge_snapshots(coding, balance);
+            if snap.has_displayable_quota() {
+                info["status"] = serde_json::json!("connected");
+                if let Some(obj) = info.as_object_mut() {
+                    if let serde_json::Value::Object(fields) = snap.to_provider_fields() {
+                        obj.extend(fields);
+                    }
+                }
+            } else if info.get("error").is_none() {
+                info["status"] = serde_json::json!("connected");
+            }
+            info
+        }
         ProviderType::Xai => {
             let mut info = serde_json::json!({
                 "provider_type": "xai",

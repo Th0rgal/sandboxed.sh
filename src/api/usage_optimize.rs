@@ -431,6 +431,33 @@ fn collect_windows(v: &Value) -> Vec<Window> {
         }
     }
 
+    // ── Kimi Code subscription (5-hour + weekly) — used-percent windows ──
+    // `GET /coding/v1/usages` reports used/limit (or remaining). The handler
+    // normalizes those to used-percent + epoch reset before we get here.
+    for (pct_key, reset_key, key, label, window_seconds) in [
+        (
+            "kimi_5h_used_percent",
+            "kimi_5h_reset",
+            "kimi_5h",
+            "5-hour",
+            FIVE_HOURS_SECONDS,
+        ),
+        (
+            "kimi_weekly_used_percent",
+            "kimi_weekly_reset",
+            "kimi_weekly",
+            "weekly",
+            WEEKLY_SECONDS,
+        ),
+    ] {
+        if let Some(used_pct) = get_f64(v, pct_key) {
+            let mut w = Window::new(key, label, "tokens", "kimi").with_used_percent(used_pct);
+            w.window_seconds = Some(window_seconds);
+            w.reset_at = get_epoch_secs(v, reset_key);
+            out.push(w);
+        }
+    }
+
     out
 }
 
@@ -752,6 +779,24 @@ mod tests {
         assert_eq!(ww["window_seconds"], json!(604800));
         // 5h is least-remaining is 100, weekly is 88 → weekly binds.
         assert_eq!(opt["primary_window"], json!("zai_weekly"));
+    }
+
+    #[test]
+    fn kimi_used_percent_windows() {
+        let weekly_reset = (now() + chrono::Duration::days(3)).timestamp();
+        let v = json!({
+            "kimi_5h_used_percent": 12.0,
+            "kimi_weekly_used_percent": 40.0,
+            "kimi_weekly_reset": weekly_reset,
+        });
+        let opt = build_optimize_block_at(&v, None, now());
+        let w5 = window(&opt, "kimi_5h");
+        assert_eq!(w5["pct_remaining"], json!(88.0));
+        assert_eq!(w5["source"], json!("kimi"));
+        let ww = window(&opt, "kimi_weekly");
+        assert_eq!(ww["pct_used"], json!(40.0));
+        assert_eq!(ww["window_seconds"], json!(604800));
+        assert_eq!(opt["primary_window"], json!("kimi_weekly"));
     }
 
     #[test]
