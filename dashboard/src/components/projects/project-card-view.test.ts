@@ -224,6 +224,45 @@ describe("cardSummary", () => {
     expect(summary.controllerBehind).toBe(false);
   });
 
+  test("a fresh controller heartbeat is a signal, not only the last LLM chapter", () => {
+    const summary = cardSummary(
+      row({
+        pending_decisions: 0,
+        controller_heartbeat_at: "2026-08-17T08:22:00Z",
+        latest_update: {
+          headline: "blocked on disk",
+          body: null,
+          session_id: "s",
+          at: "2026-08-17T07:54:00Z",
+          signature: "verity",
+          mode: "active",
+          blocker: null,
+        },
+        missions: [
+          {
+            id: "26da210b",
+            status: "active",
+            title: "Goal: close Verity C5 storage coherence #2330",
+            updated_at: "2026-08-17T08:24:00Z",
+            last_status_change_at: "2026-08-17T08:20:00Z",
+            github_pr: null,
+          },
+        ],
+        health: {
+          missions: 1,
+          active: 1,
+          failed: 0,
+          overdue: 0,
+          tracks_needing_attention: 0,
+          tracks: [],
+        },
+      }),
+    );
+    expect(summary.lastSignalAt).toBe("2026-08-17T08:22:00Z");
+    expect(summary.lastWorkAt).toBe("2026-08-17T08:20:00Z");
+    expect(summary.controllerBehind).toBe(false);
+  });
+
   test("flags next_action with zero live attempts when the owner is not asked", () => {
     const summary = cardSummary(
       row({

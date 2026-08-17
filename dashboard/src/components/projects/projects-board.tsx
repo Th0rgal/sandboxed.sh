@@ -48,6 +48,7 @@ import {
 import {
   cardSummary,
   viewControllerSignal,
+  viewLiveMissions,
   viewMovingItems,
   viewOpenItems,
   viewPendingDecisions,
@@ -55,6 +56,7 @@ import {
   type ViewDecision,
   type ViewItem,
 } from "./project-card-view";
+import { pollingFetchConfig } from "@/lib/swr-config";
 import {
   listHermesSessions,
   type HermesSession,
@@ -207,7 +209,13 @@ export default function ProjectsBoard() {
   const { data, error, isLoading } = useSWR(
     "projects-overview",
     getProjectsOverview,
-    { refreshInterval: 30000, revalidateOnFocus: false },
+    {
+      ...pollingFetchConfig,
+      refreshInterval: (overview) =>
+        (overview?.projects ?? []).some((project) => liveMissionCount(project) > 0)
+          ? 5000
+          : 15000,
+    },
   );
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
@@ -1021,16 +1029,17 @@ function ProjectDetail({
   const { data, error, isLoading } = useSWR(
     ["project-updates", project.slug],
     () => getProjectUpdates(project.slug, 50),
-    { revalidateOnFocus: false },
+    pollingFetchConfig,
   );
   const { data: detail } = useSWR(
     ["project-detail", project.slug],
     () => getProject(project.slug),
-    { revalidateOnFocus: false },
+    pollingFetchConfig,
   );
   const updates = data?.updates ?? [];
   const section = SECTIONS.find((s) => s.bucket === project.bucket);
   const summary = cardSummary(project);
+  const liveMissions = viewLiveMissions(project);
   const signal = detail ? viewControllerSignal(detail) : null;
   const items = detail ? viewOpenItems(detail) : [];
   const decisions = detail ? viewPendingDecisions(detail) : [];
@@ -1099,6 +1108,7 @@ function ProjectDetail({
             ))}
           </div>
         )}
+        {liveMissions.length > 0 && <LiveProcessList missions={liveMissions} />}
         {moving.length > 0 && <ItemList items={moving} heading="Moving" />}
         {stalled.length > 0 && (
           <ItemList items={stalled} heading="Stalled items" defaultExpanded={moving.length === 0} />
@@ -1111,7 +1121,12 @@ function ProjectDetail({
             <TrackHealthList health={project.health} />
           </div>
         ) : null}
-        {project.missions.length > 0 && <MissionList missions={project.missions} />}
+        {project.missions.length > 0 && (
+          <MissionList
+            missions={project.missions}
+            defaultExpanded={liveMissions.length === 0}
+          />
+        )}
       </div>
 
       <div className="flex-1 px-4 py-3 sm:px-5">
@@ -1139,7 +1154,7 @@ function ProjectDetail({
             <UpdateEntry
               key={`${update.session_id}-${update.at}-${index}`}
               update={update}
-              defaultExpanded={index === 0}
+              defaultExpanded={index === 0 && liveMissions.length === 0}
               replyToSessionId={
                 project.conversation?.source === "binding"
                   ? project.conversation.session_id
@@ -1317,9 +1332,32 @@ function ItemList({
   );
 }
 
+/** Live writers / subagents / processes — the operator-facing inventory. */
+function LiveProcessList({ missions }: { missions: ProjectMissionChip[] }) {
+  return (
+    <div className="mt-2.5">
+      <p className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-white/35">
+        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[rgb(var(--text)/0.65)]" />
+        Live ({missions.length})
+      </p>
+      <div className="max-h-56 overflow-y-auto divide-y divide-white/[0.04] rounded-lg border border-white/[0.06] bg-white/[0.02]">
+        {missions.map((mission) => (
+          <MissionRow key={mission.id} mission={mission} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /** Collapsible attempt list — lineage, not the work inventory. */
-function MissionList({ missions }: { missions: ProjectMissionChip[] }) {
-  const [expanded, setExpanded] = useState(false);
+function MissionList({
+  missions,
+  defaultExpanded = false,
+}: {
+  missions: ProjectMissionChip[];
+  defaultExpanded?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const live = missions.filter((m) => LIVE_STATUSES.has(m.status)).length;
   const problems = missions.filter((m) => PROBLEM_STATUSES.has(m.status)).length;
   return (
