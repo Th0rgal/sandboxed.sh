@@ -373,6 +373,112 @@ fn grok_auth_paths() -> Vec<PathBuf> {
     paths
 }
 
+/// Newest host `~/.grok/auth.json` that the Grok CLI will actually accept.
+///
+/// Skips the legacy `auth_mode: "oauth"` shape older Sandboxed.sh releases
+/// wrote — Grok CLI 0.2.93 rejects it.
+fn newest_usable_grok_auth_file(candidates: &[PathBuf]) -> Option<(PathBuf, Vec<u8>)> {
+    let mut best: Option<(std::time::SystemTime, PathBuf, Vec<u8>)> = None;
+    for path in candidates {
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let Ok(auth) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let Some(entry) = auth.get(GROK_OAUTH_CLIENT_KEY) else {
+            continue;
+        };
+        if entry.get("auth_mode").and_then(|value| value.as_str()) == Some("oauth") {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        let replace = best
+            .as_ref()
+            .map(|(prev, _, _)| mtime > *prev)
+            .unwrap_or(true);
+        if replace {
+            best = Some((mtime, path.clone(), bytes));
+        }
+    }
+    best.map(|(_, path, bytes)| (path, bytes))
+}
+
+fn workspace_grok_auth_path(workspace: &crate::workspace::Workspace) -> PathBuf {
+    crate::workspace::resolve_workspace_home_root(
+        &workspace.path,
+        workspace.workspace_type,
+        &workspace.env_vars,
+    )
+    .join(".grok")
+    .join("auth.json")
+}
+
+/// Copy `bytes` onto `dest` atomically (mode 0600).
+fn install_grok_auth_bytes(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    let tmp = dest.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, dest)
+        .map_err(|e| format!("Failed to install {}: {e}", dest.display()))?;
+    Ok(())
+}
+
+pub(crate) fn sync_grok_auth_files(
+    sources: &[PathBuf],
+    dest: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let Some((source, bytes)) = newest_usable_grok_auth_file(sources) else {
+        if dest.exists() {
+            std::fs::remove_file(dest)
+                .map_err(|e| format!("Failed to remove stale Grok auth {}: {e}", dest.display()))?;
+        }
+        return Ok(None);
+    };
+
+    if source == dest {
+        return Ok(Some(dest.to_path_buf()));
+    }
+
+    install_grok_auth_bytes(dest, &bytes)?;
+    Ok(Some(dest.to_path_buf()))
+}
+
+/// Sync the host Grok CLI auth file into a workspace HOME.
+///
+/// Container missions read `/root/.grok/auth.json` inside nspawn. Reconnecting
+/// Grok in Hermes / Settings updates the host file (`/var/lib/opencode/.grok`
+/// or `$HOME/.grok`) but leaves a stale guest copy (the 2026-05-16 401). Copy
+/// the newest host file on every turn. If the host has no usable file, delete
+/// the guest copy so `XAI_API_KEY` can win.
+pub fn sync_host_grok_auth_into_workspace(
+    workspace: &crate::workspace::Workspace,
+) -> Result<Option<PathBuf>, String> {
+    let dest = workspace_grok_auth_path(workspace);
+    let installed = sync_grok_auth_files(&grok_auth_paths(), &dest)?;
+    if installed.is_some() {
+        tracing::info!(
+            workspace_id = %workspace.id,
+            dest = %dest.display(),
+            "Synced host Grok auth.json into workspace HOME"
+        );
+    }
+    Ok(installed)
+}
+
 fn read_grok_auth_entry() -> Option<serde_json::Value> {
     // Try every candidate path (home-based AND the service path
     // `/var/lib/opencode/.grok/auth.json`) — `home_dir()` for the service
@@ -580,8 +686,8 @@ mod grok_oauth_tests {
         build_response_from_store, get_xai_api_key_for_grok, grok_auth_expires_at_millis,
         grok_cli_reconcile_due, has_refreshable_cli_proxy_account_in_dirs,
         oauth_refresh_clear_dead, oauth_refresh_mark_token_dead, oauth_refresh_token_fingerprint,
-        parse_grok_device_auth_line, remove_legacy_grok_oauth_entry, ProviderStatusResponse,
-        GROK_CLI_RECONCILE_INTERVAL, GROK_OAUTH_CLIENT_KEY,
+        parse_grok_device_auth_line, remove_legacy_grok_oauth_entry, sync_grok_auth_files,
+        ProviderStatusResponse, GROK_CLI_RECONCILE_INTERVAL, GROK_OAUTH_CLIENT_KEY,
     };
     use crate::ai_providers::{AIProvider, OAuthCredentials, ProviderType};
     use std::time::{Duration as StdDuration, Instant};
@@ -667,6 +773,56 @@ mod grok_oauth_tests {
                 .and_then(|value| value.as_str()),
             Some("native-token")
         );
+    }
+
+    #[test]
+    fn syncs_newer_host_grok_auth_over_stale_workspace_copy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let host = temp.path().join("host-auth.json");
+        let dest = temp.path().join("guest").join(".grok").join("auth.json");
+        std::fs::create_dir_all(dest.parent().unwrap()).expect("guest dir");
+        std::fs::write(
+            &dest,
+            serde_json::json!({
+                GROK_OAUTH_CLIENT_KEY: {
+                    "auth_mode": "oidc",
+                    "key": "stale-may"
+                }
+            })
+            .to_string(),
+        )
+        .expect("stale dest");
+        std::fs::write(
+            &host,
+            serde_json::json!({
+                GROK_OAUTH_CLIENT_KEY: {
+                    "auth_mode": "oidc",
+                    "key": "fresh-host"
+                }
+            })
+            .to_string(),
+        )
+        .expect("host auth");
+        let installed = sync_grok_auth_files(&[host], &dest).expect("sync");
+        assert_eq!(installed.as_deref(), Some(dest.as_path()));
+        let copied: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dest).expect("read dest"))
+                .expect("json");
+        assert_eq!(
+            copied[GROK_OAUTH_CLIENT_KEY]["key"].as_str(),
+            Some("fresh-host")
+        );
+    }
+
+    #[test]
+    fn removes_stale_workspace_grok_auth_when_host_has_none() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dest = temp.path().join("guest-auth.json");
+        std::fs::write(&dest, "{}").expect("stale dest");
+        let missing = temp.path().join("no-such-host-auth.json");
+        let installed = sync_grok_auth_files(&[missing], &dest).expect("sync");
+        assert!(installed.is_none());
+        assert!(!dest.exists());
     }
 
     #[test]

@@ -464,6 +464,7 @@ pub(crate) fn grok_stdout_line_requests_interactive_login(line: &str) -> bool {
 /// `XAI_API_KEY` (key > OAuth access token > ambient env). Shared by the
 /// streaming-json and ACP turn paths.
 async fn prepare_grok_auth_env(
+    workspace: &Workspace,
     app_working_dir: &std::path::Path,
     mission_id: Uuid,
 ) -> Result<HashMap<String, String>, AgentResult> {
@@ -513,14 +514,22 @@ async fn prepare_grok_auth_env(
     }
 
     // Grok CLI 0.2.93 rejects the legacy `auth_mode: "oauth"` shape older
-    // Sandboxed versions generated. The runner authenticates with an explicit
-    // environment key below, so never copy or overwrite the CLI's native auth
-    // file; just remove our obsolete entry when present.
+    // Sandboxed versions generated. Remove that shape on the host, then copy
+    // the newest host `~/.grok/auth.json` into the workspace HOME. Container
+    // missions otherwise keep a months-old `/root/.grok/auth.json` and 401
+    // even after Settings reconnects the host.
     if let Err(err) = crate::api::ai_providers::remove_legacy_grok_oauth_auth_entries() {
         tracing::warn!(
             mission_id = %mission_id,
             error = %err,
             "Failed to remove obsolete Grok OAuth auth entry"
+        );
+    }
+    if let Err(err) = crate::api::ai_providers::sync_host_grok_auth_into_workspace(workspace) {
+        tracing::warn!(
+            mission_id = %mission_id,
+            error = %err,
+            "Failed to sync host Grok auth.json into workspace"
         );
     }
 
@@ -741,7 +750,7 @@ async fn run_grok_streaming_json_turn(
     // capture the freshest one here and inject it below. Without it the CLI
     // falls back to an interactive browser sign-in that never completes in a
     // headless mission — the run then hangs forever ("Agent is working").
-    let env = match prepare_grok_auth_env(app_working_dir, mission_id).await {
+    let env = match prepare_grok_auth_env(workspace, app_working_dir, mission_id).await {
         Ok(env) => env,
         Err(result) => return result,
     };
@@ -1157,7 +1166,7 @@ async fn run_grok_acp_turn(
         .await
         .map_err(|e| format!("grok CLI unavailable: {e}"))?;
 
-    let env = match prepare_grok_auth_env(app_working_dir, mission_id).await {
+    let env = match prepare_grok_auth_env(workspace, app_working_dir, mission_id).await {
         Ok(env) => env,
         // Auth failures are terminal for BOTH paths — surface them directly
         // instead of falling back into the same failure.

@@ -571,6 +571,22 @@ pub async fn get_project(
     ) {
         project.next_action = Some(derived);
     }
+    let has_live = missions
+        .iter()
+        .any(|mission| super::controller_honesty::is_live_writer_status(mission.status));
+    let needs_operator = missions.iter().any(|mission| {
+        mission.awaiting_kind.is_some()
+            && matches!(
+                mission.status,
+                crate::api::control::events::MissionStatus::AwaitingUser
+            )
+    });
+    project.mode = honest_controller_mode(
+        project.mode.as_deref(),
+        has_live,
+        needs_operator,
+        decisions.len() as u32,
+    );
     Ok(Json(serde_json::json!({
         "project": project,
         "grant": grant,
@@ -762,6 +778,54 @@ pub async fn set_project_status(
         ));
     }
     let mut blocker = req.blocker.clone();
+    let mut next_action = req.next_action.clone();
+    if mode == "blocked"
+        && super::controller_honesty::is_inspect_next_action(next_action.as_deref())
+    {
+        // "inspect <dead writer>" is harness recovery, not a no-lane. Persist
+        // active so the rail/board cannot stay red after a Codex transport
+        // death. Clear the inspect next_action so it cannot be re-displayed.
+        let inspect_id =
+            super::controller_honesty::parse_inspect_mission_id(next_action.as_deref());
+        let inspect_is_dead = match inspect_id {
+            Some(id) => {
+                let store = state.control.get_mission_store().await;
+                match store.get_mission(id).await {
+                    Ok(Some(mission)) => {
+                        matches!(
+                            mission.status,
+                            crate::api::control::events::MissionStatus::Failed
+                                | crate::api::control::events::MissionStatus::Interrupted
+                        ) && super::controller_honesty::is_harness_terminal_reason(
+                            mission.terminal_reason.as_deref(),
+                            mission.terminal_evidence.as_deref(),
+                        )
+                    }
+                    _ => true,
+                }
+            }
+            None => true,
+        };
+        if inspect_is_dead {
+            let has_live = state
+                .control
+                .collect_attention_missions_for_project(&slug)
+                .await
+                .ok()
+                .is_some_and(|missions| {
+                    missions.iter().any(|mission| {
+                        super::controller_honesty::is_live_writer_status(mission.status)
+                    })
+                });
+            mode = "active".to_string();
+            next_action = None;
+            blocker = if has_live {
+                None
+            } else {
+                Some("harness".to_string())
+            };
+        }
+    }
     if mode == "blocked" && super::controller_honesty::is_lease_blocker(blocker.as_deref()) {
         let has_live = state
             .control
@@ -780,7 +844,7 @@ pub async fn set_project_status(
     }
     state
         .projects
-        .set_mode(&slug, &mode, req.next_action.as_deref(), blocker.as_deref())
+        .set_mode(&slug, &mode, next_action.as_deref(), blocker.as_deref())
         .map_err(|error| (StatusCode::NOT_FOUND, error))?;
     let project = state.projects.get_project(&slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({ "project": project })))

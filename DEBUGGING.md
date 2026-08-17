@@ -352,6 +352,10 @@ mission that intends to test dev from accidentally deploying prod.
 
 Safety rails:
 
+- **Live writers** — refuses by default if any mission is mid-turn (`active` /
+  `pending` / `waiting_background`). Restarting SIGTERMs in-flight Codex/Grok
+  bash and produces `pending tool not replayed`. Override with `force=true`
+  only if you accept killing those turns.
 - **Self-protection** — refuses by default if the calling mission lives on
   the service being restarted. Override with `force=true` only if you
   accept that your own turn will be SIGTERM'd.
