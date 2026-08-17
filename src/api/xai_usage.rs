@@ -182,23 +182,23 @@ pub fn parse_cli_settings(payload: &Value) -> Option<String> {
 }
 
 pub fn parse_api_key_info(payload: &Value) -> XaiUsageSnapshot {
-    let mut snap = XaiUsageSnapshot::default();
-    snap.key_name = string_field(payload.get("name").or_else(|| payload.get("apiKeyName")));
-    snap.team_id = string_field(
-        payload
-            .get("teamId")
-            .or_else(|| payload.get("team_id"))
-            .or_else(|| payload.get("teamID")),
-    );
-    if let Some(cents) = number(
-        payload
-            .get("remainingCredits")
-            .or_else(|| payload.get("remaining_credits"))
-            .or_else(|| payload.get("credits")),
-    ) {
-        snap.prepaid_usd = Some(cents_to_usd(cents));
+    XaiUsageSnapshot {
+        key_name: string_field(payload.get("name").or_else(|| payload.get("apiKeyName"))),
+        team_id: string_field(
+            payload
+                .get("teamId")
+                .or_else(|| payload.get("team_id"))
+                .or_else(|| payload.get("teamID")),
+        ),
+        prepaid_usd: number(
+            payload
+                .get("remainingCredits")
+                .or_else(|| payload.get("remaining_credits"))
+                .or_else(|| payload.get("credits")),
+        )
+        .map(cents_to_usd),
+        ..Default::default()
     }
-    snap
 }
 
 /// Management prepaid ledger is inverted USD cents: a $10 top-up is `"-1000"`.
@@ -296,9 +296,9 @@ fn credit_label(window_seconds: Option<i64>, reset_at: Option<i64>, now: i64) ->
 }
 
 fn label_for_seconds(secs: i64) -> &'static str {
-    if secs >= 20 * 24 * 3600 && secs <= 40 * 24 * 3600 {
+    if (20 * 24 * 3600..=40 * 24 * 3600).contains(&secs) {
         "Monthly"
-    } else if secs >= 5 * 24 * 3600 && secs <= 10 * 24 * 3600 {
+    } else if (5 * 24 * 3600..=10 * 24 * 3600).contains(&secs) {
         "Weekly"
     } else {
         "Credits"

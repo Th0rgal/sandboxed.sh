@@ -113,7 +113,7 @@ fn child_is_livable(
     }
     if let (Some(start), Some(end)) = (started_at, ended_at) {
         let lifetime = end - start;
-        if lifetime >= 0.0 && lifetime <= 5.0 && message_count.unwrap_or(0) == 0 {
+        if (0.0..=5.0).contains(&lifetime) && message_count.unwrap_or(0) == 0 {
             return false;
         }
     }

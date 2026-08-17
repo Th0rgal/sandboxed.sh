@@ -1011,11 +1011,11 @@ fn stamp_custom_workspace_control_registry(workspace: &mut Workspace, working_di
     if workspace.id == DEFAULT_WORKSPACE_ID {
         return;
     }
-    if !workspace
+    if workspace
         .config
         .get(CONTROL_REGISTRY_CONFIG_KEY)
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|root| !root.is_empty())
+        .is_none_or(|root| root.is_empty())
     {
         if !workspace.config.is_object() {
             workspace.config = serde_json::json!({});
