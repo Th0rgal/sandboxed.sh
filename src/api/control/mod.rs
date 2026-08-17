@@ -7740,19 +7740,30 @@ fn mission_holds_disk_reservation(status: MissionStatus) -> bool {
     )
 }
 
+/// Hard admission budget: emergency floor + this candidate. Paper leases are
+/// not part of the hard gate — the 2026-08-17 ledger still charged ~5–18 TiB
+/// of `failed` / parked rows after deploy, so every create died while 2 TiB
+/// was actually free.
+fn disk_admission_hard_required_bytes(emergency: u64, candidate: u64) -> u64 {
+    emergency.saturating_add(candidate)
+}
+
 fn disk_admission_required_bytes(emergency: u64, reserved: u64, candidate: u64) -> u64 {
-    emergency.saturating_add(reserved).saturating_add(candidate)
+    disk_admission_hard_required_bytes(emergency, candidate).saturating_add(reserved)
 }
 
 async fn reserved_disk_bytes_for_filesystem(
     config: &Config,
     filesystem: &str,
+    live_ids: &HashSet<Uuid>,
 ) -> Result<u64, String> {
     let ledger = read_disk_reservation_ledger(config)?;
     Ok(ledger
         .reservations
         .values()
-        .filter(|reservation| reservation.filesystem == filesystem)
+        .filter(|reservation| {
+            reservation.filesystem == filesystem && live_ids.contains(&reservation.mission_id)
+        })
         .map(disk_reservation_outstanding_bytes)
         .fold(0u64, |sum, bytes| sum.saturating_add(bytes)))
 }
@@ -7817,7 +7828,7 @@ fn nonterminal_missions_in_sqlite(
         let (id, status, workspace_id, requires_local_disk) =
             row.map_err(|error| error.to_string())?;
         let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
-            .unwrap_or(MissionStatus::Active);
+            .unwrap_or(MissionStatus::Failed);
         if mission_holds_disk_reservation(status) {
             let id = Uuid::parse_str(&id)
                 .map_err(|error| format!("parse mission id {id} in {}: {error}", path.display()))?;
@@ -7889,7 +7900,7 @@ fn migrate_legacy_ledger_placement_in_sqlite(
 async fn reconcile_disk_reservation_ledger_under_lock(
     control_hub: &ControlHub,
     config: &Config,
-) -> Result<(), String> {
+) -> Result<HashSet<Uuid>, String> {
     let inventory = control_hub.mission_store_inventory().await?;
     let mut ledger = read_disk_reservation_ledger(config)?;
     let legacy_placement = std::mem::take(&mut ledger.legacy_requires_local_disk);
@@ -8013,7 +8024,7 @@ async fn reconcile_disk_reservation_ledger_under_lock(
     if changed {
         write_disk_reservation_ledger(config, &ledger)?;
     }
-    Ok(())
+    Ok(live_missions.keys().copied().collect())
 }
 
 /// Periodic / on-demand purge of dead leases. The workspace GC loop calls
@@ -8024,7 +8035,8 @@ pub(crate) async fn sweep_stale_disk_reservations(
     config: &Config,
 ) -> Result<(), String> {
     let _guard = acquire_durable_disk_admission_lock(config).await?;
-    reconcile_disk_reservation_ledger_under_lock(control_hub, config).await
+    reconcile_disk_reservation_ledger_under_lock(control_hub, config).await?;
+    Ok(())
 }
 
 /// The caller must retain the returned lock through mission persistence and
@@ -8037,7 +8049,19 @@ async fn reserve_local_mission_disk(
     estimate_gib: u64,
 ) -> Result<(DurableDiskAdmissionLockGuard, DiskReservation), String> {
     let guard = acquire_durable_disk_admission_lock(config).await?;
-    reconcile_disk_reservation_ledger_under_lock(control_hub, config).await?;
+    let live_ids = match reconcile_disk_reservation_ledger_under_lock(control_hub, config).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            // Paper accounting must never block a host that still has real
+            // free space. A reconcile failure used to leave the stale
+            // ledger as a hard refusal (~18 TiB reserved vs ~2 TiB free).
+            tracing::warn!(
+                %error,
+                "disk reservation reconcile failed; admitting on measured free space only"
+            );
+            HashSet::new()
+        }
+    };
     let root = workspace::mission_workspace_root_for_workspace(workspace, Uuid::nil());
     if let Some(reason) = disk_admission_refusal(&root) {
         return Err(reason);
@@ -8048,27 +8072,37 @@ async fn reserve_local_mission_disk(
             root.display()
         )
     })?;
-    let reserved = reserved_disk_bytes_for_filesystem(config, &usage.filesystem).await?;
+    let reserved = reserved_disk_bytes_for_filesystem(config, &usage.filesystem, &live_ids)
+        .await
+        .unwrap_or(0);
     let estimate = estimate_gib.saturating_mul(1 << 30);
     let emergency = mission_disk_reserve_gib().saturating_mul(1 << 30);
-    let required = disk_admission_required_bytes(emergency, reserved, estimate);
-    if usage.available < required {
+    let hard_required = disk_admission_hard_required_bytes(emergency, estimate);
+    if usage.available < hard_required {
         return Err(format!(
-            "mission admission refused on filesystem {}: {} GiB free, {} GiB already reserved, {} GiB candidate estimate, {} GiB emergency reserve ({} GiB required)",
+            "mission admission refused on filesystem {}: {} GiB free, {} GiB candidate estimate, {} GiB emergency reserve ({} GiB required)",
             usage.filesystem,
             usage.available / (1 << 30),
-            reserved / (1 << 30),
             estimate_gib,
             mission_disk_reserve_gib(),
-            required / (1 << 30),
+            hard_required / (1 << 30),
         ));
+    }
+    if reserved > 0 && usage.available < hard_required.saturating_add(reserved) {
+        tracing::warn!(
+            filesystem = %usage.filesystem,
+            free_bytes = usage.available,
+            reserved_bytes = reserved,
+            candidate_bytes = estimate,
+            "paper scratch reservations exceed free space; admitting because measured disk is sufficient"
+        );
     }
     tracing::info!(
         filesystem = %usage.filesystem,
         free_bytes = usage.available,
         reserved_bytes = reserved,
         candidate_bytes = estimate,
-        required_bytes = required,
+        required_bytes = hard_required,
         "local mission disk admission reserved"
     );
     Ok((
@@ -33143,12 +33177,32 @@ Investigate <service/> failures.
 
         let emergency = 64 << 30;
         let first = 20 << 30;
-        // Exact equality leaves the emergency floor intact; a second
-        // same-filesystem admission must include the first reservation.
+        // Hard gate is emergency + candidate only. Paper reserved is a
+        // warning budget, never the refuse line.
+        assert_eq!(
+            disk_admission_hard_required_bytes(emergency, first),
+            84 << 30
+        );
         assert_eq!(disk_admission_required_bytes(emergency, 0, first), 84 << 30);
         assert_eq!(
             disk_admission_required_bytes(emergency, first, first),
             104 << 30
+        );
+    }
+
+    #[test]
+    fn paper_reservations_do_not_hard_block_when_disk_is_free() {
+        let emergency = 64 << 30;
+        let candidate = 64 << 30;
+        let paper = 5184u64 << 30;
+        let available = 2136u64 << 30;
+        assert!(
+            available >= disk_admission_hard_required_bytes(emergency, candidate),
+            "2 TiB free must admit a 64+64 GiB create"
+        );
+        assert!(
+            available < disk_admission_required_bytes(emergency, paper, candidate),
+            "the old paper-inclusive formula is what blocked Verity"
         );
     }
 
