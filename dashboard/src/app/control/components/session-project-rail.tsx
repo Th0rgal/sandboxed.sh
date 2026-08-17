@@ -16,6 +16,7 @@ import {
   viewPendingDecisions,
 } from "@/components/projects/project-card-view";
 import { parseMode } from "@/components/projects/project-health";
+import { pollingFetchConfig } from "@/lib/swr-config";
 import { cn } from "@/lib/utils";
 
 /** Item-first project snapshot docked to the right of a bound Hermes session. */
@@ -33,13 +34,13 @@ export function SessionProjectRail({ sessionId }: { sessionId: string }) {
         return match ? { slug: match.slug, session_id: sessionId } : null;
       }
     },
-    { revalidateOnFocus: false, shouldRetryOnError: false },
+    { ...pollingFetchConfig, shouldRetryOnError: false },
   );
   const rawSlug = resolved?.slug;
   const { data: overview } = useSWR(
     rawSlug ? "projects-overview" : null,
     getProjectsOverview,
-    { revalidateOnFocus: false },
+    pollingFetchConfig,
   );
   const slug = resolveSessionProjectSlug({
     resolvedSlug: rawSlug,
@@ -49,7 +50,7 @@ export function SessionProjectRail({ sessionId }: { sessionId: string }) {
   const { data: detail } = useSWR(
     slug ? ["project-detail", slug] : null,
     () => getProject(slug!),
-    { revalidateOnFocus: false },
+    pollingFetchConfig,
   );
 
   if (!slug) {

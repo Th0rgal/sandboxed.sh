@@ -70,8 +70,10 @@ export function cardSummary(project: ProjectRow): CardSummary {
     project.attention_reasons[0] ??
     nonblank(project.latest_update?.headline) ??
     nonblank(project.tracker?.status_line);
-  const lastSignalAt =
-    project.latest_update?.at ?? project.controller_heartbeat_at ?? null;
+  const lastSignalAt = latestTimestamp([
+    project.latest_update?.at,
+    project.controller_heartbeat_at,
+  ]);
   const lastWorkAt = latestLiveWorkAt(project);
   const liveAttempts = project.health?.active ?? 0;
   const pendingDecisions = project.pending_decisions ?? 0;
@@ -97,6 +99,13 @@ export function cardSummary(project: ProjectRow): CardSummary {
 }
 
 const CONTROLLER_BEHIND_MS = 15 * 60 * 1000;
+
+/** Missions that are actually executing right now. */
+export function viewLiveMissions(project: ProjectRow): ProjectRow["missions"] {
+  return (project.missions ?? []).filter((mission) =>
+    LIVE_ATTEMPT.has(mission.status),
+  );
+}
 
 function latestLiveWorkAt(project: ProjectRow): string | null {
   // Use when the live attempt *started*, not the last tool heartbeat.

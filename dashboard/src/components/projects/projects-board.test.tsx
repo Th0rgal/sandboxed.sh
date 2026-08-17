@@ -165,8 +165,6 @@ describe("ProjectsBoard", () => {
 
     renderBoard();
 
-    // Missions are behind a collapsible summary now — expand it first.
-    fireEvent.click(await screen.findByRole("button", { name: /Attempts \(1\)/ }));
     const row = await screen.findByRole("link", { name: /Phase 1C slice/ });
     expect(row).toHaveAttribute(
       "href",
@@ -318,6 +316,74 @@ describe("ProjectsBoard", () => {
     expect(
       screen.getAllByText("rebase/repair #2332 onto main after #2333").length,
     ).toBeGreaterThan(0);
+  });
+
+  test("leads the detail pane with a live process list instead of the LLM chapter", async () => {
+    mockedOverview.mockResolvedValue(
+      overview([
+        project({
+          slug: "verity-core",
+          title: "Verity",
+          mode: "active",
+          missions: [
+            {
+              id: "26da210b-aaaa-bbbb-cccc-ddddeeeeffff",
+              status: "active",
+              title: "Goal: close Verity C5 storage coherence #2330",
+              updated_at: "2026-08-17T08:24:00Z",
+              last_status_change_at: "2026-08-17T08:20:00Z",
+              github_pr: null,
+            },
+            {
+              id: "5d9f61e9-aaaa-bbbb-cccc-ddddeeeeffff",
+              status: "active",
+              title: "Goal: generic positive-body forEach correctness",
+              updated_at: "2026-08-17T08:20:53Z",
+              last_status_change_at: "2026-08-17T08:20:45Z",
+              github_pr: null,
+            },
+          ],
+          latest_update: {
+            headline: "Je reprends Verity immédiatement, avec trois lanes",
+            body: "Long controller essay that should stay collapsed.",
+            session_id: "sess-verity",
+            at: "2026-08-17T07:39:00Z",
+            signature: "verity",
+            blocker: null,
+          },
+        }),
+      ]),
+    );
+    mockedUpdates.mockResolvedValue({
+      slug: "verity-core",
+      updates: [
+        {
+          headline: "Je reprends Verity immédiatement, avec trois lanes",
+          body: "Long controller essay that should stay collapsed.",
+          session_id: "sess-verity",
+          at: "2026-08-17T07:39:00Z",
+          signature: "verity",
+          blocker: null,
+        },
+      ],
+    });
+
+    renderBoard();
+
+    expect(await screen.findByText(/Live \(2\)/)).toBeInTheDocument();
+    expect(
+      screen.getByText("Goal: close Verity C5 storage coherence #2330"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Goal: generic positive-body forEach correctness"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getAllByText("Je reprends Verity immédiatement, avec trois lanes")
+        .length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.queryByText(/Origin conversation: sess-verity/),
+    ).not.toBeInTheDocument();
   });
 
   test("selecting a project loads its updates timeline in the detail pane", async () => {
