@@ -133,7 +133,7 @@ pub fn parse_inspect_mission_id(next: Option<&str>) -> Option<uuid::Uuid> {
         .strip_prefix("inspect")
         .or_else(|| raw.strip_prefix("Inspect"))
         .or_else(|| raw.strip_prefix("INSPECT"))?;
-    let token = rest.trim().split_whitespace().next()?;
+    let token = rest.split_whitespace().next()?;
     if let Ok(id) = uuid::Uuid::parse_str(token) {
         return Some(id);
     }
