@@ -907,6 +907,110 @@ mod campaign_guard_tests {
         );
     }
 
+    #[tokio::test]
+    async fn silent_recycle_of_pr88_writer_as_reserve_is_rejected() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(
+                Some("Repair Lido PR #88"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
+        store
+            .update_mission_project(
+                mission.id,
+                mission_store::MissionProjectPatch {
+                    github_pr: Some(Some("lfglabs-dev/lido-srv3-proof-closure#88".to_string())),
+                    track: Some(Some("pr-88-repair".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag");
+        let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
+        let err = apply_writer_reuse_or_conflict(
+            &store,
+            &loaded,
+            None,
+            None,
+            None,
+            Some("Implement P-RESERVE-RELATIONAL first slice".into()),
+        )
+        .await
+        .expect_err("silent recycle");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("writer_identity_stale"));
+
+        apply_writer_reuse_or_conflict(
+            &store,
+            &loaded,
+            Some(String::new()),
+            Some("p-reserve-relational".into()),
+            Some("P-RESERVE-RELATIONAL first slice".into()),
+            Some("Implement P-RESERVE-RELATIONAL first slice".into()),
+        )
+        .await
+        .expect("explicit retag");
+        let updated = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(updated.project.github_pr.as_deref(), None);
+        assert_eq!(
+            updated.project.track.as_deref(),
+            Some("p-reserve-relational")
+        );
+    }
+
+    #[tokio::test]
+    async fn same_work_followup_without_pr_mention_is_accepted() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(
+                Some("Repair Lido PR #88"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
+        store
+            .update_mission_project(
+                mission.id,
+                mission_store::MissionProjectPatch {
+                    github_pr: Some(Some("lfglabs-dev/lido-srv3-proof-closure#88".to_string())),
+                    track: Some(Some("pr-88-repair".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag");
+        let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
+        apply_writer_reuse_or_conflict(
+            &store,
+            &loaded,
+            None,
+            None,
+            None,
+            Some("fix the failing test".into()),
+        )
+        .await
+        .expect("same-work chat must not 409");
+        let updated = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.project.github_pr.as_deref(),
+            Some("lfglabs-dev/lido-srv3-proof-closure#88")
+        );
+        assert_eq!(updated.project.track.as_deref(), Some("pr-88-repair"));
+        assert_eq!(updated.title.as_deref(), Some("Repair Lido PR #88"));
+    }
+
     #[test]
     fn dispatch_gate_blocks_paused_and_archived_only() {
         // paused → 423 Locked; archived → 409 Conflict.
@@ -3242,6 +3346,15 @@ pub struct ControlMessageRequest {
     /// message to the session's current mission.
     #[serde(default, alias = "target_mission_id")]
     pub mission_id: Option<Uuid>,
+    /// Explicit identity update when retasking a writer. Omit to leave
+    /// stored `github_pr` / `track` / `title` unchanged; empty string
+    /// clears. A different objective without these fields is refused.
+    #[serde(default)]
+    pub github_pr: Option<String>,
+    #[serde(default)]
+    pub track: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
     /// Catch-all for unrecognized request fields — surfaced as `warnings` in
     /// the response instead of being silently dropped (a mistyped targeting
     /// field once silently rerouted a message to the wrong mission).
@@ -4541,6 +4654,15 @@ pub async fn post_message(
             .await
             .map_err(internal_error)?
         {
+            apply_writer_reuse_or_conflict(
+                &control.mission_store,
+                &mission,
+                req.github_pr.clone(),
+                req.track.clone(),
+                req.title.clone(),
+                Some(content.clone()),
+            )
+            .await?;
             if mission_is_pr_writer_in_store(&control.mission_store, &mission)
                 .await
                 .map_err(internal_error)?
@@ -6740,8 +6862,6 @@ fn cross_tenant_mission_projection(
     })
 }
 
-/// Read-only scan of an offline sqlite store for project-tagged missions.
-/// Returns lightweight Mission values (no history) — enough for board rows.
 fn collect_project_missions_from_sqlite(
     path: &std::path::Path,
     terminal_cutoff_rfc3339: &str,
@@ -7610,8 +7730,14 @@ fn contains_internal_disk_reservation_tag(tags: &[String]) -> bool {
         .any(|tag| tag.trim().starts_with(DISK_RESERVATION_TAG_PREFIX))
 }
 
+/// Only missions that are actually running hold a scratch lease.
+/// Parked (`awaiting_user`, `paused`) and every terminal status release —
+/// those were the 2026-08-17 zombie majority (~18 TiB paper vs ~2 TiB free).
 fn mission_holds_disk_reservation(status: MissionStatus) -> bool {
-    !status.is_terminal() && status != MissionStatus::Acknowledged
+    matches!(
+        status,
+        MissionStatus::Active | MissionStatus::Pending | MissionStatus::WaitingBackground
+    )
 }
 
 fn disk_admission_required_bytes(emergency: u64, reserved: u64, candidate: u64) -> u64 {
@@ -7890,6 +8016,17 @@ async fn reconcile_disk_reservation_ledger_under_lock(
     Ok(())
 }
 
+/// Periodic / on-demand purge of dead leases. The workspace GC loop calls
+/// this even when directory GC is dry-run so an operator never has to edit
+/// `disk-reservations-v2.json` by hand.
+pub(crate) async fn sweep_stale_disk_reservations(
+    control_hub: &ControlHub,
+    config: &Config,
+) -> Result<(), String> {
+    let _guard = acquire_durable_disk_admission_lock(config).await?;
+    reconcile_disk_reservation_ledger_under_lock(control_hub, config).await
+}
+
 /// The caller must retain the returned lock through mission persistence and
 /// its reservation-tag write.  That makes admission, creation and durable
 /// reconstruction one atomic protocol across local control processes.
@@ -8034,7 +8171,7 @@ async fn acquire_durable_pr_writer_lock(
     })
 }
 
-fn canonical_github_pr(raw: &str) -> String {
+pub(crate) fn canonical_github_pr(raw: &str) -> String {
     let mut value = raw
         .trim()
         .split(['?', '#'])
@@ -8320,6 +8457,84 @@ fn message_requests_pr_writer(mission: &Mission, content: &str) -> bool {
 struct PrWriterLease {
     id: Uuid,
     status: MissionStatus,
+}
+
+async fn apply_writer_reuse_or_conflict(
+    store: &Arc<dyn crate::api::mission_store::MissionStore>,
+    mission: &Mission,
+    github_pr: Option<String>,
+    track: Option<String>,
+    title: Option<String>,
+    work_hint: Option<String>,
+) -> Result<(), (StatusCode, String)> {
+    use crate::api::writer_recycle::{apply_writer_reuse, WriterIdentity, WriterIdentityPatch};
+
+    let to_patch = |value: Option<String>| -> Option<Option<String>> {
+        value.map(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    };
+    let stored = WriterIdentity {
+        title: mission.title.clone(),
+        github_pr: mission.project.github_pr.clone(),
+        track: mission.project.track.clone(),
+    };
+    let next = apply_writer_reuse(
+        &stored,
+        &WriterIdentityPatch {
+            title: to_patch(title),
+            github_pr: to_patch(github_pr),
+            track: to_patch(track),
+            work_hint,
+        },
+    )
+    .map_err(|err| {
+        (
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": err.error,
+                "message": err.message,
+            })
+            .to_string(),
+        )
+    })?;
+    if next.github_pr == stored.github_pr
+        && next.track == stored.track
+        && next.title == stored.title
+    {
+        return Ok(());
+    }
+    store
+        .update_mission_project(
+            mission.id,
+            crate::api::mission_store::MissionProjectPatch {
+                github_pr: Some(next.github_pr.clone()),
+                track: Some(next.track.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(internal_error)?;
+    if next.title != stored.title {
+        if let Some(title) = next.title {
+            let _ = store
+                .update_mission_metadata(
+                    mission.id,
+                    Some(Some(title.as_str())),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+        }
+    }
+    Ok(())
 }
 
 fn pr_writer_lease(mission: &Mission) -> PrWriterLease {
@@ -13438,6 +13653,16 @@ pub struct ResumeMissionRequest {
     /// Optional attribution override (e.g. `"system:fleet-watcher"`).
     #[serde(default)]
     pub actor: Option<String>,
+    /// Required when the resume retasks the writer onto different work.
+    #[serde(default)]
+    pub github_pr: Option<String>,
+    #[serde(default)]
+    pub track: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Optional objective for the resumed turn; used to detect silent recycle.
+    #[serde(default)]
+    pub content: Option<String>,
 }
 
 /// Resume an interrupted mission.
@@ -13448,15 +13673,23 @@ pub async fn resume_mission(
     Path(mission_id): Path<Uuid>,
     body: Option<Json<ResumeMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
-    let (clean_workspace, skip_message, actor_override) = body
-        .map(|b| {
-            let r = b.0;
-            (r.clean_workspace, r.skip_message, r.actor)
-        })
-        .unwrap_or((false, false, None));
-    let actor = resolve_actor(actor_override, &user);
+    let request = body.map(|b| b.0).unwrap_or_default();
+    let clean_workspace = request.clean_workspace;
+    let skip_message = request.skip_message;
+    let actor = resolve_actor(request.actor.clone(), &user);
 
     let control = control_for_user(&state, &user).await;
+    if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
+        apply_writer_reuse_or_conflict(
+            &control.mission_store,
+            &mission,
+            request.github_pr.clone(),
+            request.track.clone(),
+            request.title.clone(),
+            request.content.clone(),
+        )
+        .await?;
+    }
     tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
 
     let outcome: Result<Mission, (StatusCode, String)> = async {
@@ -32923,7 +33156,11 @@ Investigate <service/> failures.
     fn terminal_missions_release_disk_admission_reservations() {
         assert!(mission_holds_disk_reservation(MissionStatus::Pending));
         assert!(mission_holds_disk_reservation(MissionStatus::Active));
-        assert!(mission_holds_disk_reservation(MissionStatus::AwaitingUser));
+        assert!(mission_holds_disk_reservation(
+            MissionStatus::WaitingBackground
+        ));
+        assert!(!mission_holds_disk_reservation(MissionStatus::AwaitingUser));
+        assert!(!mission_holds_disk_reservation(MissionStatus::Paused));
         assert!(!mission_holds_disk_reservation(MissionStatus::Completed));
         assert!(!mission_holds_disk_reservation(MissionStatus::Failed));
         assert!(!mission_holds_disk_reservation(MissionStatus::Acknowledged));

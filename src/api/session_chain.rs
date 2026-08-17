@@ -46,20 +46,78 @@ pub fn live_tip(db_path: &Path, session_id: &str) -> String {
     let mut seen: HashSet<String> = HashSet::from([current.clone()]);
 
     for _ in 0..MAX_CHAIN_DEPTH {
-        let child: Option<String> = connection
+        let Some(next) = newest_livable_child(&connection, &current) else {
+            break;
+        };
+        if !seen.insert(next.clone()) {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+/// Newest child that is actually a conversation, not a failed compression fork.
+fn newest_livable_child(connection: &rusqlite::Connection, parent: &str) -> Option<String> {
+    match newest_livable_child_rich(connection, parent) {
+        Ok(found) => found,
+        Err(_) => connection
             .query_row(
                 "SELECT id FROM sessions WHERE parent_session_id = ?1 \
                  ORDER BY id DESC LIMIT 1",
-                [&current],
+                [parent],
                 |row| row.get(0),
             )
-            .ok();
-        match child {
-            Some(next) if seen.insert(next.clone()) => current = next,
-            _ => break,
+            .ok(),
+    }
+}
+
+fn newest_livable_child_rich(
+    connection: &rusqlite::Connection,
+    parent: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        "SELECT id, ended_at, end_reason, started_at, message_count \
+         FROM sessions WHERE parent_session_id = ?1 ORDER BY id DESC",
+    )?;
+    let rows = statement.query_map([parent], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<f64>>(1).ok().flatten(),
+            row.get::<_, Option<String>>(2).ok().flatten(),
+            row.get::<_, Option<f64>>(3).ok().flatten(),
+            row.get::<_, Option<i64>>(4).ok().flatten(),
+        ))
+    })?;
+    for row in rows.flatten() {
+        let (id, ended_at, end_reason, started_at, message_count) = row;
+        if child_is_livable(end_reason.as_deref(), started_at, ended_at, message_count) {
+            return Ok(Some(id));
         }
     }
-    current
+    Ok(None)
+}
+
+fn child_is_livable(
+    end_reason: Option<&str>,
+    started_at: Option<f64>,
+    ended_at: Option<f64>,
+    message_count: Option<i64>,
+) -> bool {
+    let reason = end_reason.unwrap_or("").trim().to_ascii_lowercase();
+    if matches!(
+        reason.as_str(),
+        "compression_exhausted" | "compression_ineffective"
+    ) {
+        return false;
+    }
+    if let (Some(start), Some(end)) = (started_at, ended_at) {
+        let lifetime = end - start;
+        if lifetime >= 0.0 && lifetime <= 5.0 && message_count.unwrap_or(0) == 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// `session_id` and its ancestors, nearest first.
@@ -136,6 +194,52 @@ mod tests {
                 .execute(
                     "INSERT INTO sessions (id, parent_session_id) VALUES (?1, ?2)",
                     rusqlite::params![id, parent],
+                )
+                .expect("insert");
+        }
+        (dir, path)
+    }
+
+    struct RichRow<'a> {
+        id: &'a str,
+        parent: Option<&'a str>,
+        started_at: f64,
+        ended_at: Option<f64>,
+        end_reason: Option<&'a str>,
+        message_count: i64,
+    }
+
+    fn rich_db(rows: &[RichRow<'_>]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("state.db");
+        let connection = rusqlite::Connection::open(&path).expect("open");
+        connection
+            .execute(
+                "CREATE TABLE sessions (\
+                    id TEXT PRIMARY KEY, \
+                    parent_session_id TEXT, \
+                    started_at REAL, \
+                    ended_at REAL, \
+                    end_reason TEXT, \
+                    message_count INTEGER\
+                )",
+                [],
+            )
+            .expect("schema");
+        for row in rows {
+            connection
+                .execute(
+                    "INSERT INTO sessions \
+                     (id, parent_session_id, started_at, ended_at, end_reason, message_count) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        row.id,
+                        row.parent,
+                        row.started_at,
+                        row.ended_at,
+                        row.end_reason,
+                        row.message_count
+                    ],
                 )
                 .expect("insert");
         }
@@ -227,6 +331,52 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn a_compression_exhausted_child_is_not_the_tip() {
+        let (_dir, path) = rich_db(&[
+            RichRow {
+                id: "parent",
+                parent: None,
+                started_at: 1_000.0,
+                ended_at: None,
+                end_reason: None,
+                message_count: 40,
+            },
+            RichRow {
+                id: "dead-child",
+                parent: Some("parent"),
+                started_at: 2_000.0,
+                ended_at: Some(2_003.0),
+                end_reason: Some("compression_exhausted"),
+                message_count: 0,
+            },
+        ]);
+        assert_eq!(live_tip(&path, "parent"), "parent");
+    }
+
+    #[test]
+    fn a_successful_continuation_is_the_tip() {
+        let (_dir, path) = rich_db(&[
+            RichRow {
+                id: "parent",
+                parent: None,
+                started_at: 1_000.0,
+                ended_at: Some(2_000.0),
+                end_reason: Some("compression"),
+                message_count: 40,
+            },
+            RichRow {
+                id: "child",
+                parent: Some("parent"),
+                started_at: 2_000.0,
+                ended_at: None,
+                end_reason: None,
+                message_count: 12,
+            },
+        ]);
+        assert_eq!(live_tip(&path, "parent"), "child");
     }
 
     #[test]

@@ -949,7 +949,8 @@ impl ProjectsStore {
     /// Set the controller-reported mode and next-action. Increments
     /// `wait_ticks` while the mode/blocker are unchanged, and resets it to 0 on
     /// any change — so "how long has it been blocked on this" is a column read,
-    /// not a scan of the delivery log.
+    /// not a scan of the delivery log. Rephrasing `next=` does not reset wait.
+    /// A watch-idle next-action yields to an implement-ready stored track.
     pub fn set_mode(
         &self,
         slug: &str,
@@ -957,6 +958,7 @@ impl ProjectsStore {
         next_action: Option<&str>,
         blocker: Option<&str>,
     ) -> Result<(), String> {
+        let next_action = self.honest_next_action_for(slug, next_action)?;
         let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
         let previous: Option<(Option<String>, Option<String>)> = connection
@@ -985,6 +987,21 @@ impl ProjectsStore {
         Ok(())
     }
 
+    fn honest_next_action_for(
+        &self,
+        slug: &str,
+        reported: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let tracks = self.tracks(slug)?;
+        let tuples: Vec<(String, Option<String>, Option<String>)> = tracks
+            .into_iter()
+            .map(|track| (track.track, track.desired_state, track.status))
+            .collect();
+        Ok(super::controller_honesty::honest_next_action(
+            reported, &tuples,
+        ))
+    }
+
     /// Project the mode onto an existing project record from the delivery
     /// ingestor. Unlike `set_mode`, this is **idempotent** (it does not count
     /// ticks — `wait` is passed in from the state timeline's observation count)
@@ -1000,8 +1017,26 @@ impl ProjectsStore {
         blocker: Option<&str>,
         at: Option<&str>,
     ) -> Result<(), String> {
+        let next_action = self.honest_next_action_for(slug, next_action)?;
         let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
+        let previous: Option<(Option<String>, Option<String>, i64)> = connection
+            .query_row(
+                "SELECT mode, blocker, wait_ticks FROM projects WHERE slug = ?1",
+                params![slug],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let wait = match previous {
+            Some((m, b, stored)) if m.as_deref() == Some(mode) && b.as_deref() == blocker => {
+                // Same stall: never let a rephrased next= / wait=0 reset the
+                // counter. Overlapping ingest of the same delivery can still
+                // pass the same wait twice without inflating it.
+                stored.max(wait)
+            }
+            _ => wait,
+        };
         match at {
             Some(at) => {
                 let watermark: Option<String> = connection
@@ -2346,11 +2381,75 @@ mod tests {
             .expect("m3");
         assert_eq!(store.get_project("bench").unwrap().unwrap().wait_ticks, 1);
 
+        // Rephrasing next= is not a new stall.
+        store
+            .set_mode(
+                "bench",
+                "blocked",
+                Some("watch for a new Lido PR"),
+                Some("transport-cap"),
+            )
+            .expect("m3b");
+        assert_eq!(store.get_project("bench").unwrap().unwrap().wait_ticks, 2);
+
         // A changed blocker resets the counter — a new thing to be stuck on.
         store
             .set_mode("bench", "blocked", Some("x"), Some("other"))
             .expect("m4");
         assert_eq!(store.get_project("bench").unwrap().unwrap().wait_ticks, 0);
+    }
+
+    #[test]
+    fn implement_ready_track_beats_watch_idle_next_action() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+        store
+            .set_track(
+                "lido",
+                "p-reserve-relational",
+                Some("implement"),
+                Some("open"),
+            )
+            .expect("track");
+        store
+            .set_mode(
+                "lido",
+                "active",
+                Some("watch for a new Lido PR or exact-head finding"),
+                None,
+            )
+            .expect("mode");
+        let project = store.get_project("lido").unwrap().unwrap();
+        assert_eq!(
+            project.next_action.as_deref(),
+            Some("implement p-reserve-relational")
+        );
+    }
+
+    #[test]
+    fn trailer_wait_zero_does_not_reset_an_existing_stall() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+        store
+            .project_mode_from_signal("lido", "blocked", 4, Some("watch PRs"), Some("disk"), None)
+            .expect("first");
+        store
+            .project_mode_from_signal(
+                "lido",
+                "blocked",
+                0,
+                Some("surveiller toute nouvelle PR"),
+                Some("disk"),
+                None,
+            )
+            .expect("rephrase");
+        let project = store.get_project("lido").unwrap().unwrap();
+        assert_eq!(project.wait_ticks, 4);
+        assert_eq!(project.blocker.as_deref(), Some("disk"));
     }
 
     #[test]

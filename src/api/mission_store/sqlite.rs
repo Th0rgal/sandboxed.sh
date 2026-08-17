@@ -4002,10 +4002,11 @@ impl MissionStore for SqliteMissionStore {
                     params![id.to_string()],
                 );
             }
-            Ok(())
+            Ok::<(), String>(())
         })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())??;
+        Ok(())
     }
 
     async fn update_mission_history(
@@ -4675,7 +4676,7 @@ impl MissionStore for SqliteMissionStore {
     async fn delete_mission(&self, id: Uuid) -> Result<bool, String> {
         let conn = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let removed = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let rows = conn
                 .execute(
@@ -4683,10 +4684,11 @@ impl MissionStore for SqliteMissionStore {
                     params![id.to_string()],
                 )
                 .map_err(|e| e.to_string())?;
-            Ok(rows > 0)
+            Ok::<bool, String>(rows > 0)
         })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())??;
+        Ok(removed)
     }
 
     async fn delete_empty_untitled_missions_excluding(

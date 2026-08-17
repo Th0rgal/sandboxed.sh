@@ -2051,6 +2051,18 @@ pub async fn projects_overview(
             .or_insert_with(|| ProjectRowBuilder::new(key.clone()));
         builder.apply_roster(record, canonical_has_roster);
     }
+    for (slug, builder) in &mut rows {
+        if let Ok(tracks) = state.projects.tracks(slug) {
+            let tuples: Vec<(String, Option<String>, Option<String>)> = tracks
+                .into_iter()
+                .map(|track| (track.track, track.desired_state, track.status))
+                .collect();
+            builder.next_action = super::controller_honesty::honest_next_action(
+                builder.next_action.as_deref(),
+                &tuples,
+            );
+        }
+    }
     // The latest ingested state per project becomes the row's latest_update —
     // same serialized shape the delivery scan used to produce, now read back
     // from the store the ingestor maintains.

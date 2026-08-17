@@ -77,6 +77,7 @@ pub mod usage_optimize;
 pub mod validation;
 pub mod webhook_markers;
 pub mod workspaces;
+pub(crate) mod writer_recycle;
 
 pub use routes::serve;
 pub use types::*;
