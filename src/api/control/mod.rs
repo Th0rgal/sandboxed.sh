@@ -16983,9 +16983,19 @@ async fn maybe_finalize_terminal_mission(
     let Some(reason) = terminal_reason else {
         return;
     };
-    let Some((new_status, terminal_reason_str)) =
+    let transportish = final_output.or(terminal_evidence).is_some_and(|text| {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("pending tool")
+            || lower.contains("not replayed")
+            || lower.contains("stream closed before mission")
+            || lower.contains("codex app-server stream closed")
+    });
+    let mapped = if transportish && matches!(reason, TerminalReason::LlmError) {
+        Some((MissionStatus::Interrupted, "transport"))
+    } else {
         mission_status_for_terminal_reason(reason, complete_turn_without_follow_up)
-    else {
+    };
+    let Some((new_status, terminal_reason_str)) = mapped else {
         tracing::debug!(
             mission_id = %mission_id,
             reason = ?reason,
@@ -17647,7 +17657,8 @@ async fn control_actor_loop(
     // One bounded same-mission retry for structured transport failures. Auth,
     // quota/capacity, source failures, stalls, and loops are deliberately not
     // eligible. Writer leases are re-acquired by the normal start path.
-    let mut transport_auto_resumed_missions: HashSet<Uuid> = HashSet::new();
+    let mut transport_auto_resumed_missions: HashMap<Uuid, u8> = HashMap::new();
+    const TRANSPORT_AUTO_RESUME_MAX: u8 = 3;
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
     // Track number of in-flight tool calls on the main runner so the stall
@@ -21407,7 +21418,15 @@ async fn control_actor_loop(
                     if !completed_waiting_remote_job {
                         if let Some(mission_id) = completed_mission_id {
                         if completed_transport_failure
-                            && transport_auto_resumed_missions.insert(mission_id)
+                            && {
+                                let count = transport_auto_resumed_missions
+                                    .entry(mission_id)
+                                    .or_insert(0);
+                                *count < TRANSPORT_AUTO_RESUME_MAX && {
+                                    *count += 1;
+                                    true
+                                }
+                            }
                             && !queue_has_pending_target_mission(&queue, mission_id)
                         {
                             let resume_message = "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.".to_string();
@@ -21423,7 +21442,7 @@ async fn control_actor_loop(
                                 Ok(()) => {
                                     tracing::info!(
                                         %mission_id,
-                                        "Auto-resuming mission once after structured transport failure"
+                                        "Auto-resuming mission after structured transport failure"
                                     );
                                     queue.push_back((
                                         Uuid::new_v4(),
@@ -21998,11 +22017,19 @@ async fn control_actor_loop(
                                 && is_transport_failure_evidence(&completion_evidence)
                                 && !cancellation_requested
                                 && was_queue_empty
-                                && transport_auto_resumed_missions.insert(*mission_id)
+                                && {
+                                    let count = transport_auto_resumed_missions
+                                        .entry(*mission_id)
+                                        .or_insert(0);
+                                    *count < TRANSPORT_AUTO_RESUME_MAX && {
+                                        *count += 1;
+                                        true
+                                    }
+                                }
                             {
                                 tracing::info!(
                                     mission_id = %mission_id,
-                                    "Auto-resuming parallel mission once after structured transport failure"
+                                    "Auto-resuming parallel mission after structured transport failure"
                                 );
                                 runner.queue_message(
                                     Uuid::new_v4(),

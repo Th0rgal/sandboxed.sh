@@ -458,6 +458,27 @@ fn collect_windows(v: &Value) -> Vec<Window> {
         }
     }
 
+    // ── Grok Build / xAI SuperGrok credits (weekly or monthly pool) ──
+    // The CLI billing API reports used-percent + period end. Window length is
+    // the observed period when present, otherwise weekly/monthly from the
+    // label the handler already classified.
+    if let Some(used_pct) = get_f64(v, "xai_credit_used_percent") {
+        let label = get_str(v, "xai_credit_label").unwrap_or_else(|| "credits".to_string());
+        let window_seconds = get_i64(v, "xai_credit_window_seconds").or_else(|| {
+            if label.eq_ignore_ascii_case("weekly") {
+                Some(WEEKLY_SECONDS)
+            } else if label.eq_ignore_ascii_case("monthly") {
+                Some(30 * 24 * 3600)
+            } else {
+                None
+            }
+        });
+        let mut w = Window::new("xai_credits", label, "credits", "xai").with_used_percent(used_pct);
+        w.window_seconds = window_seconds;
+        w.reset_at = get_epoch_secs(v, "xai_credit_reset");
+        out.push(w);
+    }
+
     out
 }
 
@@ -510,6 +531,14 @@ fn observed_burn(
 
 fn get_f64(v: &Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|x| x.as_f64())
+}
+
+fn get_str(v: &Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn get_i64(v: &Value, key: &str) -> Option<i64> {
@@ -797,6 +826,24 @@ mod tests {
         assert_eq!(ww["pct_used"], json!(40.0));
         assert_eq!(ww["window_seconds"], json!(604800));
         assert_eq!(opt["primary_window"], json!("kimi_weekly"));
+    }
+
+    #[test]
+    fn xai_credit_window() {
+        let reset = (now() + chrono::Duration::days(4)).timestamp();
+        let v = json!({
+            "xai_credit_used_percent": 40.0,
+            "xai_credit_reset": reset,
+            "xai_credit_label": "Weekly",
+            "xai_credit_window_seconds": 604800,
+        });
+        let opt = build_optimize_block_at(&v, None, now());
+        let w = window(&opt, "xai_credits");
+        assert_eq!(w["pct_used"], json!(40.0));
+        assert_eq!(w["pct_remaining"], json!(60.0));
+        assert_eq!(w["window_seconds"], json!(604800));
+        assert_eq!(w["source"], json!("xai"));
+        assert_eq!(opt["primary_window"], json!("xai_credits"));
     }
 
     #[test]

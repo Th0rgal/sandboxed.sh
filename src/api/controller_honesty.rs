@@ -120,6 +120,38 @@ pub fn normalize_decision_question(question: &str) -> String {
         .join(" ")
 }
 
+/// `inspect <mission-uuid>` — a controller parking on a dead writer instead
+/// of redispaching. Not a project-level no-lane.
+pub fn is_inspect_next_action(next: Option<&str>) -> bool {
+    parse_inspect_mission_id(next).is_some()
+}
+
+/// Parse `inspect 51f37d4b-…` / `inspect 51f37d4b` into a UUID when possible.
+pub fn parse_inspect_mission_id(next: Option<&str>) -> Option<uuid::Uuid> {
+    let raw = next.map(str::trim).filter(|s| !s.is_empty())?;
+    let rest = raw
+        .strip_prefix("inspect")
+        .or_else(|| raw.strip_prefix("Inspect"))
+        .or_else(|| raw.strip_prefix("INSPECT"))?;
+    let token = rest.trim().split_whitespace().next()?;
+    if let Ok(id) = uuid::Uuid::parse_str(token) {
+        return Some(id);
+    }
+    // Controllers often paste the 8-char prefix. Not enough to look up.
+    None
+}
+
+/// Terminal reasons that are harness/transport, not a project blocker.
+pub fn is_harness_terminal_reason(reason: Option<&str>, evidence: Option<&str>) -> bool {
+    let blob = format!("{} {}", reason.unwrap_or(""), evidence.unwrap_or("")).to_ascii_lowercase();
+    blob.contains("llm_error")
+        || blob.contains("transport")
+        || blob.contains("server_shutdown")
+        || blob.contains("pending tool")
+        || blob.contains("not replayed")
+        || blob.contains("stream closed")
+}
+
 /// A next-action that means "idle until a PR appears" rather than do the
 /// stored roadmap item. Controllers rephrase this every tick, which used
 /// to look like progress.
@@ -253,6 +285,24 @@ mod tests {
         assert!(is_material_activity_headline(
             "Lido #81 — RÉPARATION/REVIEW EN COURS"
         ));
+    }
+
+    #[test]
+    fn inspect_next_action_parses_uuid_and_rejects_prose() {
+        let id = uuid::Uuid::parse_str("51f37d4b-7e27-466a-8c2f-fec0be2bebed").unwrap();
+        assert_eq!(
+            parse_inspect_mission_id(Some("inspect 51f37d4b-7e27-466a-8c2f-fec0be2bebed")),
+            Some(id)
+        );
+        assert!(is_inspect_next_action(Some(
+            "inspect 51f37d4b-7e27-466a-8c2f-fec0be2bebed"
+        )));
+        assert!(!is_inspect_next_action(Some("watch #2367 CI then merge")));
+        assert!(is_harness_terminal_reason(
+            Some("llm_error"),
+            Some("pending tool call exec-1 remained unresolved after thread/resume")
+        ));
+        assert!(!is_harness_terminal_reason(Some("rate_limited"), None));
     }
 
     #[test]

@@ -790,7 +790,7 @@ exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
 // ChatGPT/OpenAI account.
 const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 10;
 const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 10;
-const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
 
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
@@ -1349,6 +1349,15 @@ pub(crate) fn collect_codex_credentials(working_dir: &std::path::Path) -> Vec<Co
     creds
 }
 
+/// Fresh accounts always win over usage-capped ones, even at 0 permits.
+fn pick_codex_lease_pool<T>(fresh: Vec<T>, cooled: Vec<T>) -> Vec<T> {
+    if fresh.is_empty() {
+        cooled
+    } else {
+        fresh
+    }
+}
+
 pub(crate) async fn lease_codex_account(
     working_dir: &std::path::Path,
     tried_fingerprints: &HashSet<String>,
@@ -1373,10 +1382,11 @@ pub(crate) async fn lease_codex_account(
         return None;
     }
 
-    // Prefer credentials that aren't on a usage-cap cooldown; cooled ones stay
-    // in the list as a last resort so a single-account setup still retries
-    // instead of hard-failing. Within each group, prefer the least-loaded
-    // credential (highest available permits).
+    // Prefer credentials that aren't on a usage-cap cooldown. A cooled
+    // account is only considered when *every* remaining candidate is cooled
+    // (single-account, or all subscriptions exhausted). Mixing them used to
+    // lease the dead weekly-cap account (0 wait) while the healthy one was
+    // only at 0/10 permits — P-CONSOLIDATION-1 then died on "try again Aug 20".
     let (mut fresh, mut cooled): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|candidate| {
         codex_account_cooldown_remaining(&candidate.0.fingerprint()).is_none()
     });
@@ -1389,7 +1399,7 @@ pub(crate) async fn lease_codex_account(
         );
     }
     let candidates: Vec<(CodexCredential, Arc<Semaphore>, usize)> =
-        fresh.into_iter().chain(cooled).collect();
+        pick_codex_lease_pool(fresh, cooled);
 
     for (cred, sem, available) in &candidates {
         if let Ok(permit) = sem.clone().try_acquire_owned() {
@@ -9281,20 +9291,21 @@ mod tests {
         opencode_session_exists_in_data_home, opencode_session_token_from_line,
         overlay_opencode_auth, parse_cli_semver, parse_cli_version, parse_opencode_goal_objective,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, preferred_opencode_bin_dir, prepend_unique_path_entry,
-        record_codex_error_message, replace_filepath_artifact_with_tool_output,
-        resolve_mission_working_directory, running_health, sanitized_opencode_stdout,
-        selected_opencode_auth_path, selected_opencode_provider_auth_dir,
-        set_codex_account_cooldown, should_sync_container_opencode, stall_severity,
-        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
-        summarize_codex_usage_caps, summarize_recent_opencode_stderr,
-        text_buffer_stream_looks_degenerate, thinking_overlaps_visible_answer, tls_error_hint,
-        truncate_garbled_output, use_thinking_only_fallback, utf8_safe_prefix,
-        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, CopiedOpenCodeProbe, MissionHealth, MissionRunState, MissionRunner,
-        MissionStallSeverity, OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
-        CODEX_PENDING_TOOLS_ERROR_PREFIX, CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS,
-        STALL_WARN_SECS,
+        pick_codex_lease_pool, preferred_model_for_cost, preferred_opencode_bin_dir,
+        prepend_unique_path_entry, record_codex_error_message,
+        replace_filepath_artifact_with_tool_output, resolve_mission_working_directory,
+        running_health, sanitized_opencode_stdout, selected_opencode_auth_path,
+        selected_opencode_provider_auth_dir, set_codex_account_cooldown,
+        should_sync_container_opencode, stall_severity, strip_ansi_codes,
+        strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
+        summarize_recent_opencode_stderr, text_buffer_stream_looks_degenerate,
+        thinking_overlaps_visible_answer, tls_error_hint, truncate_garbled_output,
+        use_thinking_only_fallback, utf8_safe_prefix, ClaudeIncompleteTurnContext,
+        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
+        CopiedOpenCodeProbe, MissionHealth, MissionRunState, MissionRunner, MissionStallSeverity,
+        OpencodeSseState, CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT, CODEX_AUTH_ERROR_COOLDOWN,
+        CODEX_CAPACITY_COOLDOWN, CODEX_PENDING_TOOLS_ERROR_PREFIX, CODEX_RATE_LIMIT_COOLDOWN,
+        STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -10198,6 +10209,21 @@ mod tests {
         assert!(remaining > std::time::Duration::from_secs(50));
         clear_codex_account_cooldown(fp);
         assert!(codex_account_cooldown_remaining(fp).is_none());
+    }
+
+    #[test]
+    fn pick_codex_lease_pool_never_falls_through_to_cooled_when_fresh_exists() {
+        let fresh = vec!["ben"];
+        let cooled = vec!["thomas"];
+        assert_eq!(pick_codex_lease_pool(fresh, cooled), vec!["ben"]);
+        assert_eq!(
+            pick_codex_lease_pool(Vec::<&str>::new(), vec!["thomas"]),
+            vec!["thomas"]
+        );
+        assert_eq!(
+            CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT,
+            std::time::Duration::from_secs(180)
+        );
     }
 
     #[test]

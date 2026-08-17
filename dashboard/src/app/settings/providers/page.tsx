@@ -452,13 +452,58 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
           <div className="text-[11px] text-emerald-400/70">Connected</div>
         )}
 
+      {/* Grok Build / xAI — SuperGrok credit window + optional prepaid USD */}
+      {type === 'xai' &&
+        (usage.xai_credit_used_percent != null || usage.xai_prepaid_usd != null) && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-3 flex-wrap text-[11px] text-white/50">
+            {usage.xai_plan && (
+              <span><span className="text-white/30">Plan:</span> {usage.xai_plan}</span>
+            )}
+            {usage.xai_key_name && (
+              <span><span className="text-white/30">Key:</span> {usage.xai_key_name}</span>
+            )}
+          </div>
+          {usage.xai_credit_used_percent != null && (
+            <UsageBar
+              remaining={Math.round(100 - usage.xai_credit_used_percent)}
+              limit={100}
+              label={usage.xai_credit_label || 'Credits'}
+            />
+          )}
+          <div className="flex gap-4 text-[10px] text-white/30 flex-wrap">
+            {usage.xai_credit_reset != null && usage.xai_credit_reset > 0 && (
+              <span>
+                {usage.xai_credit_label || 'Credits'} reset:{' '}
+                {fmtResetEpoch(usage.xai_credit_reset)}
+              </span>
+            )}
+            {usage.xai_prepaid_usd != null && (
+              <span>Prepaid: ${usage.xai_prepaid_usd.toFixed(2)}</span>
+            )}
+            {usage.xai_on_demand_cap != null && usage.xai_on_demand_cap > 0 && (
+              <span>
+                On-demand: {usage.xai_on_demand_used ?? 0} / {usage.xai_on_demand_cap}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {type === 'xai' &&
+        usage.status === 'connected' &&
+        usage.xai_credit_used_percent == null &&
+        usage.xai_prepaid_usd == null && (
+          <div className="text-[11px] text-emerald-400/70">Connected</div>
+        )}
+
       {/* Google - account info only */}
       {type === 'google' && usage.status === 'connected' && !usage.account_email && (
         <div className="text-[11px] text-emerald-400/70">Connected</div>
       )}
 
       {/* Generic connected status */}
-      {!['anthropic', 'openai', 'cerebras', 'minimax', 'zai', 'google', 'kimi'].includes(type) && usage.status === 'connected' && (
+      {!['anthropic', 'openai', 'cerebras', 'minimax', 'zai', 'google', 'kimi', 'xai'].includes(type) && usage.status === 'connected' && (
         <div className="text-[11px] text-emerald-400/70">Connected</div>
       )}
     </div>

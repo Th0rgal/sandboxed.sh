@@ -283,6 +283,8 @@ repeated failure `repeat-loop-guard` · tool-call limits `context-budget`.
 - **Do not stamp `mode=blocked` from an inspect callback.** Inspect callbacks omit `[CTRL:]` on `awaiting_user`. A controller that copies the old trailer onto a callback is prompt drift: ingest already refuses inspect for mode, and re-emitting `mode=blocked` from a parked turn is how the board stays red after the writer moved on. Inspect, then write your own trailer from live state.
 - **Do not abandon the objective.** If dispatch is refused (disk, auth, capacity): keep the original project on its objective with a named infra blocker (`blocked:disk`, `blocked:auth`, `blocked:capacity`); open or fix the platform work under its own project (`sandboxed-sh`). Do not retitle or reuse the campaign session. Lido “Corriger et merger les PRs” becoming a P0 disk ticket is the incident — a platform outage is not a new campaign.
 - **Harness ≠ project blocked.** Missing CLI, wrong-arch binary, container `nsenter` failure: `mode=active` + `next=` switch backend / repair harness, or trailer `blocked:harness` ≤ 3 ticks then workaround. Structured write: `update_project_status(..., mode=blocked, blocker=harness)`. See the trailer rule above.
+- **Never persist `mode=blocked` + `next=inspect <uuid>`.** That is a dead writer, not a no-lane. ACK or redispatch; stay `mode=active`. A tick whose only act is inspect-without-redispatch is a defect (same as two ticks with no dispatch).
+- **No foreground `timeout` > 180s / `make test*` / `lake build` inside Codex bash.** Fire `remote-lean-build` (or an existing remote job) and poll the receipt. A 2h `make` in the Codex session stream dies on every deploy (`pending tool not replayed`).
 
 ## Optimisations d exécution (2026-08-10, leçons terrain)
 

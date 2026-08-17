@@ -3722,6 +3722,9 @@ enum DeployRefusal {
     SelfTarget,
     /// Last deploy was too recent (see [`DEPLOY_DEBOUNCE_SECS`]).
     Debounced { since_secs: u64 },
+    /// Live writers are mid-turn. Restarting SIGTERMs their Codex/Grok
+    /// bash and produces the pending-tool-not-replayed inspect loop.
+    WritersLive { count: usize },
 }
 
 impl DeployRefusal {
@@ -3730,6 +3733,7 @@ impl DeployRefusal {
             DeployRefusal::WrongService { .. } => StatusCode::CONFLICT,
             DeployRefusal::SelfTarget => StatusCode::CONFLICT,
             DeployRefusal::Debounced { .. } => StatusCode::TOO_MANY_REQUESTS,
+            DeployRefusal::WritersLive { .. } => StatusCode::CONFLICT,
         }
     }
 
@@ -3751,6 +3755,11 @@ impl DeployRefusal {
                  Pass force=true to override.",
                 since_secs, DEPLOY_DEBOUNCE_SECS
             ),
+            DeployRefusal::WritersLive { count } => format!(
+                "{count} mission(s) are currently running a harness turn. \
+                 Restarting now SIGTERMs in-flight Codex/Grok tools (pending-tool-not-replayed). \
+                 Wait for them to finish, or pass force=true if you accept killing those turns."
+            ),
         }
     }
 }
@@ -3763,6 +3772,7 @@ fn evaluate_deploy_request(
     calling_mission_on_this_service: bool,
     last_deploy_secs_ago: Option<u64>,
     force: bool,
+    live_writer_count: usize,
 ) -> Option<DeployRefusal> {
     if let (Some(actual), Some(expected)) = (actual_service, expected_service) {
         if actual != expected {
@@ -3774,6 +3784,11 @@ fn evaluate_deploy_request(
     }
     if !force && calling_mission_on_this_service {
         return Some(DeployRefusal::SelfTarget);
+    }
+    if !force && live_writer_count > 0 {
+        return Some(DeployRefusal::WritersLive {
+            count: live_writer_count,
+        });
     }
     match evaluate_debounce(last_deploy_secs_ago, DEPLOY_DEBOUNCE_SECS, force) {
         DebounceDecision::Allow => None,
@@ -3823,12 +3838,33 @@ pub async fn deploy_sandboxed_sh(
     let marker = deploy_marker_path();
     let last_age = deploy_marker_age_secs(&marker);
 
+    let live_writer_count = {
+        let store = state.control.get_mission_store().await;
+        let filter = crate::api::mission_store::MissionFilter {
+            attention_only: true,
+            ..Default::default()
+        };
+        match store.list_missions_filtered(&filter, 200, 0).await {
+            Ok(page) => page
+                .iter()
+                .filter(|mission| {
+                    crate::api::controller_honesty::is_live_writer_status(mission.status)
+                })
+                .count(),
+            Err(error) => {
+                tracing::warn!(%error, "deploy: could not list live writers; treating as zero");
+                0
+            }
+        }
+    };
+
     if let Some(refusal) = evaluate_deploy_request(
         Some(&actual_service),
         req.expected_service.as_deref(),
         calling_on_self,
         last_age,
         req.force,
+        live_writer_count,
     ) {
         return Err((refusal.http_status(), refusal.message()));
     }
@@ -6338,7 +6374,7 @@ mod tests {
 
     #[test]
     fn deploy_refuses_self_target_by_default() {
-        let r = evaluate_deploy_request(None, None, true, None, false);
+        let r = evaluate_deploy_request(None, None, true, None, false, 0);
         assert_eq!(r, Some(DeployRefusal::SelfTarget));
     }
 
@@ -6347,7 +6383,10 @@ mod tests {
         // force=true bypasses self-protection (caller explicitly accepts
         // the in-flight turn dying). Still respects debounce unless the
         // debounce is also force-bypassed, which it is.
-        assert_eq!(evaluate_deploy_request(None, None, true, None, true), None);
+        assert_eq!(
+            evaluate_deploy_request(None, None, true, None, true, 0),
+            None
+        );
     }
 
     #[test]
@@ -6355,11 +6394,11 @@ mod tests {
         // calling_on_self=false → no self-target refusal, no debounce
         // hit, no refusal at all.
         assert_eq!(
-            evaluate_deploy_request(None, None, false, None, false),
+            evaluate_deploy_request(None, None, false, None, false, 0),
             None
         );
         assert_eq!(
-            evaluate_deploy_request(None, None, false, Some(10_000), false),
+            evaluate_deploy_request(None, None, false, Some(10_000), false, 0),
             None
         );
     }
@@ -6369,7 +6408,7 @@ mod tests {
         // calling_on_self=false, but a deploy fired 30s ago — debounce
         // should refuse even though the self check passed.
         assert_eq!(
-            evaluate_deploy_request(None, None, false, Some(30), false),
+            evaluate_deploy_request(None, None, false, Some(30), false, 0),
             Some(DeployRefusal::Debounced { since_secs: 30 })
         );
     }
@@ -6377,7 +6416,7 @@ mod tests {
     #[test]
     fn deploy_force_bypasses_both_self_and_debounce() {
         assert_eq!(
-            evaluate_deploy_request(None, None, true, Some(0), true),
+            evaluate_deploy_request(None, None, true, Some(0), true, 0),
             None
         );
     }
@@ -6388,8 +6427,20 @@ mod tests {
         // meaningful one (self-target) so the agent sees the actual reason
         // instead of being told "wait a bit and retry" only to discover
         // it'd kill itself.
-        let r = evaluate_deploy_request(None, None, true, Some(30), false);
+        let r = evaluate_deploy_request(None, None, true, Some(30), false, 0);
         assert_eq!(r, Some(DeployRefusal::SelfTarget));
+    }
+
+    #[test]
+    fn deploy_refuses_live_writers_unless_forced() {
+        assert_eq!(
+            evaluate_deploy_request(None, None, false, None, false, 3),
+            Some(DeployRefusal::WritersLive { count: 3 })
+        );
+        assert_eq!(
+            evaluate_deploy_request(None, None, false, None, true, 3),
+            None
+        );
     }
 
     #[test]
@@ -6400,6 +6451,7 @@ mod tests {
             false,
             None,
             false,
+            0,
         );
         assert_eq!(
             r,
@@ -6418,6 +6470,7 @@ mod tests {
             false,
             None,
             false,
+            0,
         );
         assert_eq!(r, None);
     }

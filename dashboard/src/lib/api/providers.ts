@@ -390,6 +390,19 @@ export interface ProviderUsage {
     remaining_percent?: number;
     reset_at?: number;
   }>;
+  // Grok Build / xAI SuperGrok credits from the CLI billing API, plus optional
+  // prepaid USD from the Management API when a management key is configured.
+  xai_plan?: string;
+  xai_credit_label?: string;
+  xai_credit_used_percent?: number;
+  xai_credit_remaining_percent?: number;
+  xai_credit_reset?: number;
+  xai_credit_window_seconds?: number;
+  xai_on_demand_used?: number;
+  xai_on_demand_cap?: number;
+  xai_prepaid_usd?: number;
+  xai_key_name?: string;
+  xai_team_id?: string;
   // Codex (OpenAI ChatGPT subscription) limits — primary = 5h window,
   // secondary = weekly (7d) window. Reset fields are unix epoch seconds.
   codex_plan_type?: string;
