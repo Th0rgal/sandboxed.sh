@@ -8067,38 +8067,186 @@ async fn get_provider_usage(
                 "account_email": account_email,
             });
 
-            if api_key_opt.is_some() {
-                info.as_object_mut()
-                    .unwrap()
-                    .insert("status".to_string(), serde_json::json!("connected"));
-            } else if let Some(ref o) = oauth {
-                let refresh_rejected = provider_refresh_rejected
+            let refresh_rejected = oauth.as_ref().is_some_and(|o| {
+                provider_refresh_rejected
                     || provider_uuid
-                        .is_some_and(|uuid| oauth_refresh_token_is_dead(uuid, &o.refresh_token));
-                if refresh_rejected || oauth_token_expired(o.expires_at) {
-                    info.as_object_mut()
-                        .unwrap()
-                        .insert("status".to_string(), serde_json::json!("needs_reauth"));
-                    info.as_object_mut().unwrap().insert(
-                        "error".to_string(),
-                        serde_json::json!(if refresh_rejected {
-                            "xAI OAuth refresh token was rejected; reconnect Grok Build"
-                        } else {
-                            "xAI OAuth token expired; reconnect Grok Build"
-                        }),
-                    );
-                } else {
-                    info.as_object_mut()
-                        .unwrap()
-                        .insert("status".to_string(), serde_json::json!("connected"));
+                        .is_some_and(|uuid| oauth_refresh_token_is_dead(uuid, &o.refresh_token))
+            });
+
+            let mut oauth_token = oauth.as_ref().map(|o| o.access_token.clone());
+            if let (Some(o), Some(uuid)) = (oauth.as_ref(), provider_uuid) {
+                if !refresh_rejected
+                    && oauth_token_expired(o.expires_at)
+                    && !o.refresh_token.trim().is_empty()
+                {
+                    match refresh_oauth_token_internal(&ProviderType::Xai, &o.refresh_token).await {
+                        Ok((access, refresh, expires_at)) => {
+                            let creds = crate::ai_providers::OAuthCredentials {
+                                access_token: access.clone(),
+                                refresh_token: refresh,
+                                expires_at,
+                            };
+                            let _ = state.ai_providers.set_oauth_credentials(uuid, creds).await;
+                            oauth_token = Some(access);
+                        }
+                        Err(e) => {
+                            tracing::debug!("xAI usage token refresh failed: {e}");
+                        }
+                    }
                 }
-            } else {
-                info.as_object_mut().unwrap().insert(
-                    "error".to_string(),
-                    serde_json::json!("No credentials configured"),
-                );
             }
 
+            let mut snap = crate::api::xai_usage::XaiUsageSnapshot::default();
+
+            if let Some(token) = oauth_token.as_ref() {
+                if refresh_rejected
+                    || (oauth
+                        .as_ref()
+                        .is_some_and(|o| oauth_token_expired(o.expires_at))
+                        && oauth_token.as_deref()
+                            == oauth.as_ref().map(|o| o.access_token.as_str()))
+                {
+                    info["status"] = serde_json::json!("needs_reauth");
+                    info["error"] = serde_json::json!(if refresh_rejected {
+                        "xAI OAuth refresh token was rejected; reconnect Grok Build"
+                    } else {
+                        "xAI OAuth token expired; reconnect Grok Build"
+                    });
+                } else {
+                    let billing = client
+                        .get(crate::api::xai_usage::BILLING_URL)
+                        .header("Authorization", format!("Bearer {token}"))
+                        .header("x-xai-token-auth", crate::api::xai_usage::TOKEN_AUTH_HEADER)
+                        .header("Accept", "application/json")
+                        .send()
+                        .await;
+                    match billing {
+                        Ok(r) if r.status().is_success() => {
+                            if let Ok(payload) = r.json::<serde_json::Value>().await {
+                                snap = crate::api::xai_usage::parse_cli_billing(&payload);
+                            }
+                            info["status"] = serde_json::json!("connected");
+                        }
+                        Ok(r) => {
+                            let status = r.status().as_u16();
+                            if status == 401 || status == 403 {
+                                info["status"] = serde_json::json!("needs_reauth");
+                                info["error"] = serde_json::json!(format!(
+                                    "Grok billing endpoint returned HTTP {status}"
+                                ));
+                            } else {
+                                info["status"] = serde_json::json!("connected");
+                            }
+                        }
+                        Err(e) => {
+                            info["error"] =
+                                serde_json::json!(format!("Failed to reach Grok billing API: {e}"));
+                        }
+                    }
+
+                    if info.get("status").and_then(|v| v.as_str()) == Some("connected") {
+                        if let Ok(r) = client
+                            .get(crate::api::xai_usage::SETTINGS_URL)
+                            .header("Authorization", format!("Bearer {token}"))
+                            .header("x-xai-token-auth", crate::api::xai_usage::TOKEN_AUTH_HEADER)
+                            .header("Accept", "application/json")
+                            .send()
+                            .await
+                        {
+                            if r.status().is_success() {
+                                if let Ok(payload) = r.json::<serde_json::Value>().await {
+                                    if let Some(plan) =
+                                        crate::api::xai_usage::parse_cli_settings(&payload)
+                                    {
+                                        snap.plan = Some(plan);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if api_key_opt.is_none() {
+                info["error"] = serde_json::json!("No credentials configured");
+            }
+
+            if let Some(key) = api_key_opt.as_ref() {
+                match client
+                    .get(crate::api::xai_usage::API_KEY_INFO_URL)
+                    .header("Authorization", format!("Bearer {key}"))
+                    .header("Accept", "application/json")
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        if let Ok(payload) = r.json::<serde_json::Value>().await {
+                            snap = crate::api::xai_usage::merge_snapshots(
+                                snap,
+                                crate::api::xai_usage::parse_api_key_info(&payload),
+                            );
+                        }
+                        if info.get("status").is_none() {
+                            info["status"] = serde_json::json!("connected");
+                        }
+                    }
+                    Ok(r) => {
+                        let status = r.status().as_u16();
+                        if info.get("status").is_none() {
+                            if status == 401 || status == 403 {
+                                info["status"] = serde_json::json!("needs_reauth");
+                                info["error"] = serde_json::json!(format!(
+                                    "xAI API key endpoint returned HTTP {status}"
+                                ));
+                            } else {
+                                info["status"] = serde_json::json!("connected");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if info.get("error").is_none() && info.get("status").is_none() {
+                            info["error"] =
+                                serde_json::json!(format!("Failed to reach xAI API: {e}"));
+                        }
+                    }
+                }
+
+                if let (Some(team_id), Some(mgmt)) = (
+                    snap.team_id.as_deref(),
+                    std::env::var("XAI_MANAGEMENT_API_KEY")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty()),
+                ) {
+                    if let Ok(r) = client
+                        .get(crate::api::xai_usage::prepaid_balance_url(team_id))
+                        .header("Authorization", format!("Bearer {mgmt}"))
+                        .header("Accept", "application/json")
+                        .send()
+                        .await
+                    {
+                        if r.status().is_success() {
+                            if let Ok(payload) = r.json::<serde_json::Value>().await {
+                                if let Some(usd) =
+                                    crate::api::xai_usage::parse_prepaid_balance(&payload)
+                                {
+                                    snap.prepaid_usd = Some(usd);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if snap.has_displayable_quota() || snap.key_name.is_some() || snap.team_id.is_some() {
+                if info.get("status").and_then(|v| v.as_str()) != Some("needs_reauth") {
+                    info["status"] = serde_json::json!("connected");
+                }
+                if let Some(obj) = info.as_object_mut() {
+                    if let serde_json::Value::Object(fields) = snap.to_provider_fields() {
+                        obj.extend(fields);
+                    }
+                }
+            } else if info.get("error").is_none() && info.get("status").is_none() {
+                info["status"] = serde_json::json!("connected");
+            }
             info
         }
         _ => {
