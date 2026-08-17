@@ -38,6 +38,7 @@ mod github_auth;
 pub mod github_integration;
 pub(crate) mod grok_goal;
 pub(crate) mod grok_tool_bridge;
+pub(crate) mod kimi_usage;
 pub mod library;
 pub mod mcp;
 pub mod metadata_llm;

@@ -369,6 +369,27 @@ export interface ProviderUsage {
   zai_5h_reset?: number;
   zai_weekly_used_percent?: number;
   zai_weekly_reset?: number;
+  // Kimi Code subscription — used-percent windows from GET /coding/v1/usages.
+  // Optional Open Platform cash/voucher balances from /v1/users/me/balance.
+  kimi_plan?: string;
+  kimi_5h_used_percent?: number;
+  kimi_5h_remaining_percent?: number;
+  kimi_5h_reset?: number;
+  kimi_weekly_used_percent?: number;
+  kimi_weekly_remaining_percent?: number;
+  kimi_weekly_reset?: number;
+  kimi_available_balance?: number;
+  kimi_cash_balance?: number;
+  kimi_voucher_balance?: number;
+  kimi_windows?: Array<{
+    label: string;
+    used?: number;
+    limit?: number;
+    remaining?: number;
+    used_percent?: number;
+    remaining_percent?: number;
+    reset_at?: number;
+  }>;
   // Codex (OpenAI ChatGPT subscription) limits — primary = 5h window,
   // secondary = weekly (7d) window. Reset fields are unix epoch seconds.
   codex_plan_type?: string;

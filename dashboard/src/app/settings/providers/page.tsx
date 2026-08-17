@@ -399,13 +399,66 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
         <div className="text-[11px] text-emerald-400/70">Connected</div>
       )}
 
+      {/* Kimi Code subscription — 5h + weekly quota, optional Open Platform cash */}
+      {type === 'kimi' &&
+        (usage.kimi_weekly_used_percent != null ||
+          usage.kimi_5h_used_percent != null ||
+          usage.kimi_available_balance != null) && (
+        <div className="space-y-2">
+          {usage.kimi_plan && (
+            <div className="text-[11px] text-white/50">
+              <span className="text-white/30">Plan:</span> {usage.kimi_plan}
+            </div>
+          )}
+          {usage.kimi_5h_used_percent != null && (
+            <UsageBar
+              remaining={Math.round(100 - usage.kimi_5h_used_percent)}
+              limit={100}
+              label="5h window"
+            />
+          )}
+          {usage.kimi_weekly_used_percent != null && (
+            <UsageBar
+              remaining={Math.round(100 - usage.kimi_weekly_used_percent)}
+              limit={100}
+              label="Weekly"
+            />
+          )}
+          <div className="flex gap-4 text-[10px] text-white/30 flex-wrap">
+            {usage.kimi_5h_reset != null && usage.kimi_5h_reset > 0 && (
+              <span>5h reset: {fmtResetEpoch(usage.kimi_5h_reset)}</span>
+            )}
+            {usage.kimi_weekly_reset != null && usage.kimi_weekly_reset > 0 && (
+              <span>Weekly reset: {fmtResetEpoch(usage.kimi_weekly_reset)}</span>
+            )}
+            {usage.kimi_available_balance != null && (
+              <span>Available: ${usage.kimi_available_balance.toFixed(2)}</span>
+            )}
+            {usage.kimi_cash_balance != null && (
+              <span>Cash: ${usage.kimi_cash_balance.toFixed(2)}</span>
+            )}
+            {usage.kimi_voucher_balance != null && (
+              <span>Voucher: ${usage.kimi_voucher_balance.toFixed(2)}</span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {type === 'kimi' &&
+        usage.status === 'connected' &&
+        usage.kimi_weekly_used_percent == null &&
+        usage.kimi_5h_used_percent == null &&
+        usage.kimi_available_balance == null && (
+          <div className="text-[11px] text-emerald-400/70">Connected</div>
+        )}
+
       {/* Google - account info only */}
       {type === 'google' && usage.status === 'connected' && !usage.account_email && (
         <div className="text-[11px] text-emerald-400/70">Connected</div>
       )}
 
       {/* Generic connected status */}
-      {!['anthropic', 'openai', 'cerebras', 'minimax', 'zai', 'google'].includes(type) && usage.status === 'connected' && (
+      {!['anthropic', 'openai', 'cerebras', 'minimax', 'zai', 'google', 'kimi'].includes(type) && usage.status === 'connected' && (
         <div className="text-[11px] text-emerald-400/70">Connected</div>
       )}
     </div>
