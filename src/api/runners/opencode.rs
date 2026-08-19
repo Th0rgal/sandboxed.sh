@@ -131,7 +131,7 @@ pub async fn run_opencode_turn(
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         })
-        .map(|model| normalize_opencode_model_id(&model).into_owned());
+        .map(|model| canonicalize_opencode_cli_model(&model));
     let auth_state = detect_opencode_provider_auth(Some(app_working_dir));
     let has_openai = auth_state.has_openai;
     let has_anthropic = auth_state.has_anthropic;
@@ -146,6 +146,10 @@ pub async fn run_opencode_turn(
     let configured_providers = &auth_state.configured_providers;
     let provider_available = |provider: &str| -> bool {
         match provider {
+            // Injected per mission and backed by the sandboxed proxy / CLI-proxy.
+            // Must not require an OpenCode auth.json account (subscription Grok
+            // is OAuth inside CLIProxyAPI, not an xAI API key).
+            "builtin" => true,
             "anthropic" | "claude" => has_anthropic,
             "openai" | "codex" => has_openai,
             "google" | "gemini" => has_google,
@@ -281,7 +285,7 @@ pub async fn run_opencode_turn(
     let mut total_cache_creation_input_tokens: u64 = 0;
     let mut total_cache_read_input_tokens: u64 = 0;
     let agent_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent)
-        .map(|model| normalize_opencode_model_id(&model).into_owned());
+        .map(|model| canonicalize_opencode_cli_model(&model));
     if resolved_model.is_none() {
         resolved_model = agent_model.clone();
     }
@@ -2184,6 +2188,15 @@ fn opencode_model_argument(model: Option<&str>) -> Cow<'_, str> {
     }
 }
 
+/// Normalize aliases then wrap proxy-routed Grok/xAI ids as `builtin/…`
+/// *before* the runner inspects the first path segment as an OpenCode
+/// provider. Otherwise `xai/grok-4.6` is dropped when OpenCode auth.json
+/// has no xAI API key (subscription Grok is CLI-proxy OAuth).
+fn canonicalize_opencode_cli_model(model: &str) -> String {
+    let canonical = normalize_opencode_model_id(model);
+    opencode_model_argument(Some(canonical.as_ref())).into_owned()
+}
+
 fn model_is_xai_provider_id(model: &str) -> bool {
     model
         .split_once('/')
@@ -2211,7 +2224,10 @@ fn opencode_path(
 
 #[cfg(test)]
 mod path_tests {
-    use super::{normalize_opencode_model_id, opencode_model_argument, opencode_path};
+    use super::{
+        canonicalize_opencode_cli_model, normalize_opencode_model_id, opencode_model_argument,
+        opencode_path,
+    };
 
     #[test]
     fn legacy_kimi_k3_aliases_are_canonicalized() {
@@ -2271,6 +2287,26 @@ mod path_tests {
         assert_eq!(
             opencode_model_argument(Some("xai/grok-4.6")),
             "builtin/xai/grok-4.6"
+        );
+        // Wrap happens before the provider-availability check so the first
+        // path segment is `builtin`, not catalog `xai` (which is absent when
+        // Grok is CLI-proxy OAuth only).
+        assert_eq!(
+            canonicalize_opencode_cli_model("grok-4.6"),
+            "builtin/xai/grok-4.6"
+        );
+        assert_eq!(
+            canonicalize_opencode_cli_model("xai/grok-4.6"),
+            "builtin/xai/grok-4.6"
+        );
+        let provider = canonicalize_opencode_cli_model("grok-4.6")
+            .split_once('/')
+            .map(|(p, _)| p.to_string())
+            .expect("slash");
+        assert_eq!(provider, "builtin");
+        assert!(
+            !crate::api::providers::DEFAULT_CATALOG_PROVIDER_IDS.contains(&provider.as_str()),
+            "builtin must not be treated as a catalog provider that requires OpenCode auth"
         );
     }
 
