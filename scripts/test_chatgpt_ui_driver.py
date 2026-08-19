@@ -286,6 +286,16 @@ class FakePickerButton:
     async def inner_text(self) -> str:
         return self.text
 
+    async def is_visible(self) -> bool:
+        return True
+
+    @property
+    def first(self):
+        return self
+
+    async def count(self) -> int:
+        return 1
+
     async def click(self, **_kwargs) -> None:
         self.clicked = True
 
@@ -317,23 +327,33 @@ class AccountPickerHeading:
 
 
 class AccountPickerPage:
-    def __init__(self) -> None:
-        self.heading_visible = True
+    def __init__(self, heading_visible: bool = True, picker_after: int = 0) -> None:
+        self.heading_visible = heading_visible
+        self.picker_after = picker_after
+        self.waits = 0
         self.login = FakePickerButton("Log in")
-        self.saved = FakePickerButton("Fricoben\nben@example.com")
+        self.saved = FakePickerButton("Ada\nada@example.com")
         self.other = FakePickerButton("Log in to another account")
 
     def get_by_text(self, _text, exact=False):
         return AccountPickerHeading(self)
 
+    def get_by_role(self, role, name=None, exact=False):
+        if role != "button":
+            raise AssertionError(role)
+        if name is not None:
+            return self.login
+        return FakePickerButtons([self.login, self.saved, self.other])
+
     def locator(self, selector):
-        if selector == "button:visible":
-            return FakePickerButtons([self.login, self.saved, self.other])
         raise AssertionError(selector)
 
     async def wait_for_timeout(self, _timeout) -> None:
+        self.waits += 1
         if self.saved.clicked:
             self.heading_visible = False
+        elif self.picker_after and self.waits >= self.picker_after:
+            self.heading_visible = True
 
 
 class ChatGptUiDriverTests(unittest.TestCase):
@@ -344,7 +364,7 @@ class ChatGptUiDriverTests(unittest.TestCase):
         self.assertFalse(is_cloudflare_challenge_title(None))
 
     def test_saved_account_choice_ignores_login_chrome(self) -> None:
-        self.assertTrue(is_saved_account_choice("Fricoben\nben@example.com"))
+        self.assertTrue(is_saved_account_choice("Ada\nada@example.com"))
         self.assertFalse(is_saved_account_choice("Log in"))
         self.assertFalse(is_saved_account_choice("Log in to another account"))
         self.assertFalse(is_saved_account_choice("Create account"))
@@ -369,6 +389,13 @@ class ChatGptUiDriverTests(unittest.TestCase):
         self.assertFalse(page.login.clicked)
         self.assertFalse(page.other.clicked)
         self.assertFalse(page.heading_visible)
+
+    def test_saved_account_picker_waits_for_late_welcome_back_overlay(self) -> None:
+        page = AccountPickerPage(heading_visible=False, picker_after=3)
+        selected = asyncio.run(complete_saved_account_picker(page, timeout_ms=2_000))
+        self.assertTrue(selected)
+        self.assertGreaterEqual(page.waits, 3)
+        self.assertTrue(page.saved.clicked)
 
     def test_explicit_rate_limit_heading_is_classified(self) -> None:
         page = FakeComposerPage(False, False, rate_limited=True)

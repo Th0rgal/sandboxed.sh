@@ -515,22 +515,37 @@ async def wait_out_cloudflare(page, timeout_ms: int = 45_000) -> None:
     raise TransportUnavailable("Cloudflare interstitial did not clear")
 
 
-async def complete_saved_account_picker(page) -> bool:
+async def complete_saved_account_picker(page, timeout_ms: int = 25_000) -> bool:
     """Click the stored account on ChatGPT's welcome-back picker.
 
     After a CF challenge (or a cookie refresh) ChatGPT shows
     ``Welcome back / Choose an account to continue`` with the profile's
-    saved account. A visible ``Log in`` chrome on that overlay used to
-    be classified as ``auth_required``.
+    saved account. The card is a ``div[role=button]``, not a ``<button>``,
+    and the overlay often lands 15–20s after ``domcontentloaded``. A visible
+    ``Log in`` chrome on that overlay used to be classified as
+    ``auth_required``.
     """
     heading = page.get_by_text(ACCOUNT_PICKER_HEADING)
-    if not await heading.count():
+    login = page.get_by_role("button", name=re.compile(r"^(log in|sign in)$", re.I))
+    appeared = False
+    for _ in range(max(1, timeout_ms // 250)):
+        if await heading.count() and await heading.first.is_visible():
+            appeared = True
+            break
+        login_up = bool(await login.count() and await login.first.is_visible())
+        if not login_up:
+            return False
+        await page.wait_for_timeout(250)
+    if not appeared:
         return False
     emit("diagnostic", message="stage=account_picker")
-    buttons = page.locator("button:visible")
+    # Native ``<button>`` and the welcome-back account card (div role=button).
+    buttons = page.get_by_role("button")
     for index in range(await buttons.count()):
         button = buttons.nth(index)
         try:
+            if not await button.is_visible():
+                continue
             label = await button.inner_text()
         except Exception:
             continue
@@ -578,7 +593,7 @@ async def verify_authentication(page) -> None:
     # neither) and survive the rename — accept them as evidence before
     # concluding the account is gone.
     nav_evidence = page.locator(
-        'a[href*="/library"], a[href*="/scheduled"], a[href*="/images"], '
+        'a[href*="/library"], a[href*="/scheduled"], '
         '[data-testid="create-scheduled-task-button"], '
         '[data-testid="accounts-profile-button"]'
     )
