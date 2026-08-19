@@ -524,14 +524,34 @@ pub async fn get_project(
     if !is_plain_key(&slug) {
         return Err(bad_slug());
     }
-    let Some(slug) = resolve_roster_slug(&state.projects, &slug).map_err(store_err)? else {
-        return Err((StatusCode::NOT_FOUND, format!("unknown project '{slug}'")));
+    let requested = slug;
+    let resolved = resolve_roster_slug(&state.projects, &requested).map_err(store_err)?;
+    let lookup = resolved.as_deref().unwrap_or(&requested).to_string();
+    let missions = match state
+        .control
+        .collect_attention_missions_for_project(&lookup)
+        .await
+    {
+        Ok(missions) => missions,
+        Err(error) => {
+            tracing::warn!(project = %lookup, %error, "get_project: attention collect failed");
+            Vec::new()
+        }
     };
-    let project = state
-        .projects
-        .get_project(&slug)
-        .map_err(store_err)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown project '{slug}'")))?;
+    let slug = match resolved {
+        Some(slug) => slug,
+        None if !missions.is_empty() => lookup.clone(),
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("unknown project '{requested}'"),
+            ));
+        }
+    };
+    let project = match state.projects.get_project(&slug).map_err(store_err)? {
+        Some(project) => project,
+        None => synthetic_project_record(&slug),
+    };
     let grant = state.projects.get_grant(&slug).map_err(store_err)?;
     let tracks = collect_family_tracks(&state.projects, &slug).map_err(store_err)?;
     let decisions = state.projects.open_decisions(&slug).map_err(store_err)?;
@@ -545,17 +565,6 @@ pub async fn get_project(
         .map_err(store_err)?
         .map(follow_live_conversation);
     let items = load_project_items(&state, &slug).await?;
-    let missions = match state
-        .control
-        .collect_attention_missions_for_project(&slug)
-        .await
-    {
-        Ok(missions) => missions,
-        Err(error) => {
-            tracing::warn!(project = %slug, %error, "get_project: attention collect failed");
-            Vec::new()
-        }
-    };
     let mut project = project;
     if let Some(derived) = next_action_from_live_titles(
         missions
@@ -2315,6 +2324,26 @@ pub(crate) fn humanize_slug(slug: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Board-visible mission-tag project that has no roster row yet.
+fn synthetic_project_record(slug: &str) -> super::projects_store::ProjectRecord {
+    let now = chrono::Utc::now().to_rfc3339();
+    super::projects_store::ProjectRecord {
+        slug: slug.to_string(),
+        title: Some(humanize_slug(slug)),
+        objective: None,
+        status: "active".to_string(),
+        mode: None,
+        wait_ticks: 0,
+        next_action: None,
+        blocker: None,
+        controller_cron_id: None,
+        repository: None,
+        created_at: now.clone(),
+        updated_at: now,
+        mode_signal_at: None,
+    }
 }
 
 /// Roster/CTRL mode is the default; live work and parked decisions win.
