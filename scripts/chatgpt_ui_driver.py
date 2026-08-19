@@ -71,6 +71,7 @@ ACCOUNT_PICKER_SKIP = re.compile(
     r"log in to another account|create account|remove account|sign up for free|^log in$",
     re.I,
 )
+LOGIN_BUTTON_NAME = re.compile(r"^(log in|sign in)$", re.I)
 
 
 class ResumeNotFound(Exception):
@@ -485,6 +486,31 @@ def is_saved_account_choice(label: str) -> bool:
     return bool(SAVED_ACCOUNT_EMAIL.search(text))
 
 
+async def login_chrome_visible(page) -> bool:
+    login = page.get_by_role("button", name=LOGIN_BUTTON_NAME)
+    return bool(await login.count() and await login.first.is_visible())
+
+
+async def account_shell_visible(page) -> bool:
+    """Account-only chrome. Images/Deep research also exist on the logged-out home."""
+    account_controls = page.locator(
+        '[data-testid="accounts-profile-button"], '
+        'button[aria-label*="account" i], '
+        'button[aria-label*="profile" i]'
+    )
+    for index in range(await account_controls.count()):
+        if await account_controls.nth(index).is_visible():
+            return True
+    nav_evidence = page.locator(
+        'a[href*="/library"], a[href*="/scheduled"], '
+        '[data-testid="create-scheduled-task-button"]'
+    )
+    for index in range(await nav_evidence.count()):
+        if await nav_evidence.nth(index).is_visible():
+            return True
+    return False
+
+
 async def wait_out_cloudflare(page, timeout_ms: int = 45_000) -> None:
     """Wait for ChatGPT's Cloudflare interstitial to clear.
 
@@ -526,14 +552,12 @@ async def complete_saved_account_picker(page, timeout_ms: int = 25_000) -> bool:
     ``auth_required``.
     """
     heading = page.get_by_text(ACCOUNT_PICKER_HEADING)
-    login = page.get_by_role("button", name=re.compile(r"^(log in|sign in)$", re.I))
     appeared = False
     for _ in range(max(1, timeout_ms // 250)):
         if await heading.count() and await heading.first.is_visible():
             appeared = True
             break
-        login_up = bool(await login.count() and await login.first.is_visible())
-        if not login_up:
+        if not await login_chrome_visible(page):
             return False
         await page.wait_for_timeout(250)
     if not appeared:
@@ -553,11 +577,20 @@ async def complete_saved_account_picker(page, timeout_ms: int = 25_000) -> bool:
             continue
         await button.click(timeout=8_000)
         emit("diagnostic", message="stage=account_picker_selected")
-        for _ in range(40):
-            if not await heading.count() or not await heading.first.is_visible():
+        for _ in range(80):
+            heading_up = bool(
+                await heading.count() and await heading.first.is_visible()
+            )
+            if (
+                not heading_up
+                and not await login_chrome_visible(page)
+                and await account_shell_visible(page)
+            ):
                 return True
             await page.wait_for_timeout(250)
-        return True
+        if await account_shell_visible(page):
+            return True
+        raise PermissionError("login required")
     raise PermissionError(
         "welcome-back account picker is visible but no saved account could be selected"
     )
@@ -565,42 +598,16 @@ async def complete_saved_account_picker(page, timeout_ms: int = 25_000) -> bool:
 
 async def verify_authentication(page) -> None:
     """Require account-only evidence of an authenticated session."""
-    login = page.get_by_role("button", name=re.compile(r"log in|sign in", re.I)).first
-    if "/auth/" in page.url or (await login.count() and await login.is_visible()):
+    if "/auth/" in page.url or await login_chrome_visible(page):
         if await complete_saved_account_picker(page):
-            login = page.get_by_role("button", name=re.compile(r"log in|sign in", re.I)).first
-        if "/auth/" in page.url or (await login.count() and await login.is_visible()):
-            raise PermissionError("login required")
-
-    # Anonymous ChatGPT can expose a working composer, so its presence is not
-    # authentication evidence. Require an account-only control and fail closed
-    # when a UI rollout makes that evidence unavailable.
-    account_controls = page.locator(
-        '[data-testid="accounts-profile-button"], '
-        'button[aria-label*="account" i], '
-        'button[aria-label*="profile" i]'
-    )
-    for index in range(await account_controls.count()):
-        if await account_controls.nth(index).is_visible():
             emit("diagnostic", message="stage=account_confirmed")
             return
+        if "/auth/" in page.url or await login_chrome_visible(page):
+            raise PermissionError("login required")
 
-    # A UI rollout renamed the profile button and this check began failing
-    # closed on PROVISIONED profiles: measured 2026-08-06, all 12 pool
-    # profiles held session cookies valid for ~90 days while every mission
-    # died in seconds with "login is required". The sidebar's Library and
-    # Scheduled entries are account-only surfaces (anonymous ChatGPT has
-    # neither) and survive the rename — accept them as evidence before
-    # concluding the account is gone.
-    nav_evidence = page.locator(
-        'a[href*="/library"], a[href*="/scheduled"], '
-        '[data-testid="create-scheduled-task-button"], '
-        '[data-testid="accounts-profile-button"]'
-    )
-    for index in range(await nav_evidence.count()):
-        if await nav_evidence.nth(index).is_visible():
-            emit("diagnostic", message="stage=account_confirmed_via_nav")
-            return
+    if await account_shell_visible(page):
+        emit("diagnostic", message="stage=account_confirmed")
+        return
     # Guard contract: name what was probed and where. Without this, the
     # 2026-08-06 false positive read as "login required" and the dispatching
     # agent asked the operator to re-provision 12 accounts that were fine.

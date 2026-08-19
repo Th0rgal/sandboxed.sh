@@ -279,22 +279,23 @@ class StuckCloudflarePage:
 
 
 class FakePickerButton:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, visible: bool = True) -> None:
         self.text = text
+        self.visible = visible
         self.clicked = False
 
     async def inner_text(self) -> str:
         return self.text
 
     async def is_visible(self) -> bool:
-        return True
+        return self.visible
 
     @property
     def first(self):
         return self
 
     async def count(self) -> int:
-        return 1
+        return 1 if self.visible else 0
 
     async def click(self, **_kwargs) -> None:
         self.clicked = True
@@ -346,12 +347,17 @@ class AccountPickerPage:
         return FakePickerButtons([self.login, self.saved, self.other])
 
     def locator(self, selector):
+        if "library" in selector or "scheduled" in selector or "accounts-profile" in selector:
+            if self.heading_visible:
+                return FakePickerButtons([])
+            return FakePickerButtons([FakePickerButton("Library")])
         raise AssertionError(selector)
 
     async def wait_for_timeout(self, _timeout) -> None:
         self.waits += 1
         if self.saved.clicked:
             self.heading_visible = False
+            self.login.visible = False
         elif self.picker_after and self.waits >= self.picker_after:
             self.heading_visible = True
 
