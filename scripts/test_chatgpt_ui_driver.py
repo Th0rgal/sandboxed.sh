@@ -4,6 +4,10 @@ import asyncio
 import unittest
 
 from scripts.chatgpt_ui_driver import (
+    complete_saved_account_picker,
+    is_cloudflare_challenge_title,
+    is_saved_account_choice,
+    wait_out_cloudflare,
     MODEL_PICKER_READY_TIMEOUT_MS,
     SEND_BUTTON_NAME,
     SEND_CONTROL_TESTIDS,
@@ -11,6 +15,7 @@ from scripts.chatgpt_ui_driver import (
     STOP_CONTROL_TESTIDS,
     RateLimited,
     RATE_LIMIT_MODAL_TESTID,
+    TransportUnavailable,
     choose_intelligence_model,
     click_send_control,
     close_context_quietly,
@@ -213,6 +218,12 @@ class HydratingConversationPage:
     async def goto(self, url, **_kwargs) -> None:
         self.url = url
 
+    async def title(self) -> str:
+        return "ChatGPT"
+
+    async def inner_text(self, _selector) -> str:
+        return ""
+
     def locator(self, selector):
         if selector == f'[data-testid="{RATE_LIMIT_MODAL_TESTID}"]:visible':
             return HydratingLocator([0])
@@ -240,7 +251,125 @@ class HydratingConversationPage:
         return HydratingLocator([0 if exact else 0])
 
 
+class CloudflareClearingPage:
+    def __init__(self) -> None:
+        self.titles = ["Just a moment...", "Just a moment...", "ChatGPT"]
+        self.bodies = ["Verifying...", "Verifying...", "Welcome back"]
+        self.index = 0
+
+    async def title(self) -> str:
+        return self.titles[min(self.index, len(self.titles) - 1)]
+
+    async def inner_text(self, _selector) -> str:
+        return self.bodies[min(self.index, len(self.bodies) - 1)]
+
+    async def wait_for_timeout(self, _timeout) -> None:
+        self.index += 1
+
+
+class StuckCloudflarePage:
+    async def title(self) -> str:
+        return "Just a moment..."
+
+    async def inner_text(self, _selector) -> str:
+        return "Verify you are human"
+
+    async def wait_for_timeout(self, _timeout) -> None:
+        return None
+
+
+class FakePickerButton:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.clicked = False
+
+    async def inner_text(self) -> str:
+        return self.text
+
+    async def click(self, **_kwargs) -> None:
+        self.clicked = True
+
+
+class FakePickerButtons:
+    def __init__(self, buttons) -> None:
+        self.buttons = buttons
+
+    async def count(self) -> int:
+        return len(self.buttons)
+
+    def nth(self, index):
+        return self.buttons[index]
+
+
+class AccountPickerHeading:
+    def __init__(self, page) -> None:
+        self.page = page
+
+    async def count(self) -> int:
+        return 1 if self.page.heading_visible else 0
+
+    @property
+    def first(self):
+        return self
+
+    async def is_visible(self) -> bool:
+        return self.page.heading_visible
+
+
+class AccountPickerPage:
+    def __init__(self) -> None:
+        self.heading_visible = True
+        self.login = FakePickerButton("Log in")
+        self.saved = FakePickerButton("Fricoben\nben@example.com")
+        self.other = FakePickerButton("Log in to another account")
+
+    def get_by_text(self, _text, exact=False):
+        return AccountPickerHeading(self)
+
+    def locator(self, selector):
+        if selector == "button:visible":
+            return FakePickerButtons([self.login, self.saved, self.other])
+        raise AssertionError(selector)
+
+    async def wait_for_timeout(self, _timeout) -> None:
+        if self.saved.clicked:
+            self.heading_visible = False
+
+
 class ChatGptUiDriverTests(unittest.TestCase):
+    def test_cloudflare_challenge_titles_are_classified(self) -> None:
+        self.assertTrue(is_cloudflare_challenge_title("Just a moment..."))
+        self.assertTrue(is_cloudflare_challenge_title("Verifying..."))
+        self.assertFalse(is_cloudflare_challenge_title("ChatGPT"))
+        self.assertFalse(is_cloudflare_challenge_title(None))
+
+    def test_saved_account_choice_ignores_login_chrome(self) -> None:
+        self.assertTrue(is_saved_account_choice("Fricoben\nben@example.com"))
+        self.assertFalse(is_saved_account_choice("Log in"))
+        self.assertFalse(is_saved_account_choice("Log in to another account"))
+        self.assertFalse(is_saved_account_choice("Create account"))
+        self.assertFalse(is_saved_account_choice("Sign up for free"))
+        self.assertFalse(is_saved_account_choice("Remove account"))
+        self.assertFalse(is_saved_account_choice(""))
+
+    def test_cloudflare_wait_returns_once_the_interstitial_clears(self) -> None:
+        page = CloudflareClearingPage()
+        asyncio.run(wait_out_cloudflare(page, timeout_ms=2_000))
+        self.assertGreaterEqual(page.index, 2)
+
+    def test_cloudflare_wait_fails_closed_when_stuck(self) -> None:
+        with self.assertRaises(TransportUnavailable):
+            asyncio.run(wait_out_cloudflare(StuckCloudflarePage(), timeout_ms=1_000))
+
+    def test_saved_account_picker_clicks_the_email_card_not_log_in(self) -> None:
+        page = AccountPickerPage()
+        selected = asyncio.run(complete_saved_account_picker(page))
+        self.assertTrue(selected)
+        self.assertTrue(page.saved.clicked)
+        self.assertFalse(page.login.clicked)
+        self.assertFalse(page.other.clicked)
+        self.assertFalse(page.heading_visible)
+
     def test_explicit_rate_limit_heading_is_classified(self) -> None:
         page = FakeComposerPage(False, False, rate_limited=True)
 

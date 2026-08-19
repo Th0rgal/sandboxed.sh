@@ -206,7 +206,12 @@ fn safe_driver_diagnostic(message: &str) -> Option<&str> {
         | "compatibility=chatgpt-ui-v2; browser=firefox"
         | "compatibility=chatgpt-ui-v2; browser=webkit"
         | "stage=page_loaded"
+        | "stage=cloudflare_wait"
+        | "stage=cloudflare_cleared"
+        | "stage=account_picker"
+        | "stage=account_picker_selected"
         | "stage=account_confirmed"
+        | "stage=account_confirmed_via_nav"
         | "stage=blank_route"
         | "stage=composer_ready"
         | "stage=send_button_fallback"
@@ -1406,6 +1411,18 @@ mod tests {
         assert_eq!(
             safe_driver_diagnostic("stage=stop_button_fallback"),
             Some("stage=stop_button_fallback")
+        );
+        assert_eq!(
+            safe_driver_diagnostic("stage=cloudflare_wait"),
+            Some("stage=cloudflare_wait")
+        );
+        assert_eq!(
+            safe_driver_diagnostic("stage=account_picker_selected"),
+            Some("stage=account_picker_selected")
+        );
+        assert_eq!(
+            safe_driver_diagnostic("stage=account_confirmed_via_nav"),
+            Some("stage=account_confirmed_via_nav")
         );
         assert_eq!(
             safe_driver_diagnostic("stage=page_loaded account=user@example.com"),

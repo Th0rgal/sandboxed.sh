@@ -61,6 +61,16 @@ RATE_LIMIT_MODAL_TESTID = "modal-conversation-history-rate-limit"
 # durability protocol ever emits — never titles, prompts, or response text.
 CONVERSATION_PATH_RE = re.compile(r"^/c/[A-Za-z0-9-]{8,64}$")
 CHATGPT_HOSTS = {"chatgpt.com", "chat.openai.com"}
+CLOUDFLARE_TITLE = re.compile(r"just a moment|verifying", re.I)
+CLOUDFLARE_BODY = re.compile(
+    r"verify you are human|verifying\.\.\.|just a moment", re.I
+)
+ACCOUNT_PICKER_HEADING = re.compile(r"choose an account to continue", re.I)
+SAVED_ACCOUNT_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+ACCOUNT_PICKER_SKIP = re.compile(
+    r"log in to another account|create account|remove account|sign up for free|^log in$",
+    re.I,
+)
 
 
 class ResumeNotFound(Exception):
@@ -463,11 +473,89 @@ async def close_context_quietly(context) -> None:
         pass
 
 
+def is_cloudflare_challenge_title(title: str | None) -> bool:
+    return bool(CLOUDFLARE_TITLE.search(title or ""))
+
+
+def is_saved_account_choice(label: str) -> bool:
+    """True for a welcome-back saved-account card, never for Log in / Sign up."""
+    text = (label or "").strip()
+    if not text or ACCOUNT_PICKER_SKIP.search(text):
+        return False
+    return bool(SAVED_ACCOUNT_EMAIL.search(text))
+
+
+async def wait_out_cloudflare(page, timeout_ms: int = 45_000) -> None:
+    """Wait for ChatGPT's Cloudflare interstitial to clear.
+
+    Headed Chromium through the DGX SOCKS exit often sits on
+    ``Just a moment...`` / ``Verifying...`` for several seconds. Treating
+    that page as a logout quarantines every pool slot.
+    """
+    waited = False
+    for _ in range(max(1, timeout_ms // 500)):
+        title = ""
+        try:
+            title = await page.title()
+        except Exception:
+            title = ""
+        body = ""
+        try:
+            body = await page.inner_text("body")
+        except Exception:
+            body = ""
+        if not is_cloudflare_challenge_title(title) and not CLOUDFLARE_BODY.search(body or ""):
+            if waited:
+                emit("diagnostic", message="stage=cloudflare_cleared")
+            return
+        if not waited:
+            emit("diagnostic", message="stage=cloudflare_wait")
+            waited = True
+        await page.wait_for_timeout(500)
+    raise TransportUnavailable("Cloudflare interstitial did not clear")
+
+
+async def complete_saved_account_picker(page) -> bool:
+    """Click the stored account on ChatGPT's welcome-back picker.
+
+    After a CF challenge (or a cookie refresh) ChatGPT shows
+    ``Welcome back / Choose an account to continue`` with the profile's
+    saved account. A visible ``Log in`` chrome on that overlay used to
+    be classified as ``auth_required``.
+    """
+    heading = page.get_by_text(ACCOUNT_PICKER_HEADING)
+    if not await heading.count():
+        return False
+    emit("diagnostic", message="stage=account_picker")
+    buttons = page.locator("button:visible")
+    for index in range(await buttons.count()):
+        button = buttons.nth(index)
+        try:
+            label = await button.inner_text()
+        except Exception:
+            continue
+        if not is_saved_account_choice(label):
+            continue
+        await button.click(timeout=8_000)
+        emit("diagnostic", message="stage=account_picker_selected")
+        for _ in range(40):
+            if not await heading.count() or not await heading.first.is_visible():
+                return True
+            await page.wait_for_timeout(250)
+        return True
+    raise PermissionError(
+        "welcome-back account picker is visible but no saved account could be selected"
+    )
+
+
 async def verify_authentication(page) -> None:
     """Require account-only evidence of an authenticated session."""
     login = page.get_by_role("button", name=re.compile(r"log in|sign in", re.I)).first
     if "/auth/" in page.url or (await login.count() and await login.is_visible()):
-        raise PermissionError("login required")
+        if await complete_saved_account_picker(page):
+            login = page.get_by_role("button", name=re.compile(r"log in|sign in", re.I)).first
+        if "/auth/" in page.url or (await login.count() and await login.is_visible()):
+            raise PermissionError("login required")
 
     # Anonymous ChatGPT can expose a working composer, so its presence is not
     # authentication evidence. Require an account-only control and fail closed
@@ -490,8 +578,9 @@ async def verify_authentication(page) -> None:
     # neither) and survive the rename — accept them as evidence before
     # concluding the account is gone.
     nav_evidence = page.locator(
-        'a[href*="/library"], a[href*="/scheduled"], '
-        '[data-testid="create-scheduled-task-button"]'
+        'a[href*="/library"], a[href*="/scheduled"], a[href*="/images"], '
+        '[data-testid="create-scheduled-task-button"], '
+        '[data-testid="accounts-profile-button"]'
     )
     for index in range(await nav_evidence.count()):
         if await nav_evidence.nth(index).is_visible():
@@ -525,6 +614,8 @@ async def establish_resumed_chat(page, conversation_path: str, message: str) -> 
         timeout=60_000,
     )
     emit("diagnostic", message="stage=resume_route")
+    await wait_out_cloudflare(page)
+    await complete_saved_account_picker(page)
     await raise_if_rate_limited(page)
     await verify_authentication(page)
     # Unknown or deleted conversations redirect away from the recorded route.
@@ -553,6 +644,8 @@ async def establish_continued_chat(page, conversation_path: str) -> int:
         timeout=60_000,
     )
     emit("diagnostic", message="stage=continuation_route")
+    await wait_out_cloudflare(page)
+    await complete_saved_account_picker(page)
     await raise_if_rate_limited(page)
     await verify_authentication(page)
     parsed = urlparse(page.url)
@@ -582,6 +675,8 @@ async def establish_fresh_chat(page) -> int:
     """Prove an authenticated, settled blank chat before observing responses."""
     await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60_000)
     emit("diagnostic", message="stage=page_loaded")
+    await wait_out_cloudflare(page)
+    await complete_saved_account_picker(page)
     await raise_if_rate_limited(page)
     await verify_authentication(page)
 

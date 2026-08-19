@@ -61,10 +61,14 @@ DOM_PROBE = """() => {
     .map((e) => (e.innerText || '').trim())
     .filter(Boolean);
   const body = document.body ? document.body.innerText || '' : '';
+  const title = document.title || '';
   return {
     login_visible: texts.some((t) => /^(log in|se connecter|sign up|s'inscrire)$/i.test(t)),
-    authed_nav: texts.includes('Library') && texts.includes('Scheduled'),
+    authed_nav: texts.includes('Library') || texts.includes('Images') || texts.includes('Scheduled')
+      || texts.includes('Deep research'),
+    account_picker: /choose an account to continue|welcome back/i.test(body),
     challenge: /verify you are human|verifying\\.\\.\\.|just a moment/i.test(body)
+      || /just a moment|verifying/i.test(title)
       || !!document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
   };
 }"""
@@ -168,6 +172,11 @@ def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
 
     if found.get("challenge"):
         return "challenge"
+    # A welcome-back picker means the profile still has a saved session.
+    # The driver clicks through it; treating the overlay Log in chrome as
+    # logout quarantines every slot.
+    if found.get("account_picker"):
+        return "logged_in"
     if found.get("login_visible"):
         return "logged_out"
     if found.get("authed_nav"):
