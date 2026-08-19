@@ -1011,6 +1011,26 @@ mod campaign_guard_tests {
         assert_eq!(updated.title.as_deref(), Some("Repair Lido PR #88"));
     }
 
+    #[tokio::test]
+    async fn untagged_new_mission_opening_message_is_accepted() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .expect("create");
+        let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
+        apply_writer_reuse_or_conflict(
+            &store,
+            &loaded,
+            None,
+            None,
+            None,
+            Some("Continue from PR #105. Launch P-TOPUP-2 and P-ALLOC-1.".into()),
+        )
+        .await
+        .expect("blank writer first message must not 409");
+    }
+
     #[test]
     fn dispatch_gate_blocks_paused_and_archived_only() {
         // paused → 423 Locked; archived → 409 Conflict.
@@ -30902,6 +30922,23 @@ And the report:
         assert_eq!(
             normalize_model_override_for_backend(Some("opencode"), " KIMI-K3-256K "),
             Some("kimi/k3-256k".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_model_override_for_backend_maps_bare_grok_onto_xai() {
+        assert_eq!(
+            normalize_model_override_for_backend(Some("opencode"), "grok-4.6"),
+            Some("xai/grok-4.6".to_string())
+        );
+        assert_eq!(
+            normalize_model_override_for_backend(Some("opencode"), "xai/grok-4.6"),
+            Some("xai/grok-4.6".to_string())
+        );
+        // Native grok backend keeps the bare CLI id.
+        assert_eq!(
+            normalize_model_override_for_backend(Some("grok"), "grok-4.6"),
+            Some("grok-4.6".to_string())
         );
     }
 

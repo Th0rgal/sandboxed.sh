@@ -38,11 +38,21 @@ const PROXY_STREAM_INACTIVITY_CAP: std::time::Duration = std::time::Duration::fr
 /// Older Hermes skills used `kimi-k3`. OpenCode parses a slash-less value as
 /// a provider name with an empty model and fails with `Model not found:
 /// kimi-k3/`, even when the Kimi subscription itself is healthy.
+///
+/// Bare Grok ids (`grok-4.6`, `grok-4.5`, …) have the same trap: OpenCode
+/// records `providerID=grok-4.6, id=""` and the local server returns the
+/// opaque `Unexpected server error` that killed probe `b3dd8b65`. Map them
+/// onto the xAI provider prefix so the CLI argument can then be wrapped
+/// through `builtin/` (CLI-proxy OAuth + stream liveness).
 pub(crate) fn normalize_opencode_model_id(model: &str) -> Cow<'_, str> {
     let model = model.trim();
-    match model.to_ascii_lowercase().as_str() {
+    let lower = model.to_ascii_lowercase();
+    match lower.as_str() {
         "kimi-k3" => Cow::Borrowed("kimi/k3"),
         "kimi-k3-256k" => Cow::Borrowed("kimi/k3-256k"),
+        _ if !lower.contains('/') && lower.starts_with("grok-") => {
+            Cow::Owned(format!("xai/{lower}"))
+        }
         _ => Cow::Borrowed(model),
     }
 }
@@ -370,6 +380,26 @@ pub async fn run_opencode_turn(
     };
 
     let opencode_model = opencode_model_argument(resolved_model.as_deref());
+    // OpenCode's `--model` parser splits on the first `/`. A slash-less
+    // value becomes provider=<id> model="" and the CLI's local server
+    // answers with a generic 500 (`Unexpected server error`) instead of
+    // `Model not found`. Fail here with the actual id so a mis-dispatched
+    // probe is diagnosable.
+    if !opencode_model.contains('/') {
+        let err_msg = format!(
+            "OpenCode model '{opencode_model}' has no provider prefix. \
+             OpenCode treats the first path segment as the provider, so this \
+             becomes '{opencode_model}/' and fails with an opaque server error. \
+             Use provider/model (e.g. xai/grok-4.6, builtin/smart, zai/glm-5.2)."
+        );
+        tracing::error!(mission_id = %mission_id, "{}", err_msg);
+        let _ = events_tx.send(AgentEvent::Error {
+            message: err_msg.clone(),
+            mission_id: Some(mission_id),
+            resumable: true,
+        });
+        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+    }
     if opencode_model.starts_with("builtin/") {
         ensure_opencode_provider_for_model(
             &opencode_config_dir_host,
@@ -2132,13 +2162,32 @@ pub async fn run_opencode_turn(
 /// the remainder as the upstream model. Route the exact Grok CLI bridge model
 /// through the existing `builtin` provider so the proxy receives the complete
 /// `grok-cli/grok-4.5` chain id instead of the ambiguous bare `grok-4.5`.
+///
+/// Direct `xai/grok-*` is wrapped the same way. OpenCode's native `@ai-sdk/xai`
+/// adapter talks to `api.x.ai` with an API key (or, worse, an OAuth token
+/// stuffed into `XAI_API_KEY`). Subscription Grok lives on CLIProxyAPI's
+/// Responses transport; going through `builtin` is what:
+///   1. authenticates with the loopback proxy (OAuth stays inside CLIProxyAPI),
+///   2. sends `x-sandboxed-mission-id` so reasoning chunks reset the idle
+///      watchdog (`proxy_liveness`) instead of dying after 300s of harness
+///      silence — the stall that killed writer `4d823bd9` gen1.
 fn opencode_model_argument(model: Option<&str>) -> Cow<'_, str> {
     let model = model.unwrap_or("builtin/fast");
-    if crate::api::grok_tool_bridge::is_bridge_model(model) {
+    if model.starts_with("builtin/") {
+        Cow::Borrowed(model)
+    } else if crate::api::grok_tool_bridge::is_bridge_model(model)
+        || model_is_xai_provider_id(model)
+    {
         Cow::Owned(format!("builtin/{model}"))
     } else {
         Cow::Borrowed(model)
     }
+}
+
+fn model_is_xai_provider_id(model: &str) -> bool {
+    model
+        .split_once('/')
+        .is_some_and(|(provider, rest)| provider.eq_ignore_ascii_case("xai") && !rest.is_empty())
 }
 
 fn opencode_path(
@@ -2187,9 +2236,42 @@ mod path_tests {
         );
         assert_eq!(
             opencode_model_argument(Some("xai/grok-4.5")),
-            "xai/grok-4.5"
+            "builtin/xai/grok-4.5"
+        );
+        assert_eq!(
+            opencode_model_argument(Some("builtin/xai/grok-4.6")),
+            "builtin/xai/grok-4.6"
         );
         assert_eq!(opencode_model_argument(None), "builtin/fast");
+    }
+
+    #[test]
+    fn bare_grok_ids_are_canonicalized_onto_xai_then_builtin_proxy() {
+        assert_eq!(normalize_opencode_model_id("grok-4.6"), "xai/grok-4.6");
+        assert_eq!(
+            normalize_opencode_model_id(" Grok-4.6-latest "),
+            "xai/grok-4.6-latest"
+        );
+        assert_eq!(normalize_opencode_model_id("grok-4.5"), "xai/grok-4.5");
+        assert_eq!(
+            normalize_opencode_model_id("grok-build-0.1"),
+            "xai/grok-build-0.1"
+        );
+        // Already-prefixed ids must not be double-wrapped at normalize time.
+        assert_eq!(normalize_opencode_model_id("xai/grok-4.6"), "xai/grok-4.6");
+        assert_eq!(
+            normalize_opencode_model_id("grok-cli/grok-4.5"),
+            "grok-cli/grok-4.5"
+        );
+        let canonical = normalize_opencode_model_id("grok-4.6");
+        assert_eq!(
+            opencode_model_argument(Some(canonical.as_ref())),
+            "builtin/xai/grok-4.6"
+        );
+        assert_eq!(
+            opencode_model_argument(Some("xai/grok-4.6")),
+            "builtin/xai/grok-4.6"
+        );
     }
 
     #[test]

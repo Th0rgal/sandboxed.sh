@@ -86,6 +86,14 @@ fn dispatch_is_different_work(stored: &WriterIdentity, patch: &WriterIdentityPat
         return false;
     }
 
+    // An untagged mission has no previous identity to protect. The first
+    // prompt on a new writer routinely names a PR (`#105`) or campaign
+    // (`P-TOPUP-2`); treating that as a silent recycle 409s the operator's
+    // opening message (mission 374fac82, 2026-08-19).
+    if !stored_has_writer_identity(stored) {
+        return false;
+    }
+
     let stored_pr = stored.github_pr.as_deref().map(canonical_github_pr);
     let stored_pr_number = stored_pr
         .as_ref()
@@ -177,6 +185,14 @@ fn campaign_tokens_in(hint: &str) -> Vec<String> {
         i += 1;
     }
     tokens
+}
+
+fn stored_has_writer_identity(stored: &WriterIdentity) -> bool {
+    field_nonempty(&stored.github_pr) || field_nonempty(&stored.track)
+}
+
+fn field_nonempty(value: &Option<String>) -> bool {
+    value.as_deref().is_some_and(|s| !s.trim().is_empty())
 }
 
 fn stored_identity_covers(track: &str, github_pr: Option<&str>, token: &str) -> bool {
@@ -300,5 +316,38 @@ mod tests {
         )
         .expect_err("different PR is different work");
         assert_eq!(err.error, "writer_identity_stale");
+    }
+
+    #[test]
+    fn untagged_new_mission_may_name_a_pr_and_campaign() {
+        let next = apply_writer_reuse(
+            &WriterIdentity::default(),
+            &WriterIdentityPatch {
+                work_hint: Some(
+                    "Base: continue from PR #105. Launch P-TOPUP-2 and P-ALLOC-1.".into(),
+                ),
+                ..WriterIdentityPatch::default()
+            },
+        )
+        .expect("first message on a blank writer is not a recycle");
+        assert_eq!(next.github_pr, None);
+        assert_eq!(next.track, None);
+    }
+
+    #[test]
+    fn whitespace_only_tags_are_untagged() {
+        let stored = WriterIdentity {
+            github_pr: Some("  ".into()),
+            track: Some("".into()),
+            title: None,
+        };
+        apply_writer_reuse(
+            &stored,
+            &WriterIdentityPatch {
+                work_hint: Some("Implement P-SSZ-1 on PR #105".into()),
+                ..WriterIdentityPatch::default()
+            },
+        )
+        .expect("blank tags are not a stale identity");
     }
 }

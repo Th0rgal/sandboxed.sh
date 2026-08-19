@@ -11148,6 +11148,42 @@ mod tests {
         assert_eq!(mission_header, "00000000-0000-0000-0000-000000000123");
     }
 
+    #[test]
+    fn ensure_opencode_provider_builtin_accepts_xai_slash_model_id() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("ws");
+        let app_dir = temp.path().join("app");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // `--model builtin/xai/grok-4.6` splits as provider=builtin,
+        // model=xai/grok-4.6. The model key must keep the slash so the
+        // proxy sees the full provider/model passthrough id.
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "builtin/xai/grok-4.6",
+            "127.0.0.1",
+            Some("00000000-0000-0000-0000-000000000123"),
+        );
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        assert_eq!(
+            opencode_json["provider"]["builtin"]["models"]["xai/grok-4.6"]["name"],
+            "xai/grok-4.6"
+        );
+        let base_url = opencode_json["provider"]["builtin"]["options"]["baseURL"]
+            .as_str()
+            .expect("baseURL");
+        assert!(
+            base_url.starts_with("http://127.0.0.1:"),
+            "expected loopback proxy baseURL, got {base_url}"
+        );
+    }
+
     // ── extract_part_text tests ───────────────────────────────────────
 
     #[test]
