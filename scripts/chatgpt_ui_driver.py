@@ -39,6 +39,8 @@ STOP_CONTROL_TESTIDS = (
 SEND_BUTTON_NAME = re.compile(r"^send\b", re.I)
 STOP_BUTTON_NAME = re.compile(r"^stop\b", re.I)
 INTELLIGENCE_LABELS = ("Instant", "5.5", "Medium", "High", "Extra High", "Pro")
+# Current composer power slider: Instant, Medium, High, Extra High, Pro.
+INTELLIGENCE_SLIDER_LABELS = ("Instant", "Medium", "High", "Extra High", "Pro")
 PRO_MODEL_ALIASES = {
     "gpt-5.6-pro",
     "gpt 5.6 pro",
@@ -245,6 +247,53 @@ async def click_send_control(page) -> bool:
     raise RuntimeError("composer send control is not actionable")
 
 
+def intelligence_slider_index(label: str) -> int | None:
+    try:
+        return INTELLIGENCE_SLIDER_LABELS.index(label)
+    except ValueError:
+        return None
+
+
+async def select_intelligence_slider(page, overlay, slider, pill, label: str) -> bool:
+    """Move the composer power slider to Instant/Medium/High/Extra High/Pro."""
+    target = intelligence_slider_index(label)
+    if target is None:
+        return False
+    simple = overlay.locator('[data-testid="composer-model-picker-slider-simple-view"]')
+    try:
+        await slider.focus()
+    except Exception:
+        pass
+    for _ in range(10):
+        raw = await slider.get_attribute("aria-valuenow")
+        try:
+            now = int(raw) if raw is not None else -1
+        except (TypeError, ValueError):
+            now = -1
+        simple_text = ""
+        if await simple.count():
+            try:
+                simple_text = (await simple.inner_text()).strip()
+            except Exception:
+                simple_text = ""
+        current = simple_text.split(",")[0].strip() if simple_text else ""
+        if current == label or now == target:
+            await page.keyboard.press("Escape")
+            try:
+                await pill.get_by_text(label, exact=True).wait_for(
+                    state="visible", timeout=3_000
+                )
+            except Exception:
+                if (await pill.inner_text()).strip() != label:
+                    return False
+            return True
+        if now < 0:
+            return False
+        await slider.press("ArrowRight" if now < target else "ArrowLeft")
+        await page.wait_for_timeout(250)
+    return False
+
+
 async def choose_intelligence_model(page, label: str) -> bool:
     """Select a current composer intelligence option without touching the sidebar."""
     # The current ChatGPT shell hydrates the composer in two phases: the
@@ -280,6 +329,13 @@ async def choose_intelligence_model(page, label: str) -> bool:
                 '[data-testid="composer-intelligence-picker-content"]:visible'
             ).last
             await overlay.wait_for(state="visible", timeout=3_000)
+            slider = overlay.locator('[role="slider"]')
+            if await slider.count() and await slider.first.is_visible():
+                if await select_intelligence_slider(
+                    page, overlay, slider.first, button, label
+                ):
+                    return True
+                continue
             option = overlay.get_by_role("menuitemradio", name=label, exact=True)
             await option.wait_for(state="visible", timeout=3_000)
             await option.click()

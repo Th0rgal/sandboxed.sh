@@ -5,6 +5,7 @@ import unittest
 
 from scripts.chatgpt_ui_driver import (
     complete_saved_account_picker,
+    intelligence_slider_index,
     is_cloudflare_challenge_title,
     is_saved_account_choice,
     wait_out_cloudflare,
@@ -437,6 +438,10 @@ class ChatGptUiDriverTests(unittest.TestCase):
         self.assertEqual(model_selection("GPT-5.6 Pro"), ("Pro", "gpt-5.6-pro"))
         self.assertEqual(model_selection("Extra High"), ("Extra High", "Extra High"))
         self.assertGreaterEqual(MODEL_PICKER_READY_TIMEOUT_MS, 45_000)
+        self.assertEqual(intelligence_slider_index("Pro"), 4)
+        self.assertEqual(intelligence_slider_index("Instant"), 0)
+        self.assertEqual(intelligence_slider_index("High"), 2)
+        self.assertIsNone(intelligence_slider_index("5.5"))
 
     def test_model_picker_waits_for_hydration_and_accepts_current_selection(
         self,
