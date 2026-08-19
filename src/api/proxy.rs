@@ -1289,7 +1289,12 @@ async fn native_protocol_proxy(
         };
         let credential = credential.as_str();
         supported_entries += 1;
-        let upstream_body = match rewrite_model(&body, &entry.model_id) {
+        let rewrite_model_id = if via_cli_proxy && provider_type == ProviderType::Xai {
+            cli_proxy_xai_model_id(&entry.model_id)
+        } else {
+            entry.model_id.as_str()
+        };
+        let upstream_body = match rewrite_model(&body, rewrite_model_id) {
             Ok(body) => body,
             Err(error) => {
                 return error_response(
@@ -1736,7 +1741,8 @@ pub(crate) async fn chat_completions_inner(
                 build_cli_proxy_headers(),
             )
         } else if use_xai_oauth_cli_proxy_adapter {
-            let upstream_body = match rewrite_model(&body, &entry.model_id) {
+            let upstream_model = cli_proxy_xai_model_id(&entry.model_id);
+            let upstream_body = match rewrite_model(&body, upstream_model) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("Failed to rewrite model in request body: {}", e);
@@ -3193,6 +3199,19 @@ fn rewrite_model(body: &[u8], new_model: &str) -> Result<bytes::Bytes, String> {
     serde_json::to_vec(&value)
         .map(bytes::Bytes::from)
         .map_err(|e| format!("Failed to serialize: {}", e))
+}
+
+/// CLIProxyAPI's xAI executor keys models by exact id. Official rolling
+/// aliases in our catalog (`grok-4.6-latest`) are not CLI-proxy IDs — it
+/// returns HTTP 502 `unknown provider for model grok-4.6-latest` in a few
+/// milliseconds, which the waterfall then surfaces as "chain unavailable".
+fn cli_proxy_xai_model_id(model_id: &str) -> &str {
+    match model_id {
+        "grok-4.6-latest" => "grok-4.6",
+        "grok-4.5-latest" => "grok-4.5",
+        "grok-build-latest" => "grok-4.5",
+        other => other,
+    }
 }
 
 /// Newer Opus models reject explicit sampling params (`temperature`, `top_p`,
@@ -6544,6 +6563,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cli_proxy_xai_model_id_maps_rolling_aliases() {
+        assert_eq!(cli_proxy_xai_model_id("grok-4.6-latest"), "grok-4.6");
+        assert_eq!(cli_proxy_xai_model_id("grok-4.6"), "grok-4.6");
+        assert_eq!(cli_proxy_xai_model_id("grok-4.5-latest"), "grok-4.5");
+        assert_eq!(cli_proxy_xai_model_id("grok-build-latest"), "grok-4.5");
+        assert_eq!(cli_proxy_xai_model_id("grok-4.3"), "grok-4.3");
     }
 
     #[test]
