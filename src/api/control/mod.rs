@@ -30926,6 +30926,18 @@ And the report:
     }
 
     #[test]
+    fn test_normalize_model_override_for_backend_maps_muse_spark_onto_meta() {
+        assert_eq!(
+            normalize_model_override_for_backend(Some("opencode"), "muse-spark-1.2"),
+            Some("meta/muse-spark-1.2".to_string())
+        );
+        assert_eq!(
+            normalize_model_override_for_backend(Some("opencode"), "muse/muse-spark-1.2"),
+            Some("meta/muse-spark-1.2".to_string())
+        );
+    }
+
+    #[test]
     fn test_normalize_model_override_for_backend_maps_bare_grok_onto_xai() {
         assert_eq!(
             normalize_model_override_for_backend(Some("opencode"), "grok-4.6"),

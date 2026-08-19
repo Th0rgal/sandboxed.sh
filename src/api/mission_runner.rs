@@ -4954,6 +4954,7 @@ pub(crate) fn detect_opencode_provider_auth(
         if !value.trim().is_empty() {
             has_other = true;
             configured_providers.insert("muse".to_string());
+            configured_providers.insert("meta".to_string());
         }
     }
 
@@ -5401,27 +5402,11 @@ pub(crate) fn ensure_opencode_provider_for_model(
                 }
             }))
         }
-        "muse" => {
-            // Unlike minimax/xai, "muse" is not in OpenCode's built-in
-            // provider registry, so the key must be referenced explicitly.
-            // `{env:META_MODEL_API_KEY}` is expanded by OpenCode from the
-            // mission process env, which apply_opencode_auth_env populates
-            // from the provider store / server env (enum-driven via
-            // ProviderType::env_var_name).
-            let base_url = std::env::var("MUSE_BASE_URL")
-                .unwrap_or_else(|_| "https://api.meta.ai/v1".to_string());
-            Some(serde_json::json!({
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "Meta Muse",
-                "models": {
-                    model_id: { "name": model_id }
-                },
-                "options": {
-                    "baseURL": base_url,
-                    "apiKey": "{env:META_MODEL_API_KEY}"
-                }
-            }))
-        }
+        // OpenCode 1.18+ ships a native `meta` provider that calls
+        // `sdk.responses()` and applies the Meta system prompt. Do not inject
+        // an openai-compatible `muse` block — that forced Chat Completions and
+        // skipped encrypted reasoning / the Spark 1.2 coding prompt.
+        "muse" | "meta" => None,
         "cerebras" => Some(serde_json::json!({
             "npm": "@ai-sdk/cerebras",
             "name": "Cerebras",
@@ -5738,15 +5723,21 @@ fn build_opencode_auth_from_ai_providers(
         }
         let keys: Vec<&str> = match provider.provider_type {
             crate::ai_providers::ProviderType::OpenAI => vec!["openai", "codex"],
+            crate::ai_providers::ProviderType::Muse => vec!["muse", "meta"],
             _ => vec![provider.provider_type.id()],
         };
         if let Some(api_key) = provider.api_key {
-            let entry = serde_json::json!({
-                "type": "api_key",
-                "key": api_key,
-            });
             for key in &keys {
-                map.insert((*key).to_string(), entry.clone());
+                // OpenCode 1.18 native Auth only loads `type: "api"`. Keep
+                // `api_key` on the legacy `muse` alias for older CLIs.
+                let auth_type = if *key == "meta" { "api" } else { "api_key" };
+                map.insert(
+                    (*key).to_string(),
+                    serde_json::json!({
+                        "type": auth_type,
+                        "key": api_key,
+                    }),
+                );
             }
         } else if let Some(oauth) = provider.oauth {
             let entry = serde_json::json!({
@@ -5894,6 +5885,7 @@ pub(crate) fn sync_opencode_auth_to_workspace(
         "cerebras",
         "minimax",
         "muse",
+        "meta",
     ];
     if let (Some(src_dir), Some(dest_dir)) =
         (host_opencode_provider_auth_dir(), provider_auth_dir.clone())
@@ -9267,12 +9259,13 @@ fn cleanup_old_debug_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        actual_cost_cents_from_total_cost_usd, apply_terminal_result_text, bind_command_params,
-        classify_copied_opencode_probe, claudecode_idle_timeout_for_state,
-        claudecode_incomplete_turn_message, claudecode_install_command,
-        claudecode_malformed_startup_message, claudecode_pre_turn_transport_message,
-        claudecode_resume_current_session_message, claudecode_transport_failure_data,
-        claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
+        actual_cost_cents_from_total_cost_usd, apply_opencode_auth_env, apply_terminal_result_text,
+        bind_command_params, build_opencode_auth_from_ai_providers, classify_copied_opencode_probe,
+        claudecode_idle_timeout_for_state, claudecode_incomplete_turn_message,
+        claudecode_install_command, claudecode_malformed_startup_message,
+        claudecode_pre_turn_transport_message, claudecode_resume_current_session_message,
+        claudecode_transport_failure_data, claudecode_transport_failure_stage,
+        claudecode_transport_failure_stage_for_incomplete_turn,
         claudecode_transport_recovery_strategy, clear_codex_account_cooldown,
         codex_account_cooldown_remaining, codex_chatgpt_fallback_for_result,
         codex_chatgpt_fallback_model, codex_cooldown_for_reason, codex_error_message_to_surface,
@@ -9698,6 +9691,47 @@ mod tests {
         assert_eq!(merged["anthropic"]["access"], "fresh");
         assert_eq!(merged["anthropic"]["expires"], 2);
         assert_eq!(merged["unmanaged"]["key"], "preserved");
+    }
+
+    #[test]
+    fn muse_provider_auth_is_written_under_opencode_meta_key() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = temp.path().join(".sandboxed-sh");
+        fs::create_dir_all(&store).expect("store");
+        let mut provider = crate::ai_providers::AIProvider::new(
+            crate::ai_providers::ProviderType::Muse,
+            "Meta Muse".to_string(),
+        );
+        provider.api_key = Some("sk-meta-test".to_string());
+        fs::write(
+            store.join("ai_providers.json"),
+            serde_json::to_string(&vec![provider]).expect("serialize"),
+        )
+        .expect("write store");
+
+        let auth = build_opencode_auth_from_ai_providers(temp.path()).expect("auth");
+        assert_eq!(auth["meta"]["type"], "api");
+        assert_eq!(auth["meta"]["key"], "sk-meta-test");
+        assert_eq!(auth["muse"]["type"], "api_key");
+        assert_eq!(auth["muse"]["key"], "sk-meta-test");
+
+        let mut env = std::collections::HashMap::new();
+        let providers = apply_opencode_auth_env(&auth, &mut env);
+        assert_eq!(
+            env.get("META_MODEL_API_KEY").map(String::as_str),
+            Some("sk-meta-test")
+        );
+        assert!(providers.contains(&"muse"));
+
+        let meta_only = serde_json::json!({
+            "meta": { "type": "api_key", "key": "sk-meta-only" }
+        });
+        let mut env = std::collections::HashMap::new();
+        apply_opencode_auth_env(&meta_only, &mut env);
+        assert_eq!(
+            env.get("META_MODEL_API_KEY").map(String::as_str),
+            Some("sk-meta-only")
+        );
     }
 
     #[test]
@@ -11146,6 +11180,51 @@ mod tests {
             .as_str()
             .expect("mission id header");
         assert_eq!(mission_header, "00000000-0000-0000-0000-000000000123");
+    }
+
+    #[test]
+    fn ensure_opencode_provider_does_not_inject_muse_chat_adapter() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("ws");
+        let app_dir = temp.path().join("app");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "meta/muse-spark-1.2",
+            "127.0.0.1",
+            None,
+        );
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "muse/muse-spark-1.2",
+            "127.0.0.1",
+            None,
+        );
+
+        let path = config_dir.join("opencode.json");
+        if path.exists() {
+            let opencode_json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).expect("opencode.json"))
+                    .expect("parse");
+            assert!(
+                opencode_json
+                    .get("provider")
+                    .and_then(|p| p.get("muse"))
+                    .is_none(),
+                "must not inject a muse openai-compatible block"
+            );
+            assert!(
+                opencode_json
+                    .get("provider")
+                    .and_then(|p| p.get("meta"))
+                    .is_none(),
+                "must not override OpenCode's native meta Responses provider"
+            );
+        }
     }
 
     #[test]

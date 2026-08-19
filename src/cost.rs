@@ -371,20 +371,23 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         aliases: &["minimax-m3"],
         pricing: pricing(600, 2_400, Some(375), Some(60)),
     },
-    // Meta Muse (api.meta.ai). TODO: replace with published per-token prices —
-    // none were available at integration time (2026-08-06); zero entries here
-    // would be SILENT zero-cost accounting, so this placeholder uses
-    // MiniMax-M3-class rates as a conservative stand-in and must be corrected
-    // when Meta publishes pricing.
+    // Meta Muse (api.meta.ai). models.dev / OpenCode catalog, checked 2026-08-19.
+    // Contributor must sit above the 1.2 family alias so "-contributor" does not
+    // inherit standard Spark rates via the `muse-spark` prefix.
+    PricingEntry {
+        canonical: "muse-spark-1.2-contributor",
+        aliases: &["muse-spark-1.2-contributor"],
+        pricing: pricing(100, 200, None, Some(2)),
+    },
     PricingEntry {
         canonical: "muse-spark-1.2",
-        aliases: &["muse-spark-1.2", "muse-spark"],
-        pricing: pricing(600, 2_400, None, None),
+        aliases: &["muse-spark-1.2"],
+        pricing: pricing(1_250, 4_250, None, Some(150)),
     },
     PricingEntry {
         canonical: "muse-spark-1.1",
         aliases: &["muse-spark-1.1"],
-        pricing: pricing(600, 2_400, None, None),
+        pricing: pricing(1_250, 4_250, None, Some(150)),
     },
     PricingEntry {
         canonical: "minimax-m2.7-highspeed",
@@ -655,6 +658,12 @@ mod tests {
             "minimax-m2.5-highspeed"
         );
         assert_eq!(normalize_model("minimax/MiniMax-M2.5"), "minimax-m2.5");
+        assert_eq!(normalize_model("meta/muse-spark-1.2"), "muse-spark-1.2");
+        assert_eq!(
+            normalize_model("muse/muse-spark-1.2-contributor"),
+            "muse-spark-1.2-contributor"
+        );
+        assert_eq!(normalize_model("muse-spark-1.1"), "muse-spark-1.1");
     }
 
     #[test]
@@ -697,6 +706,13 @@ mod tests {
         assert!(pricing_for_model("minimax/MiniMax-M3").is_some());
         assert!(pricing_for_model("minimax/MiniMax-M2.5-highspeed").is_some());
         assert!(pricing_for_model("minimax/MiniMax-M2.5").is_some());
+        let spark = pricing_for_model("meta/muse-spark-1.2").expect("spark 1.2");
+        assert_eq!(spark.input_nano_per_token, 1_250);
+        assert_eq!(spark.output_nano_per_token, 4_250);
+        let contributor =
+            pricing_for_model("muse-spark-1.2-contributor").expect("spark 1.2 contributor");
+        assert_eq!(contributor.input_nano_per_token, 100);
+        assert_eq!(contributor.output_nano_per_token, 200);
     }
 
     #[test]

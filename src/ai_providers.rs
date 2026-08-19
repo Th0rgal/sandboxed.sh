@@ -181,7 +181,7 @@ impl ProviderType {
             "github-copilot" => Some(Self::GithubCopilot),
             "zai" => Some(Self::Zai),
             "minimax" => Some(Self::Minimax),
-            "muse" => Some(Self::Muse),
+            "muse" | "meta" => Some(Self::Muse),
             "kimi" => Some(Self::Kimi),
             "custom" => Some(Self::Custom),
             _ => None,

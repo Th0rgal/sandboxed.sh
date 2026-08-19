@@ -53,6 +53,13 @@ pub(crate) fn normalize_opencode_model_id(model: &str) -> Cow<'_, str> {
         _ if !lower.contains('/') && lower.starts_with("grok-") => {
             Cow::Owned(format!("xai/{lower}"))
         }
+        // OpenCode 1.18+ ships a native `meta` provider (`sdk.responses`,
+        // Meta system prompt). Bare Muse Spark ids and the legacy `muse/`
+        // prefix must not stay as provider=muse (openai-compatible chat).
+        _ if !lower.contains('/') && lower.starts_with("muse-spark") => {
+            Cow::Owned(format!("meta/{lower}"))
+        }
+        _ if lower.starts_with("muse/") => Cow::Owned(format!("meta/{}", &lower["muse/".len()..])),
         _ => Cow::Borrowed(model),
     }
 }
@@ -153,6 +160,11 @@ pub async fn run_opencode_turn(
             "anthropic" | "claude" => has_anthropic,
             "openai" | "codex" => has_openai,
             "google" | "gemini" => has_google,
+            // OpenCode's native id is `meta`; we also mark `muse` when the
+            // META_MODEL_API_KEY / Muse provider row is present.
+            "muse" | "meta" => {
+                configured_providers.contains("muse") || configured_providers.contains("meta")
+            }
             // For known catalog providers (xai, zai, cerebras), check if they are actually configured
             p if crate::api::providers::DEFAULT_CATALOG_PROVIDER_IDS.contains(&p) => {
                 configured_providers.contains(p)
@@ -720,10 +732,9 @@ pub async fn run_opencode_turn(
 
     if let Some(auth) = opencode_auth.as_ref() {
         let providers = apply_opencode_auth_env(auth, &mut env);
-        // Server-env fallback for Muse: the key may live only in
-        // META_MODEL_API_KEY on the service (no provider row), and the
-        // opencode provider block references {env:META_MODEL_API_KEY}.
-        // Without this, a store-less deployment silently loses the key.
+        // Server-env fallback for Muse/Meta: OpenCode's native `meta`
+        // provider (and any leftover muse adapter) reads META_MODEL_API_KEY.
+        // The key may live only on the service with no provider-store row.
         if !env.contains_key("META_MODEL_API_KEY") {
             if let Ok(value) = std::env::var("META_MODEL_API_KEY") {
                 if !value.trim().is_empty() {
@@ -2238,6 +2249,26 @@ mod path_tests {
         );
         assert_eq!(normalize_opencode_model_id("kimi/k3"), "kimi/k3");
         assert_eq!(normalize_opencode_model_id("zai/glm-5"), "zai/glm-5");
+    }
+
+    #[test]
+    fn muse_spark_ids_use_opencode_native_meta_provider() {
+        assert_eq!(
+            normalize_opencode_model_id("muse-spark-1.2"),
+            "meta/muse-spark-1.2"
+        );
+        assert_eq!(
+            normalize_opencode_model_id("muse/muse-spark-1.2"),
+            "meta/muse-spark-1.2"
+        );
+        assert_eq!(
+            normalize_opencode_model_id("meta/muse-spark-1.2"),
+            "meta/muse-spark-1.2"
+        );
+        assert_eq!(
+            canonicalize_opencode_cli_model("muse-spark-1.2"),
+            "meta/muse-spark-1.2"
+        );
     }
 
     #[test]
