@@ -38,11 +38,28 @@ const PROXY_STREAM_INACTIVITY_CAP: std::time::Duration = std::time::Duration::fr
 /// Older Hermes skills used `kimi-k3`. OpenCode parses a slash-less value as
 /// a provider name with an empty model and fails with `Model not found:
 /// kimi-k3/`, even when the Kimi subscription itself is healthy.
+///
+/// Bare Grok ids (`grok-4.6`, `grok-4.5`, …) have the same trap: OpenCode
+/// records `providerID=grok-4.6, id=""` and the local server returns the
+/// opaque `Unexpected server error` that killed probe `b3dd8b65`. Map them
+/// onto the xAI provider prefix so the CLI argument can then be wrapped
+/// through `builtin/` (CLI-proxy OAuth + stream liveness).
 pub(crate) fn normalize_opencode_model_id(model: &str) -> Cow<'_, str> {
     let model = model.trim();
-    match model.to_ascii_lowercase().as_str() {
+    let lower = model.to_ascii_lowercase();
+    match lower.as_str() {
         "kimi-k3" => Cow::Borrowed("kimi/k3"),
         "kimi-k3-256k" => Cow::Borrowed("kimi/k3-256k"),
+        _ if !lower.contains('/') && lower.starts_with("grok-") => {
+            Cow::Owned(format!("xai/{lower}"))
+        }
+        // OpenCode 1.18+ ships a native `meta` provider (`sdk.responses`,
+        // Meta system prompt). Bare Muse Spark ids and the legacy `muse/`
+        // prefix must not stay as provider=muse (openai-compatible chat).
+        _ if !lower.contains('/') && lower.starts_with("muse-spark") => {
+            Cow::Owned(format!("meta/{lower}"))
+        }
+        _ if lower.starts_with("muse/") => Cow::Owned(format!("meta/{}", &lower["muse/".len()..])),
         _ => Cow::Borrowed(model),
     }
 }
@@ -121,7 +138,7 @@ pub async fn run_opencode_turn(
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         })
-        .map(|model| normalize_opencode_model_id(&model).into_owned());
+        .map(|model| canonicalize_opencode_cli_model(&model));
     let auth_state = detect_opencode_provider_auth(Some(app_working_dir));
     let has_openai = auth_state.has_openai;
     let has_anthropic = auth_state.has_anthropic;
@@ -136,9 +153,18 @@ pub async fn run_opencode_turn(
     let configured_providers = &auth_state.configured_providers;
     let provider_available = |provider: &str| -> bool {
         match provider {
+            // Injected per mission and backed by the sandboxed proxy / CLI-proxy.
+            // Must not require an OpenCode auth.json account (subscription Grok
+            // is OAuth inside CLIProxyAPI, not an xAI API key).
+            "builtin" => true,
             "anthropic" | "claude" => has_anthropic,
             "openai" | "codex" => has_openai,
             "google" | "gemini" => has_google,
+            // OpenCode's native id is `meta`; we also mark `muse` when the
+            // META_MODEL_API_KEY / Muse provider row is present.
+            "muse" | "meta" => {
+                configured_providers.contains("muse") || configured_providers.contains("meta")
+            }
             // For known catalog providers (xai, zai, cerebras), check if they are actually configured
             p if crate::api::providers::DEFAULT_CATALOG_PROVIDER_IDS.contains(&p) => {
                 configured_providers.contains(p)
@@ -271,7 +297,7 @@ pub async fn run_opencode_turn(
     let mut total_cache_creation_input_tokens: u64 = 0;
     let mut total_cache_read_input_tokens: u64 = 0;
     let agent_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent)
-        .map(|model| normalize_opencode_model_id(&model).into_owned());
+        .map(|model| canonicalize_opencode_cli_model(&model));
     if resolved_model.is_none() {
         resolved_model = agent_model.clone();
     }
@@ -370,6 +396,26 @@ pub async fn run_opencode_turn(
     };
 
     let opencode_model = opencode_model_argument(resolved_model.as_deref());
+    // OpenCode's `--model` parser splits on the first `/`. A slash-less
+    // value becomes provider=<id> model="" and the CLI's local server
+    // answers with a generic 500 (`Unexpected server error`) instead of
+    // `Model not found`. Fail here with the actual id so a mis-dispatched
+    // probe is diagnosable.
+    if !opencode_model.contains('/') {
+        let err_msg = format!(
+            "OpenCode model '{opencode_model}' has no provider prefix. \
+             OpenCode treats the first path segment as the provider, so this \
+             becomes '{opencode_model}/' and fails with an opaque server error. \
+             Use provider/model (e.g. xai/grok-4.6, builtin/smart, zai/glm-5.2)."
+        );
+        tracing::error!(mission_id = %mission_id, "{}", err_msg);
+        let _ = events_tx.send(AgentEvent::Error {
+            message: err_msg.clone(),
+            mission_id: Some(mission_id),
+            resumable: true,
+        });
+        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+    }
     if opencode_model.starts_with("builtin/") {
         ensure_opencode_provider_for_model(
             &opencode_config_dir_host,
@@ -686,10 +732,9 @@ pub async fn run_opencode_turn(
 
     if let Some(auth) = opencode_auth.as_ref() {
         let providers = apply_opencode_auth_env(auth, &mut env);
-        // Server-env fallback for Muse: the key may live only in
-        // META_MODEL_API_KEY on the service (no provider row), and the
-        // opencode provider block references {env:META_MODEL_API_KEY}.
-        // Without this, a store-less deployment silently loses the key.
+        // Server-env fallback for Muse/Meta: OpenCode's native `meta`
+        // provider (and any leftover muse adapter) reads META_MODEL_API_KEY.
+        // The key may live only on the service with no provider-store row.
         if !env.contains_key("META_MODEL_API_KEY") {
             if let Ok(value) = std::env::var("META_MODEL_API_KEY") {
                 if !value.trim().is_empty() {
@@ -2132,13 +2177,41 @@ pub async fn run_opencode_turn(
 /// the remainder as the upstream model. Route the exact Grok CLI bridge model
 /// through the existing `builtin` provider so the proxy receives the complete
 /// `grok-cli/grok-4.5` chain id instead of the ambiguous bare `grok-4.5`.
+///
+/// Direct `xai/grok-*` is wrapped the same way. OpenCode's native `@ai-sdk/xai`
+/// adapter talks to `api.x.ai` with an API key (or, worse, an OAuth token
+/// stuffed into `XAI_API_KEY`). Subscription Grok lives on CLIProxyAPI's
+/// Responses transport; going through `builtin` is what:
+///   1. authenticates with the loopback proxy (OAuth stays inside CLIProxyAPI),
+///   2. sends `x-sandboxed-mission-id` so reasoning chunks reset the idle
+///      watchdog (`proxy_liveness`) instead of dying after 300s of harness
+///      silence — the stall that killed writer `4d823bd9` gen1.
 fn opencode_model_argument(model: Option<&str>) -> Cow<'_, str> {
     let model = model.unwrap_or("builtin/fast");
-    if crate::api::grok_tool_bridge::is_bridge_model(model) {
+    if model.starts_with("builtin/") {
+        Cow::Borrowed(model)
+    } else if crate::api::grok_tool_bridge::is_bridge_model(model)
+        || model_is_xai_provider_id(model)
+    {
         Cow::Owned(format!("builtin/{model}"))
     } else {
         Cow::Borrowed(model)
     }
+}
+
+/// Normalize aliases then wrap proxy-routed Grok/xAI ids as `builtin/…`
+/// *before* the runner inspects the first path segment as an OpenCode
+/// provider. Otherwise `xai/grok-4.6` is dropped when OpenCode auth.json
+/// has no xAI API key (subscription Grok is CLI-proxy OAuth).
+fn canonicalize_opencode_cli_model(model: &str) -> String {
+    let canonical = normalize_opencode_model_id(model);
+    opencode_model_argument(Some(canonical.as_ref())).into_owned()
+}
+
+fn model_is_xai_provider_id(model: &str) -> bool {
+    model
+        .split_once('/')
+        .is_some_and(|(provider, rest)| provider.eq_ignore_ascii_case("xai") && !rest.is_empty())
 }
 
 fn opencode_path(
@@ -2162,7 +2235,10 @@ fn opencode_path(
 
 #[cfg(test)]
 mod path_tests {
-    use super::{normalize_opencode_model_id, opencode_model_argument, opencode_path};
+    use super::{
+        canonicalize_opencode_cli_model, normalize_opencode_model_id, opencode_model_argument,
+        opencode_path,
+    };
 
     #[test]
     fn legacy_kimi_k3_aliases_are_canonicalized() {
@@ -2173,6 +2249,26 @@ mod path_tests {
         );
         assert_eq!(normalize_opencode_model_id("kimi/k3"), "kimi/k3");
         assert_eq!(normalize_opencode_model_id("zai/glm-5"), "zai/glm-5");
+    }
+
+    #[test]
+    fn muse_spark_ids_use_opencode_native_meta_provider() {
+        assert_eq!(
+            normalize_opencode_model_id("muse-spark-1.2"),
+            "meta/muse-spark-1.2"
+        );
+        assert_eq!(
+            normalize_opencode_model_id("muse/muse-spark-1.2"),
+            "meta/muse-spark-1.2"
+        );
+        assert_eq!(
+            normalize_opencode_model_id("meta/muse-spark-1.2"),
+            "meta/muse-spark-1.2"
+        );
+        assert_eq!(
+            canonicalize_opencode_cli_model("muse-spark-1.2"),
+            "meta/muse-spark-1.2"
+        );
     }
 
     #[test]
@@ -2187,9 +2283,62 @@ mod path_tests {
         );
         assert_eq!(
             opencode_model_argument(Some("xai/grok-4.5")),
-            "xai/grok-4.5"
+            "builtin/xai/grok-4.5"
+        );
+        assert_eq!(
+            opencode_model_argument(Some("builtin/xai/grok-4.6")),
+            "builtin/xai/grok-4.6"
         );
         assert_eq!(opencode_model_argument(None), "builtin/fast");
+    }
+
+    #[test]
+    fn bare_grok_ids_are_canonicalized_onto_xai_then_builtin_proxy() {
+        assert_eq!(normalize_opencode_model_id("grok-4.6"), "xai/grok-4.6");
+        assert_eq!(
+            normalize_opencode_model_id(" Grok-4.6-latest "),
+            "xai/grok-4.6-latest"
+        );
+        assert_eq!(normalize_opencode_model_id("grok-4.5"), "xai/grok-4.5");
+        assert_eq!(
+            normalize_opencode_model_id("grok-build-0.1"),
+            "xai/grok-build-0.1"
+        );
+        // Already-prefixed ids must not be double-wrapped at normalize time.
+        assert_eq!(normalize_opencode_model_id("xai/grok-4.6"), "xai/grok-4.6");
+        assert_eq!(
+            normalize_opencode_model_id("grok-cli/grok-4.5"),
+            "grok-cli/grok-4.5"
+        );
+        let canonical = normalize_opencode_model_id("grok-4.6");
+        assert_eq!(
+            opencode_model_argument(Some(canonical.as_ref())),
+            "builtin/xai/grok-4.6"
+        );
+        assert_eq!(
+            opencode_model_argument(Some("xai/grok-4.6")),
+            "builtin/xai/grok-4.6"
+        );
+        // Wrap happens before the provider-availability check so the first
+        // path segment is `builtin`, not catalog `xai` (which is absent when
+        // Grok is CLI-proxy OAuth only).
+        assert_eq!(
+            canonicalize_opencode_cli_model("grok-4.6"),
+            "builtin/xai/grok-4.6"
+        );
+        assert_eq!(
+            canonicalize_opencode_cli_model("xai/grok-4.6"),
+            "builtin/xai/grok-4.6"
+        );
+        let provider = canonicalize_opencode_cli_model("grok-4.6")
+            .split_once('/')
+            .map(|(p, _)| p.to_string())
+            .expect("slash");
+        assert_eq!(provider, "builtin");
+        assert!(
+            !crate::api::providers::DEFAULT_CATALOG_PROVIDER_IDS.contains(&provider.as_str()),
+            "builtin must not be treated as a catalog provider that requires OpenCode auth"
+        );
     }
 
     #[test]

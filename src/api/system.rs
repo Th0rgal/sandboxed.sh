@@ -35,7 +35,7 @@ use crate::workspace::{Workspace, WorkspaceStatus, WorkspaceType};
 
 /// Git remote used for sandboxed.sh self-updates
 const SANDBOXED_REPO_REMOTE: &str = "https://github.com/Th0rgal/sandboxed.sh.git";
-const MIN_SUPPORTED_OPENCODE_VERSION: &str = "1.1.59";
+const MIN_SUPPORTED_OPENCODE_VERSION: &str = "1.18.0";
 
 /// Information about a system component.
 #[derive(Debug, Clone, Serialize)]

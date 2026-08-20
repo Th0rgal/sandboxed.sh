@@ -61,10 +61,13 @@ DOM_PROBE = """() => {
     .map((e) => (e.innerText || '').trim())
     .filter(Boolean);
   const body = document.body ? document.body.innerText || '' : '';
+  const title = document.title || '';
   return {
     login_visible: texts.some((t) => /^(log in|se connecter|sign up|s'inscrire)$/i.test(t)),
-    authed_nav: texts.includes('Library') && texts.includes('Scheduled'),
+    authed_nav: texts.includes('Library') || texts.includes('Scheduled'),
+    account_picker: /choose an account to continue|welcome back/i.test(body),
     challenge: /verify you are human|verifying\\.\\.\\.|just a moment/i.test(body)
+      || /just a moment|verifying/i.test(title)
       || !!document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
   };
 }"""
@@ -155,9 +158,19 @@ def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
             try:
                 page = context.pages[0] if context.pages else context.new_page()
                 page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=90_000)
-                # Empty text right after domcontentloaded is paint timing.
-                page.wait_for_timeout(settle_ms)
-                found = page.evaluate(DOM_PROBE)
+                # The welcome-back picker is often 15–20s after domcontentloaded.
+                # Classifying at the first paint treats overlay Log in as logout.
+                deadline = time.time() + max(settle_ms, 0) / 1000.0
+                found = {"challenge": False, "account_picker": False, "login_visible": False, "authed_nav": False}
+                while True:
+                    found = page.evaluate(DOM_PROBE)
+                    if found.get("account_picker") or (
+                        found.get("authed_nav") and not found.get("login_visible")
+                    ):
+                        break
+                    if time.time() >= deadline:
+                        break
+                    page.wait_for_timeout(500)
             finally:
                 context.close()
     except Exception as exc:  # noqa: BLE001 - a probe failure is never fatal
@@ -168,6 +181,11 @@ def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
 
     if found.get("challenge"):
         return "challenge"
+    # A welcome-back picker means the profile still has a saved session.
+    # The driver clicks through it; treating the overlay Log in chrome as
+    # logout quarantines every slot.
+    if found.get("account_picker"):
+        return "logged_in"
     if found.get("login_visible"):
         return "logged_out"
     if found.get("authed_nav"):
@@ -246,7 +264,7 @@ def main() -> int:
         default=float(os.environ.get("CHATGPT_POOL_HEALTH_PACE_SECONDS", "25")),
         help="delay between probes; back-to-back launches trip Cloudflare",
     )
-    parser.add_argument("--settle-ms", type=int, default=8000)
+    parser.add_argument("--settle-ms", type=int, default=25000)
     parser.add_argument("--slot", action="append", help="probe these slots instead of rotating")
     args = parser.parse_args()
 

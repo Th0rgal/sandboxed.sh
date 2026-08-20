@@ -454,7 +454,7 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
   const handleSubmit = useCallback(
     ({ content }: { content: string }) => {
       const text = content.trim();
-      if (!text || running) return;
+      if (!text) return;
       const entry: HermesOutboxEntry = {
         id: createHermesDeliveryId(),
         sessionId,
@@ -483,7 +483,6 @@ export function HermesConversation({ sessionId }: { sessionId: string }) {
 
   const retryUserMessage = useCallback(
     (message: { id: string; content: string }) => {
-      if (running) return;
       const existing = getHermesOutbox(sessionId).find(
         (entry) => entry.id === message.id,
       );

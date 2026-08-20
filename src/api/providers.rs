@@ -1230,7 +1230,7 @@ fn default_providers_config() -> ProvidersConfig {
                 id: "muse".to_string(),
                 name: "Meta Muse".to_string(),
                 billing: "api_key".to_string(),
-                description: "Meta's Muse family via api.meta.ai (OpenAI-compatible)".to_string(),
+                description: "Meta's Muse family via api.meta.ai (OpenCode native meta Responses provider)".to_string(),
                 // Verified live against /models on 2026-08-06; the catalog
                 // refresh overwrites this with the fetched list when the key
                 // is present.
@@ -1238,12 +1238,17 @@ fn default_providers_config() -> ProvidersConfig {
                     ProviderModel {
                         id: "muse-spark-1.2".to_string(),
                         name: "Muse Spark 1.2".to_string(),
-                        description: Some("Fast reasoning model".to_string()),
+                        description: Some("Coding-focused Spark 1.2".to_string()),
                     },
                     ProviderModel {
                         id: "muse-spark-1.1".to_string(),
                         name: "Muse Spark 1.1".to_string(),
                         description: None,
+                    },
+                    ProviderModel {
+                        id: "muse-spark-1.2-contributor".to_string(),
+                        name: "Muse Spark 1.2 Contributor".to_string(),
+                        description: Some("Lower-cost Spark 1.2 tier".to_string()),
                     },
                 ],
             },

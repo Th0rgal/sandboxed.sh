@@ -277,6 +277,33 @@ pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
     )
 }
 
+/// Stash a newly arrived operator message as the mission's deferred goal.
+///
+/// Pending missions have not run yet, so multiple pre-dispatch messages
+/// concatenate. A Failed/Interrupted/… mission already executed its original
+/// prompt (left in `deferred_goal` on purpose for a capacity-race retry).
+/// Concatenating a follow-up onto that prompt buries the operator's message
+/// and the scheduler never re-dispatches non-Pending rows, so the follow-up
+/// is lost. Replace instead.
+pub(crate) fn deferred_goal_for_incoming_message(
+    status: MissionStatus,
+    previous_goal: Option<&str>,
+    content: &str,
+) -> String {
+    if status == MissionStatus::Pending {
+        match previous_goal {
+            Some(prev) if !prev.is_empty() => format!("{prev}\n{content}"),
+            _ => content.to_string(),
+        }
+    } else {
+        content.to_string()
+    }
+}
+
+fn follow_up_should_requeue_as_pending(status: MissionStatus) -> bool {
+    message_activates_mission(status) && status != MissionStatus::Pending
+}
+
 fn queued_delivery_requires_activation(
     target_mission_id: Option<Uuid>,
     source: Option<&str>,
@@ -1009,6 +1036,26 @@ mod campaign_guard_tests {
         );
         assert_eq!(updated.project.track.as_deref(), Some("pr-88-repair"));
         assert_eq!(updated.title.as_deref(), Some("Repair Lido PR #88"));
+    }
+
+    #[tokio::test]
+    async fn untagged_new_mission_opening_message_is_accepted() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .expect("create");
+        let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
+        apply_writer_reuse_or_conflict(
+            &store,
+            &loaded,
+            None,
+            None,
+            None,
+            Some("Continue from PR #105. Launch P-TOPUP-2 and P-ALLOC-1.".into()),
+        )
+        .await
+        .expect("blank writer first message must not 409");
     }
 
     #[test]
@@ -8898,6 +8945,12 @@ async fn activate_mission_for_message(
         store
             .update_mission_status(mission.id, MissionStatus::Active)
             .await?;
+        // The original create prompt stays in deferred_goal after first
+        // dispatch so a capacity-race retry can re-inject it while still
+        // Pending. Once a later operator message activates the mission,
+        // that stale prompt must not be re-dispatched (or concatenated onto)
+        // after the next failure.
+        let _ = store.set_deferred_goal(mission.id, None).await;
         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
             mission_id: mission.id,
             status: MissionStatus::Active,
@@ -18330,12 +18383,11 @@ async fn control_actor_loop(
                                                 .await
                                                 .ok()
                                                 .flatten();
-                                            let combined = match previous_goal.as_deref() {
-                                                Some(prev) if !prev.is_empty() => {
-                                                    format!("{prev}\n{content}")
-                                                }
-                                                _ => content.clone(),
-                                            };
+                                            let combined = deferred_goal_for_incoming_message(
+                                                m.status,
+                                                previous_goal.as_deref(),
+                                                &content,
+                                            );
                                             if let Err(e) = mission_store
                                                 .set_deferred_goal(tid, Some(combined))
                                                 .await
@@ -18625,15 +18677,39 @@ async fn control_actor_loop(
                                         .await
                                         .ok()
                                         .flatten();
-                                    let combined = match previous_goal.as_deref() {
-                                        Some(prev) if !prev.is_empty() => {
-                                            format!("{prev}\n{content}")
-                                        }
-                                        _ => content.clone(),
-                                    };
+                                    let combined = deferred_goal_for_incoming_message(
+                                        mission.status,
+                                        previous_goal.as_deref(),
+                                        &content,
+                                    );
                                     match mission_store.set_deferred_goal(tid, Some(combined)).await
                                     {
                                         Ok(()) => {
+                                            if follow_up_should_requeue_as_pending(mission.status) {
+                                                if let Err(error) = mission_store
+                                                    .update_mission_status(
+                                                        tid,
+                                                        MissionStatus::Pending,
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        mission_id = %tid,
+                                                        "At capacity: stashed follow-up but could not requeue as pending: {error}"
+                                                    );
+                                                } else {
+                                                    let _ = events_tx.send(
+                                                        AgentEvent::MissionStatusChanged {
+                                                            mission_id: tid,
+                                                            status: MissionStatus::Pending,
+                                                            summary: Some(
+                                                                "Operator follow-up queued until a runner slot is free"
+                                                                    .to_string(),
+                                                            ),
+                                                        },
+                                                    );
+                                                }
+                                            }
                                             tracing::info!(
                                                 mission_id = %tid,
                                                 max_parallel,
@@ -30906,6 +30982,35 @@ And the report:
     }
 
     #[test]
+    fn test_normalize_model_override_for_backend_maps_muse_spark_onto_meta() {
+        assert_eq!(
+            normalize_model_override_for_backend(Some("opencode"), "muse-spark-1.2"),
+            Some("meta/muse-spark-1.2".to_string())
+        );
+        assert_eq!(
+            normalize_model_override_for_backend(Some("opencode"), "muse/muse-spark-1.2"),
+            Some("meta/muse-spark-1.2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_model_override_for_backend_maps_bare_grok_onto_xai() {
+        assert_eq!(
+            normalize_model_override_for_backend(Some("opencode"), "grok-4.6"),
+            Some("xai/grok-4.6".to_string())
+        );
+        assert_eq!(
+            normalize_model_override_for_backend(Some("opencode"), "xai/grok-4.6"),
+            Some("xai/grok-4.6".to_string())
+        );
+        // Native grok backend keeps the bare CLI id.
+        assert_eq!(
+            normalize_model_override_for_backend(Some("grok"), "grok-4.6"),
+            Some("grok-4.6".to_string())
+        );
+    }
+
+    #[test]
     fn test_normalize_model_override_for_backend_strips_provider_prefix_for_non_opencode() {
         assert_eq!(
             normalize_model_override_for_backend(Some("codex"), "openai/gpt-5-codex"),
@@ -32065,6 +32170,22 @@ Investigate <service/> failures.
             mission_status_for_terminal_reason(TerminalReason::Completed, true),
             Some((MissionStatus::Completed, "completed"))
         );
+    }
+
+    #[test]
+    fn deferred_goal_replaces_stale_prompt_on_failed_follow_up() {
+        let original = "You are GPT-5.6 Pro with web search. Research…";
+        let follow_up = "retry now, chatgpt ui is fixed";
+        assert_eq!(
+            deferred_goal_for_incoming_message(MissionStatus::Failed, Some(original), follow_up),
+            follow_up
+        );
+        assert_eq!(
+            deferred_goal_for_incoming_message(MissionStatus::Pending, Some(original), follow_up),
+            format!("{original}\n{follow_up}")
+        );
+        assert!(follow_up_should_requeue_as_pending(MissionStatus::Failed));
+        assert!(!follow_up_should_requeue_as_pending(MissionStatus::Pending));
     }
 
     #[test]
