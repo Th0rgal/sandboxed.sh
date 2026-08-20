@@ -18,11 +18,18 @@ use crate::opencode::{extract_reasoning, extract_text};
 use crate::workspace::Workspace;
 use crate::workspace_exec::WorkspaceExec;
 
-/// Hard inactivity threshold when neither heartbeats nor proxy streaming are
-/// observed. Thinking models routinely spend 2–5 minutes inside a reasoning
-/// segment with zero harness output, so 120s produced false stall kills
-/// (mission f9ba703a: MiniMax-M3 killed mid-reasoning after exactly 120s).
-const GLOBAL_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Default inactivity threshold when neither heartbeats, proxy streaming, nor
+/// a live tool/child are observed. Thinking models routinely spend 2–5 minutes
+/// inside a reasoning segment with zero harness output, so 120s produced false
+/// stall kills (mission f9ba703a: MiniMax-M3 killed mid-reasoning after 120s).
+/// Override with `SANDBOXED_SH_OPENCODE_GLOBAL_INACTIVITY_SECS`.
+const DEFAULT_GLOBAL_INACTIVITY_SECS: u64 = 300;
+/// Default inactivity while a tool (or a descendant of the OpenCode CLI, e.g.
+/// `lake build`) is still running. Matches Claude Code's tool-idle default.
+/// Silent Lean/EVM builds emit no SSE for many minutes; a 300s global kill
+/// aborted Spark/OpenCode turns (eip-8282 P-DRAIN). Override with
+/// `SANDBOXED_SH_OPENCODE_TOOL_IDLE_TIMEOUT_SECS`.
+const DEFAULT_TOOL_IDLE_SECS: u64 = 1800;
 /// Inactivity threshold while OpenCode server heartbeats are still arriving.
 const HEARTBEAT_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(420);
 /// A builtin-proxy chunk within this window counts as "the LLM call is alive".
@@ -1060,10 +1067,15 @@ pub async fn run_opencode_turn(
     // A short timeout turns that acknowledgement into a false successful answer
     // for Telegram. Let the global inactivity timeout handle truly stuck turns.
     let opencode_text_idle_timeout_secs: u64 =
-        std::env::var("SANDBOXED_SH_OPENCODE_IDLE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(120);
+        env_u64("SANDBOXED_SH_OPENCODE_IDLE_TIMEOUT_SECS", 120);
+    let global_inactivity_timeout = std::time::Duration::from_secs(env_u64(
+        "SANDBOXED_SH_OPENCODE_GLOBAL_INACTIVITY_SECS",
+        DEFAULT_GLOBAL_INACTIVITY_SECS,
+    ));
+    let tool_idle_timeout = std::time::Duration::from_secs(env_u64(
+        "SANDBOXED_SH_OPENCODE_TOOL_IDLE_TIMEOUT_SECS",
+        DEFAULT_TOOL_IDLE_SECS,
+    ));
 
     loop {
         tokio::select! {
@@ -1199,7 +1211,11 @@ pub async fn run_opencode_turn(
                         } else {
                             sse_alive && *sse_tool_depth_rx.borrow() > 0
                         };
-                        if tools_active {
+                        let cli_has_children = child
+                            .id()
+                            .map(linux_pid_has_children)
+                            .unwrap_or(false);
+                        if tools_active || cli_has_children {
                             tracing::debug!(
                                 mission_id = %mission_id,
                                 tool_depth = *sse_tool_depth_rx.borrow(),
@@ -1253,6 +1269,11 @@ pub async fn run_opencode_turn(
                         } else {
                             sse_alive && *sse_tool_depth_rx.borrow() > 0
                         };
+                        let cli_pid = child.id();
+                        let cli_has_children = cli_pid
+                            .map(linux_pid_has_children)
+                            .unwrap_or(false);
+                        let long_tool = tools_active || cli_has_children;
                         let recent_activity = last_activity
                             .lock()
                             .ok()
@@ -1267,7 +1288,7 @@ pub async fn run_opencode_turn(
                             crate::api::proxy_liveness::time_since_activity(mission_id)
                                 .map(|d| d <= PROXY_STREAM_RECENT)
                                 .unwrap_or(false);
-                        if !recent_activity && !tools_active && !proxy_streaming {
+                        if !recent_activity && !long_tool && !proxy_streaming {
                             tracing::info!(
                                 mission_id = %mission_id,
                                 "OpenCode output idle timeout reached; terminating CLI process"
@@ -1298,6 +1319,11 @@ pub async fn run_opencode_turn(
                 } else {
                     sse_alive && *sse_tool_depth_rx.borrow() > 0
                 };
+                let cli_pid = child.id();
+                let cli_alive = cli_pid.map(linux_pid_is_alive).unwrap_or(false);
+                let cli_has_children = cli_pid
+                    .map(linux_pid_has_children)
+                    .unwrap_or(false);
                 let inactivity_elapsed = last_activity
                     .lock()
                     .ok()
@@ -1309,7 +1335,14 @@ pub async fn run_opencode_turn(
                     .and_then(|g| *g)
                     .map(|ts| ts.elapsed() <= std::time::Duration::from_secs(45))
                     .unwrap_or(false);
-                if !tools_active && inactivity_elapsed >= GLOBAL_INACTIVITY_TIMEOUT {
+                if opencode_inactivity_should_kill(
+                    tools_active,
+                    cli_alive,
+                    cli_has_children,
+                    inactivity_elapsed,
+                    global_inactivity_timeout,
+                    tool_idle_timeout,
+                ) {
                     // Proxy-stream grace: the mission's own LLM call is still
                     // streaming chunks through the builtin proxy (long
                     // reasoning segments emit no OpenCode events). Defer the
@@ -2233,12 +2266,60 @@ fn opencode_path(
     path_parts.join(":")
 }
 
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// True when `/proc/<pid>` still exists (Linux). False on missing /proc or ESRCH.
+fn linux_pid_is_alive(pid: u32) -> bool {
+    std::path::Path::new("/proc").join(pid.to_string()).exists()
+}
+
+/// True when `/proc/<pid>/task/<pid>/children` lists at least one child pid.
+/// OpenCode's bash/`lake` tools often emit no SSE while the descendant runs;
+/// SSE tool-depth then reads as 0 and a 300s global inactivity kill fires.
+fn linux_pid_has_children(pid: u32) -> bool {
+    let path = format!("/proc/{pid}/task/{pid}/children");
+    std::fs::read_to_string(path)
+        .map(|s| s.split_whitespace().any(|tok| !tok.is_empty()))
+        .unwrap_or(false)
+}
+
+/// Decide whether the OpenCode inactivity watchdog should kill the CLI.
+///
+/// A live tool (SSE depth) **or** a live descendant of the CLI (`lake`, `lean`,
+/// `bash`) uses the longer `tool_idle` window. Only a wedged CLI with no
+/// children and no SSE tools is subject to the short global inactivity cap.
+fn opencode_inactivity_should_kill(
+    tools_active: bool,
+    cli_alive: bool,
+    cli_has_children: bool,
+    inactivity: std::time::Duration,
+    global_inactivity: std::time::Duration,
+    tool_idle: std::time::Duration,
+) -> bool {
+    if !cli_alive {
+        return false;
+    }
+    let long_tool = tools_active || cli_has_children;
+    if long_tool {
+        inactivity >= tool_idle
+    } else {
+        inactivity >= global_inactivity
+    }
+}
+
 #[cfg(test)]
 mod path_tests {
     use super::{
-        canonicalize_opencode_cli_model, normalize_opencode_model_id, opencode_model_argument,
+        canonicalize_opencode_cli_model, linux_pid_has_children, linux_pid_is_alive,
+        normalize_opencode_model_id, opencode_inactivity_should_kill, opencode_model_argument,
         opencode_path,
     };
+    use std::time::Duration;
 
     #[test]
     fn legacy_kimi_k3_aliases_are_canonicalized() {
@@ -2351,5 +2432,66 @@ mod path_tests {
 
         assert!(path.contains("/mission/.sandboxed-sh/bin:/usr/bin"));
         assert!(path.ends_with("/mission/.sandboxed-sh-bin"));
+    }
+
+    #[test]
+    fn inactivity_kill_spares_silent_cli_children_until_tool_idle() {
+        let global = Duration::from_secs(300);
+        let tool = Duration::from_secs(1800);
+        // The eip-8282 Spark failure: lake running, no SSE, 300s silence.
+        assert!(
+            !opencode_inactivity_should_kill(
+                false,
+                true,
+                true,
+                Duration::from_secs(300),
+                global,
+                tool
+            ),
+            "must not kill a live CLI with children at the 300s global cap"
+        );
+        assert!(
+            !opencode_inactivity_should_kill(
+                true,
+                true,
+                false,
+                Duration::from_secs(400),
+                global,
+                tool
+            ),
+            "SSE tool depth also uses the long window"
+        );
+        assert!(opencode_inactivity_should_kill(
+            false,
+            true,
+            false,
+            Duration::from_secs(300),
+            global,
+            tool
+        ));
+        assert!(opencode_inactivity_should_kill(
+            false,
+            true,
+            true,
+            Duration::from_secs(1800),
+            global,
+            tool
+        ));
+        assert!(!opencode_inactivity_should_kill(
+            false,
+            false,
+            false,
+            Duration::from_secs(10_000),
+            global,
+            tool
+        ));
+    }
+
+    #[test]
+    fn linux_pid_helpers_see_this_process() {
+        let pid = std::process::id();
+        assert!(linux_pid_is_alive(pid));
+        assert!(!linux_pid_is_alive(u32::MAX - 1));
+        let _ = linux_pid_has_children(pid);
     }
 }
