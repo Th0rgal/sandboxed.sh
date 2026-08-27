@@ -5345,10 +5345,9 @@ mod tests {
     async fn read_only_command_guards_block_mutations_and_allow_git_reads() {
         let root = tempfile::tempdir().unwrap();
         let fixture_root = tempfile::tempdir().unwrap();
-        let guard_dir =
-            install_read_only_command_guards(root.path(), fixture_root.path())
-                .await
-                .unwrap();
+        let guard_dir = install_read_only_command_guards(root.path(), fixture_root.path())
+            .await
+            .unwrap();
         let original_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
         let guarded_path = format!("{}:{original_path}", guard_dir.display());
 
@@ -5446,7 +5445,11 @@ mod tests {
             &git_args(&["-C", &repo, "config", "user.email", "fixture@example.com"]),
             None,
         );
-        assert!(email.status.success(), "git config email failed: {:?}", email);
+        assert!(
+            email.status.success(),
+            "git config email failed: {:?}",
+            email
+        );
         let name = run_real_git(
             &git_args(&["-C", &repo, "config", "user.name", "Fixture Test"]),
             None,
@@ -5458,11 +5461,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_guard_denies(
-        output: &std::process::Output,
-        context: &str,
-        subcommand: &str,
-    ) {
+    fn assert_guard_denies(output: &std::process::Output, context: &str, subcommand: &str) {
         assert_eq!(
             output.status.code(),
             Some(73),
@@ -5477,8 +5476,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn read_only_guard_setup()
-    -> (
+    async fn read_only_guard_setup() -> (
         tempfile::TempDir,
         tempfile::TempDir,
         std::path::PathBuf,
@@ -5487,10 +5485,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let fixture_root = tempfile::tempdir().unwrap();
         let fixture_root_path = fixture_root.path().canonicalize().unwrap();
-        let guard_dir =
-            install_read_only_command_guards(root.path(), &fixture_root_path)
-                .await
-                .unwrap();
+        let guard_dir = install_read_only_command_guards(root.path(), &fixture_root_path)
+            .await
+            .unwrap();
         let original_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
         let guarded_path = format!("{}:{original_path}", guard_dir.display());
         (root, fixture_root, guard_dir.join("git"), guarded_path)
@@ -5527,13 +5524,22 @@ mod tests {
         assert!(String::from_utf8_lossy(&log.stdout).contains("fixture commit one"));
 
         std::fs::write(repo.join("notes2.txt"), "more fixture content\n").unwrap();
-        let add = run_real_git(&git_args(&["-C", &repo_path_str(&repo), "add", "notes2.txt"]), None);
+        let add = run_real_git(
+            &git_args(&["-C", &repo_path_str(&repo), "add", "notes2.txt"]),
+            None,
+        );
         assert!(add.status.success(), "git add failed: {:?}", add);
 
         let commit_c_form = run_guard_git(
             &guard_git,
             &guarded_path,
-            &git_args(&["-C", &repo_path_str(&repo), "commit", "-m", "fixture commit two"]),
+            &git_args(&[
+                "-C",
+                &repo_path_str(&repo),
+                "commit",
+                "-m",
+                "fixture commit two",
+            ]),
             Some(root.path()),
             &[],
         );
@@ -5627,10 +5633,7 @@ mod tests {
             Some(&clean_repo),
             &[(
                 "GIT_DIR",
-                std::ffi::OsString::from(format!(
-                    "{}/.git",
-                    repo_path_str(&protected_repo)
-                )),
+                std::ffi::OsString::from(format!("{}/.git", repo_path_str(&protected_repo))),
             )],
         );
         assert_guard_denies(&env_commit, "GIT_DIR env escape", "commit");
@@ -5644,7 +5647,13 @@ mod tests {
         init_repo_with_staged_file(&repo, "file.txt");
 
         for subcommand in [
-            "push", "merge", "rebase", "tag", "am", "cherry-pick", "revert",
+            "push",
+            "merge",
+            "rebase",
+            "tag",
+            "am",
+            "cherry-pick",
+            "revert",
         ] {
             let output = run_guard_git(
                 &guard_git,
