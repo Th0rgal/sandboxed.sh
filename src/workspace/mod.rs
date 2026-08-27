@@ -3405,7 +3405,20 @@ pub async fn prepare_mission_workspace_with_skills(
 }
 
 #[cfg(unix)]
-async fn install_read_only_command_guards(dir: &Path) -> anyhow::Result<PathBuf> {
+fn bake_shell_double_quoted(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('`', "\\`")
+        .replace('$', "\\$")
+}
+
+#[cfg(unix)]
+async fn install_read_only_command_guards(
+    dir: &Path,
+    fixture_root: &Path,
+) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let guard_dir = dir.join(".sandboxed-sh").join("read-only-bin");
@@ -3414,24 +3427,75 @@ async fn install_read_only_command_guards(dir: &Path) -> anyhow::Result<PathBuf>
     let gh_guard = guard_dir.join("gh");
     let git_script = r#"#!/bin/sh
 set -eu
+fixture_root="__FIXTURE_ROOT__"
 subcommand=""
 skip_next=0
+skip_capture=""
+c_arg_dir=""
+env_value_form=0
 for arg in "$@"; do
-  if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
+  if [ "$skip_next" = 1 ]; then
+    skip_next=0
+    if [ "$skip_capture" = C ]; then c_arg_dir="$arg"; skip_capture=""; fi
+    continue
+  fi
   case "$arg" in
-    -C|-c|--git-dir|--work-tree|--namespace) skip_next=1 ;;
+    -C)
+      skip_next=1
+      skip_capture=C
+      ;;
+    -C?*)
+      c_arg_dir=${arg#-C}
+      ;;
+    -c)
+      skip_next=1
+      ;;
+    --git-dir|--work-tree|--namespace)
+      skip_next=1
+      env_value_form=1
+      ;;
+    --git-dir=*|--work-tree=*|--namespace=*)
+      env_value_form=1
+      ;;
     -*) ;;
     *) subcommand="$arg"; break ;;
   esac
 done
+deny_commit() {
+  echo "sandboxed.sh: git commit is disabled for this pr-readonly mission (not an isolated fixture repository)" >&2
+  exit 73
+}
 case "$subcommand" in
-  push|commit|merge|rebase|tag|am|cherry-pick|revert)
+  push|merge|rebase|tag|am|cherry-pick|revert)
     echo "sandboxed.sh: git $subcommand is disabled for this pr-readonly mission" >&2
     exit 73
     ;;
+  commit)
+    if [ "$env_value_form" = 1 ]; then deny_commit; fi
+    if [ -n "${GIT_DIR:-}" ] || [ -n "${GIT_WORK_TREE:-}" ]; then deny_commit; fi
+    effective_dir="$PWD"
+    if [ -n "$c_arg_dir" ]; then effective_dir="$c_arg_dir"; fi
+    resolved_dir=$(cd -P "$effective_dir" 2>/dev/null && pwd -P) || deny_commit
+    case "$resolved_dir/" in
+      "$fixture_root"/*) ;;
+      *) deny_commit ;;
+    esac
+    toplevel=$(PATH="${PATH#*:}" git -C "$resolved_dir" rev-parse --show-toplevel 2>/dev/null) || deny_commit
+    resolved_toplevel=$(cd -P "$toplevel" 2>/dev/null && pwd -P) || deny_commit
+    case "$resolved_toplevel/" in
+      "$fixture_root"/*) ;;
+      *) deny_commit ;;
+    esac
+    if (cd -P "$resolved_toplevel" 2>/dev/null && [ -d .git ] && [ ! -L .git ]); then
+      :
+    else
+      deny_commit
+    fi
+    ;;
 esac
 PATH="${PATH#*:}" exec git "$@"
-"#;
+"#
+    .replace("__FIXTURE_ROOT__", &bake_shell_double_quoted(fixture_root));
     let gh_script = r#"#!/bin/sh
 set -eu
 first="${1:-}"
@@ -3488,7 +3552,11 @@ PATH="${PATH#*:}" exec gh "$@"
 }
 
 #[cfg(not(unix))]
-async fn install_read_only_command_guards(dir: &Path) -> anyhow::Result<PathBuf> {
+async fn install_read_only_command_guards(
+    dir: &Path,
+    fixture_root: &Path,
+) -> anyhow::Result<PathBuf> {
+    let _ = fixture_root;
     let guard_dir = dir.join(".sandboxed-sh").join("read-only-bin");
     tokio::fs::create_dir_all(&guard_dir).await?;
     Ok(guard_dir)
@@ -3601,7 +3669,10 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     workspace.read_only_command_guard_dir = if allow_git_mutations {
         None
     } else {
-        Some(install_read_only_command_guards(&dir).await?)
+        let fixture_root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        Some(install_read_only_command_guards(&dir, &fixture_root).await?)
     };
 
     // Get custom providers: use provided list or read from file
@@ -5273,7 +5344,11 @@ mod tests {
     #[tokio::test]
     async fn read_only_command_guards_block_mutations_and_allow_git_reads() {
         let root = tempfile::tempdir().unwrap();
-        let guard_dir = install_read_only_command_guards(root.path()).await.unwrap();
+        let fixture_root = tempfile::tempdir().unwrap();
+        let guard_dir =
+            install_read_only_command_guards(root.path(), fixture_root.path())
+                .await
+                .unwrap();
         let original_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
         let guarded_path = format!("{}:{original_path}", guard_dir.display());
 
@@ -5305,6 +5380,281 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(api_write.status.code(), Some(73));
+    }
+
+    #[cfg(unix)]
+    fn clean_git_envs() -> Vec<(&'static str, std::ffi::OsString)> {
+        vec![
+            ("GIT_CONFIG_NOSYSTEM", "1".into()),
+            ("GIT_CONFIG_GLOBAL", "/dev/null".into()),
+            ("GIT_CONFIG_SYSTEM", "/dev/null".into()),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn run_real_git(args: &[String], cwd: Option<&std::path::Path>) -> std::process::Output {
+        let original_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(args).env_clear().env("PATH", &original_path);
+        for (key, value) in clean_git_envs() {
+            cmd.env(key, value);
+        }
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        cmd.output().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn run_guard_git(
+        guard_git: &std::path::Path,
+        guarded_path: &str,
+        args: &[String],
+        cwd: Option<&std::path::Path>,
+        extra_env: &[(&str, std::ffi::OsString)],
+    ) -> std::process::Output {
+        let mut cmd = std::process::Command::new(guard_git);
+        cmd.args(args).env_clear().env("PATH", guarded_path);
+        for (key, value) in clean_git_envs() {
+            cmd.env(key, value);
+        }
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        cmd.output().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn git_args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[cfg(unix)]
+    fn repo_path_str(path: &std::path::Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    fn init_repo_with_staged_file(path: &std::path::Path, file_name: &str) {
+        let repo = repo_path_str(path);
+        let init = run_real_git(&git_args(&["init", &repo]), None);
+        assert!(init.status.success(), "git init failed: {:?}", init);
+        let email = run_real_git(
+            &git_args(&["-C", &repo, "config", "user.email", "fixture@example.com"]),
+            None,
+        );
+        assert!(email.status.success(), "git config email failed: {:?}", email);
+        let name = run_real_git(
+            &git_args(&["-C", &repo, "config", "user.name", "Fixture Test"]),
+            None,
+        );
+        assert!(name.status.success(), "git config name failed: {:?}", name);
+        std::fs::write(path.join(file_name), "fixture content\n").unwrap();
+        let add = run_real_git(&git_args(&["-C", &repo, "add", file_name]), None);
+        assert!(add.status.success(), "git add failed: {:?}", add);
+    }
+
+    #[cfg(unix)]
+    fn assert_guard_denies(
+        output: &std::process::Output,
+        context: &str,
+        subcommand: &str,
+    ) {
+        assert_eq!(
+            output.status.code(),
+            Some(73),
+            "{context}: git {subcommand} must exit 73, got {:?}",
+            output
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("pr-readonly"),
+            "{context}: git {subcommand} stderr must mention pr-readonly: {:?}",
+            output
+        );
+    }
+
+    #[cfg(unix)]
+    async fn read_only_guard_setup()
+    -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        String,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let fixture_root = tempfile::tempdir().unwrap();
+        let fixture_root_path = fixture_root.path().canonicalize().unwrap();
+        let guard_dir =
+            install_read_only_command_guards(root.path(), &fixture_root_path)
+                .await
+                .unwrap();
+        let original_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+        let guarded_path = format!("{}:{original_path}", guard_dir.display());
+        (root, fixture_root, guard_dir.join("git"), guarded_path)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_guards_allow_commit_inside_isolated_fixture_repo() {
+        let (root, fixture_root, guard_git, guarded_path) = read_only_guard_setup().await;
+        let repo = fixture_root.path().join("fixture-repo");
+        init_repo_with_staged_file(&repo, "notes.txt");
+
+        let commit = run_guard_git(
+            &guard_git,
+            &guarded_path,
+            &git_args(&["commit", "-m", "fixture commit one"]),
+            Some(&repo),
+            &[],
+        );
+        assert!(
+            commit.status.success(),
+            "fixture commit must succeed: {:?}",
+            commit
+        );
+
+        let log = run_guard_git(
+            &guard_git,
+            &guarded_path,
+            &git_args(&["log", "-1", "--format=%s"]),
+            Some(&repo),
+            &[],
+        );
+        assert!(log.status.success());
+        assert!(String::from_utf8_lossy(&log.stdout).contains("fixture commit one"));
+
+        std::fs::write(repo.join("notes2.txt"), "more fixture content\n").unwrap();
+        let add = run_real_git(&git_args(&["-C", &repo_path_str(&repo), "add", "notes2.txt"]), None);
+        assert!(add.status.success(), "git add failed: {:?}", add);
+
+        let commit_c_form = run_guard_git(
+            &guard_git,
+            &guarded_path,
+            &git_args(&["-C", &repo_path_str(&repo), "commit", "-m", "fixture commit two"]),
+            Some(root.path()),
+            &[],
+        );
+        assert!(
+            commit_c_form.status.success(),
+            "git -C form fixture commit must succeed: {:?}",
+            commit_c_form
+        );
+
+        let log = run_guard_git(
+            &guard_git,
+            &guarded_path,
+            &git_args(&["log", "-1", "--format=%s"]),
+            Some(&repo),
+            &[],
+        );
+        assert!(log.status.success());
+        assert!(String::from_utf8_lossy(&log.stdout).contains("fixture commit two"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_guards_block_commit_outside_fixture_root() {
+        let (_root, _fixture_root, guard_git, guarded_path) = read_only_guard_setup().await;
+        let protected = tempfile::tempdir().unwrap();
+        let repo = protected.path().join("checkout");
+        init_repo_with_staged_file(&repo, "file.txt");
+
+        let commit = run_guard_git(
+            &guard_git,
+            &guarded_path,
+            &git_args(&["commit", "-m", "must not commit"]),
+            Some(&repo),
+            &[],
+        );
+        assert_guard_denies(&commit, "protected checkout", "commit");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_guards_block_commit_through_symlink_escape() {
+        let (_root, fixture_root, guard_git, guarded_path) = read_only_guard_setup().await;
+        let protected = tempfile::tempdir().unwrap();
+        let protected_repo = protected.path().join("checkout");
+        init_repo_with_staged_file(&protected_repo, "file.txt");
+
+        let link = fixture_root.path().join("escape-link");
+        std::os::unix::fs::symlink(&protected_repo, &link).unwrap();
+
+        let commit = run_guard_git(
+            &guard_git,
+            &guarded_path,
+            &git_args(&["commit", "-m", "symlink escape"]),
+            Some(&link),
+            &[],
+        );
+        assert_guard_denies(&commit, "symlink escape", "commit");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_guards_block_commit_with_gitfile_or_env_escape() {
+        let (_root, fixture_root, guard_git, guarded_path) = read_only_guard_setup().await;
+        let protected = tempfile::tempdir().unwrap();
+        let protected_repo = protected.path().join("checkout");
+        init_repo_with_staged_file(&protected_repo, "file.txt");
+
+        let gitfile_repo = fixture_root.path().join("gitfile-repo");
+        init_repo_with_staged_file(&gitfile_repo, "file.txt");
+        std::fs::remove_dir_all(gitfile_repo.join(".git")).unwrap();
+        std::fs::write(
+            gitfile_repo.join(".git"),
+            format!("gitdir: {}/.git\n", repo_path_str(&protected_repo)),
+        )
+        .unwrap();
+        let gitfile_commit = run_guard_git(
+            &guard_git,
+            &guarded_path,
+            &git_args(&["commit", "-m", "gitfile escape"]),
+            Some(&gitfile_repo),
+            &[],
+        );
+        assert_guard_denies(&gitfile_commit, "gitfile escape", "commit");
+
+        let clean_repo = fixture_root.path().join("clean-repo");
+        init_repo_with_staged_file(&clean_repo, "file.txt");
+        let env_commit = run_guard_git(
+            &guard_git,
+            &guarded_path,
+            &git_args(&["commit", "-m", "env escape"]),
+            Some(&clean_repo),
+            &[(
+                "GIT_DIR",
+                std::ffi::OsString::from(format!(
+                    "{}/.git",
+                    repo_path_str(&protected_repo)
+                )),
+            )],
+        );
+        assert_guard_denies(&env_commit, "GIT_DIR env escape", "commit");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_guards_block_push_and_history_rewrites_from_fixture() {
+        let (_root, fixture_root, guard_git, guarded_path) = read_only_guard_setup().await;
+        let repo = fixture_root.path().join("fixture-repo");
+        init_repo_with_staged_file(&repo, "file.txt");
+
+        for subcommand in [
+            "push", "merge", "rebase", "tag", "am", "cherry-pick", "revert",
+        ] {
+            let output = run_guard_git(
+                &guard_git,
+                &guarded_path,
+                &git_args(&[subcommand]),
+                Some(&repo),
+                &[],
+            );
+            assert_guard_denies(&output, "from allowed fixture repo", subcommand);
+        }
     }
 
     fn all_bootstrap_flags() -> HarnessBootstrapFlags {
