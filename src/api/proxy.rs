@@ -551,6 +551,7 @@ fn protocol_capabilities(
 ///
 /// Accepts either the internal `SANDBOXED_PROXY_SECRET` or any user-generated
 /// proxy API key from the `ProxyApiKeyStore`.
+#[allow(clippy::result_large_err)] // Axum's Response is the endpoint error contract.
 pub(crate) async fn verify_proxy_auth(
     headers: &HeaderMap,
     state: &super::routes::AppState,

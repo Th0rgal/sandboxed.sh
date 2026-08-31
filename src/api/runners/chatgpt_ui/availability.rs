@@ -333,6 +333,7 @@ pub fn mark_available(profile_dirs: &[PathBuf]) {
     persist(entry);
 }
 
+#[allow(clippy::result_large_err)] // AgentResult carries the terminal mission record.
 pub async fn wait_until_available(
     profile_dirs: &[PathBuf],
     mission_id: Uuid,
