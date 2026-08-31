@@ -246,9 +246,14 @@ Every mutable project object has a revision. Commands accept the revision or
 situation cursor they were based on. A stale command fails with a compact
 conflict response containing the changed fields and a fresh cursor.
 
-Every external mutation has an idempotency key derived from project, track,
-action kind, and generation. Retrying after a timeout returns the original
-receipt rather than launching a duplicate mission or repeating a merge.
+Every external mutation carries a stable logical `action_id` and a canonical
+request fingerprint. The effective idempotency key is derived from project,
+`action_id`, and fingerprint. Retrying the same action after a timeout returns
+the original receipt rather than launching a duplicate mission or repeating a
+merge. Reusing an `action_id` with a different fingerprint is a typed conflict,
+never an implicit retry. Successive steer or plan-revision commands therefore
+use distinct action IDs even within one attempt generation; controllers may
+derive deterministic IDs from the transition or wake event they are handling.
 
 ### Wake conditions
 
@@ -316,15 +321,21 @@ evidence at the governed artifact version. If automation advances a PR head,
 head-bound evidence becomes stale automatically. A terminal mission merely ends
 an attempt.
 
-Project mode should be a derivation wherever possible:
+Project mode should be a derivation wherever possible. The underlying facts are
+independent facets; the single display mode evaluates them in this explicit
+precedence order so every surface projects the same result:
 
-- `executing`: at least one valid live owner;
-- `ready`: an unblocked track has no owner;
-- `waiting`: every open track has a valid wake condition;
-- `blocked`: every open track lacks both a ready action and a valid wake path;
-- `paused`: the grant says pause;
-- `complete`: project acceptance is satisfied;
-- `inconsistent`: authoritative sources disagree or are unavailable.
+1. `inconsistent`: authoritative sources disagree or are unavailable;
+2. `complete`: project acceptance is satisfied;
+3. `paused`: the grant says pause;
+4. `executing`: at least one valid live owner;
+5. `ready`: an unblocked track has no owner;
+6. `waiting`: every open track has a valid wake condition;
+7. `blocked`: every open track lacks both a ready action and a valid wake path.
+
+For example, a project with an owned running track and a second unowned ready
+track is `executing`, while retaining `ready_track_count > 0` as a facet for
+scheduling and diagnostics. Mode does not erase the facts used to derive it.
 
 Human-friendly `active` can remain a display grouping. The richer derived state
 prevents “active but doing nothing” from being a valid steady state.
