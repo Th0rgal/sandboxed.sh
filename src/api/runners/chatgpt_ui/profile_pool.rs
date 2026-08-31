@@ -237,6 +237,7 @@ fn launch_gates() -> &'static AsyncMutex<HashMap<PathBuf, Instant>> {
 /// allowing already-submitted multi-hour turns to continue concurrently.
 /// This limits high-risk navigation/send bursts without imposing a low hard
 /// ceiling on the number of useful Pro conversations in flight.
+#[allow(clippy::result_large_err)] // AgentResult carries the terminal mission record.
 pub async fn wait_for_launch_turn(
     profile_dir: &Path,
     min_interval: Duration,
@@ -432,6 +433,7 @@ pub(crate) fn reset_registry_for_tests(profile_dirs: &[PathBuf]) {
     availability::reset_for_tests(profile_dirs);
 }
 
+#[allow(clippy::result_large_err)] // AgentResult carries the terminal mission record.
 pub async fn acquire_profile(
     profile_dirs: &[PathBuf],
     mission_id: Uuid,

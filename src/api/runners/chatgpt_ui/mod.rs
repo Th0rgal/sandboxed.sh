@@ -380,6 +380,7 @@ fn validated_settings(app_working_dir: &Path) -> Result<Settings, String> {
 
 const RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[allow(clippy::result_large_err)] // AgentResult carries the terminal mission record.
 async fn wait_for_available_launch_turn(
     settings: &Settings,
     mission_id: Uuid,
@@ -769,6 +770,7 @@ fn unresolved_resume_result(code: &str) -> AgentResult {
 /// the durable record names the account that holds the conversation, so pool
 /// health routing does not apply — either this slot frees up or the caller
 /// gives up via cancellation.
+#[allow(clippy::result_large_err)] // AgentResult carries the terminal mission record.
 async fn acquire_pinned_profile(
     profile_dirs: &[PathBuf],
     profile_dir: &Path,
