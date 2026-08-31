@@ -1373,6 +1373,11 @@ impl WorkspaceExec {
         }
 
         if let Some(guard_dir) = self.workspace.read_only_command_guard_dir.as_ref() {
+            let fixture_root = guard_dir
+                .parent()
+                .expect("read-only guard directory has a parent")
+                .join("read-only-fixtures");
+            let fixture_root = self.translate_path_for_container(&fixture_root);
             let guard_dir = self.translate_path_for_container(guard_dir);
             let existing_path = merged
                 .get("PATH")
@@ -1380,6 +1385,7 @@ impl WorkspaceExec {
                 .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
             merged.insert("PATH".to_string(), format!("{guard_dir}:{existing_path}"));
             merged.insert("SANDBOXED_SH_PR_READONLY".to_string(), "1".to_string());
+            merged.insert("TMPDIR".to_string(), fixture_root);
             merged.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
             merged.insert("GCM_INTERACTIVE".to_string(), "never".to_string());
             // Standard pushes are blocked twice: the PATH guard rejects the
