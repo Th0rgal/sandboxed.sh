@@ -16,9 +16,12 @@ intent -> observe -> decide -> act -> receive receipt -> reconcile -> learn
 ```
 
 Every Paloma component exists to make one edge of this loop reliable. Hermes
-holds intent and judgment. sandboxed.sh holds execution, observations, and
-receipts. Skills supply policy. Projections make the whole loop legible to an
-agent and operator without creating another source of truth.
+holds the operator conversation and the coordinator's working judgment;
+sandboxed.sh owns canonical structured project intent, authority, execution,
+observations, and receipts. Hermes proposes intent changes through project
+commands rather than maintaining a second writable intent store. Skills supply
+policy. Projections make the whole loop legible to an agent and operator
+without creating another source of truth.
 
 ## The design objective
 
@@ -255,6 +258,15 @@ never an implicit retry. Successive steer or plan-revision commands therefore
 use distinct action IDs even within one attempt generation; controllers may
 derive deterministic IDs from the transition or wake event they are handling.
 
+Idempotency crosses the crash boundary. Before an external effect, the command
+service durably records the action as `prepared` with its ID, fingerprint,
+target, and expected outcome. It then uses the provider's idempotency token when
+available and advances the record through `dispatched` to `confirmed` with the
+receipt. Recovery reconciles `prepared` or `dispatched` records against the
+provider or target before retrying. If the outcome cannot be proved, the action
+becomes `ambiguous` and blocks automatic repetition until reconciliation or an
+explicit operator decision. An in-memory receipt cache is never sufficient.
+
 ### Wake conditions
 
 Waiting is data:
@@ -295,8 +307,14 @@ Ownership uses explicit leases over semantic mutation domains:
 - repository/branch writer lease;
 - scarce provider or compute slot lease.
 
-Leases have holders, scopes, expiry, and renewal evidence. “Another controller
-owns it” is true only when a live lease or observable action says so.
+Leases have holders, scopes, expiry, renewal evidence, and a monotonically
+increasing fencing generation. Every mutation gateway validates the presented
+generation against the current scope before accepting a write, so an expired
+holder cannot resume and mutate after reassignment. Where a target cannot
+validate fencing (for example, a direct Git credential), Paloma must revoke or
+terminate the old writer and prove that revocation before granting the next
+lease. Expiry alone never authorizes concurrent writers. “Another controller
+owns it” is true only when a live fenced lease or observable action says so.
 
 Resource policy should expose constraints and marginal cost, not a giant raw
 fleet dump. Placement returns a reasoned receipt: chosen node/provider,
@@ -329,9 +347,16 @@ precedence order so every surface projects the same result:
 2. `complete`: project acceptance is satisfied;
 3. `paused`: the grant says pause;
 4. `executing`: at least one valid live owner;
-5. `ready`: an unblocked track has no owner;
-6. `waiting`: every open track has a valid wake condition;
-7. `blocked`: every open track lacks both a ready action and a valid wake path.
+5. `ready`: at least one unblocked track has no owner;
+6. `blocked`: with no executing or ready track, at least one open track lacks a
+   valid wake path;
+7. `waiting`: every open track has a valid wake condition.
+
+These predicates are total under the project invariants: after excluding an
+owner and a ready action, any track without a wake path makes the aggregate
+`blocked`; otherwise all open tracks are waiting. No open tracks without
+satisfied project acceptance is an invariant violation and therefore
+`inconsistent`.
 
 For example, a project with an owned running track and a second unowned ready
 track is `executing`, while retaining `ready_track_count > 0` as a facet for
