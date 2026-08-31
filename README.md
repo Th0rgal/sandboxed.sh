@@ -64,8 +64,11 @@ isolation. The other half is a **coordinator** that decides *what* to do and
 CLI) and its bundled **hermes-desktop** Electron app (`apps/desktop/`) — but any
 MCP-capable assistant works. The agent never runs untrusted code itself; it
 hands each unit of work to sandboxed.sh, which runs it in a throwaway
-workspace/container and streams back structured results. Four concepts tie the
-system together:
+workspace/container and streams back structured results. The canonical target
+model is the
+[agent-native control-plane architecture](docs/AGENT_CONTROL_PLANE.md):
+portfolio → project → track → attempt → action → receipt → evidence. Four
+runtime concepts explain the current integration:
 
 | Concept | What it is | Where it lives |
 |---|---|---|
@@ -248,6 +251,8 @@ deployment:
 - **[Native Installation](docs/install-native.md)** - Bare metal Ubuntu setup
 
 ### Architecture & APIs
+- **[Agent-native control plane](docs/AGENT_CONTROL_PLANE.md)** - Canonical system model, epistemic contract, abstraction tower, and design laws
+- **[Agent-native roadmap](docs/AGENT_NATIVE_ROADMAP.md)** - Phased migration to bounded situation reads, receipts, atomic actions, leases, and accretive knowledge
 - **[Hermes orchestration](docs/HERMES_ORCHESTRATION.md)** - How Hermes and sandboxed.sh run autonomous projects: sessions, missions, controllers, routes
 - **[Harness System](docs/HARNESS_SYSTEM.md)** - Backend integration architecture
 - **[ChatGPT UI harness](docs/CHATGPT_UI_HARNESS.md)** - Experimental subscription-backed browser harness

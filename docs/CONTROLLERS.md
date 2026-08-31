@@ -5,6 +5,18 @@ se réveille toutes les N minutes, charge le skill `controllers-policy`, et fait
 avancer **un** projet : il dispatche des missions, merge des PRs, met à jour son
 tracker, et te livre un rapport.
 
+Le modèle système canonique est
+[`AGENT_CONTROL_PLANE.md`](AGENT_CONTROL_PLANE.md), avec sa migration dans
+[`AGENT_NATIVE_ROADMAP.md`](AGENT_NATIVE_ROADMAP.md). En particulier : projet →
+track → tentative/mission → action → reçu → preuve. Le contrôleur porte le
+jugement ; il ne doit pas reconstruire la réalité à partir de prose ni prendre
+la fin d'une mission pour la réussite d'un track.
+
+L'interface actuelle ci-dessous est la couche de compatibilité. Sa cible est un
+tick `get_situation(project, since_cursor)` → une action typée et idempotente →
+un reçu → un réveil sur condition. Tant que ces primitives ne sont pas livrées,
+le skill conserve les lectures et dual-writes explicites décrits ici.
+
 ## Créer un contrôleur
 
 Trois choses, dans cet ordre.
@@ -115,6 +127,11 @@ Un callback d'inspect (`awaiting_user`, mission parkée) ne pose pas
 `mode=blocked` : ces statuts omettent le `[CTRL:]`. Recopier l'ancien
 trailer est une dérive de prompt.
 
+À terme, `mode` devient une projection déterministe plus précise : `ready`,
+`executing`, `waiting`, `blocked`, `paused`, `complete`, ou `inconsistent`.
+`active` reste un regroupement d'affichage. Cela rend impossible l'état stable
+« active mais sans propriétaire, action ni condition de réveil ».
+
 Si le dispatch est refusé (disque, auth, capacité), le projet **garde son
 objectif** avec un blocker infra nommé (`blocked:disk`, …). Le travail
 plateforme s'ouvre sous `sandboxed-sh`. On ne retitre pas, on ne réutilise
@@ -162,6 +179,12 @@ Si un contrôleur ticque `ok` mais que rien ne bouge, la question à poser est
 *quel est son mode*. `active` sans mission créée pendant deux ticks est un défaut
 qu'il doit signaler lui-même ; `blocked` avec un `wait=` qui grimpe veut dire que
 le contournement a échoué et que l'escalade arrive.
+
+Un système agent-native ne doit finalement plus consommer un tick pour constater
+qu'une attente n'a pas changé. Toute attente doit devenir un prédicat durable
+(mission terminale, check GitHub, job fini, date atteinte) qui réveille la
+conversation ; le cron n'est plus qu'un filet de sécurité pour les échéances et
+la réconciliation.
 
 ## Coordination between controllers
 
