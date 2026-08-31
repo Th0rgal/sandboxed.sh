@@ -3484,7 +3484,11 @@ case "$subcommand" in
     ;;
   commit)
     if [ "$env_value_form" = 1 ]; then deny_commit; fi
-    if [ -n "${GIT_DIR:-}" ] || [ -n "${GIT_WORK_TREE:-}" ]; then deny_commit; fi
+    if [ -n "${GIT_DIR:-}" ] || [ -n "${GIT_WORK_TREE:-}" ] || \
+       [ -n "${GIT_INDEX_FILE:-}" ] || [ -n "${GIT_OBJECT_DIRECTORY:-}" ] || \
+       [ -n "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" ] || [ -n "${GIT_COMMON_DIR:-}" ]; then
+      deny_commit
+    fi
     effective_dir="$PWD"
     if [ -n "$c_arg_dir" ]; then effective_dir="$c_arg_dir"; fi
     resolved_dir=$(cd -P "$effective_dir" 2>/dev/null && pwd -P) || deny_commit
@@ -3509,6 +3513,17 @@ case "$subcommand" in
       *) deny_commit ;;
     esac
     if find "$resolved_git_dir" -type l -print -quit 2>/dev/null | grep -q .; then deny_commit; fi
+    common_dir=$(PATH="${PATH#*:}" git -C "$resolved_toplevel" rev-parse --git-common-dir 2>/dev/null) || deny_commit
+    case "$common_dir" in
+      /*) common_path="$common_dir" ;;
+      *) common_path="$resolved_toplevel/$common_dir" ;;
+    esac
+    resolved_common_dir=$(cd -P "$common_path" 2>/dev/null && pwd -P) || deny_commit
+    case "$resolved_common_dir/" in
+      "$fixture_root"/*) ;;
+      *) deny_commit ;;
+    esac
+    if find "$resolved_common_dir" -type l -print -quit 2>/dev/null | grep -q .; then deny_commit; fi
     ;;
 esac
 PATH="${PATH#*:}" exec git "$@"
@@ -5662,6 +5677,41 @@ mod tests {
             )],
         );
         assert_guard_denies(&env_commit, "GIT_DIR env escape", "commit");
+
+        for variable in [
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+        ] {
+            let env_commit = run_guard_git(
+                &guard_git,
+                &guarded_path,
+                &git_args(&["commit", "-m", "metadata env escape"]),
+                Some(&clean_repo),
+                &[(
+                    variable,
+                    std::ffi::OsString::from(protected_repo.join(".git")),
+                )],
+            );
+            assert_guard_denies(&env_commit, variable, "commit");
+        }
+
+        let commondir_repo = fixture_root.join("commondir-repo");
+        init_repo_with_staged_file(&commondir_repo, "file.txt");
+        std::fs::write(
+            commondir_repo.join(".git/commondir"),
+            format!("{}\n", repo_path_str(&protected_repo.join(".git"))),
+        )
+        .unwrap();
+        let commondir_commit = run_guard_git(
+            &guard_git,
+            &guarded_path,
+            &git_args(&["commit", "-m", "commondir escape"]),
+            Some(&commondir_repo),
+            &[],
+        );
+        assert_guard_denies(&commondir_commit, "commondir escape", "commit");
     }
 
     #[cfg(unix)]
