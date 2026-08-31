@@ -463,6 +463,7 @@ pub(crate) fn grok_stdout_line_requests_interactive_login(line: &str) -> bool {
 /// xAI OAuth token if stale, materialize/sync the CLI auth file, and export
 /// `XAI_API_KEY` (key > OAuth access token > ambient env). Shared by the
 /// streaming-json and ACP turn paths.
+#[allow(clippy::result_large_err)] // AgentResult carries the terminal mission record.
 async fn prepare_grok_auth_env(
     workspace: &Workspace,
     app_working_dir: &std::path::Path,
