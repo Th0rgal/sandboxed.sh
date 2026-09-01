@@ -4697,9 +4697,33 @@ fn is_opencode_exit_status_placeholder(output: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_shell_launch_diagnostic(output: &str) -> bool {
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(line) = lines.next() else {
+        return false;
+    };
+    if lines.next().is_some() {
+        return false;
+    }
+    let lower = line.to_ascii_lowercase();
+    let shell_prefix = lower.starts_with("sh: ")
+        || lower.starts_with("/bin/sh: ")
+        || lower.starts_with("bash: ")
+        || lower.starts_with("/bin/bash: ");
+    shell_prefix
+        && (lower.ends_with(": not found")
+            || lower.contains(": permission denied")
+            || lower.contains(": cannot open"))
+}
+
 pub(crate) fn opencode_output_needs_fallback(output: &str) -> bool {
     let sanitized = sanitized_opencode_stdout(output);
-    sanitized.trim().is_empty() || is_opencode_exit_status_placeholder(sanitized.as_ref())
+    sanitized.trim().is_empty()
+        || is_opencode_exit_status_placeholder(sanitized.as_ref())
+        || is_shell_launch_diagnostic(sanitized.as_ref())
 }
 
 pub(crate) fn summarize_recent_opencode_stderr(
@@ -10796,6 +10820,13 @@ mod tests {
 
         let normal_text = "The OpenCode CLI exited with status: 1 in a prior run, now fixed.";
         assert!(!opencode_output_needs_fallback(normal_text));
+
+        assert!(opencode_output_needs_fallback(
+            "sh: 1: /srv/container/.sandboxed-sh-opencode-cmd.sh: not found"
+        ));
+        assert!(!opencode_output_needs_fallback(
+            "I found that sh: 1 reported a missing command in the prior run."
+        ));
     }
 
     #[test]
