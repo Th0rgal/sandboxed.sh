@@ -17226,6 +17226,7 @@ async fn maybe_finalize_terminal_mission(
     mission_store: &Arc<dyn MissionStore>,
     events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
     mission_id: Uuid,
+    live_background_tasks: usize,
     terminal_reason: Option<TerminalReason>,
     // What the terminating guard observed, from AgentResult::terminal_evidence.
     terminal_evidence: Option<&str>,
@@ -17247,7 +17248,20 @@ async fn maybe_finalize_terminal_mission(
             || lower.contains("stream closed before mission")
             || lower.contains("codex app-server stream closed")
     });
-    let mapped = if transportish && matches!(reason, TerminalReason::LlmError) {
+    let mapped = if live_background_tasks > 0
+        && matches!(
+            reason,
+            TerminalReason::TurnComplete | TerminalReason::Completed | TerminalReason::LlmError
+        ) {
+        // Claude Code can emit its terminal result before descendants of a
+        // `run_in_background` Bash call release the PTY. The bounded teardown
+        // then SIGKILLs the lingering CLI process, which historically changed
+        // a healthy parked mission into Failed and invited a controller retry
+        // while the build was still running. The shared registry is the
+        // authoritative evidence that useful work remains live: park the
+        // mission and let bg-autoresume deliver the receipt when it completes.
+        Some((MissionStatus::WaitingBackground, "background_jobs_running"))
+    } else if transportish && matches!(reason, TerminalReason::LlmError) {
         Some((MissionStatus::Interrupted, "transport"))
     } else {
         mission_status_for_terminal_reason(reason, complete_turn_without_follow_up)
@@ -21549,6 +21563,11 @@ async fn control_actor_loop(
                                     &mission_store,
                                     &events_tx,
                                     mission_id,
+                                    background_tasks
+                                        .read()
+                                        .await
+                                        .get(&mission_id)
+                                        .map_or(0, std::collections::HashMap::len),
                                     agent_result.terminal_reason,
                                     agent_result.terminal_evidence.as_deref(),
                                     Some(completion_evidence.completion_confidence),
@@ -21826,6 +21845,11 @@ async fn control_actor_loop(
                                 &mission_store,
                                 &events_tx,
                                 mission_id,
+                                background_tasks
+                                    .read()
+                                    .await
+                                    .get(&mission_id)
+                                    .map_or(0, std::collections::HashMap::len),
                                 completed_terminal_reason,
                                 None,
                                 completed_completion_confidence,
@@ -22485,6 +22509,11 @@ async fn control_actor_loop(
                                         &mission_store,
                                         &events_tx,
                                         *mission_id,
+                                        background_tasks
+                                            .read()
+                                            .await
+                                            .get(mission_id)
+                                            .map_or(0, std::collections::HashMap::len),
                                         result.terminal_reason,
                                         result.terminal_evidence.as_deref(),
                                         Some(completion_evidence.completion_confidence),
@@ -32755,6 +32784,7 @@ Investigate <service/> failures.
             &store,
             &events_tx,
             mission.id,
+            0,
             Some(TerminalReason::LlmError),
             None,
             None,
@@ -32776,6 +32806,52 @@ Investigate <service/> failures.
     }
 
     #[tokio::test]
+    async fn terminal_turn_parks_while_background_task_is_live() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("Background build"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("mission should be active");
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel(8);
+
+        maybe_finalize_terminal_mission(
+            &store,
+            &events_tx,
+            mission.id,
+            1,
+            Some(TerminalReason::LlmError),
+            None,
+            None,
+            false,
+            Some("Claude Code produced no output after its terminal result"),
+            "background task test",
+        )
+        .await;
+
+        let updated = store
+            .get_mission(mission.id)
+            .await
+            .expect("mission lookup should succeed")
+            .expect("mission should exist");
+        assert_eq!(updated.status, MissionStatus::WaitingBackground);
+        assert_eq!(
+            updated.terminal_reason.as_deref(),
+            Some("background_jobs_running")
+        );
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(AgentEvent::MissionStatusChanged {
+                status: MissionStatus::WaitingBackground,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn maybe_finalize_terminal_mission_skips_low_confidence_completed() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
@@ -32792,6 +32868,7 @@ Investigate <service/> failures.
             &store,
             &events_tx,
             mission.id,
+            0,
             Some(TerminalReason::Completed),
             None,
             Some(crate::agents::CompletionConfidence::Low),
