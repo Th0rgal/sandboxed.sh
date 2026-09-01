@@ -3152,6 +3152,12 @@ pub struct CodexOAuthAccount {
 static CODEX_OAUTH_REFRESH_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+const CODEX_OAUTH_MIN_ACCESS_TOKEN_TTL_MS: i64 = 10 * 60 * 1000;
+
+fn codex_oauth_access_token_needs_refresh(expires_at: i64, now: i64) -> bool {
+    expires_at <= now + CODEX_OAUTH_MIN_ACCESS_TOKEN_TTL_MS
+}
+
 fn codex_oauth_refresh_lock(account_id: &str) -> Arc<AsyncMutex<()>> {
     let mut locks = CODEX_OAUTH_REFRESH_LOCKS
         .lock()
@@ -3190,7 +3196,10 @@ fn refresh_token_reused_error(error: &str) -> bool {
 
 #[cfg(test)]
 mod codex_oauth_error_tests {
-    use super::refresh_token_reused_error;
+    use super::{
+        codex_oauth_access_token_needs_refresh, refresh_token_reused_error,
+        CODEX_OAUTH_MIN_ACCESS_TOKEN_TTL_MS,
+    };
 
     #[test]
     fn recognizes_rotating_refresh_token_reuse() {
@@ -3201,6 +3210,20 @@ mod codex_oauth_error_tests {
             "The refresh token has already been used"
         ));
         assert!(!refresh_token_reused_error("access token expired"));
+    }
+
+    #[test]
+    fn refreshes_only_inside_the_access_token_safety_window() {
+        let now = 1_000_000;
+        assert!(!codex_oauth_access_token_needs_refresh(
+            now + CODEX_OAUTH_MIN_ACCESS_TOKEN_TTL_MS + 1,
+            now
+        ));
+        assert!(codex_oauth_access_token_needs_refresh(
+            now + CODEX_OAUTH_MIN_ACCESS_TOKEN_TTL_MS,
+            now
+        ));
+        assert!(codex_oauth_access_token_needs_refresh(now - 1, now));
     }
 }
 
@@ -3310,8 +3333,6 @@ pub async fn prepare_codex_oauth_account_for_launch(
     working_dir: &Path,
     selected: &CodexOAuthAccount,
 ) -> Result<CodexOAuthAccount, String> {
-    const MIN_ACCESS_TOKEN_TTL_MS: i64 = 10 * 60 * 1000;
-
     let lock = codex_oauth_refresh_lock(&selected.chatgpt_account_id);
     let _guard = lock.lock().await;
     let _process_guard = acquire_codex_oauth_cross_process_lock().await?;
@@ -3322,7 +3343,7 @@ pub async fn prepare_codex_oauth_account_for_launch(
         .unwrap_or_else(|| selected.clone());
 
     let now = chrono::Utc::now().timestamp_millis();
-    if current.expires_at > now + MIN_ACCESS_TOKEN_TTL_MS {
+    if !codex_oauth_access_token_needs_refresh(current.expires_at, now) {
         let _ = sync_shared_codex_oauth_auth(&current);
         return Ok(current);
     }
@@ -3414,6 +3435,23 @@ pub async fn refresh_codex_oauth_account_for_app_server(
     if current.refresh_token != before.refresh_token || current.access_token != before.access_token
     {
         let _ = sync_shared_codex_oauth_auth(&current);
+        return Ok(current);
+    }
+
+    // Codex can request an external refresh immediately after startup even
+    // when the access token is still valid. Refresh tokens rotate on use, so
+    // honoring that eager request needlessly races other Codex processes and
+    // independent OAuth consumers, producing `refresh_token_reused`. The
+    // backend is the refresh owner: return the current canonical access token
+    // until it is close to expiry, then rotate once under both locks above.
+    let now = chrono::Utc::now().timestamp_millis();
+    if !codex_oauth_access_token_needs_refresh(current.expires_at, now) {
+        let _ = sync_shared_codex_oauth_auth(&current);
+        tracing::debug!(
+            account_id,
+            expires_at = current.expires_at,
+            "Satisfied eager Codex OAuth refresh request from canonical access token"
+        );
         return Ok(current);
     }
 
