@@ -118,6 +118,39 @@ fn status_triggers_teardown(status: &MissionStatus) -> bool {
     }
 }
 
+/// Schedule the guarded teardown for one status transition.
+///
+/// Most transitions arrive through the broadcast listener below, but callers
+/// that persist terminal status also invoke this directly. That makes scope
+/// cleanup reliable even when the broadcast receiver is lagged, restarted, or
+/// temporarily absent. The delayed store recheck preserves live background
+/// work exactly as the listener path does.
+pub(crate) fn schedule_mission_scope_teardown(
+    mission_store: Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    status: MissionStatus,
+) {
+    if !status_triggers_teardown(&status) {
+        return;
+    }
+    tokio::spawn(async move {
+        let reason = format!("mission status {status:?}");
+        tokio::time::sleep(teardown_grace()).await;
+        match mission_store.get_mission(mission_id).await {
+            Ok(Some(m)) if status_keeps_scopes(&m.status) => {
+                tracing::debug!(
+                    %mission_id,
+                    status = ?m.status,
+                    "scope teardown skipped: status changed during grace"
+                );
+                return;
+            }
+            _ => {}
+        }
+        stop_mission_exec_scopes(mission_id, &reason).await;
+    });
+}
+
 fn legacy_scope_is_reapable(
     mission_index_complete: bool,
     age: Option<Duration>,
@@ -224,37 +257,9 @@ pub fn spawn_status_listener(
                 Ok(AgentEvent::MissionStatusChanged {
                     mission_id, status, ..
                 }) => {
-                    if status_triggers_teardown(&status) {
-                        // Detached so the grace sleep never stalls this
-                        // receiver into broadcast lag.
-                        let store = Arc::clone(&mission_store);
-                        tokio::spawn(async move {
-                            let reason = format!("mission status {status:?}");
-                            // Grace: let the harness's own shutdown path run
-                            // first, and — critically — outlast the
-                            // background watcher's 10s poll so an
-                            // AwaitingUser→WaitingBackground promotion is
-                            // visible to the recheck below.
-                            tokio::time::sleep(teardown_grace()).await;
-                            // Re-check the CURRENT status: within the grace
-                            // window the mission may have been promoted
-                            // (AwaitingUser → WaitingBackground by the
-                            // background watcher, or resumed to Active) —
-                            // stopping then would kill live work.
-                            match store.get_mission(mission_id).await {
-                                Ok(Some(m)) if status_keeps_scopes(&m.status) => {
-                                    tracing::debug!(
-                                        %mission_id,
-                                        status = ?m.status,
-                                        "scope teardown skipped: status changed during grace"
-                                    );
-                                    return;
-                                }
-                                _ => {}
-                            }
-                            stop_mission_exec_scopes(mission_id, &reason).await;
-                        });
-                    }
+                    // Detached so the grace sleep never stalls this receiver
+                    // into broadcast lag.
+                    schedule_mission_scope_teardown(Arc::clone(&mission_store), mission_id, status);
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(dropped)) => {

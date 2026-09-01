@@ -19906,6 +19906,15 @@ async fn control_actor_loop(
                                 status: new_status,
                                 summary: None,
                             });
+                            // Broadcast delivery is best-effort. Also schedule
+                            // the same guarded cleanup directly so an
+                            // acknowledged mission cannot leave a forked
+                            // dbus/MCP child pinning its transient scope.
+                            super::scope_reaper::schedule_mission_scope_teardown(
+                                Arc::clone(&mission_store),
+                                id,
+                                new_status,
+                            );
                         }
                         let _ = respond.send(result);
                     }
