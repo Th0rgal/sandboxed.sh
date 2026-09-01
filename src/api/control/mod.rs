@@ -277,6 +277,10 @@ pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
     )
 }
 
+fn background_tasks_block_ack(status: MissionStatus, task_count: usize) -> bool {
+    status == MissionStatus::Acknowledged && task_count > 0
+}
+
 /// Stash a newly arrived operator message as the mission's deferred goal.
 ///
 /// Pending missions have not run yet, so multiple pre-dispatch messages
@@ -19849,6 +19853,24 @@ async fn control_actor_loop(
                         }
                     }
                     ControlCommand::SetMissionStatus { id, status: new_status, respond } => {
+                        // A completion callback can race the 10s background-task
+                        // reconciler. Controllers often acknowledge immediately;
+                        // without this guard they can archive the mission before
+                        // AwaitingUser is promoted to WaitingBackground, then a
+                        // follow-up starts a second harness in the same scope and
+                        // kills the still-running build tree. Fail closed while
+                        // the in-memory registry has any live task for this mission.
+                        let background_task_count = background_tasks
+                            .read()
+                            .await
+                            .get(&id)
+                            .map_or(0, std::collections::HashMap::len);
+                        if background_tasks_block_ack(new_status, background_task_count) {
+                            let _ = respond.send(Err(format!(
+                                "mission {id} cannot be acknowledged while background tasks are live"
+                            )));
+                            continue;
+                        }
                         let current_id = *current_mission.read().await;
                         if current_id == Some(id) {
                             if let Some(tree) = current_tree.read().await.clone() {
@@ -32438,6 +32460,13 @@ Investigate <service/> failures.
         // until the user resumes it), so they are not activation-eligible here.
         assert!(!message_activates_mission(MissionStatus::Active));
         assert!(!message_activates_mission(MissionStatus::Paused));
+    }
+
+    #[test]
+    fn acknowledgement_is_blocked_while_background_tasks_are_registered() {
+        assert!(background_tasks_block_ack(MissionStatus::Acknowledged, 1));
+        assert!(!background_tasks_block_ack(MissionStatus::Acknowledged, 0));
+        assert!(!background_tasks_block_ack(MissionStatus::Active, 1));
     }
 
     #[test]
