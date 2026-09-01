@@ -251,6 +251,10 @@ pub(crate) async fn reset_waiting_background_on_boot(
     reconcile_waiting_background(&mission_store, &events_tx, &no_live_jobs).await;
 }
 
+fn terminal_status_discards_background_task(status: MissionStatus) -> bool {
+    status.is_terminal() || status == MissionStatus::Acknowledged
+}
+
 /// Watcher that auto-resumes missions whose background shell tasks have finished.
 ///
 /// Uses an in-memory [`BackgroundTaskRegistry`] shared with the control actor.
@@ -333,10 +337,7 @@ pub(crate) async fn background_task_autoresume_loop(
                 mission.status,
                 MissionStatus::AwaitingUser | MissionStatus::WaitingBackground
             ) {
-                let terminal = matches!(
-                    mission.status,
-                    MissionStatus::Completed | MissionStatus::Failed | MissionStatus::NotFeasible
-                );
+                let terminal = terminal_status_discards_background_task(mission.status);
                 let age_secs = task.started_at.elapsed().as_secs();
                 let prev = watches.get(&(mission_id, task.id.clone()));
                 tracing::debug!(
@@ -811,8 +812,9 @@ fn truncate_for_pgrep(command: &str) -> String {
 mod tests {
     use super::{
         bg_decide_finished, demote_parked_if_jobs_gone, parse_probe_line, pgrep_pattern_for_task,
-        reconcile_parked_status, shell_single_quote, truncate_for_pgrep, BackgroundTask, BgProbe,
-        BgWatch, MissionStatus, BG_IDLE_STABLE_SECS, BG_START_GRACE_SECS,
+        reconcile_parked_status, shell_single_quote, terminal_status_discards_background_task,
+        truncate_for_pgrep, BackgroundTask, BgProbe, BgWatch, MissionStatus, BG_IDLE_STABLE_SECS,
+        BG_START_GRACE_SECS,
     };
     use crate::api::mission_store::{InMemoryMissionStore, MissionStore};
     use std::sync::Arc;
@@ -1053,6 +1055,29 @@ mod tests {
         ] {
             assert_eq!(reconcile_parked_status(status, true), None);
             assert_eq!(reconcile_parked_status(status, false), None);
+        }
+    }
+
+    #[test]
+    fn terminal_and_acknowledged_missions_discard_stale_background_entries() {
+        for status in [
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::Interrupted,
+            MissionStatus::Blocked,
+            MissionStatus::NotFeasible,
+            MissionStatus::Acknowledged,
+        ] {
+            assert!(terminal_status_discards_background_task(status));
+        }
+        for status in [
+            MissionStatus::Pending,
+            MissionStatus::Active,
+            MissionStatus::AwaitingUser,
+            MissionStatus::WaitingBackground,
+            MissionStatus::Paused,
+        ] {
+            assert!(!terminal_status_discards_background_task(status));
         }
     }
 
