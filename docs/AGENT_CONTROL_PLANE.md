@@ -203,8 +203,13 @@ Normal operation uses three read depths:
    diagnosis, or audit.
 
 All list APIs should support `since_cursor`, server-side filters, stable sort,
-caps, and explicit omission counts. An empty result must distinguish “nothing
-matched,” “source unavailable,” and “not checked.”
+caps, and explicit omission counts. Capped reads use a stable snapshot and
+return a page cursor that advances through exactly the last delivered change,
+plus a continuation flag. The client repeats from that cursor until the
+snapshot is drained; only then does the server return the new high-water
+cursor. Omitted changes are therefore neither skipped nor replayed forever.
+An empty result must distinguish “nothing matched,” “source unavailable,” and
+“not checked.”
 
 ## The control protocol
 
@@ -347,7 +352,8 @@ precedence order so every surface projects the same result:
 2. `complete`: project acceptance is satisfied;
 3. `paused`: the grant says pause;
 4. `executing`: at least one valid live owner;
-5. `ready`: at least one unblocked track has no owner;
+5. `ready`: at least one unblocked, ownerless track has an immediately
+   actionable next transition (not merely a valid future wake condition);
 6. `blocked`: with no executing or ready track, at least one open track lacks a
    valid wake path;
 7. `waiting`: every open track has a valid wake condition.
