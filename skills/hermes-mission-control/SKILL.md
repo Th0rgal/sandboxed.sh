@@ -465,6 +465,12 @@ spans several turns. Keep reviewers as bounded task missions. Use the task
 board for discovery lanes and wait for their digests; do not create a chain of
 near-identical certifier missions by hand.
 
+`start_mission(writer: true)` enforces that distinction at the API boundary by
+entering goal mode even if a controller omitted the literal `/goal` prefix.
+Do not mark a writer complete merely because one provider turn ended; require
+the track's current evidence contract. Reviewers remain bounded with
+`writer: false`.
+
 ## Check-in cadence for multi-day missions
 
 You can't sit in a chat for a week. Conversational `start_mission` already

@@ -338,6 +338,24 @@ struct StartMissionParams {
     origin_session_id: Option<String>,
 }
 
+/// PR writers own an outcome, not one conversational turn. Make that runtime
+/// invariant explicit even when a controller forgets the `/goal` prefix; a
+/// bounded reviewer (`writer: false`) remains a normal one-turn mission.
+fn writer_goal_prompt(prompt: String, writer: bool) -> String {
+    if !writer {
+        return prompt;
+    }
+    let trimmed = prompt.trim_start();
+    let already_goal = trimmed
+        .strip_prefix("/goal")
+        .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace));
+    if already_goal {
+        prompt
+    } else {
+        format!("/goal {prompt}")
+    }
+}
+
 /// Deserialize a tool's arguments, naming the offending field when it fails.
 ///
 /// `serde_json::from_value` reports the shape mismatch but not its location:
@@ -1502,7 +1520,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "start_mission".to_string(),
-                description: "Start a new attempt on a work item. Pass project+track (the durable item) together with a stable idempotency_key; the server atomically declares/revises the track, reserves its owner lease, links the mission, and supersedes the previous owner. Retrying the same logical dispatch MUST reuse the key. Missions are attempts, not the work itself — use get_project_tasks for the declared roadmap and its separate unplanned_attempts. Set backend explicitly when possible. For Codex GPT-5.6/5.5/5.4, set fast_mode=true to request the native fast service tier; this consumes ChatGPT credits faster. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Reviewers and certifiers must use writer=false: the server tags them pr-readonly and blocks git/gh mutations. Any PR-changing mission must use writer=true; the API rejects concurrent writers for the same PR.".to_string(),
+                description: "Start a new attempt on a work item. Pass project+track (the durable item) together with a stable idempotency_key; the server atomically declares/revises the track, reserves its owner lease, links the mission, and supersedes the previous owner. Retrying the same logical dispatch MUST reuse the key. Missions are attempts, not the work itself — use get_project_tasks for the declared roadmap and its separate unplanned_attempts. Set backend explicitly when possible. For Codex GPT-5.6/5.5/5.4, set fast_mode=true to request the native fast service tier; this consumes ChatGPT credits faster. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Reviewers and certifiers must use writer=false: the server tags them pr-readonly and blocks git/gh mutations. Any PR-changing mission must use writer=true; the API rejects concurrent writers for the same PR and automatically runs writers in persistent /goal mode so a normal one-turn model stop cannot masquerade as completion.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -2285,10 +2303,12 @@ impl AssistantMcp {
         let backend = params
             .backend
             .or_else(|| native_backend_from_agent(params.agent.as_deref()));
+        let writer = params.writer.unwrap_or(false);
+        let prompt = writer_goal_prompt(params.prompt, writer);
         let tags = mission_start_tags(
             params.tags,
             params.request_merge_authority.unwrap_or(false),
-            params.writer.unwrap_or(false),
+            writer,
             params.github_pr.as_deref(),
             MergeGrantConfig::from_environment().as_ref(),
         )?;
@@ -2319,14 +2339,14 @@ impl AssistantMcp {
             // deferred goal and the scheduler dispatches it as soon as
             // capacity allows. The old create-then-send_message pattern could
             // be dropped at capacity, leaving zombie Pending missions.
-            "prompt": params.prompt,
+            "prompt": prompt,
             // Project tagging at creation so the mission isn't born with null
             // metadata (Paloma watchdogs then route by these, not titles).
             "project": params.project,
             "track": params.track,
             "intent": params.intent,
             "github_pr": params.github_pr,
-            "writer": params.writer,
+            "writer": writer,
             "tags": tags,
             "desired_state": params.desired_state,
             "acceptance_criteria": params.acceptance_criteria,
@@ -4439,6 +4459,22 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn writers_are_goal_mode_even_when_controller_omits_prefix() {
+        assert_eq!(
+            writer_goal_prompt("finish the PR".into(), true),
+            "/goal finish the PR"
+        );
+        assert_eq!(
+            writer_goal_prompt("  /goal finish the PR".into(), true),
+            "  /goal finish the PR"
+        );
+        assert_eq!(
+            writer_goal_prompt("review the PR".into(), false),
+            "review the PR"
+        );
+    }
 
     /// `adopt_mission` without a stamped session must refuse, not clear.
     #[test]
