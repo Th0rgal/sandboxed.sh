@@ -133,7 +133,7 @@ mcp_sandboxed_assistant_start_mission(
 # zai, minimax, kimi, spark
 ```
 
-**Fable 5 via `claudecode` only.** Virtuals is deprecated and no longer available. To use Fable 5, launch via `backend="claudecode"` with `model_override="claude-fable-5"`. Do NOT use `opencode` + `virtuals/claude-fable-5` — Virtuals has been removed from the provider catalog.
+**Fable 5.1 via `claudecode` only.** Virtuals is deprecated and no longer available. For demanding reasoning and long-horizon agentic work, launch via `backend="claudecode"` with the exact catalog ID `model_override="claude-fable-5-1"`. The older `claude-fable-5` remains available only for explicit compatibility. Do NOT use `opencode` + `virtuals/claude-fable-5-1` — Virtuals has been removed from the provider catalog.
 
 **Model ID gotchas:**
 - Z.AI: `glm-5.2`, `glm-5.1`, `glm-5-turbo` (lowercase, hyphenated)
