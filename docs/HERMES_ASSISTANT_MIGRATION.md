@@ -1,17 +1,22 @@
 # Hermes Assistant Migration
 
-This document captures the target architecture for replacing the built-in
-Telegram assistant path with a standalone Hermes assistant connected to
-sandboxed.sh over MCP.
+This document is the historical migration and deployment contract for replacing
+the built-in Telegram assistant path with a standalone Hermes assistant
+connected to sandboxed.sh over MCP. The cutover established the runtime split;
+it is not the current system design roadmap.
 
 > This is the migration plan. For how the two systems operate together once
 > migrated — sessions, missions, controllers, project routes, and what makes
 > progress visible — see
 > [`HERMES_ORCHESTRATION.md`](HERMES_ORCHESTRATION.md).
+> The target agent-native control-plane architecture and its implementation
+> sequence are
+> [`AGENT_CONTROL_PLANE.md`](AGENT_CONTROL_PLANE.md) and
+> [`AGENT_NATIVE_ROADMAP.md`](AGENT_NATIVE_ROADMAP.md).
 
-## Current Architecture
+## Pre-cutover Architecture
 
-The existing Telegram assistant is not just a workspace. It is a backend-owned
+The pre-cutover Telegram assistant was not just a workspace. It was a backend-owned
 assistant stack:
 
 - `src/api/telegram.rs` owns Telegram webhook routing, trigger filtering,
@@ -29,7 +34,7 @@ This makes Telegram the assistant runtime. The agent loop, memory policy,
 Telegram transport, mission steering, and proactive notification logic are all
 coupled inside sandboxed.sh.
 
-## Target Architecture
+## Cutover Architecture
 
 Hermes should become the assistant runtime. Sandboxed.sh should become the
 workspace, mission, model-routing, and control provider.

@@ -1,8 +1,15 @@
 # palomactl v0
 
-`palomactl` is a small CLI-first control-plane for Paloma/Thomas project state.
-It treats project markdown as durable operator intent and keeps volatile live
-state in generated files under `.paloma/`.
+`palomactl` is a small CLI-first reconciliation surface for Paloma/Thomas
+project state. It treats project markdown as durable operator-authored
+narrative and keeps volatile live state in generated files under `.paloma/`.
+
+Architecturally it is a reconciliation and export surface, not a competing
+project store. The canonical agent model is defined in
+[`AGENT_CONTROL_PLANE.md`](AGENT_CONTROL_PLANE.md): structured project intent,
+tracks, grants, receipts, and evidence are authoritative; markdown is authored
+narrative or a generated view. `palomactl` must never infer a successful action
+from prose or write volatile runtime state back into tracker notes.
 
 ## Data layout
 
