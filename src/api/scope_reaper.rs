@@ -160,6 +160,19 @@ fn legacy_scope_is_reapable(
     mission_index_complete && age.is_some_and(|age| age >= max_age) && !owned_by_live_workspace
 }
 
+/// A mission-tagged scope missing from the cross-store index is not proof of
+/// orphanhood. Index construction races session/store registration and has
+/// briefly missed live missions in production. Require the same age evidence
+/// as legacy scopes before treating an unknown tag as stale; status-driven
+/// teardown remains the fast path for known terminal missions.
+fn unknown_tagged_scope_is_reapable(
+    mission_index_complete: bool,
+    age: Option<Duration>,
+    max_age: Duration,
+) -> bool {
+    mission_index_complete && age.is_some_and(|age| age >= max_age)
+}
+
 /// List all `sandboxed-exec-*.scope` unit names currently known to systemd.
 pub(crate) async fn try_list_exec_scope_units() -> Result<Vec<String>, String> {
     let output = Command::new("systemctl")
@@ -392,10 +405,12 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
                     }
                 }
                 None => {
-                    if !index_full.complete {
+                    let age = unit_age(&unit).await;
+                    if !unknown_tagged_scope_is_reapable(index_full.complete, age, max_age) {
                         tracing::debug!(
                             unit,
-                            "reaper: kept (mission unknown but index incomplete)"
+                            ?age,
+                            "reaper: kept (mission unknown without stale-age evidence)"
                         );
                         report.kept += 1;
                     } else if stop_unit(&unit, "reaper: mission unknown to any store").await {
@@ -458,5 +473,19 @@ mod tests {
             false
         ));
         assert!(!legacy_scope_is_reapable(true, None, max_age, false));
+    }
+
+    #[test]
+    fn unknown_tagged_scopes_require_complete_index_and_stale_age() {
+        let max_age = Duration::from_secs(12 * 3600);
+        let old = Some(max_age + Duration::from_secs(1));
+        assert!(!unknown_tagged_scope_is_reapable(false, old, max_age));
+        assert!(!unknown_tagged_scope_is_reapable(
+            true,
+            Some(max_age - Duration::from_secs(1)),
+            max_age
+        ));
+        assert!(!unknown_tagged_scope_is_reapable(true, None, max_age));
+        assert!(unknown_tagged_scope_is_reapable(true, old, max_age));
     }
 }
