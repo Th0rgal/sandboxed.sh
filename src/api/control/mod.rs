@@ -10655,6 +10655,13 @@ fn select_actor_run_lease(
     }
 }
 
+fn terminal_wake_must_wait_for_harness(
+    execution_state: MissionExecutionState,
+    actor_owns_run: bool,
+) -> bool {
+    execution_state != MissionExecutionState::WaitingRemoteJob && actor_owns_run
+}
+
 async fn deliver_remote_build_terminal_wake(
     state: &AppState,
     receipt: &crate::remote_node::job_ledger::RemoteJobReceipt,
@@ -10744,11 +10751,25 @@ async fn deliver_remote_build_terminal_wake(
     }
     if let Some(run) = active_run {
         if run.execution_state != MissionExecutionState::WaitingRemoteJob {
-            // The harness is still consuming the synchronous result. Let that
-            // turn finish rather than racing it with a second continuation.
-            return Ok(false);
-        }
-        if actor_run.is_none() {
+            if terminal_wake_must_wait_for_harness(run.execution_state, actor_run.is_some()) {
+                // The harness is still consuming the synchronous result. Let
+                // that turn finish rather than racing it with a continuation.
+                return Ok(false);
+            }
+            // The turn is gone but the parking heartbeat lost its race with
+            // finalization (observed on srv3: terminal receipt present while
+            // the durable run stayed `running` forever). The immutable remote
+            // receipt now owns the continuation, so repair the orphaned run
+            // before delivery instead of deferring the wake indefinitely.
+            owner
+                .mission_store
+                .finish_mission_run(
+                    run.run_id,
+                    run.generation,
+                    Some("remote_build_terminal_after_unparked_turn"),
+                )
+                .await?;
+        } else if actor_run.is_none() {
             owner
                 .mission_store
                 .finish_mission_run(
@@ -27149,6 +27170,22 @@ mod tests {
             select_actor_run_lease(mission_id, false, None, None, true, Some((run_id, 9)),),
             Some((run_id, 9))
         );
+    }
+
+    #[test]
+    fn remote_terminal_wake_repairs_an_unparked_orphan_only() {
+        assert!(terminal_wake_must_wait_for_harness(
+            MissionExecutionState::Running,
+            true
+        ));
+        assert!(!terminal_wake_must_wait_for_harness(
+            MissionExecutionState::Running,
+            false
+        ));
+        assert!(!terminal_wake_must_wait_for_harness(
+            MissionExecutionState::WaitingRemoteJob,
+            true
+        ));
     }
 
     #[test]
