@@ -8,7 +8,7 @@ description: >
   resume, keep going, very hard question, ChatGPT UI, gpt-5.6-pro.
 metadata:
   policy: chatgpt-ui-pool
-  policy_version: 1.3.0
+  policy_version: 1.4.0
 version: 1.11.0
 ---
 
@@ -220,7 +220,7 @@ When a model "isn't working," first prove it's the **model** and not the
 concluding the model is too weak. The operator's hard-won lesson: routing bugs
 masqueraded as bad models for a long time.
 
-## ChatGPT UI pool policy (policy_version 1.3.0)
+## ChatGPT UI pool policy (policy_version 1.4.0)
 
 Binding rules for every `chatgpt_ui` mission you start or manage. The
 authoritative versioned policy is `docs/policy/CHATGPT_UI_POOL_POLICY.md` in
@@ -264,9 +264,11 @@ this section must stay in sync with it.
   conversation route fails closed and must not be treated as a fresh success.
 - **Auth failure → never blind-retry.** `auth_required` is terminal for that
   mission and gets 0 automatic retries. The slot is quarantined for 30
-  minutes; cooldown expiry permits a later explicit recovery attempt but does
-  not prove the login was repaired. Never use an auth-failed slot for the
-  one compatibility retry.
+  minutes, but cooldown expiry does not prove the login was repaired. Its
+  durable state remains unavailable until the health probe follows any saved
+  account picker and observes authenticated navigation; the picker alone is
+  inconclusive. Never use an auth-failed slot for new work, a resume, or the
+  one compatibility retry before that positive evidence.
 - **Rate limited → wait.** 0 automatic retries; allowance must recover.
   Do not shuffle the request across slots of the same account. One exact “Too
   many requests” page opens a shared 10-minute circuit immediately; an older

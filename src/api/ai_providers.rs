@@ -3162,6 +3162,48 @@ fn codex_oauth_refresh_lock(account_id: &str) -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
+/// Serialize rotating OpenAI refresh tokens across prod, dev, and any helper
+/// process sharing the canonical credential store. The account mutex above is
+/// intentionally fast but process-local; by itself it cannot prevent the
+/// second service from consuming an already-rotated token.
+async fn acquire_codex_oauth_cross_process_lock() -> Result<std::fs::File, String> {
+    let mut last_error = None;
+    for _ in 0..120 {
+        match acquire_oauth_refresh_lock(ProviderType::OpenAI) {
+            Ok(lock) => return Ok(lock),
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err(format!(
+        "timed out waiting for the shared Codex OAuth refresh lock: {}",
+        last_error.unwrap_or_else(|| "unknown lock error".to_string())
+    ))
+}
+
+fn refresh_token_reused_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("refresh_token_reused")
+        || lower.contains("refresh token has already been used")
+        || lower.contains("refresh token was already used")
+}
+
+#[cfg(test)]
+mod codex_oauth_error_tests {
+    use super::refresh_token_reused_error;
+
+    #[test]
+    fn recognizes_rotating_refresh_token_reuse() {
+        assert!(refresh_token_reused_error(
+            "OAuth error: refresh_token_reused"
+        ));
+        assert!(refresh_token_reused_error(
+            "The refresh token has already been used"
+        ));
+        assert!(!refresh_token_reused_error("access token expired"));
+    }
+}
+
 fn sanitize_codex_oauth_account_id(account_id: &str) -> String {
     account_id
         .chars()
@@ -3272,6 +3314,7 @@ pub async fn prepare_codex_oauth_account_for_launch(
 
     let lock = codex_oauth_refresh_lock(&selected.chatgpt_account_id);
     let _guard = lock.lock().await;
+    let _process_guard = acquire_codex_oauth_cross_process_lock().await?;
 
     let current = get_all_openai_oauth_accounts(working_dir)
         .into_iter()
@@ -3285,8 +3328,27 @@ pub async fn prepare_codex_oauth_account_for_launch(
     }
 
     let client = reqwest::Client::new();
-    let (access, refresh, expires_at, _id_token) =
-        refresh_openai_oauth_tokens(&client, &current.refresh_token).await?;
+    let refreshed_tokens = refresh_openai_oauth_tokens(&client, &current.refresh_token).await;
+    let (access, refresh, expires_at, _id_token) = match refreshed_tokens {
+        Ok(tokens) => tokens,
+        Err(error) if refresh_token_reused_error(&error.to_string()) => {
+            // A legacy Codex process may have rotated the token just before it
+            // was brought under the shared lock. Re-read once and accept the
+            // new canonical pair instead of declaring the whole provider dead.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Some(updated) = find_openai_oauth_account_by_chatgpt_account_id(
+                working_dir,
+                &current.chatgpt_account_id,
+            ) {
+                if updated.refresh_token != current.refresh_token {
+                    let _ = sync_shared_codex_oauth_auth(&updated);
+                    return Ok(updated);
+                }
+            }
+            return Err(error.to_string());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let refreshed_account_id =
         extract_chatgpt_account_id(&access).unwrap_or_else(|| current.chatgpt_account_id.clone());
 
@@ -3334,7 +3396,14 @@ pub async fn refresh_codex_oauth_account_for_app_server(
 
     let lock = codex_oauth_refresh_lock(account_id);
     let _guard = lock.lock().await;
-
+    let before = find_openai_oauth_account_by_chatgpt_account_id(working_dir, account_id)
+        .ok_or_else(|| {
+            format!(
+                "No OpenAI OAuth account found for ChatGPT account {}",
+                account_id
+            )
+        })?;
+    let _process_guard = acquire_codex_oauth_cross_process_lock().await?;
     let current = find_openai_oauth_account_by_chatgpt_account_id(working_dir, account_id)
         .ok_or_else(|| {
             format!(
@@ -3342,10 +3411,30 @@ pub async fn refresh_codex_oauth_account_for_app_server(
                 account_id
             )
         })?;
+    if current.refresh_token != before.refresh_token || current.access_token != before.access_token
+    {
+        let _ = sync_shared_codex_oauth_auth(&current);
+        return Ok(current);
+    }
 
     let client = reqwest::Client::new();
-    let (access, refresh, expires_at, _id_token) =
-        refresh_openai_oauth_tokens(&client, &current.refresh_token).await?;
+    let refreshed_tokens = refresh_openai_oauth_tokens(&client, &current.refresh_token).await;
+    let (access, refresh, expires_at, _id_token) = match refreshed_tokens {
+        Ok(tokens) => tokens,
+        Err(error) if refresh_token_reused_error(&error.to_string()) => {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Some(updated) =
+                find_openai_oauth_account_by_chatgpt_account_id(working_dir, account_id)
+            {
+                if updated.refresh_token != current.refresh_token {
+                    let _ = sync_shared_codex_oauth_auth(&updated);
+                    return Ok(updated);
+                }
+            }
+            return Err(error.to_string());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let refreshed_account_id =
         extract_chatgpt_account_id(&access).unwrap_or_else(|| current.chatgpt_account_id.clone());
 

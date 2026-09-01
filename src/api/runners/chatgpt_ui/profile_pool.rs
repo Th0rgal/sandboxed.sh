@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -96,6 +97,133 @@ struct SlotHealth {
 fn registry() -> &'static Mutex<HashMap<PathBuf, SlotHealth>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, SlotHealth>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableAuthState {
+    /// No durable health store has been installed yet. Preserve upgrade
+    /// compatibility rather than deadlocking every existing deployment.
+    Unconfigured,
+    Ready,
+    RequiresLogin,
+    Unknown,
+}
+
+fn durable_health_path() -> PathBuf {
+    std::env::var("CHATGPT_POOL_HEALTH_STATE")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/sandboxed-sh/chatgpt-pool-health.json"))
+}
+
+fn profile_name(profile_dir: &Path) -> &str {
+    profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("profile")
+}
+
+fn durable_auth_state(profile_dir: &Path) -> DurableAuthState {
+    let path = durable_health_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return DurableAuthState::Unconfigured;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return DurableAuthState::Unknown;
+    };
+    durable_auth_state_from_value(&value, profile_name(profile_dir))
+}
+
+fn durable_auth_state_from_value(
+    value: &serde_json::Value,
+    profile_name: &str,
+) -> DurableAuthState {
+    match value
+        .get("slots")
+        .and_then(|slots| slots.get(profile_name))
+        .and_then(|slot| slot.get("state"))
+        .and_then(|state| state.as_str())
+    {
+        Some("logged_in") => DurableAuthState::Ready,
+        Some("logged_out") => DurableAuthState::RequiresLogin,
+        _ => DurableAuthState::Unknown,
+    }
+}
+
+/// Persist the same per-profile auth verdict consumed by the external health
+/// sweep. Auth failure must survive backend restarts; a 30-minute in-memory
+/// cooldown is not evidence that a browser session became valid again.
+fn persist_durable_auth_state(profile_dir: &Path, state: &str) -> Result<(), String> {
+    let path = durable_health_path();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "ChatGPT health path has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create ChatGPT health directory: {error}"))?;
+    let lock_path = parent.join("chatgpt-pool-health.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| format!("open ChatGPT health lock: {error}"))?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("lock ChatGPT health state: {error}"))?;
+
+    let mut value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({"cursor": 0, "slots": {}}));
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| "ChatGPT health state is not an object".to_string())?;
+    let slots = root
+        .entry("slots")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "ChatGPT health slots is not an object".to_string())?;
+    let now = chrono::Utc::now().timestamp() as f64;
+    let slot = slots
+        .entry(profile_name(profile_dir).to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let slot = slot
+        .as_object_mut()
+        .ok_or_else(|| "ChatGPT health slot is not an object".to_string())?;
+    if slot.get("state").and_then(|value| value.as_str()) != Some(state) {
+        slot.insert("since".to_string(), serde_json::json!(now));
+    }
+    slot.insert("state".to_string(), serde_json::json!(state));
+    slot.insert("checked_at".to_string(), serde_json::json!(now));
+    slot.insert(
+        "source".to_string(),
+        serde_json::json!("sandboxed-sh-runtime"),
+    );
+    let tmp = parent.join(format!(
+        ".chatgpt-pool-health.{}.{}.tmp",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let serialized = serde_json::to_vec_pretty(&value)
+        .map_err(|error| format!("serialize ChatGPT health state: {error}"))?;
+    let mut output =
+        File::create(&tmp).map_err(|error| format!("create ChatGPT health temp file: {error}"))?;
+    output
+        .write_all(&serialized)
+        .and_then(|_| output.sync_all())
+        .map_err(|error| format!("write ChatGPT health state: {error}"))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|error| format!("install ChatGPT health state: {error}"))?;
+    let _ = FileExt::unlock(&lock);
+    Ok(())
+}
+
+pub fn profile_is_auth_ready(profile_dir: &Path) -> bool {
+    matches!(
+        durable_auth_state(profile_dir),
+        DurableAuthState::Unconfigured | DurableAuthState::Ready
+    )
 }
 
 #[derive(Debug, Default)]
@@ -376,6 +504,11 @@ fn record_slot_failure_at(profile_dir: &Path, kind: SlotFailureKind, now: Instan
 
 pub fn record_slot_failure(profile_dir: &Path, kind: SlotFailureKind) {
     record_slot_failure_at(profile_dir, kind, Instant::now());
+    if kind == SlotFailureKind::Auth {
+        if let Err(error) = persist_durable_auth_state(profile_dir, "logged_out") {
+            tracing::error!(%error, "could not persist ChatGPT UI auth failure");
+        }
+    }
     tracing::warn!(
         failure_kind = kind.as_str(),
         "ChatGPT UI profile slot recorded a slot-local failure"
@@ -390,6 +523,9 @@ pub fn record_slot_success(profile_dir: &Path) {
     // contract and transport are usable again, regardless of which profile
     // observed the earlier compatibility wave.
     clear_backend_circuit(profile_dir);
+    if let Err(error) = persist_durable_auth_state(profile_dir, "logged_in") {
+        tracing::error!(%error, "could not persist ChatGPT UI auth success");
+    }
 }
 
 fn slot_health_at(profile_dir: &Path, now: Instant) -> SlotHealth {
@@ -459,6 +595,9 @@ pub async fn acquire_profile(
         });
         for (slot, profile_dir) in candidates {
             let health = slot_health_at(profile_dir, now);
+            if !profile_is_auth_ready(profile_dir) {
+                continue;
+            }
             if retry_requirement.is_some_and(|requirement| {
                 slot == requirement.excluded_slot
                     || (requirement.require_healthy && health.last_failure.is_some())
@@ -531,6 +670,8 @@ pub enum ProfileSlotState {
     Available,
     InUse,
     Quarantined,
+    RequiresLogin,
+    Unknown,
     Unavailable,
 }
 
@@ -623,6 +764,14 @@ pub fn pool_snapshot(profile_dirs: &[PathBuf]) -> Vec<ProfileSlotStatus> {
             let lock_state = try_lock_profile(profile_dir);
             let state = match lock_state {
                 Ok(None) => ProfileSlotState::InUse,
+                Ok(Some(_))
+                    if durable_auth_state(profile_dir) == DurableAuthState::RequiresLogin =>
+                {
+                    ProfileSlotState::RequiresLogin
+                }
+                Ok(Some(_)) if durable_auth_state(profile_dir) == DurableAuthState::Unknown => {
+                    ProfileSlotState::Unknown
+                }
                 Ok(Some(_)) if quarantine_remaining.is_some() => ProfileSlotState::Quarantined,
                 Ok(Some(_)) => ProfileSlotState::Available,
                 Err(_) => ProfileSlotState::Unavailable,
@@ -647,6 +796,33 @@ pub fn pool_snapshot(profile_dirs: &[PathBuf]) -> Vec<ProfileSlotStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_auth_requires_positive_post_login_evidence() {
+        let state = serde_json::json!({
+            "slots": {
+                "ready": {"state": "logged_in"},
+                "dead": {"state": "logged_out"},
+                "picker": {"state": "unknown"}
+            }
+        });
+        assert_eq!(
+            durable_auth_state_from_value(&state, "ready"),
+            DurableAuthState::Ready
+        );
+        assert_eq!(
+            durable_auth_state_from_value(&state, "dead"),
+            DurableAuthState::RequiresLogin
+        );
+        assert_eq!(
+            durable_auth_state_from_value(&state, "picker"),
+            DurableAuthState::Unknown
+        );
+        assert_eq!(
+            durable_auth_state_from_value(&state, "missing"),
+            DurableAuthState::Unknown
+        );
+    }
 
     #[test]
     fn profile_lock_is_exclusive_and_reusable() {
