@@ -7197,14 +7197,16 @@ fn claudecode_install_command(
 }
 
 fn desired_claudecode_version() -> String {
-    // 2.1.140 ships the bug-fixed native `/goal` slash command (added in
-    // 2.1.139, hardened against `disableAllHooks` / `allowManagedHooksOnly`
-    // in 2.1.140). Bumping the pin so the per-workspace install matches what
-    // `run_claudecode_native_goal` relies on.
+    // 2.1.257 is the first production pin that supports Claude Fable 5.1
+    // (`claude-fable-5-1` requires Claude Code >= 2.1.251). It also retains
+    // the bug-fixed native `/goal` command introduced in 2.1.139 and hardened
+    // in 2.1.140. Keep the per-workspace installer at or above this version:
+    // otherwise mission startup silently downgrades the host CLI and the
+    // model appears in the catalog but every Fable 5.1 dispatch fails.
     std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "2.1.140".to_string())
+        .unwrap_or_else(|| "2.1.257".to_string())
 }
 
 async fn claude_cli_matches_desired_version(
@@ -13367,12 +13369,12 @@ mod tests {
 
     #[test]
     fn claude_install_prefers_npm_for_native_package_when_bun_is_also_present() {
-        let command = claudecode_install_command("2.1.140", true, Some("bun"))
+        let command = claudecode_install_command("2.1.257", true, Some("bun"))
             .expect("npm should produce an install command");
 
         assert_eq!(
             command,
-            "npm install -g @anthropic-ai/claude-code@'2.1.140'"
+            "npm install -g @anthropic-ai/claude-code@'2.1.257'"
         );
         assert!(!command.contains("bun install"));
     }
