@@ -96,6 +96,8 @@ authentication was repaired. Its durable state remains `requires_login` until
 the health probe follows any saved-account picker and observes authenticated
 navigation. A picker by itself is inconclusive. The slot is excluded from new,
 resumed, and compatibility-retry work until that positive evidence exists.
+Legacy unversioned health verdicts are not positive evidence; only a v2
+post-picker probe or a successful runtime turn makes a slot ready.
 
 ## 5. Rate limits: wait, do not churn
 

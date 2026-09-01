@@ -268,7 +268,9 @@ this section must stay in sync with it.
   durable state remains unavailable until the health probe follows any saved
   account picker and observes authenticated navigation; the picker alone is
   inconclusive. Never use an auth-failed slot for new work, a resume, or the
-  one compatibility retry before that positive evidence.
+  one compatibility retry before that positive evidence. Legacy unversioned
+  health verdicts are not positive evidence; readiness requires a v2 probe or
+  a successful runtime turn.
 - **Rate limited → wait.** 0 automatic retries; allowance must recover.
   Do not shuffle the request across slots of the same account. One exact “Too
   many requests” page opens a shared 10-minute circuit immediately; an older

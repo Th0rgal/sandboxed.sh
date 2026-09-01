@@ -401,6 +401,8 @@ def main() -> int:
 
         entry["state"] = observed
         entry["checked_at"] = now
+        entry["verdict_version"] = 2
+        entry["source"] = "post-picker-probe-v2"
         if previous != observed:
             entry["since"] = now
 

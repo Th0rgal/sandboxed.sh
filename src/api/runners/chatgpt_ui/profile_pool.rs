@@ -138,14 +138,21 @@ fn durable_auth_state_from_value(
     value: &serde_json::Value,
     profile_name: &str,
 ) -> DurableAuthState {
-    match value
+    let slot = value
         .get("slots")
         .and_then(|slots| slots.get(profile_name))
+        .and_then(|slot| slot.as_object());
+    let state = slot
         .and_then(|slot| slot.get("state"))
         .and_then(|state| state.as_str())
-    {
-        Some("logged_in") => DurableAuthState::Ready,
-        Some("logged_out") => DurableAuthState::RequiresLogin,
+        .unwrap_or("unknown");
+    let verdict_version = slot
+        .and_then(|slot| slot.get("verdict_version"))
+        .and_then(|version| version.as_u64())
+        .unwrap_or(0);
+    match state {
+        "logged_in" if verdict_version >= 2 => DurableAuthState::Ready,
+        "logged_out" => DurableAuthState::RequiresLogin,
         _ => DurableAuthState::Unknown,
     }
 }
@@ -200,6 +207,7 @@ fn persist_durable_auth_state(profile_dir: &Path, state: &str) -> Result<(), Str
         "source".to_string(),
         serde_json::json!("sandboxed-sh-runtime"),
     );
+    slot.insert("verdict_version".to_string(), serde_json::json!(2));
     let tmp = parent.join(format!(
         ".chatgpt-pool-health.{}.{}.tmp",
         std::process::id(),
@@ -801,7 +809,8 @@ mod tests {
     fn durable_auth_requires_positive_post_login_evidence() {
         let state = serde_json::json!({
             "slots": {
-                "ready": {"state": "logged_in"},
+                "ready": {"state": "logged_in", "verdict_version": 2},
+                "legacy": {"state": "logged_in"},
                 "dead": {"state": "logged_out"},
                 "picker": {"state": "unknown"}
             }
@@ -809,6 +818,10 @@ mod tests {
         assert_eq!(
             durable_auth_state_from_value(&state, "ready"),
             DurableAuthState::Ready
+        );
+        assert_eq!(
+            durable_auth_state_from_value(&state, "legacy"),
+            DurableAuthState::Unknown
         );
         assert_eq!(
             durable_auth_state_from_value(&state, "dead"),
