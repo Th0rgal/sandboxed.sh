@@ -1,6 +1,10 @@
 import unittest
 
-from scripts.chatgpt_ui_pool_health import classify_probe, is_saved_account_choice
+from scripts.chatgpt_ui_pool_health import (
+    classify_probe,
+    evaluate_dom_probe,
+    is_saved_account_choice,
+)
 
 
 class ChatgptUiPoolHealthTests(unittest.TestCase):
@@ -48,6 +52,15 @@ class ChatgptUiPoolHealthTests(unittest.TestCase):
         self.assertFalse(is_saved_account_choice("Thomas"))
         self.assertFalse(is_saved_account_choice("Log in to another account"))
         self.assertFalse(is_saved_account_choice("Continue with Google"))
+
+    def test_navigation_context_loss_is_retried(self) -> None:
+        class NavigatingPage:
+            def evaluate(self, _script):
+                raise RuntimeError(
+                    "Execution context was destroyed, most likely because of a navigation"
+                )
+
+        self.assertIsNone(evaluate_dom_probe(NavigatingPage()))
 
 
 if __name__ == "__main__":

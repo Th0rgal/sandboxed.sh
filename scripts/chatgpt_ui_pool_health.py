@@ -166,6 +166,17 @@ def classify_probe(found: dict) -> str:
     return "unknown"
 
 
+def evaluate_dom_probe(page) -> dict | None:
+    """Navigation invalidates one JS context; retry it instead of failing."""
+    try:
+        return page.evaluate(DOM_PROBE)
+    except Exception as exc:  # noqa: BLE001 - Playwright errors are optional here
+        message = str(exc).lower()
+        if "execution context was destroyed" in message or "because of a navigation" in message:
+            return None
+        raise
+
+
 def complete_saved_account_picker(page, settle_ms: int) -> dict:
     """Select the remembered account and classify the resulting page."""
     buttons = page.get_by_role("button")
@@ -194,7 +205,11 @@ def complete_saved_account_picker(page, settle_ms: int) -> dict:
     deadline = time.time() + max(settle_ms, 5_000) / 1000.0
     found = {}
     while time.time() < deadline:
-        found = page.evaluate(DOM_PROBE)
+        candidate = evaluate_dom_probe(page)
+        if candidate is None:
+            page.wait_for_timeout(500)
+            continue
+        found = candidate
         if found.get("challenge"):
             return found
         if not found.get("account_picker") and (
@@ -248,7 +263,13 @@ def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
                 deadline = time.time() + max(settle_ms, 0) / 1000.0
                 found = {"challenge": False, "account_picker": False, "login_visible": False, "authed_nav": False}
                 while True:
-                    found = page.evaluate(DOM_PROBE)
+                    candidate = evaluate_dom_probe(page)
+                    if candidate is None:
+                        if time.time() >= deadline:
+                            break
+                        page.wait_for_timeout(500)
+                        continue
+                    found = candidate
                     if found.get("account_picker"):
                         found = complete_saved_account_picker(page, settle_ms)
                         break
