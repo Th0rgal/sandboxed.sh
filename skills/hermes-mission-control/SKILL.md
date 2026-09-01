@@ -121,10 +121,22 @@ the roster slug (`verity-core`, `verity-lido`, …) and `track` as the
 wakeup and do not wait. Report on the next tick or via the project
 route. A `cron_*` session dies with the tick; never stamp one as origin.
 
-The project's items **are** the roadmap (`get_project` / `get_project_tasks`
-are the same list). `plan_project_tasks` upserts an item. Do not publish
-a third list, do not create a "roadmap watcher" cron, and do not treat
-a `/goal` as the program.
+The project's declared tracks are the roadmap denominator.
+`get_project_tasks` is the server-authoritative projection; it returns live
+undeclared work separately as `unplanned_attempts`. `plan_project_tasks`
+upserts a declared item. Do not publish a third list, create a "roadmap
+watcher" cron, or treat a `/goal` as the program.
+
+For project work, pass `project`, `track`, the track's acceptance criteria,
+and a stable `idempotency_key` directly to `start_mission`. The launch records
+one durable dispatch intent, owner lease, mission link, supersession receipt,
+and declared track. Do not retry with a new key after a lost response.
+
+Completion is evidence-derived, never a mission's self-report. Record each
+accepted current criterion with `accept_project_track_evidence`, using the
+exact governed artifact version. Planning cannot reopen terminal work; use
+`reopen_project_track` with a reason when the contract/artifact genuinely
+changes.
 
 ### On callback
 

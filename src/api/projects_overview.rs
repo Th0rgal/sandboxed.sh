@@ -22,9 +22,10 @@ use std::sync::Arc;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 
+use super::auth::AuthUser;
 use super::control::events::MissionStatus;
 use super::mission_store::Mission;
 use super::projects_store::ProjectConversation;
@@ -894,6 +895,108 @@ pub async fn set_project_track(
     Ok(Json(serde_json::json!({ "tracks": tracks })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AcceptTrackEvidenceRequest {
+    #[serde(default)]
+    pub criterion: Option<String>,
+    pub verifier_class: String,
+    pub evidence_ref: String,
+    pub artifact_version: String,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+}
+
+/// Accept immutable evidence for one criterion. Satisfaction is derived in the
+/// same projects.db transaction; callers cannot assert `done` directly.
+pub async fn accept_project_track_evidence(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    AxumPath((requested, track)): AxumPath<(String, String)>,
+    Json(req): Json<AcceptTrackEvidenceRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&requested) || !is_plain_key(&track) {
+        return Err(bad_slug());
+    }
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("unknown project '{requested}'"),
+            )
+        })?;
+    let accepted_by = if user.username.trim().is_empty() {
+        format!("user:{}", user.id)
+    } else {
+        format!("user:{}", user.username.trim())
+    };
+    let evidence = state
+        .projects
+        .accept_track_evidence(
+            &slug,
+            &track,
+            req.criterion.as_deref(),
+            &req.verifier_class,
+            &req.evidence_ref,
+            &req.artifact_version,
+            req.observed_at.as_deref(),
+            &accepted_by,
+        )
+        .map_err(store_err)?;
+    let track = state
+        .projects
+        .tracks(&slug)
+        .map_err(store_err)?
+        .into_iter()
+        .find(|candidate| candidate.track == track)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "track disappeared".to_string()))?;
+    Ok(Json(
+        serde_json::json!({ "evidence": evidence, "track": track }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReopenTrackRequest {
+    pub reason: String,
+    #[serde(default)]
+    pub governed_artifact_version: Option<String>,
+}
+
+pub async fn reopen_project_track(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    AxumPath((requested, track)): AxumPath<(String, String)>,
+    Json(req): Json<ReopenTrackRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&requested) || !is_plain_key(&track) {
+        return Err(bad_slug());
+    }
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("unknown project '{requested}'"),
+            )
+        })?;
+    state
+        .projects
+        .reopen_track(
+            &slug,
+            &track,
+            &req.reason,
+            req.governed_artifact_version.as_deref(),
+            &if user.username.trim().is_empty() {
+                format!("user:{}", user.id)
+            } else {
+                format!("user:{}", user.username.trim())
+            },
+        )
+        .map_err(store_err)?;
+    let tracks = state.projects.tracks(&slug).map_err(store_err)?;
+    Ok(Json(serde_json::json!({ "tracks": tracks })))
+}
+
 /// `GET /api/projects/:slug/grant` — the autonomy grant.
 pub async fn get_project_grant(
     State(state): State<Arc<AppState>>,
@@ -1271,30 +1374,91 @@ pub async fn project_tasks(
         .map_err(store_err)?
         .unwrap_or(requested);
     let items = load_project_items(&state, &slug).await?;
-    let mut done = 0usize;
-    let mut running = 0usize;
+    let mut satisfied = 0usize;
+    let mut executing = 0usize;
     let mut failed = 0usize;
+    let mut inconsistencies = Vec::new();
     let rows: Vec<serde_json::Value> = items
         .iter()
-        .filter(|item| item_belongs_on_roadmap(item))
+        .filter(|item| {
+            item.declared
+                && item.kind == "track"
+                && item.lifecycle != Some(super::projects_store::TrackLifecycle::Cancelled)
+        })
         .map(|item| {
             let status = item_roadmap_status(item);
             match status {
-                "accepted" => done += 1,
-                "running" | "settled" => running += 1,
+                "accepted" => match state.projects.track_contract_satisfied(&slug, &item.key) {
+                    Ok(true) => satisfied += 1,
+                    Ok(false) => inconsistencies.push(serde_json::json!({
+                        "kind": "satisfied_without_current_evidence",
+                        "track": item.key,
+                        "revision": item.revision,
+                    })),
+                    Err(error) => inconsistencies.push(serde_json::json!({
+                        "kind": "evidence_unavailable",
+                        "track": item.key,
+                        "error": error,
+                    })),
+                },
+                "running" | "settled" => executing += 1,
                 "failed" => failed += 1,
                 _ => {}
             }
             item_as_roadmap_task(item)
         })
         .collect();
+    let unplanned: Vec<serde_json::Value> = items
+        .iter()
+        .filter(|item| {
+            !item.declared
+                && item
+                    .attempts
+                    .iter()
+                    .any(|attempt| item_attempt_is_live(&attempt.status))
+        })
+        .map(item_as_roadmap_task)
+        .collect();
+    for item in items.iter().filter(|item| item.kind == "task") {
+        inconsistencies.push(serde_json::json!({
+            "kind": "legacy_proposal_not_declared_track",
+            "track": item.key,
+        }));
+    }
+    for item in items.iter().filter(|item| {
+        item.declared
+            && item.lifecycle == Some(super::projects_store::TrackLifecycle::Executing)
+            && !item
+                .attempts
+                .iter()
+                .any(|attempt| item_attempt_is_live(&attempt.status))
+    }) {
+        inconsistencies.push(serde_json::json!({
+            "kind": "executing_without_live_attempt",
+            "track": item.key,
+            "revision": item.revision,
+        }));
+    }
+    let declared_total = rows.len();
+    let unplanned_count = unplanned.len();
+    let inconsistency_count = inconsistencies.len();
     Ok(Json(serde_json::json!({
         "slug": slug,
         "tasks": rows,
+        "unplanned_attempts": unplanned,
+        "inconsistencies": inconsistencies,
         "summary": {
-            "total": rows.len(),
-            "done": done,
-            "running": running,
+            "declared_total": declared_total,
+            "satisfied": satisfied,
+            "executing": executing,
+            "unplanned_attempts": unplanned_count,
+            "inconsistencies": inconsistency_count,
+            // Compatibility fields for older dashboards. They are aliases of
+            // the server-derived declarative projection, never recomputed from
+            // live mission-only rows.
+            "total": declared_total,
+            "done": satisfied,
+            "running": executing,
             "failed": failed,
         },
     })))
@@ -1310,6 +1474,8 @@ pub struct ProposalInput {
     pub acceptance_criteria: Vec<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub position: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1382,6 +1548,7 @@ fn planned_tracks_from_request(
             desired_state: desired.to_string(),
             acceptance_criteria: task.acceptance_criteria.clone(),
             depends_on: task.depends_on.clone(),
+            position: task.position,
         });
     }
     Ok(planned)
@@ -1576,6 +1743,14 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/:slug", get(get_project))
         .route("/:slug/state", get(project_state))
         .route("/:slug/tasks", get(project_tasks).post(plan_project_tasks))
+        .route(
+            "/:slug/tracks/:track/evidence",
+            axum::routing::post(accept_project_track_evidence),
+        )
+        .route(
+            "/:slug/tracks/:track/reopen",
+            axum::routing::post(reopen_project_track),
+        )
         .route(
             "/:slug/tasks/:task_key",
             axum::routing::patch(update_project_task).delete(cancel_project_task),
@@ -2974,7 +3149,7 @@ pub fn roster_lookup_keys_with(aliases: &HashMap<String, String>, requested: &st
     keys
 }
 
-fn resolve_roster_slug(
+pub(crate) fn resolve_roster_slug(
     store: &super::projects_store::ProjectsStore,
     requested: &str,
 ) -> Result<Option<String>, String> {
@@ -3173,6 +3348,8 @@ fn item_as_roadmap_task(item: &super::mission_horizon::ProjectItem) -> serde_jso
         "task_key": item.key,
         "title": title,
         "status": item_roadmap_status(item),
+        "lifecycle": item.lifecycle,
+        "revision": item.revision,
         "kind": item.kind,
         "open": item.open,
         "desired_state": item.desired_state,
@@ -3205,7 +3382,7 @@ fn is_placeholder_descriptor(descriptor: &str) -> bool {
 }
 
 /// A routing key / project tag must be a plain slug.
-fn is_plain_key(key: &str) -> bool {
+pub(crate) fn is_plain_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 100
         && key
@@ -3862,8 +4039,11 @@ mod tests {
         let open_live = ProjectItem {
             key: "c5".into(),
             kind: "track",
+            position: Some(0),
             desired_state: Some("land #2332".into()),
             status: Some("open".into()),
+            lifecycle: Some(crate::api::projects_store::TrackLifecycle::Executing),
+            revision: Some(1),
             title: Some("Land #2332".into()),
             acceptance_criteria: vec!["CI green".into()],
             depends_on: vec!["freeze".into()],
@@ -3922,8 +4102,11 @@ mod tests {
         let declared = |status: Option<&str>| ProjectItem {
             key: "pr-48".into(),
             kind: "track",
+            position: Some(0),
             desired_state: None,
             status: status.map(str::to_string),
+            lifecycle: None,
+            revision: Some(1),
             title: None,
             acceptance_criteria: Vec::new(),
             depends_on: Vec::new(),
@@ -3952,6 +4135,7 @@ mod tests {
     fn plan_request_validates_the_whole_batch_before_any_write() {
         let ok = ProposalInput {
             task_key: "land-2332".into(),
+            position: None,
             title: "Land #2332".into(),
             prompt: Some("merge after certify".into()),
             acceptance_criteria: vec!["CI green".into()],
@@ -3966,6 +4150,7 @@ mod tests {
 
         let first = ProposalInput {
             task_key: "ok-item".into(),
+            position: None,
             title: "Fine".into(),
             prompt: None,
             acceptance_criteria: Vec::new(),
@@ -3973,6 +4158,7 @@ mod tests {
         };
         let bad_key = ProposalInput {
             task_key: "not a key".into(),
+            position: None,
             title: "Bad".into(),
             prompt: None,
             acceptance_criteria: Vec::new(),
@@ -3983,6 +4169,7 @@ mod tests {
 
         let empty_title = ProposalInput {
             task_key: "second".into(),
+            position: None,
             title: "   ".into(),
             prompt: None,
             acceptance_criteria: Vec::new(),
@@ -3990,6 +4177,7 @@ mod tests {
         };
         let first = ProposalInput {
             task_key: "ok-item".into(),
+            position: None,
             title: "Fine".into(),
             prompt: None,
             acceptance_criteria: Vec::new(),
@@ -4006,6 +4194,7 @@ mod tests {
             .expect("seed");
         let valid = ProposalInput {
             task_key: "first".into(),
+            position: None,
             title: "First".into(),
             prompt: None,
             acceptance_criteria: Vec::new(),
@@ -4013,6 +4202,7 @@ mod tests {
         };
         let invalid = ProposalInput {
             task_key: "".into(),
+            position: None,
             title: "Second".into(),
             prompt: None,
             acceptance_criteria: Vec::new(),

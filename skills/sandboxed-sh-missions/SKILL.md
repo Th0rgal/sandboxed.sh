@@ -14,6 +14,13 @@ Delegate coding/automation tasks to **isolated containerised missions** via the 
 
 A conversational `start_mission` is a **worker of this chat**. Hermes stamps `origin_session_id`, enrolls the mission, and the terminal webhook folds the result back here. End the turn after dispatch — do not poll, and do not invent a cron just to wait. Controller/cron ticks are different: they pass `project` and report on the next tick / project route.
 
+When dispatching against a project roadmap, also pass the declared `track`,
+its `acceptance_criteria`, and a stable retry-safe `idempotency_key`. The
+server reserves the track owner and links the mission as one durable intent;
+reusing the key returns the original launch instead of duplicating work.
+Mission completion alone does not satisfy the track. Accepted criterion
+evidence at the governed artifact version must be recorded separately.
+
 This is **not** the same as delegating to a CLI coding agent (Claude Code, Codex, OpenCode) via the `terminal` tool. The MCP runs an entire conversation loop inside the container; the CLI agents are interactive programs you spawn in a single `terminal()` call. Use this skill for isolated multi-step research/coding, or work that needs a specific pre-baked workspace (e.g. `tailscale-ubuntu`, `minecraft`, `dgx-spark`).
 
 ## When to use

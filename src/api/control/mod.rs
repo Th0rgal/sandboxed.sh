@@ -7393,6 +7393,12 @@ pub struct CreateMissionRequest {
     pub tags: Option<Vec<String>>,
     /// Track state, e.g. "waiting_ci" / "waiting_review" / "blocked_external".
     pub desired_state: Option<String>,
+    /// Acceptance contract used when this dispatch declares a new track.
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    /// Stable caller key for retry-safe dispatch. When omitted a unique key is
+    /// generated, preserving compatibility but not cross-request deduplication.
+    pub idempotency_key: Option<String>,
     /// When the track should next be checked (RFC3339).
     pub next_check_at: Option<String>,
     /// Initial prompt for the mission. Stored as the mission's deferred goal:
@@ -9252,6 +9258,8 @@ pub async fn create_mission(
         intent: None,
         github_pr: None,
         writer: None,
+        acceptance_criteria: Vec::new(),
+        idempotency_key: None,
         tags: None,
         desired_state: None,
         next_check_at: None,
@@ -9823,7 +9831,93 @@ pub async fn create_mission(
             }
         }
     }
-    control
+    let track_dispatch = match (
+        req.project
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+        req.track
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    ) {
+        (Some(requested_project), Some(track)) => {
+            if !super::projects_overview::is_plain_key(track) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "track must be a plain key (letters, digits, '-', '_', or '.')".to_string(),
+                ));
+            }
+            let canonical =
+                super::projects_overview::resolve_roster_slug(&state.projects, requested_project)
+                    .map_err(internal_error)?
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::NOT_FOUND,
+                            format!("unknown project '{requested_project}'"),
+                        )
+                    })?;
+            let key = req
+                .idempotency_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "idempotency_key is required when project and track are set".to_string(),
+                    )
+                })?;
+            let receipt = state
+                .projects
+                .begin_track_dispatch(
+                    &canonical,
+                    track,
+                    title.as_deref(),
+                    req.desired_state.as_deref(),
+                    (!req.acceptance_criteria.is_empty())
+                        .then_some(req.acceptance_criteria.as_slice()),
+                    &key,
+                )
+                .map_err(|error| (StatusCode::CONFLICT, error))?;
+            if receipt.state == "started" {
+                if let Some(existing_id) = receipt
+                    .mission_id
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                {
+                    if let Some(existing) = control
+                        .mission_store
+                        .get_mission(existing_id)
+                        .await
+                        .map_err(internal_error)?
+                    {
+                        return Ok((headers, Json(existing)));
+                    }
+                }
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "dispatch intent '{}' is finalized but its mission receipt cannot be resolved",
+                        receipt.idempotency_key
+                    ),
+                ));
+            }
+            if receipt.state != "reserved" {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "dispatch intent '{}' is already {}; use a new key for a new logical dispatch",
+                        receipt.idempotency_key, receipt.state
+                    ),
+                ));
+            }
+            Some(receipt)
+        }
+        _ => None,
+    };
+    if let Err(error) = control
         .cmd_tx
         .send(ControlCommand::CreateMission {
             title,
@@ -9847,9 +9941,40 @@ pub async fn create_mission(
             respond: tx,
         })
         .await
-        .map_err(session_unavailable)?;
+    {
+        if let Some(dispatch) = track_dispatch.as_ref() {
+            let _ = state.projects.finish_track_dispatch(
+                &dispatch.idempotency_key,
+                None,
+                Some("control_session_unavailable"),
+            );
+        }
+        return Err(session_unavailable(error));
+    }
 
-    let mut mission = rx.await.map_err(recv_failed)?.map_err(internal_error)?;
+    let mut mission = match rx.await {
+        Ok(Ok(mission)) => mission,
+        Ok(Err(error)) => {
+            if let Some(dispatch) = track_dispatch.as_ref() {
+                let _ = state.projects.finish_track_dispatch(
+                    &dispatch.idempotency_key,
+                    None,
+                    Some(&error),
+                );
+            }
+            return Err(internal_error(error));
+        }
+        Err(error) => {
+            if let Some(dispatch) = track_dispatch.as_ref() {
+                let _ = state.projects.finish_track_dispatch(
+                    &dispatch.idempotency_key,
+                    None,
+                    Some("mission_create_response_dropped"),
+                );
+            }
+            return Err(recv_failed(error));
+        }
+    };
 
     // Close the preflight-to-create race under the store-only mutex. Exactly
     // one concurrent creator wins; a loser is durably interrupted before it
@@ -9916,7 +10041,12 @@ pub async fn create_mission(
     // An explicit value always wins, including a deliberate blank, which is
     // how a caller says "this belongs to no project".
     let project = match nonblank(&req.project) {
-        Some(explicit) => Some(explicit),
+        Some(explicit) => Some(
+            super::projects_overview::resolve_roster_slug(&state.projects, &explicit)
+                .ok()
+                .flatten()
+                .unwrap_or(explicit),
+        ),
         None if req.project.is_some() => None,
         None => req
             .origin_session_id
@@ -10036,6 +10166,12 @@ pub async fn create_mission(
                 "could not absorb prior attempts on the same item"
             );
         }
+    }
+    if let Some(dispatch) = track_dispatch.as_ref() {
+        state
+            .projects
+            .finish_track_dispatch(&dispatch.idempotency_key, Some(mission.id), None)
+            .map_err(internal_error)?;
     }
     drop(pr_writer_guard);
 
@@ -13680,6 +13816,8 @@ pub async fn clone_mission(
         intent: source.project.intent.clone(),
         github_pr: source.project.github_pr.clone(),
         writer: None,
+        acceptance_criteria: Vec::new(),
+        idempotency_key: None,
         tags: if source.project.tags.is_empty() {
             None
         } else {
@@ -16928,6 +17066,47 @@ fn is_transport_failure_evidence(evidence: &crate::agents::CompletionEvidence) -
         evidence.failure_class,
         Some(crate::agents::FailureClass::TransportError)
     )
+}
+
+const TRANSPORT_AUTO_RESUME_PROMPT: &str = "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.";
+
+const CHATGPT_UI_TRANSPORT_FALLBACK_PROMPT: &str = "The previous ChatGPT UI turn failed to start. Repeat the original user request exactly. Do not reconcile git, PRs, Lean, remote jobs, or repository head.";
+
+/// ChatGPT UI turns send only the queued message as the prompt. Replaying the
+/// coding-worker reconciliation stub after a profile lock can replace the
+/// original UI request with unrelated repository instructions.
+fn transport_auto_resume_message(
+    backend: Option<&str>,
+    original_user_message: Option<&str>,
+) -> String {
+    if backend == Some("chatgpt_ui") {
+        if let Some(original) = original_user_message
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        {
+            return original.to_string();
+        }
+        return CHATGPT_UI_TRANSPORT_FALLBACK_PROMPT.to_string();
+    }
+    TRANSPORT_AUTO_RESUME_PROMPT.to_string()
+}
+
+async fn transport_auto_resume_message_for_mission(
+    store: &dyn MissionStore,
+    mission_id: Uuid,
+) -> String {
+    let backend = store
+        .get_mission(mission_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|mission| mission.backend);
+    let original = store
+        .get_initial_user_message(mission_id)
+        .await
+        .ok()
+        .flatten();
+    transport_auto_resume_message(backend.as_deref(), original.as_deref())
 }
 
 fn is_bare_llm_error_output(output: &str) -> bool {
@@ -21505,7 +21684,11 @@ async fn control_actor_loop(
                             }
                             && !queue_has_pending_target_mission(&queue, mission_id)
                         {
-                            let resume_message = "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.".to_string();
+                            let resume_message = transport_auto_resume_message_for_mission(
+                                mission_store.as_ref(),
+                                mission_id,
+                            )
+                            .await;
                             let activation = activate_mission_id_for_message(
                                 &control_hub,
                                 &mission_store,
@@ -22107,9 +22290,14 @@ async fn control_actor_loop(
                                     mission_id = %mission_id,
                                     "Auto-resuming parallel mission after structured transport failure"
                                 );
+                                let resume_message = transport_auto_resume_message_for_mission(
+                                    mission_store.as_ref(),
+                                    *mission_id,
+                                )
+                                .await;
                                 runner.queue_message(
                                     Uuid::new_v4(),
-                                    "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.".to_string(),
+                                    resume_message,
                                     None,
                                     Some("transport_auto_resume".to_string()),
                                 );
@@ -32608,6 +32796,27 @@ Investigate <service/> failures.
         assert!(!is_transport_failure_evidence(
             &completion_evidence_for_agent_result(&auth)
         ));
+    }
+
+    #[test]
+    fn chatgpt_ui_transport_resume_replays_the_original_prompt() {
+        let original = "You are GPT-5.6 Pro. Rewrite EIP-8282 in French.";
+        assert_eq!(
+            transport_auto_resume_message(Some("chatgpt_ui"), Some(original)),
+            original
+        );
+        assert_eq!(
+            transport_auto_resume_message(Some("chatgpt_ui"), Some("  \n ")),
+            CHATGPT_UI_TRANSPORT_FALLBACK_PROMPT
+        );
+        assert_eq!(
+            transport_auto_resume_message(Some("chatgpt_ui"), None),
+            CHATGPT_UI_TRANSPORT_FALLBACK_PROMPT
+        );
+        assert_eq!(
+            transport_auto_resume_message(Some("codex"), Some(original)),
+            TRANSPORT_AUTO_RESUME_PROMPT
+        );
     }
 
     #[test]

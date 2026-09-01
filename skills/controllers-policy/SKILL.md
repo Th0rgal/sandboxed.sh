@@ -155,18 +155,26 @@ and any live surface read *this*, not a parsed trailer. Once per tick:
   `coldcard-rng-cracker`). Nicknames (`verity`, `lido`, `lido-audit`) resolve, but
   do not invent a new slug. Same mode vocabulary as the trailer; the store counts
   your consecutive-tick `wait`.
-- The project's **items are the only roadmap**. `get_project` / `get_project_tasks`
-  return the same list (tracks + live attempts). `plan_project_tasks` upserts an
-  item (`project_tracks`). Do not create a second plan (no extra cron "roadmap
+- The project's declared **tracks are the only roadmap denominator**.
+  `get_project_tasks` returns that server-derived projection and lists live
+  undeclared attempts separately as `unplanned_attempts`; never count those as
+  roadmap scope. `plan_project_tasks` upserts a declared item
+  (`project_tracks`). Do not create a second plan (no extra cron "roadmap
   watcher", no `/goal` as the program, no new `project=` for a workstream — that
   is a `track`).
-- For every mission you dispatch this tick, `link_mission_to_project(mission_id, slug,
-  track)` so it appears on that item. An unlinked worker is invisible.
+- Dispatch project work with `project`, `track`, acceptance criteria, and a
+  stable `idempotency_key` in `start_mission`. The server atomically declares
+  or revises the track, reserves its owner lease, links the mission, and
+  supersedes the prior owner. Use `link_mission_to_project` only to repair a
+  legacy/unplanned attempt; an unlinked worker is visible only as unplanned.
 - At your first tick (or after the prompt changed), read `get_project_grant(slug)` — the
   merge authority, budget, and any PAUSED live there and outrank the prompt.
-- Each tick, `set_project_track` for every open in-scope PR and issue so the roadmap
-  stays populated even when no mission is live. Open tracks must not be dropped just
-  because the writer finished.
+- Use `set_project_track` only for non-terminal lifecycle movement. A track is
+  satisfied only after `accept_project_track_evidence` records accepted
+  evidence for every current criterion at one governed artifact version.
+  Never write `done` from prose or mission self-report. Planning preserves a
+  terminal track; reopening requires `reopen_project_track` with an audited
+  reason. Open tracks must not be dropped because the writer finished.
 
 Keep emitting the two text trailers below during this transition (dual-write); the
 structured call is authoritative, the trailers are the compatibility path.

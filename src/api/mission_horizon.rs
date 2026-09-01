@@ -19,7 +19,7 @@ use super::mission_store::{
     default_attention_keeps, Mission, MissionFilter, MissionProjectPatch, MissionStore,
     SUPERSEDED_TAG,
 };
-use super::projects_store::{ProjectTrack, RoadmapProposal};
+use super::projects_store::{ProjectTrack, RoadmapProposal, TrackLifecycle};
 
 /// How this mission participates in a PR, if at all. Writer and reviewer
 /// attempts on the same track are different items.
@@ -127,9 +127,15 @@ pub struct ProjectItem {
     pub key: String,
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub desired_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<TrackLifecycle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -151,6 +157,13 @@ pub fn track_status_is_open(status: Option<&str>) -> bool {
     !matches!(
         status.map(str::trim).filter(|value| !value.is_empty()),
         Some("done") | Some("closed") | Some("cancelled")
+    )
+}
+
+pub fn track_lifecycle_is_open(lifecycle: TrackLifecycle) -> bool {
+    !matches!(
+        lifecycle,
+        TrackLifecycle::Satisfied | TrackLifecycle::Cancelled
     )
 }
 
@@ -179,12 +192,15 @@ pub fn project_items(
             ProjectItem {
                 key: track.track.clone(),
                 kind: "track",
+                position: Some(track.position),
                 desired_state: track.desired_state.clone(),
                 status: track.status.clone(),
+                lifecycle: Some(track.lifecycle),
+                revision: Some(track.revision),
                 title: track.title.clone(),
                 acceptance_criteria: track.acceptance_criteria.clone(),
                 depends_on: track.depends_on.clone(),
-                open: track_status_is_open(track.status.as_deref()),
+                open: track_lifecycle_is_open(track.lifecycle),
                 declared: true,
                 attempts: Vec::new(),
             },
@@ -196,8 +212,11 @@ pub fn project_items(
             .or_insert_with(|| ProjectItem {
                 key: proposal.task_key.clone(),
                 kind: "task",
+                position: None,
                 desired_state: proposal.prompt.clone(),
                 status: Some("proposed".to_string()),
+                lifecycle: None,
+                revision: None,
                 title: Some(proposal.title.clone()),
                 acceptance_criteria: proposal.acceptance_criteria.clone(),
                 depends_on: proposal.depends_on.clone(),
@@ -221,8 +240,11 @@ pub fn project_items(
         let item = items.entry(key.clone()).or_insert_with(|| ProjectItem {
             key: key.clone(),
             kind: "track",
+            position: None,
             desired_state: mission.project.desired_state.clone(),
             status: None,
+            lifecycle: None,
+            revision: None,
             title: None,
             acceptance_criteria: Vec::new(),
             depends_on: Vec::new(),
@@ -243,7 +265,16 @@ pub fn project_items(
         item.attempts
             .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     }
-    items.into_values().collect()
+    let mut items: Vec<_> = items.into_values().collect();
+    items.sort_by(|left, right| match (left.position, right.position) {
+        (Some(left_position), Some(right_position)) => left_position
+            .cmp(&right_position)
+            .then_with(|| left.key.cmp(&right.key)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.key.cmp(&right.key),
+    });
+    items
 }
 
 /// Where a terminal / `awaiting_user` callback should land.
@@ -561,6 +592,14 @@ mod tests {
             title: Some("Core".to_string()),
             acceptance_criteria: vec!["merged".to_string()],
             depends_on: Vec::new(),
+            lifecycle: TrackLifecycle::Executing,
+            revision: 1,
+            position: 0,
+            governed_artifact_version: None,
+            accepted_at: None,
+            reopened_at: None,
+            reopen_reason: None,
+            reopened_by: None,
             updated_at: "2026-08-14T00:00:00Z".to_string(),
         }];
         let proposals = vec![RoadmapProposal {
@@ -605,6 +644,14 @@ mod tests {
             title: None,
             acceptance_criteria: Vec::new(),
             depends_on: Vec::new(),
+            lifecycle: TrackLifecycle::Cancelled,
+            revision: 1,
+            position: 0,
+            governed_artifact_version: None,
+            accepted_at: None,
+            reopened_at: None,
+            reopen_reason: None,
+            reopened_by: None,
             updated_at: "2026-08-01T00:00:00Z".to_string(),
         }];
         let closed = project_items(&cancelled, &[], &[]);
@@ -623,6 +670,14 @@ mod tests {
                 title: None,
                 acceptance_criteria: Vec::new(),
                 depends_on: Vec::new(),
+                lifecycle: TrackLifecycle::Executing,
+                revision: 1,
+                position: 0,
+                governed_artifact_version: None,
+                accepted_at: None,
+                reopened_at: None,
+                reopen_reason: None,
+                reopened_by: None,
                 updated_at: "2026-08-14T00:00:00Z".to_string(),
             }],
             &[],

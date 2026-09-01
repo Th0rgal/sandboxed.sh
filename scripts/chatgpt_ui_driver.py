@@ -67,10 +67,18 @@ CLOUDFLARE_TITLE = re.compile(r"just a moment|verifying", re.I)
 CLOUDFLARE_BODY = re.compile(
     r"verify you are human|verifying\.\.\.|just a moment", re.I
 )
-ACCOUNT_PICKER_HEADING = re.compile(r"choose an account to continue", re.I)
+ACCOUNT_PICKER_HEADING = re.compile(
+    r"choose an account to continue|welcome back|choisissez un compte", re.I
+)
 SAVED_ACCOUNT_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+ANOTHER_ACCOUNT_NAME = re.compile(
+    r"log in to another account|use another account|un autre compte|another account",
+    re.I,
+)
 ACCOUNT_PICKER_SKIP = re.compile(
-    r"log in to another account|create account|remove account|sign up for free|^log in$",
+    r"log in to another account|create account|remove account|sign up for free|"
+    r"^log in$|^sign in$|^sign up$|^se connecter$|^chatgpt$|^skip to content$|"
+    r"^new chat$|^images$|^plugins$|^continue$",
     re.I,
 )
 LOGIN_BUTTON_NAME = re.compile(r"^(log in|sign in)$", re.I)
@@ -535,11 +543,23 @@ def is_cloudflare_challenge_title(title: str | None) -> bool:
 
 
 def is_saved_account_choice(label: str) -> bool:
-    """True for a welcome-back saved-account card, never for Log in / Sign up."""
+    """True for a welcome-back saved-account card, never for Log in / Sign up.
+
+    Current ChatGPT cards often show only the display name (``Fricoben``),
+    not ``name\\nemail``. Requiring an ``@`` skipped the only clickable
+    account and left the overlay up.
+    """
     text = (label or "").strip()
     if not text or ACCOUNT_PICKER_SKIP.search(text):
         return False
-    return bool(SAVED_ACCOUNT_EMAIL.search(text))
+    if SAVED_ACCOUNT_EMAIL.search(text):
+        return True
+    name = text.split("\n")[0].strip()
+    if len(name) < 2 or len(name) > 80:
+        return False
+    if re.search(r"https?:|cookie|privacy|terms", name, re.I):
+        return False
+    return bool(re.search(r"[A-Za-zÀ-ÿ]", name))
 
 
 async def login_chrome_visible(page) -> bool:
@@ -597,23 +617,42 @@ async def wait_out_cloudflare(page, timeout_ms: int = 45_000) -> None:
     raise TransportUnavailable("Cloudflare interstitial did not clear")
 
 
+async def account_picker_visible(page) -> bool:
+    """True for the heading *or* the 'Log in to another account' control.
+
+    The 2026-08 overlay often has no ``Choose an account to continue``
+    heading — only the saved-account card plus that secondary action.
+    """
+    heading = page.get_by_text(ACCOUNT_PICKER_HEADING)
+    try:
+        if await heading.count() and await heading.first.is_visible():
+            return True
+    except Exception:
+        pass
+    other = page.get_by_role("button", name=ANOTHER_ACCOUNT_NAME)
+    try:
+        if await other.count() and await other.first.is_visible():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def complete_saved_account_picker(page, timeout_ms: int = 25_000) -> bool:
     """Click the stored account on ChatGPT's welcome-back picker.
 
-    After a CF challenge (or a cookie refresh) ChatGPT shows
-    ``Welcome back / Choose an account to continue`` with the profile's
-    saved account. The card is a ``div[role=button]``, not a ``<button>``,
+    After a CF challenge (or a cookie refresh) ChatGPT shows a saved
+    account card. The card is a ``div[role=button]``, not a ``<button>``,
     and the overlay often lands 15–20s after ``domcontentloaded``. A visible
     ``Log in`` chrome on that overlay used to be classified as
     ``auth_required``.
     """
-    heading = page.get_by_text(ACCOUNT_PICKER_HEADING)
     appeared = False
     for _ in range(max(1, timeout_ms // 250)):
-        if await heading.count() and await heading.first.is_visible():
+        if await account_picker_visible(page):
             appeared = True
             break
-        if not await login_chrome_visible(page):
+        if await account_shell_visible(page):
             return False
         await page.wait_for_timeout(250)
     if not appeared:
@@ -621,6 +660,7 @@ async def complete_saved_account_picker(page, timeout_ms: int = 25_000) -> bool:
     emit("diagnostic", message="stage=account_picker")
     # Native ``<button>`` and the welcome-back account card (div role=button).
     buttons = page.get_by_role("button")
+    selected = False
     for index in range(await buttons.count()):
         button = buttons.nth(index)
         try:
@@ -633,23 +673,30 @@ async def complete_saved_account_picker(page, timeout_ms: int = 25_000) -> bool:
             continue
         await button.click(timeout=8_000)
         emit("diagnostic", message="stage=account_picker_selected")
-        for _ in range(80):
-            heading_up = bool(
-                await heading.count() and await heading.first.is_visible()
-            )
-            if (
-                not heading_up
-                and not await login_chrome_visible(page)
-                and await account_shell_visible(page)
-            ):
-                return True
-            await page.wait_for_timeout(250)
-        if await account_shell_visible(page):
+        selected = True
+        break
+    if not selected:
+        raise PermissionError(
+            "welcome-back account picker is visible but no saved account could be selected"
+        )
+    heading = page.get_by_text(ACCOUNT_PICKER_HEADING)
+    for _ in range(80):
+        heading_up = False
+        try:
+            heading_up = bool(await heading.count() and await heading.first.is_visible())
+        except Exception:
+            heading_up = False
+        if (
+            not heading_up
+            and not await account_picker_visible(page)
+            and not await login_chrome_visible(page)
+            and await account_shell_visible(page)
+        ):
             return True
-        raise PermissionError("login required")
-    raise PermissionError(
-        "welcome-back account picker is visible but no saved account could be selected"
-    )
+        await page.wait_for_timeout(250)
+    if await account_shell_visible(page):
+        return True
+    raise PermissionError("login required")
 
 
 async def verify_authentication(page) -> None:

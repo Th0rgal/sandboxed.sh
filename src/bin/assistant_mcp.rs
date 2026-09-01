@@ -107,6 +107,28 @@ struct SetProjectTrackParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct AcceptProjectTrackParams {
+    slug: String,
+    track: String,
+    #[serde(default)]
+    criterion: Option<String>,
+    verifier_class: String,
+    evidence_ref: String,
+    artifact_version: String,
+    #[serde(default)]
+    observed_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReopenProjectTrackParams {
+    slug: String,
+    track: String,
+    reason: String,
+    #[serde(default)]
+    governed_artifact_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SetProjectGrantParams {
     slug: String,
     #[serde(default)]
@@ -135,6 +157,8 @@ struct ProposalTaskInput {
     acceptance_criteria: Vec<String>,
     #[serde(default)]
     depends_on: Vec<String>,
+    #[serde(default)]
+    position: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,6 +324,10 @@ struct StartMissionParams {
     tags: Option<Vec<String>>,
     #[serde(default)]
     desired_state: Option<String>,
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
     #[serde(default)]
     next_check_at: Option<String>,
     #[serde(default)]
@@ -1474,7 +1502,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "start_mission".to_string(),
-                description: "Start a new attempt on a work item. Pass project+track (the durable item); a new start on the same project/track/writer role absorbs the previous attempt so you do not have to acknowledge it. Missions are attempts, not the work itself — use get_project to read open items. Set backend explicitly when possible. For Codex GPT-5.6/5.5/5.4, set fast_mode=true to request the native fast service tier; this consumes ChatGPT credits faster. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Reviewers and certifiers must use writer=false: the server tags them pr-readonly and blocks git/gh mutations. Any PR-changing mission must use writer=true; the API rejects concurrent writers for the same PR.".to_string(),
+                description: "Start a new attempt on a work item. Pass project+track (the durable item) together with a stable idempotency_key; the server atomically declares/revises the track, reserves its owner lease, links the mission, and supersedes the previous owner. Retrying the same logical dispatch MUST reuse the key. Missions are attempts, not the work itself — use get_project_tasks for the declared roadmap and its separate unplanned_attempts. Set backend explicitly when possible. For Codex GPT-5.6/5.5/5.4, set fast_mode=true to request the native fast service tier; this consumes ChatGPT credits faster. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Reviewers and certifiers must use writer=false: the server tags them pr-readonly and blocks git/gh mutations. Any PR-changing mission must use writer=true; the API rejects concurrent writers for the same PR.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -1496,6 +1524,8 @@ impl AssistantMcp {
                         "request_merge_authority": {"type": "boolean", "description": "Request final guarded merge capability for a dedicated integrator. This is not self-authorization: the trusted Hermes client grants it only when github_pr matches the operator-configured repository allowlist."},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "desired_state": {"type": "string", "description": "Track state, e.g. waiting_ci / waiting_review / blocked_external."},
+                        "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "Outcome contract used when this dispatch declares the track. Existing satisfied tracks are never reopened implicitly."},
+                        "idempotency_key": {"type": "string", "description": "Stable retry key for one logical dispatch. Reusing it returns the existing mission receipt instead of starting a duplicate."},
                         "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."},
                         "estimated_disk_gib": {"type": "integer", "minimum": 1, "maximum": 512, "description": "Expected peak local scratch use. Set this for Lean/build-heavy missions; omit for small/no-build work."},
                         "origin_session_id": {"type": "string", "description": "Hermes session id of the conversation spawning this mission. Dashboards group the mission as a worker of that session, AND the mission-status webhook carries it back so the completion is delivered into that conversation instead of an isolated webhook session — always pass it when starting a mission from a conversation. Injected automatically by the Hermes-side plugin; pass through unchanged, never another session's id."}
@@ -1603,7 +1633,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "set_project_track".to_string(),
-                description: "Declare or update one workstream of your project: its desired_state (what it should reach) and current status. Use instead of editing prose in a tracker file.".to_string(),
+                description: "Declare or update one workstream using the validated lifecycle. This cannot mark a track satisfied without accepted criterion evidence and cannot reopen a satisfied track; use accept_project_track_evidence or reopen_project_track for those transitions.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["slug", "track"],
@@ -1611,7 +1641,38 @@ impl AssistantMcp {
                         "slug": {"type": "string"},
                         "track": {"type": "string"},
                         "desired_state": {"type": "string"},
-                        "status": {"type": "string"}
+                        "status": {"type": "string", "enum": ["planned", "ready", "executing", "waiting", "blocked", "satisfied", "cancelled"]}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "accept_project_track_evidence".to_string(),
+                description: "Accept immutable evidence for one track criterion. The server derives satisfaction only when every current criterion has accepted evidence at the governed artifact version; a mission self-report alone is not evidence.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "track", "verifier_class", "evidence_ref", "artifact_version"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "track": {"type": "string"},
+                        "criterion": {"type": "string", "description": "Exact acceptance criterion. May be omitted for a zero- or one-criterion track."},
+                        "verifier_class": {"type": "string", "enum": ["external_state", "command", "review", "operator", "manual"]},
+                        "evidence_ref": {"type": "string", "description": "Immutable receipt/URL/commit/job/review reference."},
+                        "artifact_version": {"type": "string", "description": "Immutable governed version, normally a full commit SHA."},
+                        "observed_at": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "reopen_project_track".to_string(),
+                description: "Explicitly reopen a satisfied or cancelled track. Requires a reason, records the authenticated actor, increments the contract revision, and prevents old evidence from satisfying the new revision.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "track", "reason"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "track": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "governed_artifact_version": {"type": "string"}
                     }
                 }),
             },
@@ -1683,7 +1744,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "plan_project_tasks".to_string(),
-                description: "Plan roadmap items for a project from conversation. Creates proposals (status 'proposed') on the project's roadmap — visible to the owner and to the project's controller, which turns them into real board tasks when it dispatches work (a board task under the same task_key supersedes the proposal). Re-planning an existing key updates it.".to_string(),
+                description: "Declare or revise project tracks. These rows are the only roadmap denominator. Re-planning preserves terminal lifecycle and current evidence; use explicit reopen for terminal work. Set position when the operator declares an exact sequence.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["slug", "tasks"],
@@ -1699,7 +1760,8 @@ impl AssistantMcp {
                                     "title": {"type": "string"},
                                     "prompt": {"type": "string", "description": "What a worker should actually do, if known."},
                                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-                                    "depends_on": {"type": "array", "items": {"type": "string"}}
+                                    "depends_on": {"type": "array", "items": {"type": "string"}},
+                                    "position": {"type": "integer", "minimum": 0, "description": "Optional zero-based declarative order. Omission preserves an existing position or appends a new track."}
                                 }
                             }
                         }
@@ -2267,6 +2329,8 @@ impl AssistantMcp {
             "writer": params.writer,
             "tags": tags,
             "desired_state": params.desired_state,
+            "acceptance_criteria": params.acceptance_criteria,
+            "idempotency_key": params.idempotency_key,
             "next_check_at": params.next_check_at,
             "estimated_disk_gib": params.estimated_disk_gib,
             // Mission-level provenance. `origin` is fixed by this server (not
@@ -2736,6 +2800,47 @@ impl AssistantMcp {
         Self::response_value(response, "set project track").await
     }
 
+    async fn accept_project_track_evidence(
+        &self,
+        params: AcceptProjectTrackParams,
+    ) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
+        let track = params.track.trim();
+        let response = self
+            .api_post(
+                &format!("/api/projects/{slug}/tracks/{track}/evidence"),
+                json!({
+                    "criterion": params.criterion,
+                    "verifier_class": params.verifier_class,
+                    "evidence_ref": params.evidence_ref,
+                    "artifact_version": params.artifact_version,
+                    "observed_at": params.observed_at,
+                }),
+            )
+            .await?;
+        Self::response_value(response, "accept project track evidence").await
+    }
+
+    async fn reopen_project_track(
+        &self,
+        params: ReopenProjectTrackParams,
+    ) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
+        let track = params.track.trim();
+        let response = self
+            .api_post(
+                &format!("/api/projects/{slug}/tracks/{track}/reopen"),
+                json!({
+                    "reason": params.reason,
+                    "governed_artifact_version": params.governed_artifact_version,
+                }),
+            )
+            .await?;
+        Self::response_value(response, "reopen project track").await
+    }
+
     async fn get_project_grant(&self, params: ProjectSlugParams) -> Result<Value, String> {
         let slug = params.slug.trim();
         let response = self.api_get(&format!("/api/projects/{slug}/grant")).await?;
@@ -2812,6 +2917,7 @@ impl AssistantMcp {
                     "prompt": task.prompt,
                     "acceptance_criteria": task.acceptance_criteria,
                     "depends_on": task.depends_on,
+                    "position": task.position,
                 })
             })
             .collect();
@@ -3438,6 +3544,14 @@ impl AssistantMcp {
             "set_project_track" => {
                 let params: SetProjectTrackParams = parse_params(arguments)?;
                 self.set_project_track(params).await
+            }
+            "accept_project_track_evidence" => {
+                let params: AcceptProjectTrackParams = parse_params(arguments)?;
+                self.accept_project_track_evidence(params).await
+            }
+            "reopen_project_track" => {
+                let params: ReopenProjectTrackParams = parse_params(arguments)?;
+                self.reopen_project_track(params).await
             }
             "get_project_grant" => {
                 let params: ProjectSlugParams = parse_params(arguments)?;
@@ -5026,6 +5140,8 @@ mod tests {
             "get_project",
             "update_project_status",
             "set_project_track",
+            "accept_project_track_evidence",
+            "reopen_project_track",
             "get_project_grant",
             "set_project_grant",
             "record_project_decision",
