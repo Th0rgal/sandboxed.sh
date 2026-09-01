@@ -17434,6 +17434,18 @@ async fn maybe_finalize_terminal_mission(
                     summary: mission_status_summary_for_terminal_reason(reason),
                 });
 
+                // Broadcast delivery is best-effort. Mirror the explicit
+                // SetMissionStatus path and schedule teardown directly so a
+                // finalizer cannot leak detached WorkspaceExec scopes when
+                // the scope-reaper listener is lagged or attached to another
+                // per-user control channel. The delayed status recheck still
+                // preserves missions promoted to WaitingBackground.
+                super::scope_reaper::schedule_mission_scope_teardown(
+                    Arc::clone(mission_store),
+                    mission_id,
+                    new_status,
+                );
+
                 // Stall-guard: orchestrators that park in awaiting_user with no
                 // wakeup armed can't resume themselves — arm a bounded fallback.
                 if new_status == MissionStatus::AwaitingUser {
