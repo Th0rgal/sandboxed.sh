@@ -4091,11 +4091,21 @@ pub(crate) fn workspace_path_for_env(
     workspace: &Workspace,
     host_path: &std::path::Path,
 ) -> std::path::PathBuf {
-    if workspace.workspace_type == workspace::WorkspaceType::Container
-        && workspace::use_nspawn_for_workspace(workspace)
-    {
-        if let Ok(rel) = host_path.strip_prefix(&workspace.path) {
-            return std::path::PathBuf::from("/").join(rel);
+    workspace_path_for_env_with_nspawn(
+        workspace,
+        host_path,
+        workspace::use_nspawn_for_workspace(workspace),
+    )
+}
+
+fn workspace_path_for_env_with_nspawn(
+    workspace: &Workspace,
+    host_path: &std::path::Path,
+    uses_nspawn: bool,
+) -> std::path::PathBuf {
+    if workspace.workspace_type == workspace::WorkspaceType::Container && uses_nspawn {
+        if let Some(relative) = workspace::strip_workspace_prefix(host_path, &workspace.path) {
+            return std::path::PathBuf::from("/").join(relative);
         }
     }
     host_path.to_path_buf()
@@ -9295,12 +9305,12 @@ mod tests {
         strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
         summarize_recent_opencode_stderr, text_buffer_stream_looks_degenerate,
         thinking_overlaps_visible_answer, tls_error_hint, truncate_garbled_output,
-        use_thinking_only_fallback, utf8_safe_prefix, ClaudeIncompleteTurnContext,
-        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
-        CopiedOpenCodeProbe, MissionHealth, MissionRunState, MissionRunner, MissionStallSeverity,
-        OpencodeSseState, CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT, CODEX_AUTH_ERROR_COOLDOWN,
-        CODEX_CAPACITY_COOLDOWN, CODEX_PENDING_TOOLS_ERROR_PREFIX, CODEX_RATE_LIMIT_COOLDOWN,
-        STALL_SEVERE_SECS, STALL_WARN_SECS,
+        use_thinking_only_fallback, utf8_safe_prefix, workspace_path_for_env_with_nspawn,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, CopiedOpenCodeProbe, MissionHealth, MissionRunState, MissionRunner,
+        MissionStallSeverity, OpencodeSseState, CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT,
+        CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN, CODEX_PENDING_TOOLS_ERROR_PREFIX,
+        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -9316,6 +9326,30 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[cfg(unix)]
+    #[test]
+    fn container_env_path_accepts_canonical_mission_path_under_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_root = temp.path().join("srv/containers/verity");
+        let mission_dir = canonical_root.join("workspaces/mission-4ca18dbd");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let script = mission_dir.join(".sandboxed-sh-opencode-cmd.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+
+        let alias_parent = temp.path().join("root/.sandboxed-sh/containers");
+        std::fs::create_dir_all(&alias_parent).unwrap();
+        let alias_root = alias_parent.join("verity");
+        symlink(&canonical_root, &alias_root).unwrap();
+        let workspace = crate::workspace::Workspace::new_container("verity".into(), alias_root);
+
+        assert_eq!(
+            workspace_path_for_env_with_nspawn(&workspace, &script, true),
+            std::path::PathBuf::from("/workspaces/mission-4ca18dbd/.sandboxed-sh-opencode-cmd.sh")
+        );
+    }
 
     #[test]
     fn copy_host_executable_follows_a_symlink_and_writes_a_real_binary() {
