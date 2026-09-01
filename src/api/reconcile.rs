@@ -221,16 +221,17 @@ fn status_needs_scopes(status: &MissionStatus) -> bool {
 }
 
 /// Classify an exec scope given what the mission index knows about its owner.
-/// `mission_status = None` means the mission is unknown; that only justifies a
-/// stop when `index_complete` proves every store was actually scanned.
+/// `mission_status = None` means the mission is unknown. A complete snapshot
+/// still cannot distinguish an orphan from a scope created concurrently with
+/// session/store registration, so boot reconciliation fails closed and leaves
+/// unknown scopes to the periodic age-gated reaper.
 pub fn classify_exec_scope(
     mission_status: Option<&MissionStatus>,
-    index_complete: bool,
+    _index_complete: bool,
 ) -> ScopeVerdict {
     match mission_status {
         Some(status) if status_needs_scopes(status) => ScopeVerdict::Keep,
         Some(_) => ScopeVerdict::Stop,
-        None if index_complete => ScopeVerdict::Stop,
         None => ScopeVerdict::Keep,
     }
 }
@@ -957,8 +958,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_mission_scope_stops_only_with_complete_index() {
-        assert_eq!(classify_exec_scope(None, true), ScopeVerdict::Stop);
+    fn unknown_mission_scope_is_left_to_age_gated_reaper() {
+        assert_eq!(classify_exec_scope(None, true), ScopeVerdict::Keep);
         assert_eq!(classify_exec_scope(None, false), ScopeVerdict::Keep);
     }
 
