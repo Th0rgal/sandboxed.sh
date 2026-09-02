@@ -76,6 +76,7 @@ pub(crate) mod spark;
 pub(crate) mod supervision;
 pub mod system;
 pub mod telegram;
+pub mod track_leases;
 pub mod tracker_import;
 pub mod types;
 pub mod usage_optimize;

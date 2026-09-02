@@ -305,6 +305,8 @@ struct StartMissionParams {
     #[serde(default)]
     track: Option<String>,
     #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
     intent: Option<String>,
     #[serde(default)]
     github_pr: Option<String>,
@@ -1508,6 +1510,7 @@ impl AssistantMcp {
                         "agent": {"type": "string"},
                         "project": {"type": "string", "description": "Stable project id (e.g. \"verity\")."},
                         "track": {"type": "string", "description": "Track/workstream (e.g. \"core-c3\")."},
+                        "idempotency_key": {"type": "string", "description": "Stable key for this dispatch (e.g. '<project>/<track>/<intent>/<date>'). A retry with the same key cannot take a second track lease."},
                         "intent": {"type": "string", "description": "Intent (e.g. \"review_merge_pr\")."},
                         "github_pr": {"type": "string", "description": "Associated PR ref (e.g. \"owner/repo#123\")."},
                         "writer": {"type": "boolean", "description": "Capability boundary for the associated PR. Use false for every reviewer/certifier (server-enforced read-only git/gh); use true for any branch, comment, thread, approval, or merge mutation. Concurrent writers for one PR are rejected."},
@@ -2331,6 +2334,7 @@ impl AssistantMcp {
             // metadata (Paloma watchdogs then route by these, not titles).
             "project": params.project,
             "track": params.track,
+            "idempotency_key": params.idempotency_key,
             "intent": params.intent,
             "github_pr": params.github_pr,
             "writer": params.writer,

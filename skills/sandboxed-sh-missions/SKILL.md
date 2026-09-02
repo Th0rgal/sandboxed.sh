@@ -280,7 +280,7 @@ Self-containment is the single biggest factor in mission success. The mission ag
 
 **Conversational launch** (desktop / API / TUI): `start_mission` is a worker of this chat. Hermes stamps `origin_session_id` and enrolls the mission. Confirm `pending`/`active`, then end the turn. The terminal webhook folds the result back here (ledger), or appends a `[Mission callback]` and wakes this session. Do **not** verify `PALOMA_WEBHOOK_FORWARD_URL`, do not start `fleet-heartbeat`, and do not create a `cronjob` to poll.
 
-**Controller launch** (cron tick with `deliver: project:<slug>`): pass `project` (and track / intent). Do not wait. Report on the next tick or the project route. Never stamp a `cron_*` session as origin.
+**Controller launch** (cron tick with `deliver: project:<slug>`): pass `project`, `track` (a key from `get_situation`; unknown keys are absorbed as unplanned items), `intent`, and a stable `idempotency_key`. One writer per track: `409 track_owned` names the holder — attach to it or dispatch read-only (`writer=false`). Do not wait. Report on the next tick or the project route. Never stamp a `cron_*` session as origin.
 
 **On callback:** inspect `get_mission` / `get_mission_digest` plus artifacts through the direct source before reporting. Mission self-report is not success. Notify Thomas for a user-launched completion, failure, blocker, decision, PR opened/merged, or useful research result. Stale duplicate ACKs may stay silent.
 

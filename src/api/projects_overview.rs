@@ -3287,7 +3287,14 @@ pub(crate) async fn load_project_situation(
     };
     let items = super::mission_horizon::project_items(&tracks, &proposals, &missions);
     let as_of = chrono::Utc::now().to_rfc3339();
-    super::situation::build(slug, &items, &source, &as_of)
+    let mut situation = super::situation::build(slug, &items, &source, &as_of);
+    match state.projects.live_leases(Some(slug)) {
+        Ok(leases) => super::situation::apply_leases(&mut situation, &leases),
+        Err(error) => {
+            tracing::warn!(project = %slug, %error, "situation: leases unavailable");
+        }
+    }
+    situation
 }
 
 fn accept_err(error: super::projects_store::AcceptError) -> (StatusCode, String) {

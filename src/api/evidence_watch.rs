@@ -157,6 +157,18 @@ pub fn spawn(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(WATCH_INTERVAL_SECS)).await;
+            match super::track_leases::sweep(&state).await {
+                Ok(report)
+                    if report.released_terminal
+                        + report.released_missing
+                        + report.expired_overdue
+                        > 0 =>
+                {
+                    tracing::info!(?report, "track leases swept")
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "track lease sweep failed"),
+            }
             match run_once(&state).await {
                 Ok(0) => {}
                 Ok(count) => {
