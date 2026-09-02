@@ -407,6 +407,15 @@ pub struct ReconcileReport {
 pub async fn run(state: &Arc<AppState>) -> ReconcileReport {
     let mut report = ReconcileReport::default();
 
+    // Track leases: release those whose mission is terminal or gone, renew
+    // the live ones. Repairs the create-mission crash windows at boot.
+    match super::track_leases::sweep(state).await {
+        Ok(leases) => {
+            tracing::info!(?leases, "reconcile: track leases swept");
+        }
+        Err(error) => tracing::warn!(%error, "reconcile: track lease sweep failed"),
+    }
+
     // ---- Phase 1: scopes ----
     let units = match try_list_sandboxed_scope_units().await {
         Ok(units) => {

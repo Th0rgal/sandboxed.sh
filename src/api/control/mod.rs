@@ -7496,8 +7496,14 @@ pub struct CreateMissionRequest {
     pub deadline: Option<chrono::DateTime<chrono::Utc>>,
     /// Project tagging: stable project identifier (e.g. "verity-core").
     pub project: Option<String>,
-    /// Project tagging: track / workstream within the project.
+    /// Project tagging: track / workstream within the project. Resolved
+    /// against the plan (key, alias, single PR ref) and absorbed as a new
+    /// `origin = absorbed` track when unknown.
     pub track: Option<String>,
+    /// Caller-supplied idempotency key for the dispatch. Keys the track lease
+    /// so a retried create cannot take a second lease; generated per mission
+    /// when absent.
+    pub idempotency_key: Option<String>,
     /// Project tagging: intent (e.g. "review_merge_pr").
     pub intent: Option<String>,
     /// Project tagging: associated GitHub PR ref (e.g. "owner/repo#123").
@@ -8959,6 +8965,23 @@ fn find_existing_pr_writer_in_sqlite(
     Ok(None)
 }
 
+impl ControlHub {
+    /// Look a mission up across every persisted per-user store. Used by
+    /// cross-cutting sweeps (track leases) that hold a mission id but no user.
+    pub(crate) async fn find_mission_any_store(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Option<Mission>, String> {
+        let inventory = self.mission_store_inventory().await?;
+        for store in inventory.live {
+            if let Some(mission) = store.get_mission(mission_id).await? {
+                return Ok(Some(mission));
+            }
+        }
+        Ok(None)
+    }
+}
+
 async fn find_existing_pr_writer_global(
     control_hub: &ControlHub,
     github_pr: &str,
@@ -9386,6 +9409,105 @@ async fn nonterminal_missions_for_project(
         .collect()
 }
 
+/// Resolve or absorb the track for a freshly created mission and take its
+/// lease. On a held writer lease the new mission is durably interrupted
+/// (reason `track_owned`) and a 409 is returned; on a missing track under
+/// `SANDBOXED_TRACK_REQUIRED` the mission is interrupted with `track_required`
+/// and a 400 is returned. Returns the canonical track key.
+#[allow(clippy::too_many_arguments)]
+async fn bind_mission_to_track(
+    state: &Arc<AppState>,
+    control: &ControlState,
+    mission: &Mission,
+    project: &str,
+    track: Option<&str>,
+    title: Option<&str>,
+    github_pr: Option<&str>,
+    intent: Option<&str>,
+    writer_flag: Option<bool>,
+    tags: &[String],
+    request_is_writer: bool,
+    idempotency_key: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
+    use super::track_leases;
+    let mission_id = mission.id.to_string();
+    let requested = match track.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(track) => track.to_string(),
+        None if track_leases::track_required() => {
+            interrupt_new_mission(control, mission.id, "track_required").await;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "track_required",
+                    "project": project,
+                    "message": "a project mission must name its track (the plan item it attempts); call get_situation and pass `track`",
+                })
+                .to_string(),
+            ));
+        }
+        None => {
+            let generated = track_leases::generated_track_key(&mission_id);
+            tracing::warn!(
+                mission_id = %mission_id,
+                project,
+                track = %generated,
+                "project mission dispatched without a track; absorbed under a generated key (compatibility window)"
+            );
+            generated
+        }
+    };
+    let pr = track_leases::pr_number(github_pr);
+    let outcome = state
+        .projects
+        .absorb_track(project, &requested, title, pr)
+        .map_err(internal_error)?;
+    if outcome.created || outcome.matched_by == "pr_ref" {
+        tracing::info!(
+            mission_id = %mission_id,
+            project,
+            requested = %requested,
+            track = %outcome.key,
+            matched_by = outcome.matched_by,
+            "mission track absorbed onto the plan"
+        );
+    }
+    let mode = if request_is_writer {
+        "writer"
+    } else {
+        track_leases::lease_mode(writer_flag, tags, intent)
+    };
+    let request =
+        track_leases::lease_request(project, &outcome.key, &mission_id, mode, idempotency_key);
+    match state.projects.acquire_track_lease(&request) {
+        Ok(_) => Ok(outcome.key),
+        Err(super::projects_store::LeaseError::Store(error)) => Err(internal_error(error)),
+        Err(error) => {
+            interrupt_new_mission(control, mission.id, "track_owned").await;
+            Err((
+                StatusCode::CONFLICT,
+                track_leases::owned_body(project, &outcome.key, &error).to_string(),
+            ))
+        }
+    }
+}
+
+/// Durably interrupt a mission that lost an admission check after creation,
+/// so it can never receive a goal or become a writer.
+async fn interrupt_new_mission(control: &ControlState, mission_id: Uuid, reason: &str) {
+    if let Err(error) = control
+        .mission_store
+        .update_mission_status_with_reason(mission_id, MissionStatus::Interrupted, Some(reason))
+        .await
+    {
+        tracing::warn!(mission_id = %mission_id, %error, reason, "could not interrupt rejected mission");
+    }
+    let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        mission_id,
+        status: MissionStatus::Interrupted,
+        summary: Some(reason.to_string()),
+    });
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -9409,6 +9531,7 @@ pub async fn create_mission(
         deadline: None,
         project: None,
         track: None,
+        idempotency_key: None,
         intent: None,
         github_pr: None,
         writer: None,
@@ -10157,12 +10280,40 @@ pub async fn create_mission(
                 })
             }),
     };
-    let track = nonblank(&req.track);
+    let mut track = nonblank(&req.track);
     let intent = nonblank(&req.intent);
     let github_pr = nonblank(&req.github_pr);
     let desired_state = nonblank(&req.desired_state);
     let next_check_at = nonblank(&req.next_check_at);
     let mut tags = normalized_request_tags;
+    // Absorb at write time: a project mission always lands on a plan row
+    // (existing key / alias / single PR ref, else a new `absorbed` track) and
+    // takes a lease on it. A held writer lease interrupts this duplicate
+    // instead of letting two writers race on one track.
+    if let Some(project_slug) = project.as_deref() {
+        match bind_mission_to_track(
+            &state,
+            &control,
+            &mission,
+            project_slug,
+            track.as_deref(),
+            req.title.as_deref(),
+            github_pr.as_deref(),
+            intent.as_deref(),
+            req.writer,
+            tags.as_deref().unwrap_or(&[]),
+            request_is_writer,
+            req.idempotency_key.as_deref(),
+        )
+        .await
+        {
+            Ok(canonical) => track = Some(canonical),
+            Err(response) => {
+                drop(pr_writer_guard);
+                return Err(response);
+            }
+        }
+    }
     if req
         .github_pr
         .as_deref()
@@ -12131,6 +12282,53 @@ pub async fn update_mission_project(
         }
     }
 
+    // Track move: resolve/absorb the new key, take its lease, release the
+    // old ones. A held writer lease is a 409 and the patch is not applied.
+    let effective_project = effective_string(&project, &current.project.project);
+    let effective_track = effective_string(&track, &current.project.track);
+    let track_changed = track.is_some() || project.is_some();
+    let track = if let (true, Some(slug), Some(key)) = (
+        track_changed,
+        effective_project.as_deref(),
+        effective_track.as_deref(),
+    ) {
+        let pr = super::track_leases::pr_number(effective_github_pr.as_deref());
+        let outcome = state
+            .projects
+            .absorb_track(slug, key, current.title.as_deref(), pr)
+            .map_err(internal_error)?;
+        let mode = if becomes_writer {
+            "writer"
+        } else {
+            super::track_leases::lease_mode(
+                req.writer,
+                &effective_tags,
+                effective_intent.as_deref(),
+            )
+        };
+        let request =
+            super::track_leases::lease_request(slug, &outcome.key, &id.to_string(), mode, None);
+        match state.projects.acquire_track_lease(&request) {
+            Ok(_) => {}
+            Err(super::projects_store::LeaseError::Store(error)) => {
+                return Err(internal_error(error))
+            }
+            Err(error) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    super::track_leases::owned_body(slug, &outcome.key, &error).to_string(),
+                ));
+            }
+        }
+        state
+            .projects
+            .release_leases_except(&id.to_string(), slug, &outcome.key)
+            .map_err(internal_error)?;
+        Some(Some(outcome.key))
+    } else {
+        track
+    };
+
     control
         .mission_store
         .update_mission_project(
@@ -13887,6 +14085,7 @@ pub async fn clone_mission(
         // grouped under the same project/track/intent.
         project: source.project.project.clone(),
         track: source.project.track.clone(),
+        idempotency_key: None,
         intent: source.project.intent.clone(),
         github_pr: source.project.github_pr.clone(),
         writer: None,

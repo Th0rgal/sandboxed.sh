@@ -156,9 +156,20 @@ and any live surface read *this*, not a parsed trailer. Once per tick:
   do not invent a new slug. Same mode vocabulary as the trailer; the store counts
   your consecutive-tick `wait`.
 - The project's **items are the only roadmap** — the right-rail checklist is
-  `project_tracks` (+ live attempts). `get_project` / `get_project_tasks` return
-  that list. `plan_project_tasks` upserts a key; `set_project_track(..., status=cancelled)`
-  retires a key. Editing `projects/active/<slug>.md` does **not** change the
+  `project_tracks` (+ live attempts). `get_situation(slug)` is the one read:
+  its `summary` (`total`, `verified_satisfied`, `claim_only`, `open`,
+  `blocked`, `live_attempts`, `cursor`) is the only progress number you may
+  quote; never recount items yourself. `claim_only` tracks were marked done
+  before receipts existed — report them as unproven, never as verified. An
+  unchanged `cursor` since your last tick means nothing moved. `get_project`
+  carries the same `summary`; `get_project_tasks` is deprecated.
+  `plan_project_tasks` upserts a key; `set_project_track(..., status=cancelled)`
+  retires a key. **A track becomes satisfied only through
+  `accept_project_track(slug, track, idempotency_key, evidence)`** with one
+  immutable handle per acceptance criterion (`owner/repo#233@<head sha>`, a
+  job id, a named operator decision). `set_project_track(status=done)` is
+  rejected. Head-bound evidence is invalidated automatically when the PR head
+  moves; `invalidate_project_track_evidence` withdraws it by hand. Editing `projects/active/<slug>.md` does **not** change the
   board. That file is narrative (IDs, heads, GRANT). If the owner says "clean
   the roadmap", mutate `project_tracks` in the same turn: cancel every obsolete
   open key, then `plan_project_tasks` the new keys. `plan_project_tasks` does
@@ -166,8 +177,18 @@ and any live surface read *this*, not a parsed trailer. Once per tick:
   cancelled. Do not create a second plan (no extra cron "roadmap watcher", no
   `/goal` as the program, no new `project=` for a workstream — that is a
   `track`).
-- For every mission you dispatch this tick, `link_mission_to_project(mission_id, slug,
-  track)` so it appears on that item. An unlinked worker is invisible.
+- Every `start_mission` on a project names its `track` (a key from
+  `get_situation`). The server resolves the key (spelling, alias, the single
+  track referencing the PR) and otherwise absorbs it as a new `origin=absorbed`
+  item — so invent keys only on purpose. Pass a stable `idempotency_key`
+  (`<slug>/<track>/<intent>/<date>`) so a retried dispatch cannot take a
+  second lease. One writer per track: a second writer gets `409 track_owned`
+  with the holder mission id — attach to it or dispatch read-only
+  (`writer=false`, or a review/certify intent). Missions created without a
+  track are absorbed under `mission-<id8>` during the transition and will be
+  rejected (`400 track_required`) once `SANDBOXED_TRACK_REQUIRED` is on.
+  `link_mission_to_project(mission_id, slug, track)` moves a mission and its
+  lease onto another item.
 - At your first tick (or after the prompt changed), read `get_project_grant(slug)` — the
   merge authority, budget, and any PAUSED live there and outrank the prompt.
 - Each tick, `set_project_track` for every **current** open in-scope item (and

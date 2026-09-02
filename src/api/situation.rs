@@ -438,6 +438,40 @@ pub fn build(
     }
 }
 
+/// Overlay live leases onto the items: the owner is whoever holds the writer
+/// lease (with its expiry), falling back to the live attempt when no lease
+/// exists yet (compatibility window).
+pub fn apply_leases(
+    situation: &mut ProjectSituation,
+    leases: &[super::projects_store::TrackLease],
+) {
+    for item in &mut situation.items {
+        let writer = leases
+            .iter()
+            .find(|lease| lease.track == item.key && lease.mode == "writer");
+        if let Some(lease) = writer {
+            let status = item
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id.to_string() == lease.attempt_id)
+                .map(|attempt| attempt.status.clone())
+                .unwrap_or_else(|| "leased".to_string());
+            item.owner = Some(ItemOwner {
+                attempt_id: lease.attempt_id.clone(),
+                status,
+                lease_until: Some(lease.lease_until.clone()),
+            });
+        } else if let Some(owner) = &mut item.owner {
+            if let Some(lease) = leases
+                .iter()
+                .find(|lease| lease.track == item.key && lease.attempt_id == owner.attempt_id)
+            {
+                owner.lease_until = Some(lease.lease_until.clone());
+            }
+        }
+    }
+}
+
 /// The `/tasks` checklist vocabulary (accepted / running / failed / proposed /
 /// pending), derived from the canonical state so the compatibility endpoint
 /// and the canonical one can never disagree.

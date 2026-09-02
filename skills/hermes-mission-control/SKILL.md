@@ -121,12 +121,18 @@ the roster slug (`verity-core`, `verity-lido`, …) and `track` as the
 wakeup and do not wait. Report on the next tick or via the project
 route. A `cron_*` session dies with the tick; never stamp one as origin.
 
-The project's items **are** the roadmap (`get_project` / `get_project_tasks`
-are the same list: `project_tracks` + live attempts). `plan_project_tasks`
-upserts an item; `set_project_track(..., cancelled)` retires one. Editing
-`projects/active/<slug>.md` does not change the right-rail checklist. Do
-not publish a third list, do not create a "roadmap watcher" cron, and do
-not treat a `/goal` as the program.
+The project's items **are** the roadmap (`get_situation` / `get_project`
+return the same list: `project_tracks` + live attempts, with one `summary`).
+Quote `summary.verified_satisfied / summary.total`; `claim_only` is
+"marked done, unproven". `plan_project_tasks` upserts an item;
+`set_project_track(..., cancelled)` retires one; only
+`accept_project_track(..., evidence)` closes one — `status=done` is rejected.
+`start_mission` on a project always names its `track` (and a stable
+`idempotency_key`); an unknown key is absorbed as an unplanned item, a held
+writer lease answers `409 track_owned`. Editing `projects/active/<slug>.md`
+does not change the right-rail checklist. Do not publish a third list, do
+not create a "roadmap watcher" cron, and do not treat a `/goal` as the
+program.
 
 ### On callback
 
