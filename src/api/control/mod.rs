@@ -27788,6 +27788,11 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
                 identity: Some(crate::remote_node::job_ledger::RemoteJobIdentity {
+                    version: 0,
+                    base_tree_sha: None,
+                    builder_image_digest: None,
+                    build_protocol_version: None,
+                    behavior_env_digest: None,
                     repository: "https://example.invalid/repo.git".to_string(),
                     commit: "abc123".to_string(),
                     cwd_rel_known: true,
@@ -27898,6 +27903,11 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: crate::remote_node::job_ledger::JobHandleKind::RemoteBuild,
                 identity: Some(crate::remote_node::job_ledger::RemoteJobIdentity {
+                    version: 0,
+                    base_tree_sha: None,
+                    builder_image_digest: None,
+                    build_protocol_version: None,
+                    behavior_env_digest: None,
                     repository: "https://example.invalid/repo.git".to_string(),
                     commit: "def456".to_string(),
                     cwd_rel_known: true,
