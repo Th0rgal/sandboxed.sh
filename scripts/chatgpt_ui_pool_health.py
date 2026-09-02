@@ -234,6 +234,10 @@ def slot_in_use(profile_dir: str) -> bool:
 
 def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
     from playwright.sync_api import sync_playwright
+    try:
+        from chatgpt_ui_relogin import direct_chromium_command, reserve_loopback_port
+    except ImportError:
+        from scripts.chatgpt_ui_relogin import direct_chromium_command, reserve_loopback_port
 
     src = Path(profile_dir)
     dst = SCRATCH / src.name
@@ -248,14 +252,28 @@ def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
 
     try:
         with sync_playwright() as pw:
-            context = pw.chromium.launch_persistent_context(
-                user_data_dir=str(dst),
-                headless=False,
-                viewport={"width": 1440, "height": 1000},
-                args=["--disable-background-networking"],
-                proxy={"server": proxy},
+            port = reserve_loopback_port()
+            process = subprocess.Popen(
+                direct_chromium_command(
+                    pw.chromium.executable_path, dst, proxy, port
+                ),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
+            browser = None
             try:
+                endpoint = f"http://127.0.0.1:{port}"
+                for _ in range(120):
+                    if process.poll() is not None:
+                        raise RuntimeError("Chromium exited before CDP was ready")
+                    try:
+                        browser = pw.chromium.connect_over_cdp(endpoint, timeout=1_000)
+                        break
+                    except Exception:
+                        time.sleep(0.25)
+                if browser is None or not browser.contexts:
+                    raise RuntimeError("Chromium CDP endpoint was not ready")
+                context = browser.contexts[0]
                 page = context.pages[0] if context.pages else context.new_page()
                 page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=90_000)
                 # The welcome-back picker is often 15–20s after domcontentloaded.
@@ -279,7 +297,18 @@ def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
                         break
                     page.wait_for_timeout(500)
             finally:
-                context.close()
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=10)
     except Exception as exc:  # noqa: BLE001 - a probe failure is never fatal
         log(f"{src.name}: probe error: {type(exc).__name__}: {exc}")
         return "unknown"
@@ -397,8 +426,17 @@ def main() -> int:
         # Cloudflare challenge would silently "clear" a dead slot.
         if observed in {"challenge", "unknown"}:
             entry["last_inconclusive_at"] = now
+            entry["consecutive_inconclusive"] = int(
+                entry.get("consecutive_inconclusive", 0)
+            ) + 1
+            if entry["consecutive_inconclusive"] >= 3:
+                entry["state"] = observed
+                entry["checked_at"] = now
+                if previous != observed:
+                    entry["since"] = now
             continue
 
+        entry.pop("consecutive_inconclusive", None)
         entry["state"] = observed
         entry["checked_at"] = now
         entry["verdict_version"] = 2
