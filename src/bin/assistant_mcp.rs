@@ -97,6 +97,24 @@ struct UpdateProjectStatusParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct AcceptProjectTrackParams {
+    slug: String,
+    track: String,
+    idempotency_key: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+    evidence: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InvalidateProjectTrackEvidenceParams {
+    slug: String,
+    track: String,
+    receipt_id: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SetProjectTrackParams {
     slug: String,
     track: String,
@@ -1588,6 +1606,15 @@ impl AssistantMcp {
                 }),
             },
             ToolDefinition {
+                name: "get_situation".to_string(),
+                description: "One bounded read of a project's plan: `summary` (total, verified_satisfied, claim_only, open, blocked, live_attempts, source_unavailable, cursor) and every track with its derived_state (ready | executing | waiting | blocked | satisfied | claim_only | cancelled), origin (declared | absorbed), owner attempt, and title. This is the only progress number to quote; do not recount items yourself. `claim_only` tracks were marked done without evidence — never report them as verified. An unchanged `cursor` since your last tick means nothing moved.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug"],
+                    "properties": {"slug": {"type": "string", "description": "Project slug or alias."}}
+                }),
+            },
+            ToolDefinition {
                 name: "update_project_status".to_string(),
                 description: "Report your project's state for this tick: mode (active | blocked | paused), the next action, and the blocker if any. Replaces the [CTRL:] trailer with a structured write; the store counts how long you have been in this mode, so blocked/paused staleness is visible without parsing your reports.".to_string(),
                 input_schema: json!({
@@ -1612,6 +1639,48 @@ impl AssistantMcp {
                         "track": {"type": "string"},
                         "desired_state": {"type": "string"},
                         "status": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "accept_project_track".to_string(),
+                description: "Satisfy a track with evidence — the ONLY way a track becomes satisfied (set_project_track rejects done/closed). Pass one evidence entry per declared acceptance criterion (criterion_id = the criterion text or c1, c2, …; omit when the track declares none). Each entry names an immutable handle: kind pr_merged | pr_head_review | review with subject_id 'owner/repo#233@<head sha>', or command / external_state / operator / manual with a job id, commit, or named decision. Head-bound evidence is invalidated automatically when the PR head moves. Use a stable idempotency_key per acceptance (retry-safe); pass expected_revision from get_situation to detect concurrent edits (409 on mismatch).".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "track", "idempotency_key", "evidence"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "track": {"type": "string"},
+                        "idempotency_key": {"type": "string"},
+                        "expected_revision": {"type": "integer"},
+                        "evidence": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["kind", "subject_id"],
+                                "properties": {
+                                    "criterion_id": {"type": "string"},
+                                    "kind": {"type": "string", "enum": ["pr_merged", "pr_head_review", "review", "command", "external_state", "operator", "manual"]},
+                                    "subject_id": {"type": "string", "description": "Immutable handle, e.g. 'lfglabs-dev/verity#233@20494801f6e2'."},
+                                    "verifier": {"type": "string", "description": "Who or what verified it (reviewer, check name, mission id)."},
+                                    "payload": {"type": "object"}
+                                }
+                            }
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "invalidate_project_track_evidence".to_string(),
+                description: "Withdraw one piece of evidence on a track (receipt_id from get_situation / the track's receipts) with a reason. Appends an invalidate receipt; the track reopens if no other evidence stands. Use when a certification turned out wrong or the governed artifact changed in a way the watcher cannot see.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "track", "receipt_id", "reason"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "track": {"type": "string"},
+                        "receipt_id": {"type": "string"},
+                        "reason": {"type": "string"}
                     }
                 }),
             },
@@ -2705,6 +2774,15 @@ impl AssistantMcp {
         Ok(compact_project(raw))
     }
 
+    async fn get_situation(&self, params: ProjectSlugParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        let response = self
+            .api_get(&format!("/api/projects/{slug}/situation"))
+            .await?;
+        let raw = Self::response_value(response, "get situation").await?;
+        Ok(compact_situation(raw))
+    }
+
     async fn update_project_status(
         &self,
         params: UpdateProjectStatusParams,
@@ -2734,6 +2812,56 @@ impl AssistantMcp {
             .api_post(&format!("/api/projects/{slug}/track"), body)
             .await?;
         Self::response_value(response, "set project track").await
+    }
+
+    async fn accept_project_track(
+        &self,
+        params: AcceptProjectTrackParams,
+    ) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
+        let track = params.track.trim();
+        let body = json!({
+            "idempotency_key": params.idempotency_key,
+            "expected_revision": params.expected_revision,
+            "evidence": params.evidence,
+            "actor_type": "controller",
+            "actor_id": self.actor_id(),
+        });
+        let response = self
+            .api_post(&format!("/api/projects/{slug}/tracks/{track}/accept"), body)
+            .await?;
+        Self::response_value(response, "accept project track").await
+    }
+
+    async fn invalidate_project_track_evidence(
+        &self,
+        params: InvalidateProjectTrackEvidenceParams,
+    ) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
+        let track = params.track.trim();
+        let body = json!({
+            "receipt_id": params.receipt_id,
+            "reason": params.reason,
+            "actor": self.actor_id(),
+        });
+        let response = self
+            .api_post(
+                &format!("/api/projects/{slug}/tracks/{track}/invalidate"),
+                body,
+            )
+            .await?;
+        Self::response_value(response, "invalidate project track evidence").await
+    }
+
+    /// Who this MCP acts as, for receipts: the bound project scope or the
+    /// generic connector identity.
+    fn actor_id(&self) -> String {
+        std::env::var("HERMES_CONTROLLER_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "assistant-mcp".to_string())
     }
 
     async fn get_project_grant(&self, params: ProjectSlugParams) -> Result<Value, String> {
@@ -3431,6 +3559,10 @@ impl AssistantMcp {
                 let params: ProjectSlugParams = parse_params(arguments)?;
                 self.get_project(params).await
             }
+            "get_situation" => {
+                let params: ProjectSlugParams = parse_params(arguments)?;
+                self.get_situation(params).await
+            }
             "update_project_status" => {
                 let params: UpdateProjectStatusParams = parse_params(arguments)?;
                 self.update_project_status(params).await
@@ -3438,6 +3570,14 @@ impl AssistantMcp {
             "set_project_track" => {
                 let params: SetProjectTrackParams = parse_params(arguments)?;
                 self.set_project_track(params).await
+            }
+            "accept_project_track" => {
+                let params: AcceptProjectTrackParams = parse_params(arguments)?;
+                self.accept_project_track(params).await
+            }
+            "invalidate_project_track_evidence" => {
+                let params: InvalidateProjectTrackEvidenceParams = parse_params(arguments)?;
+                self.invalidate_project_track_evidence(params).await
             }
             "get_project_grant" => {
                 let params: ProjectSlugParams = parse_params(arguments)?;
@@ -3808,6 +3948,9 @@ fn compact_item(item: &Value) -> Value {
         "open": item.get("open").cloned().unwrap_or(Value::Null),
         "status": compact_opt_text(item.get("status"), MCP_PROJECT_TEXT_CAP),
         "desired_state": compact_opt_text(item.get("desired_state"), MCP_PROJECT_TEXT_CAP),
+        "title": compact_opt_text(item.get("title"), 120),
+        "derived_state": item.get("derived_state").cloned().unwrap_or(Value::Null),
+        "origin": item.get("origin").cloned().unwrap_or(Value::Null),
         "attempts": kept,
     });
     if omitted > 0 {
@@ -3895,9 +4038,49 @@ fn compact_project(raw: Value) -> Value {
         "items_total": items_total,
         "items_omitted": items_total.saturating_sub(kept_items.len()),
         "item_counts": counts,
+        "summary": raw.get("summary").cloned().unwrap_or(Value::Null),
         "open_decisions": kept_decisions,
         "open_decisions_omitted": decisions_total.saturating_sub(kept_decisions.len()),
         "conversation": conversation,
+    })
+}
+
+/// The situation is already bounded server-side; only trim prose and cap
+/// the item list so a 200-track project cannot flood the controller's turn.
+fn compact_situation(raw: Value) -> Value {
+    let items = raw
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let items_total = items.len();
+    let kept: Vec<Value> = items
+        .iter()
+        .take(MCP_PROJECT_ITEM_CAP)
+        .map(|item| {
+            let mut out = json!({
+                "key": item.get("key").cloned().unwrap_or(Value::Null),
+                "title": compact_opt_text(item.get("title"), 120),
+                "derived_state": item.get("derived_state").cloned().unwrap_or(Value::Null),
+                "origin": item.get("origin").cloned().unwrap_or(Value::Null),
+                "acceptance": item.get("acceptance").cloned().unwrap_or(Value::Null),
+                "updated_at": item.get("updated_at").cloned().unwrap_or(Value::Null),
+            });
+            if let Some(owner) = item.get("owner") {
+                out["owner"] = owner.clone();
+            }
+            if let Some(blocked_by) = item.get("blocked_by") {
+                out["blocked_by"] = blocked_by.clone();
+            }
+            out
+        })
+        .collect();
+    json!({
+        "slug": raw.get("slug").cloned().unwrap_or(Value::Null),
+        "summary": raw.get("summary").cloned().unwrap_or(Value::Null),
+        "items": kept,
+        "items_total": items_total,
+        "items_omitted": items_total.saturating_sub(kept.len()),
     })
 }
 

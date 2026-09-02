@@ -20,6 +20,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use uuid::Uuid;
+
+/// Bumped by every table rebuild. Additive `ensure_column` migrations do not
+/// count; they stay idempotent on their own.
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// Tracker parser revision recorded on every import row.
+pub const TRACKER_PARSER_VERSION: i64 = 1;
 
 pub type SharedProjectsStore = Arc<ProjectsStore>;
 
@@ -102,18 +110,98 @@ CREATE TABLE IF NOT EXISTS project_grant (
     autonomy_level    TEXT         -- observe | propose | act_reversible | act_full
 );
 
--- One row per workstream. `desired_state` is what the track should reach;
--- `status` is where it is. The controller sets these instead of editing prose.
+-- One row per workstream: the plan inventory and the only durable truth about
+-- what work exists. `lifecycle` is the only stored state; satisfaction is
+-- derived from `receipts` (see the situation builder), never written here.
+-- `track` is the normalized key (lowercase `[a-z0-9-]`); old spellings live in
+-- `project_track_aliases`.
 CREATE TABLE IF NOT EXISTS project_tracks (
+    id                   TEXT PRIMARY KEY,                 -- stable uuid
     slug                 TEXT NOT NULL,
     track                TEXT NOT NULL,
+    title                TEXT NOT NULL,
     desired_state        TEXT,
-    status               TEXT,
-    title                TEXT,
-    acceptance_criteria  TEXT,                             -- JSON array of strings
-    depends_on           TEXT,                             -- JSON array of task keys
+    lifecycle            TEXT NOT NULL DEFAULT 'active'
+                         CHECK (lifecycle IN ('active','cancelled')),
+    origin               TEXT NOT NULL DEFAULT 'declared'
+                         CHECK (origin IN ('declared','imported','absorbed')),
+    explicit_blocker     TEXT,                             -- structured judgment, nullable
+    acceptance_criteria  TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(acceptance_criteria)),
+    depends_on           TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(depends_on)),
+    revision             INTEGER NOT NULL DEFAULT 0,
+    created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL,
-    PRIMARY KEY (slug, track)
+    UNIQUE (slug, track)
+);
+
+CREATE TABLE IF NOT EXISTS schema_version (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    version     INTEGER NOT NULL,
+    migrated_at TEXT NOT NULL
+);
+
+-- Append-only evidence. A receipt is emitted by a completed action or an
+-- explicit observation; it never represents a live process (live build state
+-- is `remote_jobs`). Terminal rows are never updated: a newer receipt
+-- supersedes (`supersedes_receipt_id`) or invalidates an older one.
+CREATE TABLE IF NOT EXISTS receipts (
+    id                    TEXT PRIMARY KEY,
+    idempotency_key       TEXT NOT NULL UNIQUE,
+    request_hash          TEXT NOT NULL,
+    kind                  TEXT NOT NULL,                   -- legacy_import|accept|invalidate|reconcile|reconcile_ack|build|...
+    project_slug          TEXT,
+    track_id              TEXT,
+    criterion_id          TEXT,
+    subject_type          TEXT NOT NULL,                   -- build|pr|command|migration|import|operator|...
+    subject_id            TEXT NOT NULL,                   -- immutable external handle
+    outcome               TEXT NOT NULL CHECK (outcome IN
+                            ('succeeded','failed','cancelled','observed','invalidated')),
+    actor_type            TEXT NOT NULL,                   -- mission|operator|controller|system
+    actor_id              TEXT NOT NULL,
+    verifier              TEXT,
+    supersedes_receipt_id TEXT REFERENCES receipts(id),
+    observed_at           TEXT NOT NULL,
+    payload               TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
+    created_at            TEXT NOT NULL,
+    FOREIGN KEY (project_slug) REFERENCES projects(slug) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS receipts_track_time
+    ON receipts(project_slug, track_id, observed_at);
+CREATE INDEX IF NOT EXISTS receipts_subject
+    ON receipts(subject_type, subject_id);
+
+-- Old spellings of a track key (`UX1`, `P-ETH-1`) that still resolve.
+CREATE TABLE IF NOT EXISTS project_track_aliases (
+    slug        TEXT NOT NULL,
+    alias_key   TEXT NOT NULL,
+    track_id    TEXT NOT NULL REFERENCES project_tracks(id) ON DELETE CASCADE,
+    reason      TEXT NOT NULL,                             -- normalized_collision|imported_code|renamed
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (slug, alias_key)
+);
+
+-- External references a track governs. A shared PR is a matching hint for
+-- absorption, never an automatic merge.
+CREATE TABLE IF NOT EXISTS project_track_refs (
+    track_id    TEXT NOT NULL REFERENCES project_tracks(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,                             -- pr|issue|mission
+    repository  TEXT NOT NULL DEFAULT '',
+    number      INTEGER NOT NULL DEFAULT 0,
+    url         TEXT,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (track_id, kind, repository, number)
+);
+
+-- One row per (source, content hash, parser): the importer is idempotent.
+CREATE TABLE IF NOT EXISTS project_imports (
+    slug            TEXT NOT NULL,
+    source_path     TEXT NOT NULL,
+    source_hash     TEXT NOT NULL,
+    parser_version  INTEGER NOT NULL,
+    imported_at     TEXT NOT NULL,
+    items           INTEGER NOT NULL,
+    receipt_id      TEXT,
+    PRIMARY KEY (slug, source_path, source_hash, parser_version)
 );
 
 -- The decision ledger. Two kinds of rows share it: escalations (questions the
@@ -181,11 +269,20 @@ impl ProjectsStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)?;
+        let connection = Connection::open(&path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         // Required for `project_grant`'s ON DELETE CASCADE — SQLite defaults it
         // off, so without this a deleted project would strand its grant row.
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        // A table rebuild is the one migration that is not trivially
+        // reversible: copy the file first, next to itself, so an operator can
+        // roll back by moving the copy back.
+        if Self::needs_tracks_rebuild(&connection)? {
+            let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+            let backup = path.with_extension(format!("db.bak-{stamp}"));
+            connection.execute("VACUUM INTO ?1", params![backup.to_string_lossy()])?;
+            tracing::warn!(backup = %backup.display(), "projects.db: rebuilding project_tracks (v2); backup written");
+        }
         Self::initialize(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -284,7 +381,370 @@ impl ProjectsStore {
             "depends_on",
             "depends_on TEXT",
         )?;
+        // 2026-09: tracks gain a stable id, a checked lifecycle, an origin and
+        // a revision; legacy `done`/`closed` become claim receipts. Table
+        // rebuild, one transaction, idempotent.
+        Self::migrate_tracks_v2(connection)?;
         Ok(())
+    }
+
+    /// True while `project_tracks` still has the pre-v2 shape.
+    fn needs_tracks_rebuild(connection: &Connection) -> rusqlite::Result<bool> {
+        let table_exists: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_tracks'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if table_exists.is_none() {
+            return Ok(false);
+        }
+        let mut statement = connection.prepare("PRAGMA table_info(project_tracks)")?;
+        let has_lifecycle = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == "lifecycle");
+        Ok(!has_lifecycle)
+    }
+
+    /// Rebuild `project_tracks` into the v2 shape.
+    ///
+    /// Legacy mapping (design doc §A1): `cancelled` → lifecycle `cancelled`;
+    /// `done` / `closed` → lifecycle `active` plus a `legacy_import` claim
+    /// receipt; anything else (NULL, empty, `running`, `in-progress`,
+    /// unknown) → `active` plus a reconciliation correction. Keys are
+    /// normalized; a spelling that collides after normalization becomes an
+    /// alias of the most recently updated row and is reported as an
+    /// ambiguity — never silently merged as the same semantic track.
+    fn migrate_tracks_v2(connection: &Connection) -> rusqlite::Result<()> {
+        if !Self::needs_tracks_rebuild(connection)? {
+            Self::stamp_schema_version(connection)?;
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> rusqlite::Result<()> {
+            connection.execute_batch(
+                "CREATE TABLE project_tracks_v2 (
+                    id                   TEXT PRIMARY KEY,
+                    slug                 TEXT NOT NULL,
+                    track                TEXT NOT NULL,
+                    title                TEXT NOT NULL,
+                    desired_state        TEXT,
+                    lifecycle            TEXT NOT NULL DEFAULT 'active'
+                                         CHECK (lifecycle IN ('active','cancelled')),
+                    origin               TEXT NOT NULL DEFAULT 'declared'
+                                         CHECK (origin IN ('declared','imported','absorbed')),
+                    explicit_blocker     TEXT,
+                    acceptance_criteria  TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(acceptance_criteria)),
+                    depends_on           TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(depends_on)),
+                    revision             INTEGER NOT NULL DEFAULT 0,
+                    created_at           TEXT NOT NULL,
+                    updated_at           TEXT NOT NULL,
+                    UNIQUE (slug, track)
+                );",
+            )?;
+            struct Legacy {
+                slug: String,
+                track: String,
+                desired_state: Option<String>,
+                status: Option<String>,
+                title: Option<String>,
+                acceptance_criteria: Option<String>,
+                depends_on: Option<String>,
+                updated_at: String,
+            }
+            let legacy: Vec<Legacy> = {
+                let mut statement = connection.prepare(
+                    "SELECT slug, track, desired_state, status, title, acceptance_criteria, \
+                            depends_on, updated_at \
+                     FROM project_tracks ORDER BY slug, updated_at DESC, track",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok(Legacy {
+                        slug: row.get(0)?,
+                        track: row.get(1)?,
+                        desired_state: row.get(2)?,
+                        status: row.get(3)?,
+                        title: row.get(4)?,
+                        acceptance_criteria: row.get(5)?,
+                        depends_on: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            // Per project: corrections for the reconcile receipt.
+            let mut corrections: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+            // Alias rows reference `project_tracks(id)`, which the legacy
+            // table does not have yet: buffer them until after the rename.
+            let mut aliases: Vec<(String, String, String, &'static str)> = Vec::new();
+            // (slug, normalized key) → id of the row that won.
+            let mut winners: HashMap<(String, String), String> = HashMap::new();
+            for row in legacy {
+                let key = normalize_track_key(&row.track);
+                let slug_corrections = corrections.entry(row.slug.clone()).or_default();
+                if let Some(winner) = winners.get(&(row.slug.clone(), key.clone())) {
+                    // Rows are ordered newest-first, so the winner is the most
+                    // recently updated spelling. Keep this one resolvable.
+                    aliases.push((
+                        row.slug.clone(),
+                        row.track.clone(),
+                        winner.clone(),
+                        "normalized_collision",
+                    ));
+                    slug_corrections.push(serde_json::json!({
+                        "op": "normalized_collision",
+                        "alias": row.track,
+                        "into": key,
+                        "ambiguous": true,
+                        "note": "two spellings normalize to one key; the newer row won, the older spelling is an alias — verify they are the same track",
+                    }));
+                    continue;
+                }
+                let id = Uuid::new_v4().to_string();
+                let status = row
+                    .status
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let lifecycle = match status {
+                    Some("cancelled") => "cancelled",
+                    _ => "active",
+                };
+                let title = row
+                    .title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        row.desired_state
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| {
+                        slug_corrections.push(serde_json::json!({
+                            "op": "title_synthesized",
+                            "track": key,
+                            "from_key": row.track,
+                        }));
+                        humanize_track_key(&row.track)
+                    });
+                let criteria = row
+                    .acceptance_criteria
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                    .unwrap_or_default();
+                let depends: Vec<String> = row
+                    .depends_on
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|dep| normalize_track_key(&dep))
+                    .collect();
+                connection.execute(
+                    "INSERT INTO project_tracks_v2 \
+                       (id, slug, track, title, desired_state, lifecycle, origin, explicit_blocker, \
+                        acceptance_criteria, depends_on, revision, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'declared', NULL, ?7, ?8, 0, ?9, ?9)",
+                    params![
+                        id,
+                        row.slug,
+                        key,
+                        title,
+                        row.desired_state,
+                        lifecycle,
+                        serde_json::to_string(&criteria).unwrap_or_else(|_| "[]".into()),
+                        serde_json::to_string(&depends).unwrap_or_else(|_| "[]".into()),
+                        row.updated_at,
+                    ],
+                )?;
+                if key != row.track {
+                    aliases.push((row.slug.clone(), row.track.clone(), id.clone(), "renamed"));
+                    slug_corrections.push(serde_json::json!({
+                        "op": "key_normalized",
+                        "track": key,
+                        "from": row.track,
+                    }));
+                }
+                match status {
+                    Some("done") | Some("closed") => {
+                        Self::insert_receipt_row(
+                            connection,
+                            &NewReceipt {
+                                idempotency_key: format!(
+                                    "legacy_import:{}:{}:{}",
+                                    row.slug, key, row.updated_at
+                                ),
+                                kind: "legacy_import".into(),
+                                project_slug: Some(row.slug.clone()),
+                                track_id: Some(id.clone()),
+                                criterion_id: None,
+                                subject_type: "migration".into(),
+                                subject_id: format!("project_tracks:{}:{}", row.slug, row.track),
+                                outcome: "observed".into(),
+                                actor_type: "system".into(),
+                                actor_id: "projects_store::migrate_tracks_v2".into(),
+                                verifier: None,
+                                supersedes_receipt_id: None,
+                                observed_at: row.updated_at.clone(),
+                                payload: serde_json::json!({
+                                    "legacy_status": status,
+                                    "note": "marked done before receipts existed; claim only",
+                                }),
+                            },
+                            &now,
+                        )?;
+                        slug_corrections.push(serde_json::json!({
+                            "op": "legacy_done_to_claim_only",
+                            "track": key,
+                            "legacy_status": status,
+                        }));
+                    }
+                    Some("cancelled") => {}
+                    other => {
+                        if !matches!(other, None | Some("open")) {
+                            slug_corrections.push(serde_json::json!({
+                                "op": "status_normalized",
+                                "track": key,
+                                "from": other,
+                                "to": "open",
+                            }));
+                        }
+                    }
+                }
+                winners.insert((row.slug.clone(), key), id);
+            }
+            for (slug, corrections) in corrections {
+                if corrections.is_empty() {
+                    continue;
+                }
+                Self::insert_receipt_row(
+                    connection,
+                    &NewReceipt {
+                        idempotency_key: format!("reconcile:migrate_tracks_v2:{slug}:{now}"),
+                        kind: "reconcile".into(),
+                        project_slug: Some(slug.clone()),
+                        track_id: None,
+                        criterion_id: None,
+                        subject_type: "migration".into(),
+                        subject_id: "project_tracks_v2".into(),
+                        outcome: "observed".into(),
+                        actor_type: "system".into(),
+                        actor_id: "projects_store::migrate_tracks_v2".into(),
+                        verifier: None,
+                        supersedes_receipt_id: None,
+                        observed_at: now.clone(),
+                        payload: serde_json::json!({ "corrections": corrections }),
+                    },
+                    &now,
+                )?;
+            }
+            connection.execute_batch(
+                "DROP TABLE project_tracks;
+                 ALTER TABLE project_tracks_v2 RENAME TO project_tracks;",
+            )?;
+            for (slug, alias, track_id, reason) in aliases {
+                connection.execute(
+                    "INSERT OR IGNORE INTO project_track_aliases \
+                       (slug, alias_key, track_id, reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![slug, alias, track_id, reason, now],
+                )?;
+            }
+            Self::stamp_schema_version(connection)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => connection.execute_batch("COMMIT"),
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn stamp_schema_version(connection: &Connection) -> rusqlite::Result<()> {
+        connection.execute(
+            "INSERT INTO schema_version (id, version, migrated_at) VALUES (1, ?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET version = excluded.version, \
+               migrated_at = CASE WHEN schema_version.version = excluded.version \
+                                  THEN schema_version.migrated_at ELSE excluded.migrated_at END",
+            params![SCHEMA_VERSION, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn schema_version(&self) -> Result<i64, String> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT version FROM schema_version WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+            .map(|version| version.unwrap_or(0))
+    }
+
+    /// Append one receipt on an already-held connection (migration / txn).
+    fn insert_receipt_row(
+        connection: &Connection,
+        receipt: &NewReceipt,
+        now: &str,
+    ) -> rusqlite::Result<Receipt> {
+        let id = Uuid::new_v4().to_string();
+        let payload = serde_json::to_string(&receipt.payload).unwrap_or_else(|_| "{}".into());
+        let request_hash = receipt.request_hash();
+        connection.execute(
+            "INSERT INTO receipts \
+               (id, idempotency_key, request_hash, kind, project_slug, track_id, criterion_id, \
+                subject_type, subject_id, outcome, actor_type, actor_id, verifier, \
+                supersedes_receipt_id, observed_at, payload, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                id,
+                receipt.idempotency_key,
+                request_hash,
+                receipt.kind,
+                receipt.project_slug,
+                receipt.track_id,
+                receipt.criterion_id,
+                receipt.subject_type,
+                receipt.subject_id,
+                receipt.outcome,
+                receipt.actor_type,
+                receipt.actor_id,
+                receipt.verifier,
+                receipt.supersedes_receipt_id,
+                receipt.observed_at,
+                payload,
+                now,
+            ],
+        )?;
+        Ok(Receipt {
+            id,
+            idempotency_key: receipt.idempotency_key.clone(),
+            kind: receipt.kind.clone(),
+            project_slug: receipt.project_slug.clone(),
+            track_id: receipt.track_id.clone(),
+            criterion_id: receipt.criterion_id.clone(),
+            subject_type: receipt.subject_type.clone(),
+            subject_id: receipt.subject_id.clone(),
+            outcome: receipt.outcome.clone(),
+            actor_type: receipt.actor_type.clone(),
+            actor_id: receipt.actor_id.clone(),
+            verifier: receipt.verifier.clone(),
+            supersedes_receipt_id: receipt.supersedes_receipt_id.clone(),
+            observed_at: receipt.observed_at.clone(),
+            payload: receipt.payload.clone(),
+            created_at: now.to_string(),
+        })
     }
 
     /// Additive column migration; returns true when the column was added.
@@ -356,6 +816,43 @@ impl ProjectsStore {
             )
             .optional()
             .map_err(|e| e.to_string())
+    }
+
+    /// Bind stored under the canonical slug; drop nickname rows that fold onto it.
+    pub fn set_canonical_binding(
+        &self,
+        canonical: &str,
+        session_id: &str,
+        aliases: &[String],
+        bound_by: Option<&str>,
+    ) -> Result<ProjectConversation, String> {
+        let conversation = self.set_binding(canonical, session_id, bound_by)?;
+        for alias in aliases {
+            if alias != canonical {
+                self.clear_binding(alias)?;
+            }
+        }
+        Ok(conversation)
+    }
+
+    /// Canonical bind first, then any nickname row (one-release fallback).
+    pub fn binding_for_canonical(
+        &self,
+        canonical: &str,
+        aliases: &[String],
+    ) -> Result<Option<ProjectConversation>, String> {
+        if let Some(found) = self.binding(canonical)? {
+            return Ok(Some(found));
+        }
+        for alias in aliases {
+            if alias == canonical {
+                continue;
+            }
+            if let Some(found) = self.binding(alias)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
     }
 
     /// Bind (or re-bind) a project's control conversation.
@@ -552,6 +1049,47 @@ impl ProjectsStore {
         Ok(1)
     }
 
+    /// Advance freshness for an inspect callback without opening a chapter
+    /// or incrementing the stall counter.
+    ///
+    /// Mission-complete inspect callbacks used to become `latest_update` and
+    /// trip "same state on 3 consecutive updates" while the controller had
+    /// already told the operator there was nothing to do (Verity #2397).
+    pub fn touch_freshness(
+        &self,
+        slug: &str,
+        at: &str,
+        session_id: Option<&str>,
+    ) -> Result<u32, String> {
+        let connection = self.lock()?;
+        let current: Option<(String, String, u32)> = connection
+            .query_row(
+                "SELECT first_seen_at, last_seen_at, observations \
+                 FROM project_state_events WHERE slug = ?1 \
+                 ORDER BY last_seen_at DESC LIMIT 1",
+                params![slug],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((first_seen_at, last_seen_at, observations)) = current else {
+            return Ok(0);
+        };
+        if at <= last_seen_at.as_str() {
+            return Ok(0);
+        }
+        connection
+            .execute(
+                "UPDATE project_state_events \
+                 SET last_seen_at = ?1, \
+                     session_id = COALESCE(?4, session_id) \
+                 WHERE slug = ?2 AND first_seen_at = ?3",
+                params![at, slug, first_seen_at, session_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(observations)
+    }
+
     /// A project's state history, newest first.
     pub fn state_timeline(&self, slug: &str, limit: usize) -> Result<Vec<ProjectState>, String> {
         let connection = self.lock()?;
@@ -595,6 +1133,45 @@ impl ProjectsStore {
                    SELECT MAX(last_seen_at) FROM project_state_events \
                    WHERE slug = e.slug \
                  )",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ProjectState {
+                        signature: row.get(1)?,
+                        headline: row.get(2)?,
+                        first_seen_at: row.get(3)?,
+                        last_seen_at: row.get(4)?,
+                        observations: row.get(5)?,
+                        session_id: row.get(6)?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Newest non-inspect chapter per slug. Inspect callbacks must not own
+    /// the board headline or the stall counter; they only refresh `last_seen_at`
+    /// via [`Self::touch_freshness`].
+    pub fn latest_controller_states(&self) -> Result<HashMap<String, ProjectState>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT slug, signature, headline, first_seen_at, last_seen_at, \
+                        observations, session_id \
+                 FROM project_state_events e \
+                 WHERE IFNULL(signature, '') NOT LIKE 'mission-callback%' \
+                   AND IFNULL(headline, '') NOT LIKE '[Mission callback:%' \
+                   AND last_seen_at = ( \
+                     SELECT MAX(last_seen_at) FROM project_state_events \
+                     WHERE slug = e.slug \
+                       AND IFNULL(signature, '') NOT LIKE 'mission-callback%' \
+                       AND IFNULL(headline, '') NOT LIKE '[Mission callback:%' \
+                   )",
             )
             .map_err(|e| e.to_string())?;
         let rows = statement
@@ -807,6 +1384,19 @@ impl ProjectsStore {
                 params![slug],
             )
             .map_err(|e| e.to_string())?;
+        for table in ["project_imports", "project_track_aliases", "receipts"] {
+            let column = if table == "receipts" {
+                "project_slug"
+            } else {
+                "slug"
+            };
+            transaction
+                .execute(
+                    &format!("DELETE FROM {table} WHERE {column} = ?1"),
+                    params![slug],
+                )
+                .map_err(|e| e.to_string())?;
+        }
         let removed = transaction
             .execute("DELETE FROM projects WHERE slug = ?1", params![slug])
             .map_err(|e| e.to_string())?
@@ -867,10 +1457,18 @@ impl ProjectsStore {
                 params![old, new, now],
             )
             .map_err(|e| e.to_string())?;
+        transaction
+            .execute(
+                "UPDATE receipts SET project_slug = ?2 WHERE project_slug = ?1",
+                params![old, new],
+            )
+            .map_err(|e| e.to_string())?;
         for table in [
             "project_grant",
             "project_bindings",
             "project_tracks",
+            "project_track_aliases",
+            "project_imports",
             "project_state_events",
             "project_decisions",
             "project_roadmap_proposals",
@@ -1096,28 +1694,85 @@ impl ProjectsStore {
 
     pub fn tracks(&self, slug: &str) -> Result<Vec<ProjectTrack>, String> {
         let connection = self.lock()?;
+        Self::tracks_on(&connection, slug)
+    }
+
+    fn tracks_on(connection: &Connection, slug: &str) -> Result<Vec<ProjectTrack>, String> {
         let mut statement = connection
-            .prepare(
-                "SELECT track, desired_state, status, title, acceptance_criteria, depends_on, updated_at \
-                 FROM project_tracks WHERE slug = ?1 ORDER BY track",
-            )
+            .prepare(TRACK_SELECT)
             .map_err(|e| e.to_string())?;
         let rows = statement
-            .query_map(params![slug], |row| {
-                let criteria: Option<String> = row.get(4)?;
-                let depends: Option<String> = row.get(5)?;
-                Ok(ProjectTrack {
-                    track: row.get(0)?,
-                    desired_state: row.get(1)?,
-                    status: row.get(2)?,
-                    title: row.get(3)?,
-                    acceptance_criteria: parse_string_list(criteria),
-                    depends_on: parse_string_list(depends),
-                    updated_at: row.get(6)?,
-                })
-            })
+            .query_map(params![slug], track_from_row)
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// One track by normalized key or alias, within `slug`.
+    pub fn track(&self, slug: &str, key: &str) -> Result<Option<ProjectTrack>, String> {
+        let connection = self.lock()?;
+        Self::track_on(&connection, slug, key)
+    }
+
+    fn track_on(
+        connection: &Connection,
+        slug: &str,
+        key: &str,
+    ) -> Result<Option<ProjectTrack>, String> {
+        let Some(id) = Self::resolve_track_id_on(connection, slug, key)? else {
+            return Ok(None);
+        };
+        connection
+            .query_row(TRACK_SELECT_BY_ID, params![id], track_from_row)
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Resolve a caller-supplied key (any spelling) to the row id. Exact
+    /// normalized key first, then the alias table.
+    fn resolve_track_id_on(
+        connection: &Connection,
+        slug: &str,
+        key: &str,
+    ) -> Result<Option<String>, String> {
+        let normalized = normalize_track_key(key);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let direct: Option<String> = connection
+            .query_row(
+                "SELECT id FROM project_tracks WHERE slug = ?1 AND track = ?2",
+                params![slug, normalized],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if direct.is_some() {
+            return Ok(direct);
+        }
+        connection
+            .query_row(
+                "SELECT track_id FROM project_track_aliases WHERE slug = ?1 AND (alias_key = ?2 OR alias_key = ?3)",
+                params![slug, key.trim(), normalized],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Canonical key for any spelling, if the track exists.
+    pub fn resolve_track_key(&self, slug: &str, key: &str) -> Result<Option<String>, String> {
+        let connection = self.lock()?;
+        let Some(id) = Self::resolve_track_id_on(&connection, slug, key)? else {
+            return Ok(None);
+        };
+        connection
+            .query_row(
+                "SELECT track FROM project_tracks WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
             .map_err(|e| e.to_string())
     }
 
@@ -1125,32 +1780,28 @@ impl ProjectsStore {
     pub fn find_track_slug(&self, slugs: &[String], track: &str) -> Result<Option<String>, String> {
         let connection = self.lock()?;
         for slug in slugs {
-            let found: Option<String> = connection
-                .query_row(
-                    "SELECT slug FROM project_tracks WHERE slug = ?1 AND track = ?2",
-                    params![slug, track],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            if found.is_some() {
-                return Ok(found);
+            if Self::resolve_track_id_on(&connection, slug, track)?.is_some() {
+                return Ok(Some(slug.clone()));
             }
         }
         Ok(None)
     }
 
+    /// Declare or update one workstream. `status` is the legacy vocabulary
+    /// and maps onto lifecycle / blocker; it can never mark a track done —
+    /// that takes a receipt (`accept_track_evidence`).
     pub fn set_track(
         &self,
         slug: &str,
         track: &str,
         desired_state: Option<&str>,
         status: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), TrackWriteError> {
         self.patch_track(slug, track, desired_state, status, None, None, None)
     }
 
     /// Partial update: NULL / omitted contract fields leave the stored values.
+    /// Creates the row (`origin = declared`) when the key is unknown.
     #[allow(clippy::too_many_arguments)]
     pub fn patch_track(
         &self,
@@ -1161,79 +1812,802 @@ impl ProjectsStore {
         title: Option<&str>,
         acceptance_criteria: Option<&[String]>,
         depends_on: Option<&[String]>,
-    ) -> Result<(), String> {
+    ) -> Result<(), TrackWriteError> {
+        let transition = TrackTransition::from_legacy_status(status)?;
+        let key = normalize_track_key(track);
+        if key.is_empty() {
+            return Err(TrackWriteError::Invalid(format!(
+                "track key '{track}' is empty after normalization"
+            )));
+        }
         let now = Utc::now().to_rfc3339();
         let criteria = acceptance_criteria
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| TrackWriteError::Store(e.to_string()))?;
         let depends = depends_on
-            .map(serde_json::to_string)
+            .map(|deps| {
+                deps.iter()
+                    .map(|dep| normalize_track_key(dep))
+                    .collect::<Vec<_>>()
+            })
+            .map(|deps| serde_json::to_string(&deps))
             .transpose()
-            .map_err(|e| e.to_string())?;
-        let connection = self.lock()?;
-        connection
-            .execute(
-                "INSERT INTO project_tracks \
-                   (slug, track, desired_state, status, title, acceptance_criteria, depends_on, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                 ON CONFLICT(slug, track) DO UPDATE SET \
-                   desired_state = COALESCE(excluded.desired_state, project_tracks.desired_state), \
-                   status = COALESCE(excluded.status, project_tracks.status), \
-                   title = COALESCE(excluded.title, project_tracks.title), \
-                   acceptance_criteria = COALESCE(excluded.acceptance_criteria, project_tracks.acceptance_criteria), \
-                   depends_on = COALESCE(excluded.depends_on, project_tracks.depends_on), \
-                   updated_at = excluded.updated_at",
-                params![
-                    slug,
-                    track,
-                    desired_state,
-                    status,
-                    title,
-                    criteria,
-                    depends,
-                    now
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(())
+            .map_err(|e| TrackWriteError::Store(e.to_string()))?;
+        let mut connection = self.lock().map_err(TrackWriteError::Store)?;
+        let tx = connection
+            .transaction()
+            .map_err(|e| TrackWriteError::Store(e.to_string()))?;
+        let existing =
+            Self::resolve_track_id_on(&tx, slug, track).map_err(TrackWriteError::Store)?;
+        match existing {
+            Some(id) => {
+                let (lifecycle_sql, blocker_sql) = transition.update_clauses();
+                tx.execute(
+                    &format!(
+                        "UPDATE project_tracks SET \
+                           desired_state = COALESCE(?2, desired_state), \
+                           title = COALESCE(?3, title), \
+                           acceptance_criteria = COALESCE(?4, acceptance_criteria), \
+                           depends_on = COALESCE(?5, depends_on), \
+                           {lifecycle_sql} \
+                           {blocker_sql} \
+                           revision = revision + 1, \
+                           updated_at = ?6 \
+                         WHERE id = ?1"
+                    ),
+                    params![id, desired_state, title, criteria, depends, now],
+                )
+                .map_err(|e| TrackWriteError::Store(e.to_string()))?;
+            }
+            None => {
+                let title = title
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        desired_state
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| humanize_track_key(track));
+                let (lifecycle, blocker) = transition.insert_values();
+                let id = Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO project_tracks \
+                       (id, slug, track, title, desired_state, lifecycle, origin, explicit_blocker, \
+                        acceptance_criteria, depends_on, revision, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'declared', ?7, ?8, ?9, 0, ?10, ?10)",
+                    params![
+                        id,
+                        slug,
+                        key,
+                        title,
+                        desired_state,
+                        lifecycle,
+                        blocker,
+                        criteria.unwrap_or_else(|| "[]".into()),
+                        depends.unwrap_or_else(|| "[]".into()),
+                        now
+                    ],
+                )
+                .map_err(|e| TrackWriteError::Store(e.to_string()))?;
+                if key != track.trim() {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO project_track_aliases \
+                           (slug, alias_key, track_id, reason, created_at) \
+                         VALUES (?1, ?2, ?3, 'renamed', ?4)",
+                        params![slug, track.trim(), id, now],
+                    )
+                    .map_err(|e| TrackWriteError::Store(e.to_string()))?;
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|e| TrackWriteError::Store(e.to_string()))
     }
 
-    /// Plan items from chat: latest title + contract win, status stays `open`
-    /// unless a later `set_track` moved it. One transaction so a later invalid
-    /// caller never leaves a prefix of the batch persisted.
+    /// Plan items from chat: latest title + contract win, lifecycle returns
+    /// to `active` (a re-planned cancelled key is un-cancelled). One
+    /// transaction so a later invalid caller never leaves a prefix persisted.
     pub fn upsert_planned_tracks(&self, slug: &str, items: &[PlannedTrack]) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.lock()?;
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         for item in items {
+            let key = normalize_track_key(&item.track);
+            if key.is_empty() {
+                return Err(format!(
+                    "task_key '{}' is empty after normalization",
+                    item.track
+                ));
+            }
+            let title = item.title.trim();
+            if title.is_empty() {
+                return Err(format!("task '{}' needs a title", item.track));
+            }
             let criteria =
                 serde_json::to_string(&item.acceptance_criteria).map_err(|e| e.to_string())?;
-            let depends = serde_json::to_string(&item.depends_on).map_err(|e| e.to_string())?;
+            let depends: Vec<String> = item
+                .depends_on
+                .iter()
+                .map(|dep| normalize_track_key(dep))
+                .collect();
+            let depends = serde_json::to_string(&depends).map_err(|e| e.to_string())?;
+            let existing = Self::resolve_track_id_on(&tx, slug, &item.track)?;
+            match existing {
+                Some(id) => {
+                    tx.execute(
+                        "UPDATE project_tracks SET \
+                           title = ?2, desired_state = ?3, acceptance_criteria = ?4, depends_on = ?5, \
+                           lifecycle = 'active', origin = 'declared', explicit_blocker = NULL, \
+                           revision = revision + 1, updated_at = ?6 \
+                         WHERE id = ?1",
+                        params![id, title, item.desired_state, criteria, depends, now],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                None => {
+                    let id = Uuid::new_v4().to_string();
+                    tx.execute(
+                        "INSERT INTO project_tracks \
+                           (id, slug, track, title, desired_state, lifecycle, origin, explicit_blocker, \
+                            acceptance_criteria, depends_on, revision, created_at, updated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'declared', NULL, ?6, ?7, 0, ?8, ?8)",
+                        params![id, slug, key, title, item.desired_state, criteria, depends, now],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    if key != item.track.trim() {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO project_track_aliases \
+                               (slug, alias_key, track_id, reason, created_at) \
+                             VALUES (?1, ?2, ?3, 'renamed', ?4)",
+                            params![slug, item.track.trim(), id, now],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    // ── Receipts ────────────────────────────────────────────────────────
+
+    /// Append one receipt. Idempotent on `idempotency_key`: the same key with
+    /// the same body returns the stored row; the same key with a different
+    /// body is a conflict.
+    pub fn insert_receipt(&self, receipt: &NewReceipt) -> Result<Receipt, ReceiptWriteError> {
+        let mut connection = self.lock().map_err(ReceiptWriteError::Store)?;
+        let tx = connection
+            .transaction()
+            .map_err(|e| ReceiptWriteError::Store(e.to_string()))?;
+        let result = Self::insert_receipt_on(&tx, receipt)?;
+        tx.commit()
+            .map_err(|e| ReceiptWriteError::Store(e.to_string()))?;
+        Ok(result)
+    }
+
+    fn insert_receipt_on(
+        connection: &Connection,
+        receipt: &NewReceipt,
+    ) -> Result<Receipt, ReceiptWriteError> {
+        if let Some(prior) = Self::receipt_by_key_on(connection, &receipt.idempotency_key)
+            .map_err(ReceiptWriteError::Store)?
+        {
+            let stored_hash: String = connection
+                .query_row(
+                    "SELECT request_hash FROM receipts WHERE id = ?1",
+                    params![prior.id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| ReceiptWriteError::Store(e.to_string()))?;
+            if stored_hash == receipt.request_hash() {
+                return Ok(prior);
+            }
+            return Err(ReceiptWriteError::IdempotencyMismatch {
+                idempotency_key: receipt.idempotency_key.clone(),
+                prior_receipt_id: prior.id,
+            });
+        }
+        let now = Utc::now().to_rfc3339();
+        Self::insert_receipt_row(connection, receipt, &now)
+            .map_err(|e| ReceiptWriteError::Store(e.to_string()))
+    }
+
+    fn receipt_by_key_on(connection: &Connection, key: &str) -> Result<Option<Receipt>, String> {
+        connection
+            .query_row(
+                &format!("{RECEIPT_SELECT} WHERE idempotency_key = ?1"),
+                params![key],
+                receipt_from_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn receipt(&self, id: &str) -> Result<Option<Receipt>, String> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                &format!("{RECEIPT_SELECT} WHERE id = ?1"),
+                params![id],
+                receipt_from_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Every receipt on one track, oldest first.
+    pub fn receipts_for_track(&self, slug: &str, key: &str) -> Result<Vec<Receipt>, String> {
+        let connection = self.lock()?;
+        let Some(id) = Self::resolve_track_id_on(&connection, slug, key)? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = connection
+            .prepare(&format!(
+                "{RECEIPT_SELECT} WHERE track_id = ?1 ORDER BY observed_at, created_at"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![id], receipt_from_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// The newest `reconcile` receipt for the project that no `reconcile_ack`
+    /// supersedes. Surfaced on `get_project` until the operator acknowledges.
+    pub fn latest_unacked_reconcile(&self, slug: &str) -> Result<Option<Receipt>, String> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                &format!(
+                    "{RECEIPT_SELECT} WHERE project_slug = ?1 AND kind = 'reconcile' \
+                       AND NOT EXISTS (SELECT 1 FROM receipts ack \
+                                       WHERE ack.kind = 'reconcile_ack' \
+                                         AND ack.supersedes_receipt_id = receipts.id) \
+                     ORDER BY observed_at DESC, created_at DESC LIMIT 1"
+                ),
+                params![slug],
+                receipt_from_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Acknowledge a reconcile receipt: appends `reconcile_ack`, mutates nothing.
+    pub fn ack_reconcile(
+        &self,
+        slug: &str,
+        receipt_id: &str,
+        actor: &str,
+    ) -> Result<Receipt, ReceiptWriteError> {
+        let now = Utc::now().to_rfc3339();
+        self.insert_receipt(&NewReceipt {
+            idempotency_key: format!("reconcile_ack:{receipt_id}"),
+            kind: "reconcile_ack".into(),
+            project_slug: Some(slug.to_string()),
+            track_id: None,
+            criterion_id: None,
+            subject_type: "receipt".into(),
+            subject_id: receipt_id.to_string(),
+            outcome: "observed".into(),
+            actor_type: "operator".into(),
+            actor_id: actor.to_string(),
+            verifier: None,
+            supersedes_receipt_id: Some(receipt_id.to_string()),
+            observed_at: now,
+            payload: serde_json::json!({}),
+        })
+    }
+
+    // ── Acceptance ──────────────────────────────────────────────────────
+
+    /// Satisfy a track with evidence. One transaction: revision check,
+    /// evidence validation against the acceptance criteria, immutable
+    /// receipts, revision bump. Retrying the same idempotency key with the
+    /// same body replays the prior receipts without bumping the revision.
+    pub fn accept_track_evidence(
+        &self,
+        slug: &str,
+        key: &str,
+        request: &AcceptRequest,
+    ) -> Result<AcceptResult, AcceptError> {
+        if request.evidence.is_empty() {
+            return Err(AcceptError::Invalid("evidence is required".into()));
+        }
+        if request.idempotency_key.trim().is_empty() {
+            return Err(AcceptError::Invalid("idempotency_key is required".into()));
+        }
+        for (index, evidence) in request.evidence.iter().enumerate() {
+            if !EVIDENCE_KINDS.contains(&evidence.kind.as_str()) {
+                return Err(AcceptError::Invalid(format!(
+                    "evidence[{index}].kind '{}' is not one of {}",
+                    evidence.kind,
+                    EVIDENCE_KINDS.join(" | ")
+                )));
+            }
+            if evidence.subject_id.trim().is_empty() {
+                return Err(AcceptError::Invalid(format!(
+                    "evidence[{index}].subject_id is required (an immutable handle: PR head, commit, job id)"
+                )));
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.lock().map_err(AcceptError::Store)?;
+        let tx = connection
+            .transaction()
+            .map_err(|e| AcceptError::Store(e.to_string()))?;
+        let Some(track) = Self::track_on(&tx, slug, key).map_err(AcceptError::Store)? else {
+            return Err(AcceptError::NotFound);
+        };
+        if track.lifecycle == "cancelled" {
+            return Err(AcceptError::Invalid(format!(
+                "track '{}' is cancelled; re-plan it before accepting evidence",
+                track.track
+            )));
+        }
+        // An idempotent retry (same key, first receipt already stored) must
+        // return the prior response even though the first call bumped the
+        // revision; a mismatching body still fails below.
+        let prior = Self::receipt_by_key_on(&tx, &format!("{}:0", request.idempotency_key.trim()))
+            .map_err(AcceptError::Store)?;
+        let is_retry = prior.is_some();
+        // A server-defaulted observation time must not make a retry look
+        // like a different body: reuse the prior receipt's.
+        let observed_at = request
+            .observed_at
+            .clone()
+            .or_else(|| prior.as_ref().map(|receipt| receipt.observed_at.clone()))
+            .unwrap_or_else(|| now.clone());
+        if let Some(expected) = request.expected_revision {
+            if !is_retry && expected != track.revision {
+                return Err(AcceptError::StaleRevision {
+                    expected,
+                    current: track.revision,
+                });
+            }
+        }
+        // Every declared criterion needs evidence. Criteria are plain strings
+        // today; a criterion id is the string itself or `c<n>` (1-based).
+        if !track.acceptance_criteria.is_empty() {
+            let mut covered = vec![false; track.acceptance_criteria.len()];
+            for (index, evidence) in request.evidence.iter().enumerate() {
+                let Some(criterion) = evidence.criterion_id.as_deref().map(str::trim) else {
+                    return Err(AcceptError::Invalid(format!(
+                        "evidence[{index}] needs a criterion_id; track '{}' declares {} criteria",
+                        track.track,
+                        track.acceptance_criteria.len()
+                    )));
+                };
+                let position = track
+                    .acceptance_criteria
+                    .iter()
+                    .position(|declared| declared.trim() == criterion)
+                    .or_else(|| {
+                        criterion
+                            .strip_prefix('c')
+                            .and_then(|n| n.parse::<usize>().ok())
+                            .filter(|n| *n >= 1 && *n <= track.acceptance_criteria.len())
+                            .map(|n| n - 1)
+                    });
+                match position {
+                    Some(position) => covered[position] = true,
+                    None => {
+                        return Err(AcceptError::Invalid(format!(
+                            "evidence[{index}].criterion_id '{criterion}' matches no declared criterion of '{}'",
+                            track.track
+                        )))
+                    }
+                }
+            }
+            let missing: Vec<String> = covered
+                .iter()
+                .enumerate()
+                .filter(|(_, done)| !**done)
+                .map(|(i, _)| format!("c{}: {}", i + 1, track.acceptance_criteria[i]))
+                .collect();
+            if !missing.is_empty() {
+                return Err(AcceptError::Invalid(format!(
+                    "criteria without evidence: {}",
+                    missing.join("; ")
+                )));
+            }
+        }
+        let mut receipts = Vec::with_capacity(request.evidence.len());
+        let mut replayed = 0usize;
+        for (index, evidence) in request.evidence.iter().enumerate() {
+            let before: i64 = tx
+                .query_row("SELECT count(*) FROM receipts", [], |row| row.get(0))
+                .map_err(|e| AcceptError::Store(e.to_string()))?;
+            let receipt = Self::insert_receipt_on(
+                &tx,
+                &NewReceipt {
+                    idempotency_key: format!("{}:{index}", request.idempotency_key.trim()),
+                    kind: "accept".into(),
+                    project_slug: Some(slug.to_string()),
+                    track_id: Some(track.id.clone()),
+                    criterion_id: evidence.criterion_id.clone(),
+                    subject_type: evidence_subject_type(&evidence.kind).into(),
+                    subject_id: evidence.subject_id.trim().to_string(),
+                    outcome: "succeeded".into(),
+                    actor_type: request.actor_type.clone(),
+                    actor_id: request.actor_id.clone(),
+                    verifier: evidence.verifier.clone(),
+                    supersedes_receipt_id: None,
+                    observed_at: observed_at.clone(),
+                    payload: serde_json::json!({
+                        "evidence_kind": evidence.kind,
+                        "track": track.track,
+                        "details": evidence.payload,
+                    }),
+                },
+            )
+            .map_err(|error| match error {
+                ReceiptWriteError::IdempotencyMismatch {
+                    idempotency_key,
+                    prior_receipt_id,
+                } => AcceptError::IdempotencyMismatch {
+                    idempotency_key,
+                    prior_receipt_id,
+                },
+                ReceiptWriteError::Store(message) => AcceptError::Store(message),
+            })?;
+            let after: i64 = tx
+                .query_row("SELECT count(*) FROM receipts", [], |row| row.get(0))
+                .map_err(|e| AcceptError::Store(e.to_string()))?;
+            if after == before {
+                replayed += 1;
+            }
+            receipts.push(receipt);
+        }
+        let replayed = replayed == request.evidence.len();
+        if !replayed {
             tx.execute(
-                "INSERT INTO project_tracks \
-                   (slug, track, desired_state, status, title, acceptance_criteria, depends_on, updated_at) \
-                 VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7) \
-                 ON CONFLICT(slug, track) DO UPDATE SET \
-                   desired_state = excluded.desired_state, \
-                   status = 'open', \
-                   title = excluded.title, \
-                   acceptance_criteria = excluded.acceptance_criteria, \
-                   depends_on = excluded.depends_on, \
-                   updated_at = excluded.updated_at",
+                "UPDATE project_tracks SET revision = revision + 1, updated_at = ?2 WHERE id = ?1",
+                params![track.id, now],
+            )
+            .map_err(|e| AcceptError::Store(e.to_string()))?;
+        }
+        let track = Self::track_on(&tx, slug, key)
+            .map_err(AcceptError::Store)?
+            .ok_or(AcceptError::NotFound)?;
+        tx.commit().map_err(|e| AcceptError::Store(e.to_string()))?;
+        Ok(AcceptResult {
+            track,
+            receipts,
+            replayed,
+        })
+    }
+
+    /// Append an `invalidate` receipt over an accept / legacy claim. The
+    /// derived state reopens on the next read; nothing is deleted.
+    pub fn invalidate_track_evidence(
+        &self,
+        slug: &str,
+        key: &str,
+        receipt_id: &str,
+        reason: &str,
+        actor_type: &str,
+        actor_id: &str,
+    ) -> Result<Receipt, AcceptError> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.lock().map_err(AcceptError::Store)?;
+        let tx = connection
+            .transaction()
+            .map_err(|e| AcceptError::Store(e.to_string()))?;
+        let Some(track) = Self::track_on(&tx, slug, key).map_err(AcceptError::Store)? else {
+            return Err(AcceptError::NotFound);
+        };
+        let target = tx
+            .query_row(
+                &format!("{RECEIPT_SELECT} WHERE id = ?1"),
+                params![receipt_id],
+                receipt_from_row,
+            )
+            .optional()
+            .map_err(|e| AcceptError::Store(e.to_string()))?;
+        let Some(target) = target else {
+            return Err(AcceptError::Invalid(format!("no receipt '{receipt_id}'")));
+        };
+        if target.track_id.as_deref() != Some(track.id.as_str())
+            || !matches!(target.kind.as_str(), "accept" | "legacy_import")
+        {
+            return Err(AcceptError::Invalid(format!(
+                "receipt '{receipt_id}' is not evidence on track '{}'",
+                track.track
+            )));
+        }
+        let receipt = Self::insert_receipt_on(
+            &tx,
+            &NewReceipt {
+                idempotency_key: format!("invalidate:{receipt_id}"),
+                kind: "invalidate".into(),
+                project_slug: Some(slug.to_string()),
+                track_id: Some(track.id.clone()),
+                criterion_id: target.criterion_id.clone(),
+                subject_type: target.subject_type.clone(),
+                subject_id: target.subject_id.clone(),
+                outcome: "invalidated".into(),
+                actor_type: actor_type.into(),
+                actor_id: actor_id.into(),
+                verifier: None,
+                supersedes_receipt_id: Some(receipt_id.to_string()),
+                observed_at: now.clone(),
+                payload: serde_json::json!({ "reason": reason, "track": track.track }),
+            },
+        )
+        .map_err(|error| match error {
+            ReceiptWriteError::IdempotencyMismatch { .. } => {
+                AcceptError::Invalid(format!("receipt '{receipt_id}' is already invalidated"))
+            }
+            ReceiptWriteError::Store(message) => AcceptError::Store(message),
+        })?;
+        tx.execute(
+            "UPDATE project_tracks SET revision = revision + 1, updated_at = ?2 WHERE id = ?1",
+            params![track.id, now],
+        )
+        .map_err(|e| AcceptError::Store(e.to_string()))?;
+        tx.commit().map_err(|e| AcceptError::Store(e.to_string()))?;
+        Ok(receipt)
+    }
+
+    /// Un-invalidated `accept` receipts with a given subject type, across
+    /// every project — what the head-staleness observer walks.
+    pub fn active_accept_receipts(&self, subject_type: &str) -> Result<Vec<Receipt>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{RECEIPT_SELECT} WHERE kind = 'accept' AND subject_type = ?1 \
+                   AND NOT EXISTS (SELECT 1 FROM receipts i \
+                                   WHERE i.supersedes_receipt_id = receipts.id \
+                                     AND i.outcome = 'invalidated') \
+                 ORDER BY observed_at"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![subject_type], receipt_from_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Track key for a receipt's `track_id`, if it still exists.
+    pub fn track_key_for_id(&self, track_id: &str) -> Result<Option<(String, String)>, String> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT slug, track FROM project_tracks WHERE id = ?1",
+                params![track_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    // ── Aliases, refs, imports ──────────────────────────────────────────
+
+    pub fn add_track_alias(
+        &self,
+        slug: &str,
+        key: &str,
+        alias: &str,
+        reason: &str,
+    ) -> Result<bool, String> {
+        let connection = self.lock()?;
+        let Some(id) = Self::resolve_track_id_on(&connection, slug, key)? else {
+            return Err(format!("no track '{key}' in '{slug}'"));
+        };
+        let alias = alias.trim();
+        if alias.is_empty() {
+            return Ok(false);
+        }
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO project_track_aliases \
+                   (slug, alias_key, track_id, reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![slug, alias, id, reason, Utc::now().to_rfc3339()],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn add_track_ref(
+        &self,
+        slug: &str,
+        key: &str,
+        kind: &str,
+        repository: Option<&str>,
+        number: i64,
+        url: Option<&str>,
+    ) -> Result<bool, String> {
+        let connection = self.lock()?;
+        let Some(id) = Self::resolve_track_id_on(&connection, slug, key)? else {
+            return Err(format!("no track '{key}' in '{slug}'"));
+        };
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO project_track_refs \
+                   (track_id, kind, repository, number, url, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    kind,
+                    repository.unwrap_or(""),
+                    number,
+                    url,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Tracks in `slug` that reference PR `number` (any repository when
+    /// `repository` is None). A matching hint for absorption, not a merge.
+    pub fn tracks_for_pr(
+        &self,
+        slug: &str,
+        repository: Option<&str>,
+        number: i64,
+    ) -> Result<Vec<String>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT t.track FROM project_track_refs r \
+                 JOIN project_tracks t ON t.id = r.track_id \
+                 WHERE t.slug = ?1 AND r.kind = 'pr' AND r.number = ?2 \
+                   AND (?3 IS NULL OR r.repository = ?3 OR r.repository = '') \
+                 ORDER BY t.track",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![slug, number, repository], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// True when this exact (source, hash, parser) was already imported.
+    pub fn import_exists(
+        &self,
+        slug: &str,
+        source_path: &str,
+        source_hash: &str,
+        parser_version: i64,
+    ) -> Result<bool, String> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT 1 FROM project_imports \
+                 WHERE slug = ?1 AND source_path = ?2 AND source_hash = ?3 AND parser_version = ?4",
+                params![slug, source_path, source_hash, parser_version],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn record_import(
+        &self,
+        slug: &str,
+        source_path: &str,
+        source_hash: &str,
+        parser_version: i64,
+        items: usize,
+        receipt_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO project_imports \
+                   (slug, source_path, source_hash, parser_version, imported_at, items, receipt_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     slug,
-                    item.track,
-                    item.desired_state,
-                    item.title,
-                    criteria,
-                    depends,
-                    now
+                    source_path,
+                    source_hash,
+                    parser_version,
+                    Utc::now().to_rfc3339(),
+                    items as i64,
+                    receipt_id
                 ],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Insert an imported track (no-op when the key or an alias already
+    /// exists; returns whether a row was created).
+    pub fn import_track(
+        &self,
+        slug: &str,
+        key: &str,
+        title: &str,
+        aliases: &[String],
+    ) -> Result<bool, String> {
+        let normalized = normalize_track_key(key);
+        if normalized.is_empty() {
+            return Err(format!("track key '{key}' is empty after normalization"));
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.lock()?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let existing = Self::resolve_track_id_on(&tx, slug, key)?;
+        let created = existing.is_none();
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let id = Uuid::new_v4().to_string();
+                let title = title.trim();
+                let title = if title.is_empty() {
+                    humanize_track_key(key)
+                } else {
+                    title.to_string()
+                };
+                tx.execute(
+                    "INSERT INTO project_tracks \
+                       (id, slug, track, title, desired_state, lifecycle, origin, explicit_blocker, \
+                        acceptance_criteria, depends_on, revision, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, NULL, 'active', 'imported', NULL, '[]', '[]', 0, ?5, ?5)",
+                    params![id, slug, normalized, title, now],
+                )
+                .map_err(|e| e.to_string())?;
+                id
+            }
+        };
+        for alias in aliases.iter().chain(std::iter::once(&key.to_string())) {
+            let alias = alias.trim();
+            if alias.is_empty() || alias == normalized {
+                continue;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO project_track_aliases \
+                   (slug, alias_key, track_id, reason, created_at) VALUES (?1, ?2, ?3, 'imported_code', ?4)",
+                params![slug, alias, id, now],
             )
             .map_err(|e| e.to_string())?;
         }
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(created)
+    }
+
+    /// Leftover proposal rows become imported tracks and are retired.
+    pub fn import_open_proposals(&self, slug: &str) -> Result<usize, String> {
+        let proposals = self.list_open_proposals(slug)?;
+        let mut created = 0usize;
+        for proposal in &proposals {
+            if self.import_track(slug, &proposal.task_key, &proposal.title, &[])? {
+                created += 1;
+            }
+            if !proposal.acceptance_criteria.is_empty() || !proposal.depends_on.is_empty() {
+                self.patch_track(
+                    slug,
+                    &proposal.task_key,
+                    proposal.prompt.as_deref(),
+                    None,
+                    None,
+                    Some(&proposal.acceptance_criteria),
+                    Some(&proposal.depends_on),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        if !proposals.is_empty() {
+            let connection = self.lock()?;
+            connection
+                .execute(
+                    "UPDATE project_roadmap_proposals SET status = 'imported', updated_at = ?2 \
+                     WHERE slug = ?1 AND status = 'proposed'",
+                    params![slug, Utc::now().to_rfc3339()],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(created)
     }
 
     pub fn get_grant(&self, slug: &str) -> Result<Option<ProjectGrant>, String> {
@@ -1577,12 +2951,12 @@ impl ProjectsStore {
     /// Existing open row for this question, if any. Used so Coldcard cannot
     /// record the same checkpoint prompt twice two seconds apart.
     fn pending_question_at(&self, slug: &str, question: &str) -> Result<Option<String>, String> {
-        let needle = super::controller_honesty::normalize_decision_question(question);
+        let needle = super::controller_honesty::decision_identity(question);
         if needle.is_empty() {
             return Ok(None);
         }
         Ok(self.open_decisions(slug)?.into_iter().find_map(|decision| {
-            (super::controller_honesty::normalize_decision_question(&decision.question) == needle)
+            (super::controller_honesty::decision_identity(&decision.question) == needle)
                 .then_some(decision.at)
         }))
     }
@@ -1836,6 +3210,430 @@ pub struct RoadmapProposal {
     pub updated_at: String,
 }
 
+const TRACK_SELECT: &str =
+    "SELECT t.id, t.track, t.desired_state, t.title, t.acceptance_criteria, t.depends_on, \
+     t.updated_at, t.lifecycle, t.origin, t.explicit_blocker, t.revision, \
+     (SELECT r.kind FROM receipts r \
+        WHERE r.track_id = t.id AND r.kind IN ('legacy_import', 'accept') \
+          AND r.outcome IN ('observed', 'succeeded') \
+          AND NOT EXISTS (SELECT 1 FROM receipts i \
+                          WHERE i.supersedes_receipt_id = r.id AND i.outcome = 'invalidated') \
+        ORDER BY r.observed_at DESC, r.created_at DESC LIMIT 1) AS claim \
+     FROM project_tracks t WHERE t.slug = ?1 ORDER BY t.track";
+
+const TRACK_SELECT_BY_ID: &str =
+    "SELECT t.id, t.track, t.desired_state, t.title, t.acceptance_criteria, t.depends_on, \
+     t.updated_at, t.lifecycle, t.origin, t.explicit_blocker, t.revision, \
+     (SELECT r.kind FROM receipts r \
+        WHERE r.track_id = t.id AND r.kind IN ('legacy_import', 'accept') \
+          AND r.outcome IN ('observed', 'succeeded') \
+          AND NOT EXISTS (SELECT 1 FROM receipts i \
+                          WHERE i.supersedes_receipt_id = r.id AND i.outcome = 'invalidated') \
+        ORDER BY r.observed_at DESC, r.created_at DESC LIMIT 1) AS claim \
+     FROM project_tracks t WHERE t.id = ?1";
+
+fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectTrack> {
+    let criteria: Option<String> = row.get(4)?;
+    let depends: Option<String> = row.get(5)?;
+    let lifecycle: String = row.get(7)?;
+    let explicit_blocker: Option<String> = row.get(9)?;
+    let claim: Option<String> = row.get(11)?;
+    let status = derived_track_status(&lifecycle, explicit_blocker.as_deref(), claim.as_deref());
+    Ok(ProjectTrack {
+        id: row.get(0)?,
+        track: row.get(1)?,
+        desired_state: row.get(2)?,
+        status: Some(status.to_string()),
+        title: row.get(3)?,
+        acceptance_criteria: parse_string_list(criteria),
+        depends_on: parse_string_list(depends),
+        updated_at: row.get(6)?,
+        lifecycle,
+        origin: row.get(8)?,
+        explicit_blocker,
+        revision: row.get::<_, i64>(10)?.max(0) as u64,
+        claim,
+    })
+}
+
+/// The legacy status vocabulary, derived from stored facts. Readers that
+/// predate `lifecycle` (mission horizon, honest next-action) keep working;
+/// nothing writes this back.
+pub fn derived_track_status(
+    lifecycle: &str,
+    blocker: Option<&str>,
+    claim: Option<&str>,
+) -> &'static str {
+    if lifecycle == "cancelled" {
+        return "cancelled";
+    }
+    match claim {
+        Some("accept") => "satisfied",
+        Some(_) => "done",
+        None if blocker.is_some() => "blocked",
+        None => "open",
+    }
+}
+
+/// Track keys are lowercase `[a-z0-9-]` with collapsed dashes. `UX1`,
+/// `ux1`, `UX_1` and ` ux-1 ` are the same key. Normalization is a spelling
+/// rule, not a proof of semantic identity: `ux1` and `ux1-pr229-cert` stay
+/// distinct.
+pub fn normalize_track_key(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = true;
+    for ch in raw.trim().chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if ch.is_alphanumeric() {
+            // Non-ASCII letters: keep them lowercased so a French title key
+            // does not collapse into dashes.
+            ch.to_lowercase().next()
+        } else {
+            None
+        };
+        match mapped {
+            Some(ch) => {
+                out.push(ch);
+                last_dash = false;
+            }
+            None => {
+                if !last_dash {
+                    out.push('-');
+                    last_dash = true;
+                }
+            }
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// `ux1-pr229-cert` → `UX1 PR229 Cert`. Same rule as the situation builder;
+/// duplicated here so the store has no dependency on the API layer.
+pub fn humanize_track_key(key: &str) -> String {
+    key.split(['-', '_', ' '])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let has_digit = part.chars().any(|c| c.is_ascii_digit());
+            if (has_digit && part.len() <= 6) || part.len() <= 3 {
+                part.to_ascii_uppercase()
+            } else {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// How a legacy `status` string moves lifecycle / blocker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackTransition {
+    Keep,
+    Activate,
+    Block,
+    Cancel,
+}
+
+impl TrackTransition {
+    fn from_legacy_status(status: Option<&str>) -> Result<Self, TrackWriteError> {
+        match status.map(str::trim).filter(|value| !value.is_empty()) {
+            None => Ok(Self::Keep),
+            Some(
+                "open" | "active" | "running" | "in-progress" | "in_progress" | "ready" | "waiting",
+            ) => Ok(Self::Activate),
+            Some("blocked") => Ok(Self::Block),
+            Some("cancelled" | "canceled") => Ok(Self::Cancel),
+            Some(
+                done @ ("done" | "closed" | "satisfied" | "accepted" | "complete" | "completed"),
+            ) => Err(TrackWriteError::NeedsReceipt(done.to_string())),
+            Some(other) => Err(TrackWriteError::Invalid(format!(
+                "unknown track status '{other}' (open | blocked | cancelled; done needs a receipt)"
+            ))),
+        }
+    }
+
+    fn update_clauses(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Keep => ("", ""),
+            Self::Activate => ("lifecycle = 'active',", "explicit_blocker = NULL,"),
+            Self::Block => (
+                "lifecycle = 'active',",
+                "explicit_blocker = COALESCE(?2, explicit_blocker, 'blocked'),",
+            ),
+            Self::Cancel => ("lifecycle = 'cancelled',", ""),
+        }
+    }
+
+    fn insert_values(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::Keep | Self::Activate => ("active", None),
+            Self::Block => ("active", Some("blocked")),
+            Self::Cancel => ("cancelled", None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackWriteError {
+    /// The caller tried to mark a track done/closed/satisfied. That is a
+    /// receipt (`POST /tracks/:track/accept`), not a status write.
+    NeedsReceipt(String),
+    Invalid(String),
+    Store(String),
+}
+
+impl std::fmt::Display for TrackWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NeedsReceipt(status) => write!(
+                f,
+                "status '{status}' cannot be written: a track is satisfied only by accepted evidence (accept_project_track)"
+            ),
+            Self::Invalid(message) | Self::Store(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<TrackWriteError> for String {
+    fn from(error: TrackWriteError) -> Self {
+        error.to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiptWriteError {
+    IdempotencyMismatch {
+        idempotency_key: String,
+        prior_receipt_id: String,
+    },
+    Store(String),
+}
+
+impl std::fmt::Display for ReceiptWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IdempotencyMismatch {
+                idempotency_key,
+                prior_receipt_id,
+            } => write!(
+                f,
+                "idempotency key '{idempotency_key}' was already used with a different body (receipt {prior_receipt_id})"
+            ),
+            Self::Store(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<ReceiptWriteError> for String {
+    fn from(error: ReceiptWriteError) -> Self {
+        error.to_string()
+    }
+}
+
+/// Verifier classes (design doc, "Completion and truth") plus the two PR
+/// shapes controllers actually produce.
+pub const EVIDENCE_KINDS: &[&str] = &[
+    "pr_merged",
+    "pr_head_review",
+    "review",
+    "command",
+    "external_state",
+    "operator",
+    "manual",
+];
+
+/// Where the evidence's immutable handle lives, for the observers.
+pub fn evidence_subject_type(kind: &str) -> &'static str {
+    match kind {
+        "pr_merged" | "pr_head_review" | "review" => "pr",
+        "command" => "command",
+        "external_state" => "external",
+        _ => "operator",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct EvidenceInput {
+    #[serde(default)]
+    pub criterion_id: Option<String>,
+    pub kind: String,
+    /// Immutable handle: `owner/repo#233@<head sha>`, a commit, a job id.
+    pub subject_id: String,
+    #[serde(default)]
+    pub verifier: Option<String>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct AcceptRequest {
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
+    pub evidence: Vec<EvidenceInput>,
+    #[serde(default = "default_actor_type")]
+    pub actor_type: String,
+    #[serde(default = "default_actor_id")]
+    pub actor_id: String,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+}
+
+fn default_actor_type() -> String {
+    "controller".into()
+}
+
+fn default_actor_id() -> String {
+    "unknown".into()
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AcceptResult {
+    pub track: ProjectTrack,
+    pub receipts: Vec<Receipt>,
+    /// True when every receipt already existed (idempotent retry).
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptError {
+    NotFound,
+    StaleRevision {
+        expected: u64,
+        current: u64,
+    },
+    Invalid(String),
+    IdempotencyMismatch {
+        idempotency_key: String,
+        prior_receipt_id: String,
+    },
+    Store(String),
+}
+
+impl std::fmt::Display for AcceptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("no such track"),
+            Self::StaleRevision { expected, current } => write!(
+                f,
+                "stale revision: expected {expected}, track is at {current}"
+            ),
+            Self::Invalid(message) | Self::Store(message) => f.write_str(message),
+            Self::IdempotencyMismatch {
+                idempotency_key,
+                prior_receipt_id,
+            } => write!(
+                f,
+                "idempotency key '{idempotency_key}' was already used with a different body (receipt {prior_receipt_id})"
+            ),
+        }
+    }
+}
+
+/// An immutable receipt row.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Receipt {
+    pub id: String,
+    pub idempotency_key: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub criterion_id: Option<String>,
+    pub subject_type: String,
+    pub subject_id: String,
+    pub outcome: String,
+    pub actor_type: String,
+    pub actor_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes_receipt_id: Option<String>,
+    pub observed_at: String,
+    pub payload: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewReceipt {
+    pub idempotency_key: String,
+    pub kind: String,
+    pub project_slug: Option<String>,
+    pub track_id: Option<String>,
+    pub criterion_id: Option<String>,
+    pub subject_type: String,
+    pub subject_id: String,
+    pub outcome: String,
+    pub actor_type: String,
+    pub actor_id: String,
+    pub verifier: Option<String>,
+    pub supersedes_receipt_id: Option<String>,
+    pub observed_at: String,
+    pub payload: serde_json::Value,
+}
+
+impl NewReceipt {
+    /// Hash of everything but the idempotency key, so a key reused with a
+    /// different body is detectable.
+    pub fn request_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let body = serde_json::json!({
+            "kind": self.kind,
+            "project_slug": self.project_slug,
+            "track_id": self.track_id,
+            "criterion_id": self.criterion_id,
+            "subject_type": self.subject_type,
+            "subject_id": self.subject_id,
+            "outcome": self.outcome,
+            "actor_type": self.actor_type,
+            "actor_id": self.actor_id,
+            "verifier": self.verifier,
+            "supersedes_receipt_id": self.supersedes_receipt_id,
+            "observed_at": self.observed_at,
+            "payload": self.payload,
+        });
+        let mut hasher = Sha256::new();
+        hasher.update(body.to_string().as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+const RECEIPT_SELECT: &str =
+    "SELECT id, idempotency_key, kind, project_slug, track_id, criterion_id, subject_type, \
+     subject_id, outcome, actor_type, actor_id, verifier, supersedes_receipt_id, observed_at, \
+     payload, created_at FROM receipts";
+
+fn receipt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Receipt> {
+    let payload: String = row.get(14)?;
+    Ok(Receipt {
+        id: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        kind: row.get(2)?,
+        project_slug: row.get(3)?,
+        track_id: row.get(4)?,
+        criterion_id: row.get(5)?,
+        subject_type: row.get(6)?,
+        subject_id: row.get(7)?,
+        outcome: row.get(8)?,
+        actor_type: row.get(9)?,
+        actor_id: row.get(10)?,
+        verifier: row.get(11)?,
+        supersedes_receipt_id: row.get(12)?,
+        observed_at: row.get(13)?,
+        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+        created_at: row.get(15)?,
+    })
+}
+
 /// Input for `upsert_proposals`.
 #[derive(Debug, Clone)]
 pub struct NewProposal {
@@ -1888,9 +3686,15 @@ pub struct ProjectGrant {
 /// One workstream within a project.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProjectTrack {
+    /// Stable id, survives key renames.
+    pub id: String,
+    /// Normalized key.
     pub track: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub desired_state: Option<String>,
+    /// Legacy vocabulary, **derived**: `cancelled` | `done` (claim only) |
+    /// `satisfied` (accepted evidence) | `blocked` | `open`. Kept for readers
+    /// that predate `lifecycle`; the store never persists it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1900,6 +3704,15 @@ pub struct ProjectTrack {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     pub updated_at: String,
+    pub lifecycle: String,
+    pub origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_blocker: Option<String>,
+    pub revision: u64,
+    /// Kind of the newest un-invalidated claim receipt (`legacy_import` |
+    /// `accept`), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim: Option<String>,
 }
 
 /// True when `needle` appears in `hay` without being a prefix of a longer
@@ -2250,6 +4063,73 @@ mod tests {
         );
         let timeline = store.state_timeline("verity", 10).expect("timeline");
         assert_eq!(timeline[0].observations, 1);
+    }
+
+    #[test]
+    fn touch_freshness_does_not_bump_observations_or_change_headline() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .record_state(
+                "verity-core",
+                "pr-2397-merged",
+                Some("PR #2397 merged"),
+                "2026-08-24T13:28:30Z",
+                Some("1299f6"),
+            )
+            .expect("record");
+        assert_eq!(
+            store
+                .touch_freshness("verity-core", "2026-08-24T13:30:46Z", Some("1299f6"))
+                .expect("touch"),
+            1
+        );
+        let timeline = store.state_timeline("verity-core", 5).expect("timeline");
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].observations, 1);
+        assert_eq!(timeline[0].headline.as_deref(), Some("PR #2397 merged"));
+        assert_eq!(timeline[0].last_seen_at, "2026-08-24T13:30:46Z");
+        let material = store.latest_controller_states().expect("material");
+        assert_eq!(
+            material["verity-core"].headline.as_deref(),
+            Some("PR #2397 merged")
+        );
+    }
+
+    #[test]
+    fn canonical_bind_drops_nickname_rows() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .set_binding("verity", "old-session", None)
+            .expect("alias bind");
+        store
+            .set_canonical_binding(
+                "verity-core",
+                "1299f6",
+                &[
+                    "verity".into(),
+                    "verity-core".into(),
+                    "verity-roadmap".into(),
+                ],
+                None,
+            )
+            .expect("canonical");
+        assert_eq!(
+            store
+                .binding("verity-core")
+                .expect("canonical row")
+                .unwrap()
+                .session_id,
+            "1299f6"
+        );
+        assert!(store.binding("verity").expect("alias gone").is_none());
+        assert_eq!(
+            store
+                .binding_for_canonical("verity-core", &["verity".into()])
+                .expect("lookup")
+                .unwrap()
+                .session_id,
+            "1299f6"
+        );
     }
 
     /// An out-of-order delivery from the overlap window must not be recorded
@@ -2711,7 +4591,11 @@ mod tests {
             .expect("track");
         let tracks = store.tracks("lido").expect("tracks");
         assert_eq!(tracks.len(), 1);
-        assert_eq!(tracks[0].track, "P-ETH-1");
+        assert_eq!(tracks[0].track, "p-eth-1", "keys are normalized on write");
+        assert_eq!(
+            store.resolve_track_key("lido", "P-ETH-1").expect("alias"),
+            Some("p-eth-1".into())
+        );
 
         store
             .record_decision("lido", &escalation("merge #48?", Some("blocks A.2")))
@@ -2950,6 +4834,27 @@ mod tests {
             .expect("dup");
         assert_eq!(first, second, "duplicate question must reuse the row");
         assert_eq!(store.open_decisions("coldcard").expect("open").len(), 1);
+
+        let vl_a = store
+            .record_decision(
+                "verity-lido",
+                &escalation(
+                    "VL-002 — rétablir de préférence l'OAuth Codex, ou la facturation Muse.",
+                    None,
+                ),
+            )
+            .expect("vl a");
+        let vl_b = store
+            .record_decision(
+                "verity-lido",
+                &escalation(
+                    "VL-002 — restaurer Codex OAuth sandboxed.sh ou Muse billing pour débloquer P-ETH-1.",
+                    None,
+                ),
+            )
+            .expect("vl b");
+        assert_eq!(vl_a, vl_b, "same VL-002 ticket must reuse the pending row");
+        assert_eq!(store.open_decisions("verity-lido").expect("open").len(), 1);
 
         let inserted = store
             .record_decision_from_delivery(
@@ -3232,28 +5137,368 @@ mod tests {
             .expect("canonical miss"));
     }
 
-    #[test]
-    fn an_old_tracks_table_gains_the_plan_contract_columns() {
+    fn legacy_tracks_connection() -> Connection {
         let connection = Connection::open_in_memory().expect("conn");
         connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("fk");
+        connection
             .execute_batch(
-                "CREATE TABLE project_tracks (
+                "CREATE TABLE projects (slug TEXT PRIMARY KEY, title TEXT, objective TEXT, \
+                    status TEXT NOT NULL DEFAULT 'active', mode TEXT, wait_ticks INTEGER NOT NULL DEFAULT 0, \
+                    next_action TEXT, blocker TEXT, controller_cron_id TEXT, repository TEXT, \
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 INSERT INTO projects (slug, created_at, updated_at) VALUES ('lido', 'x', 'x');
+                 CREATE TABLE project_tracks (
                     slug TEXT NOT NULL, track TEXT NOT NULL,
                     desired_state TEXT, status TEXT, updated_at TEXT NOT NULL,
                     PRIMARY KEY (slug, track));
                  INSERT INTO project_tracks VALUES
-                    ('lido', 'P-ETH-1', 'proved', 'in-progress', '2026-08-01T00:00:00Z');",
+                    ('lido', 'P-ETH-1', 'proved', 'in-progress', '2026-08-01T00:00:00Z'),
+                    ('lido', 'S3', 'token bound', 'done', '2026-08-02T00:00:00Z'),
+                    ('lido', 'wave-1', NULL, 'cancelled', '2026-08-03T00:00:00Z'),
+                    ('lido', 'closed-one', 'x', 'closed', '2026-08-04T00:00:00Z'),
+                    ('lido', 'UX1', 'new spelling', NULL, '2026-08-06T00:00:00Z'),
+                    ('lido', 'ux1', 'old spelling', 'running', '2026-08-05T00:00:00Z');",
             )
             .expect("old schema");
+        connection
+    }
+
+    #[test]
+    fn an_old_tracks_table_is_rebuilt_with_lifecycle_and_claims() {
+        let connection = legacy_tracks_connection();
         ProjectsStore::initialize(&connection).expect("migrate");
         let store = ProjectsStore {
             connection: Mutex::new(connection),
         };
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
         let tracks = store.tracks("lido").expect("read");
-        assert_eq!(tracks.len(), 1);
-        assert_eq!(tracks[0].track, "P-ETH-1");
-        assert_eq!(tracks[0].status.as_deref(), Some("in-progress"));
-        assert!(tracks[0].title.is_none());
-        assert!(tracks[0].acceptance_criteria.is_empty());
+        let by_key = |key: &str| tracks.iter().find(|t| t.track == key).expect(key).clone();
+
+        // in-progress → active/open, key normalized, old spelling aliased.
+        let eth = by_key("p-eth-1");
+        assert_eq!(eth.lifecycle, "active");
+        assert_eq!(eth.status.as_deref(), Some("open"));
+        assert_eq!(
+            eth.title.as_deref(),
+            Some("proved"),
+            "title falls back to desired_state"
+        );
+        assert_eq!(
+            store.resolve_track_key("lido", "P-ETH-1").expect("alias"),
+            Some("p-eth-1".into())
+        );
+
+        // done → active + legacy_import claim; the derived status says done
+        // but the situation builder will count it as claim_only.
+        let s3 = by_key("s3");
+        assert_eq!(s3.lifecycle, "active");
+        assert_eq!(s3.claim.as_deref(), Some("legacy_import"));
+        assert_eq!(s3.status.as_deref(), Some("done"));
+        assert_eq!(by_key("closed-one").claim.as_deref(), Some("legacy_import"));
+
+        assert_eq!(by_key("wave-1").lifecycle, "cancelled");
+        assert_eq!(by_key("wave-1").status.as_deref(), Some("cancelled"));
+
+        // UX1 / ux1 collide after normalization: the newest row wins, the
+        // other spelling resolves as an alias, and the ambiguity is reported.
+        assert_eq!(tracks.iter().filter(|t| t.track == "ux1").count(), 1);
+        assert_eq!(by_key("ux1").desired_state.as_deref(), Some("new spelling"));
+        let reconcile = store
+            .latest_unacked_reconcile("lido")
+            .expect("reconcile")
+            .expect("one reconcile receipt");
+        let ops: Vec<&str> = reconcile.payload["corrections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["op"].as_str())
+            .collect();
+        assert!(ops.contains(&"normalized_collision"));
+        assert!(ops.contains(&"legacy_done_to_claim_only"));
+        assert!(ops.contains(&"status_normalized"));
+        assert!(ops.contains(&"key_normalized"));
+
+        // Acknowledging appends; it does not mutate the receipt.
+        store
+            .ack_reconcile("lido", &reconcile.id, "thomas")
+            .expect("ack");
+        assert!(store
+            .latest_unacked_reconcile("lido")
+            .expect("reconcile")
+            .is_none());
+        assert_eq!(
+            store
+                .receipt(&reconcile.id)
+                .expect("receipt")
+                .unwrap()
+                .payload,
+            reconcile.payload
+        );
+    }
+
+    #[test]
+    fn the_rebuild_is_idempotent_across_restarts() {
+        let connection = legacy_tracks_connection();
+        ProjectsStore::initialize(&connection).expect("first");
+        let before: i64 = connection
+            .query_row("SELECT count(*) FROM receipts", [], |r| r.get(0))
+            .unwrap();
+        ProjectsStore::initialize(&connection).expect("second");
+        let after: i64 = connection
+            .query_row("SELECT count(*) FROM receipts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "a second initialize must not re-run the rebuild"
+        );
+        assert!(!ProjectsStore::needs_tracks_rebuild(&connection).unwrap());
+    }
+
+    #[test]
+    fn done_cannot_be_written_as_a_status() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+        store
+            .set_track("lido", "a1", Some("x"), Some("open"))
+            .expect("open");
+        for status in ["done", "closed", "satisfied"] {
+            let error = store
+                .set_track("lido", "a1", None, Some(status))
+                .expect_err(status);
+            assert!(
+                matches!(error, TrackWriteError::NeedsReceipt(_)),
+                "{status}"
+            );
+        }
+        assert!(matches!(
+            store.set_track("lido", "a1", None, Some("weird")),
+            Err(TrackWriteError::Invalid(_))
+        ));
+        store
+            .set_track("lido", "A1", Some("why"), Some("blocked"))
+            .expect("blocked");
+        let track = store.track("lido", "a1").expect("read").expect("row");
+        assert_eq!(track.status.as_deref(), Some("blocked"));
+        assert_eq!(track.explicit_blocker.as_deref(), Some("why"));
+        assert_eq!(
+            track.revision, 1,
+            "rejected writes do not bump the revision"
+        );
+        store
+            .set_track("lido", "a1", None, Some("cancelled"))
+            .expect("cancel");
+        assert_eq!(
+            store.track("lido", "a1").unwrap().unwrap().lifecycle,
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn receipts_are_idempotent_on_key_and_reject_a_changed_body() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+        let receipt = NewReceipt {
+            idempotency_key: "k1".into(),
+            kind: "accept".into(),
+            project_slug: Some("lido".into()),
+            track_id: None,
+            criterion_id: None,
+            subject_type: "pr".into(),
+            subject_id: "org/repo#1@abc".into(),
+            outcome: "observed".into(),
+            actor_type: "operator".into(),
+            actor_id: "thomas".into(),
+            verifier: None,
+            supersedes_receipt_id: None,
+            observed_at: "2026-09-01T00:00:00Z".into(),
+            payload: serde_json::json!({"a": 1}),
+        };
+        let first = store.insert_receipt(&receipt).expect("first");
+        let again = store.insert_receipt(&receipt).expect("retry");
+        assert_eq!(first.id, again.id);
+        let changed = NewReceipt {
+            payload: serde_json::json!({"a": 2}),
+            ..receipt
+        };
+        assert!(matches!(
+            store.insert_receipt(&changed),
+            Err(ReceiptWriteError::IdempotencyMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn import_track_is_idempotent_and_keeps_declared_titles() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+        assert!(store
+            .import_track("lido", "A1", "A1 no P-ALLOC-3", &["A2".into()])
+            .expect("import"));
+        assert!(!store
+            .import_track("lido", "a1", "other title", &[])
+            .expect("again"));
+        let track = store.track("lido", "A2").expect("alias").expect("row");
+        assert_eq!(track.origin, "imported");
+        assert_eq!(track.title.as_deref(), Some("A1 no P-ALLOC-3"));
+        assert_eq!(store.tracks("lido").unwrap().len(), 1);
+    }
+
+    fn evidence(criterion: Option<&str>, subject: &str) -> EvidenceInput {
+        EvidenceInput {
+            criterion_id: criterion.map(str::to_string),
+            kind: "pr_head_review".into(),
+            subject_id: subject.into(),
+            verifier: Some("codex-review".into()),
+            payload: serde_json::json!({"head": "abc"}),
+        }
+    }
+
+    fn accept(key: &str, evidence: Vec<EvidenceInput>, revision: Option<u64>) -> AcceptRequest {
+        AcceptRequest {
+            idempotency_key: key.into(),
+            expected_revision: revision,
+            evidence,
+            actor_type: "controller".into(),
+            actor_id: "cron-1".into(),
+            observed_at: None,
+        }
+    }
+
+    #[test]
+    fn accept_requires_every_criterion_then_satisfies_and_replays() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+        store
+            .patch_track(
+                "lido",
+                "ux1",
+                None,
+                Some("open"),
+                Some("UX1"),
+                Some(&["review clean".into(), "deployed".into()]),
+                None,
+            )
+            .expect("declare");
+        let partial = accept("k1", vec![evidence(Some("c1"), "o/r#229@abc")], None);
+        let error = store
+            .accept_track_evidence("lido", "UX1", &partial)
+            .expect_err("one criterion missing");
+        assert!(
+            matches!(error, AcceptError::Invalid(ref m) if m.contains("deployed")),
+            "{error}"
+        );
+        assert_eq!(
+            store
+                .track("lido", "ux1")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("open")
+        );
+
+        let full = accept(
+            "k2",
+            vec![
+                evidence(Some("review clean"), "o/r#229@abc"),
+                evidence(Some("c2"), "o/r#229@abc"),
+            ],
+            Some(0),
+        );
+        let result = store
+            .accept_track_evidence("lido", "ux1", &full)
+            .expect("accepted");
+        assert!(!result.replayed);
+        assert_eq!(result.receipts.len(), 2);
+        assert_eq!(result.track.status.as_deref(), Some("satisfied"));
+        assert_eq!(result.track.claim.as_deref(), Some("accept"));
+        assert_eq!(result.track.revision, 1);
+
+        let again = store
+            .accept_track_evidence("lido", "ux1", &full)
+            .expect("retry");
+        assert!(again.replayed, "same key + body replays");
+        assert_eq!(again.track.revision, 1);
+        assert!(matches!(
+            store.accept_track_evidence(
+                "lido",
+                "ux1",
+                &accept("k3", full.evidence.clone(), Some(0))
+            ),
+            Err(AcceptError::StaleRevision {
+                expected: 0,
+                current: 1
+            })
+        ));
+        let mut changed = full.clone();
+        changed.evidence[0].payload = serde_json::json!({"head": "zzz"});
+        assert!(matches!(
+            store.accept_track_evidence("lido", "ux1", &changed),
+            Err(AcceptError::IdempotencyMismatch { .. })
+        ));
+        assert!(matches!(
+            store.accept_track_evidence("lido", "nope", &full),
+            Err(AcceptError::NotFound)
+        ));
+        let bad_kind = accept(
+            "k4",
+            vec![EvidenceInput {
+                kind: "vibes".into(),
+                ..evidence(Some("c1"), "x")
+            }],
+            None,
+        );
+        assert!(matches!(
+            store.accept_track_evidence("lido", "ux1", &bad_kind),
+            Err(AcceptError::Invalid(_))
+        ));
+
+        // Invalidation reopens without deleting anything.
+        let target = result.receipts[0].id.clone();
+        let invalidated = store
+            .invalidate_track_evidence("lido", "ux1", &target, "head moved", "system", "watch")
+            .expect("invalidate");
+        assert_eq!(invalidated.outcome, "invalidated");
+        assert_eq!(
+            invalidated.supersedes_receipt_id.as_deref(),
+            Some(target.as_str())
+        );
+        let track = store.track("lido", "ux1").unwrap().unwrap();
+        // One of two accept receipts is invalidated; the other still stands as
+        // the newest un-invalidated claim, so the track still reads satisfied
+        // until that one is invalidated too.
+        assert_eq!(track.claim.as_deref(), Some("accept"));
+        let other = result.receipts[1].id.clone();
+        store
+            .invalidate_track_evidence("lido", "ux1", &other, "head moved", "system", "watch")
+            .expect("invalidate second");
+        let track = store.track("lido", "ux1").unwrap().unwrap();
+        assert_eq!(track.claim, None);
+        assert_eq!(track.status.as_deref(), Some("open"));
+        assert_eq!(track.revision, 3);
+        assert_eq!(store.active_accept_receipts("pr").unwrap().len(), 0);
+        assert_eq!(store.receipts_for_track("lido", "ux1").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn normalize_track_key_is_a_spelling_rule() {
+        assert_eq!(normalize_track_key("UX1"), "ux1");
+        assert_eq!(normalize_track_key(" P-ETH-1 "), "p-eth-1");
+        assert_eq!(normalize_track_key("ux1--pr229__cert"), "ux1-pr229-cert");
+        assert_eq!(normalize_track_key("repair pr 233"), "repair-pr-233");
+        assert_eq!(normalize_track_key("---"), "");
+        assert_ne!(
+            normalize_track_key("ux1"),
+            normalize_track_key("ux1-pr229-cert")
+        );
     }
 }

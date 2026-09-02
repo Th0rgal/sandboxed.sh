@@ -154,6 +154,19 @@ fn is_mission_inspect_callback(headline: &str, state: Option<&str>) -> bool {
     })
 }
 
+fn stall_descriptor(state: Option<&str>) -> bool {
+    let Some(descriptor) = state.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if descriptor.starts_with(CTRL_DESCRIPTOR_PREFIX) {
+        return false;
+    }
+    if descriptor.starts_with("mission-callback") {
+        return false;
+    }
+    true
+}
+
 /// Newest pending `[CTRL:]` mode per slug, applied after the oldest-first
 /// timeline replay so a mixed batch cannot let an older blocked trailer win.
 struct PendingModeWrite {
@@ -245,7 +258,10 @@ fn ingest_deliveries_with_live(
         let silence = headline.is_none_or(|text| {
             super::controller_honesty::should_silence_headline(text, has_live_writer)
         });
-        let recorded = if silence {
+        let inspect = is_mission_inspect_callback(&delivery.headline, delivery.state.as_deref());
+        let recorded = if inspect {
+            projects.touch_freshness(slug, &delivery.at, session)
+        } else if silence {
             projects.record_silent_observation(slug, &descriptor, &delivery.at, session)
         } else {
             projects.record_state(slug, &descriptor, headline, &delivery.at, session)
@@ -466,6 +482,26 @@ fn store_err(error: String) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error)
 }
 
+/// A track write that the caller got wrong is a 400 (`done` needs a receipt,
+/// unknown status); only store failures are 500.
+fn track_write_err(error: super::projects_store::TrackWriteError) -> (StatusCode, String) {
+    use super::projects_store::TrackWriteError;
+    match error {
+        TrackWriteError::NeedsReceipt(_) | TrackWriteError::Invalid(_) => {
+            (StatusCode::BAD_REQUEST, error.to_string())
+        }
+        TrackWriteError::Store(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+    }
+}
+
+fn receipt_write_err(error: super::projects_store::ReceiptWriteError) -> (StatusCode, String) {
+    use super::projects_store::ReceiptWriteError;
+    match error {
+        ReceiptWriteError::IdempotencyMismatch { .. } => (StatusCode::CONFLICT, error.to_string()),
+        ReceiptWriteError::Store(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+    }
+}
+
 /// `GET /api/projects/by-session/:session_id` — resolve a Hermes conversation
 /// (or any continuation in its chain) to the bound project slug.
 pub async fn project_by_session(
@@ -561,10 +597,14 @@ pub async fn get_project(
         .map_err(store_err)?;
     let conversation = state
         .projects
-        .binding(&slug)
+        .binding_for_canonical(&slug, &project_tag_keys(&slug))
         .map_err(store_err)?
         .map(follow_live_conversation);
-    let items = load_project_items(&state, &slug).await?;
+    let situation = load_project_situation(&state, &slug).await;
+    let reconciliation = state
+        .projects
+        .latest_unacked_reconcile(&slug)
+        .map_err(store_err)?;
     let mut project = project;
     if let Some(derived) = next_action_from_live_titles(
         missions
@@ -600,7 +640,9 @@ pub async fn get_project(
         "project": project,
         "grant": grant,
         "tracks": tracks,
-        "items": items,
+        "items": situation.items,
+        "summary": situation.summary,
+        "reconciliation": reconciliation,
         "open_decisions": decisions,
         "recent_decisions": recent,
         "conversation": conversation,
@@ -889,7 +931,7 @@ pub async fn set_project_track(
             req.desired_state.as_deref(),
             req.status.as_deref(),
         )
-        .map_err(store_err)?;
+        .map_err(track_write_err)?;
     let tracks = collect_family_tracks(&state.projects, &slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({ "tracks": tracks })))
 }
@@ -1263,41 +1305,72 @@ fn merge_announcement_needles(delivery: &DeliveryUpdate, recorded_decided: bool)
 pub async fn project_tasks(
     State(state): State<Arc<AppState>>,
     AxumPath(requested): AxumPath<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
     if !is_plain_key(&requested) {
         return Err(bad_slug());
     }
     let slug = resolve_roster_slug(&state.projects, &requested)
         .map_err(store_err)?
         .unwrap_or(requested);
-    let items = load_project_items(&state, &slug).await?;
-    let mut done = 0usize;
+    let situation = load_project_situation(&state, &slug).await;
+    let body = tasks_projection(&situation);
+    // Deprecated: a lossless projection of `/situation`. The counter log line
+    // is the removal gate — delete the route once it stays at zero for a
+    // release (plan step 9).
+    tracing::info!(project = %slug, "deprecated /tasks projection served");
+    let mut response = axum::response::IntoResponse::into_response(Json(body));
+    response
+        .headers_mut()
+        .insert("deprecation", axum::http::HeaderValue::from_static("true"));
+    response.headers_mut().insert(
+        "link",
+        axum::http::HeaderValue::from_str(&format!(
+            "</api/projects/{slug}/situation>; rel=\"successor-version\""
+        ))
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("")),
+    );
+    Ok(response)
+}
+
+/// The legacy checklist shape, derived from the situation. `done` keeps its
+/// historical meaning (satisfied *or* claimed) so old readers do not regress;
+/// the canonical split rides alongside under `summary`.
+fn tasks_projection(situation: &super::situation::ProjectSituation) -> serde_json::Value {
     let mut running = 0usize;
     let mut failed = 0usize;
-    let rows: Vec<serde_json::Value> = items
+    let rows: Vec<serde_json::Value> = situation
+        .items
         .iter()
-        .filter(|item| item_belongs_on_roadmap(item))
+        .filter(|item| super::situation::belongs_on_roadmap(item))
         .map(|item| {
-            let status = item_roadmap_status(item);
-            match status {
-                "accepted" => done += 1,
+            match super::situation::roadmap_status(item) {
                 "running" | "settled" => running += 1,
                 "failed" => failed += 1,
                 _ => {}
             }
-            item_as_roadmap_task(item)
+            situation_roadmap_task(item)
         })
         .collect();
-    Ok(Json(serde_json::json!({
-        "slug": slug,
+    let summary = &situation.summary;
+    serde_json::json!({
+        "slug": situation.slug,
         "tasks": rows,
         "summary": {
-            "total": rows.len(),
-            "done": done,
+            "total": summary.total,
+            "done": summary.verified_satisfied + summary.claim_only,
             "running": running,
             "failed": failed,
+            "verified_satisfied": summary.verified_satisfied,
+            "claim_only": summary.claim_only,
+            "open": summary.open,
+            "blocked": summary.blocked,
+            "cancelled": summary.cancelled,
+            "live_attempts": summary.live_attempts,
+            "source_unavailable": summary.source_unavailable,
+            "as_of": summary.as_of,
+            "cursor": summary.cursor,
         },
-    })))
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1448,7 +1521,7 @@ pub async fn update_project_task(
                 req.acceptance_criteria.as_deref(),
                 req.depends_on.as_deref(),
             )
-            .map_err(store_err)?;
+            .map_err(track_write_err)?;
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
     let Some(stored) = state
@@ -1504,7 +1577,7 @@ pub async fn cancel_project_task(
         state
             .projects
             .set_track(&stored, &task_key, None, Some("cancelled"))
-            .map_err(store_err)?;
+            .map_err(track_write_err)?;
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
     let Some(stored) = state
@@ -1575,6 +1648,24 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/by-session/:session_id", get(project_by_session))
         .route("/:slug", get(get_project))
         .route("/:slug/state", get(project_state))
+        .route("/:slug/situation", get(project_situation))
+        .route(
+            "/:slug/imports",
+            axum::routing::post(super::tracker_import::import_tracker),
+        )
+        .route(
+            "/:slug/reconcile/ack",
+            axum::routing::post(ack_project_reconcile),
+        )
+        .route(
+            "/:slug/tracks/:track/accept",
+            axum::routing::post(accept_project_track),
+        )
+        .route(
+            "/:slug/tracks/:track/invalidate",
+            axum::routing::post(invalidate_project_track_evidence),
+        )
+        .route("/:slug/tracks/:track/receipts", get(project_track_receipts))
         .route("/:slug/tasks", get(project_tasks).post(plan_project_tasks))
         .route(
             "/:slug/tasks/:task_key",
@@ -1928,6 +2019,10 @@ struct ProjectRow {
     /// Per-track rollup, worst-first. Answers "which track is stuck" without
     /// making the reader scan a list of 800 mission chips.
     health: super::project_health::ProjectHealth,
+    /// The canonical plan summary — the same numbers `get_project`,
+    /// `/situation` and MCP `get_situation` return. The card renders this and
+    /// nothing else as its progress.
+    summary: super::situation::TrackSummary,
     /// The conversation to open for this project. An explicit binding wins;
     /// otherwise the newest delivery's session is offered as a GUESS, tagged
     /// as such — cron controllers open a throwaway session per tick, so an
@@ -1998,6 +2093,10 @@ pub async fn projects_overview(
         .projects
         .latest_states()
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let controller_states = state
+        .projects
+        .latest_controller_states()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let update_totals = state
         .projects
         .state_event_totals()
@@ -2024,8 +2123,16 @@ pub async fn projects_overview(
     let mut rows: HashMap<String, ProjectRowBuilder> = HashMap::new();
 
     let deleted = |slug: &str| overrides.get(slug).map(String::as_str) == Some("deleted");
+    let markdown_roster = markdown_roster_enabled();
+    let mut deferred_trackers: Vec<TrackerInfo> = Vec::new();
     for tracker in trackers {
         if deleted(&tracker.slug) {
+            continue;
+        }
+        if !markdown_roster {
+            // Markdown is no longer a roster source: attach the file to a
+            // row that some other source creates, never create one.
+            deferred_trackers.push(tracker);
             continue;
         }
         // An alias's tracker file (`verity.md`, `verity-roadmap.md`) folds onto
@@ -2124,6 +2231,14 @@ pub async fn projects_overview(
             .or_insert_with(|| ProjectRowBuilder::new(key.clone()));
         builder.apply_roster(record, canonical_has_roster);
     }
+    for tracker in deferred_trackers {
+        let key = resolve_alias(&aliases, &tracker.slug);
+        if let Some(builder) = rows.get_mut(&key) {
+            if key == tracker.slug || builder.tracker.is_none() {
+                builder.tracker = Some(tracker);
+            }
+        }
+    }
     for (slug, builder) in &mut rows {
         if let Ok(tracks) = state.projects.tracks(slug) {
             let tuples: Vec<(String, Option<String>, Option<String>)> = tracks
@@ -2134,6 +2249,43 @@ pub async fn projects_overview(
                 builder.next_action.as_deref(),
                 &tuples,
             );
+        }
+    }
+    // One situation per row, from the single mission scan above: the card's
+    // progress must be the same number `get_project` returns.
+    {
+        let by_project = super::situation::group_by(&missions, |mission| {
+            mission
+                .project
+                .project
+                .as_deref()
+                .filter(|project| is_plain_key(project))
+                .map(|project| resolve_alias(&aliases, project))
+        });
+        let empty: Vec<&crate::api::mission_store::Mission> = Vec::new();
+        for (slug, builder) in &mut rows {
+            let mut source = super::situation::SourceStatus::default();
+            let tracks = collect_family_tracks(&state.projects, slug).unwrap_or_else(|error| {
+                tracing::warn!(project = %slug, %error, "overview: tracks unavailable");
+                source.tracks_failed = true;
+                Vec::new()
+            });
+            let proposals =
+                collect_family_proposals(&state.projects, slug).unwrap_or_else(|error| {
+                    tracing::warn!(project = %slug, %error, "overview: proposals unavailable");
+                    source.tracks_failed = true;
+                    Vec::new()
+                });
+            let owned: Vec<crate::api::mission_store::Mission> = by_project
+                .get(slug)
+                .unwrap_or(&empty)
+                .iter()
+                .map(|mission| (*mission).clone())
+                .collect();
+            let items = super::mission_horizon::project_items(&tracks, &proposals, &owned);
+            let situation = super::situation::build(slug, &items, &source, &now);
+            builder.done_keys = super::situation::done_keys(&situation);
+            builder.summary = Some(situation.summary);
         }
     }
     // The latest ingested state per project becomes the row's latest_update —
@@ -2166,11 +2318,20 @@ pub async fn projects_overview(
             .or_else(|| record_signals.get(slug))
             .cloned()
             .unwrap_or_default();
-        let update = store_update(&key, project_state, mode, blocker);
+        let material = controller_states
+            .get(slug)
+            .or_else(|| controller_states.get(&key))
+            .unwrap_or(project_state);
+        let mut chapter = material.clone();
+        chapter.last_seen_at = project_state.last_seen_at.clone();
+        if chapter.session_id.is_none() {
+            chapter.session_id = project_state.session_id.clone();
+        }
+        let update = store_update(&key, &chapter, mode, blocker);
         let total = update_totals.get(slug).copied().unwrap_or(0);
         rows.entry(key.clone())
             .or_insert_with(|| ProjectRowBuilder::new(key.clone()))
-            .attach_store_update(update, project_state.observations, total);
+            .attach_store_update(update, chapter.observations, total);
     }
     let unrouted: Vec<DeliveryUpdate> = unrouted_rows
         .into_iter()
@@ -2219,7 +2380,9 @@ pub async fn projects_overview(
                 .and_then(|id| heartbeats.get(id))
                 .cloned();
             let forced = overrides.get(&builder.slug).cloned();
-            let binding = bindings.get(&builder.slug).cloned();
+            let binding = project_tag_keys_with(&aliases, &builder.slug)
+                .into_iter()
+                .find_map(|key| bindings.get(&key).cloned());
             builder.finish(&archived, forced.as_deref(), binding, &now)
         })
         .collect();
@@ -2397,6 +2560,10 @@ struct ProjectRowBuilder {
     updates_count: usize,
     autonomy_level: Option<String>,
     pending_decisions: u32,
+    /// Attached by the handler from the situation builder; `None` means the
+    /// builder was never consulted, rendered as source-unavailable.
+    summary: Option<super::situation::TrackSummary>,
+    done_keys: std::collections::BTreeSet<String>,
 }
 
 impl ProjectRowBuilder {
@@ -2417,6 +2584,8 @@ impl ProjectRowBuilder {
             updates_count: 0,
             autonomy_level: None,
             pending_decisions: 0,
+            summary: None,
+            done_keys: std::collections::BTreeSet::new(),
         }
     }
 
@@ -2467,7 +2636,20 @@ impl ProjectRowBuilder {
         // Rolled up before the chips are truncated, so the verdict covers
         // every mission rather than only the 8 shown.
         let inputs: Vec<_> = self.health_inputs.iter().map(|i| i.as_input()).collect();
-        let health = super::project_health::rollup(&inputs, now);
+        let plan_known = self.summary.is_some();
+        let health = super::project_health::rollup_with_plan(
+            &inputs,
+            now,
+            plan_known.then_some(&self.done_keys),
+        );
+        let summary = self
+            .summary
+            .take()
+            .unwrap_or_else(|| super::situation::TrackSummary {
+                source_unavailable: true,
+                as_of: now.to_string(),
+                ..Default::default()
+            });
 
         self.missions
             .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -2499,7 +2681,7 @@ impl ProjectRowBuilder {
             // collapses consecutive identical descriptors into one row and
             // counts observations, so "three deliveries reported this state
             // running" is exactly `observations >= 3` on the latest event.
-            if latest.state.is_some() && self.latest_observations >= 3 {
+            if stall_descriptor(latest.state.as_deref()) && self.latest_observations >= 3 {
                 attention.push("same state on 3 consecutive updates".to_string());
             }
         }
@@ -2798,6 +2980,7 @@ impl ProjectRowBuilder {
             pending_decisions: self.pending_decisions,
             attention_reasons: attention,
             health,
+            summary,
             conversation,
         }
     }
@@ -2974,7 +3157,7 @@ pub fn roster_lookup_keys_with(aliases: &HashMap<String, String>, requested: &st
     keys
 }
 
-fn resolve_roster_slug(
+pub(crate) fn resolve_roster_slug(
     store: &super::projects_store::ProjectsStore,
     requested: &str,
 ) -> Result<Option<String>, String> {
@@ -3065,12 +3248,31 @@ fn collect_family_proposals(
     Ok(collected)
 }
 
-async fn load_project_items(
+/// Load one project's situation: declared tracks, leftover proposals and
+/// attention-horizon attempts, folded through the situation builder. A store
+/// or mission-collect failure is reported on the summary
+/// (`source_unavailable`) instead of collapsing to an empty plan.
+pub(crate) async fn load_project_situation(
     state: &Arc<AppState>,
     slug: &str,
-) -> Result<Vec<super::mission_horizon::ProjectItem>, (StatusCode, String)> {
-    let tracks = collect_family_tracks(&state.projects, slug).map_err(store_err)?;
-    let proposals = collect_family_proposals(&state.projects, slug).map_err(store_err)?;
+) -> super::situation::ProjectSituation {
+    let mut source = super::situation::SourceStatus::default();
+    let tracks = match collect_family_tracks(&state.projects, slug) {
+        Ok(tracks) => tracks,
+        Err(error) => {
+            tracing::warn!(project = %slug, %error, "situation: tracks unavailable");
+            source.tracks_failed = true;
+            Vec::new()
+        }
+    };
+    let proposals = match collect_family_proposals(&state.projects, slug) {
+        Ok(proposals) => proposals,
+        Err(error) => {
+            tracing::warn!(project = %slug, %error, "situation: proposals unavailable");
+            source.tracks_failed = true;
+            Vec::new()
+        }
+    };
     let missions = match state
         .control
         .collect_attention_missions_for_project(slug)
@@ -3078,101 +3280,228 @@ async fn load_project_items(
     {
         Ok(missions) => missions,
         Err(error) => {
-            tracing::warn!(project = %slug, %error, "project items: attention collect failed");
+            tracing::warn!(project = %slug, %error, "situation: attention collect failed");
+            source.missions_failed = true;
             Vec::new()
         }
     };
-    Ok(super::mission_horizon::project_items(
-        &tracks, &proposals, &missions,
-    ))
+    let items = super::mission_horizon::project_items(&tracks, &proposals, &missions);
+    let as_of = chrono::Utc::now().to_rfc3339();
+    super::situation::build(slug, &items, &source, &as_of)
 }
 
-fn item_attempt_is_live(status: &str) -> bool {
-    matches!(status, "active" | "pending" | "running" | "awaiting_user")
+fn accept_err(error: super::projects_store::AcceptError) -> (StatusCode, String) {
+    use super::projects_store::AcceptError;
+    match &error {
+        AcceptError::NotFound => (StatusCode::NOT_FOUND, error.to_string()),
+        AcceptError::StaleRevision { .. } | AcceptError::IdempotencyMismatch { .. } => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
+        AcceptError::Invalid(_) => (StatusCode::BAD_REQUEST, error.to_string()),
+        AcceptError::Store(message) => (StatusCode::INTERNAL_SERVER_ERROR, message.clone()),
+    }
 }
 
-/// The public roadmap is the plan, not the unacknowledged graveyard.
-/// Controllers still see every attention item on `get_project`.
-fn item_belongs_on_roadmap(item: &super::mission_horizon::ProjectItem) -> bool {
-    if item
-        .attempts
-        .iter()
-        .any(|attempt| item_attempt_is_live(&attempt.status))
-    {
-        return true;
+/// `POST /api/projects/:slug/tracks/:track/accept` — satisfy a track with
+/// evidence. This is the only way a track becomes `satisfied`.
+pub async fn accept_project_track(
+    State(state): State<Arc<AppState>>,
+    AxumPath((requested, track)): AxumPath<(String, String)>,
+    Json(req): Json<super::projects_store::AcceptRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&requested) || !is_plain_key(&track) {
+        return Err(bad_slug());
     }
-    if item.kind == "task" {
-        return item.open;
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .unwrap_or(requested);
+    let family = project_tag_keys(&slug);
+    let stored = state
+        .projects
+        .find_track_slug(&family, &track)
+        .map_err(store_err)?
+        .unwrap_or(slug);
+    let result = state
+        .projects
+        .accept_track_evidence(&stored, &track, &req)
+        .map_err(accept_err)?;
+    let situation = load_project_situation(&state, &stored).await;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "replayed": result.replayed,
+        "track": result.track,
+        "receipts": result.receipts,
+        "summary": situation.summary,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InvalidateEvidenceRequest {
+    pub receipt_id: String,
+    pub reason: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// `POST /api/projects/:slug/tracks/:track/invalidate` — append an
+/// `invalidate` receipt over evidence; the track reopens on the next read.
+pub async fn invalidate_project_track_evidence(
+    State(state): State<Arc<AppState>>,
+    AxumPath((requested, track)): AxumPath<(String, String)>,
+    Json(req): Json<InvalidateEvidenceRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&requested) || !is_plain_key(&track) {
+        return Err(bad_slug());
     }
-    if !item.declared {
-        return false;
+    if req.reason.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "reason is required".to_string()));
     }
-    // Declared tracks stay on the checklist unless cancelled/closed.
-    // `done` remains (as accepted). Missing, empty, running, in-progress
-    // match `project_items`: they are open.
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .unwrap_or(requested);
+    let family = project_tag_keys(&slug);
+    let stored = state
+        .projects
+        .find_track_slug(&family, &track)
+        .map_err(store_err)?
+        .unwrap_or(slug);
+    let receipt = state
+        .projects
+        .invalidate_track_evidence(
+            &stored,
+            &track,
+            &req.receipt_id,
+            req.reason.trim(),
+            "operator",
+            req.actor.as_deref().unwrap_or("operator"),
+        )
+        .map_err(accept_err)?;
+    let situation = load_project_situation(&state, &stored).await;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "receipt": receipt,
+        "summary": situation.summary,
+    })))
+}
+
+/// `GET /api/projects/:slug/tracks/:track/receipts` — the evidence history.
+pub async fn project_track_receipts(
+    State(state): State<Arc<AppState>>,
+    AxumPath((requested, track)): AxumPath<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&requested) || !is_plain_key(&track) {
+        return Err(bad_slug());
+    }
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .unwrap_or(requested);
+    let family = project_tag_keys(&slug);
+    let stored = state
+        .projects
+        .find_track_slug(&family, &track)
+        .map_err(store_err)?
+        .unwrap_or(slug);
+    let receipts = state
+        .projects
+        .receipts_for_track(&stored, &track)
+        .map_err(store_err)?;
+    let track_row = state.projects.track(&stored, &track).map_err(store_err)?;
+    Ok(Json(serde_json::json!({
+        "track": track_row,
+        "receipts": receipts,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AckReconcileRequest {
+    pub receipt_id: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// `POST /api/projects/:slug/reconcile/ack` — acknowledge a reconciliation
+/// receipt. Appends `reconcile_ack`; the receipt itself is immutable.
+pub async fn ack_project_reconcile(
+    State(state): State<Arc<AppState>>,
+    AxumPath(requested): AxumPath<String>,
+    Json(req): Json<AckReconcileRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&requested) {
+        return Err(bad_slug());
+    }
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .unwrap_or(requested);
+    let Some(receipt) = state.projects.receipt(&req.receipt_id).map_err(store_err)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no receipt '{}'", req.receipt_id),
+        ));
+    };
+    if receipt.kind != "reconcile" || receipt.project_slug.as_deref() != Some(slug.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "receipt '{}' is not a reconcile receipt of '{slug}'",
+                req.receipt_id
+            ),
+        ));
+    }
+    let ack = state
+        .projects
+        .ack_reconcile(
+            &slug,
+            &req.receipt_id,
+            req.actor.as_deref().unwrap_or("operator"),
+        )
+        .map_err(receipt_write_err)?;
+    Ok(Json(serde_json::json!({ "ok": true, "ack": ack })))
+}
+
+/// `SANDBOXED_ROSTER_MARKDOWN=off` stops Hermes tracker Markdown from
+/// creating roster rows. Tracker files then only enrich rows that exist
+/// (status line, mtime). Default on for one release; flipped per project
+/// after `palomactl import-trackers` has run.
+pub fn markdown_roster_enabled() -> bool {
     !matches!(
-        item.status
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty()),
-        Some("cancelled") | Some("closed")
+        std::env::var("SANDBOXED_ROSTER_MARKDOWN")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false" | "no"
     )
 }
 
-/// Map an item onto the existing `/tasks` row shape the desktop already
-/// renders. Status vocabulary stays the checklist's: accepted / running /
-/// failed / proposed / pending.
-fn item_roadmap_status(item: &super::mission_horizon::ProjectItem) -> &'static str {
-    if !item.open {
-        return "accepted";
+/// `GET /api/projects/:slug/situation` — the canonical bounded read.
+/// `get_project`, `/tasks`, the roster row and MCP `get_situation` are all
+/// projections of this.
+pub async fn project_situation(
+    State(state): State<Arc<AppState>>,
+    AxumPath(requested): AxumPath<String>,
+) -> Result<Json<super::situation::ProjectSituation>, (StatusCode, String)> {
+    if !is_plain_key(&requested) {
+        return Err(bad_slug());
     }
-    if item
-        .attempts
-        .iter()
-        .any(|attempt| item_attempt_is_live(&attempt.status))
-    {
-        return "running";
-    }
-    if item.status.as_deref() == Some("proposed") {
-        return "proposed";
-    }
-    if !item.attempts.is_empty()
-        && item
-            .attempts
-            .iter()
-            .all(|attempt| matches!(attempt.status.as_str(), "failed" | "interrupted"))
-    {
-        return "failed";
-    }
-    "pending"
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .unwrap_or(requested);
+    Ok(Json(load_project_situation(&state, &slug).await))
 }
 
-fn item_as_roadmap_task(item: &super::mission_horizon::ProjectItem) -> serde_json::Value {
-    let title = item
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            item.desired_state
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            item.attempts
-                .iter()
-                .find_map(|attempt| attempt.title.clone().filter(|title| !title.is_empty()))
-        })
-        .unwrap_or_else(|| item.key.clone());
+/// Map a canonical item onto the `/tasks` row shape the desktop still
+/// renders. Status vocabulary stays the checklist's: accepted / running /
+/// failed / proposed / pending — derived from `derived_state`, never counted
+/// separately.
+fn situation_roadmap_task(item: &super::situation::SituationItem) -> serde_json::Value {
     let latest = item.attempts.first();
     serde_json::json!({
-        "id": null,
+        "id": item.id,
         "task_key": item.key,
-        "title": title,
-        "status": item_roadmap_status(item),
+        "title": item.title,
+        "status": super::situation::roadmap_status(item),
+        "derived_state": item.derived_state,
+        "origin": item.origin,
         "kind": item.kind,
         "open": item.open,
         "desired_state": item.desired_state,
@@ -3180,7 +3509,7 @@ fn item_as_roadmap_task(item: &super::mission_horizon::ProjectItem) -> serde_jso
         "depends_on": item.depends_on,
         "worker_mission_id": latest.map(|attempt| attempt.id.to_string()),
         "attempts": item.attempts.len(),
-        "updated_at": latest.map(|attempt| attempt.updated_at.clone()),
+        "updated_at": item.updated_at,
     })
 }
 
@@ -3205,7 +3534,7 @@ fn is_placeholder_descriptor(descriptor: &str) -> bool {
 }
 
 /// A routing key / project tag must be a plain slug.
-fn is_plain_key(key: &str) -> bool {
+pub(crate) fn is_plain_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 100
         && key
@@ -3274,12 +3603,24 @@ pub async fn bind_project_conversation(
             "session_id must be 1-128 chars of [A-Za-z0-9._:-]".to_string(),
         ));
     }
+    let canonical = canonicalize_project_slug(&slug);
+    if !is_plain_key(&canonical) {
+        return Err((StatusCode::BAD_REQUEST, "invalid project slug".to_string()));
+    }
+    let aliases = project_tag_keys(&canonical);
+    let tip = match hermes_state_db() {
+        Some(path) => super::session_chain::live_tip(&path, session_id),
+        None => session_id.to_string(),
+    };
     let conversation = state
         .projects
-        .set_binding(&slug, session_id, None)
+        .set_canonical_binding(&canonical, &tip, &aliases, None)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    if let Err(error) = super::hermes_control_route::bind_canonical(&canonical, &tip) {
+        tracing::warn!(slug = %canonical, session = %tip, %error, "hermes route write-through failed");
+    }
     Ok(Json(serde_json::json!({
-        "slug": slug,
+        "slug": canonical,
         "conversation": conversation,
     })))
 }
@@ -3291,12 +3632,25 @@ pub async fn unbind_project_conversation(
     if !is_plain_key(&slug) {
         return Err((StatusCode::BAD_REQUEST, "invalid project slug".to_string()));
     }
-    let removed = state
+    let canonical = canonicalize_project_slug(&slug);
+    let aliases = project_tag_keys(&canonical);
+    let mut removed = state
         .projects
-        .clear_binding(&slug)
+        .clear_binding(&canonical)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    for alias in &aliases {
+        if alias != &canonical {
+            removed |= state
+                .projects
+                .clear_binding(alias)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        }
+    }
+    if let Err(error) = super::hermes_control_route::unbind_canonical(&canonical) {
+        tracing::warn!(slug = %canonical, %error, "hermes route unbind write-through failed");
+    }
     Ok(Json(
-        serde_json::json!({ "slug": slug, "unbound": removed }),
+        serde_json::json!({ "slug": canonical, "unbound": removed }),
     ))
 }
 
@@ -3855,8 +4209,9 @@ mod tests {
     }
 
     #[test]
-    fn item_roadmap_status_follows_open_and_live_attempts() {
+    fn tasks_projection_is_derived_from_the_situation() {
         use crate::api::mission_horizon::{ProjectItem, ProjectItemAttempt};
+        use crate::api::situation::{build, SourceStatus};
         use uuid::Uuid;
 
         let open_live = ProjectItem {
@@ -3876,25 +4231,20 @@ mod tests {
                 updated_at: "2026-08-15T00:00:00Z".into(),
                 role: None,
             }],
+            id: None,
+            origin: None,
+            revision: 0,
+            blocker: None,
         };
-        assert_eq!(item_roadmap_status(&open_live), "running");
-        let row = item_as_roadmap_task(&open_live);
-        assert_eq!(row["task_key"], "c5");
-        assert_eq!(row["title"], "Land #2332");
-        assert_eq!(row["status"], "running");
-        assert_eq!(row["acceptance_criteria"][0], "CI green");
-        assert_eq!(row["depends_on"][0], "freeze");
-
         let done = ProjectItem {
+            key: "c4".into(),
             open: false,
             status: Some("done".into()),
             attempts: Vec::new(),
             ..open_live.clone()
         };
-        assert_eq!(item_roadmap_status(&done), "accepted");
-        assert!(item_belongs_on_roadmap(&open_live));
-        assert!(item_belongs_on_roadmap(&done));
         let zombie = ProjectItem {
+            key: "zombie".into(),
             open: true,
             status: None,
             desired_state: None,
@@ -3909,15 +4259,39 @@ mod tests {
             }],
             ..open_live.clone()
         };
-        assert!(
-            !item_belongs_on_roadmap(&zombie),
+        let situation = build(
+            "p",
+            &[open_live, done, zombie],
+            &SourceStatus::default(),
+            "2026-08-15T00:00:00Z",
+        );
+        let body = tasks_projection(&situation);
+        let rows = body["tasks"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
             "unacknowledged failed attempts are not the roadmap"
         );
+        let c5 = rows.iter().find(|row| row["task_key"] == "c5").unwrap();
+        assert_eq!(c5["title"], "Land #2332");
+        assert_eq!(c5["status"], "running");
+        assert_eq!(c5["derived_state"], "executing");
+        assert_eq!(c5["acceptance_criteria"][0], "CI green");
+        assert_eq!(c5["depends_on"][0], "freeze");
+        let c4 = rows.iter().find(|row| row["task_key"] == "c4").unwrap();
+        assert_eq!(c4["status"], "accepted");
+        assert_eq!(c4["derived_state"], "claim_only");
+        // Legacy `done` counts claims; the canonical split is alongside.
+        assert_eq!(body["summary"]["done"], 1);
+        assert_eq!(body["summary"]["verified_satisfied"], 0);
+        assert_eq!(body["summary"]["claim_only"], 1);
+        assert_eq!(body["summary"]["total"], 2);
     }
 
     #[test]
     fn declared_open_tracks_stay_on_the_roadmap() {
         use crate::api::mission_horizon::{track_status_is_open, ProjectItem};
+        use crate::api::situation::{belongs_on_roadmap, build, SourceStatus};
 
         let declared = |status: Option<&str>| ProjectItem {
             key: "pr-48".into(),
@@ -3930,6 +4304,14 @@ mod tests {
             open: track_status_is_open(status),
             declared: true,
             attempts: Vec::new(),
+            id: None,
+            origin: None,
+            revision: 0,
+            blocker: None,
+        };
+        let on_roadmap = |status: Option<&str>| {
+            let situation = build("p", &[declared(status)], &SourceStatus::default(), "now");
+            belongs_on_roadmap(&situation.items[0])
         };
         for status in [
             None,
@@ -3939,13 +4321,14 @@ mod tests {
             Some("in-progress"),
         ] {
             assert!(
-                item_belongs_on_roadmap(&declared(status)),
+                on_roadmap(status),
                 "declared track status {status:?} belongs on the roadmap"
             );
         }
-        assert!(item_belongs_on_roadmap(&declared(Some("done"))));
-        assert!(!item_belongs_on_roadmap(&declared(Some("cancelled"))));
-        assert!(!item_belongs_on_roadmap(&declared(Some("closed"))));
+        assert!(on_roadmap(Some("done")));
+        // `closed` is a legacy claim, same as `done`: shown as accepted.
+        assert!(on_roadmap(Some("closed")));
+        assert!(!on_roadmap(Some("cancelled")));
     }
 
     #[test]
@@ -4205,6 +4588,22 @@ mod tests {
             .attention_reasons
             .iter()
             .any(|r| r.contains("3 consecutive")));
+
+        // Inspect callbacks repeating must not stall — they are not a chapter.
+        let mut inspecting = ProjectRowBuilder::new("verity".into());
+        inspecting.attach_store_update(
+            delivery("mission-callback|fcbaebd9|awaiting_user|inspect"),
+            3,
+            3,
+        );
+        let row = inspecting.finish(&[], None, None, "2026-08-04T20:00:00Z");
+        assert!(
+            !row.attention_reasons
+                .iter()
+                .any(|r| r.contains("3 consecutive")),
+            "inspect callbacks must not stall: {:?}",
+            row.attention_reasons
+        );
     }
 
     // ---- [DECISION:] trailer ----
