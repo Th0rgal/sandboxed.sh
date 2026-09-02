@@ -173,7 +173,7 @@ async fn ensure_automation(
             created_at: now_iso(),
             last_triggered_at: None,
             retry_config: Default::default(),
-            stop_policy: StopPolicy::Never,
+            stop_policy: StopPolicy::WhenMissionTerminal,
             fresh_session: Default::default(),
             consecutive_failures: 0,
             driver: AutomationDriver::HarnessLoop,

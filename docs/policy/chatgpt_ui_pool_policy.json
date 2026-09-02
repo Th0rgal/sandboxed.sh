@@ -1,6 +1,6 @@
 {
   "policy": "chatgpt-ui-pool",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "source_of_truth": {
     "runtime": "src/api/runners/chatgpt_ui/mod.rs",
     "pool": "src/api/runners/chatgpt_ui/profile_pool.rs",

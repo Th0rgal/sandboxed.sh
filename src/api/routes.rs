@@ -565,6 +565,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     super::validation::spawn_outbox_forwarder(Arc::clone(&state));
     super::projects_overview::spawn_state_ingestor(Arc::clone(&state));
+    super::evidence_watch::spawn(Arc::clone(&state));
 
     // Remote-node fleet monitor: periodic heartbeat polling so
     // `/api/remote-nodes` and dispatch decisions read cached statuses
@@ -1661,15 +1662,28 @@ async fn get_stats(
     // Get mission stats from mission store
     let control_state = state.control.get_or_spawn(&user).await;
 
-    // Count missions by status
-    let mission_counts = control_state
-        .mission_store
-        .count_missions_by_status()
-        .await
-        .unwrap_or_default();
+    // Count missions by status. `since` scopes the window used by the
+    // Overview "Last 24 hours" panel; lifetime totals omit it.
+    let mission_counts = if let Some(ref since) = params.since {
+        control_state
+            .mission_store
+            .count_missions_updated_since(since)
+            .await
+            .unwrap_or_default()
+    } else {
+        control_state
+            .mission_store
+            .count_missions_by_status()
+            .await
+            .unwrap_or_default()
+    };
     let mission_total = mission_counts.total;
     let mission_active = mission_counts.active;
-    let mission_completed = mission_counts.completed;
+    let mission_completed = if params.since.is_some() {
+        mission_counts.completed + mission_counts.acknowledged
+    } else {
+        mission_counts.completed
+    };
     let mission_failed = mission_counts.failed;
 
     // Combine legacy tasks and missions
@@ -1706,9 +1720,15 @@ async fn get_stats(
             (total, a, e, u)
         };
 
-    let finished = completed_tasks + failed_tasks;
+    let success_ok = completed_tasks
+        + if params.since.is_some() {
+            0
+        } else {
+            mission_counts.acknowledged
+        };
+    let finished = success_ok + failed_tasks;
     let success_rate = if finished > 0 {
-        completed_tasks as f64 / finished as f64
+        success_ok as f64 / finished as f64
     } else {
         1.0
     };

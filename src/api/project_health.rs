@@ -11,7 +11,7 @@
 //! new source of truth is introduced: if the rollup disagrees with the mission
 //! list, the mission list is right.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -164,14 +164,24 @@ impl TrackAccumulator {
         }
     }
 
-    fn finish(self, track: Option<String>) -> TrackHealth {
+    fn finish(self, track: Option<String>, plan: Option<&BTreeSet<String>>) -> TrackHealth {
+        // `Done` is a statement about the *track*, not about its last
+        // mission. When the caller knows the plan (the situation builder's
+        // satisfied / claim-only keys), only those tracks may read as done; a
+        // completed mission on an open track is `Idle`. Without a plan the
+        // legacy mission-derived reading stays.
+        let done_per_plan = match (plan, track.as_deref()) {
+            (Some(plan), Some(key)) => plan.contains(key),
+            (Some(_), None) => false,
+            (None, _) => self.completed > 0 && self.failed == 0,
+        };
         let verdict = if self.failed > 0 && self.active == 0 {
             TrackVerdict::Failing
         } else if self.overdue > 0 {
             TrackVerdict::Overdue
         } else if self.active > 0 {
             TrackVerdict::Active
-        } else if self.completed > 0 && self.failed == 0 {
+        } else if done_per_plan {
             TrackVerdict::Done
         } else {
             TrackVerdict::Idle
@@ -196,6 +206,17 @@ impl TrackAccumulator {
 /// every project in a listing with the same instant — otherwise two tracks in
 /// the same response could disagree about whether the same deadline had passed.
 pub fn rollup(missions: &[MissionHealthInput<'_>], now: &str) -> ProjectHealth {
+    rollup_with_plan(missions, now, None)
+}
+
+/// Like [`rollup`], but `Done` is gated by the plan: only tracks whose key is
+/// in `done_keys` (satisfied or claim-only per the situation builder) may be
+/// reported done. Pass `Some(&BTreeSet::new())` for "plan known, nothing done".
+pub fn rollup_with_plan(
+    missions: &[MissionHealthInput<'_>],
+    now: &str,
+    done_keys: Option<&BTreeSet<String>>,
+) -> ProjectHealth {
     let mut by_track: BTreeMap<Option<String>, TrackAccumulator> = BTreeMap::new();
     for mission in missions {
         let track = mission
@@ -208,7 +229,7 @@ pub fn rollup(missions: &[MissionHealthInput<'_>], now: &str) -> ProjectHealth {
 
     let mut tracks: Vec<TrackHealth> = by_track
         .into_iter()
-        .map(|(track, accumulator)| accumulator.finish(track))
+        .map(|(track, accumulator)| accumulator.finish(track, done_keys))
         .collect();
     // Worst verdict first; within a verdict, the busiest track first, then by
     // name so the order is stable across requests.

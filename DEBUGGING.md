@@ -185,17 +185,22 @@ systemctl restart sandboxed-sh-dev
 **Paths (Production):**
 
 - Binary: `/usr/local/bin/sandboxed-sh-prod`
-- Config: `/etc/open_agent/open_agent.env`
+- Config: `/etc/open_agent/open_agent.env` (legacy filename; systemd unit is
+  `sandboxed-sh-prod`. Hermes env lives separately at
+  `/etc/sandboxed-sh/hermes-assistant.env`.)
 - Service: `/etc/systemd/system/sandboxed-sh-prod.service`
 - Data root: `/srv/sandboxed-storage/staging/agent-core`
 
 **Paths (Development):**
 
 - Binary: `/usr/local/bin/sandboxed-sh-dev`
-- Config: `/etc/open_agent/open_agent_dev.env`
+- Config: `/etc/open_agent/open_agent_dev.env` (same legacy filename pattern)
 - Service: `/etc/systemd/system/sandboxed-sh-dev.service`
 - Data root: inspect `WORKING_DIR`/storage settings in the dev environment file;
   never infer it from the production path.
+
+Local source checkout is `~/work/paloma/sandboxed_sh` (formerly
+`~/work/open_agent`; that old path is now a symlink).
 
 ### Investigating Unexpected Service Stops
 
@@ -276,12 +281,12 @@ Sync source code and build directly on the server:
 # Sync source (backend-only; avoids copying dashboard/ which deploys via Vercel)
 rsync -avz --exclude 'target' --exclude '.git' --exclude 'dashboard' \
   -e "ssh -i ~/.ssh/paloma" \
-  /Users/thomas/work/open_agent/ root@65.109.98.246:/opt/sandboxed-sh-dev/
+  /Users/thomas/work/paloma/sandboxed_sh/ root@65.109.98.246:/opt/sandboxed-sh-dev/
 
 # If you need the dashboard on the server for debugging, remove the dashboard exclude:
 # rsync -avz --exclude 'target' --exclude '.git' --exclude 'dashboard/node_modules' --exclude 'dashboard/.next' \
 #   -e "ssh -i ~/.ssh/paloma" \
-#   /Users/thomas/work/open_agent/ root@65.109.98.246:/opt/sandboxed-sh-dev/
+#   /Users/thomas/work/paloma/sandboxed_sh/ root@65.109.98.246:/opt/sandboxed-sh-dev/
 
 # Build on server (debug mode)
 ssh -i ~/.ssh/paloma root@65.109.98.246 "cd /opt/sandboxed-sh-dev && source ~/.cargo/env && cargo build"

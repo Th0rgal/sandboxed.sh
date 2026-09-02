@@ -139,9 +139,18 @@ pub struct ProjectItem {
     pub open: bool,
     /// True when a `project_tracks` or leftover proposal row declared this
     /// item. Mission-only attention rows stay off the public roadmap.
-    #[serde(skip)]
     pub declared: bool,
     pub attempts: Vec<ProjectItemAttempt>,
+    /// Stable track id (None for mission-only rows and leftover proposals).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// `declared` | `imported` | `absorbed`, from the track row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    pub revision: u64,
+    /// Operator-declared structured blocker, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
 }
 
 /// A declared track is open unless it is done, closed, or cancelled.
@@ -150,7 +159,7 @@ pub struct ProjectItem {
 pub fn track_status_is_open(status: Option<&str>) -> bool {
     !matches!(
         status.map(str::trim).filter(|value| !value.is_empty()),
-        Some("done") | Some("closed") | Some("cancelled")
+        Some("done") | Some("closed") | Some("cancelled") | Some("satisfied")
     )
 }
 
@@ -187,6 +196,10 @@ pub fn project_items(
                 open: track_status_is_open(track.status.as_deref()),
                 declared: true,
                 attempts: Vec::new(),
+                id: Some(track.id.clone()),
+                origin: Some(track.origin.clone()),
+                revision: track.revision,
+                blocker: track.explicit_blocker.clone(),
             },
         );
     }
@@ -204,6 +217,10 @@ pub fn project_items(
                 open: true,
                 declared: true,
                 attempts: Vec::new(),
+                id: None,
+                origin: Some("declared".to_string()),
+                revision: 0,
+                blocker: None,
             });
     }
     for mission in missions {
@@ -229,6 +246,10 @@ pub fn project_items(
             open: true,
             declared: false,
             attempts: Vec::new(),
+            id: None,
+            origin: Some("absorbed".to_string()),
+            revision: 0,
+            blocker: None,
         });
         item.attempts.push(ProjectItemAttempt {
             id: mission.id,
@@ -299,15 +320,22 @@ pub fn bound_session_from_projects_db(working_dir: &Path, slug: &str) -> Option<
     let connection =
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .ok()?;
-    connection
-        .query_row(
-            "SELECT control_session_id FROM project_bindings WHERE slug = ?1",
-            [slug],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-        .map(|session| session.trim().to_string())
-        .filter(|session| !session.is_empty())
+    let canonical = crate::api::projects_overview::canonicalize_project_slug(slug);
+    for key in crate::api::projects_overview::project_tag_keys(&canonical) {
+        if let Some(session) = connection
+            .query_row(
+                "SELECT control_session_id FROM project_bindings WHERE slug = ?1",
+                [&key],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .map(|session: String| session.trim().to_string())
+            .filter(|session| !session.is_empty())
+        {
+            return Some(session);
+        }
+    }
+    None
 }
 
 /// Shipped wake decision for a mission-status webhook: project binding,
@@ -562,6 +590,12 @@ mod tests {
             acceptance_criteria: vec!["merged".to_string()],
             depends_on: Vec::new(),
             updated_at: "2026-08-14T00:00:00Z".to_string(),
+            id: "id".to_string(),
+            lifecycle: "active".to_string(),
+            origin: "declared".to_string(),
+            explicit_blocker: None,
+            revision: 0,
+            claim: None,
         }];
         let proposals = vec![RoadmapProposal {
             task_key: "docs".to_string(),
@@ -606,6 +640,12 @@ mod tests {
             acceptance_criteria: Vec::new(),
             depends_on: Vec::new(),
             updated_at: "2026-08-01T00:00:00Z".to_string(),
+            id: "id".to_string(),
+            lifecycle: "active".to_string(),
+            origin: "declared".to_string(),
+            explicit_blocker: None,
+            revision: 0,
+            claim: None,
         }];
         let closed = project_items(&cancelled, &[], &[]);
         assert_eq!(closed.len(), 1);
@@ -624,6 +664,12 @@ mod tests {
                 acceptance_criteria: Vec::new(),
                 depends_on: Vec::new(),
                 updated_at: "2026-08-14T00:00:00Z".to_string(),
+                id: "id".to_string(),
+                lifecycle: "active".to_string(),
+                origin: "declared".to_string(),
+                explicit_blocker: None,
+                revision: 0,
+                claim: None,
             }],
             &[],
             &[],

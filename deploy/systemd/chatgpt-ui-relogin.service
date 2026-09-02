@@ -1,0 +1,15 @@
+[Unit]
+Description=Re-login ChatGPT UI pool profiles from Bitwarden
+After=chatgpt-ui-dgx-proxy.service
+Wants=chatgpt-ui-dgx-proxy.service
+
+[Service]
+Type=oneshot
+# Own display: missions paint on :93 and a relogin must never share it.
+ExecStart=/usr/bin/xvfb-run --auto-servernum "--server-args=-screen 0 1440x1000x24" \
+    /opt/sandboxed-sh/chatgpt-ui-venv/bin/python \
+    /opt/sandboxed-sh/scripts/chatgpt_ui_relogin.py
+# Yield to in-flight Pro turns; this is repair, not the workload.
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=10min

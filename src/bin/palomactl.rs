@@ -31,13 +31,26 @@ fn run(args: Vec<String>) -> Result<()> {
             println!("{}", render_status_text(&state));
         }
         "reconcile" => {
-            let state = reconcile(&root)?;
-            println!(
-                "wrote {}\nwrote {}\ndrift={}",
-                control_dir(&root).join("status.json").display(),
-                control_dir(&root).join("status.md").display(),
-                state.drift.len()
-            );
+            if let Some(api) = value_after_flag(&args, "--api") {
+                let report = reconcile_live(&args, api)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let state = reconcile(&root)?;
+                println!(
+                    "wrote {}\nwrote {}\ndrift={}",
+                    control_dir(&root).join("status.json").display(),
+                    control_dir(&root).join("status.md").display(),
+                    state.drift.len()
+                );
+            }
+        }
+        "import-trackers" => {
+            let api = value_after_flag(&args, "--api")
+                .map(str::to_string)
+                .or_else(|| env::var("SANDBOXED_API_URL").ok())
+                .ok_or_else(|| anyhow!("missing --api <url> (or SANDBOXED_API_URL)"))?;
+            let report = import_trackers(&args, &api)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         "pr-gates" => {
             let repo = args.get(1).ok_or_else(|| anyhow!("missing owner/repo"))?;
@@ -100,7 +113,7 @@ fn run(args: Vec<String>) -> Result<()> {
 
 fn print_usage() {
     println!(
-        "usage:\n  palomactl status\n  palomactl reconcile\n  palomactl pr-gates <owner/repo> <number> [--worker-head <sha>]\n  palomactl set-mode <project> <mode> --until <iso>\n  palomactl dispatch-plan --project <slug>\n  palomactl validation-matrix [path]\n  palomactl cluster-lean-errors <log-path>"
+        "usage:\n  palomactl status\n  palomactl reconcile [--api <url> [--token <jwt>] [--dir <trackers>] [slug...]]\n  palomactl import-trackers --api <url> [--token <jwt>] [--dir <trackers>] [--dry-run] [slug...]\n  palomactl pr-gates <owner/repo> <number> [--worker-head <sha>]\n  palomactl set-mode <project> <mode> --until <iso>\n  palomactl dispatch-plan --project <slug>\n  palomactl validation-matrix [path]\n  palomactl cluster-lean-errors <log-path>"
     );
 }
 
@@ -197,6 +210,227 @@ struct ProjectState {
     mission_counts: BTreeMap<String, usize>,
     missions: Vec<MissionRef>,
     drift: Vec<Drift>,
+}
+
+// ── Live API: tracker import and drift ──────────────────────────────────
+
+fn api_token(args: &[String]) -> Option<String> {
+    value_after_flag(args, "--token")
+        .map(str::to_string)
+        .or_else(|| env::var("SANDBOXED_API_TOKEN").ok())
+        .or_else(|| env::var("HERMES_SANDBOXED_API_TOKEN").ok())
+        .filter(|token| !token.trim().is_empty())
+}
+
+fn trackers_dir(args: &[String]) -> Result<PathBuf> {
+    let dir = value_after_flag(args, "--dir")
+        .map(PathBuf::from)
+        .or_else(|| env::var("HERMES_PROJECTS_DIR").ok().map(PathBuf::from))
+        .ok_or_else(|| anyhow!("missing --dir <trackers> (or HERMES_PROJECTS_DIR)"))?;
+    if !dir.is_dir() {
+        bail!("tracker directory {} is not a directory", dir.display());
+    }
+    Ok(dir)
+}
+
+/// Positional arguments after the command that are not flag values.
+fn positional_slugs(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    for arg in args.iter().skip(1) {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if arg == "--api" || arg == "--token" || arg == "--dir" {
+            skip = true;
+            continue;
+        }
+        if arg.starts_with("--") {
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
+}
+
+fn tracker_files(dir: &Path, only: &[String]) -> Result<Vec<(String, PathBuf)>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if validate_project_slug(stem).is_err() {
+            continue;
+        }
+        if !only.is_empty() && !only.iter().any(|slug| slug == stem) {
+            continue;
+        }
+        files.push((stem.to_string(), path));
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn api_request(
+    method: &str,
+    url: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> Result<(u16, Value)> {
+    let mut request = ureq::request(method, url).timeout(std::time::Duration::from_secs(60));
+    if let Some(token) = token {
+        request = request.set("Authorization", &format!("Bearer {token}"));
+    }
+    let response = match body {
+        Some(body) => request.send_json(body),
+        None => request.call(),
+    };
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            let value: Value = response.into_json().unwrap_or(Value::Null);
+            Ok((status, value))
+        }
+        Err(ureq::Error::Status(status, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            Ok((status, Value::String(text)))
+        }
+        Err(error) => Err(anyhow!("{method} {url}: {error}")),
+    }
+}
+
+/// `palomactl import-trackers --api URL [--dry-run] [slug...]`: post every
+/// tracker file to `POST /api/projects/:slug/imports`. The server owns the
+/// parser and the idempotency; this only reads files and prints the report.
+fn import_trackers(args: &[String], api: &str) -> Result<Value> {
+    let token = api_token(args);
+    let dir = trackers_dir(args)?;
+    let dry_run = args.iter().any(|arg| arg == "--dry-run");
+    let only = positional_slugs(args);
+    let mut reports = Vec::new();
+    for (slug, path) in tracker_files(&dir, &only)? {
+        let content = fs::read_to_string(&path)?;
+        let (status, body) = api_request(
+            "POST",
+            &format!("{}/api/projects/{slug}/imports", api.trim_end_matches('/')),
+            token.as_deref(),
+            Some(json!({
+                "source_path": path.display().to_string(),
+                "content": content,
+                "dry_run": dry_run,
+                "actor": "palomactl",
+            })),
+        )?;
+        match status {
+            200 => reports.push(json!({
+                "slug": slug,
+                "path": path.display().to_string(),
+                "created": body.get("created"),
+                "claims": body.get("claims"),
+                "already_imported": body.get("already_imported"),
+                "ambiguities": body.get("ambiguities"),
+                "receipt_id": body.get("receipt_id"),
+                "items": body.get("items").and_then(Value::as_array).map(Vec::len),
+            })),
+            404 => reports.push(json!({
+                "slug": slug,
+                "path": path.display().to_string(),
+                "skipped": "not a roster project",
+            })),
+            other => reports.push(json!({
+                "slug": slug,
+                "path": path.display().to_string(),
+                "error": format!("HTTP {other}: {body}"),
+            })),
+        }
+    }
+    Ok(json!({ "dry_run": dry_run, "reports": reports }))
+}
+
+/// `palomactl reconcile --api URL [slug...]`: read-only drift between the
+/// tracker Markdown checklist and the live plan (`/situation`). Never writes.
+fn reconcile_live(args: &[String], api: &str) -> Result<Value> {
+    let token = api_token(args);
+    let dir = trackers_dir(args)?;
+    let only = positional_slugs(args);
+    let mut projects = Vec::new();
+    for (slug, path) in tracker_files(&dir, &only)? {
+        let content = fs::read_to_string(&path)?;
+        let (status, situation) = api_request(
+            "GET",
+            &format!(
+                "{}/api/projects/{slug}/situation",
+                api.trim_end_matches('/')
+            ),
+            token.as_deref(),
+            None,
+        )?;
+        if status == 404 {
+            continue;
+        }
+        if status != 200 {
+            projects.push(json!({ "slug": slug, "error": format!("HTTP {status}: {situation}") }));
+            continue;
+        }
+        let plan: BTreeMap<String, String> = situation
+            .get("items")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        Some((
+                            item.get("key")?.as_str()?.to_string(),
+                            item.get("derived_state")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut drift = Vec::new();
+        let mut markdown_keys = BTreeSet::new();
+        for item in sandboxed_sh::api::tracker_import::parse_tracker(&content) {
+            markdown_keys.insert(item.key.clone());
+            match plan.get(&item.key).map(String::as_str) {
+                None => drift.push(json!({
+                    "kind": "markdown_item_missing_in_plan",
+                    "key": item.key, "line": item.line,
+                })),
+                Some(state) => {
+                    let plan_done = matches!(state, "satisfied" | "claim_only");
+                    if item.checked && !plan_done {
+                        drift.push(json!({
+                            "kind": "markdown_checked_but_track_open",
+                            "key": item.key, "line": item.line, "derived_state": state,
+                        }));
+                    } else if !item.checked && plan_done {
+                        drift.push(json!({
+                            "kind": "markdown_open_but_track_done",
+                            "key": item.key, "line": item.line, "derived_state": state,
+                        }));
+                    }
+                }
+            }
+        }
+        for (key, state) in &plan {
+            if state != "cancelled" && !markdown_keys.contains(key) {
+                drift.push(json!({ "kind": "plan_track_missing_in_markdown", "key": key, "derived_state": state }));
+            }
+        }
+        projects.push(json!({
+            "slug": slug,
+            "summary": situation.get("summary"),
+            "drift": drift,
+        }));
+    }
+    Ok(
+        json!({ "projects": projects, "note": "read-only; the plan (project_tracks) is the truth, Markdown is narrative" }),
+    )
 }
 
 fn load_state(root: &Path) -> Result<ProjectState> {

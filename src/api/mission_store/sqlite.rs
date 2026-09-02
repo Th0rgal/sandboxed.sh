@@ -919,6 +919,7 @@ impl SqliteMissionStore {
             match stop_policy_str.as_str() {
                 "never" => StopPolicy::Never,
                 "after_first_fire" => StopPolicy::AfterFirstFire,
+                "when_mission_terminal" => StopPolicy::WhenMissionTerminal,
                 _ => StopPolicy::Never,
             }
         };
@@ -3130,13 +3131,37 @@ impl MissionStore for SqliteMissionStore {
             for row in rows {
                 let (status, count) = row.map_err(|e| e.to_string())?;
                 let count = usize::try_from(count).unwrap_or(0);
-                counts.total += count;
-                match parse_status(&status) {
-                    MissionStatus::Active => counts.active += count,
-                    MissionStatus::Completed => counts.completed += count,
-                    MissionStatus::Failed => counts.failed += count,
-                    _ => {}
-                }
+                counts.add(parse_status(&status), count);
+            }
+            Ok(counts)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn count_missions_updated_since(
+        &self,
+        since: &str,
+    ) -> Result<MissionStatusCounts, String> {
+        let conn = self.conn.clone();
+        let since = since.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT status, COUNT(*) FROM missions WHERE updated_at >= ?1 GROUP BY status",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![since], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            let mut counts = MissionStatusCounts::default();
+            for row in rows {
+                let (status, count) = row.map_err(|e| e.to_string())?;
+                let count = usize::try_from(count).unwrap_or(0);
+                counts.add(parse_status(&status), count);
             }
             Ok(counts)
         })
@@ -6974,6 +6999,7 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let stop_policy_str = match &a.stop_policy {
                 StopPolicy::Never => "never".to_string(),
+                StopPolicy::WhenMissionTerminal => "when_mission_terminal".to_string(),
                 StopPolicy::WhenFailingConsecutively { count } => format!("consecutive_failures:{}", count),
                 StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo } => format!("all_issues_closed_and_prs_merged:{}", repo),
                 StopPolicy::AfterFirstFire => "after_first_fire".to_string(),
@@ -7217,6 +7243,7 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let stop_policy_str = match &automation.stop_policy {
                 StopPolicy::Never => "never".to_string(),
+                StopPolicy::WhenMissionTerminal => "when_mission_terminal".to_string(),
                 StopPolicy::WhenFailingConsecutively { count } => format!("consecutive_failures:{}", count),
                 StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo } => format!("all_issues_closed_and_prs_merged:{}", repo),
                 StopPolicy::AfterFirstFire => "after_first_fire".to_string(),
@@ -10860,6 +10887,7 @@ impl MissionStore for SqliteMissionStore {
                     .unwrap_or_else(|_| "{}".to_string());
                 let stop_policy_str = match &auto.stop_policy {
                     StopPolicy::Never => "never".to_string(),
+                    StopPolicy::WhenMissionTerminal => "when_mission_terminal".to_string(),
                     StopPolicy::WhenFailingConsecutively { count } => {
                         format!("consecutive_failures:{}", count)
                     }

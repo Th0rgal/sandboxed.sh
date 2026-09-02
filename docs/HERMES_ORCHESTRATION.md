@@ -9,6 +9,11 @@ orchestration layer that runs on top of it: how a project keeps one durable
 conversation, how work is attributed back to it, and what makes progress
 visible.
 
+The target system model is defined in
+[`AGENT_CONTROL_PLANE.md`](AGENT_CONTROL_PLANE.md). In that model this document
+specifies the conversation, routing, and callback edges of the larger control
+loop; it is not a second architecture.
+
 ---
 
 ## The split
@@ -24,20 +29,26 @@ sandboxed.sh never decides what to work on.
 
 ---
 
-## Four objects
+## Runtime objects
 
 | object | lives in | what it is |
 |---|---|---|
 | **session** | Hermes `state.db` | a durable conversation, e.g. `20260804_103847_86ca5c` |
 | **mission** | sandboxed.sh | one unit of work, in a workspace, with an agent and a model |
 | **controller** | Hermes cron | a job that drives one project, one agent turn per tick |
-| **route** | Hermes `projects.db` | binds a project to the session it reports into |
+| **route** | sandboxed `project_bindings` (replica: Hermes `project_session_routes`) | the one control conversation for the project |
 
 A session carries a **source**: `desktop`, `webhook`, `cli`, `tui`,
 `api_server`, `telegram`, `cron`. The source decides how a report reaches it.
 
 A mission carries three tags that make it findable: `project`, `track`, and
 `origin_session_id`.
+
+These are runtime identities, not the whole project model. The durable
+abstraction tower is project → track → attempt/mission → action → receipt →
+evidence. A session is where judgment continues; it is not project state. A
+mission is one disposable attempt; it is not the roadmap item or proof of its
+completion.
 
 ---
 
@@ -55,31 +66,41 @@ A mission carries three tags that make it findable: `project`, `track`, and
 2. The controller reads live state: PRs, CI, missions in flight.
 3. It decides, then dispatches missions through the `sandboxed_assistant` MCP
    server.
-4. It writes a report.
-5. The report is delivered into the project's bound session.
+4. sandboxed.sh returns an action receipt and arranges a wake condition.
+5. Mission completion routes back into the bound session, where the controller
+   reconciles the receipt against external evidence and the track's acceptance
+   criteria.
+6. Only material judgment is reported to the operator.
+
+Today some of those steps are separate writes and controller conventions. The
+target API makes one logical action atomic and wakes the controller from a
+durable predicate instead of requiring polling; see the agent-native roadmap.
 
 ---
 
 ## Project routes
 
 A controller does not name a session. It declares `deliver: project:verity`,
-and the route store resolves that name.
+and the bind resolves that name to **one canonical slug and one live session**.
 
-Routes are **explicit or nothing**. With no route bound, delivery fails and says
-so. The system never falls back to "whichever conversation is open", because
-that fallback is precisely the misrouting the store exists to prevent.
+The operator bind (`PUT /api/projects/:slug/conversation`) is the source of
+truth, stored under the canonical roster slug (`verity-core`, not `verity`).
+Hermes `project_session_routes` is a replica: bind write-through plus repair
+on cron resolve if the replica is missing. Nicknames still fold through
+`routes.json`. Explicit-or-nothing stays — there is no fallback to whichever
+Desktop tab is open.
 
 This replaced a worse arrangement. Each cron tick used to open a throwaway
 session and end it, so a project accumulated one dead conversation per tick —
-Verity had 52 for a single project. A route makes it one project, one
-conversation.
+Verity had 52 for a single project. Two stores then drifted (Hermes live
+`1299f6` vs board `2a62eb`). One bind, two readers.
 
 ```bash
-# bind (Hermes side)
-project_route_set project=verity session_id=20260804_103847_86ca5c
-
-# bind (sandboxed.sh side, drives the board's Conversation button)
+# bind (board / API) — canonicalizes and write-through to Hermes
 PUT /api/projects/verity/conversation  {"session_id": "..."}
+
+# bind (Hermes side, also copies into the roster)
+project_route_set project=verity session_id=20260804_103847_86ca5c
 ```
 
 `bind_route` validates both ends: the project must exist and be unarchived, and
@@ -245,6 +266,26 @@ nothing looked wrong for hours. Check the budget, not just the status.
 understated description led a controller to report a campaign blocked because it
 believed an `acknowledged` mission could not be woken. It could.
 
+**Do not make the model perform a database join.** If choosing the next action
+requires combining a grant, a tracker, a global mission scan, a PR head, and a
+fleet dump, every tick spends context rediscovering the control plane. The
+normal read must be one bounded situation projection with provenance,
+freshness, omissions, and a cursor.
+
+**A terminal attempt is not a completed track.** Completion belongs to the
+acceptance criteria and their evidence at the governed artifact version. A
+mission self-report is a claim; a commit, exact-head review, replayable build,
+or owner decision is evidence.
+
+**Waiting should not require reasoning.** If progress depends on a check, job,
+mission, or date, store that predicate and wake the conversation when it
+changes. Re-running an unchanged controller prompt is expensive polling.
+
+**One logical act must be one transaction.** Dispatching a worker and then
+separately linking it to a project creates an invisible-work failure window.
+Intent-level actions need authority validation, ownership, routing,
+idempotency, and a receipt together.
+
 ---
 
 ## The guard contract
@@ -280,10 +321,11 @@ without evidence is missing data to report — never an invitation to guess.
 
 ## Known limitations
 
-**Two stores hold the project↔conversation link.** Hermes `projects.db` follows
-continuations automatically; the sandboxed.sh `project_bindings` table does not.
-They drift apart every time a conversation rolls over, and the sandboxed.sh side
-must be re-pointed by hand.
+**The project↔conversation link is replicated.** sandboxed.sh owns the operator
+bind and Hermes keeps a routing replica. Write-through and repair handle the
+common path, but replication authority, lag, and repair are not yet surfaced as
+first-class situation data. Continuation migration must remain covered by an
+end-to-end invariant until the replica is hidden behind one contract.
 
 **Project tags drift back.** Missions are often tagged from a tracker filename
 rather than the family slug, so families re-fragment over time.
@@ -293,6 +335,19 @@ answer.
 
 **Fallback depth is invisible by default.** Only `test?all=true` reveals it.
 Consider running it on a schedule.
+
+**The controller reconstructs too much state.** `get_project` is bounded, but
+normal control still spans project, track, mission, GitHub, provider, and fleet
+reads. The planned `get_situation(..., since_cursor)` projection makes this a
+server-side, provenance-preserving join.
+
+**Logical actions are multi-write.** Dispatch, track linkage, decision
+declaration, callback ownership, and status can fail independently. The planned
+intent-level action API makes them atomic and idempotent.
+
+**Trailers are compatibility state.** Structured project state is authoritative,
+but `[CTRL:]` and `[STATE_SIGNATURE:]` remain dual-written for older consumers.
+They should be removed after every surface uses the shared projection.
 
 ---
 

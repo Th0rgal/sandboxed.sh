@@ -1,6 +1,9 @@
 """Unit tests for mission-complete routing (no gateway needed)."""
 
 from gateway.platforms.mission_status_route import (
+    MISSION_CALLBACK_WAKE_PROMPT,
+    PROJECT_OPERATOR_WAKE_MESSAGE_CAP,
+    append_mission_callback,
     extract_origin_session,
     extract_project_slug,
     extract_status,
@@ -8,6 +11,7 @@ from gateway.platforms.mission_status_route import (
     is_routable_mission_status,
     resolve_live_session_id,
     resolve_mission_delivery_session,
+    should_wake_mission_callback,
 )
 
 
@@ -39,7 +43,9 @@ class _FakeSessionDBWithMessages(_FakeSessionDB):
 
     def append_message(self, session_id, role, content):
         self.appended.append((session_id, role, content))
-        self.messages.setdefault(session_id, []).append({"content": content})
+        self.messages.setdefault(session_id, []).append(
+            {"role": role, "content": content}
+        )
 
 
 def test_extracts_nested_project_and_origin():
@@ -134,47 +140,7 @@ def test_callback_text_carries_ctrl_and_signature():
     assert "[DECISION:]" in text
 
 
-def test_awaiting_user_callback_omits_ctrl():
-    text = format_mission_callback(
-        {
-            "mission_id": "acfb03d2",
-            "status": "awaiting_user",
-            "title": "need a secret",
-            "project": "verity-core",
-            "short_description": "Waiting on an API key",
-        }
-    )
-    assert "[Mission callback: need a secret]" in text
-    assert "status=awaiting_user mission=acfb03d2" in text
-    assert "Waiting on an API key" in text
-    assert "[CTRL:" not in text
-    assert "mode=blocked" not in text
-    assert (
-        "[STATE_SIGNATURE: verity-core|mission-callback|acfb03d2|awaiting_user|inspect]"
-        in text
-    )
-
-
-def test_interrupted_callback_omits_ctrl():
-    text = format_mission_callback(
-        {
-            "mission_id": "acfb03d2",
-            "status": "interrupted",
-            "title": "killed mid-run",
-            "project": "verity-core",
-        }
-    )
-    assert "[CTRL:" not in text
-    assert "mode=blocked" not in text
-    assert (
-        "[STATE_SIGNATURE: verity-core|mission-callback|acfb03d2|interrupted|inspect]"
-        in text
-    )
-
-
 def test_origin_must_reference_the_mission_when_inspectable():
-    from gateway.platforms.mission_status_route import append_mission_callback
-
     mission = "acfb03d2-d088-46c3-a2a3-6576563f06cb"
     db = _FakeSessionDBWithMessages(
         {"victim": {"source": "desktop"}, "owner": {"source": "desktop"}},
@@ -196,9 +162,44 @@ def test_origin_must_reference_the_mission_when_inspectable():
     assert resolve_mission_delivery_session(legit, db) == "owner"
 
 
-def test_duplicate_event_id_appends_once():
-    from gateway.platforms.mission_status_route import append_mission_callback
+def test_async_session_db_wrapper_is_unwrapped():
+    """Gateway runner._session_db is AsyncSessionDB — must not see coroutines."""
+    import asyncio
 
+    inner = _FakeSessionDBWithMessages(
+        {"owner": {"source": "desktop"}},
+        messages={"owner": [{"content": "start_mission -> acfb03d2"}]},
+    )
+
+    class _AsyncWrap:
+        def __init__(self, db):
+            self._db = db
+
+        def __getattr__(self, name):
+            attr = getattr(self._db, name)
+
+            async def _offloaded(*args, **kwargs):
+                return attr(*args, **kwargs)
+
+            return _offloaded if callable(attr) else attr
+
+    payload = {
+        "mission_id": "acfb03d2",
+        "status": "completed",
+        "origin_session": "owner",
+    }
+    wrapped = _AsyncWrap(inner)
+    assert resolve_mission_delivery_session(payload, wrapped) == "owner"
+    live, appended = append_mission_callback("owner", payload, wrapped)
+    assert live == "owner"
+    assert appended is True
+    assert any("[Mission callback" in t["content"] for t in inner.messages["owner"])
+    pending = wrapped.get_session("owner")
+    assert asyncio.iscoroutine(pending)
+    pending.close()
+
+
+def test_duplicate_event_id_appends_once():
     db = _FakeSessionDBWithMessages({"s1": {"source": "desktop"}})
     payload = {
         "mission_id": "acfb03d2",
@@ -206,9 +207,74 @@ def test_duplicate_event_id_appends_once():
         "title": "retry storm",
         "event_id": "evt-123",
     }
-    assert append_mission_callback("s1", payload, db) == "s1"
-    assert append_mission_callback("s1", payload, db) == "s1"
+    assert append_mission_callback("s1", payload, db) == ("s1", True)
+    assert append_mission_callback("s1", payload, db) == ("s1", False)
     assert len(db.appended) == 1
     # A different delivery still lands.
-    assert append_mission_callback("s1", dict(payload, event_id="evt-456"), db) == "s1"
-    assert len(db.appended) == 2
+    assert append_mission_callback("s1", dict(payload, event_id="evt-456"), db) == (
+        "s1",
+        True,
+    )
+    assert len(db.appended) == 3  # user separator + assistant for the second event
+
+
+def test_callback_inserts_user_separator_after_assistant():
+    db = _FakeSessionDBWithMessages(
+        {"s1": {"source": "desktop"}},
+        messages={"s1": [{"role": "assistant", "content": "already replied"}]},
+    )
+    payload = {"mission_id": "acfb03d2", "status": "completed", "title": "t"}
+    live, appended = append_mission_callback("s1", payload, db)
+    assert live == "s1" and appended
+    roles = [role for _sid, role, _c in db.appended]
+    assert roles == ["user", "assistant"]
+    assert "has finished" in db.appended[0][2]
+    assert "[Mission callback" in db.appended[1][2]
+
+
+def test_origin_ownership_walks_compression_parent():
+    mission = "acfb03d2-d088-46c3-a2a3-6576563f06cb"
+    db = _FakeSessionDBWithMessages(
+        {
+            "parent": {"source": "desktop"},
+            "child": {"source": "desktop", "parent_session_id": "parent"},
+        },
+        resumes={"parent": "child"},
+        messages={
+            "parent": [{"content": f"start_mission -> {mission} dispatched"}],
+            "child": [{"content": "compressed continuation, no mission id"}],
+        },
+    )
+    payload = {
+        "mission_id": mission,
+        "status": "failed",
+        "origin_session": "parent",
+    }
+    assert resolve_mission_delivery_session(payload, db) == "child"
+
+
+def test_should_wake_huge_operator_sessions():
+    # The wake prompt forbids tools; a 500-message control chat still needs
+    # the one-line "mission finished" notice.
+    db = _FakeSessionDB({"s1": {"source": "desktop", "message_count": 515}})
+    assert should_wake_mission_callback(db, "s1") is True
+    db = _FakeSessionDB({"s1": {"source": "desktop", "message_count": 12}})
+    assert should_wake_mission_callback(db, "s1") is True
+    assert PROJECT_OPERATOR_WAKE_MESSAGE_CAP == 80
+
+
+def test_should_wake_skips_a_session_being_compacted():
+    class _Locked(_FakeSessionDB):
+        def get_compression_lock_holder(self, sid):
+            return "pid=1:compressor"
+
+    db = _Locked({"s1": {"source": "desktop", "message_count": 4}})
+    assert should_wake_mission_callback(db, "s1") is False
+
+
+def test_wake_prompt_does_not_order_an_inspect_loop():
+    lower = MISSION_CALLBACK_WAKE_PROMPT.lower()
+    assert "do not inspect" in lower
+    assert "do not run tools" in lower
+    assert "continue autonomously" not in lower
+    assert "if you can continue" not in lower

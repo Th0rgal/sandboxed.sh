@@ -1124,6 +1124,74 @@ mod campaign_guard_tests {
         );
     }
 
+    #[tokio::test]
+    async fn live_mission_on_workspace_is_the_unique_occupant() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let writer = store
+            .create_mission(Some("writer"), None, None, None, None, None, None)
+            .await
+            .expect("create");
+        store
+            .update_mission_status(writer.id, MissionStatus::Active)
+            .await
+            .expect("active");
+        let occupant = live_mission_on_workspace(&store, writer.workspace_id)
+            .await
+            .expect("occupant");
+        assert_eq!(occupant.id, writer.id);
+        store
+            .update_mission_status(writer.id, MissionStatus::Completed)
+            .await
+            .expect("complete");
+        assert!(
+            live_mission_on_workspace(&store, writer.workspace_id)
+                .await
+                .is_none(),
+            "a finished writer frees the worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_codex_oauth_invalidation_detects_chatgpt_refresh_death() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(
+                Some("E1 parallel"),
+                None,
+                None,
+                None,
+                None,
+                Some("codex"),
+                None,
+            )
+            .await
+            .expect("create");
+        store
+            .update_mission_status(mission.id, MissionStatus::Failed)
+            .await
+            .expect("fail");
+        store
+            .update_mission_metadata(
+                mission.id,
+                None,
+                Some(Some(
+                    "auth refresh request failed: ChatGPT OAuth refresh failed: OpenAI OAuth refresh failed (401 Unauthorized): refresh_token_invalidated",
+                )),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("desc");
+        assert!(chatgpt_oauth_refresh_invalidated(
+            "sandboxed-sh: ChatGPT OAuth refresh failed: refresh_token_invalidated"
+        ));
+        assert!(
+            recent_codex_oauth_invalidation(&store).await.is_some(),
+            "a fresh Codex OAuth death must trip the gate"
+        );
+    }
+
     #[test]
     fn terminal_and_archived_statuses_do_not_hold_the_slot() {
         for status in [
@@ -3149,14 +3217,27 @@ async fn mission_has_active_automation(
     }
 }
 
+fn mission_is_terminal_for_goal_loop(status: MissionStatus) -> bool {
+    matches!(
+        status,
+        MissionStatus::Acknowledged
+            | MissionStatus::Completed
+            | MissionStatus::Failed
+            | MissionStatus::Interrupted
+            | MissionStatus::NotFeasible
+            | MissionStatus::Paused
+    )
+}
+
 async fn stop_policy_matches_status(
     stop_policy: &mission_store::StopPolicy,
-    _status: MissionStatus,
+    status: MissionStatus,
     consecutive_failures: u32,
     has_fired: bool,
 ) -> bool {
     match stop_policy {
         mission_store::StopPolicy::Never => false,
+        mission_store::StopPolicy::WhenMissionTerminal => mission_is_terminal_for_goal_loop(status),
         mission_store::StopPolicy::WhenFailingConsecutively { count } => {
             consecutive_failures >= *count
         }
@@ -6041,6 +6122,12 @@ pub struct TrackSummary {
     pub desired_state: Option<String>,
     pub github_pr: Option<String>,
     pub next_check_at: Option<String>,
+    /// The plan's derived state for this track (`ready` / `executing` /
+    /// `waiting` / `blocked` / `satisfied` / `claim_only` / `cancelled`),
+    /// from the situation builder. `None` when the track is mission-only and
+    /// the project has no plan row for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6105,6 +6192,7 @@ pub async fn list_tracks(
                     desired_state: None,
                     github_pr: None,
                     next_check_at: None,
+                    derived_state: None,
                 }
             });
             entry.total += 1;
@@ -6138,10 +6226,39 @@ pub async fn list_tracks(
         offset += PAGE;
     }
 
-    let tracks = order
+    let mut tracks = order
         .into_iter()
         .filter_map(|k| groups.remove(&k))
         .collect::<Vec<_>>();
+
+    // Projection of the situation builder: the same derived state every
+    // other surface renders, looked up once per project.
+    let mut situations: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = std::collections::HashMap::new();
+    for summary in &mut tracks {
+        let (Some(project), Some(track)) = (summary.project.as_deref(), summary.track.as_deref())
+        else {
+            continue;
+        };
+        if !situations.contains_key(project) {
+            let situation =
+                crate::api::projects_overview::load_project_situation(&state, project).await;
+            situations.insert(
+                project.to_string(),
+                situation
+                    .items
+                    .into_iter()
+                    .map(|item| (item.key, item.derived_state.as_str().to_string()))
+                    .collect(),
+            );
+        }
+        summary.derived_state = situations
+            .get(project)
+            .and_then(|states| states.get(track))
+            .cloned();
+    }
     Ok(Json(tracks))
 }
 
@@ -9170,6 +9287,49 @@ fn campaign_slot_held_by(status: MissionStatus) -> bool {
     )
 }
 
+fn chatgpt_oauth_refresh_invalidated(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("refresh_token_invalidated") || t.contains("chatgpt oauth refresh failed")
+}
+
+async fn live_mission_on_workspace(
+    mission_store: &Arc<dyn MissionStore>,
+    workspace_id: Uuid,
+) -> Option<Mission> {
+    const PAGE: usize = 200;
+    mission_store
+        .list_missions(PAGE, 0)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|mission| {
+            mission.workspace_id == workspace_id && campaign_slot_held_by(mission.status)
+        })
+}
+
+async fn recent_codex_oauth_invalidation(mission_store: &Arc<dyn MissionStore>) -> Option<Mission> {
+    const PAGE: usize = 200;
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(6);
+    mission_store
+        .list_missions(PAGE, 0)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|mission| {
+            mission.backend == "codex"
+                && matches!(
+                    mission.status,
+                    MissionStatus::Failed | MissionStatus::Interrupted
+                )
+                && chatgpt_oauth_refresh_invalidated(
+                    mission.short_description.as_deref().unwrap_or(""),
+                )
+                && chrono::DateTime::parse_from_rfc3339(&mission.updated_at)
+                    .ok()
+                    .is_some_and(|at| at.with_timezone(&chrono::Utc) >= cutoff)
+        })
+}
+
 /// Find a non-terminal `track == "campaign"` mission for `project`, if any.
 /// Scan errors return `None` (a duplicate campaign is recoverable; refusing a
 /// legitimate create is not) — same failure direction as the retry coalescer.
@@ -9419,6 +9579,56 @@ pub async fn create_mission(
                     ));
                 }
             }
+        }
+    }
+
+    // One live occupant per worktree. Lido E1 spawned a parallel Codex
+    // worker (`6f1e92b0`) on the same workspace as the existing writer;
+    // ChatGPT OAuth is single-use and the extra occupant also races the
+    // files. Sequential certify-after-repair is fine: the writer is terminal.
+    if let Some(ws_id) = req.workspace_id {
+        let control_state = control_for_user(&state, &user).await;
+        if let Some(existing) = live_mission_on_workspace(&control_state.mission_store, ws_id).await
+        {
+            tracing::info!(
+                workspace_id = %ws_id,
+                existing = %existing.id,
+                "create_mission rejected: workspace already has a live mission"
+            );
+            return Err((
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "workspace_occupied",
+                    "mission_id": existing.id.to_string(),
+                    "title": existing.title,
+                    "message": "this worktree already has a live mission; wait for it or reuse that mission instead of launching a parallel worker",
+                })
+                .to_string(),
+            ));
+        }
+    }
+
+    if req
+        .backend
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|b| b.eq_ignore_ascii_case("codex"))
+    {
+        let control_state = control_for_user(&state, &user).await;
+        if let Some(failed) = recent_codex_oauth_invalidation(&control_state.mission_store).await {
+            tracing::info!(
+                failed = %failed.id,
+                "create_mission rejected: Codex ChatGPT OAuth refresh is invalidated"
+            );
+            return Err((
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "codex_oauth_invalidated",
+                    "mission_id": failed.id.to_string(),
+                    "message": "Codex ChatGPT OAuth refresh is invalidated (refresh_token_invalidated). Do not retry on backend=codex. Use claudecode, kimi, or glm on the existing worktree writer.",
+                })
+                .to_string(),
+            ));
         }
     }
 
@@ -15788,22 +15998,6 @@ async fn automation_scheduler_loop(
                 },
                 DurableJobTerminal(Uuid),
             }
-            let schedule = match &automation.trigger {
-                TriggerType::Interval { seconds } => ScheduleKind::Interval(*seconds),
-                TriggerType::Cron {
-                    expression,
-                    timezone,
-                } => ScheduleKind::Cron {
-                    expression: expression.clone(),
-                    timezone: timezone.clone(),
-                },
-                TriggerType::Webhook { .. } => continue,
-                TriggerType::AgentFinished => continue,
-                TriggerType::Telegram { .. } => continue,
-                TriggerType::DurableJobTerminal { job_id } => {
-                    ScheduleKind::DurableJobTerminal(*job_id)
-                }
-            };
 
             let mission = match mission_store.get_mission(automation.mission_id).await {
                 Ok(Some(mission)) => mission,
@@ -15825,6 +16019,27 @@ async fn automation_scheduler_loop(
                     continue;
                 }
             };
+
+            if matches!(automation.trigger, TriggerType::AgentFinished)
+                && mission_is_terminal_for_goal_loop(mission.status)
+            {
+                tracing::info!(
+                    "Disabling agent_finished automation {} — host mission {} is {:?}",
+                    automation.id,
+                    mission.id,
+                    mission.status
+                );
+                let mut updated = automation.clone();
+                updated.active = false;
+                if let Err(e) = mission_store.update_automation(updated).await {
+                    tracing::warn!(
+                        "Failed to disable automation {} after host mission ended: {}",
+                        automation.id,
+                        e
+                    );
+                }
+                continue;
+            }
 
             let consecutive_failures =
                 consecutive_failure_count_for_automation(&mission_store, &automation).await;
@@ -15863,6 +16078,23 @@ async fn automation_scheduler_loop(
                 }
                 continue;
             }
+
+            let schedule = match &automation.trigger {
+                TriggerType::Interval { seconds } => ScheduleKind::Interval(*seconds),
+                TriggerType::Cron {
+                    expression,
+                    timezone,
+                } => ScheduleKind::Cron {
+                    expression: expression.clone(),
+                    timezone: timezone.clone(),
+                },
+                TriggerType::Webhook { .. } => continue,
+                TriggerType::AgentFinished => continue,
+                TriggerType::Telegram { .. } => continue,
+                TriggerType::DurableJobTerminal { job_id } => {
+                    ScheduleKind::DurableJobTerminal(*job_id)
+                }
+            };
 
             // Check if it's time to trigger based on schedule type.
             let should_trigger = match &schedule {
@@ -16930,6 +17162,47 @@ fn is_transport_failure_evidence(evidence: &crate::agents::CompletionEvidence) -
     )
 }
 
+const TRANSPORT_AUTO_RESUME_PROMPT: &str = "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.";
+
+const CHATGPT_UI_TRANSPORT_FALLBACK_PROMPT: &str = "The previous ChatGPT UI turn failed to start. Repeat the original user request exactly. Do not reconcile git, PRs, Lean, remote jobs, or repository head.";
+
+/// ChatGPT UI turns send only the queued message as the prompt. Replaying the
+/// coding-worker reconcilation stub after a profile lock made Pro lane A on
+/// eip-8282 return a Lean campaign verdict instead of the original rewrite.
+fn transport_auto_resume_message(
+    backend: Option<&str>,
+    original_user_message: Option<&str>,
+) -> String {
+    if backend == Some("chatgpt_ui") {
+        if let Some(original) = original_user_message
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return original.to_string();
+        }
+        return CHATGPT_UI_TRANSPORT_FALLBACK_PROMPT.to_string();
+    }
+    TRANSPORT_AUTO_RESUME_PROMPT.to_string()
+}
+
+async fn transport_auto_resume_message_for_mission(
+    store: &dyn MissionStore,
+    mission_id: Uuid,
+) -> String {
+    let backend = store
+        .get_mission(mission_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|mission| mission.backend);
+    let original = store
+        .get_initial_user_message(mission_id)
+        .await
+        .ok()
+        .flatten();
+    transport_auto_resume_message(backend.as_deref(), original.as_deref())
+}
+
 fn is_bare_llm_error_output(output: &str) -> bool {
     if looks_like_structured_provider_error(output) {
         return true;
@@ -17329,13 +17602,14 @@ async fn agent_finished_automation_messages(
             false
         };
 
-        if stop_policy_matches_status(
-            &automation.stop_policy,
-            mission.status,
-            consecutive_failures,
-            has_fired,
-        )
-        .await
+        if mission_is_terminal_for_goal_loop(mission.status)
+            || stop_policy_matches_status(
+                &automation.stop_policy,
+                mission.status,
+                consecutive_failures,
+                has_fired,
+            )
+            .await
         {
             tracing::info!(
                 "Disabling agent_finished automation {} due to stop policy {:?} (mission {} status {:?})",
@@ -21505,7 +21779,11 @@ async fn control_actor_loop(
                             }
                             && !queue_has_pending_target_mission(&queue, mission_id)
                         {
-                            let resume_message = "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.".to_string();
+                            let resume_message = transport_auto_resume_message_for_mission(
+                                mission_store.as_ref(),
+                                mission_id,
+                            )
+                            .await;
                             let activation = activate_mission_id_for_message(
                                 &control_hub,
                                 &mission_store,
@@ -22107,9 +22385,14 @@ async fn control_actor_loop(
                                     mission_id = %mission_id,
                                     "Auto-resuming parallel mission after structured transport failure"
                                 );
+                                let resume_message = transport_auto_resume_message_for_mission(
+                                    mission_store.as_ref(),
+                                    *mission_id,
+                                )
+                                .await;
                                 runner.queue_message(
                                     Uuid::new_v4(),
-                                    "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.".to_string(),
+                                    resume_message,
                                     None,
                                     Some("transport_auto_resume".to_string()),
                                 );
@@ -32611,6 +32894,31 @@ Investigate <service/> failures.
     }
 
     #[test]
+    fn chatgpt_ui_transport_resume_replays_the_original_prompt() {
+        let original = "You are GPT-5.6 Pro. Rewrite EIP-8282 in French.";
+        assert_eq!(
+            transport_auto_resume_message(Some("chatgpt_ui"), Some(original)),
+            original
+        );
+        assert_eq!(
+            transport_auto_resume_message(Some("chatgpt_ui"), Some("  \n ")),
+            CHATGPT_UI_TRANSPORT_FALLBACK_PROMPT
+        );
+        assert_eq!(
+            transport_auto_resume_message(Some("chatgpt_ui"), None),
+            CHATGPT_UI_TRANSPORT_FALLBACK_PROMPT
+        );
+        assert_eq!(
+            transport_auto_resume_message(Some("codex"), Some(original)),
+            TRANSPORT_AUTO_RESUME_PROMPT
+        );
+        assert_eq!(
+            transport_auto_resume_message(Some("opencode"), None),
+            TRANSPORT_AUTO_RESUME_PROMPT
+        );
+    }
+
+    #[test]
     fn maybe_recover_soft_llm_error_preserves_pending_tool_transport_failure() {
         let mut result = crate::agents::AgentResult::failure(
             "Codex stopped while tool calls were still pending: remote build".to_string(),
@@ -32909,6 +33217,32 @@ Investigate <service/> failures.
             )
             .await
         );
+    }
+
+    #[tokio::test]
+    async fn test_stop_policy_when_mission_terminal() {
+        assert!(
+            !stop_policy_matches_status(
+                &mission_store::StopPolicy::WhenMissionTerminal,
+                MissionStatus::Active,
+                0,
+                false,
+            )
+            .await
+        );
+        assert!(
+            stop_policy_matches_status(
+                &mission_store::StopPolicy::WhenMissionTerminal,
+                MissionStatus::Acknowledged,
+                0,
+                false,
+            )
+            .await
+        );
+        assert!(mission_is_terminal_for_goal_loop(
+            MissionStatus::Interrupted
+        ));
+        assert!(!mission_is_terminal_for_goal_loop(MissionStatus::Active));
     }
 
     #[tokio::test]

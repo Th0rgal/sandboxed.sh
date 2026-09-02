@@ -41,6 +41,12 @@ python3 -m venv /opt/sandboxed-sh/chatgpt-ui-venv
 /opt/sandboxed-sh/chatgpt-ui-venv/bin/playwright install chromium
 install -D -m 0755 scripts/chatgpt_ui_driver.py \
   /opt/sandboxed-sh/scripts/chatgpt_ui_driver.py
+install -D -m 0755 scripts/chatgpt_ui_pool_health.py \
+  /opt/sandboxed-sh/scripts/chatgpt_ui_pool_health.py
+install -D -m 0755 scripts/chatgpt_ui_relogin.py \
+  /opt/sandboxed-sh/scripts/chatgpt_ui_relogin.py
+install -D -m 0755 scripts/chatgpt_ui_login_steps.py \
+  /opt/sandboxed-sh/scripts/chatgpt_ui_login_steps.py
 ```
 
 Create a dedicated profile directory outside repositories and mission
@@ -121,9 +127,31 @@ driver is selected automatically. `CHATGPT_UI_PROXY` is optional and should
 match `proxy_server` when the account requires a stable external egress.
 `CHATGPT_UI_HEADLESS=false` requires a working `DISPLAY`.
 
+## Session repair
+
+Expired ChatGPT cookies used to need a VNC session on display `:93`. Pool
+health now starts `chatgpt-ui-relogin.service` when it sees a logged-out slot.
+That unit reads Hermes's Bitwarden token and these secret keys, then logs in
+one idle profile and clones it over the other idle dead slots:
+
+- `CHATGPT_USERNAME`
+- `CHATGPT_PASSWORD`
+- `CHATGPT_OTP` (TOTP secret or `otpauth://` URI)
+
+The helper never prints those values, never bypasses CAPTCHA/Cloudflare, and
+never writes a profile a mission currently holds. Login is a step registry
+(`scripts/chatgpt_ui_login_steps.py`): each tick dispatches on the visible
+surface (picker, email, password, TOTP, passkey, locale chrome) instead of
+assuming one field order. Add a new `LoginStep` plus a snapshot test when a
+new UI shows up. Failed missions still terminate with `auth_required`;
+relogin only repairs the next dispatch.
+Manual recovery remains `systemctl start chatgpt-ui-relogin.service`, or VNC
+on `:93` if Cloudflare or emailed MFA blocks the form.
+
 ## Diagnostics
 
-- `auth_required`: provision or refresh login interactively.
+- `auth_required`: pool health starts automatic relogin from Bitwarden; if
+  that unit fails, provision or refresh login interactively on `:93`.
 - Auth status in the settings API stays unknown until a driver turn loads a
   blank page; directory presence is never treated as proof of authentication.
 - `requested model is not visibly available`: verify the exact current label

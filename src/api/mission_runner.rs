@@ -468,12 +468,12 @@ pub(crate) fn workspace_api_base_url(workspace: &Workspace) -> Option<String> {
 
 /// Claude Code's built-in `ScheduleWakeup` tool ends the agent's turn with a
 /// promise that "the harness re-invokes you when the wakeup fires" — but in
-/// `--print` mode, open_agent is the harness and would otherwise have no way
+/// `--print` mode, sandboxed.sh is the harness and would otherwise have no way
 /// to know about the request. These helpers translate the built-in tool call
-/// into an open_agent interval automation that fires the prompt back into the
+/// into a sandboxed.sh interval automation that fires the prompt back into the
 /// mission after the requested delay (mirroring `automation_manager_mcp`'s
 /// `schedule_wakeup`). The delay is clamped to the same [60, 3600] range
-/// open_agent's own wakeup tool advertises.
+/// sandboxed.sh's own wakeup tool advertises.
 const CLAUDE_BUILTIN_WAKEUP_MIN_SECONDS: u64 = 60;
 const CLAUDE_BUILTIN_WAKEUP_MAX_SECONDS: u64 = 3600;
 

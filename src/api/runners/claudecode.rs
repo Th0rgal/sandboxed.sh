@@ -1535,7 +1535,7 @@ pub fn run_claudecode_turn<'a>(
         // Track tool calls for result mapping
         let mut pending_tools: HashMap<String, String> = HashMap::new();
         // Track Claude Code's built-in ScheduleWakeup calls so we can convert
-        // a successful tool result into an open_agent wakeup automation.
+        // a successful tool result into a sandboxed.sh wakeup automation.
         // Maps tool_use_id -> (delay_seconds, prompt, reason).
         let mut pending_wakeups: HashMap<String, (u64, String, String)> = HashMap::new();
         let mut total_cost_usd: Option<f64> = None;
@@ -2369,7 +2369,7 @@ pub fn run_claudecode_turn<'a>(
                                             }
 
                                             // Convert a successful Claude built-in
-                                            // ScheduleWakeup into an open_agent wakeup
+                                            // ScheduleWakeup into a sandboxed.sh wakeup
                                             // automation. Claude Code's CLI handles the
                                             // tool locally and emits a confirmation result
                                             // but no further re-invocation happens in

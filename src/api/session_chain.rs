@@ -34,10 +34,12 @@ fn open(db_path: &Path) -> Option<rusqlite::Connection> {
 
 /// The live continuation tip of `session_id`, following children forward.
 ///
-/// Returns `session_id` itself when it has no continuation, when the database
-/// is unreadable, or when the row does not exist. Degrading to the declared id
-/// is the right failure: it is what the operator asked for, and a stale answer
-/// beats no answer on a display path.
+/// Same order as Hermes `resolve_delivery_session_id`: a live non-cron,
+/// non-tool descendant (the operator's adopted subagent chat) wins, then a
+/// compression continuation. Returns `session_id` itself when it has no
+/// continuation, when the database is unreadable, or when the row does not
+/// exist. Degrading to the declared id is the right failure: it is what the
+/// operator asked for, and a stale answer beats no answer on a display path.
 pub fn live_tip(db_path: &Path, session_id: &str) -> String {
     let Some(connection) = open(db_path) else {
         return session_id.to_string();
@@ -46,7 +48,9 @@ pub fn live_tip(db_path: &Path, session_id: &str) -> String {
     let mut seen: HashSet<String> = HashSet::from([current.clone()]);
 
     for _ in 0..MAX_CHAIN_DEPTH {
-        let Some(next) = newest_livable_child(&connection, &current) else {
+        let next = newest_live_operator_child(&connection, &current)
+            .or_else(|| newest_livable_child(&connection, &current));
+        let Some(next) = next else {
             break;
         };
         if !seen.insert(next.clone()) {
@@ -55,6 +59,26 @@ pub fn live_tip(db_path: &Path, session_id: &str) -> String {
         current = next;
     }
     current
+}
+
+/// Live SessionDB child the operator is actually in (not a cron tick, not a
+/// tool worker). Mirrors Hermes delivery: `ended_at IS NULL`, source not
+/// `cron`/`tool`, most recently active first. Missing `source` /
+/// `last_activity_at` columns fall through to the compression walk.
+fn newest_live_operator_child(connection: &rusqlite::Connection, parent: &str) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT id FROM sessions \
+             WHERE parent_session_id = ?1 \
+               AND ended_at IS NULL \
+               AND COALESCE(source, '') NOT IN ('cron', 'tool') \
+             ORDER BY COALESCE(last_activity_at, started_at) DESC, \
+                      started_at DESC, id DESC \
+             LIMIT 1",
+            [parent],
+            |row| row.get(0),
+        )
+        .ok()
 }
 
 /// Newest child that is actually a conversation, not a failed compression fork.
@@ -77,7 +101,8 @@ fn newest_livable_child_rich(
     parent: &str,
 ) -> Result<Option<String>, rusqlite::Error> {
     let mut statement = connection.prepare(
-        "SELECT id, ended_at, end_reason, started_at, message_count \
+        "SELECT id, ended_at, end_reason, started_at, message_count, \
+                COALESCE(source, '') \
          FROM sessions WHERE parent_session_id = ?1 ORDER BY id DESC",
     )?;
     let rows = statement.query_map([parent], |row| {
@@ -87,10 +112,14 @@ fn newest_livable_child_rich(
             row.get::<_, Option<String>>(2).ok().flatten(),
             row.get::<_, Option<f64>>(3).ok().flatten(),
             row.get::<_, Option<i64>>(4).ok().flatten(),
+            row.get::<_, String>(5).unwrap_or_default(),
         ))
     })?;
     for row in rows.flatten() {
-        let (id, ended_at, end_reason, started_at, message_count) = row;
+        let (id, ended_at, end_reason, started_at, message_count, source) = row;
+        if matches!(source.as_str(), "cron" | "tool") {
+            continue;
+        }
         if child_is_livable(end_reason.as_deref(), started_at, ended_at, message_count) {
             return Ok(Some(id));
         }
@@ -207,6 +236,8 @@ mod tests {
         ended_at: Option<f64>,
         end_reason: Option<&'a str>,
         message_count: i64,
+        source: Option<&'a str>,
+        last_activity_at: Option<f64>,
     }
 
     fn rich_db(rows: &[RichRow<'_>]) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -221,7 +252,9 @@ mod tests {
                     started_at REAL, \
                     ended_at REAL, \
                     end_reason TEXT, \
-                    message_count INTEGER\
+                    message_count INTEGER, \
+                    source TEXT, \
+                    last_activity_at REAL\
                 )",
                 [],
             )
@@ -230,15 +263,18 @@ mod tests {
             connection
                 .execute(
                     "INSERT INTO sessions \
-                     (id, parent_session_id, started_at, ended_at, end_reason, message_count) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (id, parent_session_id, started_at, ended_at, end_reason, \
+                      message_count, source, last_activity_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     rusqlite::params![
                         row.id,
                         row.parent,
                         row.started_at,
                         row.ended_at,
                         row.end_reason,
-                        row.message_count
+                        row.message_count,
+                        row.source,
+                        row.last_activity_at
                     ],
                 )
                 .expect("insert");
@@ -343,6 +379,8 @@ mod tests {
                 ended_at: None,
                 end_reason: None,
                 message_count: 40,
+                source: Some("api_server"),
+                last_activity_at: Some(1_000.0),
             },
             RichRow {
                 id: "dead-child",
@@ -351,6 +389,8 @@ mod tests {
                 ended_at: Some(2_003.0),
                 end_reason: Some("compression_exhausted"),
                 message_count: 0,
+                source: Some("desktop"),
+                last_activity_at: Some(2_000.0),
             },
         ]);
         assert_eq!(live_tip(&path, "parent"), "parent");
@@ -366,6 +406,8 @@ mod tests {
                 ended_at: Some(2_000.0),
                 end_reason: Some("compression"),
                 message_count: 40,
+                source: Some("desktop"),
+                last_activity_at: Some(2_000.0),
             },
             RichRow {
                 id: "child",
@@ -374,6 +416,8 @@ mod tests {
                 ended_at: None,
                 end_reason: None,
                 message_count: 12,
+                source: Some("desktop"),
+                last_activity_at: Some(2_100.0),
             },
         ]);
         assert_eq!(live_tip(&path, "parent"), "child");
@@ -400,5 +444,70 @@ mod tests {
             ),
             "verity-core"
         );
+    }
+
+    #[test]
+    fn a_live_subagent_child_is_the_delivery_tip() {
+        // Lido: bound parent e31271 (api_server) with live subagent c0b8a8.
+        let (_dir, path) = rich_db(&[
+            RichRow {
+                id: "e31271",
+                parent: None,
+                started_at: 1_000.0,
+                ended_at: None,
+                end_reason: None,
+                message_count: 144,
+                source: Some("api_server"),
+                last_activity_at: Some(1_100.0),
+            },
+            RichRow {
+                id: "c0b8a8",
+                parent: Some("e31271"),
+                started_at: 1_200.0,
+                ended_at: None,
+                end_reason: None,
+                message_count: 1110,
+                source: Some("subagent"),
+                last_activity_at: Some(2_000.0),
+            },
+            RichRow {
+                id: "cron-tick",
+                parent: Some("e31271"),
+                started_at: 1_900.0,
+                ended_at: None,
+                end_reason: None,
+                message_count: 4,
+                source: Some("cron"),
+                last_activity_at: Some(2_100.0),
+            },
+        ]);
+        assert_eq!(live_tip(&path, "e31271"), "c0b8a8");
+    }
+
+    #[test]
+    fn a_cron_child_is_not_the_tip() {
+        let (_dir, path) = rich_db(&[
+            RichRow {
+                id: "parent",
+                parent: None,
+                started_at: 1_000.0,
+                ended_at: None,
+                end_reason: None,
+                message_count: 10,
+                source: Some("desktop"),
+                last_activity_at: Some(1_000.0),
+            },
+            RichRow {
+                id: "cron-tick",
+                parent: Some("parent"),
+                started_at: 2_000.0,
+                ended_at: None,
+                end_reason: None,
+                message_count: 3,
+                source: Some("cron"),
+                last_activity_at: Some(2_000.0),
+            },
+        ]);
+        assert_eq!(live_tip(&path, "parent"), "parent");
     }
 }

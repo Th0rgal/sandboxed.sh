@@ -8,8 +8,8 @@ description: >
   resume, keep going, very hard question, ChatGPT UI, gpt-5.6-pro.
 metadata:
   policy: chatgpt-ui-pool
-  policy_version: 1.3.0
-version: 1.11.0
+  policy_version: 1.4.0
+version: 1.12.0
 ---
 
 # Hermes Mission Control
@@ -122,9 +122,11 @@ wakeup and do not wait. Report on the next tick or via the project
 route. A `cron_*` session dies with the tick; never stamp one as origin.
 
 The project's items **are** the roadmap (`get_project` / `get_project_tasks`
-are the same list). `plan_project_tasks` upserts an item. Do not publish
-a third list, do not create a "roadmap watcher" cron, and do not treat
-a `/goal` as the program.
+are the same list: `project_tracks` + live attempts). `plan_project_tasks`
+upserts an item; `set_project_track(..., cancelled)` retires one. Editing
+`projects/active/<slug>.md` does not change the right-rail checklist. Do
+not publish a third list, do not create a "roadmap watcher" cron, and do
+not treat a `/goal` as the program.
 
 ### On callback
 
@@ -208,7 +210,7 @@ When a model "isn't working," first prove it's the **model** and not the
 concluding the model is too weak. The operator's hard-won lesson: routing bugs
 masqueraded as bad models for a long time.
 
-## ChatGPT UI pool policy (policy_version 1.3.0)
+## ChatGPT UI pool policy (policy_version 1.4.0)
 
 Binding rules for every `chatgpt_ui` mission you start or manage. The
 authoritative versioned policy is `docs/policy/CHATGPT_UI_POOL_POLICY.md` in
@@ -254,7 +256,11 @@ this section must stay in sync with it.
   mission and gets 0 automatic retries. The slot is quarantined for 30
   minutes; cooldown expiry permits a later explicit recovery attempt but does
   not prove the login was repaired. Never use an auth-failed slot for the
-  one compatibility retry.
+  one compatibility retry. Pool health starts `chatgpt-ui-relogin.service`,
+  which logs in one idle profile from Bitwarden `CHATGPT_USERNAME` /
+  `CHATGPT_PASSWORD` / `CHATGPT_OTP` and clones it over other idle dead slots.
+  That repair is not a mission retry. If relogin fails (CAPTCHA, emailed MFA,
+  missing secrets), escalate to the operator — do not VNC first.
 - **Rate limited → wait.** 0 automatic retries; allowance must recover.
   Do not shuffle the request across slots of the same account. One exact “Too
   many requests” page opens a shared 10-minute circuit immediately; an older
