@@ -277,6 +277,10 @@ pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
     )
 }
 
+fn background_tasks_block_ack(status: MissionStatus, task_count: usize) -> bool {
+    status == MissionStatus::Acknowledged && task_count > 0
+}
+
 /// Stash a newly arrived operator message as the mission's deferred goal.
 ///
 /// Pending missions have not run yet, so multiple pre-dispatch messages
@@ -7516,6 +7520,9 @@ pub struct CreateMissionRequest {
     pub tags: Option<Vec<String>>,
     /// Track state, e.g. "waiting_ci" / "waiting_review" / "blocked_external".
     pub desired_state: Option<String>,
+    /// Acceptance contract declared (or revised) on the track by this dispatch.
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
     /// When the track should next be checked (RFC3339).
     pub next_check_at: Option<String>,
     /// Initial prompt for the mission. Stored as the mission's deferred goal:
@@ -9428,6 +9435,7 @@ async fn bind_mission_to_track(
     tags: &[String],
     request_is_writer: bool,
     idempotency_key: Option<&str>,
+    acceptance_criteria: &[String],
 ) -> Result<String, (StatusCode, String)> {
     use super::track_leases;
     let mission_id = mission.id.to_string();
@@ -9476,6 +9484,22 @@ async fn bind_mission_to_track(
     } else {
         track_leases::lease_mode(writer_flag, tags, intent)
     };
+    // A dispatch may declare or revise the track's acceptance contract, but
+    // never a satisfied track's (planning rules apply).
+    if !acceptance_criteria.is_empty() {
+        if let Err(error) = state.projects.patch_track(
+            project,
+            &outcome.key,
+            None,
+            None,
+            None,
+            Some(acceptance_criteria),
+            None,
+        ) {
+            tracing::warn!(mission_id = %mission_id, project, track = %outcome.key, %error,
+                "could not declare acceptance criteria from dispatch");
+        }
+    }
     let request =
         track_leases::lease_request(project, &outcome.key, &mission_id, mode, idempotency_key);
     match state.projects.acquire_track_lease(&request) {
@@ -9539,6 +9563,7 @@ pub async fn create_mission(
         intent: None,
         github_pr: None,
         writer: None,
+        acceptance_criteria: Vec::new(),
         tags: None,
         desired_state: None,
         next_check_at: None,
@@ -9588,6 +9613,35 @@ pub async fn create_mission(
         );
         if let Ok(value) = axum::http::HeaderValue::from_str(&joined) {
             headers.insert("x-ignored-fields", value);
+        }
+    }
+
+    // Retried dispatch: the caller's idempotency key already holds a live
+    // track lease. Answer with the mission that holds it instead of creating
+    // (and then interrupting) a duplicate.
+    if let Some(key) = req
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        if let Ok(Some(lease)) = state.projects.lease_by_key(&format!("lease:{key}")) {
+            if let Ok(mission_id) = Uuid::parse_str(&lease.attempt_id) {
+                let control_state = control_for_user(&state, &user).await;
+                if let Ok(Some(existing)) =
+                    control_state.mission_store.get_mission(mission_id).await
+                {
+                    tracing::info!(
+                        mission_id = %existing.id,
+                        idempotency_key = key,
+                        "create_mission coalesced onto the mission holding this dispatch key"
+                    );
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&existing.id.to_string()) {
+                        headers.insert("x-coalesced-with", value);
+                    }
+                    return Ok((headers, Json(existing)));
+                }
+            }
         }
     }
 
@@ -10160,7 +10214,7 @@ pub async fn create_mission(
             }
         }
     }
-    control
+    if let Err(error) = control
         .cmd_tx
         .send(ControlCommand::CreateMission {
             title,
@@ -10184,9 +10238,19 @@ pub async fn create_mission(
             respond: tx,
         })
         .await
-        .map_err(session_unavailable)?;
+    {
+        return Err(session_unavailable(error));
+    }
 
-    let mut mission = rx.await.map_err(recv_failed)?.map_err(internal_error)?;
+    let mut mission = match rx.await {
+        Ok(Ok(mission)) => mission,
+        Ok(Err(error)) => {
+            return Err(internal_error(error));
+        }
+        Err(error) => {
+            return Err(recv_failed(error));
+        }
+    };
 
     // Close the preflight-to-create race under the store-only mutex. Exactly
     // one concurrent creator wins; a loser is durably interrupted before it
@@ -10253,7 +10317,12 @@ pub async fn create_mission(
     // An explicit value always wins, including a deliberate blank, which is
     // how a caller says "this belongs to no project".
     let project = match nonblank(&req.project) {
-        Some(explicit) => Some(explicit),
+        Some(explicit) => Some(
+            super::projects_overview::resolve_roster_slug(&state.projects, &explicit)
+                .ok()
+                .flatten()
+                .unwrap_or(explicit),
+        ),
         None if req.project.is_some() => None,
         None => req
             .origin_session_id
@@ -10308,6 +10377,7 @@ pub async fn create_mission(
             tags.as_deref().unwrap_or(&[]),
             request_is_writer,
             req.idempotency_key.as_deref(),
+            &req.acceptance_criteria,
         )
         .await
         {
@@ -10884,6 +10954,13 @@ fn select_actor_run_lease(
     }
 }
 
+fn terminal_wake_must_wait_for_harness(
+    execution_state: MissionExecutionState,
+    actor_owns_run: bool,
+) -> bool {
+    execution_state != MissionExecutionState::WaitingRemoteJob && actor_owns_run
+}
+
 async fn deliver_remote_build_terminal_wake(
     state: &AppState,
     receipt: &crate::remote_node::job_ledger::RemoteJobReceipt,
@@ -10973,11 +11050,25 @@ async fn deliver_remote_build_terminal_wake(
     }
     if let Some(run) = active_run {
         if run.execution_state != MissionExecutionState::WaitingRemoteJob {
-            // The harness is still consuming the synchronous result. Let that
-            // turn finish rather than racing it with a second continuation.
-            return Ok(false);
-        }
-        if actor_run.is_none() {
+            if terminal_wake_must_wait_for_harness(run.execution_state, actor_run.is_some()) {
+                // The harness is still consuming the synchronous result. Let
+                // that turn finish rather than racing it with a continuation.
+                return Ok(false);
+            }
+            // The turn is gone but the parking heartbeat lost its race with
+            // finalization (observed on srv3: terminal receipt present while
+            // the durable run stayed `running` forever). The immutable remote
+            // receipt now owns the continuation, so repair the orphaned run
+            // before delivery instead of deferring the wake indefinitely.
+            owner
+                .mission_store
+                .finish_mission_run(
+                    run.run_id,
+                    run.generation,
+                    Some("remote_build_terminal_after_unparked_turn"),
+                )
+                .await?;
+        } else if actor_run.is_none() {
             owner
                 .mission_store
                 .finish_mission_run(
@@ -14107,6 +14198,7 @@ pub async fn clone_mission(
         intent: source.project.intent.clone(),
         github_pr: source.project.github_pr.clone(),
         writer: None,
+        acceptance_criteria: Vec::new(),
         tags: if source.project.tags.is_empty() {
             None
         } else {
@@ -17512,6 +17604,7 @@ async fn maybe_finalize_terminal_mission(
     mission_store: &Arc<dyn MissionStore>,
     events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
     mission_id: Uuid,
+    live_background_tasks: usize,
     terminal_reason: Option<TerminalReason>,
     // What the terminating guard observed, from AgentResult::terminal_evidence.
     terminal_evidence: Option<&str>,
@@ -17533,7 +17626,20 @@ async fn maybe_finalize_terminal_mission(
             || lower.contains("stream closed before mission")
             || lower.contains("codex app-server stream closed")
     });
-    let mapped = if transportish && matches!(reason, TerminalReason::LlmError) {
+    let mapped = if live_background_tasks > 0
+        && matches!(
+            reason,
+            TerminalReason::TurnComplete | TerminalReason::Completed | TerminalReason::LlmError
+        ) {
+        // Claude Code can emit its terminal result before descendants of a
+        // `run_in_background` Bash call release the PTY. The bounded teardown
+        // then SIGKILLs the lingering CLI process, which historically changed
+        // a healthy parked mission into Failed and invited a controller retry
+        // while the build was still running. The shared registry is the
+        // authoritative evidence that useful work remains live: park the
+        // mission and let bg-autoresume deliver the receipt when it completes.
+        Some((MissionStatus::WaitingBackground, "background_jobs_running"))
+    } else if transportish && matches!(reason, TerminalReason::LlmError) {
         Some((MissionStatus::Interrupted, "transport"))
     } else {
         mission_status_for_terminal_reason(reason, complete_turn_without_follow_up)
@@ -17705,6 +17811,18 @@ async fn maybe_finalize_terminal_mission(
                     status: new_status,
                     summary: mission_status_summary_for_terminal_reason(reason),
                 });
+
+                // Broadcast delivery is best-effort. Mirror the explicit
+                // SetMissionStatus path and schedule teardown directly so a
+                // finalizer cannot leak detached WorkspaceExec scopes when
+                // the scope-reaper listener is lagged or attached to another
+                // per-user control channel. The delayed status recheck still
+                // preserves missions promoted to WaitingBackground.
+                super::scope_reaper::schedule_mission_scope_teardown(
+                    Arc::clone(mission_store),
+                    mission_id,
+                    new_status,
+                );
 
                 // Stall-guard: orchestrators that park in awaiting_user with no
                 // wakeup armed can't resume themselves — arm a bounded fallback.
@@ -20140,6 +20258,24 @@ async fn control_actor_loop(
                         }
                     }
                     ControlCommand::SetMissionStatus { id, status: new_status, respond } => {
+                        // A completion callback can race the 10s background-task
+                        // reconciler. Controllers often acknowledge immediately;
+                        // without this guard they can archive the mission before
+                        // AwaitingUser is promoted to WaitingBackground, then a
+                        // follow-up starts a second harness in the same scope and
+                        // kills the still-running build tree. Fail closed while
+                        // the in-memory registry has any live task for this mission.
+                        let background_task_count = background_tasks
+                            .read()
+                            .await
+                            .get(&id)
+                            .map_or(0, std::collections::HashMap::len);
+                        if background_tasks_block_ack(new_status, background_task_count) {
+                            let _ = respond.send(Err(format!(
+                                "mission {id} cannot be acknowledged while background tasks are live"
+                            )));
+                            continue;
+                        }
                         let current_id = *current_mission.read().await;
                         if current_id == Some(id) {
                             if let Some(tree) = current_tree.read().await.clone() {
@@ -20175,6 +20311,15 @@ async fn control_actor_loop(
                                 status: new_status,
                                 summary: None,
                             });
+                            // Broadcast delivery is best-effort. Also schedule
+                            // the same guarded cleanup directly so an
+                            // acknowledged mission cannot leave a forked
+                            // dbus/MCP child pinning its transient scope.
+                            super::scope_reaper::schedule_mission_scope_teardown(
+                                Arc::clone(&mission_store),
+                                id,
+                                new_status,
+                            );
                         }
                         let _ = respond.send(result);
                     }
@@ -21809,6 +21954,11 @@ async fn control_actor_loop(
                                     &mission_store,
                                     &events_tx,
                                     mission_id,
+                                    background_tasks
+                                        .read()
+                                        .await
+                                        .get(&mission_id)
+                                        .map_or(0, std::collections::HashMap::len),
                                     agent_result.terminal_reason,
                                     agent_result.terminal_evidence.as_deref(),
                                     Some(completion_evidence.completion_confidence),
@@ -22086,6 +22236,11 @@ async fn control_actor_loop(
                                 &mission_store,
                                 &events_tx,
                                 mission_id,
+                                background_tasks
+                                    .read()
+                                    .await
+                                    .get(&mission_id)
+                                    .map_or(0, std::collections::HashMap::len),
                                 completed_terminal_reason,
                                 None,
                                 completed_completion_confidence,
@@ -22745,6 +22900,11 @@ async fn control_actor_loop(
                                         &mission_store,
                                         &events_tx,
                                         *mission_id,
+                                        background_tasks
+                                            .read()
+                                            .await
+                                            .get(mission_id)
+                                            .map_or(0, std::collections::HashMap::len),
                                         result.terminal_reason,
                                         result.terminal_evidence.as_deref(),
                                         Some(completion_evidence.completion_confidence),
@@ -27461,6 +27621,22 @@ mod tests {
             select_actor_run_lease(mission_id, false, None, None, true, Some((run_id, 9)),),
             Some((run_id, 9))
         );
+    }
+
+    #[test]
+    fn remote_terminal_wake_repairs_an_unparked_orphan_only() {
+        assert!(terminal_wake_must_wait_for_harness(
+            MissionExecutionState::Running,
+            true
+        ));
+        assert!(!terminal_wake_must_wait_for_harness(
+            MissionExecutionState::Running,
+            false
+        ));
+        assert!(!terminal_wake_must_wait_for_harness(
+            MissionExecutionState::WaitingRemoteJob,
+            true
+        ));
     }
 
     #[test]
@@ -32716,6 +32892,13 @@ Investigate <service/> failures.
     }
 
     #[test]
+    fn acknowledgement_is_blocked_while_background_tasks_are_registered() {
+        assert!(background_tasks_block_ack(MissionStatus::Acknowledged, 1));
+        assert!(!background_tasks_block_ack(MissionStatus::Acknowledged, 0));
+        assert!(!background_tasks_block_ack(MissionStatus::Active, 1));
+    }
+
+    #[test]
     fn every_targeted_queued_delivery_reasserts_mission_activation() {
         let mission_id = Uuid::new_v4();
 
@@ -32992,6 +33175,7 @@ Investigate <service/> failures.
             &store,
             &events_tx,
             mission.id,
+            0,
             Some(TerminalReason::LlmError),
             None,
             None,
@@ -33013,6 +33197,52 @@ Investigate <service/> failures.
     }
 
     #[tokio::test]
+    async fn terminal_turn_parks_while_background_task_is_live() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("Background build"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("mission should be active");
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel(8);
+
+        maybe_finalize_terminal_mission(
+            &store,
+            &events_tx,
+            mission.id,
+            1,
+            Some(TerminalReason::LlmError),
+            None,
+            None,
+            false,
+            Some("Claude Code produced no output after its terminal result"),
+            "background task test",
+        )
+        .await;
+
+        let updated = store
+            .get_mission(mission.id)
+            .await
+            .expect("mission lookup should succeed")
+            .expect("mission should exist");
+        assert_eq!(updated.status, MissionStatus::WaitingBackground);
+        assert_eq!(
+            updated.terminal_reason.as_deref(),
+            Some("background_jobs_running")
+        );
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(AgentEvent::MissionStatusChanged {
+                status: MissionStatus::WaitingBackground,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn maybe_finalize_terminal_mission_skips_low_confidence_completed() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
@@ -33029,6 +33259,7 @@ Investigate <service/> failures.
             &store,
             &events_tx,
             mission.id,
+            0,
             Some(TerminalReason::Completed),
             None,
             Some(crate::agents::CompletionConfidence::Low),

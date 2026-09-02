@@ -4091,11 +4091,21 @@ pub(crate) fn workspace_path_for_env(
     workspace: &Workspace,
     host_path: &std::path::Path,
 ) -> std::path::PathBuf {
-    if workspace.workspace_type == workspace::WorkspaceType::Container
-        && workspace::use_nspawn_for_workspace(workspace)
-    {
-        if let Ok(rel) = host_path.strip_prefix(&workspace.path) {
-            return std::path::PathBuf::from("/").join(rel);
+    workspace_path_for_env_with_nspawn(
+        workspace,
+        host_path,
+        workspace::use_nspawn_for_workspace(workspace),
+    )
+}
+
+fn workspace_path_for_env_with_nspawn(
+    workspace: &Workspace,
+    host_path: &std::path::Path,
+    uses_nspawn: bool,
+) -> std::path::PathBuf {
+    if workspace.workspace_type == workspace::WorkspaceType::Container && uses_nspawn {
+        if let Some(relative) = workspace::strip_workspace_prefix(host_path, &workspace.path) {
+            return std::path::PathBuf::from("/").join(relative);
         }
     }
     host_path.to_path_buf()
@@ -4687,9 +4697,33 @@ fn is_opencode_exit_status_placeholder(output: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_shell_launch_diagnostic(output: &str) -> bool {
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(line) = lines.next() else {
+        return false;
+    };
+    if lines.next().is_some() {
+        return false;
+    }
+    let lower = line.to_ascii_lowercase();
+    let shell_prefix = lower.starts_with("sh: ")
+        || lower.starts_with("/bin/sh: ")
+        || lower.starts_with("bash: ")
+        || lower.starts_with("/bin/bash: ");
+    shell_prefix
+        && (lower.ends_with(": not found")
+            || lower.contains(": permission denied")
+            || lower.contains(": cannot open"))
+}
+
 pub(crate) fn opencode_output_needs_fallback(output: &str) -> bool {
     let sanitized = sanitized_opencode_stdout(output);
-    sanitized.trim().is_empty() || is_opencode_exit_status_placeholder(sanitized.as_ref())
+    sanitized.trim().is_empty()
+        || is_opencode_exit_status_placeholder(sanitized.as_ref())
+        || is_shell_launch_diagnostic(sanitized.as_ref())
 }
 
 pub(crate) fn summarize_recent_opencode_stderr(
@@ -7197,14 +7231,16 @@ fn claudecode_install_command(
 }
 
 fn desired_claudecode_version() -> String {
-    // 2.1.140 ships the bug-fixed native `/goal` slash command (added in
-    // 2.1.139, hardened against `disableAllHooks` / `allowManagedHooksOnly`
-    // in 2.1.140). Bumping the pin so the per-workspace install matches what
-    // `run_claudecode_native_goal` relies on.
+    // 2.1.257 is the first production pin that supports Claude Fable 5.1
+    // (`claude-fable-5-1` requires Claude Code >= 2.1.251). It also retains
+    // the bug-fixed native `/goal` command introduced in 2.1.139 and hardened
+    // in 2.1.140. Keep the per-workspace installer at or above this version:
+    // otherwise mission startup silently downgrades the host CLI and the
+    // model appears in the catalog but every Fable 5.1 dispatch fails.
     std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "2.1.140".to_string())
+        .unwrap_or_else(|| "2.1.257".to_string())
 }
 
 async fn claude_cli_matches_desired_version(
@@ -9293,12 +9329,12 @@ mod tests {
         strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
         summarize_recent_opencode_stderr, text_buffer_stream_looks_degenerate,
         thinking_overlaps_visible_answer, tls_error_hint, truncate_garbled_output,
-        use_thinking_only_fallback, utf8_safe_prefix, ClaudeIncompleteTurnContext,
-        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
-        CopiedOpenCodeProbe, MissionHealth, MissionRunState, MissionRunner, MissionStallSeverity,
-        OpencodeSseState, CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT, CODEX_AUTH_ERROR_COOLDOWN,
-        CODEX_CAPACITY_COOLDOWN, CODEX_PENDING_TOOLS_ERROR_PREFIX, CODEX_RATE_LIMIT_COOLDOWN,
-        STALL_SEVERE_SECS, STALL_WARN_SECS,
+        use_thinking_only_fallback, utf8_safe_prefix, workspace_path_for_env_with_nspawn,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, CopiedOpenCodeProbe, MissionHealth, MissionRunState, MissionRunner,
+        MissionStallSeverity, OpencodeSseState, CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT,
+        CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN, CODEX_PENDING_TOOLS_ERROR_PREFIX,
+        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -9314,6 +9350,30 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[cfg(unix)]
+    #[test]
+    fn container_env_path_accepts_canonical_mission_path_under_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_root = temp.path().join("srv/containers/verity");
+        let mission_dir = canonical_root.join("workspaces/mission-4ca18dbd");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let script = mission_dir.join(".sandboxed-sh-opencode-cmd.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+
+        let alias_parent = temp.path().join("root/.sandboxed-sh/containers");
+        std::fs::create_dir_all(&alias_parent).unwrap();
+        let alias_root = alias_parent.join("verity");
+        symlink(&canonical_root, &alias_root).unwrap();
+        let workspace = crate::workspace::Workspace::new_container("verity".into(), alias_root);
+
+        assert_eq!(
+            workspace_path_for_env_with_nspawn(&workspace, &script, true),
+            std::path::PathBuf::from("/workspaces/mission-4ca18dbd/.sandboxed-sh-opencode-cmd.sh")
+        );
+    }
 
     #[test]
     fn copy_host_executable_follows_a_symlink_and_writes_a_real_binary() {
@@ -10760,6 +10820,13 @@ mod tests {
 
         let normal_text = "The OpenCode CLI exited with status: 1 in a prior run, now fixed.";
         assert!(!opencode_output_needs_fallback(normal_text));
+
+        assert!(opencode_output_needs_fallback(
+            "sh: 1: /srv/container/.sandboxed-sh-opencode-cmd.sh: not found"
+        ));
+        assert!(!opencode_output_needs_fallback(
+            "I found that sh: 1 reported a missing command in the prior run."
+        ));
     }
 
     #[test]
@@ -13367,12 +13434,12 @@ mod tests {
 
     #[test]
     fn claude_install_prefers_npm_for_native_package_when_bun_is_also_present() {
-        let command = claudecode_install_command("2.1.140", true, Some("bun"))
+        let command = claudecode_install_command("2.1.257", true, Some("bun"))
             .expect("npm should produce an install command");
 
         assert_eq!(
             command,
-            "npm install -g @anthropic-ai/claude-code@'2.1.140'"
+            "npm install -g @anthropic-ai/claude-code@'2.1.257'"
         );
         assert!(!command.contains("bun install"));
     }

@@ -1285,7 +1285,7 @@ impl WorkspaceExec {
 
     fn rel_path_in_container(&self, cwd: &Path) -> String {
         let root = &self.workspace.path;
-        let rel = cwd.strip_prefix(root).unwrap_or_else(|_| Path::new(""));
+        let rel = crate::workspace::strip_workspace_prefix(cwd, root).unwrap_or_default();
         if rel.as_os_str().is_empty() {
             "/".to_string()
         } else {

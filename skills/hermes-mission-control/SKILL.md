@@ -129,7 +129,10 @@ Quote `summary.verified_satisfied / summary.total`; `claim_only` is
 `accept_project_track(..., evidence)` closes one — `status=done` is rejected.
 `start_mission` on a project always names its `track` (and a stable
 `idempotency_key`); an unknown key is absorbed as an unplanned item, a held
-writer lease answers `409 track_owned`. Editing `projects/active/<slug>.md`
+writer lease answers `409 track_owned`; retrying the same `idempotency_key`
+returns the mission that holds the lease. Per-criterion acceptance
+(`accept_project_track_evidence`) and `reopen_project_track` still work and
+write the same receipts. Editing `projects/active/<slug>.md`
 does not change the right-rail checklist. Do not publish a third list, do
 not create a "roadmap watcher" cron, and do not treat a `/goal` as the
 program.
@@ -462,6 +465,12 @@ Use `/goal` for the long-lived sole writer or campaign owner when the objective
 spans several turns. Keep reviewers as bounded task missions. Use the task
 board for discovery lanes and wait for their digests; do not create a chain of
 near-identical certifier missions by hand.
+
+`start_mission(writer: true)` enforces that distinction at the API boundary by
+entering goal mode even if a controller omitted the literal `/goal` prefix.
+Do not mark a writer complete merely because one provider turn ended; require
+the track's current evidence contract. Reviewers remain bounded with
+`writer: false`.
 
 ## Check-in cadence for multi-day missions
 

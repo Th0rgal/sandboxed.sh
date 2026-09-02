@@ -26,10 +26,12 @@ Deliberately conservative about what counts as dead:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -133,9 +135,107 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2))
-    tmp.replace(STATE_FILE)
+    lock_path = STATE_FILE.parent / "chatgpt-pool-health.lock"
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            current = load_state()
+            merged_slots = dict(current.get("slots", {}))
+            for name, candidate in state.get("slots", {}).items():
+                existing = merged_slots.get(name, {})
+                if float(candidate.get("checked_at", 0)) >= float(
+                    existing.get("checked_at", 0)
+                ):
+                    merged_slots[name] = candidate
+            merged = dict(current)
+            merged.update(state)
+            merged["slots"] = merged_slots
+            tmp = STATE_FILE.with_name(
+                f".{STATE_FILE.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            )
+            tmp.write_text(json.dumps(merged, indent=2) + "\n")
+            tmp.replace(STATE_FILE)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def is_saved_account_choice(label: str) -> bool:
+    """Match a remembered account card, never login/signup controls."""
+    text = (label or "").strip()
+    if not text or re.search(
+        r"log in to another account|sign up|create account|continue with|use another|se connecter|s'inscrire",
+        text,
+        re.I,
+    ):
+        return False
+    return bool(re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, re.I))
+
+
+def classify_probe(found: dict) -> str:
+    """Only post-picker authenticated navigation is positive evidence."""
+    if found.get("challenge"):
+        return "challenge"
+    if found.get("account_picker"):
+        return "unknown"
+    if found.get("login_visible"):
+        return "logged_out"
+    if found.get("authed_nav"):
+        return "logged_in"
+    return "unknown"
+
+
+def evaluate_dom_probe(page) -> dict | None:
+    """Navigation invalidates one JS context; retry it instead of failing."""
+    try:
+        return page.evaluate(DOM_PROBE)
+    except Exception as exc:  # noqa: BLE001 - Playwright errors are optional here
+        message = str(exc).lower()
+        if "execution context was destroyed" in message or "because of a navigation" in message:
+            return None
+        raise
+
+
+def complete_saved_account_picker(page, settle_ms: int) -> dict:
+    """Select the remembered account and classify the resulting page."""
+    buttons = page.get_by_role("button")
+    selected = False
+    for index in range(buttons.count()):
+        button = buttons.nth(index)
+        try:
+            if not button.is_visible():
+                continue
+            label = button.inner_text()
+        except Exception:  # noqa: BLE001 - a malformed node is inconclusive
+            continue
+        if not is_saved_account_choice(label):
+            continue
+        button.click(timeout=8_000)
+        selected = True
+        break
+    if not selected:
+        return {
+            "challenge": False,
+            "account_picker": True,
+            "login_visible": False,
+            "authed_nav": False,
+        }
+
+    deadline = time.time() + max(settle_ms, 5_000) / 1000.0
+    found = {}
+    while time.time() < deadline:
+        candidate = evaluate_dom_probe(page)
+        if candidate is None:
+            page.wait_for_timeout(500)
+            continue
+        found = candidate
+        if found.get("challenge"):
+            return found
+        if not found.get("account_picker") and (
+            found.get("login_visible") or found.get("authed_nav")
+        ):
+            return found
+        page.wait_for_timeout(500)
+    return found
 
 
 def slot_in_use(profile_dir: str) -> bool:
@@ -199,10 +299,17 @@ def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
                 deadline = time.time() + max(settle_ms, 0) / 1000.0
                 found = {"challenge": False, "account_picker": False, "login_visible": False, "authed_nav": False}
                 while True:
-                    found = page.evaluate(DOM_PROBE)
-                    if found.get("account_picker") or (
-                        found.get("authed_nav") and not found.get("login_visible")
-                    ):
+                    candidate = evaluate_dom_probe(page)
+                    if candidate is None:
+                        if time.time() >= deadline:
+                            break
+                        page.wait_for_timeout(500)
+                        continue
+                    found = candidate
+                    if found.get("account_picker"):
+                        found = complete_saved_account_picker(page, settle_ms)
+                        break
+                    if found.get("authed_nav") and not found.get("login_visible"):
                         break
                     if time.time() >= deadline:
                         break
@@ -226,18 +333,7 @@ def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
     finally:
         shutil.rmtree(dst, ignore_errors=True)
 
-    if found.get("challenge"):
-        return "challenge"
-    # A welcome-back picker means the profile still has a saved session.
-    # The driver clicks through it; treating the overlay Log in chrome as
-    # logout quarantines every slot.
-    if found.get("account_picker"):
-        return "logged_in"
-    if found.get("login_visible"):
-        return "logged_out"
-    if found.get("authed_nav"):
-        return "logged_in"
-    return "unknown"
+    return classify_probe(found)
 
 
 def deliver_webhook(payload: dict) -> None:
@@ -376,6 +472,8 @@ def main() -> int:
         entry.pop("consecutive_inconclusive", None)
         entry["state"] = observed
         entry["checked_at"] = now
+        entry["verdict_version"] = 2
+        entry["source"] = "post-picker-probe-v2"
         if previous != observed:
             entry["since"] = now
 

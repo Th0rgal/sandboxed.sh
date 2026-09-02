@@ -794,10 +794,18 @@ fn default_providers_config() -> ProvidersConfig {
                         ),
                     },
                     ProviderModel {
+                        id: "claude-fable-5-1".to_string(),
+                        name: "Claude Fable 5.1".to_string(),
+                        description: Some(
+                            "Demanding reasoning and long-horizon agentic work, adaptive thinking, 1M context"
+                                .to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "claude-fable-5".to_string(),
                         name: "Claude Fable 5".to_string(),
                         description: Some(
-                            "Most capable widely released model, adaptive thinking, 1M context"
+                            "Previous-generation Fable model retained for explicit compatibility"
                                 .to_string(),
                         ),
                     },
@@ -3125,6 +3133,10 @@ mod tests {
             .models
             .iter()
             .any(|model| model.id == "claude-opus-4-8"));
+        assert!(anthropic
+            .models
+            .iter()
+            .any(|model| model.id == "claude-fable-5-1"));
     }
 
     #[test]

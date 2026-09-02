@@ -127,6 +127,8 @@ pub struct ProjectItem {
     pub key: String,
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub desired_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -188,6 +190,7 @@ pub fn project_items(
             ProjectItem {
                 key: track.track.clone(),
                 kind: "track",
+                position: Some(track.position),
                 desired_state: track.desired_state.clone(),
                 status: track.status.clone(),
                 title: track.title.clone(),
@@ -209,6 +212,7 @@ pub fn project_items(
             .or_insert_with(|| ProjectItem {
                 key: proposal.task_key.clone(),
                 kind: "task",
+                position: None,
                 desired_state: proposal.prompt.clone(),
                 status: Some("proposed".to_string()),
                 title: Some(proposal.title.clone()),
@@ -238,6 +242,7 @@ pub fn project_items(
         let item = items.entry(key.clone()).or_insert_with(|| ProjectItem {
             key: key.clone(),
             kind: "track",
+            position: None,
             desired_state: mission.project.desired_state.clone(),
             status: None,
             title: None,
@@ -264,7 +269,16 @@ pub fn project_items(
         item.attempts
             .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     }
-    items.into_values().collect()
+    let mut items: Vec<_> = items.into_values().collect();
+    items.sort_by(|left, right| match (left.position, right.position) {
+        (Some(left_position), Some(right_position)) => left_position
+            .cmp(&right_position)
+            .then_with(|| left.key.cmp(&right.key)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.key.cmp(&right.key),
+    });
+    items
 }
 
 /// Where a terminal / `awaiting_user` callback should land.
@@ -596,6 +610,9 @@ mod tests {
             explicit_blocker: None,
             revision: 0,
             claim: None,
+            position: 0,
+            governed_artifact_version: None,
+            accepted_at: None,
         }];
         let proposals = vec![RoadmapProposal {
             task_key: "docs".to_string(),
@@ -646,6 +663,9 @@ mod tests {
             explicit_blocker: None,
             revision: 0,
             claim: None,
+            position: 0,
+            governed_artifact_version: None,
+            accepted_at: None,
         }];
         let closed = project_items(&cancelled, &[], &[]);
         assert_eq!(closed.len(), 1);
@@ -670,6 +690,9 @@ mod tests {
                 explicit_blocker: None,
                 revision: 0,
                 claim: None,
+                position: 0,
+                governed_artifact_version: None,
+                accepted_at: None,
             }],
             &[],
             &[],

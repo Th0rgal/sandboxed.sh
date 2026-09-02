@@ -62,9 +62,9 @@ To keep the integration coherent, here's what the existing two adapters do.
   `/api/library/builtin-commands → codex`.
 
 ### Claude Code `/goal` — handled inside the CLI
-- Claude Code 2.1.139+ has a native `/goal` slash command. `src/api/
-  mission_runner.rs:9368-9377` pins the CLI to ≥2.1.140 specifically for
-  this reason.
+- Claude Code 2.1.139+ has a native `/goal` slash command. The production pin
+  is 2.1.257: it keeps the `/goal` fixes from 2.1.140 and adds Fable 5.1
+  support (which requires Claude Code 2.1.251 or newer).
 - Sandboxed.sh **does not** strip the `/goal ` prefix for claudecode —
   the message is sent verbatim to `claude --print --output-format
   stream-json …`. The CLI parses the slash command itself.
@@ -378,4 +378,3 @@ Suggested rollout:
   `~/.grok/docs/user-guide/04-slash-commands.md`,
   `~/.grok/docs/user-guide/13-headless-mode.md`,
   `~/.grok/docs/user-guide/14-agent-mode.md`.
-

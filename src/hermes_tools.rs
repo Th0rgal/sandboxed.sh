@@ -37,6 +37,8 @@ pub const HERMES_ASSISTANT_TOOL_ALLOWLIST: &[&str] = &[
     "get_situation",
     "update_project_status",
     "set_project_track",
+    "accept_project_track_evidence",
+    "reopen_project_track",
     "accept_project_track",
     "invalidate_project_track_evidence",
     "get_project_grant",

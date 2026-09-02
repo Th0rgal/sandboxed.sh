@@ -87,6 +87,11 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         pricing: pricing(15_000, 75_000, Some(18_750), Some(1_500)),
     },
     PricingEntry {
+        canonical: "claude-fable-5-1",
+        aliases: &["claude-fable-5-1", "claude-fable-5.1"],
+        pricing: pricing(10_000, 50_000, Some(12_500), Some(250)),
+    },
+    PricingEntry {
         canonical: "claude-fable-5",
         aliases: &["claude-fable-5"],
         pricing: pricing(10_000, 50_000, Some(12_500), Some(1_000)),
@@ -608,6 +613,8 @@ mod tests {
             "claude-3-5-sonnet"
         );
         assert_eq!(normalize_model("claude-opus-4-7"), "claude-opus-4-7");
+        assert_eq!(normalize_model("claude-fable-5-1"), "claude-fable-5-1");
+        assert_eq!(normalize_model("claude-fable-5.1"), "claude-fable-5-1");
         assert_eq!(normalize_model("claude-5-opus"), "claude-opus-5");
         assert_eq!(
             normalize_model("claude-opus-4-5-20251101"),
@@ -671,6 +678,7 @@ mod tests {
         assert!(pricing_for_model("claude-3-5-sonnet").is_some());
         assert!(pricing_for_model("claude-opus-4-7").is_some());
         assert!(pricing_for_model("claude-opus-5").is_some());
+        assert!(pricing_for_model("claude-fable-5-1").is_some());
         assert!(pricing_for_model("claude-opus-4-5").is_some());
         assert!(pricing_for_model("claude-sonnet-4-5").is_some());
         assert!(pricing_for_model("claude-haiku-4-5").is_some());

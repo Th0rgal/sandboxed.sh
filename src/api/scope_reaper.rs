@@ -118,6 +118,39 @@ fn status_triggers_teardown(status: &MissionStatus) -> bool {
     }
 }
 
+/// Schedule the guarded teardown for one status transition.
+///
+/// Most transitions arrive through the broadcast listener below, but callers
+/// that persist terminal status also invoke this directly. That makes scope
+/// cleanup reliable even when the broadcast receiver is lagged, restarted, or
+/// temporarily absent. The delayed store recheck preserves live background
+/// work exactly as the listener path does.
+pub(crate) fn schedule_mission_scope_teardown(
+    mission_store: Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    status: MissionStatus,
+) {
+    if !status_triggers_teardown(&status) {
+        return;
+    }
+    tokio::spawn(async move {
+        let reason = format!("mission status {status:?}");
+        tokio::time::sleep(teardown_grace()).await;
+        match mission_store.get_mission(mission_id).await {
+            Ok(Some(m)) if status_keeps_scopes(&m.status) => {
+                tracing::debug!(
+                    %mission_id,
+                    status = ?m.status,
+                    "scope teardown skipped: status changed during grace"
+                );
+                return;
+            }
+            _ => {}
+        }
+        stop_mission_exec_scopes(mission_id, &reason).await;
+    });
+}
+
 fn legacy_scope_is_reapable(
     mission_index_complete: bool,
     age: Option<Duration>,
@@ -125,6 +158,19 @@ fn legacy_scope_is_reapable(
     owned_by_live_workspace: bool,
 ) -> bool {
     mission_index_complete && age.is_some_and(|age| age >= max_age) && !owned_by_live_workspace
+}
+
+/// A mission-tagged scope missing from the cross-store index is not proof of
+/// orphanhood. Index construction races session/store registration and has
+/// briefly missed live missions in production. Require the same age evidence
+/// as legacy scopes before treating an unknown tag as stale; status-driven
+/// teardown remains the fast path for known terminal missions.
+fn unknown_tagged_scope_is_reapable(
+    mission_index_complete: bool,
+    age: Option<Duration>,
+    max_age: Duration,
+) -> bool {
+    mission_index_complete && age.is_some_and(|age| age >= max_age)
 }
 
 /// List all `sandboxed-exec-*.scope` unit names currently known to systemd.
@@ -224,37 +270,9 @@ pub fn spawn_status_listener(
                 Ok(AgentEvent::MissionStatusChanged {
                     mission_id, status, ..
                 }) => {
-                    if status_triggers_teardown(&status) {
-                        // Detached so the grace sleep never stalls this
-                        // receiver into broadcast lag.
-                        let store = Arc::clone(&mission_store);
-                        tokio::spawn(async move {
-                            let reason = format!("mission status {status:?}");
-                            // Grace: let the harness's own shutdown path run
-                            // first, and — critically — outlast the
-                            // background watcher's 10s poll so an
-                            // AwaitingUser→WaitingBackground promotion is
-                            // visible to the recheck below.
-                            tokio::time::sleep(teardown_grace()).await;
-                            // Re-check the CURRENT status: within the grace
-                            // window the mission may have been promoted
-                            // (AwaitingUser → WaitingBackground by the
-                            // background watcher, or resumed to Active) —
-                            // stopping then would kill live work.
-                            match store.get_mission(mission_id).await {
-                                Ok(Some(m)) if status_keeps_scopes(&m.status) => {
-                                    tracing::debug!(
-                                        %mission_id,
-                                        status = ?m.status,
-                                        "scope teardown skipped: status changed during grace"
-                                    );
-                                    return;
-                                }
-                                _ => {}
-                            }
-                            stop_mission_exec_scopes(mission_id, &reason).await;
-                        });
-                    }
+                    // Detached so the grace sleep never stalls this receiver
+                    // into broadcast lag.
+                    schedule_mission_scope_teardown(Arc::clone(&mission_store), mission_id, status);
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(dropped)) => {
@@ -387,10 +405,12 @@ async fn run_once(state: &Arc<AppState>) -> ReaperReport {
                     }
                 }
                 None => {
-                    if !index_full.complete {
+                    let age = unit_age(&unit).await;
+                    if !unknown_tagged_scope_is_reapable(index_full.complete, age, max_age) {
                         tracing::debug!(
                             unit,
-                            "reaper: kept (mission unknown but index incomplete)"
+                            ?age,
+                            "reaper: kept (mission unknown without stale-age evidence)"
                         );
                         report.kept += 1;
                     } else if stop_unit(&unit, "reaper: mission unknown to any store").await {
@@ -453,5 +473,19 @@ mod tests {
             false
         ));
         assert!(!legacy_scope_is_reapable(true, None, max_age, false));
+    }
+
+    #[test]
+    fn unknown_tagged_scopes_require_complete_index_and_stale_age() {
+        let max_age = Duration::from_secs(12 * 3600);
+        let old = Some(max_age + Duration::from_secs(1));
+        assert!(!unknown_tagged_scope_is_reapable(false, old, max_age));
+        assert!(!unknown_tagged_scope_is_reapable(
+            true,
+            Some(max_age - Duration::from_secs(1)),
+            max_age
+        ));
+        assert!(!unknown_tagged_scope_is_reapable(true, None, max_age));
+        assert!(unknown_tagged_scope_is_reapable(true, old, max_age));
     }
 }

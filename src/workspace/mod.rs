@@ -2000,7 +2000,7 @@ fn mcp_launcher_shell_escape(value: &str) -> String {
 /// `/srv/sandboxed-storage/...` target of that symlink. `Path::strip_prefix`
 /// is lexical and treats those as unrelated, which made every container
 /// resume fail with "MCP launcher is outside the container workspace".
-fn strip_workspace_prefix(child: &Path, workspace_root: &Path) -> Option<PathBuf> {
+pub(crate) fn strip_workspace_prefix(child: &Path, workspace_root: &Path) -> Option<PathBuf> {
     if let Ok(relative) = child.strip_prefix(workspace_root) {
         return Some(relative.to_path_buf());
     }
